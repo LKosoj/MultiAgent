@@ -210,3 +210,6 @@ plots/.DS_Store
 /doc/*копия*
 /doc/Безымянный-*
 /scripts/*.zip
+/examples
+doc/MultiAgent/.DS_Store
+CopilotKit/
