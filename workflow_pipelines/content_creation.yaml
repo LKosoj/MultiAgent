@@ -1,0 +1,130 @@
+# Пайплайн создания образовательного контента
+name: "content_creation"
+version: "1.2"
+description: "Полный цикл создания образовательного контента: от идеи до готового курса"
+
+inputs:
+  topic: ""  # Тема для создания образовательного контента (обязательная)
+
+global_retry_policy:
+  max_retries: 3
+  backoff_strategy: "linear"
+  base_delay: 2.0
+  max_delay: 60.0
+
+global_resource_limits:
+  max_duration_seconds: 1800  # 30 минут
+  max_memory_mb: 1024
+  max_api_calls_per_minute: 20
+
+steps:
+  - id: "validate_topic"
+    agent_type: "input_guard_agent"
+    task: "Проверить тему '{topic}' на соответствие образовательным стандартам и безопасность"
+    timeout: 30
+    metadata:
+      validation_type: "content_safety"
+
+  - id: "research_topic"
+    agent_type: "researcher"
+    task: "Углубленное исследование темы '{topic}' для образовательного контента"
+    depends_on: ["validate_topic"]
+    condition: "validate_topic.output.is_safe == true"
+    timeout: 300
+    retry_policy:
+      max_retries: 2
+      backoff_strategy: "exponential"
+      base_delay: 3.0
+    resource_limits:
+      max_api_calls_per_minute: 8
+    metadata:
+      depth: "advanced"
+      include_examples: true
+
+  - id: "create_course_plan"
+    agent_type: "course_plan_agent"
+    task: "Создать детальный план курса на основе исследования"
+    depends_on: ["research_topic"]
+    timeout: 180
+    metadata:
+      course_level: "intermediate"
+      duration_hours: 4
+
+  - id: "design_practical_labs"
+    agent_type: "practical_lab_designer_agent"
+    task: "Разработать практические задания для курса"
+    depends_on: ["create_course_plan"]
+    timeout: 240
+    resource_limits:
+      max_memory_mb: 512
+    metadata:
+      lab_count: 3
+      difficulty: "progressive"
+
+  - id: "create_content"
+    agent_type: "content_education_expert_agent"
+    task: "Создать образовательный контент на основе плана и практических заданий"
+    depends_on: ["create_course_plan", "design_practical_labs"]
+    timeout: 400
+    retry_policy:
+      max_retries: 1
+      backoff_strategy: "fixed"
+      base_delay: 10.0
+    metadata:
+      format: "interactive"
+      include_media: true
+
+  - id: "create_diagrams"
+    agent_type: "diagram_creator"
+    task: "Создать диаграммы и визуализации для курса"
+    depends_on: ["create_content"]
+    timeout: 180
+    condition: "create_content.output.requires_diagrams == true"
+    metadata:
+      diagram_types: ["flowchart", "concept_map", "process_diagram"]
+
+  - id: "validate_content"
+    agent_type: "validator"
+    task: "Проверить качество и соответствие образовательным стандартам"
+    depends_on: ["create_content", "create_diagrams"]
+    timeout: 120
+    rollback_action: "revert_to_draft"
+    metadata:
+      validation_criteria: ["accuracy", "completeness", "accessibility"]
+
+  - id: "package_course"
+    agent_type: "project_manager"
+    task: "Упаковать финальный курс со всеми материалами"
+    depends_on: ["validate_content"]
+    timeout: 90
+    metadata:
+      output_formats: ["pdf", "html", "scorm"]
+      include_metadata: true
+
+# Уведомления о важных этапах
+notifications:
+  - "email:education-team@company.com"
+  - "webhook:https://api.company.com/course-notifications"
+
+# Продвинутая обработка ошибок
+error_handling:
+  on_failure: "pause_and_notify"
+  retry_failed_steps: true
+  save_checkpoint_interval: 300  # каждые 5 минут
+  emergency_contacts:
+    - "slack:#education-emergency"
+    - "sms:+1234567890"
+
+metadata:
+  author: "Education Team"
+  category: "content_creation"
+  complexity: "high"
+  estimated_duration: "25-30 minutes"
+  target_audience: "educators"
+  prerequisites: ["validated_topic"]
+  deliverables:
+    - "course_plan"
+    - "practical_labs"
+    - "educational_content"
+    - "diagrams"
+    - "packaged_course"

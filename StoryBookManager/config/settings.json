@@ -1,0 +1,14 @@
+{
+  "projects_directory": "/Users/kosoj/Documents/MultiAgent/plots/storybooks",
+  "backup_directory": "/Users/kosoj/Documents/MultiAgent/StoryBookManager/backups",
+  "logs_directory": "/Users/kosoj/Documents/MultiAgent/StoryBookManager/logs",
+  "auto_save_interval": 30,
+  "max_backup_files": 10,
+  "theme": "default",
+  "window_geometry": "1470x828+0+34",
+  "json_editor_mode": "structured",
+  "enable_ai_assistant": true,
+  "media_cache_size": 100,
+  "video_preview_quality": "medium",
+  "log_level": "INFO"
+}

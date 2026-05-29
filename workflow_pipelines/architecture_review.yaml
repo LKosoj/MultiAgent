@@ -1,0 +1,192 @@
+# Пайплайн архитектурного анализа и документирования
+name: "architecture_review"
+version: "1.0"
+description: "Анализ архитектуры кода, создание диаграмм и технической документации"
+
+inputs:
+  project_path: ""  # Путь к проекту для анализа архитектуры (обязательный)
+
+outputs:
+  final:
+    from_step: create_technical_docs
+    field: output
+    format: markdown
+  analysis:
+    from_step: analyze_codebase
+    field: output
+    format: json
+  components:
+    from_step: identify_components
+    field: output
+    format: json
+  quality:
+    from_step: analyze_code_quality
+    field: output
+    format: json
+  system_diagram:
+    from_step: create_system_diagram
+    field: output
+    format: text
+  component_diagram:
+    from_step: create_component_diagram
+    field: output
+    format: text
+  validation:
+    from_step: validate_documentation
+    field: output
+    format: json
+
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: "exponential"
+  base_delay: 2.0
+  max_delay: 60.0
+
+global_resource_limits:
+  max_duration_seconds: 1200  # 20 минут
+  max_memory_mb: 1536
+  max_api_calls_per_minute: 12
+
+steps:
+  - id: "analyze_codebase"
+    agent_type: "codebase_analyzer"
+    task: "Проанализировать архитектуру проекта в папке: {project_path}"
+    timeout: 300
+    resource_limits:
+      max_memory_mb: 512
+    metadata:
+      analysis_depth: "comprehensive"
+      include_dependencies: true
+      detect_patterns: true
+
+  - id: "identify_components"
+    agent_type: "codebase_analyzer"
+    task: |
+      Выделить основные компоненты и их взаимосвязи на основе результата анализа.
+
+      Результат анализа (JSON):
+      {analyze_codebase}
+    depends_on: ["analyze_codebase"]
+    timeout: 120
+    metadata:
+      component_types: ["services", "modules", "interfaces", "databases"]
+      relationship_mapping: true
+
+  - id: "create_system_diagram"
+    agent_type: "diagram_creator"
+    task:  |
+      Создать диаграмму системной архитектуры на основе результата анализа и идентификации компонентов.
+
+      Анализ (JSON):
+      {analyze_codebase}
+
+      Компоненты (JSON):
+      {identify_components}
+    depends_on: ["identify_components"]
+    timeout: 180
+    metadata:
+      diagram_type: "system_architecture"
+      include_data_flow: true
+      format: "mermaid"
+
+  - id: "create_component_diagram"
+    agent_type: "plantuml_creator"
+    task: |
+      Создать детальную диаграмму компонентов в PlantUML на основе результата анализа и идентификации компонентов.
+
+      Анализ (JSON):
+      {analyze_codebase}
+
+      Компоненты (JSON):
+      {identify_components}
+    depends_on: ["identify_components"]
+    timeout: 150
+    metadata:
+      diagram_type: "component"
+      include_interfaces: true
+      show_dependencies: true
+
+  - id: "analyze_code_quality"
+    agent_type: "analyst"
+    task: |
+      Оценить качество кода и выявить проблемные места на основе результата анализа.
+
+      Анализ (JSON):
+      {analyze_codebase}
+
+      Компоненты (JSON):
+      {identify_components}
+    depends_on: ["analyze_codebase"]
+    timeout: 200
+    metadata:
+      check_complexity: true
+      detect_code_smells: true
+      security_review: true
+
+  - id: "create_technical_docs"
+    agent_type: "architect"
+    task: |
+      Создать техническую документацию на основе анализа, качества кода и диаграмм.
+
+      Анализ (JSON):
+      {analyze_codebase}
+
+      Компоненты (JSON):
+      {identify_components}
+
+      Качество кода (JSON):
+      {analyze_code_quality}
+
+      Диаграмма системы:
+      {create_system_diagram}
+
+      Диаграмма компонентов:
+      {create_component_diagram}
+    depends_on: ["analyze_code_quality", "create_system_diagram", "create_component_diagram"]
+    timeout: 240
+    metadata:
+      include_architecture_decisions: true
+      add_improvement_recommendations: true
+      format: "markdown"
+
+  - id: "validate_documentation"
+    agent_type: "validator"
+    task: |
+      Проверить полноту и качество документации.
+
+      Документация:
+      {create_technical_docs}
+
+      Анализ (JSON):
+      {analyze_codebase}
+
+      Компоненты (JSON):
+      {identify_components}
+
+      Качество кода (JSON):
+      {analyze_code_quality}
+
+      Диаграмма системы:
+      {create_system_diagram}
+
+      Диаграмма компонентов:
+      {create_component_diagram}
+    depends_on: ["create_technical_docs"]
+    timeout: 60
+    metadata:
+      check_completeness: true
+      validate_diagrams: true
+      review_recommendations: true
+
+metadata:
+  author: "Architecture Team"
+  category: "architecture"
+  complexity: "high"
+  estimated_duration: "15-20 minutes"
+  deliverables:
+    - "architecture_analysis"
+    - "system_diagram"
+    - "component_diagram"
+    - "technical_documentation"
+    - "quality_assessment"
+  target_audience: ["developers", "architects", "managers"]

@@ -1,0 +1,23 @@
+name: file_write
+description: "Записывает содержимое в файл в каталог 'plots'. Если append=True, дописывает в конец файла."
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.file_system_tools.file_write
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии для отслеживания выполнения задач."
+    required: true
+  - name: "filename"
+    type: "str"
+    description: "Путь к файлу для записи."
+    required: true
+  - name: "content"
+    type: "str"
+    description: "Содержимое, которое нужно записать в файл."
+    required: true
+  - name: "append"
+    type: "bool"
+    description: "Если True, дописывает в конец файла, иначе перезаписывает."
+    required: false
+    default: false 

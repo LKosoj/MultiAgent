@@ -1,0 +1,144 @@
+# Sidecar для optimization_metadata всех агентов.
+# Вынесено из боевых profile-файлов (EPIC 6, task 6.15), чтобы не засорять контракт профиля.
+# Структура: agent_name -> metadata-блок (как раньше лежал прямо в профиле).
+# prompt_optimizer/prompt_optimizer.py сначала читает отсюда, fallback на profile.get('optimization_metadata') для старых бэкапов.
+agent_constructor:
+  optimized_at: '2025-08-28T01:29:23.306600'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+analyst:
+  optimized_at: '2025-08-23T12:35:31.833957'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+architect:
+  optimized_at: '2025-08-23T12:33:49.370017'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+artist_agent:
+  optimized_at: '2025-08-23T12:37:01.860486'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+code_executor:
+  optimized_at: '2025-08-23T12:35:06.543145'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+content_education_expert_agent:
+  optimized_at: '2025-08-23T12:34:10.140721'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+course_plan_agent:
+  optimized_at: '2025-08-23T12:36:09.895155'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+db_audit_agent:
+  optimized_at: '2025-08-23T12:37:28.205512'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+diagram_creator:
+  optimized_at: '2025-08-23T12:37:50.248035'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+manager:
+  optimized_at: '2025-08-23T12:38:59.856805'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+nlu_agent:
+  optimized_at: '2025-08-23T12:39:32.769497'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+practical_lab_designer_agent:
+  optimized_at: '2025-08-23T12:36:27.356960'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+project_manager:
+  optimized_at: '2025-08-23T12:38:33.629870'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+report_generator_agent:
+  optimized_at: '2025-08-28T01:29:09.176365'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+researcher:
+  optimized_at: '2025-08-23T12:38:11.507744'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+schema_rag_agent:
+  optimized_at: '2025-08-23T12:33:16.953231'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+sql_generator_agent:
+  optimized_at: '2025-08-23T12:39:51.680349'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+sql_verifier_agent:
+  optimized_at: '2025-08-23T12:36:44.280946'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+validator:
+  optimized_at: '2025-08-23T12:35:47.332731'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct
+visualizer:
+  optimized_at: '2025-08-23T12:34:37.099880'
+  optimizer_version: '1.0'
+  optimized_components:
+    - prompt
+    - description
+  optimizer_model: Qwen3-Coder-480B-A35B-Instruct

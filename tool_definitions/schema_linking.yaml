@@ -1,0 +1,23 @@
+name: schema_linking
+description: "Сопоставляет извлеченные из текста сущности с реальными таблицами и полями в схеме базы данных."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.schema_linking
+parameters:
+  - name: entities
+    type: object
+    description: "Объект с сущностями, извлеченными NLU-агентом. Инструмент автоматически найдет релевантный контекст."
+    required: true
+  - name: dsn
+    type: string
+    description: "DSN целевой БД для загрузки sqlrag-схемы и интроспекции. Для tool-step передается через tool_params.dsn; для agent tool calls — через workflow runtime metadata. Не вставлять DSN в prompt или ответ."
+    required: false
+output:
+  type: object
+  properties:
+    linked_entities:
+      type: object
+    unlinked_entities:
+      type: array
+      items:
+        type: string

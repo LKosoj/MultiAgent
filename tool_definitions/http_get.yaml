@@ -1,0 +1,27 @@
+name: http_get
+description: "Делает простой HTTP GET по URL и возвращает ответ без LLM-преобразований. Подходит для API."
+category: "Веб"
+source_type: custom_function
+implementation_source: custom_tools.web_tools.http_get
+parameters:
+  - name: "url"
+    type: "str"
+    description: "Полный URL запроса."
+    required: true
+  - name: "params"
+    type: "str"
+    description: "JSON-строка с query-параметрами (опционально)."
+    required: false
+  - name: "headers"
+    type: "str"
+    description: "JSON-строка с HTTP-заголовками (опционально)."
+    required: false
+  - name: "timeout"
+    type: "int"
+    description: "Таймаут запроса в секундах (по умолчанию 30)."
+    required: false
+  - name: "expect_json"
+    type: "bool"
+    description: "Если true, пытается распарсить и вернуть pretty JSON."
+    required: false
+

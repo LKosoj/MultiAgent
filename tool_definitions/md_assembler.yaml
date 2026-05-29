@@ -1,0 +1,75 @@
+name: md_assembler_tool
+description: "Универсальный сборщик Markdown-документов из изображений и/или манифеста"
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.md_tools.md_assembler_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии"
+    required: true
+  - name: mode
+    type: str
+    description: "Режим работы: manifest | discovery"
+    required: true
+  - name: output_path
+    type: str
+    description: "Абсолютный путь к выходному .md файлу"
+    required: true
+  - name: image_globs
+    type: List[str]
+    description: "(discovery) Список glob-шаблонов для изображений"
+    required: false
+  - name: fallback_globs
+    type: List[str]
+    description: "(discovery) Дополнительные glob-шаблоны"
+    required: false
+  - name: order
+    type: str
+    description: "(discovery) Порядок: by_regex | by_mtime | alphanumeric"
+    required: false
+  - name: order_regex
+    type: str
+    description: "(discovery) Регулярное выражение с группой номера для сортировки"
+    required: false
+  - name: title
+    type: str
+    description: "Заголовок документа"
+    required: false
+  - name: frontmatter
+    type: dict
+    description: "YAML frontmatter (словарь)"
+    required: false
+  - name: link_strategy
+    type: str
+    description: "Как формировать ссылки: absolute | relative | url"
+    required: false
+  - name: base_url
+    type: str
+    description: "Базовый URL (для link_strategy=url)"
+    required: false
+  - name: assets_copy_dir
+    type: str
+    description: "Куда копировать ассеты (если нужно)"
+    required: false
+  - name: toc
+    type: bool
+    description: "Генерировать оглавление"
+    required: false
+  - name: heading_level_offset
+    type: int
+    description: "Сдвиг уровней заголовков"
+    required: false
+  - name: manifest_path
+    type: str
+    description: "(manifest) Путь к JSON/JSONL манифесту"
+    required: false
+  - name: variables
+    type: dict
+    description: "(manifest) Переменные для подстановки плейсхолдеров"
+    required: false
+  - name: skip_if_exists
+    type: bool
+    description: "Пропускать, если файл уже существует"
+    required: false
+

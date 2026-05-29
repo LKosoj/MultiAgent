@@ -1,0 +1,22 @@
+name: code_formatter
+description: "Форматирует SQL-код в соответствии со стандартами стиля для улучшения читаемости."
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.code_formatter
+parameters:
+  - name: sql_query
+    type: string
+    description: "Неформатированный SQL-запрос."
+    required: true
+output:
+  type: object
+  properties:
+    formatted_sql_query:
+      type: string
+      description: "Отформатированный SQL. Отсутствует, если вернулся error."
+    # Runtime-контракт (W2-T7): при сбое sqlglot-форматирования возвращается
+    # только {error}, без formatted_sql_query (тело SQL намеренно не эхоируется).
+    error:
+      type: string
+      nullable: true
+      description: "Присутствует при сбое sqlglot-форматирования; тогда formatted_sql_query отсутствует."

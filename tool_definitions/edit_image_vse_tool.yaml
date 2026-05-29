@@ -1,0 +1,38 @@
+name: edit_image_vse_tool
+description: "Редактирует изображение(я) с помощью VseGPT API на основе текстового описания изменений. Поддерживает до 10 изображений одновременно. ВАЖНО: промпт должен быть СТРОГО на английском языке!"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.image_tools.edit_image_vse_tool
+parameters:
+  - name: "prompt"
+    type: "str"
+    description: "Текстовое описание желаемых изменений к изображению СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ"
+    required: true
+  - name: "image_paths"
+    type: "list"
+    description: "Список путей к исходным файлам изображений (до 10 изображений)"
+    required: true
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии для именования файла"
+    required: true
+  - name: "output_path"
+    type: "str"
+    description: "Путь для сохранения отредактированного изображения (опционально)"
+    required: false
+  - name: "seed"
+    type: "int"
+    description: "Seed для воспроизводимости (оставьте пустым для случайного)"
+    required: false
+  - name: "negative_prompt"
+    type: "str"
+    description: "Негативный промпт (что НЕ должно быть в изображении)"
+    required: false
+  - name: "width"
+    type: "int"
+    description: "Ширина результата. По умолчанию 1920"
+    required: false
+  - name: "height"
+    type: "int"
+    description: "Высота результата. По умолчанию 1080"
+    required: false

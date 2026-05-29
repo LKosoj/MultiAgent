@@ -1,0 +1,31 @@
+name: emit_event
+description: "Генерирует событие в EventBus для запуска цепочек workflow."
+category: "Workflow"
+source_type: custom_function
+implementation_source: custom_tools.event_tools.emit_event
+parameters:
+  - name: "event_type"
+    type: "str"
+    description: "Тип события, например workflow.completed или customer.created."
+    required: true
+  - name: "payload"
+    type: "Dict"
+    description: "Полезная нагрузка события."
+    required: false
+  - name: "priority"
+    type: "str"
+    description: "Приоритет события: low, normal, high, critical."
+    required: false
+  - name: "metadata"
+    type: "Dict"
+    description: "Дополнительные метаданные события."
+    required: false
+  - name: "correlation_id"
+    type: "str"
+    description: "Корреляционный идентификатор цепочки событий."
+    required: false
+  - name: "aggregate_id"
+    type: "str"
+    description: "Агрегат (stream) для event sourcing."
+    required: false
+

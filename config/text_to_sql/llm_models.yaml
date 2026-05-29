@@ -1,0 +1,28 @@
+# Source of truth для LLM model parameters в text-to-sql pipeline.
+#
+# Loader: custom_tools/text_to_sql/llm_models_config.py::load_llm_models_config
+# Override path via env TEXT_TO_SQL_LLM_MODELS_PATH.
+# Override profile via env TEXT_TO_SQL_LLM_MODELS_PROFILE.
+#
+# Назначение секций (см. EPIC 4 / 4.17, W6-T3):
+#   * schema_linking — параметры LLM-запросов внутри schema_linking pipeline
+#     (custom_tools/text_to_sql/schema_linking/strategies.py::llm_linking)
+#   * sql_generation — параметры LLM-запросов в SQL-генераторе
+#     (custom_tools/text_to_sql/sql_generator.py)
+#   * nlu — параметры LLM-запросов NLU (intent extraction + tokenization),
+#     custom_tools/text_to_sql/nlu.py. Ключи intent_max_tokens / nlp_max_tokens
+#     соответствуют двум разным вызовам внутри одного модуля.
+#
+# Дефолтный профиль содержит безопасные общие значения; конкретные
+# домены/датасеты могут переопределять их в своих профилях.
+version: 1
+
+profiles:
+  default:
+    schema_linking:
+      max_tokens: 20000
+    sql_generation:
+      max_tokens: 20000
+    nlu:
+      intent_max_tokens: 800
+      nlp_max_tokens: 2000

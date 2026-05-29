@@ -1,0 +1,17 @@
+name: audit_logger
+description: "Записывает подробную информацию о выполненной операции в защищенный лог аудита."
+category: "Безопасность"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.audit_logger
+parameters:
+  - name: audit_entry
+    type: object
+    description: "Объект, содержащий всю информацию для записи в лог."
+    required: true
+output:
+  type: object
+  properties:
+    log_id:
+      type: string
+    status:
+      type: string 

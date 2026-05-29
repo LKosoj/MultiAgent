@@ -1,0 +1,172 @@
+# Source: extracted from custom_tools/text_to_sql/nlu.py @T4.1
+# Used by _fallback_extract_intent when TEXT_TO_SQL_NLU_ALLOW_FALLBACKS=1.
+# Loader: custom_tools/text_to_sql/nlu_config.py::load_nlu_morphemes
+# Override path via env TEXT_TO_SQL_NLU_MORPHEMES_PATH.
+#
+# Layout (W3-T1, profile-aware):
+#   * Top-level: shared structural константы (version, language,
+#     table_name_inflections).
+#   * profiles.default: пустой / нейтральный набор — на любой не-RU
+#     инсталляции heuristic NLU fallback закрыт (``enabled: false``,
+#     intents/dimensions/intent_rules пустые). RU морфем здесь НЕТ —
+#     non-RU инсталляция без muni_ru НЕ получает RU интентов в fallback'е.
+#   * profiles.muni_ru: legacy муниципальный РФ-набор (выруч/доход/регион
+#     /клиент/между/больше/топ и т.п.). Активируется через env
+#     ``TEXT_TO_SQL_NLU_PROFILE=muni_ru`` или явно через
+#     ``NLUProcessor(morphemes_registry=...)``.
+#
+# Loader сам разворачивает выбранный профиль в flat-mapping для NLUMorphemes
+# (см. nlu_config._apply_profile). Профильно-зависимые поля перечислены в
+# nlu_config._PROFILE_OVERRIDABLE_KEYS.
+version: 1
+language: ru
+
+# Английская плюрализация имён таблиц для JoinBuilder.infer_joins_by_convention.
+# Это структурная (а не RU-доменная) константа, поэтому живёт на верхнем
+# уровне и одинакова для default и muni_ru.
+table_name_inflections:
+  enabled: true
+  pluralizers:
+    - ["", "s"]      # user → users
+    - ["y", "ies"]   # category → categories
+
+profiles:
+  # ---------------------------------------------------------------
+  # default — пустой/нейтральный профиль. Heuristic NLU fallback
+  # отключён, ни одной RU морфемы / regex с RU-словами не отдаём.
+  # Любая non-RU инсталляция, не активирующая muni_ru, получает
+  # closed-world fallback в виде RuntimeError("disabled by config"),
+  # а не молчаливую RU-эвристику.
+  # ---------------------------------------------------------------
+  # НАМЕРЕННО: default-профиль закрывает heuristic NLU fallback (enabled: false).
+  # Non-RU инсталляция получает RuntimeError а не молчаливую RU-эвристику.
+  # Паттерны ниже — минимальный нейтральный набор; RU-морфемы живут только в muni_ru.
+  # Для RU муниципального датасета: TEXT_TO_SQL_NLU_PROFILE=muni_ru
+  default:
+    enabled: false
+    intents: []
+    dimensions: []
+    relative_date:
+      triggers: []
+      periods: []
+      days_pattern: '(\d+)\s*(?:day)'
+    patterns:
+      date_iso:
+        - '(20\d{2}-\d{2}-\d{2})'
+      region: []
+      amount_greater:
+        - '(?:>)\s*(\d+(?:\.\d+)?)'
+      amount_less:
+        - '(?:<)\s*(\d+(?:\.\d+)?)'
+      amount_between: []
+      top_n:
+        - '(?:top)\s*(\d+)'
+    order:
+      triggers: ["desc", "asc"]
+      desc_triggers: ["desc"]
+    intent_rules: []
+    default_intent: query
+    top_n_intent: top_n
+    tokenizer:
+      adpositions: []
+    regions:
+      normalize: {}
+
+  # ---------------------------------------------------------------
+  # muni_ru — legacy муниципальный РФ-набор морфем/regex. Содержит
+  # ровно те значения, которые до W3-T1 жили на верхнем уровне yaml
+  # как «default» (тогда default-конфиг был де-факто RU-доменным).
+  # Активируется через env TEXT_TO_SQL_NLU_PROFILE=muni_ru.
+  # ---------------------------------------------------------------
+  muni_ru:
+    enabled: true
+
+    # Intent metrics: substring match against lowercased text.
+    intents:
+      - canonical: revenue
+        morphemes: ["выруч", "revenue", "amount", "сумм", "доход", "прибыл"]
+      - canonical: count
+        morphemes: ["количеств", "count", "число", "сколько", "штук", "единиц"]
+      - canonical: average
+        morphemes: ["средн", "average", "avg"]
+
+    # Dimensions: substring match against lowercased text.
+    dimensions:
+      - canonical: date
+        morphemes: ["дат", "date", "период", "время", "месяц", "год", "день"]
+      - canonical: region
+        morphemes: ["регион", "region", "страна", "город", "облас", "край"]
+      - canonical: product
+        morphemes: ["продук", "product", "товар", "категор"]
+      - canonical: customer
+        morphemes: ["клиент", "customer", "покупател", "заказчик"]
+
+    # Relative date markers and corresponding period/unit hints.
+    relative_date:
+      triggers: ["последни", "за послед", "last"]
+      periods:
+        - canonical: month
+          morphemes: ["месяц", "month"]
+        - canonical: week
+          morphemes: ["неделя", "week", "недели", "неделю", "недель"]
+        - canonical: year
+          morphemes: ["год", "year"]
+        - canonical: day
+          morphemes: ["день", "дней", "дня", "day"]
+      # Regex захватывает числовой модификатор перед любым стволом периода.
+      # Одна capture group = count; паттерн ищет любые поддерживаемые стволы.
+      # Ствол 'дн' покрывает формы 'днём'/'дню'/'дн' и здесь БЕЗОПАСЕН: защита —
+      # это ОБЯЗАТЕЛЬНЫЙ digit-префикс \d+ (capture group), а пробел между ними
+      # \s* (ноль или более). Т.к. это regex-, а не substring-матч, 'последн*'
+      # не имеет цифр перед 'дн' и не срабатывает. В substring-матчах ('intents'
+      # /'dimensions') ствол 'дн' НЕ использовать — там digit-префикса нет.
+      days_pattern: '(\d+)\s*(?:месяц|недел|год|дн|день|дней|дня|week|month|year|day)'
+
+    # Regex patterns used by the heuristic. All patterns operate on lowercased text.
+    patterns:
+      date_iso:
+        - '(20\d{2}-\d{2}-\d{2})'
+      region:
+        - 'регион(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+        - 'в\s+([a-zA-Zа-яА-Я]+(?:ской|ском|кой|ком)?\s*(?:област|регион|край))'
+        - 'город(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+      amount_greater:
+        - '(?:больше|более|>)\s*(\d+(?:\.\d+)?)'
+      amount_less:
+        - '(?:меньше|менее|<)\s*(\d+(?:\.\d+)?)'
+      amount_between:
+        - 'между\s*(\d+(?:\.\d+)?)\s*и\s*(\d+(?:\.\d+)?)'
+      top_n:
+        - '(?:топ|top)\s*(\d+)'
+        - 'первы[еих]\s*(\d+)'
+        - 'лучши[еих]\s*(\d+)'
+        - '(?:показать|вывести)\s*(\d+)'
+
+    # Канонизация значений для filters.region (см. 3.13).
+    # muni_ru: словарь стартует пустым; конкретные канонические формы должны
+    # заводиться в проекте / профиле, а не в коде nlu.py.
+    regions:
+      normalize: {}
+
+    # Sorting heuristic: order is set if any trigger matches; then desc_triggers wins over asc.
+    order:
+      triggers: ["по убыван", "по возраст", "desc", "asc"]
+      desc_triggers: ["по убыван", "desc"]
+
+    # Intent classification (checked top-to-bottom; first match wins).
+    # Special canonical "top_n" is selected when filters.limit is populated and no other intent matched.
+    intent_rules:
+      - canonical: aggregate
+        morphemes: ["агрегир", "сумм", "итог", "всего"]
+      - canonical: aggregate_over_time
+        morphemes: ["по времени", "по месяц", "по дат", "динамик"]
+      - canonical: compare
+        morphemes: ["сравни", "compare", "против", "vs"]
+
+    # Default intent if no rule matched and filters.limit is not set.
+    default_intent: query
+    top_n_intent: top_n
+
+    # Fallback tokenizer adpositions (POS=ADP).
+    tokenizer:
+      adpositions: ["по", "за", "между", "в", "для", "от", "до"]

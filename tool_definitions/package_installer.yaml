@@ -1,0 +1,15 @@
+name: install_package
+description: "Безопасно устанавливает Python-пакеты используя pip с проверками безопасности. Блокирует потенциально опасные пакеты (системные команды, процессы, криптография, сеть). Поддерживает белый список безопасных пакетов для анализа данных и научных вычислений."
+category: "Утилиты"
+source_type: custom_function
+implementation_source: custom_tools.file_system_tools.install_package
+parameters:
+  - name: "package_name"
+    type: "str"
+    description: "Имя пакета для установки (например, 'numpy', 'pandas')."
+    required: true
+  - name: "version"
+    type: "str"
+    description: "Версия пакета для установки (опционально, например '1.21.0')."
+    required: false
+    default: null

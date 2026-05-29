@@ -1,0 +1,23 @@
+name: agent_profile_generator
+description: "Формирует YAML-профиль агента на основе spec, tools_resolved и dependency_plan."
+category: "Агенты"
+source_type: custom_function
+implementation_source: custom_tools.agent_constructor.generate_agent_profile
+parameters:
+  - name: spec
+    type: object
+    description: "Нормализованный spec."
+    required: true
+  - name: tools_resolved
+    type: array
+    description: "Подтверждённые тули."
+    required: true
+  - name: dependency_plan
+    type: object
+    description: "План зависимостей."
+    required: true
+  - name: output_dir
+    type: string
+    description: "Каталог для записи профиля (по умолчанию agent_profiles)."
+    required: false
+

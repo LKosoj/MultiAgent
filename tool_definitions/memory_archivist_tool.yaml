@@ -1,0 +1,45 @@
+name: memory_archivist_access
+description: |-
+  Предоставляет полный неограниченный доступ к системе памяти для агента-архивариуса.
+  Позволяет читать, сохранять и управлять памятью всех сессий, агентов и типов данных.
+  
+  Основные возможности:
+  - Чтение всей памяти без ограничений по сессиям и агентам
+  - Семантический поиск по всей базе памяти
+  - Сохранение общей информации доступной всем агентам
+  - Извлечение статистики и аналитики по памяти
+  - Управление архивацией и очисткой памяти
+  - Доступ к исторической памяти (деактивированные записи)
+  
+  Этот инструмент предназначен ТОЛЬКО для агента-архивариуса памяти.
+source_type: custom_function
+implementation_source: custom_tools.memory_archivist_tools.memory_archivist_access
+parameters:
+  - name: operation
+    type: str
+    description: "Операция: global_search, save_global, read_all, get_stats, list_sessions, list_agents, export_memory или search_historical."
+    required: true
+  - name: session_id
+    type: str
+    description: "ID сессии для фильтрации."
+    required: false
+  - name: agent_name
+    type: str
+    description: "Имя агента для фильтрации."
+    required: false
+  - name: query
+    type: str
+    description: "Поисковый запрос."
+    required: false
+  - name: data
+    type: dict
+    description: "Данные для сохранения."
+    required: false
+  - name: include_historical
+    type: bool
+    description: "Включать исторические записи."
+    required: false
+  - name: max_results
+    type: int
+    description: "Максимальное количество результатов."
+    required: false

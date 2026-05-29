@@ -1,0 +1,6 @@
+name: get_available_image_analysis_types
+description: "Получить список всех доступных типов анализа изображений. Полезно для агентов, которые хотят узнать возможности системы анализа изображений."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.image_tools.get_available_image_analysis_types
+parameters: []

@@ -1,0 +1,14 @@
+name: file_list
+description: "Читает директорию и возвращает список файлов в ней."
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.file_system_tools.file_list
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии для отслеживания выполнения задач."
+    required: true
+  - name: "dir_name"
+    type: "str"
+    description: "Имя директории ('plots', 'data') для чтения содержимого."
+    required: true 

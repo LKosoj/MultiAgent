@@ -1,0 +1,15 @@
+name: dependency_planner
+description: "Строит простой план зависимостей и конфигураций для подтверждённых тулов."
+category: "Агенты"
+source_type: custom_function
+implementation_source: custom_tools.agent_constructor.plan_dependencies
+parameters:
+  - name: tools_resolved
+    type: array
+    description: "Результат валидатора доступности."
+    required: true
+  - name: context
+    type: object
+    description: "Опциональный контекст (env, политики)."
+    required: false
+

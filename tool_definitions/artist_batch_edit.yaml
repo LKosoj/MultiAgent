@@ -1,0 +1,27 @@
+name: artist_agent_batch_edit_tool
+description: "Пакетное редактирование изображений через агента artist_agent. Поддерживает как одиночные, так и множественные изображения (до 4), reference images, negative prompt и детерминированные параметры."
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.artist_batch_edit.artist_agent_batch_edit_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии (обязателен)"
+    required: true
+  - name: "items"
+    type: "List[Dict[str, Any]]"
+    description: "Список заданий. Каждый элемент может содержать: image_path (одно изображение) ИЛИ image_paths (массив до 4 изображений), english_prompt, negative_prompt, width, height, true_cfg_scale, number, output_path, reference_image_paths[]"
+    required: true
+  - name: "max_concurrency"
+    type: "int"
+    description: "Максимальное число параллельных вызовов агента (>=1)"
+    required: false
+  - name: "pipeline_type"
+    type: "str"
+    description: "Тип пайплайна для фабрики агентов (по умолчанию 'workflow')"
+    required: false
+  - name: "enable"
+    type: "bool"
+    description: "Если True, выполняет генерацию изображений. Если False, пропускает выполнение (по умолчанию True)"
+    required: false
+

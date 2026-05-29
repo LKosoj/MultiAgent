@@ -1,0 +1,26 @@
+name: story_editor_tool
+description: "Редактирует и улучшает текст истории из story.json по главам: стилистика, детали, диалоги"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.story_editor.story_editor_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии"
+    required: true
+  - name: project_id
+    type: str
+    description: "Идентификатор проекта"
+    required: true
+  - name: force_edit
+    type: bool
+    description: "Принудительное редактирование, даже если история не была перегенерирована"
+    required: false
+  - name: chapter_numbers
+    type: list
+    description: "Список номеров глав для редактирования (например: [1, 3, 5]). Если не указано, редактируются все главы"
+    required: false
+  - name: edit_all_chapters
+    type: bool
+    description: "Если True, редактировать все главы сразу. Если False (по умолчанию), редактировать по одной главе"
+    required: false

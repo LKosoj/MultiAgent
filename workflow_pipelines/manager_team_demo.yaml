@@ -1,0 +1,73 @@
+# Демонстрационный пайплайн: менеджер с командой
+name: "manager_team_demo"
+version: "1.0"
+description: "Демонстрация вызова менеджера с предзагруженной командой агентов"
+
+inputs:
+  topic: ""  # Тема для исследования (обязательная)
+
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: "exponential"
+  base_delay: 2.0
+
+global_resource_limits:
+  max_duration_seconds: 1200  # 20 минут
+  max_memory_mb: 1024
+  max_api_calls_per_minute: 15
+
+steps:
+  - id: "simple_task"
+    agent_type: "researcher"
+    task: "Кратко исследовать тему: {topic}"
+    timeout: 120
+    metadata:
+      description: "Простое исследование без менеджера"
+
+  - id: "manager_with_team"
+    agent_type: "manager"
+    task: "Провести углубленное исследование темы '{topic}' с созданием аналитического отчета и диаграмм"
+    depends_on: ["simple_task"]
+    timeout: 600
+    metadata:
+      preload_agents: ["researcher", "analyst", "diagram_creator"]
+      pipeline_type: "general_tasks"
+      description: "Менеджер координирует команду из 3 агентов"
+
+  - id: "educational_content_team"
+    agent_type: "manager"
+    task: "Создать краткий образовательный модуль по теме '{topic}'"
+    depends_on: ["manager_with_team"]
+    timeout: 450
+    metadata:
+      preload_agents: ["course_plan_agent", "content_education_expert_agent"]
+      pipeline_type: "educational_content"
+      description: "Менеджер создает образовательный контент"
+
+# Уведомления о важных этапах
+notifications:
+  - "console"
+
+# Обработка ошибок
+error_handling:
+  on_failure: "continue"
+  retry_failed_steps: true
+
+metadata:
+  author: "System"
+  category: "demo"
+  complexity: "medium"
+  estimated_duration: "8-12 minutes"
+  target_audience: "developers"
+  prerequisites: ["topic"]
+  deliverables:
+    - "research_report"
+    - "analysis_diagrams"
+    - "educational_module"
+  description: |
+    Демонстрационный пайплайн показывает три подхода:
+    1. Простой агент без менеджера
+    2. Менеджер с командой исследования/анализа
+    3. Менеджер с командой образовательного контента
+    
+    Используйте переменную {topic} для задания темы исследования.

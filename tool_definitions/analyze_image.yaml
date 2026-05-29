@@ -1,0 +1,36 @@
+name: analyze_image_tool
+description: "Универсальный инструмент для анализа изображений с помощью vision модели через OpenAI API. Принимает локальные файлы, URL изображений и base64 строки. Может распознавать объекты, анализировать композицию, цвета и качество изображения."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.image_tools.analyze_image_tool
+parameters:
+  - name: "image_input"
+    type: "str"
+    description: "Путь к файлу изображения ИЛИ URL изображения ИЛИ base64 строка изображения"
+    required: true
+  - name: "analysis_prompt"
+    type: "str"
+    description: "Кастомный промпт для анализа (опционально)"
+    required: false
+  - name: "analysis_types"
+    type: "List[str]"
+    description: "Список типов анализа для выполнения. Если не указано - выполняется полный анализ."
+    enum: 
+      - "Распознавание объектов"
+      - "Анализ композиции"
+      - "Определение цветов"
+      - "Оценка качества"
+      - "Анализ содержимого"
+      - "Анализ лиц"
+      - "Извлечение текста (OCR)"
+      - "Определение настроения"
+    required: false
+  - name: "input_type"
+    type: "str"
+    description: "Тип входных данных - 'path', 'url', 'base64' или 'auto' (автоопределение)"
+    enum:
+      - "path"
+      - "url"
+      - "base64"
+      - "auto"
+    required: false

@@ -1,0 +1,40 @@
+name: md_to_pdf_tool
+description: "Конвертирует Markdown в PDF c поддержкой относительных ссылок на изображения (base_url)"
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.md_tools.md_to_pdf_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии для трассировки выполнения"
+    required: true
+  - name: md_path
+    type: str
+    description: "Путь к исходному .md файлу"
+    required: true
+  - name: pdf_path
+    type: str
+    description: "Путь, куда сохранить итоговый .pdf (по умолчанию рядом с md)"
+    required: false
+  - name: css_path
+    type: str
+    description: "Путь к дополнительному CSS для печати"
+    required: false
+  - name: title
+    type: str
+    description: "Заголовок документа"
+    required: false
+  - name: skip_if_up_to_date
+    type: bool
+    description: "Пропускать, если PDF новее MD"
+    required: false
+  - name: page_size
+    type: str
+    description: "Размер страницы (например, A4, Letter)"
+    required: false
+  - name: margins
+    type: str
+    description: "Поля страницы (например, 12mm)"
+    required: false
+
+

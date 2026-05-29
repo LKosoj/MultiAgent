@@ -1,0 +1,144 @@
+# Source: extracted from custom_tools/text_to_sql/schema_linking_core.py @T4.2
+#
+# Доменные алиасы колонок для best_column_for.
+# Конкретные синонимы («revenue ≈ amount ≈ price», «date ≈ order_date»
+# и т.п.) — это особенности пользовательских датасетов, а не общее
+# правило для всех схем. Держим их здесь, а не в .py — это source of
+# truth конкретного домена.
+#
+# Дефолтный профиль ПУСТ. Это значит:
+#   * без явного profile = "muni_ru" (или другого) поиск опирается
+#     ТОЛЬКО на exact-match, FK references и description (которое
+#     обогащается schema_enricher через LLM).
+#   * никаких молчаливых эвристик «revenue → amount».
+#
+# Активный профиль выбирается:
+#   1. явный аргумент `profile` в best_column_for;
+#   2. env TEXT_TO_SQL_COLUMN_ALIASES_PROFILE;
+#   3. иначе — "default" (пустой).
+#
+# Override пути: env TEXT_TO_SQL_COLUMN_ALIASES_PATH.
+#
+# Bump v1 → v2 (EPIC 5.5/5.6): категории type_hints и инварианты профилей
+# вынесены из Python в секцию policy ниже. v1 без policy → fail-fast.
+version: 2
+
+# Политика загрузчика. Без secret defaults — всё явно из yaml.
+#   * type_hint_categories — категории, допустимые в profiles.<x>.type_hints.
+#     Имена должны совпадать с группами, которые best_column_for/scoring
+#     сравнивает против col_type. Опечатка в категории → ValueError.
+#   * required_profiles — профили, которые обязаны присутствовать.
+#   * default_profile_must_be_empty — если true, профиль 'default' не должен
+#     содержать алиасов (доменные синонимы — в отдельных профилях).
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+
+profiles:
+  # ---------------------------------------------------------------
+  # Дефолтный профиль: НИКАКИХ алиасов.
+  # Поиск идёт только по exact-match, description (LLM-обогащённому),
+  # FK-метаданным и типу. Это убирает closed-world эвристику.
+  #
+  # type_hints — список query-токенов, для которых тип колонки даёт
+  # +3 бонус (только при наличии primary signal). В default — пусто:
+  # никакого type-bonus без явно активированного домена.
+  # Категории фиксированы: numeric / temporal / identifier.
+  # ---------------------------------------------------------------
+  default:
+    aliases: {}
+    type_hints:
+      numeric: []
+      temporal: []
+      identifier: []
+
+  # ---------------------------------------------------------------
+  # Регрессионный safety-net для пользовательского муниципального
+  # датасета (РФ). Сохраняет ровно тот же набор синонимов, что был
+  # захардкожен в schema_linking_core.py до T4.2 — чтобы существующие
+  # запросы вида "revenue по region" продолжали находить amount/region_id.
+  #
+  # Активируется через env TEXT_TO_SQL_COLUMN_ALIASES_PROFILE=muni_ru.
+  # ---------------------------------------------------------------
+  muni_ru:
+    aliases:
+      revenue:
+        - revenue
+        - amount
+        - sale_amount
+        - total
+        - sum
+        - price
+        - cost
+      date:
+        - date
+        - order_date
+        - created_at
+        - dt
+        - timestamp
+        - time
+        - day
+      region:
+        - region
+        - region_name
+        - regionid
+        - region_id
+        - country
+        - city
+        - location
+      product:
+        - product
+        - product_name
+        - item
+        - good
+        - commodity
+      customer:
+        - customer
+        - client
+        - user
+        - buyer
+        - purchaser
+      year:
+        - year
+        - yr
+        - fiscal_year
+        - calendar_year
+      month:
+        - month
+        - mon
+        - period
+      quarter:
+        - quarter
+        - qtr
+        - q
+      category:
+        - category
+        - cat
+        - type
+        - class
+        - classification
+      id:
+        - id
+        - identifier
+        - key
+        - code
+    # Legacy type-hint наборы, ранее захардкоженные в
+    # schema_linking_core.py (B1-блокер). Это query-токены, для
+    # которых совпадение по типу колонки даёт +3 бонус.
+    type_hints:
+      numeric:
+        - amount
+        - sum
+        - total
+        - revenue
+        - price
+        - cost
+      temporal:
+        - date
+        - time
+        - timestamp
+      identifier:
+        - id
+        - key
+        - code

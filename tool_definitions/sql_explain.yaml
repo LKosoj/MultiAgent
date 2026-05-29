@@ -1,0 +1,25 @@
+name: sql_explain
+description: "Выполняет 'сухой прогон' SQL-запроса (EXPLAIN), чтобы проанализировать его план выполнения и оценить производительность."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.sql_explain
+parameters:
+  - name: sql_query
+    type: string
+    description: "SQL-запрос для анализа."
+    required: true
+  - name: dsn
+    type: string
+    description: "DSN для подключения к БД. Обязателен для реального EXPLAIN: передавай dsn из контекста pipeline для согласованности с secure_db_executor. Без dsn допустим только dry-run режим TEXT_TO_SQL_DRY_RUN_ONLY/dry_run_only. Silent fallback на переменную окружения DB_DSN отключён по умолчанию (AGENTS.md). Чтобы временно разрешить env-fallback, выставь SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 (не рекомендуется)."
+    required: false
+output:
+  type: object
+  properties:
+    plan:
+      type: string
+    estimated_cost:
+      type: number
+    issues:
+      type: array
+      items:
+        type: object

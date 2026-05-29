@@ -1,0 +1,89 @@
+# Дефолтная политика качества для enhanced workflow
+name: "default"
+version: "1.0"
+
+# Ворота качества
+quality_gates:
+  default:
+    min_quality_score: 0.7
+    soft_fail_threshold: 0.5  # Warning but continue
+    hard_fail_threshold: 0.3  # Must retry
+    required_validators: ["structural", "completeness"]
+    custom_rules: {}
+
+# Правила валидации
+validation_rules:
+  structural:
+    enabled: true
+    required_fields: ["output"]
+    min_length: 10
+    json_format: false
+    
+  completeness:
+    enabled: true
+    coverage_threshold: 0.8
+    expected_keywords: []
+    expected_sections: []
+    min_sentences: 3
+    
+  semantic:
+    enabled: false  # Expensive, enable selectively
+    fact_check: false
+    hallucination_check: false
+    
+  security:
+    enabled: true
+    sql_injection_check: true
+    xss_check: true
+    command_injection_check: true
+    data_leak_check: true
+
+# Политики повторов
+retry_policies:
+  default:
+    max_retries: 3
+    strategies:
+      1: "refine_prompt"
+      2: "add_context"
+      3: "alternate_agent"
+    backoff_multiplier: 1.5
+    max_backoff_seconds: 60
+    error_specific:
+      timeout:
+        max_retries: 2
+        strategies: ["extend_timeout", "alternate_agent"]
+      empty_response:
+        max_retries: 2
+        strategies: ["refine_prompt", "add_examples"]
+      low_quality:
+        max_retries: 3
+        strategies: ["refine_prompt", "add_context", "peer_review"]
+
+# Бюджеты ресурсов
+budgets:
+  per_step:
+    max_tokens: 32768
+    max_duration_seconds: 300
+    max_cost_usd: 5.0
+    max_retries: 3
+    
+  per_workflow:
+    max_tokens: 500000
+    max_duration_seconds: 1800
+    max_cost_usd: 50.0
+    max_retries: 10
+
+# Эскалация
+escalation:
+  triggers:
+    - "retry_budget_exhausted"
+    - "quality_persistently_low"
+    - "security_violation"
+  notification_channels:
+    - "log:error"
+  timeout_seconds: 3600  # 1 hour for human response
+  auto_actions:
+    retry_budget_exhausted: "human_escalation"
+    security_violation: "stop_immediately"
+
+

@@ -1,0 +1,18 @@
+name: code_interpreter_tool
+description: "Выполняет Python-код или генерирует код на основе текстового описания задачи. Поддерживает работу с данными, визуализацию и вычисления."
+category: "Код"
+source_type: custom_function
+implementation_source: codeinterpreter.code_interpreter_tool
+parameters:
+  - name: "code_prompt"
+    type: "str"
+    description: "Текстовое описание задачи или Python код для выполнения"
+    required: true
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии (опционально)"
+    required: false
+  - name: "data_path"
+    type: "str"
+    description: "Путь к файлу с данными (опционально)"
+    required: false

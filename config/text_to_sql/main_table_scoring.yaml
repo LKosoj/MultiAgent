@@ -1,0 +1,63 @@
+# Source: extracted from custom_tools/text_to_sql/schema_linking_core.py @T4.5
+#
+# Веса скоринга для find_main_table.
+# Это структурные технические эвристики (PK/FK/numeric/количество колонок) —
+# они дают ранжирование «последнего резерва», когда semantic memory не дала
+# сигнала.
+#
+# Никакого скоринга по длине имени таблицы (бывший "len(table_name) < 20 → +5")
+# здесь НЕТ. Это closed-world эвристика, и она удалена.
+#
+# Веса — структурные (PK/FK/numeric/columns_count), не доменные. Они нейтральны
+# и одинаковы для любого датасета. Profile-pattern введён для согласованности с
+# остальными yaml-конфигами text-to-sql (significance, column_aliases, safety,
+# nlu_morphemes) и для возможности переопределить веса под конкретный домен
+# через ENV ``TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE``.
+#
+# Активный профиль выбирается:
+#   1. env TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE;
+#   2. иначе — "default".
+#
+# Override пути: env TEXT_TO_SQL_MAIN_TABLE_SCORING_PATH.
+version: 2
+
+profiles:
+  # ---------------------------------------------------------------
+  # Дефолтный профиль: общеотраслевые структурные веса. Применимы к
+  # любому датасету; ничего доменного здесь нет.
+  # ---------------------------------------------------------------
+  default:
+    # Бонус, если таблица найдена semantic memory (relevant_tables).
+    # Стоит на несколько порядков выше структурных весов — semantic memory
+    # и/или LLM-результат всегда приоритетнее структурных эвристик.
+    semantic_match_weight: 100
+
+    # Вес одной PK-колонки в таблице.
+    pk_weight: 10
+
+    # Вес одной FK-колонки.
+    fk_weight: 5
+
+    # Вес одной числовой колонки (поддерживает int/float/decimal/numeric).
+    numeric_weight: 3
+
+    # Вес за каждую колонку таблицы (больше колонок ~ больше данных).
+    columns_count_weight: 2
+
+    # Минимальный порог скоринга: если у всех таблиц score == 0 — fail-fast,
+    # main table не угадывается.
+    min_score_for_pick: 1
+
+  # ---------------------------------------------------------------
+  # Муниципальный РФ-датасет: пока веса совпадают с default.
+  # Профиль присутствует для совместимости с общей convention
+  # text-to-sql (profiles.default + profiles.muni_ru) и для будущих
+  # доменных override'ов без миграции схемы yaml.
+  # ---------------------------------------------------------------
+  muni_ru:
+    semantic_match_weight: 100
+    pk_weight: 10
+    fk_weight: 5
+    numeric_weight: 3
+    columns_count_weight: 2
+    min_score_for_pick: 1

@@ -1,0 +1,19 @@
+name: story_planner_tool
+description: "Генерирует synopsis.json и beats.json по 00_brief.json"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.story_planner.story_planner_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта"
+    required: true
+  - name: "task"
+    type: "str"
+    description: "Дополнительные детали для генерации сказки"
+    required: false
+

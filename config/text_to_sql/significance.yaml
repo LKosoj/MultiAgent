@@ -1,0 +1,145 @@
+# Source: extracted from custom_tools/text_to_sql/schema_metadata.py @T4.3
+#
+# Конфигурация значимости колонок для is_semantic_significant_column.
+# Решает, попадёт ли колонка в LLM-контекст при фильтрации схемы.
+#
+# Содержит:
+#   * структурные паттерны имени колонок (technical naming conventions)
+#     в профиле `default` — общеотраслевые признаки;
+#   * доменные термины конкретного пользовательского датасета
+#     (муниципальная/демографическая статистика РФ) — в отдельном
+#     профиле `muni_ru`.
+#
+# Дефолтный профиль НЕ содержит доменных терминов — это снимает скрытую
+# доменную привязку для не-муниципальных пользователей.
+#
+# Слияние: при активном профиле X результирующие списки =
+#   default ∪ X (union по каждому полю). Это даёт регрес-сейф поведение
+# для существующих пользовательских сценариев: при активации `muni_ru`
+# доступны все default-признаки плюс муниципальные добавки.
+#
+# Активный профиль выбирается:
+#   1. env TEXT_TO_SQL_SIGNIFICANCE_PROFILE;
+#   2. иначе — "default".
+#
+# Override пути: env TEXT_TO_SQL_SIGNIFICANCE_PATH.
+version: 2
+
+profiles:
+  # ---------------------------------------------------------------
+  # Дефолтный профиль: общеотраслевые признаки (id, year, date,
+  # period, value, amount) и структурные regex для технических имён
+  # колонок. Никаких доменных слов конкретного датасета.
+  # ---------------------------------------------------------------
+  default:
+    # Точные имена колонок (или совпадение как отдельного слова с
+    # границами через ``_matches_exactly``). Всегда значимы.
+    #
+    # ВНИМАНИЕ: word-boundary в ``_matches_exactly`` трактует ``_`` как
+    # разделитель — это значит, что ``id`` в default матчит ``user_id``,
+    # ``id_user`` и т.п. (см. EPIC 3.33). Чтобы исключить ``_value``,
+    # ``_period`` и т.п. из default, для них используем regex
+    # ``^value$``/``^period$``/``^amount$``/``^year$`` в
+    # ``medium_priority_patterns`` ниже — это даёт точное совпадение
+    # с целым именем колонки, без word-boundary leak.
+    high_priority_exact:
+      - id
+      - date
+
+    # Подстроки имени колонки, по которым schema_memory.create_table_description
+    # выделяет «important columns» (раньше был хардкод
+    # ['name', 'title', 'date', 'amount', 'value'] прямо в .py).
+    # Merge с активным профилем — union (см. EPIC 5.3).
+    important_column_name_substrings:
+      - name
+      - title
+      - date
+      - amount
+      - value
+
+    # Подстроки в имени колонки (substring match, lowercase).
+    # В default — пусто; составные доменные имена живут в профилях.
+    high_priority_compound: []
+
+    # Regex-паттерны для структурных признаков имени.
+    # pattern — regex, description — человеческая метка (не используется
+    # в матчинге).
+    #
+    # ``^X$`` для общеотраслевых одиночных метрик — точечное
+    # совпадение без word-boundary leak (см. комментарий к
+    # ``high_priority_exact`` выше).
+    medium_priority_patterns:
+      - pattern: '_id$'
+        description: идентификатор
+      - pattern: '^id_'
+        description: идентификатор
+      - pattern: '_code$'
+        description: код
+      - pattern: '_key$'
+        description: ключ
+      - pattern: '_time$'
+        description: время
+      - pattern: '_date$'
+        description: дата
+      - pattern: '_month$'
+        description: месяц
+      - pattern: '_year$'
+        description: год
+      - pattern: '_name$'
+        description: название
+      - pattern: '^name_'
+        description: название
+      - pattern: '_title$'
+        description: заголовок
+      - pattern: '^year$'
+        description: год (точное имя колонки)
+      - pattern: '^value$'
+        description: значение
+      - pattern: '^amount$'
+        description: сумма
+      - pattern: '^period$'
+        description: период
+
+    # Ключевые слова, ищутся подстрокой в LLM-обогащённом description
+    # колонки (description.lower().contains(keyword)).
+    # В default — только общеотраслевые признаки PK/FK/первичной метрики.
+    critical_description_keywords:
+      - "уникальный идентификатор"
+      - "первичный ключ"
+      - "внешний ключ"
+      - "дата создан"
+      - "основная метрик"
+      - "главный показател"
+      - "полное название"
+
+  # ---------------------------------------------------------------
+  # Регрессионный safety-net для пользовательского муниципального
+  # датасета (РФ). Сохраняет ровно те доменные термины, что были
+  # захардкожены в schema_metadata.py до T4.3 — чтобы существующие
+  # запросы по муниципальным данным продолжали работать.
+  #
+  # ВАЖНО: эти списки сливаются с default через union. Здесь
+  # указываем ТОЛЬКО доменные добавки.
+  #
+  # Активируется через env TEXT_TO_SQL_SIGNIFICANCE_PROFILE=muni_ru.
+  # ---------------------------------------------------------------
+  muni_ru:
+    # Доменные точные имена колонок муниципального датасета.
+    # ``year``/``value``/``amount``/``period`` переехали из default exact —
+    # в default они теперь матчатся через regex ``^X$`` (см. выше) и НЕ
+    # делают значимыми составные имена вроде ``indicator_value``,
+    # ``year_col`` и т.п. В muni_ru-профиле возвращаются в exact, чтобы
+    # ``year_col``/``indicator_value`` снова попадали в LLM-контекст по
+    # word-boundary (это и есть legacy-поведение).
+    high_priority_exact:
+      - oktmo  # код муниципального образования (ОКТМО, РФ)
+      - year
+      - value
+      - amount
+      - period
+    high_priority_compound: []
+    medium_priority_patterns: []
+    critical_description_keywords:
+      - "год отчет"
+      - "период отчет"
+      - "значение показател"

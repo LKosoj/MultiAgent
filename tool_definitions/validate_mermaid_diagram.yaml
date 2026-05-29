@@ -1,0 +1,10 @@
+name: validate_mermaid_diagram
+description: "Проверяет корректность синтаксиса Mermaid диаграммы."
+category: "Утилиты"
+source_type: custom_function
+implementation_source: custom_tools.diagram_tools.validate_mermaid_diagram
+parameters:
+  - name: "diagram_content"
+    type: "str"
+    description: "Содержимое Mermaid диаграммы для проверки."
+    required: true 

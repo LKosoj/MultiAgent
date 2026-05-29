@@ -1,0 +1,49 @@
+# Source of truth для текстов LLM-промптов в text-to-sql pipeline (W6-T2/W6-T4).
+#
+# Loader: custom_tools/text_to_sql/prompts_config.py::load_prompts_config
+# Override path via env TEXT_TO_SQL_PROMPTS_PATH.
+# Override profile via env TEXT_TO_SQL_PROMPTS_PROFILE (default: "default").
+#
+# Назначение секций:
+#   * schema_linking.system_prompt — system-сообщение для LLM-вызова в
+#     custom_tools/text_to_sql/schema_linking/llm_linker.py::llm_linking.
+#     Раньше было вшито в код (см. W6-T2 в TEXT_TO_SQL_REFACTOR_PLAN.md).
+#   * sql_generation.user_prompt_rules — список «обязательных правил»,
+#     встраиваемый в user prompt SQL-генератора. Включает чёткое правило
+#     про одинарные/двойные кавычки (W6-T4), чтобы LLM не превращал имена
+#     таблиц/колонок в строковые литералы.
+#   * sql_generation.system_prompt — system-сообщение SQL-генератора
+#     (текст вынесен из sql_generator.py в этот yaml).
+#
+# Дефолтный профиль — универсальный. Доменные профили (например, muni_ru)
+# могут переопределять отдельные ключи; при отсутствии ключа в профиле
+# выбора — fail-fast (KeyError), как и в остальных *_config loader'ах.
+version: 1
+
+profiles:
+  default:
+    schema_linking:
+      system_prompt: |
+        Ты эксперт по базам данных и schema linking для Text-to-SQL.
+        КРИТИЧЕСКИ ВАЖНО: если сущности находятся в разных таблицах, массив joins НЕ ДОЛЖЕН БЫТЬ ПУСТЫМ!
+        Верни ТОЛЬКО валидный JSON без пояснений. Формат: начинается с { и заканчивается }.
+        Приоритет: найти хотя бы одну связь между таблицами через общие колонки.
+
+    sql_generation:
+      system_prompt: |
+        Ты SQL-генератор для {dialect_label}. Генерируй корректный SQL, соответствующий схеме БД.
+        Верни ТОЛЬКО валидный JSON (начинается с { и заканчивается }). Без markdown, текста, комментариев.
+      # Список «обязательных правил», подставляемых в user prompt. Каждый
+      # элемент — отдельное правило; sql_generator склеит их через "; ".
+      # W6-T4: правило про кавычки переписано так, чтобы LLM не путал
+      # строковые литералы с идентификаторами (SELECT 'col' FROM 'table'
+      # — типовая ошибка, когда в промпте написано просто «одинарные
+      # кавычки»).
+      user_prompt_rules:
+        - "только SELECT"
+        - "без подзапросов DML/DDL/PRAGMA"
+        - "один стейтмент"
+        - "используй одинарные кавычки ТОЛЬКО для строковых литералов значений (WHERE col = 'value')"
+        - "используй двойные кавычки для имён таблиц и колонок, требующих квотирования (Postgres: case-sensitive имена, зарезервированные слова)"
+        - "НЕ заключай имена таблиц или колонок в одинарные кавычки — это сделает их строковыми литералами"
+        - "где возможно — агрегируй по измерениям"

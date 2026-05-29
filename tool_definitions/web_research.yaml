@@ -1,0 +1,14 @@
+name: web_research
+description: "Visits a webpage at the given URL and returns its content as a markdown string."
+category: "Веб"
+source_type: custom_function
+implementation_source: custom_tools.web_research.web_research
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "The ID of the session."
+    required: true 
+  - name: "user_query"
+    type: "str"
+    description: "The query of the user."
+    required: true 

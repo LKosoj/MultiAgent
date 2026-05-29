@@ -1,0 +1,34 @@
+name: sql_safety_check
+description: "Проверяет SQL-запрос на наличие опасных операций и потенциальных уязвимостей."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.sql_safety_check
+parameters:
+  - name: sql_query
+    type: string
+    description: "SQL-запрос для проверки."
+    required: true
+  - name: dsn
+    type: string
+    description: "Опциональный DSN пользовательской БД для выбора SQL-диалекта при статической проверке."
+    required: false
+output:
+  type: object
+  properties:
+    is_safe:
+      type: boolean
+    issues:
+      type: array
+      items:
+        type: object
+    advisory_issues:
+      type: array
+      items:
+        type: object
+      description: "Неблокирующие LLM-находки при успешном LLM-аудите; runtime-сбой LLM-аудита остаётся блокирующим через issues/is_safe=false."
+    llm_audit:
+      type: string
+    llm_audit_error:
+      type: string
+    safety_status:
+      type: string

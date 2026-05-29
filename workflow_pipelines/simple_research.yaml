@@ -1,0 +1,72 @@
+# Простой исследовательский пайплайн
+name: "simple_research"
+version: "1.0"
+description: "Простой пайплайн для исследования темы и создания отчета"
+
+inputs:
+  topic: ""  # Тема для исследования (обязательная)
+
+# Глобальная политика повторов
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: "exponential"
+  base_delay: 1.0
+  max_delay: 30.0
+  retry_on_errors:
+    - "network_error"
+    - "rate_limit"
+    - "timeout"
+
+# Глобальные ограничения ресурсов
+global_resource_limits:
+  max_duration_seconds: 300
+  max_api_calls_per_minute: 10
+
+steps:
+  - id: "research_topic"
+    agent_type: "researcher"
+    task: "Исследовать тему: {topic}. Найти актуальную информацию из надежных источников."
+    timeout: 120
+    resource_limits:
+      max_api_calls_per_minute: 5
+    metadata:
+      priority: "high"
+      tags: ["research", "web_search"]
+
+  - id: "analyze_findings"
+    agent_type: "analyst"
+    task: "Проанализировать результаты исследования и выделить ключевые моменты."
+    depends_on: ["research_topic"]
+    timeout: 60
+    metadata:
+      requires_human_review: false
+
+  - id: "create_report"
+    agent_type: "analyst"
+    task: "Создать структурированный отчет на основе анализа."
+    depends_on: ["analyze_findings"]
+    timeout: 90
+    retry_policy:
+      max_retries: 1
+      backoff_strategy: "fixed"
+      base_delay: 5.0
+    metadata:
+      output_format: "markdown"
+      include_sources: true
+
+# Уведомления
+notifications:
+  - "email:admin@company.com"
+  - "slack:#research-channel"
+
+# Обработка ошибок
+error_handling:
+  on_failure: "rollback"
+  notify_on_error: true
+  save_partial_results: true
+
+metadata:
+  author: "Research Team"
+  category: "research"
+  tags: ["research", "analysis", "reporting"]
+  estimated_duration: "5-10 minutes"

@@ -1,0 +1,34 @@
+name: screenplay_shots_generator_tool
+description: "Генерирует shots.json для создания изображений кадров на основе режиссерского сценария"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.screenplay_shots_generator.screenplay_shots_generator_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии для трассировки выполнения"
+    required: true
+  - name: project_id
+    type: str
+    description: "Идентификатор проекта для которого генерируются кадры"
+    required: true
+  - name: generate_end_shots
+    type: bool
+    description: "Если True, генерирует end кадры, иначе пропускает выполнение"
+    required: false
+  - name: enable
+    type: bool
+    description: "Если True, генерирует shots.json, иначе пропускает выполнение"
+    required: false
+  - name: max_scenes
+    type: int
+    description: "Ограничение количества сцен для генерации (после фильтрации по scene_numbers)"
+    required: false
+  - name: scene_numbers
+    type: list[int]
+    description: "Явный список номеров сцен для генерации (например: [2,3]). Если задан — генерация выполняется только для этих сцен."
+    required: false
+  - name: force
+    type: bool
+    description: "Если True — игнорирует существующий shots.json и перегенерирует заново (полезно при частичной генерации)"
+    required: false

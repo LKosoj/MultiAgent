@@ -1,0 +1,23 @@
+name: vector_db_search
+description: "Выполняет семантический поиск по векторной базе данных для нахождения похожих примеров SQL-запросов."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.vector_db_search
+parameters:
+  - name: query
+    type: string
+    description: "Текстовый запрос пользователя для семантического поиска в памяти."
+    required: true
+  - name: top_k
+    type: integer
+    description: "Количество возвращаемых результатов."
+    required: false
+output:
+  type: array
+  items:
+    type: object
+    properties:
+      sql_example:
+        type: string
+      similarity_score:
+        type: number 

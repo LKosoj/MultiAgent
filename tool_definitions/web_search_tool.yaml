@@ -1,0 +1,6 @@
+name: web_search_tool
+description: "Инструмент для поиска информации в интернете."
+category: "Веб"
+source_type: class_instance
+implementation_source: smolagents.DuckDuckGoSearchTool
+parameters: []

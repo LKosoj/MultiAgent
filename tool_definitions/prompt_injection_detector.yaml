@@ -1,0 +1,16 @@
+name: prompt_injection_detector
+description: "Обнаруживает попытки промпт-инъекций и джейлбрейков во входящем тексте."
+category: "Безопасность"
+source_type: custom_function
+implementation_source: custom_tools.llm_guard_tools.prompt_injection_detector
+parameters:
+  - name: text
+    type: string
+    description: "Текст для проверки на инъекции."
+    required: true
+output:
+  type: object
+  properties:
+    is_injection:
+      type: boolean
+      description: "True, если обнаружена попытка инъекции." 

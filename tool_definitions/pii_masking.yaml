@@ -1,0 +1,54 @@
+name: pii_masking
+description: "Маскирует персональные данные (PII) в результатах запроса. column_names
+  берётся из поля `columns` ответа предыдущего вызова secure_db_executor — передавайте
+  его явно, если columns_to_mask непуст."
+category: "Безопасность"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.pii_masking
+parameters:
+  - name: data
+    type: array
+    items:
+      type: array
+      items:
+        type: string
+    description: "Данные, полученные из базы данных."
+    required: true
+  - name: columns_to_mask
+    type: array
+    items:
+      type: string
+    description: "Список колонок для маскирования."
+    required: true
+  - name: column_names
+    type: array
+    items:
+      type: string
+    description: "Имена всех колонок результата (из поля columns ответа
+      secure_db_executor). Обязательно при непустом columns_to_mask. При
+      columns_to_mask: [AUTO] — используется для LLM-детекции PII; если не
+      передан и columns_to_mask непуст, вызов завершится ошибкой."
+    required: false
+output:
+  type: object
+  properties:
+    masked_data:
+      type: array
+      items:
+        type: array
+        items:
+          type: string
+    # Расширенный контракт реализации (_pii.pii_masking): эти поля
+    # возвращаются всегда, держим yaml-схему в синхроне с реализацией.
+    pii_detected:
+      type: boolean
+      description: "Было ли реально что-то замаскировано."
+    masked_columns:
+      type: array
+      items:
+        type: string
+      description: "Имена колонок, к которым применялась маскировка."
+    reason:
+      type: string
+      nullable: true
+      description: "Причина no-op режима при pii_detected=false (например masking_disabled/empty_data/auto_detected_none); иначе null."

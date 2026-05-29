@@ -1,0 +1,131 @@
+# Глобальная конфигурация Enhanced Workflow Engine
+
+# Основные настройки enhanced layer
+enhanced_workflow:
+  enabled: true
+  rollout_percentage: 100
+  fallback_to_legacy: true
+  version: "1.0"
+
+workflow_overrides:
+  text_to_sql:
+    fallback_to_legacy: false
+
+# Feature flags для отдельных компонентов
+features:
+  # Планирование шагов
+  pre_step_planner:
+    enabled: true
+    rollout: 100
+    timeout_seconds: 30
+    
+  # Валидация результатов
+  post_step_judge:
+    enabled: true
+    rollout: 100
+    timeout_seconds: 60
+    
+  # Семантическая валидация (дорогая)
+  semantic_validation:
+    enabled: false
+    rollout: 0
+    cost_threshold_usd: 0.10
+    
+  # Консенсус нескольких агентов
+  multi_agent_consensus:
+    enabled: false
+    rollout: 10
+    min_agents: 2
+    agreement_threshold: 0.75
+    
+  # Human-in-the-Loop
+  human_in_the_loop:
+    enabled: true
+    rollout: 100
+    max_wait_time_minutes: 60
+    notification_channels:
+      - "log:info"
+    
+  # Circuit Breaker защита
+  circuit_breaker:
+    enabled: true
+    rollout: 100
+    failure_threshold: 5
+    recovery_timeout_seconds: 300
+    
+  # Кэширование решений
+  decision_caching:
+    enabled: true
+    rollout: 50
+    ttl_seconds: 3600
+    max_cache_size: 1000
+    
+  # Orchestration features
+  conditional_execution:
+    enabled: true
+    rollout: 70
+    timeout_seconds: 30
+    
+  alternative_execution:
+    enabled: true
+    rollout: 40
+    max_alternatives: 3
+    default_strategy: "race"
+    
+  result_cache:
+    enabled: true
+    rollout: 80
+    ttl_seconds: 1800
+    max_cache_size: 500
+    min_quality_score: 0.7
+    
+  quality_prediction:
+    enabled: true
+    rollout: 50
+    confidence_threshold: "medium"
+    
+  performance_optimization:
+    enabled: true
+    rollout: 30
+    prediction_enabled: true
+    
+  # Мониторинг качества
+  quality_monitoring:
+    enabled: true
+    rollout: 100
+    alert_threshold: 0.5
+    sample_rate: 1.0
+
+# Настройки производительности
+performance:
+  max_concurrent_steps: 3
+  step_timeout_seconds: 300
+  validation_timeout_seconds: 60
+  decision_timeout_seconds: 30
+  
+# Настройки надежности
+reliability:
+  max_retry_attempts: 5
+  circuit_breaker_enabled: true
+  graceful_degradation: true
+  shadow_mode_enabled: false
+  
+# Настройки мониторинга
+monitoring:
+  metrics_enabled: true
+  detailed_logging: true
+  performance_tracking: true
+  decision_audit: true
+  
+# Настройки безопасности
+security:
+  input_validation: true
+  output_sanitization: true
+  audit_trail: true
+  policy_enforcement: strict
+
+# Настройки интеграции
+integration:
+  legacy_compatibility: true
+  api_versioning: true
+  webhook_notifications: false

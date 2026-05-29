@@ -1,0 +1,24 @@
+name: compact_agent_context
+description: |-
+  Сжимает локальный контекст агента.
+  Заменяет все локальные шаги агента на саммари и возвращает его текст.
+category: "Память"
+source_type: custom_function
+implementation_source: memory.tools.compact_agent_context
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии."
+    required: true
+  - name: "agent_name"
+    type: "str"
+    description: "Имя агента."
+    required: true
+  - name: "prompt"
+    type: "str"
+    description: "Дополнительные инструкции для суммаризации."
+    required: false
+  - name: "max_chars"
+    type: "int"
+    description: "Лимит символов контекста для суммаризации."
+    required: false

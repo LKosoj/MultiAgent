@@ -1,0 +1,32 @@
+# Source: extracted from custom_tools/text_to_sql/schema_metadata.py @EPIC 5.2
+#
+# Категории SQL-типов и совместимость для type-aware join validation.
+# Раньше это было захардкожено в ColumnMetadataHelper.check_type_compatibility
+# и в db_plugins/base.py не было общего метода get_type_category.
+#
+# Категории — substring-match по lowercase-форме SQL-типа.
+#   Пример: тип "BIGINT" попадает в integer (так как содержит "int").
+#   Тип "DECIMAL(10,2)" — в numeric (содержит "decimal").
+#   Если ни одна категория не подошла → "other".
+#
+# compatibility — список пар категорий, которые считаются совместимыми
+# при join validation. Симметрично: [integer, numeric] = [numeric, integer].
+# Одинаковая категория всегда совместима сама с собой.
+#
+# Override пути: env TEXT_TO_SQL_TYPE_CATEGORIES_PATH.
+version: 1
+
+categories:
+  integer: ["int", "bigint", "smallint", "tinyint", "serial"]
+  numeric: ["float", "double", "decimal", "numeric", "real"]
+  string: ["char", "varchar", "text", "string"]
+  temporal: ["date", "time", "timestamp"]
+  # uuid выделен в отдельную категорию (а не «other»), чтобы вернуть прежнюю
+  # поддержку identifier-подсказки для UUID-ключей (PG/MSSQL), утерянную при
+  # миграции с хардкода ("int","char","text","uuid"). Намеренно НЕ добавлен в
+  # compatibility — для join-валидации остаётся совместим только сам с собой
+  # (как было, когда uuid попадал в «other»).
+  uuid: ["uuid", "uniqueidentifier"]
+
+compatibility:
+  - [integer, numeric]

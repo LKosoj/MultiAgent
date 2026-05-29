@@ -1,0 +1,40 @@
+name: brief_from_prompt_tool
+description: "Генерирует brief (JSON) для инициализации проекта на основе текстового промпта"
+category: "Агенты"
+source_type: custom_function
+implementation_source: custom_tools.storybook.brief_from_prompt.brief_from_prompt_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии"
+    required: true
+  - name: project_id
+    type: str
+    description: "Идентификатор проекта (используется как название книги)"
+    required: true
+  - name: storybook_prompt
+    type: str
+    description: "Текстовый промпт с идеей книги и деталями"
+    required: true
+  - name: pages_min
+    type: int
+    description: "Минимальное количество страниц"
+    required: false
+  - name: pages_max
+    type: int
+    description: "Максимальное количество страниц"
+    required: false
+  - name: words_per_page_min
+    type: int
+    description: "Минимальное количество слов на страницу"
+    required: false
+  - name: words_per_page_max
+    type: int
+    description: "Максимальное количество слов на страницу"
+    required: false
+  - name: language
+    type: str
+    description: "Язык книги"
+    required: false
+
+

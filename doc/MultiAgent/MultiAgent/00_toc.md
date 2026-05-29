@@ -1,0 +1,33 @@
+# Оглавление MultiAgent (Структура)
+
+- 01. Обзор архитектуры и принципы — `01_agent_core_architecture.md`
+- 02. Динамическая система агентов — `02_dynamic_agent_system.md`
+- 03. Профили агентов — `03_agent_profiles.md`
+- 04. Фабрика агентов — `04_agent_factory.md`
+- 05. Система инструментов — `05_tool_system.md`
+- 06. Определение инструмента — `06_tool_definition.md`
+- 07. Менеджер инструментов — `07_tool_manager.md`
+- 08. Система памяти (RAG) — `08_memory_system.md`
+- 09. Менеджер памяти — `09_memory_manager.md`
+- 10. Определение Workflow — `10_workflow_definition.md`
+- 11. Движок рабочих процессов — `11_workflow_engine.md`
+- 12. Расширенный движок процессов — `12_enhanced_workflow_engine.md`
+- 13. Событийно-управляемый движок — `13_event_driven_workflow_engine.md`
+- 14. Конструктор агентов — `14_agent_constructor.md`
+- 15. Инструменты конструктора агентов — `15_agent_constructor_tools.md`
+- 16. Оптимизатор промптов — `16_prompt_optimizer.md`
+- 17. Пайплайн Text-to-SQL — `17_text_to_sql_pipeline.md`
+- 18. Система плагинов для БД — `18_db_plugins.md`
+- 19. Веб-интерфейс / API для Streamlit — `19_streamlit_api.md`
+- 20. Менеджер агентов для UI — `20_agent_manager_ui_api.md`
+- 21. Менеджер конфигурации — `21_configuration_manager.md`
+- 22. Единая система логирования — `22_logging.md`
+- 23. Система телеметрии — `23_telemetry.md`
+- 24. Система устойчивости — `24_resilience.md`
+- 25. Механизм повторных попыток — `25_retry_engine.md`
+- 26. Circuit Breaker — `26_circuit_breaker.md`
+- 27. Визуализатор HTML — `27_html_visualizer.md`
+- 28. Менеджер плагинов БД — `28_db_plugin_manager.md`
+- 29. Связчик схем — `29_schema_linker.md`
+- 30. Модель с повторными попытками — `30_openai_retry_model.md`
+- 31. Система наблюдаемости — `31_observability.md`

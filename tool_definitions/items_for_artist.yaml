@@ -1,0 +1,19 @@
+name: items_for_artist_tool
+description: "Готовит список items для пакетного вызова artist_agent_batch_edit_tool из 40_prompts/*"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.items_builder.items_for_artist_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта"
+    required: true
+  - name: "language"
+    type: "str"
+    description: "Язык для генерации контента"
+    required: true
+

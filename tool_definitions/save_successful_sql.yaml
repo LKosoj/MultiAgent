@@ -1,0 +1,37 @@
+name: save_successful_sql
+description: "Сохраняет успешно выполненный SQL-запрос в файл sqlrag для будущего использования в RAG."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.save_successful_sql
+parameters:
+  - name: sql_query
+    type: string
+    description: "SQL-запрос для сохранения."
+    required: true
+  - name: user_query
+    type: string
+    description: "Исходный запрос пользователя на естественном языке."
+    required: false
+  - name: execution_result
+    type: string
+    description: "JSON-строка с результатом выполнения SQL-запроса (success, rows_affected, execution_time_ms)."
+    required: false
+  - name: dsn
+    type: string
+    description: "DSN целевой БД. Передавай dsn из workflow, чтобы sqlrag-файл индексировался под правильной session_id. Без явного dsn или workflow runtime metadata инструмент завершится ошибкой."
+    required: false
+output:
+  type: object
+  properties:
+    status:
+      type: string
+      description: "Статус сохранения: 'saved', 'exists', 'error'"
+    filename:
+      type: string
+      description: "Имя созданного файла"
+    path:
+      type: string
+      description: "Полный путь к файлу"
+    error:
+      type: string
+      description: "Сообщение об ошибке, если status='error'"

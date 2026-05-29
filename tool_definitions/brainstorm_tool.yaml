@@ -1,0 +1,24 @@
+name: brainstorm
+description: "Инструмент для мозгового штурма с использованием множественных методологий. Генерирует идеи используя 6 различных подходов и синтезирует их в единый отчет. Возвращает синтезированный отчет с идеями анализом и рекомендациями."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.brainstorm_tool.brainstorm
+
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "topic"
+    type: "str"
+    description: "Тема для мозгового штурма"
+    required: true
+  - name: "methods"
+    type: "str"
+    description: "Тип методологии (all, creative, analytical, problem_solving или перечисление выбранных методологий из списка big_mind_mapping,scamper,six_thinking_hats,starbursting,reverse_brainstorming,role_storming через запятую)"
+    required: false
+    default: "all"
+
+output:
+  result:
+    type: "str"

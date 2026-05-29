@@ -1,0 +1,14 @@
+name: analysis
+description: "Анализирует данные и возвращает результаты анализа."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.analysis_tools.analysis
+parameters:
+  - name: "data"
+    type: "Dict"
+    description: "Словарь с данными для анализа в формате ключ-значение."
+    required: true
+  - name: "query"
+    type: "str"
+    description: "Строка запроса, определяющая тип анализа."
+    required: true 

@@ -1,0 +1,15 @@
+name: prompt_engineer_tool
+description: "Создаёт per-page page_{NN}_prompt.json из канона, стилей и битов"
+category: "NLP"
+source_type: custom_function
+implementation_source: custom_tools.storybook.prompt_engineer.prompt_engineer_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта"
+    required: true
+

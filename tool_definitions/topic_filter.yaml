@@ -1,0 +1,16 @@
+name: topic_filter
+description: "Проверяет, соответствует ли тема текста разрешенной политике."
+category: "NLP"
+source_type: custom_function
+implementation_source: custom_tools.llm_guard_tools.topic_filter
+parameters:
+  - name: text
+    type: string
+    description: "Текст для проверки темы."
+    required: true
+output:
+  type: object
+  properties:
+    is_allowed:
+      type: boolean
+      description: "True, если тема разрешена." 

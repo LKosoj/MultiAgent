@@ -1,0 +1,21 @@
+name: natural_language_processing
+description: "Анализирует текст для извлечения основных лингвистических особенностей."
+category: "NLP"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.natural_language_processing
+parameters:
+  - name: text
+    type: string
+    description: "Входной текст для анализа."
+    required: true
+output:
+  type: object
+  properties:
+    tokens:
+      type: array
+      items:
+        type: string
+    pos_tags:
+      type: array
+      items:
+        type: string 

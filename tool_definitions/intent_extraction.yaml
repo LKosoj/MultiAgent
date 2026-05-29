@@ -1,0 +1,17 @@
+name: intent_extraction
+description: "Определяет намерение пользователя и извлекает сущности из текста."
+category: "NLP"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.intent_extraction
+parameters:
+  - name: text
+    type: string
+    description: "Входной текст для анализа."
+    required: true
+output:
+  type: object
+  properties:
+    intent:
+      type: string
+    entities:
+      type: object 

@@ -1,0 +1,15 @@
+name: style_keeper_tool
+description: "Фиксирует единый стиль текста/изображений и negative_prompt_list.txt"
+category: "Утилиты"
+source_type: custom_function
+implementation_source: custom_tools.storybook.style_keeper.style_keeper_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта"
+    required: true
+

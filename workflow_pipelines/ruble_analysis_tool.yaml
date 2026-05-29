@@ -1,0 +1,107 @@
+# Анализ курса рубля с использованием прямых вызовов инструментов
+name: "ruble_analysis_tool"
+version: "1.0"
+description: "Анализ курса рубля за неделю с генерацией графика через инструменты"
+
+inputs:
+  end_date: "today"  # Конечная дата анализа (dd/mm/yyyy), по умолчанию сегодня
+
+# Глобальная политика повторов
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: "exponential"
+  base_delay: 2.0
+  max_delay: 60.0
+  retry_on_errors:
+    - "network_error"
+    - "api_error"
+    - "timeout"
+
+# Глобальные ограничения ресурсов
+global_resource_limits:
+  max_duration_seconds: 300
+  max_api_calls_per_minute: 10
+
+steps:
+  # Шаг 1: Получение данных о курсе рубля через веб-поиск
+  - id: "fetch_ruble_data"
+    step_type: "tool" 
+    tool_name: "web_search_tool"
+    task: "Получить данные о курсе рубля за последнюю неделю"
+    tool_params:
+      query: "курс рубля за неделю ЦБ РФ site:cbr.ru"
+    timeout: 60
+    metadata:
+      priority: "high"
+      data_source: "cbr.ru"
+
+  # Шаг 2: Анализ данных через код-интерпретатор
+  - id: "analyze_ruble_trend"
+    step_type: "tool"
+    tool_name: "code_interpreter_tool"
+    task: "Проанализировать тренд курса рубля и создать график"
+    tool_params:
+      code_prompt: |
+        Проанализируй данные о курсе рубля за неделю:
+        1. Получи данные с http://www.cbr.ru/scripts/XML_daily.asp?date_req={end_date}
+        2. Построй график изменения курса за неделю
+        3. Вычисли среднее значение и изменение в процентах
+        4. Создай интерактивный график с plotly
+      session_id: "{session_id}"
+      data_path: null
+    depends_on: ["fetch_ruble_data"]
+    timeout: 120
+    retry_policy:
+      max_retries: 3
+      backoff_strategy: "linear"
+      base_delay: 5.0
+    metadata:
+      output_format: "html"
+      chart_types: ["line", "bar"]
+
+  # Шаг 3: Генерация изображения-иллюстрации
+  - id: "generate_chart_illustration"
+    step_type: "tool"
+    tool_name: "generate_image_tool"
+    task: "Создать иллюстративное изображение для отчета"
+    tool_params:
+      prompt: "Professional financial chart showing Russian ruble exchange rate trends, modern design, blue and gold colors"
+      session_id: "{session_id}"
+      number: 1
+    depends_on: ["analyze_ruble_trend"]
+    timeout: 60
+    metadata:
+      optional: true
+      image_style: "professional"
+
+  # Шаг 4: Создание финального отчета через агента
+  - id: "create_final_report"
+    step_type: "agent"
+    agent_type: "analyst"
+    task: "Создать комплексный отчет по анализу курса рубля с выводами и рекомендациями"
+    depends_on: ["analyze_ruble_trend", "generate_chart_illustration"]
+    timeout: 90
+    metadata:
+      include_charts: true
+      include_analysis: true
+      format: "markdown"
+
+# Уведомления
+notifications:
+  - "email:finance-team@company.com"
+
+# Обработка ошибок
+error_handling:
+  on_failure: "continue_best_effort"
+  notify_on_error: true
+  save_partial_results: true
+  fallback_strategy: "use_cached_data"
+
+metadata:
+  author: "Finance Analytics Team"
+  category: "financial_analysis"
+  tags: ["ruble", "currency", "analysis", "tools", "cbr"]
+  estimated_duration: "4-6 minutes"
+  data_sources: ["cbr.ru", "web_search"]
+  output_types: ["report", "chart", "image"]
+

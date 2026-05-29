@@ -1,0 +1,14 @@
+name: file_read
+description: "Читает содержимое файла из разрешённых директорий ('plots', 'data'). ВАЖНО: возвращает СТРОКУ с содержимым!"
+category: "Файлы"
+source_type: custom_function
+implementation_source: custom_tools.file_system_tools.file_read
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии для отслеживания выполнения задач."
+    required: true
+  - name: "filename"
+    type: "str"
+    description: "Путь к файлу для чтения."
+    required: true 

@@ -1,0 +1,304 @@
+# Source: extracted from custom_tools/text_to_sql/validators/safety.py @EPIC 2.1.
+# Layout aligned with Phase 4 / W3-T3 profile-pattern:
+#   * `default` — минимальный deny-by-default набор: только SELECT/WITH/EXPLAIN
+#     допустимы по структуре, все DDL/DML AST-классы и базовые DML/DDL ключевые
+#     слова запрещены. БЕЗ доменно/движково-специфичных forbidden_functions
+#     (pg_*, lo_*, mysql.user и т.п.) — эти расширенные правила живут в named
+#     профиле `extended`. Идея: default — "deny-by-default" безопасный минимум,
+#     который НЕ зависит от конкретного DB-движка и НЕ закрывает закрытым
+#     списком все будущие атаки; для строгого фильтра используем `extended`.
+#   * `extended` — default + большой список движково-специфичных «опасных»
+#     функций/конструкций (file I/O, OS commands, server-side eval, каталоги),
+#     ужесточённые лимиты и расширенные DDL/DCL/SET-keyword'ы. Это рекомендуемый
+#     профиль для production-инсталляций (включается через
+#     env TEXT_TO_SQL_SAFETY_PROFILE=extended).
+#   * `strict` — alias к `extended`, сохранён для обратной совместимости
+#     (см. doc/MultiAgent/06_пайплайн_text_to_sql_.md и
+#     doc/TEXT_TO_SQL_CONFIG.md). По содержимому идентичен `extended`.
+#
+# Контракт source-of-truth:
+#   * Никаких python-копий этого файла. При отсутствии файла валидатор
+#     поднимает `SafetyConfigMissing` (наследник `FileNotFoundError`) и
+#     QA-слой отказывается принимать запрос — это закреплено в AGENTS.md
+#     («не использовать fallback без согласования»).
+#
+# Активный профиль выбирается:
+#   1. env TEXT_TO_SQL_SAFETY_PROFILE;
+#   2. иначе — "default".
+#
+# Override пути: env TEXT_TO_SQL_SAFETY_CONFIG_PATH.
+version: 2
+
+profiles:
+  # ---------------------------------------------------------------------------
+  # default — deny-by-default. Запрещены все мутационные стейтменты,
+  # разрешены только SELECT/WITH/DESCRIBE/EXPLAIN (без ANALYZE). Никаких
+  # движково-специфичных функций здесь нет — расширенный список см. в
+  # `extended`. Цель: безопасный минимум, не зависящий от конкретной СУБД.
+  # ---------------------------------------------------------------------------
+  default:
+    # Базовые DML/DDL/DCL/EXEC ключевые слова — pre-parse regex-маршрут.
+    # Это минимальный набор, чтобы любая мутация не проходила даже на
+    # legacy-пути (USE_SQLGLOT=0). PRAGMA/CALL/EXEC/EXECUTE — server-side
+    # execution; ATTACH/DETACH — открывают доступ к другим БД.
+    forbidden_keywords:
+      - INSERT
+      - UPDATE
+      - DELETE
+      - DROP
+      - TRUNCATE
+      - ALTER
+      - CREATE
+      - REPLACE
+      - VACUUM
+      - ATTACH
+      - DETACH
+      - GRANT
+      - REVOKE
+      - PRAGMA
+      - CALL
+      - EXEC
+      - EXECUTE
+      - MERGE
+      - COPY
+    # forbidden_functions намеренно пуст в default-профиле: движково-
+    # специфичные функции (pg_sleep / lo_import / xp_cmdshell / mysql.user и
+    # т.п.) переехали в `extended`. Это снимает скрытую привязку default к
+    # PostgreSQL/MySQL/SQLServer и делает контракт «минимальный универсальный
+    # set». Пустой список — product-решение, не баг.
+    # AST-проверка функций (фикс #1/#9) активна в extended/strict профилях
+    # при USE_SQLGLOT=1 через _SqlglotValidator.check_forbidden_functions_ast.
+    forbidden_functions: []
+    # AST-маршрут (sqlglot) — финальная линия защиты: любая попытка DML/DDL
+    # будет поймана независимо от форматирования / комментариев / regex.
+    ast_forbidden_stmt_classes:
+      - Insert
+      - Update
+      - Delete
+      - Drop
+      - Create
+      - Alter
+      - TruncateTable
+      - Merge
+    # Командные слова (exp.Command), которые тоже мутируют состояние или
+    # триггерят server-side эффекты.
+    ast_forbidden_command_words:
+      - LOAD
+      - BACKUP
+      - RESTORE
+      - LISTEN
+      - NOTIFY
+      - INSTALL
+      - INVALIDATE
+      - REFRESH
+      - LOCK
+      - UNLOCK
+    max_query_length: 10000
+    max_in_list_size: 1000
+
+  # ---------------------------------------------------------------------------
+  # extended — рекомендуемый production-профиль. default + движково-
+  # специфичные «опасные» функции/конструкции (file I/O, OS commands,
+  # каталоги information_schema/pg_catalog/mysql.user, server-side eval).
+  # Также ужесточены keyword'ы (SET/RESET/USE/SHOW/ANALYZE) и лимиты длины
+  # запроса / IN-списка. Активируется env TEXT_TO_SQL_SAFETY_PROFILE=extended.
+  # ---------------------------------------------------------------------------
+  extended:
+    forbidden_keywords:
+      - INSERT
+      - UPDATE
+      - DELETE
+      - DROP
+      - TRUNCATE
+      - ALTER
+      - CREATE
+      - REPLACE
+      - VACUUM
+      - ATTACH
+      - DETACH
+      - GRANT
+      - REVOKE
+      - PRAGMA
+      - CALL
+      - EXEC
+      - EXECUTE
+      - MERGE
+      - COPY
+      - SET
+      - RESET
+      - USE
+      - SHOW
+      - ANALYZE
+    # Опасные функции/конструкции, специфичные для DB-движков. Блокируются
+    # pre-parse в SELECT-only режиме (file I/O, OS commands, server-side eval,
+    # каталоги). Multi-word — последовательность через whitespace.
+    # W8-T8: расширен список PostgreSQL admin/IO и ClickHouse table-функций
+    # (file/url/s3/hdfs/remote и т.п.) — это типовые векторы exfiltration / DoS.
+    forbidden_functions:
+      - pg_sleep
+      - pg_read_file
+      - pg_read_binary_file
+      - pg_ls_dir
+      - lo_export
+      - lo_import
+      - load_file
+      - into outfile
+      - into dumpfile
+      - xp_cmdshell
+      - xp_regread
+      - sp_executesql
+      - information_schema
+      - pg_catalog
+      - mysql.user
+      - current_user
+      - current_setting
+      - pg_read_server_files
+      # PostgreSQL: admin / cross-DB / cancellation
+      - pg_terminate_backend
+      - pg_cancel_backend
+      - dblink
+      - dblink_exec
+      - dblink_send_query
+      # ClickHouse: table-функции для exfiltration через сеть / FS
+      - file
+      - url
+      - s3
+      - hdfs
+      - mysql
+      - postgresql
+      - remote
+      - remoteSecure
+      - cluster
+      - clusterAllReplicas
+      - system.shutdown
+      - system.kill
+    ast_forbidden_stmt_classes:
+      - Insert
+      - Update
+      - Delete
+      - Drop
+      - Create
+      - Alter
+      - TruncateTable
+      - Merge
+      - Set
+      - Use
+    ast_forbidden_command_words:
+      - LOAD
+      - BACKUP
+      - RESTORE
+      - LISTEN
+      - NOTIFY
+      - INSTALL
+      - INVALIDATE
+      - REFRESH
+      - LOCK
+      - UNLOCK
+      - SET
+      - RESET
+      - USE
+      - SHOW
+      - ANALYZE
+      - KILL
+    max_query_length: 4000
+    max_in_list_size: 200
+
+  # ---------------------------------------------------------------------------
+  # strict — alias к `extended` для обратной совместимости (документация и
+  # существующие deployment'ы могут использовать имя 'strict'). По
+  # содержимому идентичен `extended`. Не удалять без согласованного
+  # переименования в doc/MultiAgent/06_*.md и doc/TEXT_TO_SQL_CONFIG.md.
+  # ---------------------------------------------------------------------------
+  strict:
+    forbidden_keywords:
+      - INSERT
+      - UPDATE
+      - DELETE
+      - DROP
+      - TRUNCATE
+      - ALTER
+      - CREATE
+      - REPLACE
+      - VACUUM
+      - ATTACH
+      - DETACH
+      - GRANT
+      - REVOKE
+      - PRAGMA
+      - CALL
+      - EXEC
+      - EXECUTE
+      - MERGE
+      - COPY
+      - SET
+      - RESET
+      - USE
+      - SHOW
+      - ANALYZE
+    # W8-T8: synchronized with `extended` profile (PG admin + ClickHouse table fns).
+    forbidden_functions:
+      - pg_sleep
+      - pg_read_file
+      - pg_read_binary_file
+      - pg_ls_dir
+      - lo_export
+      - lo_import
+      - load_file
+      - into outfile
+      - into dumpfile
+      - xp_cmdshell
+      - xp_regread
+      - sp_executesql
+      - information_schema
+      - pg_catalog
+      - mysql.user
+      - current_user
+      - current_setting
+      - pg_read_server_files
+      - pg_terminate_backend
+      - pg_cancel_backend
+      - dblink
+      - dblink_exec
+      - dblink_send_query
+      - file
+      - url
+      - s3
+      - hdfs
+      - mysql
+      - postgresql
+      - remote
+      - remoteSecure
+      - cluster
+      - clusterAllReplicas
+      - system.shutdown
+      - system.kill
+    ast_forbidden_stmt_classes:
+      - Insert
+      - Update
+      - Delete
+      - Drop
+      - Create
+      - Alter
+      - TruncateTable
+      - Merge
+      - Set
+      - Use
+    ast_forbidden_command_words:
+      - LOAD
+      - BACKUP
+      - RESTORE
+      - LISTEN
+      - NOTIFY
+      - INSTALL
+      - INVALIDATE
+      - REFRESH
+      - LOCK
+      - UNLOCK
+      - SET
+      - RESET
+      - USE
+      - SHOW
+      - ANALYZE
+      - KILL
+    max_query_length: 4000
+    max_in_list_size: 200

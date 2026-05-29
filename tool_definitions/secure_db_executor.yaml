@@ -1,0 +1,60 @@
+name: secure_db_executor
+description: "Безопасно выполняет проверенный SQL-запрос в базе данных."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.secure_db_executor
+parameters:
+  - name: sql_query
+    type: string
+    description: "Проверенный SQL-запрос для выполнения."
+    required: true
+  - name: row_limit
+    type: integer
+    description: "Максимальное количество строк для возврата. Если не передан, используется DB_EXECUTOR_ROW_LIMIT."
+    required: false
+  - name: dsn
+    type: string
+    description: "DSN для подключения к БД. Обязателен для реального выполнения: передавай dsn из контекста pipeline, чтобы выполнение шло на пользовательской БД. Без dsn допустим только dry-run режим TEXT_TO_SQL_DRY_RUN_ONLY/dry_run_only. Silent fallback на переменную окружения DB_DSN отключён по умолчанию (AGENTS.md). Чтобы временно разрешить env-fallback, выставь SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 (не рекомендуется)."
+    required: false
+output:
+  type: object
+  properties:
+    success:
+      type: boolean
+    data:
+      type: array
+      items:
+        type: array
+        items:
+          oneOf:
+            - type: string
+            - type: integer
+            - type: number
+            - type: boolean
+            - type: object
+            - type: array
+            - type: "null"
+    columns:
+      type: array
+      items:
+        type: string
+    rows_affected:
+      type: integer
+    execution_time_ms:
+      type: integer
+    error_message:
+      type: string
+      nullable: true
+    safety_issues:
+      type: array
+      items:
+        type: object
+    dry_run_only:
+      type: boolean
+    skipped_execution:
+      type: boolean
+    sql_query:
+      type: string
+    applied_row_limit:
+      type: integer
+      nullable: true

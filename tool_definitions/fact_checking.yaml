@@ -1,0 +1,14 @@
+name: fact_checking
+description: "Проверяет достоверность утверждения по указанным источникам."
+category: "Анализ"
+source_type: custom_function
+implementation_source: custom_tools.analysis_tools.fact_checking
+parameters:
+  - name: "claim"
+    type: "str"
+    description: "Утверждение для проверки."
+    required: true
+  - name: "sources"
+    type: "List[str]"
+    description: "Список источников для проверки утверждения."
+    required: true 

@@ -1,0 +1,47 @@
+name: shots_prompt_qa_tool
+description: "LLM-валидатор и LLM-repair: проверяет и корректирует prompts в shots.json по сценарию ДО генерации изображений"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.shots_prompt_qa.shots_prompt_qa_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии"
+    required: true
+  - name: project_id
+    type: str
+    description: "Идентификатор проекта"
+    required: true
+  - name: shots_data
+    type: dict
+    description: "Данные shots (выход screenplay_shots_generator_tool). Если не передано — будет прочитано из shots.json"
+    required: false
+  - name: enable
+    type: bool
+    description: "Если True — выполняет LLM QA/repair, иначе пропускает"
+    required: false
+  - name: model
+    type: str
+    description: "LLM модель для QA/repair. Принимает (hard|code|lite|summary|big|ultimate)"
+    required: false
+  - name: temperature
+    type: float
+    description: "Температура для QA/repair"
+    required: false
+  - name: max_scenes
+    type: int
+    description: "Ограничение количества сцен для обработки (опционально)"
+    required: false
+  - name: force
+    type: bool
+    description: "Если True — игнорирует prompts_validated и выполняет повторную валидацию"
+    required: false
+  - name: global_max_repairs
+    type: int
+    description: "Максимум global screenplay-level правок (compact patch ops) на финальном шаге"
+    required: false
+  - name: dry_run
+    type: bool
+    description: "Если True — выполняет QA/repair, но НЕ сохраняет shots.json/report на диск"
+    required: false
+

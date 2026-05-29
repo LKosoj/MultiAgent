@@ -1,0 +1,168 @@
+# Пайплайн анализа данных и создания отчетов
+name: "data_analysis"
+version: "2.0"
+description: "Комплексный анализ данных с генерацией SQL, выполнением запросов и визуализацией"
+
+inputs:
+  analysis_request: ""  # Запрос на анализ данных (обязательный)
+
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: "exponential"
+  base_delay: 1.5
+  max_delay: 45.0
+  retry_on_errors:
+    - "database_connection_error"
+    - "query_timeout"
+    - "network_error"
+
+global_resource_limits:
+  max_duration_seconds: 900  # 15 минут
+  max_memory_mb: 2048
+  max_api_calls_per_minute: 15
+  max_concurrent_steps: 2
+
+steps:
+  - id: "validate_request"
+    agent_type: "input_guard_agent"
+    task: "Проверить запрос на анализ данных: '{analysis_request}'"
+    timeout: 20
+    metadata:
+      check_sql_injection: true
+      validate_permissions: true
+
+  - id: "understand_request"
+    agent_type: "nlu_agent"
+    task: "Понять и структурировать запрос на анализ: '{analysis_request}'"
+    depends_on: ["validate_request"]
+    timeout: 45
+    metadata:
+      extract_entities: true
+      identify_intent: true
+
+  - id: "audit_database"
+    agent_type: "db_audit_agent"
+    task: "Проанализировать схему базы данных и доступные таблицы"
+    depends_on: ["understand_request"]
+    timeout: 60
+    resource_limits:
+      max_api_calls_per_minute: 5
+    metadata:
+      include_metadata: true
+      check_permissions: true
+
+  - id: "generate_sql"
+    agent_type: "sql_generator_agent"
+    task: "Сгенерировать SQL запрос на основе анализа потребностей"
+    depends_on: ["understand_request", "audit_database"]
+    timeout: 90
+    retry_policy:
+      max_retries: 3
+      backoff_strategy: "linear"
+      base_delay: 2.0
+    metadata:
+      optimize_performance: true
+      add_comments: true
+
+  - id: "verify_sql"
+    agent_type: "sql_verifier_agent"
+    task: "Проверить корректность и безопасность сгенерированного SQL"
+    depends_on: ["generate_sql"]
+    timeout: 30
+    rollback_action: "regenerate_sql"
+    metadata:
+      check_syntax: true
+      validate_security: true
+      estimate_performance: true
+
+  - id: "execute_query"
+    agent_type: "code_executor"
+    task: "Выполнить проверенный SQL запрос"
+    depends_on: ["verify_sql"]
+    condition: "verify_sql.output.is_safe == true and verify_sql.output.is_valid == true"
+    timeout: 180
+    resource_limits:
+      max_duration_seconds: 120
+      max_memory_mb: 1024
+    retry_policy:
+      max_retries: 2
+      backoff_strategy: "fixed"
+      base_delay: 5.0
+      retry_on_errors: ["timeout", "temporary_db_error"]
+    metadata:
+      timeout_handling: "graceful"
+      result_limit: 10000
+
+  - id: "analyze_results"
+    agent_type: "analyst"
+    task: "Проанализировать полученные данные и выявить паттерны"
+    depends_on: ["execute_query"]
+    timeout: 120
+    metadata:
+      statistical_analysis: true
+      identify_trends: true
+      generate_insights: true
+
+  - id: "create_visualizations"
+    agent_type: "visualizer"
+    task: "Создать визуализации данных и графики"
+    depends_on: ["analyze_results"]
+    timeout: 90
+    resource_limits:
+      max_memory_mb: 512
+    metadata:
+      chart_types: ["bar", "line", "pie", "scatter"]
+      interactive: true
+      export_formats: ["png", "svg", "html"]
+
+  - id: "generate_report"
+    agent_type: "analyst"
+    task: "Создать финальный отчет с анализом и рекомендациями"
+    depends_on: ["analyze_results", "create_visualizations"]
+    timeout: 150
+    metadata:
+      include_methodology: true
+      add_recommendations: true
+      executive_summary: true
+      technical_details: true
+
+# Параллельные задачи для оптимизации
+parallel_groups:
+  - name: "data_preparation"
+    steps: ["audit_database", "understand_request"]
+  - name: "analysis_and_viz"
+    steps: ["analyze_results", "create_visualizations"]
+
+# Уведомления о ключевых этапах
+notifications:
+  - "email:data-team@company.com"
+  - "slack:#data-analytics"
+  - "webhook:https://api.company.com/analytics-webhook"
+
+# Расширенная обработка ошибок
+error_handling:
+  on_failure: "pause_and_debug"
+  auto_retry_transient: true
+  escalation_policy:
+    - level: 1
+      wait_minutes: 5
+      action: "auto_retry"
+    - level: 2
+      wait_minutes: 15
+      action: "notify_admin"
+    - level: 3
+      wait_minutes: 30
+      action: "manual_intervention"
+  
+  checkpoint_strategy: "after_each_step"
+  preserve_intermediate_results: true
+
+metadata:
+  author: "Data Analytics Team"
+  category: "data_analysis"
+  complexity: "high"
+  estimated_duration: "10-15 minutes"
+  data_sources: ["sql_database"]
+  output_types: ["report", "visualizations", "insights"]
+  compliance: ["gdpr", "sox"]
+  security_level: "high"

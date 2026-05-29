@@ -1,0 +1,87 @@
+# Демонстрация передачи результатов между шагами workflow
+name: "step_results_demo"
+version: "1.0"
+description: "Демонстрация как результаты одного шага становятся доступными в следующих шагах"
+
+inputs:
+  topic: "Искусственный интеллект в 2024"  # Тема для исследования
+  session_id: ""  # Идентификатор сессии (будет автогенерирован, если пуст)
+
+steps:
+  # Шаг 1: Веб-поиск (возвращает результаты)
+  - id: "search_data"
+    step_type: "tool"
+    tool_name: "web_search_tool"
+    task: "Найти информацию о {topic}"
+    tool_params:
+      query: "{topic} актуальная информация"
+      session_id: "{session_id}"
+      max_results: 3
+    timeout: 60
+    metadata:
+      description: "Этот шаг сохранит результаты поиска в step_outputs['search_data']"
+
+  # Шаг 2: Генерация изображения на основе результатов поиска
+  - id: "create_visualization"
+    step_type: "tool"
+    tool_name: "generate_image_tool"
+    task: "Создать визуализацию найденной информации"
+    tool_params:
+      prompt: "Professional infographic about: {search_data}"  # Использует результат предыдущего шага!
+      session_id: "{session_id}"
+      number: 1
+    depends_on: ["search_data"]
+    timeout: 90
+    metadata:
+      description: "Использует search_data из результатов предыдущего шага"
+
+  # Шаг 3: Анализ через агента с использованием обеих результатов
+  - id: "comprehensive_analysis"
+    step_type: "agent"
+    agent_type: "analyst"
+    task: |
+      Проанализируй следующие данные:
+      
+      Результаты поиска: {search_data}
+      Созданное изображение: {create_visualization}
+      
+      Создай подробный отчет с выводами и рекомендациями.
+    depends_on: ["search_data", "create_visualization"]
+    timeout: 120
+    metadata:
+      description: "Использует результаты обоих предыдущих шагов"
+
+  # Шаг 4: Финальная обработка с доступом ко всем результатам
+  - id: "final_summary"
+    step_type: "agent"
+    agent_type: "manager"
+    task: |
+      Создай финальное резюме проекта на основе:
+      
+      - Исходная тема: {topic}
+      - Данные поиска: {search_data}
+      - Визуализация: {create_visualization}
+      - Анализ: {comprehensive_analysis}
+      - ID сессии: {session_id}
+      
+      Подготовь краткий executive summary.
+    depends_on: ["comprehensive_analysis"]
+    timeout: 90
+    metadata:
+      description: "Имеет доступ ко всем переменным и результатам предыдущих шагов"
+
+metadata:
+  author: "Workflow Team"
+  category: "demo"
+  tags: ["step_results", "data_flow", "demo"]
+  estimated_duration: "5-8 minutes"
+
+      
+  notes: |
+    Этот workflow демонстрирует:
+    
+    1. Результаты каждого шага сохраняются в context.step_outputs[step_id]
+    2. В следующих шагах можно использовать {step_id} для доступа к результатам
+    3. Доступны как исходные переменные {topic}, так и результаты шагов {search_data}
+    4. Агенты и инструменты одинаково получают доступ к переменным
+    5. Зависимости (depends_on) гарантируют порядок выполнения

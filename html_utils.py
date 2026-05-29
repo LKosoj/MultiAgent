@@ -1,0 +1,2075 @@
+import os
+import logging
+import re
+import base64
+import html
+from datetime import datetime
+from typing import Union, List
+import subprocess
+import tempfile
+import re
+from pathlib import Path
+import markdown2
+from bs4 import BeautifulSoup
+import traceback
+import uuid
+import json
+import time
+import glob
+import hashlib
+import requests
+import mimetypes
+
+class HTMLVisualizer:
+    """Утилита для создания расширенной HTML-визуализации"""
+    
+    def __init__(self, plots_dir='plots'):
+        """
+        Инициализация визуализатора
+        
+        Args:
+            plots_dir (str, optional): Директория для сохранения графиков. По умолчанию 'plots'.
+        """
+        self.plots_dir = plots_dir
+        self.diagrams_found = 0
+        os.makedirs(plots_dir, exist_ok=True)
+        
+        # Путь к JAR-файлу PlantUML
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.plantuml_jar = os.path.join(current_dir, 'plantuml.jar')
+        
+        # Проверяем существование файла
+        if not os.path.exists(self.plantuml_jar):
+            self.plantuml_jar = os.path.join(current_dir, '..', 'plantuml.jar')
+        
+        # Инициализация openai_helper
+        self.openai_helper = None
+    
+    def _convert_markdown(self, text, base_url=None):
+        """
+        Конвертирует markdown-разметку в HTML.
+        
+        Args:
+            text (str): Текст с markdown-разметкой
+            base_url (str, optional): Базовый URL для преобразования относительных ссылок изображений
+        
+        Returns:
+            str: HTML-разметка
+        """
+        try:
+            # Сначала сохраняем уже существующие контейнеры mermaid-container
+            mermaid_containers = {}
+            mermaid_container_pattern = r'<div class="mermaid-container"[\s\S]*?</div>\s*</div>'
+            
+            # Функция для сохранения HTML-контейнеров диаграмм
+            def extract_mermaid_containers(match_obj):
+                container_id = f"MERMAID-CONTAINER-PLACEHOLDER-{len(mermaid_containers)}"
+                mermaid_containers[container_id] = match_obj.group(0)
+                return container_id
+            
+            # Заменяем готовые HTML-контейнеры на временные маркеры
+            processed_text = re.sub(mermaid_container_pattern, extract_mermaid_containers, text, flags=re.DOTALL)
+            
+            # Сохраняем плейсхолдеры Mermaid (MERMAID-PLACEHOLDER-*)
+            mermaid_placeholders = {}
+            placeholder_pattern = r'(MERMAID-PLACEHOLDER-\d+)'
+            
+            def extract_mermaid_placeholders(match_obj):
+                placeholder = match_obj.group(0)
+                placeholder_id = f"TEMP-{placeholder}"
+                mermaid_placeholders[placeholder_id] = placeholder
+                return placeholder_id
+            
+            # Заменяем плейсхолдеры MERMAID-PLACEHOLDER-* на временные TEMP-MERMAID-PLACEHOLDER-*
+            processed_text = re.sub(placeholder_pattern, extract_mermaid_placeholders, processed_text)
+            
+            # Находим и храним все блоки mermaid для дальнейшего преобразования
+            mermaid_blocks = {}
+            mermaid_pattern = r'```mermaid\s*([\s\S]*?)```'
+            
+            # Сохраняем ссылки в формате [N], которые присутствуют в документе
+            reference_links = {}
+            ref_pattern = r'\[(\d+)\]'
+            references = list(re.finditer(ref_pattern, processed_text))
+            if references:
+                # Ищем раздел Sources или Источники в конце документа
+                sources_section = None
+                sources_patterns = [
+                    r'Sources\s*\n([\s\S]+)$',
+                    r'Источники\s*\n([\s\S]+)$',
+                    r'Список литературы\s*\n([\s\S]+)$',
+                    r'Литература\s*\n([\s\S]+)$',
+                    r'References\s*\n([\s\S]+)$'
+                ]
+                
+                for pattern in sources_patterns:
+                    sources_match = re.search(pattern, processed_text)
+                    if sources_match:
+                        sources_section = sources_match.group(1)
+                        break
+                
+                if sources_section:
+                    # Парсим источники в формате [1] Текст источника http://example.com
+                    source_pattern = r'\[(\d+)\](.*?)(?=\[\d+\]|$)'
+                    sources = re.finditer(source_pattern, sources_section, re.DOTALL)
+                    
+                    for source_match in sources:
+                        ref_num = source_match.group(1)
+                        source_text = source_match.group(2).strip()
+                        
+                        # Ищем URL в тексте источника
+                        url_match = re.search(r'https?://[^\s]+', source_text)
+                        if url_match:
+                            url = url_match.group(0)
+                            # Сохраняем номер ссылки и соответствующий URL
+                            reference_links[ref_num] = {
+                                'url': url,
+                                'text': source_text
+                            }
+            
+            # Собираем все блоки mermaid для последующей обработки
+            mermaid_matches = list(re.finditer(mermaid_pattern, processed_text, re.DOTALL))
+            for i, match in enumerate(mermaid_matches):
+                block_id = f"MERMAID-PLACEHOLDER-{i}"
+                mermaid_content = match.group(1).strip()
+                # Сохраняем оригинальный код mermaid-диаграммы для последующей подстановки
+                mermaid_blocks[block_id] = mermaid_content
+                
+            # Заменяем блоки mermaid на временные плейсхолдеры
+            # ВАЖНО: На этом этапе код диаграммы заменяется на div с уникальным ID
+            # Эти плейсхолдеры будут заменены на реальные контейнеры после парсинга HTML
+            for block_id, content in mermaid_blocks.items():
+                pattern = r'```mermaid\s*' + re.escape(content) + r'\s*```'
+                processed_text = re.sub(pattern, f"<div id='{block_id}'></div>", processed_text, flags=re.DOTALL)
+            
+            processed_text = processed_text.replace('_', '\\_').replace("\\n", "\n")
+            
+            # Добавляем пустые строки перед ключевыми разделами для правильного форматирования
+            key_sections = ['🔹 ', 'ℹ️ ', '🔍 ', '• ', 'Подробный отчет:', 'Резюме:', 'Введение:', 'Методология:', 'Анализ данных:', 'Ключевые выводы:', 'Рекомендации:', 'Ограничения:', 'Список источников:']
+            for section in key_sections:
+                # Заменяем начало раздела на пустую строку + начало раздела
+                processed_text = re.sub(f'([^\n])\n({re.escape(section)})', r'\1\n\n\2', processed_text)
+            
+            # Конвертируем текст с базовыми опциями markdown
+            try:
+                # Используем базовый набор опций, который точно поддерживается
+                base_extras = [
+                    'tables',           # Поддержка таблиц
+                    'fenced-code-blocks', # Блоки кода с ограждением
+                    'header-ids',       # Идентификаторы для заголовков
+                    'break-on-newline', # Перевод строк
+                    'smart-strong',     # Умное форматирование жирного текста
+                    'cuddled-lists',    # Улучшенная обработка списков
+                    #'smart-quotes',     # Умные кавычки
+                ]
+                
+                html = markdown2.markdown(processed_text, extras=base_extras)
+                
+            except Exception as e:
+                logging.warning(f"Ошибка при обработке markdown: {str(e)}")
+                # Используем минимальный набор опций
+                html = markdown2.markdown(processed_text)
+                
+            # В HTML, обратные слеши могли быть преобразованы в &amp;#92; - исправляем это
+            html = html.replace('&amp;#92;_', '_')
+            html = html.replace('\\_', '_')
+            
+            # Парсим HTML
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # 1. Обрабатываем ссылки в формате [N] - сноски на источники
+            if reference_links:
+                for tag in soup.find_all(['p', 'li', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                    if tag.string:
+                        # Ищем ссылки вида [1], [2], итд
+                        ref_matches = list(re.finditer(r'\[(\d+)\]', tag.string))
+                        if ref_matches:
+                            # Создаем новое содержимое с заменой ссылок
+                            new_content = tag.string
+                            offset = 0
+                            
+                            for ref_match in ref_matches:
+                                ref_num = ref_match.group(1)
+                                
+                                # Если найден соответствующий источник с URL
+                                if ref_num in reference_links:
+                                    source_info = reference_links[ref_num]
+                                    url = source_info['url']
+                                    
+                                    # Создаем тег <a> для ссылки
+                                    link_tag = soup.new_tag('a', href=url)
+                                    link_tag.string = f"[{ref_num}]"
+                                    link_tag['target'] = '_blank'
+                                    link_tag['rel'] = 'noopener noreferrer'
+                                    link_tag['title'] = source_info['text']
+                                    
+                                    # Заменяем [N] на тег <a>
+                                    start_pos = ref_match.start() + offset
+                                    end_pos = ref_match.end() + offset
+                                    new_content = new_content[:start_pos] + str(link_tag) + new_content[end_pos:]
+                                    offset += len(str(link_tag)) - (end_pos - start_pos)
+                            
+                            # Обновляем содержимое тега с добавленными ссылками
+                            if offset > 0:  # Если были замены
+                                new_tag = BeautifulSoup(new_content, 'html.parser')
+                                tag.replace_with(new_tag)
+            
+            # 2. Находим и обрабатываем необработанные Markdown-ссылки
+            markdown_link_pattern = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
+            for tag in soup.find_all(['p', 'li', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                if tag.string and ('[' in tag.string and '](' in tag.string):
+                    md_links = markdown_link_pattern.finditer(tag.string)
+                    if md_links:
+                        new_content = tag.string
+                        offset = 0
+                        for link_match in md_links:
+                            link_text = link_match.group(1)
+                            url = link_match.group(2).strip()
+                            
+                            # Создаем новый тег <a>
+                            link_tag = soup.new_tag('a', href=url)
+                            link_tag.string = link_text
+                            
+                            # Если ссылка внешняя, добавляем target и rel
+                            if url.startswith('http'):
+                                link_tag['target'] = '_blank'
+                                link_tag['rel'] = 'noopener noreferrer'
+                            
+                            # Заменяем Markdown-ссылку на тег <a>
+                            start_pos = link_match.start() + offset
+                            end_pos = link_match.end() + offset
+                            new_content = new_content[:start_pos] + str(link_tag) + new_content[end_pos:]
+                            offset += len(str(link_tag)) - (end_pos - start_pos)
+                        
+                        # Обновляем содержимое тега с добавленными ссылками
+                        if offset > 0:  # Если были замены
+                            new_tag = BeautifulSoup(new_content, 'html.parser')
+                            tag.replace_with(new_tag)
+            
+            # 3. Находим и обрабатываем обычные URL в тексте
+            url_pattern = re.compile(r'(https?://[^\s<>"]+)(?![^<]*>|[^<>]*<\/a>)')
+            for tag in soup.find_all(['p', 'li', 'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+                if tag.string:
+                    urls = list(url_pattern.finditer(tag.string))
+                    if urls:
+                        new_content = tag.string
+                        offset = 0
+                        for url_match in urls:
+                            url = url_match.group(1)
+                            # Создаем новый тег <a>
+                            link_tag = soup.new_tag('a', href=url)
+                            link_tag.string = url
+                            link_tag['target'] = '_blank'
+                            link_tag['rel'] = 'noopener noreferrer'
+                            
+                            # Заменяем текстовый URL на тег <a>
+                            start_pos = url_match.start() + offset
+                            end_pos = url_match.end() + offset
+                            new_content = new_content[:start_pos] + str(link_tag) + new_content[end_pos:]
+                            offset += len(str(link_tag)) - len(url)
+                        
+                        # Обновляем содержимое тега с добавленными ссылками
+                        if offset > 0:  # Если были замены
+                            new_tag = BeautifulSoup(new_content, 'html.parser')
+                            tag.replace_with(new_tag)
+            
+            # 4. Обрабатываем все оставшиеся URL во всем документе
+            # Ищем любой текст, который может быть URL, во всем HTML
+            def make_urls_clickable(html_content):
+                # Паттерн для поиска URL-подобных строк, исключая те, что уже в <a> тегах
+                url_pattern = r'(https?://[^\s<>"]+)(?![^<]*>|[^<>]*<\/a>)'
+                
+                # Функция замены, которая преобразует найденный URL в тег <a>
+                def replace_with_link(match):
+                    url = match.group(1)
+                    # Создаем тег <a> с корректным отображением URL, включая символы подчеркивания
+                    return f'<a href="{url}" target="_blank" rel="noopener noreferrer" class="url-with-underscores">{url}</a>'
+                
+                # Заменяем все найденные URL на теги <a>
+                return re.sub(url_pattern, replace_with_link, html_content)
+            
+            # Применяем обработку ко всему HTML
+            result_html = str(soup)
+            result_html = make_urls_clickable(result_html)
+
+            # Пересоздаем soup из обновленного HTML
+            soup = BeautifulSoup(result_html, 'html.parser')
+            
+            # Обрабатываем все блоки кода
+            for pre in soup.find_all('pre'):
+                # Удаляем экранирование внутри блоков кода
+                if pre.code:
+                    code_content = pre.code.string
+                    if code_content:
+                        pre.code.string = code_content.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            
+            # Находим все заголовки h1 и проверяем их длину
+            for h1 in soup.find_all('h1'):
+                if len(h1.get_text()) > 100:
+                    # Создаем новый параграф с тем же текстом
+                    new_p = soup.new_tag('p')
+                    new_p.string = h1.get_text()
+                    # Заменяем h1 на p
+                    h1.replace_with(new_p)
+            
+            # Обрабатываем переносы строк
+            for p in soup.find_all(['p', 'li']):
+                # Сохраняем переносы строк внутри параграфов и списков
+                # ВАЖНО: Не применяем замену переносов строк к содержимому mermaid-диаграмм!
+                content = str(p)
+            
+            # Встраивание изображений в HTML
+            for img_tag in soup.find_all('img'):
+                src = img_tag.get('src')
+                if src:
+                    try:
+                        if src.startswith('data:image'): # Пропускаем уже встроенные изображения
+                            continue
+
+                        if src.startswith(('http://', 'https://')):
+                            # Удаленное изображение
+                            logging.info(f"Попытка встроить удаленное изображение: {src}")
+                            response = requests.get(src, stream=True, timeout=20)
+                            response.raise_for_status() # Проверка на ошибки HTTP
+                            
+                            content_type = response.headers.get('Content-Type')
+                            # Пытаемся угадать тип, если Content-Type неполный или отсутствует
+                            if not content_type or '/' not in content_type:
+                                guessed_type = mimetypes.guess_type(src)[0]
+                                if guessed_type:
+                                    content_type = guessed_type
+                                else: # Fallback, если не удалось угадать
+                                    content_type = 'application/octet-stream'
+                            
+                            img_data = response.content
+                            base64_data = base64.b64encode(img_data).decode('utf-8')
+                            img_tag['src'] = f"data:{content_type};base64,{base64_data}"
+                            logging.info(f"Успешно встроено удаленное изображение: {src}")
+                        
+                        elif os.path.exists(src): # Проверяем, что это локальный файл и он существует
+                            # Локальное изображение (путь разрешается относительно CWD или абсолютный)
+                            logging.info(f"Попытка встроить локальное изображение: {src}")
+                            mime_type, _ = mimetypes.guess_type(src)
+                            if not mime_type:
+                                mime_type = 'application/octet-stream' # Fallback
+                            
+                            with open(src, 'rb') as f_img:
+                                img_data = f_img.read()
+                            base64_data = base64.b64encode(img_data).decode('utf-8')
+                            img_tag['src'] = f"data:{mime_type};base64,{base64_data}"
+                            logging.info(f"Успешно встроено локальное изображение: {src}")
+                        
+                        else:
+                            # Если base_url предоставлен и src выглядит как относительный путь, 
+                            # пробуем преобразовать в абсолютный URL
+                            if base_url and src.startswith('/'):
+                                from urllib.parse import urljoin, urlparse
+                                parsed_base = urlparse(base_url)
+                                # Формируем базовый URL без пути для корректного соединения
+                                base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
+                                absolute_url = urljoin(base_domain, src)
+                                
+                                logging.info(f"Преобразование относительного пути '{src}' в абсолютный URL: {absolute_url}")
+                                
+                                # Пробуем загрузить изображение по абсолютному URL
+                                try:
+                                    response = requests.get(absolute_url, stream=True, timeout=20)
+                                    response.raise_for_status()
+                                    
+                                    content_type = response.headers.get('Content-Type')
+                                    if not content_type or '/' not in content_type:
+                                        guessed_type = mimetypes.guess_type(absolute_url)[0]
+                                        if guessed_type:
+                                            content_type = guessed_type
+                                        else:
+                                            content_type = 'application/octet-stream'
+                                    
+                                    img_data = response.content
+                                    base64_data = base64.b64encode(img_data).decode('utf-8')
+                                    img_tag['src'] = f"data:{content_type};base64,{base64_data}"
+                                    logging.info(f"Успешно встроено изображение из абсолютного URL: {absolute_url}")
+                                    continue  # Переходим к следующему изображению
+                                    
+                                except Exception as e:
+                                    logging.warning(f"Не удалось загрузить изображение по абсолютному URL {absolute_url}: {e}")
+                            
+                            # Если преобразование не удалось или base_url не предоставлен, логируем предупреждение
+                            logging.warning(f"Ссылка на изображение '{src}' не является URL, файл не найден локально, и это не data URI.")
+
+                    except requests.exceptions.Timeout:
+                        logging.warning(f"Тайм-аут при загрузке изображения по URL {src}")
+                    except requests.exceptions.RequestException as e:
+                        logging.warning(f"Не удалось загрузить изображение по URL {src}: {e}")
+                    except FileNotFoundError:
+                        logging.warning(f"Локальный файл изображения не найден: {src}")
+                    except Exception as e:
+                        logging.warning(f"Ошибка при встраивании изображения {src}: {e}\n{traceback.format_exc()}")
+            
+            result_html = str(soup)
+            
+            # Восстанавливаем плейсхолдеры, используя оригинальный текст диаграммы без изменений
+            # ВАЖНО: Используем простые строковые замены вместо BeautifulSoup,
+            # чтобы избежать повреждения кода диаграмм
+            for block_id, original_content in mermaid_blocks.items():
+                placeholder = f"<div id='{block_id}'></div>"
+                if placeholder in result_html:
+                    # Создаем базовый контейнер без форматирования, с оригинальным кодом
+                    # ВАЖНО: используем чистый оригинальный код диаграммы без изменений
+                    diagram_id = f"mermaid-diagram-{str(uuid.uuid4())[:8]}"
+                    
+                    # Создаем простой HTML-контейнер для mermaid-диаграммы
+                    simple_html = f'<div class="mermaid">{original_content}</div>'
+                    
+                    # Заменяем плейсхолдер напрямую, без использования BeautifulSoup
+                    result_html = result_html.replace(placeholder, simple_html)
+            
+            # Восстанавливаем оригинальные HTML-контейнеры диаграмм
+            for container_id, container_html in mermaid_containers.items():
+                result_html = result_html.replace(container_id, container_html)
+            
+            # Делаем все оставшиеся URL в HTML кликабельными
+            result_html = make_urls_clickable(result_html)
+            
+            # Финальная обработка: находим все фрагменты URL с подчёркиваниями, которые могли быть
+            # неправильно интерпретированы как форматирование Markdown
+            
+            # 1. Обрабатываем случаи, когда URL разбит на ссылку и курсивный текст
+            url_with_emphasis_pattern = r'(https?://[^<\s]+)</a><em>([^<]+)</em>'
+            
+            def fix_url_with_underscores(match):
+                base_url = match.group(1)
+                emphasized_part = match.group(2)
+                # Восстанавливаем полный URL для отображения
+                full_url = f"{base_url}_{emphasized_part}"
+                # Создаем новый тег <a> с полным URL
+                return f'<a href="{full_url}" target="_blank" rel="noopener noreferrer">{full_url}</a>'
+            
+            # Исправляем URL, разбитые на части из-за подчеркиваний
+            result_html = re.sub(url_with_emphasis_pattern, fix_url_with_underscores, result_html)
+            
+            # 2. Обрабатываем случаи, когда часть URL за пределами ссылки (не в курсиве)
+            url_with_text_after_pattern = r'<a href="([^"]+)" [^>]+>([^<]+)</a>([a-zA-Z0-9_\-\.]+)(?=<br|<\/)'
+            
+            def fix_url_with_text_after(match):
+                href = match.group(1)
+                url_part = match.group(2)
+                text_after = match.group(3)
+                # Проверяем, является ли текст после ссылки частью URL
+                if text_after and (href.endswith(url_part) or url_part.endswith(text_after)):
+                    # Если это часть URL, создаем новую ссылку с полным URL
+                    full_url = href
+                    return f'<a href="{full_url}" target="_blank" rel="noopener noreferrer">{full_url}</a>'
+                else:
+                    # Если это не часть URL, оставляем как есть
+                    return match.group(0)
+            
+            # Исправляем URL, за которыми следует обычный текст без тегов
+            result_html = re.sub(url_with_text_after_pattern, fix_url_with_text_after, result_html)
+            
+            # 3. Обрабатываем случаи, когда URL начинается с текста, потом курсив
+            url_with_emphasis_before_pattern = r'([a-zA-Z0-9/\.:]+)<em>([^<]+)</em>'
+            
+            def fix_url_with_emphasis_before(match):
+                before_text = match.group(1)
+                emphasized_text = match.group(2)
+                # Проверяем, может ли это быть URL с подчеркиванием
+                combined = f"{before_text}_{emphasized_text}"
+                if re.match(r'https?://[^\s]+', combined):
+                    return f'<a href="{combined}" target="_blank" rel="noopener noreferrer">{combined}</a>'
+                else:
+                    return match.group(0)
+            
+            # Исправляем URL с курсивным текстом до начала ссылки
+            result_html = re.sub(url_with_emphasis_before_pattern, fix_url_with_emphasis_before, result_html)
+            
+            # 4. Исправляем неправильное форматирование в текстах ссылок (например, [36] pavel-mlgn/obsidian<em>gtd</em>vault)
+            title_with_em_pattern = r'(\[\d+\] [^<]+)<em>([^<]+)</em>([^<]+) - '
+            
+            def fix_description_with_emphasis(match):
+                prefix = match.group(1)
+                emphasized = match.group(2)
+                suffix = match.group(3)
+                # Восстанавливаем нормальный текст без тегов em
+                fixed_text = f"{prefix}{emphasized}{suffix} - "
+                return fixed_text
+            
+            # Исправляем текст описаний ссылок, где есть некорректные теги em
+            result_html = re.sub(title_with_em_pattern, fix_description_with_emphasis, result_html)
+            
+            # 5. Специально обрабатываем URL в разделе Sources
+            if "Sources" in result_html:
+                # Ищем закодированные URL-символы, которые могли быть неправильно преобразованы
+                encoded_url_pattern = r'(%[A-F0-9]{2})+<br'
+                
+                def fix_encoded_url(match):
+                    encoded_part = match.group(1)
+                    # Заменяем закодированные символы на правильные в тексте
+                    return f'{encoded_part}<br'
+                
+                # Применяем исправление закодированных URL
+                result_html = re.sub(encoded_url_pattern, fix_encoded_url, result_html)
+                
+            # Важно: это последняя операция - замена плейсхолдеров на реальные диаграммы
+            # КРИТИЧЕСКИ ВАЖНО: используем простые строковые замены в итоговом HTML, 
+            # а не BeautifulSoup, который может повредить код диаграмм
+            for block_id, mermaid_content in mermaid_blocks.items():
+                placeholder = f'<div id="{block_id}"></div>'
+                if placeholder in result_html:
+                    # Создаем простой div с классом mermaid и оригинальным кодом диаграммы
+                    # Оборачиваем код диаграммы в тег pre, чтобы предотвратить автоматическую конвертацию
+                    # переносов строк в <br/> при отображении HTML
+                    mermaid_html = f'<div class="mermaid">{mermaid_content}</div>'
+                    result_html = result_html.replace(placeholder, mermaid_html)
+                
+            # Восстанавливаем оригинальные HTML-контейнеры диаграмм
+            for container_id, container_html in mermaid_containers.items():
+                result_html = result_html.replace(container_id, container_html)
+            
+            # Финальная обработка - восстанавливаем плейсхолдеры Mermaid
+            #result_html = str(soup)
+            
+            # Восстанавливаем временные TEMP-MERMAID-PLACEHOLDER плейсхолдеры обратно в MERMAID-PLACEHOLDER
+            for temp_id, original_placeholder in mermaid_placeholders.items():
+                result_html = result_html.replace(temp_id, original_placeholder)
+            
+            # Восстанавливаем плейсхолдеры, используя оригинальный текст диаграммы без изменений
+            for block_id, original_content in mermaid_blocks.items():
+                placeholder = f"<div id='{block_id}'></div>"
+                if placeholder in result_html:
+                    # Создаем базовый контейнер без форматирования, с оригинальным кодом
+                    simple_html = f'<div class="mermaid">{original_content}</div>'
+                    
+                    # Заменяем плейсхолдер напрямую, без использования BeautifulSoup
+                    result_html = result_html.replace(placeholder, simple_html)
+            
+            # Восстанавливаем оригинальные HTML-контейнеры диаграмм
+            for container_id, container_html in mermaid_containers.items():
+                result_html = result_html.replace(container_id, container_html)
+            
+            return result_html
+        except Exception as e:
+            logging.warning(f"___________Ошибка при обработке markdown: {str(e)}")
+            return processed_text
+    
+    def _sort_files_by_creation_time(self, files, directory):
+        """
+        Сортирует файлы по времени создания (от раннего к позднему).
+        
+        Args:
+            files (List[str]): Список имен файлов
+            directory (str): Директория, в которой находятся файлы
+            
+        Returns:
+            List[str]: Отсортированный список имен файлов
+        """
+        # Создаем список кортежей (имя_файла, время_создания)
+        files_with_time = []
+        for filename in files:
+            filepath = os.path.join(directory, filename)
+            try:
+                # Получаем время создания файла
+                creation_time = os.path.getctime(filepath)
+                files_with_time.append((filename, creation_time))
+            except Exception as e:
+                logging.warning(f"Не удалось получить время создания файла {filename}: {str(e)}")
+                # Если не удалось получить время создания, используем текущее время
+                files_with_time.append((filename, float('inf')))
+        
+        # Сортируем по времени создания (от раннего к позднему)
+        sorted_files = [f[0] for f in sorted(files_with_time, key=lambda x: x[1])]
+        return sorted_files
+    
+    def _create_mermaid_container(self, diagram_id, mermaid_code, index, title=None, creation_time=None):
+        """
+        Создаёт HTML-контейнер для mermaid диаграммы с полным функционалом.
+        Этот метод используется как часть процесса обработки диаграмм Mermaid
+        
+        Args:
+            diagram_id (str): Уникальный идентификатор диаграммы
+            mermaid_code (str): Код диаграммы mermaid
+            index (int): Индекс диаграммы
+            title (str, optional): Заголовок диаграммы. Если не указан, используется "Mermaid Диаграмма {index+1}"
+            creation_time (str, optional): Время создания диаграммы. Если не указано, используется текущее время
+            
+        Returns:
+            str: HTML-код контейнера с диаграммой
+        """
+        try:
+            # Декодируем HTML-сущности
+            mermaid_code = mermaid_code.replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
+            
+            # Удаляем HTML-теги, которые могли попасть в код диаграммы
+            mermaid_code = mermaid_code.replace('<br/>', '\n').replace('<br>', '\n')
+            
+            # Дополнительно удаляем теги <em> и другие, которые могут испортить код диаграммы
+            mermaid_code = re.sub(r'<\/?em>', '', mermaid_code)
+            mermaid_code = re.sub(r'<\/?i>', '', mermaid_code)
+            mermaid_code = re.sub(r'<\/?b>', '', mermaid_code)
+            mermaid_code = re.sub(r'<\/?strong>', '', mermaid_code)
+            
+            # ВАЖНО: НЕ заменяем переносы строк тегами <br/>, так как это искажает код диаграммы
+            # mermaid_code должен сохранять свой исходный формат
+            
+            # Создаем уникальные ID для элементов
+            content_id = f"{diagram_id}-content"
+            code_id = f"{diagram_id}-code"
+            
+            # Получаем текущую дату и время, если не указано
+            if creation_time is None:
+                creation_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            else:
+                creation_time_str = creation_time
+                
+            # Используем переданный заголовок или создаем стандартный
+            if title is None:
+                title_str = f"Mermaid Диаграмма {index+1}"
+            else:
+                title_str = title
+            
+            # Формируем HTML контейнер для диаграммы
+            html = [
+                f'<div class="mermaid-container" id="{diagram_id}">',
+                '    <div class="mermaid-header">',
+                f'        <h3 class="mermaid-title">{title_str} <span class="file-time">({creation_time_str})</span></h3>',
+                '        <div class="mermaid-controls">',
+                f'            <select class="mermaid-theme-select" onchange="changeTheme(this.value, \'{content_id}\', \'{code_id}\')">',
+                '                <option value="default">Светлая тема</option>',
+                '                <option value="dark">Темная тема</option>',
+                '                <option value="forest">Лесная тема</option>',
+                '                <option value="neutral">Нейтральная тема</option>',
+                '            </select>',
+                f'            <button class="mermaid-btn" onclick="toggleCode(\'{code_id}\')">',
+                '                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>',
+                '                Показать код',
+                '            </button>',
+                f'            <button class="mermaid-btn" onclick="copyToClipboard(\'{code_id}\')">',
+                '                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+                '                Копировать',
+                '            </button>',
+                f'            <button class="mermaid-btn" onclick="saveSvg(\'{content_id}\', \'diagram_{index}\')">',
+                '                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>',
+                '                Сохранить SVG',
+                '            </button>',
+                f'            <button class="mermaid-btn" onclick="savePng(\'{content_id}\', \'diagram_{index}\')">',
+                '                <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>',
+                '                Сохранить PNG',
+                '            </button>',
+                '        </div>',
+                '    </div>',
+                f'    <div class="mermaid-content" id="{content_id}">',
+                f'        <div class="mermaid">{mermaid_code}</div>',
+                '        <div class="zoom-controls">',
+                f'            <div class="zoom-btn" onclick="zoomIn(\'{content_id}\')">+</div>',
+                f'            <div class="zoom-btn" onclick="zoomOut(\'{content_id}\')">-</div>',
+                f'            <div class="zoom-btn" onclick="resetZoom(\'{content_id}\')">↺</div>',
+                '        </div>',
+                '    </div>',
+                f'    <pre class="mermaid-code" id="{code_id}">{mermaid_code}</pre>',
+                '</div>'
+            ]
+            
+            return '\n'.join(html)
+            
+        except Exception as e:
+            print(f"Ошибка при создании HTML-контейнера для mermaid диаграммы: {str(e)}")
+            return f'<div class="mermaid">{mermaid_code}</div>'
+    
+    def advanced_visualization(self, result, session_id, show=False, base_url=None):
+        """
+        Создаёт HTML страницу из сохраненных графиков.
+        
+        Args:
+            result (list or str): Результаты для визуализации
+            session_id (str): Идентификатор сессии
+            show (bool, optional): Отображать ли результат. По умолчанию False.
+            base_url (str, optional): Базовый URL для преобразования относительных ссылок изображений
+            
+        Returns:
+            str: Путь к созданному HTML-файлу
+        """
+        output_path=f"output/interactive_plots_{session_id}.html"
+        try:
+            # Если во входном результате приходит JSON (dict или JSON-строка),
+            # преобразуем его в человекочитаемый HTML перед дальнейшей обработкой
+            try:
+                import json
+                import re
+                import ast
+
+                def _list_of_dicts_to_md_table(rows):
+                    if not isinstance(rows, list) or not rows:
+                        return ''
+                    first = rows[0]
+                    if not isinstance(first, dict):
+                        return ''
+                    columns = list(first.keys())
+                    header = '| ' + ' | '.join(columns) + ' |'
+                    sep = '| ' + ' | '.join(['---'] * len(columns)) + ' |'
+                    body_lines = []
+                    for r in rows:
+                        if isinstance(r, dict):
+                            vals = [str(r.get(c, '')) for c in columns]
+                            body_lines.append('| ' + ' | '.join(vals) + ' |')
+                    return '\n'.join([header, sep] + body_lines)
+
+                def _dict_to_md(d, heading_level=3):
+                    if not isinstance(d, dict):
+                        return str(d)
+                    import json as _json
+                    parts = []
+                    # Специально обрабатываем только 'task' на текущем уровне
+                    if 'task' in d:
+                        parts.append(f"{'#' * heading_level} Задача\n{d.get('task')}")
+                    # Прочие ключи — универсально
+                    for k, v in d.items():
+                        if k == 'task':
+                            continue
+                        header = f"{'#' * heading_level} {k}"
+                        if isinstance(v, list):
+                            parts.append(header)
+                            if v and isinstance(v[0], dict):
+                                table = _list_of_dicts_to_md_table(v)
+                                if table:
+                                    parts.append(table)
+                                else:
+                                    parts.append(_json.dumps(v, ensure_ascii=False, indent=2))
+                            else:
+                                bullets = '\n'.join([f"- {str(x)}" for x in v]) if v else ''
+                                parts.append(bullets)
+                        elif isinstance(v, dict):
+                            parts.append(header)
+                            parts.append(_dict_to_md(v, heading_level=heading_level + 1))
+                        else:
+                            parts.append(header)
+                            parts.append(str(v))
+                    return '\n\n'.join(parts)
+
+                def _parse_json_str(s):
+                    s = str(s).strip()
+                    # Всегда пытаемся разобрать как JSON, затем как Python-литерал
+                    try:
+                        obj = json.loads(s)
+                        if isinstance(obj, dict):
+                            return _dict_to_md(obj)
+                        elif isinstance(obj, list):
+                            table = _list_of_dicts_to_md_table(obj)
+                            if table:
+                                return table
+                            return json.dumps(obj, ensure_ascii=False, indent=2)
+                        return str(obj)
+                    except Exception:
+                        try:
+                            obj = ast.literal_eval(s)
+                            if isinstance(obj, dict):
+                                return _dict_to_md(obj)
+                            elif isinstance(obj, list):
+                                table = _list_of_dicts_to_md_table(obj)
+                                if table:
+                                    return table
+                                return json.dumps(obj, ensure_ascii=False, indent=2)
+                            return str(obj)
+                        except Exception:
+                            return s
+
+                # Нормализуем result в список markdown-блоков
+                if isinstance(result, dict):
+                    result = [_dict_to_md(result)]
+                elif isinstance(result, str):
+                    result = [_parse_json_str(result)]
+                elif isinstance(result, list):
+                    normalized = []
+                    for item in result:
+                        if isinstance(item, dict):
+                            normalized.append(_dict_to_md(item))
+                        elif isinstance(item, str):
+                            normalized.append(_parse_json_str(item))
+                        else:
+                            normalized.append(str(item))
+                    result = normalized
+                else:
+                    result = [str(result)]
+            except Exception as e:
+                print(f"____Ошибка при преобразовании JSON результата: {e}")
+
+            # Проверяем наличие директории с графиками
+            plots_dir = 'plots'
+            os.makedirs(plots_dir, exist_ok=True)
+
+            # Добавляем MD файлы
+            md_files = []
+            if os.path.exists(plots_dir):
+                md_files = [f for f in os.listdir(plots_dir) if f'{session_id}' in f and f.endswith('.md')]
+                print(f"Найдено {len(md_files)} MD файлов: {md_files}")
+                # Сортируем файлы по времени создания
+                md_files = self._sort_files_by_creation_time(md_files, plots_dir)
+
+            # Обрабатываем каждый MD файл
+            for i, md_file in enumerate(md_files, 1):
+                md_path = os.path.join(plots_dir, md_file)
+                try:
+                    # Получаем дату создания файла
+                    try:
+                        creation_time = os.path.getctime(md_path)
+                        creation_time_str = datetime.fromtimestamp(creation_time).strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        creation_time_str = "Время создания неизвестно"
+                        
+                    with open(md_path, 'r', encoding='utf-8') as f:
+                        md_content = f.read()
+                        
+                        # Добавляем MD файл в результат
+                        result.append(f"## {md_file} ({creation_time_str})")
+                        result.append(md_content)
+                        result.append('')
+                except Exception as e:
+                    logging.error(f"Ошибка при обработке MD файла {md_file}: {str(e)}")
+                    print(f"Ошибка при обработке MD файла {md_file}: {str(e)}")
+                    continue
+
+            # Сначала обрабатываем встроенные диаграммы (важно сделать это до преобразования в HTML)
+            processed_result = self._detect_and_save_mermaid(result, session_id, base_url)
+            
+            plot_files = []
+            # Получаем список всех PNG файлов
+            if not os.path.exists(plots_dir):
+                logging.error("Директория с графиками не найдена")
+            else:
+                plot_files = [f for f in os.listdir(plots_dir) if f'{session_id}' in f and f.endswith('.png')]
+                # Сортируем файлы по времени создания
+                plot_files = self._sort_files_by_creation_time(plot_files, plots_dir)
+            
+            if not plot_files:
+                logging.warning("PNG графики не найдены")
+
+            # Создаем HTML страницу
+            html_content = [
+                '<!DOCTYPE html>',
+                '<html>',
+                '<head>',
+                '    <meta charset="utf-8">',
+                '    <title>Визуализация данных</title>',
+                '    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>',
+                '    <script>',
+                '        document.addEventListener("DOMContentLoaded", function() {',
+                '            mermaid.initialize({',
+                '                startOnLoad: true,',
+                '                theme: "default",',
+                '                securityLevel: "loose",',
+                '                htmlLabels: true,',
+                '                flowchart: { useMaxWidth: false, htmlLabels: true },',
+                '                sequence: { useMaxWidth: false, htmlLabels: true },',
+                '                gantt: { useMaxWidth: false },',
+                '                journey: { useMaxWidth: false }',
+                '            });',
+                '        });',
+                '    </script>',
+                '    <style>',
+                '        body {',
+                '            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;',
+                '            margin: 0;',
+                '            padding: 0;',
+                '            background-color: #f8f9fa;',
+                '            color: #333;',
+                '        }',
+                '        .markdown-body {',
+                '            box-sizing: border-box;',
+                '            min-width: 200px;',
+                '            max-width: 980px;',
+                '            margin: 0 auto;',
+                '            padding: 45px;',
+                '            background-color: #fff;',
+                '            border-radius: 8px;',
+                '            box-shadow: 0 2px 10px rgba(0,0,0,0.05);',
+                '        }',
+                '        .plot-container {',
+                '            max-width: 800px;',
+                '            margin: 20px auto;',
+                '            padding: 20px;',
+                '            border: 1px solid #ddd;',
+                '            border-radius: 8px;',
+                '            background-color: #fff;',
+                '            box-shadow: 0 2px 5px rgba(0,0,0,0.05);',
+                '        }',
+                '        .uml-container {',
+                '            max-width: 800px;',
+                '            margin: 20px auto;',
+                '            padding: 20px;',
+                '            border: 1px solid #ddd;',
+                '            border-radius: 8px;',
+                '            background-color: #fff;',
+                '            box-shadow: 0 2px 5px rgba(0,0,0,0.05);',
+                '        }',
+                '        .mermaid-container {',
+                '            max-width: 850px;',
+                '            margin: 30px auto;',
+                '            padding: 0;',
+                '            border-radius: 10px;',
+                '            background-color: #fff;',
+                '            box-shadow: 0 4px 15px rgba(0,0,0,0.08);',
+                '            overflow: hidden;',
+                '        }',
+                '        .mermaid-header {',
+                '            display: flex;',
+                '            justify-content: space-between;',
+                '            align-items: center;',
+                '            padding: 12px 20px;',
+                '            background-color: #f2f3f5;',
+                '            border-bottom: 1px solid #e1e4e8;',
+                '        }',
+                '        .mermaid-title {',
+                '            margin: 0;',
+                '            font-size: 16px;',
+                '            font-weight: 600;',
+                '            color: #444;',
+                '        }',
+                '        .mermaid-controls {',
+                '            display: flex;',
+                '            gap: 10px;',
+                '        }',
+                '        .mermaid-theme-select {',
+                '            padding: 5px 10px;',
+                '            border-radius: 4px;',
+                '            border: 1px solid #ddd;',
+                '            background-color: #fff;',
+                '            color: #555;',
+                '            font-size: 12px;',
+                '            cursor: pointer;',
+                '            transition: all 0.2s;',
+                '        }',
+                '        .mermaid-theme-select:hover {',
+                '            border-color: #bbb;',
+                '        }',
+                '        .mermaid-btn {',
+                '            border: none;',
+                '            background: #fff;',
+                '            color: #555;',
+                '            padding: 5px 10px;',
+                '            border-radius: 4px;',
+                '            cursor: pointer;',
+                '            font-size: 12px;',
+                '            display: flex;',
+                '            align-items: center;',
+                '            gap: 4px;',
+                '            border: 1px solid #ddd;',
+                '            transition: all 0.2s;',
+                '        }',
+                '        .mermaid-btn:hover {',
+                '            background-color: #f0f0f0;',
+                '            color: #000;',
+                '        }',
+                '        .mermaid-content {',
+                '            padding: 20px;',
+                '            overflow: auto;',
+                '            background-color: #fff;',
+                '            position: relative;',
+                '        }',
+                '        .mermaid-svg {',
+                '            margin: 0 auto;',
+                '            text-align: center;',
+                '            overflow: visible !important;',
+                '        }',
+                '        .mermaid-code {',
+                '            display: none;',
+                '            margin-top: 15px;',
+                '            padding: 15px;',
+                '            background-color: #f6f8fa;',
+                '            border-radius: 6px;',
+                '            border: 1px solid #e1e4e8;',
+                '            white-space: pre-wrap;',
+                '            font-family: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;',
+                '            font-size: 14px;',
+                '            line-height: 1.4;',
+                '            overflow-x: auto;',
+                '        }',
+                '        .zoom-controls {',
+                '            position: absolute;',
+                '            bottom: 15px;',
+                '            right: 15px;',
+                '            display: flex;',
+                '            gap: 5px;',
+                '            background: rgba(255,255,255,0.8);',
+                '            padding: 5px;',
+                '            border-radius: 4px;',
+                '            box-shadow: 0 2px 5px rgba(0,0,0,0.1);',
+                '        }',
+                '        .zoom-btn {',
+                '            width: 30px;',
+                '            height: 30px;',
+                '            border: 1px solid #ddd;',
+                '            background: #fff;',
+                '            font-size: 18px;',
+                '            line-height: 30px;',
+                '            text-align: center;',
+                '            cursor: pointer;',
+                '            border-radius: 3px;',
+                '            user-select: none;',
+                '        }',
+                '        .zoom-btn:hover {',
+                '            background: #f5f5f5;',
+                '        }',
+                '        img {',
+                '            max-width: 100%;',
+                '            height: auto;',
+                '            display: block;',
+                '            margin: 0 auto;',
+                '        }',
+                '        h2 {',
+                '            text-align: center;',
+                '            color: #333;',
+                '            margin-top: 0;',
+                '        }',
+                '        .file-time {',
+                '            font-size: 12px;',
+                '            color: #777;',
+                '            font-weight: normal;',
+                '        }',
+                '        .url-with-underscores {',
+                '            font-family: monospace;',
+                '            word-break: break-all;',
+                '            text-decoration: underline;',
+                '        }',
+                '        .toast {',
+                '            position: fixed;',
+                '            bottom: 20px;',
+                '            left: 50%;',
+                '            transform: translateX(-50%);',
+                '            background-color: rgba(0, 0, 0, 0.7);',
+                '            color: white;',
+                '            padding: 10px 20px;',
+                '            border-radius: 4px;',
+                '            opacity: 0;',
+                '            transition: opacity 0.3s;',
+                '            z-index: 1000;',
+                '        }',
+                '        .fadeIn {',
+                '            opacity: 1;',
+                '        }',
+                '        .fadeOut {',
+                '            opacity: 0;',
+                '        }',
+                '        .md-container {',
+                '            max-width: 850px;',
+                '            margin: 30px auto;',
+                '            padding: 0;',
+                '            border-radius: 10px;',
+                '            background-color: #fff;',
+                '            box-shadow: 0 4px 15px rgba(0,0,0,0.08);',
+                '            overflow: hidden;',
+                '        }',
+                '        .md-header {',
+                '            display: flex;',
+                '            justify-content: space-between;',
+                '            align-items: center;',
+                '            padding: 12px 20px;',
+                '            background-color: #f2f3f5;',
+                '            border-bottom: 1px solid #e1e4e8;',
+                '        }',
+                '        .md-title {',
+                '            margin: 0;',
+                '            font-size: 16px;',
+                '            font-weight: 600;',
+                '            color: #444;',
+                '        }',
+                '        .md-controls {',
+                '            display: flex;',
+                '            gap: 10px;',
+                '        }',
+                '        .md-content {',
+                '            padding: 20px;',
+                '        }',
+                '    </style>',
+                '</head>',
+                '<body>',
+                '    <div id="toast" class="toast"></div>'
+            ]
+
+            # Добавляем каждый график в HTML
+            for i, plot_file in enumerate(plot_files, 1):
+                plot_path = os.path.join(plots_dir, plot_file)
+                
+                # Получаем дату создания файла
+                try:
+                    creation_time = os.path.getctime(plot_path)
+                    creation_time_str = datetime.fromtimestamp(creation_time).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    creation_time_str = "Время создания неизвестно"
+                
+                # Конвертируем изображение в base64
+                with open(plot_path, 'rb') as img_file:
+                    import base64
+                    img_data = base64.b64encode(img_file.read()).decode('utf-8')
+                
+                html_content.extend([
+                    '    <div class="plot-container">',
+                    f'        <h2>График {i} <span class="file-time">({creation_time_str})</span></h2>',
+                    f'        <img src="data:image/png;base64,{img_data}" alt="График {i}">',
+                    '    </div>'
+                ])
+
+            try:
+                # Преобразуем список в строку, если это список
+                if isinstance(processed_result, list):
+                    processed_result = ' '.join(map(str, processed_result))
+                
+                processed_result = processed_result.replace("\\n", "\n").replace("\\'", "'").replace("\\\\n", "\n")
+            except Exception as e:
+                print(f"____Ошибка при обработке результата: {e}", traceback.format_exc())
+            
+            # Добавляем результаты с поддержкой markdown
+            html_content.extend([
+                '    <div class="markdown-body">',
+                f'        {processed_result}',
+                '    </div>'
+            ])
+
+            # Добавляем Mermaid диаграммы из файлов
+            mermaid_files = []
+            if os.path.exists(plots_dir):
+                mermaid_files = [f for f in os.listdir(plots_dir) if f'{session_id}' in f and f.endswith('.mermaid')]
+                print(f"Найдено {len(mermaid_files)} mermaid файлов: {mermaid_files}")
+                # Сортируем файлы по времени создания
+                mermaid_files = self._sort_files_by_creation_time(mermaid_files, plots_dir)
+            
+            for i, mermaid_file in enumerate(mermaid_files, 1):
+                try:
+                    mermaid_path = os.path.join(plots_dir, mermaid_file)
+                    
+                    # Получаем дату создания файла для информации
+                    try:
+                        creation_time = os.path.getctime(mermaid_path)
+                        creation_time_str = datetime.fromtimestamp(creation_time).strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception:
+                        creation_time_str = "Время создания неизвестно"
+                    
+                    # Читаем содержимое файла
+                    with open(mermaid_path, 'r', encoding='utf-8') as f:
+                        mermaid_data = f.read().strip()
+                    
+                    # Формируем заголовок для диаграммы из файла
+                    file_title = f"Файл: {mermaid_file.replace('.mermaid', '')}"
+                    
+                    diagram_id = f"mermaid-diagram-{str(uuid.uuid4())[:8]}"
+                    html_container = self._create_mermaid_container(
+                        diagram_id,
+                        mermaid_data,  # Используем оригинальный код диаграммы
+                        i-1,  # Индекс диаграммы (0-based)
+                        file_title,  # Заголовок с именем файла
+                        creation_time_str  # Время создания
+                    )
+                    
+                    # Если удалось создать HTML-контейнер, добавляем его в HTML
+                    if html_container:
+                        html_content.append(html_container)
+                    else:
+                        diagram_id = f"mermaid-diagram-{i}"
+                        content_id = f"mermaid-content-{i}"
+                        code_id = f"mermaid-code-{i}"
+                    
+                        html_content.extend([
+                            f'    <div class="mermaid-container" id="{diagram_id}">',
+                            '        <div class="mermaid-header">',
+                            f'            <h3 class="mermaid-title">Файл: {mermaid_file} <span class="file-time">({creation_time_str})</span></h3>',
+                            '            <div class="mermaid-controls">',
+                            f'                <select class="mermaid-theme-select" onchange="changeTheme(this.value, \'{content_id}\', \'{code_id}\')">',
+                            '                    <option value="default">Светлая тема</option>',
+                            '                    <option value="dark">Темная тема</option>',
+                            '                    <option value="forest">Лесная тема</option>',
+                            '                    <option value="neutral">Нейтральная тема</option>',
+                            '                </select>',
+                            f'                <button class="mermaid-btn" onclick="toggleCode(\'{code_id}\')">',
+                            '                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg>',
+                            '                    Показать код',
+                            '                </button>',
+                            f'                <button class="mermaid-btn" onclick="copyToClipboard(\'{code_id}\')">',
+                            '                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>',
+                            '                    Копировать',
+                            '                </button>',
+                            f'                <button class="mermaid-btn" onclick="saveSvg(\'{content_id}\', \'diagram_{i}\')">',
+                            '                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>',
+                            '                    Сохранить SVG',
+                            '                </button>',
+                            f'                <button class="mermaid-btn" onclick="savePng(\'{content_id}\', \'diagram_{i}\')">',
+                            '                    <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>',
+                            '                    Сохранить PNG',
+                            '                </button>',
+                            '            </div>',
+                            '        </div>',
+                            f'        <div class="mermaid-content" id="{content_id}">',
+                            f'            <div class="mermaid">{mermaid_data}</div>',
+                            '            <div class="zoom-controls">',
+                            f'                <div class="zoom-btn" onclick="zoomIn(\'{content_id}\')">+</div>',
+                            f'                <div class="zoom-btn" onclick="zoomOut(\'{content_id}\')">-</div>',
+                            f'                <div class="zoom-btn" onclick="resetZoom(\'{content_id}\')">↺</div>',
+                            '            </div>',
+                            '        </div>',
+                            f'        <pre class="mermaid-code" id="{code_id}">{mermaid_data}</pre>',
+                            '    </div>'
+                        ])
+                        logging.warning(f"Использован запасной метод отображения для файла {mermaid_file}")
+                except Exception as e:
+                    logging.error(f"Ошибка при обработке файла mermaid {mermaid_file}: {str(e)}")
+                    print(f"Ошибка при обработке файла mermaid {mermaid_file}: {str(e)}")
+                    continue
+
+            # Получаем список всех UML файлов
+            plot_files = []
+            if not os.path.exists(plots_dir):
+                logging.error("Директория с графиками не найдена")
+            else:
+                plot_files = [f for f in os.listdir(plots_dir) if f'{session_id}' in f and f.endswith('.puml')]
+                # Сортируем файлы по времени создания
+                plot_files = self._sort_files_by_creation_time(plot_files, plots_dir)
+
+            # Добавляем каждый UML в HTML
+            for i, plot_file in enumerate(plot_files, 1):
+                plot_path = os.path.join(plots_dir, plot_file)
+                
+                # Получаем дату создания файла
+                try:
+                    creation_time = os.path.getctime(plot_path)
+                    creation_time_str = datetime.fromtimestamp(creation_time).strftime('%Y-%m-%d %H:%M:%S')
+                except Exception:
+                    creation_time_str = "Время создания неизвестно"
+                
+                # Добавляем UML в HTML
+                with open(plot_path, 'r') as uml_file:
+                    uml_data = uml_file.read()
+                
+                html_content.extend([
+                    '    <div class="uml-container">',
+                    f'        <h2>UML {i} <span class="file-time">({creation_time_str})</span></h2>',
+                    f'        <pre>{uml_data}</pre>',
+                    '    </div>'
+                ])
+
+            # Добавляем JavaScript для интерактивных возможностей
+            html_content.extend([
+                '    <script>',
+                '        // Функция для копирования кода диаграммы',
+                '        function copyToClipboard(elementId) {',
+                '            const codeElement = document.getElementById(elementId);',
+                '            const textToCopy = codeElement.textContent || codeElement.innerText;',
+                '            navigator.clipboard.writeText(textToCopy)',
+                '                .then(() => showToast("Код скопирован в буфер обмена!"))',
+                '                .catch(err => showToast("Ошибка при копировании: " + err));',
+                '        }',
+                '',
+                '        // Функция для управления отображением MD контента',
+                '        function toggleMdContent(elementId) {',
+                '            const container = document.getElementById(elementId);',
+                '            const content = container.querySelector(".md-content");',
+                '            const button = container.querySelector(".mermaid-btn");',
+                '',
+                '            if (content.style.display === "none") {',
+                '                content.style.display = "block";',
+                '                button.innerHTML = \'<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg> Показать\';',
+                '            } else {',
+                '                content.style.display = "none";',
+                '                button.innerHTML = \'<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg> Скрыть\';',
+                '            }',
+                '        }',
+                '',
+                '        // Функция для отображения/скрытия кода диаграммы',
+                '        function toggleCode(elementId) {',
+                '            const codeBlock = document.getElementById(elementId);',
+                '            const isDisplayed = codeBlock.style.display === "block";',
+                '            codeBlock.style.display = isDisplayed ? "none" : "block";',
+                '            const btn = event.currentTarget;',
+                '            btn.innerHTML = isDisplayed ? ',
+                '                `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"></polyline><polyline points="8 6 2 12 8 18"></polyline></svg> Показать код` : ',
+                '                `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"></polyline></svg> Скрыть код`;',
+                '        }',
+                '',
+                '        // Функция для оповещений',
+                '        function showToast(message) {',
+                '            const toast = document.getElementById("toast");',
+                '            toast.textContent = message;',
+                '            toast.classList.add("fadeIn");',
+                '            setTimeout(() => {',
+                '                toast.classList.remove("fadeIn");',
+                '                toast.classList.add("fadeOut");',
+                '                setTimeout(() => {',
+                '                    toast.classList.remove("fadeOut");',
+                '                }, 300);',
+                '            }, 2000);',
+                '        }',
+                '',
+                '        // Функция для сохранения диаграммы в формате SVG',
+                '        function saveSvg(contentId, filename) {',
+                '            const container = document.getElementById(contentId);',
+                '            const svg = container.querySelector("svg");',
+                '            if (!svg) {',
+                '                showToast("Диаграмма не найдена");',
+                '                return;',
+                '            }',
+                '',
+                '            try {',
+                '                // Клонируем SVG для манипуляций',
+                '                const svgClone = svg.cloneNode(true);',
+                '                ',
+                '                // Получаем текущий масштаб из атрибута transform или dataset',
+                '                let scale = getScale(svg);',
+                '                ',
+                '                // Применяем текущий масштаб к клонированному SVG',
+                '                let transformValue = svgClone.getAttribute("transform") || "";',
+                '                if (transformValue && !transformValue.includes("scale")) {',
+                '                    transformValue += ` scale(${scale})`;',
+                '                } else if (!transformValue) {',
+                '                    transformValue = `scale(${scale})`;',
+                '                }',
+                '                svgClone.setAttribute("transform", transformValue);',
+                '                ',
+                '                // Добавляем необходимые атрибуты для standalone SVG',
+                '                svgClone.setAttribute("xmlns", "http://www.w3.org/2000/svg");',
+                '                svgClone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");',
+                '                ',
+                '                // Устанавливаем размеры, если они не заданы',
+                '                if (!svgClone.hasAttribute("width") || !svgClone.hasAttribute("height")) {',
+                '                    try {',
+                '                        const bbox = svg.getBBox();',
+                '                        svgClone.setAttribute("width", bbox.width * scale);',
+                '                        svgClone.setAttribute("height", bbox.height * scale);',
+                '                    } catch (e) {',
+                '                        // Если getBBox не работает, используем viewBox или фиксированный размер',
+                '                        if (svg.viewBox.baseVal) {',
+                '                            svgClone.setAttribute("width", svg.viewBox.baseVal.width * scale);',
+                '                            svgClone.setAttribute("height", svg.viewBox.baseVal.height * scale);',
+                '                        } else {',
+                '                            svgClone.setAttribute("width", "800");',
+                '                            svgClone.setAttribute("height", "600");',
+                '                        }',
+                '                    }',
+                '                }',
+                '                ',
+                '                // Получаем стили из документа, которые могут влиять на SVG',
+                '                const styleSheets = document.styleSheets;',
+                '                let cssText = "";',
+                '                for (let i = 0; i < styleSheets.length; i++) {',
+                '                    try {',
+                '                        const cssRules = styleSheets[i].cssRules || styleSheets[i].rules;',
+                '                        for (let j = 0; j < cssRules.length; j++) {',
+                '                            // Получаем только те стили, которые могут влиять на SVG',
+                '                            if (cssRules[j].selectorText && ',
+                '                                (cssRules[j].selectorText.includes(".mermaid") || ',
+                '                                 cssRules[j].selectorText.includes("svg") || ',
+                '                                 cssRules[j].selectorText.includes("path") || ',
+                '                                 cssRules[j].selectorText.includes("polygon") || ',
+                '                                 cssRules[j].selectorText.includes("rect") || ',
+                '                                 cssRules[j].selectorText.includes("text") || ',
+                '                                 cssRules[j].selectorText.includes("g "))) {',
+                '                                cssText += cssRules[j].cssText;',
+                '                            }',
+                '                        }',
+                '                    } catch (e) {',
+                '                        console.warn("Не удалось получить стили:", e);',
+                '                    }',
+                '                }',
+                '                ',
+                '                // Создаем инлайновые стили',
+                '                const styleElement = document.createElement("style");',
+                '                styleElement.type = "text/css";',
+                '                styleElement.appendChild(document.createTextNode(cssText));',
+                '                ',
+                '                // Добавляем стили в начало SVG',
+                '                if (svgClone.firstChild) {',
+                '                    svgClone.insertBefore(styleElement, svgClone.firstChild);',
+                '                } else {',
+                '                    svgClone.appendChild(styleElement);',
+                '                }',
+                '                ',
+                '                // Получаем HTML код SVG элемента',
+                '                const svgData = new XMLSerializer().serializeToString(svgClone);',
+                '                ',
+                '                // Создаем Blob из SVG кода',
+                '                const svgBlob = new Blob([svgData], {type: "image/svg+xml;charset=utf-8"});',
+                '                ',
+                '                // Создаем URL для скачивания',
+                '                const url = URL.createObjectURL(svgBlob);',
+                '                ',
+                '                // Создаем ссылку для скачивания и симулируем клик',
+                '                const downloadLink = document.createElement("a");',
+                '                downloadLink.href = url;',
+                '                downloadLink.download = `${filename}.svg`;',
+                '                document.body.appendChild(downloadLink);',
+                '                downloadLink.click();',
+                '                document.body.removeChild(downloadLink);',
+                '                ',
+                '                // Освобождаем ресурсы',
+                '                URL.revokeObjectURL(url);',
+                '                ',
+                '                showToast("SVG файл сохранен");',
+                '            } catch (e) {',
+                '                console.error("Ошибка при сохранении SVG:", e);',
+                '                showToast("Ошибка при сохранении SVG: " + e.message);',
+                '            }',
+                '        }',
+                '',
+                '        // Функция для сохранения диаграммы в формате PNG',
+                '        function savePng(contentId, filename) {',
+                '            const container = document.getElementById(contentId);',
+                '            const svg = container.querySelector("svg");',
+                '            if (!svg) {',
+                '                showToast("Диаграмма не найдена");',
+                '                return;',
+                '            }',
+                '',
+                '            try {',
+                '                // Клонируем SVG для манипуляций',
+                '                const svgClone = svg.cloneNode(true);',
+                '                ',
+                '                // Получаем текущий масштаб из атрибута transform или dataset',
+                '                let scale = getScale(svg);',
+                '                ',
+                '                // Получаем размеры SVG',
+                '                let bbox;',
+                '                try {',
+                '                    bbox = svg.getBBox();',
+                '                } catch (e) {',
+                '                    // Если getBBox не работает, используем viewBox или фиксированные размеры',
+                '                    console.warn("Не удалось получить getBBox:", e);',
+                '                }',
+                '',
+                '                // Определяем итоговые размеры диаграммы',
+                '                const width = (bbox ? bbox.width : (svg.viewBox.baseVal.width || 800));',
+                '                const height = (bbox ? bbox.height : (svg.viewBox.baseVal.height || 600));',
+                '                ',
+                '                // Добавляем необходимые атрибуты для standalone SVG',
+                '                svgClone.setAttribute("xmlns", "http://www.w3.org/2000/svg");',
+                '                svgClone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");',
+                '                ',
+                '                // Применяем текущий масштаб к клонированному SVG',
+                '                let transformValue = svgClone.getAttribute("transform") || "";',
+                '                if (transformValue && !transformValue.includes("scale")) {',
+                '                    transformValue += ` scale(${scale})`;',
+                '                } else if (!transformValue) {',
+                '                    transformValue = `scale(${scale})`;',
+                '                }',
+                '                svgClone.setAttribute("transform", transformValue);',
+                '                ',
+                '                // Получаем HTML код SVG элемента',
+                '                const svgData = new XMLSerializer().serializeToString(svgClone);',
+                '                ',
+                '                // Получаем стили из документа, которые могут влиять на SVG',
+                '                const styleSheets = document.styleSheets;',
+                '                let cssText = "";',
+                '                for (let i = 0; i < styleSheets.length; i++) {',
+                '                    try {',
+                '                        const cssRules = styleSheets[i].cssRules || styleSheets[i].rules;',
+                '                        for (let j = 0; j < cssRules.length; j++) {',
+                '                            // Получаем только те стили, которые могут влиять на SVG',
+                '                            if (cssRules[j].selectorText && ',
+                '                                (cssRules[j].selectorText.includes(".mermaid") || ',
+                '                                 cssRules[j].selectorText.includes("svg") || ',
+                '                                 cssRules[j].selectorText.includes("path") || ',
+                '                                 cssRules[j].selectorText.includes("polygon"))) {',
+                '                                cssText += cssRules[j].cssText;',
+                '                            }',
+                '                        }',
+                '                    } catch (e) {',
+                '                        console.warn("Не удалось получить стили:", e);',
+                '                    }',
+                '                }',
+                '                ',
+                '                // Создаем инлайновые стили',
+                '                const styleElement = document.createElement("style");',
+                '                styleElement.type = "text/css";',
+                '                styleElement.appendChild(document.createTextNode(cssText));',
+                '                ',
+                '                // Добавляем стили в начало SVG',
+                '                if (svgClone.firstChild) {',
+                '                    svgClone.insertBefore(styleElement, svgClone.firstChild);',
+                '                } else {',
+                '                    svgClone.appendChild(styleElement);',
+                '                }',
+                '                ',
+                '                // Обновляем SVG данные с добавленными стилями',
+                '                const svgDataWithStyles = new XMLSerializer().serializeToString(svgClone);',
+                '                ',
+                '                // Создаем изображение из SVG',
+                '                const img = new Image();',
+                '                img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgDataWithStyles)));',
+                '                ',
+                '                img.onload = function() {',
+                '                    // Создаем canvas элемент для конвертации SVG в PNG',
+                '                    const canvas = document.createElement("canvas");',
+                '                    ',
+                '                    // Применяем масштабирование с учетом текущей трансформации',
+                '                    const scaleFactor = 2 * scale; // Увеличиваем разрешение для лучшего качества',
+                '                    canvas.width = width * scaleFactor;',
+                '                    canvas.height = height * scaleFactor;',
+                '                    ',
+                '                    // Получаем контекст canvas',
+                '                    const ctx = canvas.getContext("2d");',
+                '                    ',
+                '                    // Устанавливаем белый фон',
+                '                    ctx.fillStyle = "#FFFFFF";',
+                '                    ctx.fillRect(0, 0, canvas.width, canvas.height);',
+                '                    ',
+                '                    // Масштабируем для лучшего качества',
+                '                    ctx.scale(scaleFactor, scaleFactor);',
+                '                    ',
+                '                    // Рисуем SVG на canvas',
+                '                    ctx.drawImage(img, 0, 0);',
+                '                    ',
+                '                    // Конвертируем canvas в PNG с максимальным качеством',
+                '                    try {',
+                '                        const dataUrl = canvas.toDataURL("image/png", 1.0);',
+                '                        ',
+                '                        // Создаем ссылку для скачивания и симулируем клик',
+                '                        const downloadLink = document.createElement("a");',
+                '                        downloadLink.href = dataUrl;',
+                '                        downloadLink.download = `${filename}.png`;',
+                '                        document.body.appendChild(downloadLink);',
+                '                        downloadLink.click();',
+                '                        document.body.removeChild(downloadLink);',
+                '                        ',
+                '                        showToast("PNG файл сохранен");',
+                '                    } catch (e) {',
+                '                        console.error("Ошибка при экспорте PNG:", e);',
+                '                        showToast("Ошибка при экспорте PNG: " + e.message);',
+                '                    }',
+                '                };',
+                '                ',
+                '                img.onerror = function(e) {',
+                '                    console.error("Ошибка при загрузке SVG:", e);',
+                '                    showToast("Ошибка при загрузке SVG");',
+                '                };',
+                '            } catch (e) {',
+                '                console.error("Ошибка при сохранении PNG:", e);',
+                '                showToast("Ошибка при сохранении PNG: " + e.message);',
+                '            }',
+                '        }',
+                '',
+                '        // Функция для изменения темы диаграммы',
+                '        function changeTheme(theme, contentId, codeId) {',
+                '            const container = document.getElementById(contentId);',
+                '            const codeBlock = document.getElementById(codeId);',
+                '            if (container && codeBlock) {',
+                '                // Получаем код и декодируем HTML-сущности',
+                '                let mermaidCode = codeBlock.textContent;',
+                '                mermaidCode = mermaidCode.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");',
+                '                container.innerHTML = "";',
+                '                ',
+                '                // Инициализируем Mermaid с новой темой',
+                '                mermaid.initialize({',
+                '                    theme: theme,',
+                '                    startOnLoad: true,',
+                '                    securityLevel: "loose",',
+                '                    htmlLabels: true,',
+                '                    flowchart: { useMaxWidth: false, htmlLabels: true },',
+                '                    sequence: { useMaxWidth: false, htmlLabels: true },',
+                '                    gantt: { useMaxWidth: false },',
+                '                    journey: { useMaxWidth: false }',
+                '                });',
+                '                ',
+                '                // Заново рендерим диаграмму',
+                '                try {',
+                '                    const tempContainer = document.createElement("div");',
+                '                    tempContainer.className = "mermaid";',
+                '                    tempContainer.textContent = mermaidCode;',
+                '                    container.appendChild(tempContainer);',
+                '                    ',
+                '                    // Добавляем зону управления масштабом',
+                '                    const zoomControls = document.createElement("div");',
+                '                    zoomControls.className = "zoom-controls";',
+                '                    zoomControls.innerHTML = `',
+                '                        <div class="zoom-btn" onclick="zoomIn(\'${contentId}\')">+</div>',
+                '                        <div class="zoom-btn" onclick="zoomOut(\'${contentId}\')">-</div>',
+                '                        <div class="zoom-btn" onclick="resetZoom(\'${contentId}\')">↺</div>',
+                '                    `;',
+                '                    container.appendChild(zoomControls);',
+                '                    ',
+                '                    mermaid.init(undefined, tempContainer);',
+                '                } catch (error) {',
+                '                    console.error("Ошибка при рендеринге диаграммы:", error);',
+                '                    container.innerHTML = "<div class=\'error\'>Ошибка рендеринга: " + error.message + "</div>";',
+                '                }',
+                '            }',
+                '        }',
+                '',
+                '        // Инициализация панорамирования и масштабирования',
+                '        document.addEventListener("DOMContentLoaded", function() {',
+                '            // Добавляем функционал масштабирования для диаграмм',
+                '            document.querySelectorAll(".mermaid-content").forEach(container => {',
+                '                const svgContainer = container.querySelector("svg");',
+                '                if (svgContainer) {',
+                '                    let scale = 1;',
+                '                    container.style.transform = `scale(${scale})`;',
+                '                    container.style.transformOrigin = "center center";',
+                '                }',
+                '            });',
+                '        });',
+                '',
+                '        // Функции для масштабирования',
+                '        function zoomIn(elementId) {',
+                '            const container = document.getElementById(elementId);',
+                '            const svg = container.querySelector("svg");',
+                '            if (svg) {',
+                '                // Получаем текущий масштаб из transform или устанавливаем 1, если не задан',
+                '                let scale = getScale(svg);',
+                '                // Увеличиваем масштаб',
+                '                scale += 0.1;',
+                '                svg.style.transform = `scale(${scale})`;',
+                '                svg.dataset.scale = scale;',
+                '            }',
+                '        }',
+                '',
+                '        function zoomOut(elementId) {',
+                '            const container = document.getElementById(elementId);',
+                '            const svg = container.querySelector("svg");',
+                '            if (svg) {',
+                '                let scale = getScale(svg);',
+                '                // Уменьшаем масштаб, но не меньше 0.5',
+                '                scale = Math.max(0.5, scale - 0.1);',
+                '                svg.style.transform = `scale(${scale})`;',
+                '                svg.dataset.scale = scale;',
+                '            }',
+                '        }',
+                '',
+                '        function resetZoom(elementId) {',
+                '            const container = document.getElementById(elementId);',
+                '            const svg = container.querySelector("svg");',
+                '            if (svg) {',
+                '                svg.style.transform = "scale(1)";',
+                '                svg.dataset.scale = 1;',
+                '            }',
+                '        }',
+                '',
+                '        function getScale(element) {',
+                '            // Получаем текущий масштаб из data-атрибута или transform',
+                '            let scale = parseFloat(element.dataset.scale || "1");',
+                '            if (isNaN(scale)) scale = 1;',
+                '            return scale;',
+                '        }',
+                '',
+                '        // Делаем диаграммы перетаскиваемыми',
+                '        document.addEventListener("DOMContentLoaded", function() {',
+                '            setTimeout(() => {',
+                '                document.querySelectorAll(".mermaid-content svg").forEach(svg => {',
+                '                    makeDraggable(svg);',
+                '                });',
+                '            }, 1000); // Небольшая задержка, чтобы диаграммы успели отрендериться',
+                '        });',
+                '',
+                '        function makeDraggable(element) {',
+                '            let pos1 = 0, pos2 = 0, pos3 = 0, pos4 = 0;',
+                '            element.style.cursor = "move";',
+                '            element.style.userSelect = "none";',
+                '',
+                '            element.onmousedown = dragMouseDown;',
+                '',
+                '            function dragMouseDown(e) {',
+                '                e = e || window.event;',
+                '                e.preventDefault();',
+                '                // Запоминаем начальную позицию курсора',
+                '                pos3 = e.clientX;',
+                '                pos4 = e.clientY;',
+                '                document.onmouseup = closeDragElement;',
+                '                // Вызываем функцию при движении курсора',
+                '                document.onmousemove = elementDrag;',
+                '            }',
+                '',
+                '            function elementDrag(e) {',
+                '                e = e || window.event;',
+                '                e.preventDefault();',
+                '                // Рассчитываем новую позицию',
+                '                pos1 = pos3 - e.clientX;',
+                '                pos2 = pos4 - e.clientY;',
+                '                pos3 = e.clientX;',
+                '                pos4 = e.clientY;',
+                '',
+                '                // Получаем текущую позицию из transform',
+                '                let transform = element.style.transform || "";',
+                '                let translateMatch = transform.match(/translate\\(([-\\d.]+)px,\\s*([-\\d.]+)px\\)/);',
+                '                let translateX = translateMatch ? parseFloat(translateMatch[1]) : 0;',
+                '                let translateY = translateMatch ? parseFloat(translateMatch[2]) : 0;',
+                '',
+                '                // Получаем текущий масштаб',
+                '                let scaleMatch = transform.match(/scale\\(([-\\d.]+)\\)/);',
+                '                let scale = scaleMatch ? parseFloat(scaleMatch[1]) : 1;',
+                '',
+                '                // Обновляем позицию, сохраняя масштаб',
+                '                translateX = translateX - pos1;',
+                '                translateY = translateY - pos2;',
+                '                element.style.transform = `translate(${translateX}px, ${translateY}px) scale(${scale})`;',
+                '            }',
+                '',
+                '            function closeDragElement() {',
+                '                // Прекращаем движение при отпускании кнопки мыши',
+                '                document.onmouseup = null;',
+                '                document.onmousemove = null;',
+                '            }',
+                '        }',
+                '    </script>',
+                '</body>',
+                '</html>'
+            ])
+
+            html_content = '\n'.join(html_content)
+            html_content = html_content.replace("\\n", "<br>").replace("\\'", "'").replace("\\\\n", "<br>")
+            # Сохраняем HTML файл
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(html_content)
+
+            logging.info(f"HTML страница с графиками сохранена в {output_path}")
+            self.clean_data(session_id)            
+            return output_path
+            
+        except Exception as e:
+            print(f"Ошибка при создании HTML-страницы: {str(e)}")
+            logging.error(f"Ошибка при создании HTML-страницы: {str(e)}")
+            return None
+        finally:
+            self.clean_data(session_id)
+
+
+    def _enhance_mermaid_code(self, code):
+        """
+        Улучшает код Mermaid диаграммы, добавляя дополнительные стили и форматирование.
+        
+        Args:
+            code (str): Исходный код Mermaid диаграммы
+            
+        Returns:
+            str: Улучшенный код диаграммы
+        """
+        # Добавляем стили и улучшения для различных типов диаграмм
+        enhanced_code = code.strip()
+        
+        # Добавляем отступы и улучшаем читаемость
+        lines = enhanced_code.split('\n')
+        enhanced_lines = [lines[0]]  # Сохраняем первую строку (тип диаграммы)
+        
+        for line in lines[1:]:
+            # Добавляем отступы и улучшаем форматирование
+            if line.strip():
+                enhanced_lines.append('    ' + line.strip())
+        
+        return '\n'.join(enhanced_lines)
+
+    def _enhance_flowchart(self, code):
+        """
+        Улучшает код флоучарта, добавляя цвета и стили.
+        
+        Args:
+            code (str): Исходный код флоучарта
+            
+        Returns:
+            str: Улучшенный код флоучарта
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        # Добавляем цвета для узлов
+        color_map = {
+            'start': 'fill:#2ecc71,stroke:#27ae60',
+            'process': 'fill:#3498db,stroke:#2980b9',
+            'decision': 'fill:#e74c3c,stroke:#c0392b',
+            'end': 'fill:#f39c12,stroke:#d35400'
+        }
+        
+        for node_type, style in color_map.items():
+            enhanced_code = enhanced_code.replace(f'class {node_type}', f'class {node_type} {style}')
+        
+        return enhanced_code
+
+    def _enhance_sequence_diagram(self, code):
+        """
+        Улучшает код диаграммы последовательности, добавляя стили и цвета.
+        
+        Args:
+            code (str): Исходный код диаграммы последовательности
+            
+        Returns:
+            str: Улучшенный код диаграммы последовательности
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        return enhanced_code
+        # Добавляем стили для участников
+        enhanced_code += '\n\n    %% Стили участников\n'
+        enhanced_code += '    classDef actor fill:#f1c40f,stroke:#f39c12;\n'
+        enhanced_code += '    classDef system fill:#3498db,stroke:#2980b9;\n'
+        
+        return enhanced_code
+
+    def _enhance_class_diagram(self, code):
+        """
+        Улучшает код диаграммы классов, добавляя цвета и стили.
+        
+        Args:
+            code (str): Исходный код диаграммы классов
+            
+        Returns:
+            str: Улучшенный код диаграммы классов
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        # Добавляем цвета для классов
+        enhanced_code += '\n\n    %% Стили классов\n'
+        enhanced_code += '    classDef publicClass fill:#2ecc71,stroke:#27ae60,color:#fff;\n'
+        enhanced_code += '    classDef privateClass fill:#e74c3c,stroke:#c0392b,color:#fff;\n'
+        enhanced_code += '    classDef abstractClass fill:#3498db,stroke:#2980b9,color:#fff,stroke-dasharray: 5 2;\n'
+        
+        return enhanced_code
+
+    def _enhance_gantt(self, code):
+        """
+        Улучшает код диаграммы Ганта, добавляя цвета и стили.
+        
+        Args:
+            code (str): Исходный код диаграммы Ганта
+            
+        Returns:
+            str: Улучшенный код диаграммы Ганта
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        # Добавляем стили для задач
+        enhanced_code += '\n\n    %% Стили задач\n'
+        enhanced_code += '    classDef active fill:#2ecc71,stroke:#27ae60;\n'
+        enhanced_code += '    classDef completed fill:#3498db,stroke:#2980b9;\n'
+        enhanced_code += '    classDef delayed fill:#e74c3c,stroke:#c0392b;\n'
+        
+        return enhanced_code
+
+    def _enhance_state_diagram(self, code):
+        """
+        Улучшает код диаграммы состояний, добавляя цвета и стили.
+        
+        Args:
+            code (str): Исходный код диаграммы состояний
+            
+        Returns:
+            str: Улучшенный код диаграммы состояний
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        # Добавляем цвета для состояний
+        color_map = {
+            'initial': 'fill:#2ecc71,stroke:#27ae60',
+            'final': 'fill:#e74c3c,stroke:#c0392b',
+            'active': 'fill:#3498db,stroke:#2980b9',
+            'waiting': 'fill:#f39c12,stroke:#d35400'
+        }
+        
+        for state_type, style in color_map.items():
+            enhanced_code = enhanced_code.replace(f'class {state_type}', f'class {state_type} {style}')
+        
+        return enhanced_code
+
+    def _enhance_pie_chart(self, code):
+        """
+        Улучшает код круговой диаграммы, добавляя цвета и стили.
+        
+        Args:
+            code (str): Исходный код круговой диаграммы
+            
+        Returns:
+            str: Улучшенный код круговой диаграммы
+        """
+        enhanced_code = self._enhance_mermaid_code(code)
+        
+        # Добавляем палитру цветов
+        colors = [
+            '#3498db', '#2ecc71', '#e74c3c', 
+            '#f39c12', '#9b59b6', '#1abc9c'
+        ]
+        
+        # Добавляем цвета для секторов
+        for i, color in enumerate(colors):
+            enhanced_code = enhanced_code.replace(
+                f'section {i+1}', 
+                f'section {i+1} fill:{color}'
+            )
+        
+        return enhanced_code
+
+    def _get_state_color(self, state_name):
+        """
+        Возвращает цвет для состояния.
+        
+        Args:
+            state_name (str): Название состояния
+            
+        Returns:
+            str: Цвет для состояния
+        """
+        color_map = {
+            'initial': '#2ecc71',     # Зеленый
+            'final': '#e74c3c',       # Красный
+            'active': '#3498db',      # Синий
+            'waiting': '#f39c12',     # Оранжевый
+            'error': '#c0392b',       # Темно-красный
+            'success': '#27ae60',     # Темно-зеленый
+            'pending': '#95a5a6'      # Серый
+        }
+        
+        return color_map.get(state_name.lower(), '#34495e')  # По умолчанию темно-синий
+
+    def clean_data(self, session_id):
+        #return
+        """Удаляет файлы с суффиксом _{session_id} в каталоге plots."""
+        for file in os.listdir('plots'):
+            if f'_{session_id}' in file:
+                os.remove(os.path.join('plots', file))
+
+    def _detect_and_save_mermaid(self, result, session_id, base_url=None):
+        """
+        Обнаруживает и сохраняет Mermaid-диаграммы из результата в файл.
+        
+        Args:
+            result (list or str): Результаты для анализа
+            session_id (str): Идентификатор сессии
+            
+            
+        Returns:
+            list или str: Обработанный результат с замененными диаграммами и плейсхолдерами
+        """
+        try:
+            # Преобразуем результат в строку
+            result_str = '\n'.join(result) if isinstance(result, list) else str(result)
+            original_result = result  # Сохраняем исходный результат
+            
+            # Регулярное выражение для поиска блоков Mermaid кода
+            # Порядок шаблонов важен - сначала ищем в markdown-разметке, затем в HTML
+            mermaid_patterns = [
+                # Markdown шаблоны - приоритетный поиск
+                r'```mermaid\s*([\s\S]*?)```',                        # ```mermaid ... ``` в markdown
+                r'(?:^|\n)mermaid\s*\n([\s\S]*?)(?=\n```|$)',          # блоки, начинающиеся с "mermaid"
+                
+                # HTML шаблоны - вторичный поиск
+                r'<pre[\s\S]*?class="mermaid"[\s\S]*?>([\s\S]*?)</pre>',  # <pre class="mermaid">...</pre> в HTML
+                r'<code[\s\S]*?class="mermaid"[\s\S]*?>([\s\S]*?)</code>',  # <code class="mermaid">...</code> в HTML
+                r'<div[\s\S]*?class="mermaid"[\s\S]*?>([\s\S]*?)</div>',  # <div class="mermaid">...</div> в HTML
+                r'class="language-mermaid"[\s\S]*?>([\s\S]*?)</code>',  # код с классом language-mermaid
+                r'class="mermaid"[\s\S]*?>([\s\S]*?)</'               # любой элемент с классом mermaid
+            ]
+            
+            mermaid_count = 0
+            print(f"Анализ текста длиной {len(result_str)} символов на наличие mermaid-диаграмм")
+            
+            # Словарь для хранения обнаруженных диаграмм и их плейсхолдеров
+            mermaid_blocks = {}
+            
+            # Найдем все блоки Mermaid и заменим их на плейсхолдеры
+            processed_text = result_str
+            for pattern in mermaid_patterns:
+                try:
+                    # Находим все совпадения
+                    matches = list(re.finditer(pattern, processed_text, re.DOTALL))
+                    for i, match_obj in enumerate(matches):
+                        try:
+                            # Получаем оригинальный код диаграммы
+                            mermaid_code = match_obj.group(1).strip()
+                            full_match = match_obj.group(0)
+                            
+                            if "Here is the final answer" in mermaid_code:
+                                # Удаляем диаграмму, если она содержит "Here is the final answer"
+                                print(f"Удаляем диаграмму, если она содержит 'Here is the final answer'")
+                                processed_text = processed_text.replace(full_match, "")
+                                continue
+                            
+                            # Выводим обнаруженный код для отладки
+                            pattern_type = "markdown" if "```mermaid" in pattern or "(?:^|\n)mermaid" in pattern else "HTML"
+                            print(f"Найден блок Mermaid кода ({pattern_type}):")
+                            print(f"---START---\n{mermaid_code[:100]}...\n---END---")
+                            
+                            # Создаем уникальный плейсхолдер для этой диаграммы
+                            placeholder = f"MERMAID-PLACEHOLDER-{mermaid_count}"
+                            
+                            # Сохраняем оригинальный код диаграммы
+                            mermaid_blocks[placeholder] = {
+                                'code': mermaid_code,
+                                'index': mermaid_count
+                            }
+                            
+                            # Заменяем блок Mermaid на плейсхолдер
+                            processed_text = processed_text.replace(full_match, placeholder)
+                            mermaid_count += 1
+                            
+                        except Exception as e:
+                            logging.error(f"Ошибка при обработке блока Mermaid: {str(e)}")
+                            continue
+                except Exception as e:
+                    logging.error(f"Ошибка при поиске по паттерну {pattern}: {str(e)}")
+                    continue
+            
+            # Преобразуем текст с плейсхолдерами через _convert_markdown
+            # Важно: на этом этапе плейсхолдеры сохраняются без изменений
+            html_result = self._convert_markdown(processed_text, base_url)
+
+            # После конвертации Markdown в HTML, заменяем плейсхолдеры на HTML-контейнеры с диаграммами
+            for placeholder, data in mermaid_blocks.items():
+                try:
+                    mermaid_code = data['code']
+                    index = data['index']
+                    
+                    # Создаем ID для диаграммы
+                    diagram_id = f"mermaid-diagram-{str(uuid.uuid4())[:8]}"
+                    
+                    # Создаем HTML-контейнер с оригинальным кодом диаграммы
+                    html_container = self._create_mermaid_container(
+                        diagram_id,
+                        mermaid_code,  # Оригинальный код без изменений
+                        index
+                    )
+                    
+                    if html_container:
+                        # Заменяем плейсхолдер на HTML-контейнер
+                        html_result = html_result.replace(placeholder, html_container)
+                    else:
+                        # Если не удалось создать контейнер, используем простой div
+                        simple_html = f'<div class="mermaid">{mermaid_code}</div>'
+                        html_result = html_result.replace(placeholder, simple_html)
+                        
+                except Exception as e:
+                    logging.error(f"Ошибка при замене плейсхолдера на HTML-контейнер: {str(e)}")
+                    # В случае ошибки используем простой div с оригинальным кодом
+                    html_result = html_result.replace(
+                        placeholder, 
+                        f'<div class="mermaid">{mermaid_blocks[placeholder]["code"]}</div>'
+                    )
+            
+            if mermaid_count > 0:
+                print(f"Обнаружено и обработано {mermaid_count} Mermaid диаграмм")
+                logging.info(f"Обнаружено и обработано {mermaid_count} Mermaid диаграмм")
+                
+            else:
+                print("Mermaid диаграммы не обнаружены")
+                logging.info("Mermaid диаграммы не обнаружены")
+
+            if isinstance(original_result, list):
+                return [html_result]
+            return html_result
+
+        except Exception as e:
+            print(f"Ошибка при обработке Mermaid диаграмм: {str(e)}")
+            logging.error(f"Ошибка при обработке Mermaid диаграмм: {str(e)}")
+            traceback.print_exc()  # Добавляем полный стек-трейс для отладки
+            return result
+
+
+
+def json_to_readable_text(data, indent=0):
+    """Преобразует JSON в читаемый текстовый формат"""
+    result = []
+    space = "  " * indent
+    
+    if isinstance(data, dict):
+        for key, value in data.items():
+            result.append(f"{space}🔹 {key}:")
+            if isinstance(value, (dict, list)):
+                result.extend(json_to_readable_text(value, indent + 1))
+            else:
+                result.append(f"{space}  {value}")
+    
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, (dict, list)):
+                result.extend(json_to_readable_text(item, indent + 1))
+            else:
+                result.append(f"{space}• {item}")
+    
+    return result
+
+html_visualizer = HTMLVisualizer()

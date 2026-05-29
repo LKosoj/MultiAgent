@@ -1,0 +1,18 @@
+name: webpage_content
+description: "Visits a webpage at the given URL and returns its content as a markdown string."
+category: "Веб"
+source_type: custom_function
+implementation_source: custom_tools.web_tools.webpage_content
+parameters:
+  - name: "url"
+    type: "str"
+    description: "The URL of the webpage to visit."
+    required: true 
+  - name: "query"
+    type: "str"
+    description: "The user query to search for on the webpage."
+    required: true
+  - name: "query_type"
+    type: "str"
+    description: "The type of query to search for on the webpage. Possible values: fullcontent (return full content of the webpage), relevant (return summary with relevant information)."
+    required: true

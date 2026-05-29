@@ -1,0 +1,30 @@
+name: generate_image_tool
+description: "Генерирует изображение по заданному prompt. ВАЖНО: промпт должен быть СТРОГО на английском языке!"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.image_tools.generate_image_tool
+parameters:
+  - name: "prompt"
+    type: "str"
+    description: "Строка запроса для генерации изображения СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ."
+    required: true
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии."
+    required: true
+  - name: "number"
+    type: "int"
+    description: "Номер изображения."
+    required: true 
+  - name: "negative_prompt"
+    type: "str"
+    description: "Негативный промпт (что НЕ должно быть в изображении) СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ"
+    required: false
+  - name: "width"
+    type: "int"
+    description: "Ширина результата. По умолчанию 1920"
+    required: false
+  - name: "height"
+    type: "int"
+    description: "Высота результата. По умолчанию 1080"
+    required: false

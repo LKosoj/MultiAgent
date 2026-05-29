@@ -1,0 +1,50 @@
+# W9-A7: единый source of truth для similarity-порогов text-to-sql / memory.
+#
+# До W9-A7 пороги жили в виде env-defaults в разных модулях:
+#   * memory/tools.py: RAG_VECTOR_THRESHOLD=0.75, RAG_RERANK_THRESHOLD=0.5
+#   * custom_tools/text_to_sql/schema_memory_sqlite.py:
+#       SCHEMA_TABLE_MIN_SCORE=0.2
+#   * RAG examples (custom_tools/text_to_sql/rag/retrieval.py):
+#       короткозамыкание RAG_RESCORE_SHORT_CIRCUIT_THRESHOLD=None
+#
+# Этот yaml — единый список порогов. Значения профиля `default` сохраняют
+# исторические дефолты (чтобы существующие тесты и пользовательские
+# конфигурации не сломались). Профиль `muni_ru` зарезервирован для
+# тюнинга под муниципальный РФ-датасет (пока — снимок default'а).
+#
+# Контракт:
+#   * Корень: `profiles.<name>`. Профиль `default` обязателен.
+#   * Активный профиль выбирается env TEXT_TO_SQL_SIMILARITY_PROFILE,
+#     по умолчанию `default`.
+#   * Все 4 поля обязательны в каждом профиле (fail-fast при пропуске).
+#   * Значения — float в диапазоне [0.0, 1.0]; нарушение → ValueError.
+#   * env-переменные (RAG_VECTOR_THRESHOLD, RAG_RERANK_THRESHOLD,
+#     SCHEMA_TABLE_MIN_SCORE и т.п.) сохраняют приоритет над yaml — это
+#     сознательно: они существовали в проде до W9-A7 и тесты на них
+#     опираются.
+#
+# Поля:
+#   rag_examples_min_score      — порог отсечки sql-примеров при ретривале
+#                                 (rag/retrieval.py, short-circuit reranker).
+#   strategic_memory_min_score  — порог векторного поиска по стратегической
+#                                 памяти (memory/tools.py, vector_threshold).
+#   tactical_memory_min_score   — порог реранкера при поиске по тактической
+#                                 памяти (memory/tools.py, rerank_threshold).
+#   schema_linking_min_score    — порог семантической релевантности таблиц
+#                                 в schema_memory_sqlite.search (RAG schema
+#                                 linker).
+
+version: 1
+
+profiles:
+  default:
+    rag_examples_min_score: 0.7
+    strategic_memory_min_score: 0.75
+    tactical_memory_min_score: 0.5
+    schema_linking_min_score: 0.2
+
+  muni_ru:
+    rag_examples_min_score: 0.7
+    strategic_memory_min_score: 0.75
+    tactical_memory_min_score: 0.5
+    schema_linking_min_score: 0.2

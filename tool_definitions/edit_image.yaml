@@ -1,0 +1,50 @@
+name: edit_image_tool
+description: "Редактирует изображение с помощью ИИ на основе текстового описания изменений. ВАЖНО: промпт должен быть СТРОГО на английском языке!"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.image_tools.edit_image_tool
+parameters:
+  - name: "prompt"
+    type: "str"
+    description: "Текстовое описание желаемых изменений к изображению СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ"
+    required: true
+  - name: "image_path"
+    type: "str"
+    description: "Путь к исходному файлу изображения"
+    required: true
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "number"
+    type: "int"
+    description: "Номер изображения"
+    required: true
+  - name: "width"
+    type: "int"
+    description: "Ширина результата (512-2048)"
+    required: false
+  - name: "height"
+    type: "int"
+    description: "Высота результата (512-2048)"
+    required: false
+  - name: "negative_prompt"
+    type: "str"
+    description: "Негативный промпт (что НЕ должно быть в результате) СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ"
+    required: true
+  - name: "true_cfg_scale"
+    type: "float"
+    description: "Сила следования промпту (1.0-10.0, по умолчанию 4.0)"
+    required: false
+  - name: "num_inference_steps"
+    type: "int"
+    description: "Количество шагов обработки (10-100, по умолчанию 50)"
+    required: false
+  - name: "seed"
+    type: "int"
+    description: "Seed для воспроизводимости (оставьте пустым для случайного)"
+    required: false
+  - name: "output_path"
+    type: "str"
+    description: "Путь для сохранения отредактированного изображения (опционально)"
+    required: false

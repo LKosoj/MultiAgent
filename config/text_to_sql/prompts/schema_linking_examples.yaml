@@ -1,0 +1,57 @@
+# Source: extracted from custom_tools/text_to_sql/prompts.py::build_schema_linking_prompt @T4.4
+#
+# Доменные подсказки для schema-linking промпта.
+# Конкретные имена колонок (territory_id, oktmo, municipal_district_name и т.п.)
+# — это особенности пользовательских датасетов, а не общее правило для всех схем.
+# Держим их здесь, а не в .py — это source of truth конкретного домена.
+#
+# Активный профиль выбирается:
+#   1. явный аргумент `profile` в build_schema_linking_prompt(..);
+#   2. env TEXT_TO_SQL_SCHEMA_LINKING_PROFILE;
+#   3. иначе — "default" (пустой, доменных строк в промпт не добавляется).
+#
+# Override пути: env TEXT_TO_SQL_SCHEMA_LINKING_EXAMPLES_PATH.
+version: 1
+
+profiles:
+  # ---------------------------------------------------------------
+  # Дефолтный профиль: НИКАКИХ доменных подсказок.
+  # Промпт остаётся универсальным (только структурные правила про
+  # FK/PK, *_id/*_code, имена-подстроки и пр.).
+  # ---------------------------------------------------------------
+  default:
+    # Конкретные имена ID-колонок, которые следует предпочитать при джойнах.
+    # Пусто — у общей схемы нет известных приоритетных идентификаторов.
+    priority_id_columns: []
+
+    # Конкретные имена текстовых колонок, которые нужно использовать как
+    # последний резерв, если ID-колонок нет.
+    low_priority_name_columns: []
+
+    # Правила «если в таблицах есть колонка X — используй её, игнорируй Y».
+    # Каждая запись: {id_column: <имя>, ignore_column: <имя>}.
+    prefer_id_over_name_rules: []
+
+  # ---------------------------------------------------------------
+  # Профиль муниципального/демографического датасета пользователя (РФ).
+  # Содержит конкретные имена из существующих схем (territory_id, oktmo,
+  # municipal_district_name и т.п.) — те, что раньше были захардкожены
+  # в build_schema_linking_prompt.
+  # ---------------------------------------------------------------
+  muni_ru:
+    priority_id_columns:
+      - district_id
+      - area_id
+      - zone_id
+      - territory_id
+      - region_id
+      - okato
+      - oktmo
+
+    low_priority_name_columns:
+      - municipal_district_name
+      - region_name
+
+    prefer_id_over_name_rules:
+      - id_column: territory_id
+        ignore_column: municipal_district_name

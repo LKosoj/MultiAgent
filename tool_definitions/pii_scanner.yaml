@@ -1,0 +1,21 @@
+name: pii_scanner
+description: "Сканирует текст на наличие Персональных Идентифицируемых Данных (PII)."
+category: "Безопасность"
+source_type: custom_function
+implementation_source: custom_tools.llm_guard_tools.pii_scanner
+parameters:
+  - name: text
+    type: string
+    description: "Текст для сканирования на PII."
+    required: true
+output:
+  type: object
+  properties:
+    has_pii:
+      type: boolean
+      description: "True, если в тексте обнаружены PII."
+    pii_types:
+      type: array
+      items:
+        type: string
+      description: "Список типов обнаруженных PII (например, 'PHONE', 'EMAIL')." 

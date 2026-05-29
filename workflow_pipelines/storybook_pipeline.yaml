@@ -1,0 +1,261 @@
+name: storybook_pipeline
+version: '0.1'
+description: 'Универсальный пайплайн детской сказки: от брифа до PDF'
+parallel_execution: true
+max_parallel_steps: 5
+inputs:
+  task: 'Книга о храбром коте-рыцаре в сияющих доспехах, который защищает своё королевство от злого волшебника. Дружелюбная сказка с приключениями для детей 6-8 лет. Главные герои: кот-рыцарь и принцесса. Антогонисты: злой волшебник.'
+  project_id: storybook_project
+  pages_min: 1
+  pages_max: 2
+  words_per_page_min: 200
+  words_per_page_max: 300
+  generate_screenplay: true
+  generate_end_shots: true
+  language: ru
+  screenplay_time: 120
+  force_update_prompts: false
+  skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: exponential
+  base_delay: 1.0
+  max_delay: 300.0
+  retry_on_errors:
+  - network_error
+  - rate_limit
+  - timeout
+global_resource_limits:
+  max_duration_seconds: 600
+  max_api_calls_per_minute: 15
+steps:
+- id: brief_from_prompt
+  step_type: tool
+  task: Generate brief JSON from a free-form storybook prompt
+  timeout: 120
+  tool_name: brief_from_prompt_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    storybook_prompt: '{task}'
+    pages_min: '{pages_min}'
+    pages_max: '{pages_max}'
+    words_per_page_min: '{words_per_page_min}'
+    words_per_page_max: '{words_per_page_max}'
+    language: '{language}'
+- id: init_project
+  step_type: tool
+  task: Init project structure and save 00_brief.json
+  timeout: 120
+  tool_name: project_init_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    brief: '{brief_from_prompt}'
+  depends_on:
+  - brief_from_prompt
+- id: story_planner
+  step_type: tool
+  task: Generate synopsis.json and beats.json
+  timeout: 120
+  tool_name: story_planner_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    task: '{task}'
+  depends_on:
+  - init_project
+- id: bible_builder
+  step_type: tool
+  task: Build characters/locations canon and rules
+  timeout: 120
+  tool_name: bible_builder_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+  depends_on:
+  - story_planner
+- id: style_keeper
+  step_type: tool
+  task: Fix style for text and images and negative list
+  timeout: 120
+  tool_name: style_keeper_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+  depends_on:
+  - bible_builder
+- id: story_writer
+  step_type: tool
+  task: Generate story.json with per-page text
+  timeout: 120
+  tool_name: story_writer_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+  depends_on:
+  - story_editor
+- id: story_editor
+  step_type: tool
+  task: Edit and improve story text if it was regenerated
+  timeout: 180
+  tool_name: story_editor_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+  depends_on:
+  - story_writer
+  condition: '{story_writer.regenerated}'
+- id: prompt_engineer
+  step_type: tool
+  task: Create per-page EN prompts with references and technical params
+  timeout: 120
+  tool_name: prompt_engineer_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+  depends_on:
+  - style_keeper
+- id: items_builder
+  step_type: tool
+  task: Prepare batch items for artist agent
+  timeout: 120
+  tool_name: items_for_artist_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+  depends_on:
+  - prompt_engineer
+- id: artist_batch
+  step_type: tool
+  task: Parallel artist edits with references for final images
+  timeout: 120
+  tool_name: artist_agent_batch_edit_tool
+  tool_params:
+    session_id: '{session_id}'
+    items: '{items_builder}'
+    language: '{language}'
+  depends_on:
+  - items_builder
+- id: assemble_md
+  step_type: tool
+  task: Assemble universal Markdown with image links
+  timeout: 120
+  tool_name: md_assembler_tool
+  tool_params:
+    session_id: '{session_id}'
+    mode: 'discovery'
+    output_path: 'plots/storybooks/{project_id}/90_md/book.md'
+    image_globs: ['plots/storybooks/{project_id}/50_images/**/img_final.png']
+    story_json_path: 'plots/storybooks/{project_id}/20_story/story.json'
+    text_mode: 'body'
+    title: '{brief_from_prompt.title}'
+    skip_if_exists: true
+  depends_on:
+  - artist_batch
+  - story_editor
+- id: md_to_pdf
+  step_type: tool
+  task: Convert Markdown book.md to PDF book.pdf
+  timeout: 120
+  tool_name: md_to_pdf_tool
+  tool_params:
+    session_id: '{session_id}'
+    md_path: 'plots/storybooks/{project_id}/90_md/book.md'
+    pdf_path: 'plots/storybooks/{project_id}/95_pdf/book.pdf'
+    css_path: 'doc/storybook_pdf.css'
+    skip_if_up_to_date: true
+    page_size: 'A4'
+    margins: '14mm'
+  depends_on:
+  - assemble_md
+- id: screenplay_generator
+  step_type: tool
+  task: Generate director's screenplay in JSON format
+  timeout: 360
+  tool_name: screenplay_generator_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    screenplay_time: '{screenplay_time}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - story_editor
+- id: screenplay_shots_generator
+  step_type: tool
+  task: Generate shots JSON for storyboard frames
+  timeout: 600
+  tool_name: screenplay_shots_generator_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    generate_end_shots: '{generate_end_shots}'
+    enable: '{generate_screenplay}'
+    #enable: false
+  depends_on:
+  - screenplay_generator
+- id: shots_prompt_qa
+  step_type: tool
+  task: LLM validate+repair shots prompts vs screenplay BEFORE generating shot images
+  timeout: 600
+  tool_name: shots_prompt_qa_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    shots_data: '{screenplay_shots_generator}'
+    enable: '{generate_screenplay}'
+    model: 'ultimate'
+    temperature: 0.1
+  depends_on:
+  - screenplay_shots_generator
+- id: artist_batch_shots
+  step_type: tool
+  task: Parallel artist edits with references for final shots images
+  timeout: 1200
+  tool_name: artist_agent_batch_edit_tool
+  tool_params:
+    session_id: '{session_id}'
+    items: '{shots_prompt_qa}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+    #enable: false
+  depends_on:
+  - shots_prompt_qa
+  - artist_batch
+- id: video_generator
+  step_type: tool
+  task: Generate video from shots
+  timeout: 1200
+#  tool_name: video_generator_veo_tool
+#  tool_name: video_generator_mm_tool
+  tool_name: video_generator_aitunnel_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    force_update_prompts: '{force_update_prompts}'
+    skip_prompt_enhancement: '{skip_prompt_enhancement}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - artist_batch_shots
+error_handling:
+  on_failure: stop
+  auto_retry_transient: true
+  save_partial_results: true
+  checkpoint_strategy: after_each_step
+  save_checkpoint_interval: 300
+metadata:
+  author: Pipeline Constructor
+  category: general
+  estimated_duration: 25-35 minutes
+  complexity: complex
+  engine_type: enhanced
+  tags:
+  - constructed
+  - general
+  - engine_enhanced

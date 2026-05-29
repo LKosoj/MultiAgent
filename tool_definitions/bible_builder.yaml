@@ -1,0 +1,20 @@
+name: bible_builder_tool
+description: "Создаёт канон персонажей и мира: characters.json, locations.json, consistency_rules.json"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.bible_builder.bible_builder_tool
+parameters:
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта"
+    required: true
+  - name: "language"
+    type: "str"
+    description: "Язык генерации"
+    required: false
+    default: "ru"
+

@@ -1,0 +1,65 @@
+name: schema_info
+description: "Получает детальную информацию о структуре конкретной таблицы из кэша схемы, включая все колонки, их типы данных и описания."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.schema_info
+parameters:
+  - name: table_name
+    type: string
+    description: "Имя таблицы для получения информации о структуре (может включать схему, например 'main.bdmo_salary_full')."
+    required: true
+  - name: dsn
+    type: string
+    description: "DSN подключения к БД. Передавай dsn из контекста pipeline; если параметр не указан, tool использует workflow runtime context. Silent fallback на DB_DSN отключён."
+    required: false
+output:
+  type: object
+  properties:
+    success:
+      type: boolean
+      description: "Успешность операции"
+    table_info:
+      type: object
+      properties:
+        table_name:
+          type: string
+          description: "Полное имя таблицы"
+        description:
+          type: string
+          description: "Описание таблицы"
+        columns_count:
+          type: integer
+          description: "Количество колонок в таблице"
+        columns:
+          type: array
+          description: "Список колонок с детальной информацией"
+          items:
+            type: object
+            properties:
+              name:
+                type: string
+                description: "Имя колонки"
+              type:
+                type: string
+                description: "Тип данных колонки"
+              description:
+                type: string
+                description: "Описание колонки"
+              not_null:
+                type: boolean
+                description: "Обязательность заполнения (NOT NULL)"
+              default_value:
+                type: string
+                description: "Значение по умолчанию"
+              is_primary_key:
+                type: boolean
+                description: "Является ли первичным ключом"
+              constraint_type:
+                type: string
+                description: "Тип ограничения (PK, FK, UNIQUE или пусто)"
+              references:
+                type: string
+                description: "Ссылка на другую таблицу для внешних ключей"
+    error_message:
+      type: string
+      description: "Сообщение об ошибке в случае неудачи"

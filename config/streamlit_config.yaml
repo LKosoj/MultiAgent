@@ -1,0 +1,109 @@
+last_updated: '2025-08-26T15:56:28.267559'
+llm:
+  api_key: ''
+  base_url: ''
+  frequency_penalty: 0.5
+  max_tokens: 4000
+  model: model_code
+  presence_penalty: 0.3
+  provider: openai
+  temperature: 0.7
+  timeout_seconds: 30
+  top_p: 0.8
+logging:
+  console_output: true
+  file_output: true
+  format: detailed
+  level: INFO
+  logs_dir: logs
+  max_age_days: 7
+  rotation_size_mb: 50
+  unified_logging_enabled: true
+memory:
+  batch_size: 100
+  chromadb_path: memory/chromadb
+  collection_prefix: multiagent
+  custom_embedding_model: null
+  default_search_k: 10
+  embedding_dimensions: 768
+  embedding_model: intfloat/multilingual-e5-base
+  enable_compression: true
+  enabled: true
+  max_strategic_memories: 500
+  max_tactical_memories: 1000
+  memory_type: chromadb
+  reindex_interval_hours: 24
+  similarity_threshold: 0.2
+  strategic_memory_ttl_days: 30
+  tactical_memory_ttl_hours: 24
+network:
+  http_timeout_seconds: 30
+  max_retries: 5
+  proxy_url: null
+  user_agent: MultiAgent-System/1.0
+performance:
+  cache_size_mb: 256
+  enable_caching: true
+  task_queue_size: 1000
+  worker_threads: 4
+resource_limits:
+  api_calls_per_minute: 60
+  disk_space_limit_gb: 50
+  execution_timeout_minutes: 30
+  max_concurrent_agents: 10
+  max_concurrent_workflows: 5
+  memory_limit_mb: 2048
+security:
+  allowed_functions:
+  - SELECT
+  - EXPLAIN
+  allowed_schemas: []
+  allowed_sql_operations:
+  - SELECT
+  audit_all_queries: true
+  blocked_sql_keywords:
+  - DROP
+  - DELETE
+  - UPDATE
+  - INSERT
+  - ALTER
+  - CREATE
+  enable_pii_detection: false
+  log_security_events: true
+  max_sql_rows: 1000
+  pii_action: block
+  pii_detection_enabled: true
+  query_timeout_seconds: 30
+  safety_level: strict
+  sql_execution_enabled: true
+  table_blacklist: []
+  table_whitelist: []
+system:
+  cleanup_interval_hours: 24
+  language: ru
+  temp_directory: /tmp
+  work_directory: .
+telemetry:
+  batch_size: 100
+  collect_detailed_spans: true
+  collect_error_details: true
+  collect_memory_metrics: true
+  collect_performance_metrics: true
+  collect_system_metrics: true
+  collect_user_interactions: true
+  compression_enabled: true
+  detail_level: verbose
+  enabled: true
+  export_format: jsonl
+  flush_interval_seconds: 30
+  max_trace_file_size_mb: 10.0
+  service_name: multiagent-system
+  trace_retention_days: 7
+  traces_dir: logs/traces
+ui:
+  advanced_features: true
+  auto_refresh_interval: 5
+  page_size: 50
+  show_debug_info: false
+  theme: light
+version: 1.0.0

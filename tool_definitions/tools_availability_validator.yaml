@@ -1,0 +1,15 @@
+name: tools_availability_validator
+description: "Проверяет доступность запрошенных по имени тулов в custom и MCP."
+category: "Агенты"
+source_type: custom_function
+implementation_source: custom_tools.agent_constructor.validate_tools_availability
+parameters:
+  - name: tools_requested
+    type: array
+    description: "Список имен тулов (без префиксов). Допускаются записи с custom:/mcp: — будут очищены."
+    required: true
+  - name: context
+    type: object
+    description: "Опциональный контекст (env, политики)."
+    required: false
+

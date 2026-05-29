@@ -1,0 +1,344 @@
+name: text_to_sql_pipeline
+version: '1.0'
+description: 'Пайплайн генерации SQL из естественного языка с параллельной NLU обработкой и динамическим агентом'
+parallel_execution: true
+max_parallel_steps: 2
+
+# Pipeline requires EnhancedWorkflowEngine for output_retry_policy support
+# (см. секцию sql_verification.output_retry_policy ниже).
+pipeline:
+  requires_enhanced_engine: true   # output_retry_policy не работает в базовом engine
+
+inputs:
+  query: ""              # Пользовательский запрос на естественном языке
+  dsn: ""                # Database DSN для подключения
+  max_rows: 100         # Максимальное количество строк в результате
+  session_id: ""        # Стабильный идентификатор сессии/схемы
+  run_id: ""            # Уникальный идентификатор конкретного запуска
+  safety_level: strict
+  include_explanation: true
+  validate_schema: true
+  dry_run_only: false
+  use_schema_suggestions: true
+  allow_enhanced_fallback: false
+
+outputs:
+  final:
+    from_step: db_audit
+    field: output
+    format: markdown
+  sql_generation:
+    from_step: sql_generation
+    field: output
+    format: json
+  sql_verification:
+    from_step: sql_verification
+    field: output
+    format: json
+  schema_linking:
+    from_step: schema_linking_step
+    field: output
+    format: json
+  intent:
+    from_step: intent_extraction_step
+    field: output
+    format: json
+  nlu:
+    from_step: nlu_processing
+    field: output
+    format: json
+
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: exponential
+  base_delay: 1.0
+  max_delay: 60.0
+  retry_on_errors:
+    - network_error
+    - rate_limit
+    - timeout
+
+global_resource_limits:
+  max_duration_seconds: 300
+  max_api_calls_per_minute: 20
+  max_concurrent_steps: 2
+
+steps:
+  # =====================================================================
+  # ЭТАП 1-2: ПАРАЛЛЕЛЬНАЯ NLU ОБРАБОТКА (прямой вызов тулов)
+  # =====================================================================
+  
+  - id: nlu_processing
+    step_type: tool
+    task: "Токенизация и POS-анализ пользовательского запроса на естественном языке"
+    tool_name: natural_language_processing
+    tool_params:
+      text: '{query}'
+    timeout: 30
+    retry_policy:
+      max_retries: 2
+    
+  - id: intent_extraction_step
+    step_type: tool
+    task: "Извлечение интентов и сущностей из пользовательского запроса"
+    tool_name: intent_extraction
+    tool_params:
+      text: '{query}'
+    timeout: 30
+    retry_policy:
+      max_retries: 2
+  
+  # =====================================================================
+  # ЭТАП 3: SCHEMA LINKING (прямой вызов тула)
+  # =====================================================================
+  
+  - id: schema_linking_step
+    # OUTPUT CONTRACT (passed to sql_generation via {schema_linking_step}):
+    #   linked_entities: {metrics: [...], dimensions: [...], filters: [...]}
+    #   joins: [{from_table, to_table, from_column, to_column, join_type}, ...]
+    #   schema_info: {tables: {...}, columns: {...}, primary_keys: {...}}
+    #   linking_strategy: "llm" | "heuristic" | "hybrid" | "fallback" | "none"
+    step_type: tool
+    task: "Связывание извлеченных сущностей со схемой базы данных через RAG"
+    tool_name: schema_linking
+    condition: '{use_schema_suggestions}'
+    tool_params:
+      entities: '{intent_extraction_step.entities}'
+      dsn: '{dsn}'
+    depends_on:
+      - nlu_processing
+      - intent_extraction_step
+    metadata:
+      skip_output:
+        status: "skipped_disabled"
+        reason: "use_schema_suggestions=false"
+        linked_entities:
+          metrics: []
+          dimensions: []
+          filters: {}
+        joins: []
+        join_success: false
+        unlinked_entities: []
+        schema_info: {}
+    timeout: 60
+    retry_policy:
+      max_retries: 3
+      backoff_strategy: exponential
+  
+  # =====================================================================
+  # ЭТАП 4: SQL GENERATION (отдельный агент)
+  # =====================================================================
+
+  - id: sql_generation
+    step_type: agent
+    agent_type: sql_generator_agent
+    task: |
+      Сгенерируй SQL-запрос для задачи пользователя.
+
+      Исходный запрос пользователя:
+      ```
+      {query}
+      ```
+
+      Результаты предыдущих этапов:
+
+      1. NLU анализ:
+      ```json
+      {nlu_processing}
+      ```
+
+      2. Извлечённые интенты и сущности:
+      ```json
+      {intent_extraction_step}
+      ```
+
+      3. Schema Linking (КРИТИЧНО: передавай в инструменты БЕЗ ИЗМЕНЕНИЙ):
+      ```json
+      {schema_linking_step}
+      ```
+
+      Параметры запуска:
+      - session_id: {session_id}
+      - run_id: {run_id}
+      - max_rows: {max_rows}
+      - safety_level: {safety_level}
+      - dry_run_only: {dry_run_only}
+      - dsn: передан инструментам через workflow runtime metadata
+
+      Используй инструмент sql_generation_plugin(context=..., user_query=...) для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
+    depends_on:
+      - schema_linking_step
+    timeout: 120
+    retry_policy:
+      max_retries: 2
+      backoff_strategy: exponential
+    metadata:
+      pipeline_type: text_to_sql
+      session_id: '{session_id}'
+      run_id: '{run_id}'
+      max_rows: '{max_rows}'
+      safety_level: '{safety_level}'
+      use_schema_suggestions: '{use_schema_suggestions}'
+      dsn: '{dsn}'
+
+  # =====================================================================
+  # ЭТАП 5: SQL VERIFICATION (отдельный агент)
+  # =====================================================================
+
+  - id: sql_verification
+    step_type: agent
+    agent_type: sql_verifier_agent
+    output_schema: json_object
+    output_schema_requirements:
+      required:
+        - verification_status
+        - safety_check
+        - performance_check
+        - recommendations
+      properties:
+        verification_status:
+          enum:
+            - Approved
+            - Rejected
+    condition: '{sql_generation.sql} != ""'
+    task: |
+      Проверь безопасность и корректность SQL-запроса, сгенерированного на предыдущем шаге.
+
+      SQL-запрос от sql_generation (JSON с полями sql / description):
+      ```json
+      {sql_generation}
+      ```
+
+      Параметры:
+      - safety_level: {safety_level}
+      - validate_schema: {validate_schema}
+      - dsn: передан инструментам через workflow runtime metadata
+
+      Используй sql_safety_check(sql_query=...) и sql_explain(sql_query=...). DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструментам из metadata шага. Верни JSON со следующими полями:
+      verification_status (Approved/Rejected), safety_check, performance_check, recommendations.
+
+      Если статус "Rejected", в recommendations укажи конкретные шаги по исправлению — они будут переданы sql_generator_agent при перезапуске.
+    depends_on:
+      - sql_generation
+    timeout: 90
+    retry_policy:
+      max_retries: 1
+      backoff_strategy: fixed
+    metadata:
+      pipeline_type: text_to_sql
+      session_id: '{session_id}'
+      run_id: '{run_id}'
+      safety_level: '{safety_level}'
+      validate_schema: '{validate_schema}'
+      dsn: '{dsn}'
+      # Контрактный маркер для движка / документации: при verification_status=Rejected
+      # генератор перезапускается с feedback. См. 6.3 + sql_generator_agent.yaml
+      # (поле sql_safety_check_feedback в task).
+      rerun_on_reject: sql_generation
+      # skip_output применяется когда condition выше == false (sql_generation вернул пустой SQL)
+      skip_output:
+        verification_status: Rejected
+        safety_check:
+          status: skipped
+          reason: sql_generation returned empty SQL
+        performance_check:
+          status: skipped
+        recommendations:
+          - "SQL не был сгенерирован — проверьте запрос пользователя"
+    # Cross-step retry с feedback: при verification_status=Rejected движок
+    # пакует output этого шага в context.variables[feedback_field] и повторно
+    # запускает rerun_step. Затем перевыполняется сам verification.
+    # Loop guard: max_iterations. Реализация: workflow.engine._maybe_run_output_retry.
+    # NB: condition содержит ссылку на собственный output, поэтому это поле
+    # вынесено за пределы metadata (metadata подставляется заранее, fail-fast).
+    output_retry_policy:
+      condition: '{sql_verification.verification_status} == "Rejected"'
+      rerun_step: sql_generation
+      max_iterations: 2
+      feedback_field: sql_safety_check_feedback
+
+  # =====================================================================
+  # ЭТАП 6: DB AUDIT / EXECUTION (отдельный агент)
+  # =====================================================================
+
+  - id: db_audit
+    step_type: agent
+    agent_type: db_audit_agent
+    # Выполняем только при Approved. При Rejected step пропускается и
+    # подставляется skip_output (status=skipped_rejected_by_verifier).
+    condition: '{sql_verification.verification_status} == "Approved"'
+    task: |
+      Выполни одобренный SQL-запрос и верни результаты.
+
+      SQL-запрос (после генерации):
+      ```json
+      {sql_generation}
+      ```
+
+      Результат верификации:
+      ```json
+      {sql_verification}
+      ```
+
+      Параметры выполнения:
+      - dsn: передан инструментам через workflow runtime metadata
+      - session_id: {session_id}
+      - run_id: {run_id}
+      - max_rows: {max_rows}
+      - dry_run_only: {dry_run_only}
+      - include_explanation: {include_explanation}
+
+      Если dry_run_only=true — НЕ выполняй SQL в БД, верни SQL и статус выполнения executed=false, status=skipped.
+      Иначе выполни SQL с ограничением max_rows и верни:
+      - Постановку задачи (переформулированный запрос пользователя)
+      - Сгенерированный SQL-запрос (ОБЯЗАТЕЛЬНО!)
+      - Результаты выполнения запроса
+      - Анализ полученных данных
+      - Выводы и ограничения (если есть)
+
+      При сохранении успешного SQL в RAG вызывай save_successful_sql(...). DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструментам из metadata шага, чтобы файл попал в session_id целевой БД, а не в DB_DSN окружения.
+
+      Формат отчёта — структурированный текст на русском языке.
+    depends_on:
+      - sql_verification
+    timeout: 180
+    retry_policy:
+      max_retries: 1
+    metadata:
+      pipeline_type: text_to_sql
+      max_rows: '{max_rows}'
+      dsn: '{dsn}'
+      session_id: '{session_id}'
+      run_id: '{run_id}'
+      safety_level: '{safety_level}'
+      include_explanation: '{include_explanation}'
+      validate_schema: '{validate_schema}'
+      dry_run_only: '{dry_run_only}'
+      use_schema_suggestions: '{use_schema_suggestions}'
+      allow_enhanced_fallback: '{allow_enhanced_fallback}'
+      # skip_output применяется когда condition выше == false (verifier=Rejected)
+      skip_output:
+        status: skipped_rejected_by_verifier
+        reason: SQL was rejected by verifier; db_audit not executed
+        executed: false
+
+error_handling:
+  on_failure: fail
+  auto_retry_transient: true
+  save_partial_results: false
+  checkpoint_strategy: after_each_step
+  save_checkpoint_interval: 60
+
+metadata:
+  agui_entrypoint: presets.text_to_sql.generate
+  forbid_workflows_start: true
+  author: System
+  category: text_to_sql
+  estimated_duration: 30-60 seconds
+  complexity: medium
+  engine_type: enhanced
+  tags:
+    - text_to_sql
+    - sql_generation
+    - workflow
+    - parallel_processing

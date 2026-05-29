@@ -1,0 +1,68 @@
+name: tool_demo
+version: '1.0'
+description: Демонстрация прямого вызова инструментов в workflow
+
+inputs:
+  image_prompt: ""     # Промпт для генерации изображения (обязательный)
+  research_topic: ""   # Тема для исследования (обязательная)
+  session_id: ""       # Идентификатор сессии (будет автогенерирован, если пуст)
+
+global_retry_policy:
+  max_retries: 2
+  backoff_strategy: exponential
+  base_delay: 1.0
+  max_delay: 30.0
+  retry_on_errors:
+  - network_error
+  - rate_limit
+  - timeout
+global_resource_limits:
+  max_duration_seconds: 600
+  max_api_calls_per_minute: 15
+steps:
+- id: generate_image
+  step_type: tool
+  task: 'Сгенерировать изображение по запросу: {image_prompt}'
+  timeout: 120
+  tool_name: generate_image_tool
+  tool_params:
+    session_id: '{session_id}'
+- id: web_research
+  step_type: agent
+  task: 'Найти информацию о: {research_topic}'
+  timeout: 60
+  agent_type: researcher
+- id: analyze_data
+  step_type: tool
+  task: Проанализировать сгенерированное изображение
+  timeout: 45
+  tool_name: analyze_image_tool
+  tool_params:
+    session_id: '{session_id}'
+  depends_on:
+  - generate_image
+- id: create_report
+  step_type: agent
+  task: 'Создать отчет на основе результатов: изображение={generate_image}, исследование={web_research}'
+  timeout: 90
+  agent_type: analyst
+  depends_on:
+  - generate_image
+  - web_research
+error_handling:
+  on_failure: continue
+  auto_retry_transient: true
+  save_partial_results: true
+  checkpoint_strategy: after_each_step
+  save_checkpoint_interval: 300
+metadata:
+  author: Pipeline Constructor
+  category: demo
+  estimated_duration: 3-5 minutes
+  complexity: simple
+  engine_type: simple
+  tags:
+  - constructed
+  - demo
+  - engine_simple
+

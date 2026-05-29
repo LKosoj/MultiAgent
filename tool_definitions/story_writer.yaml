@@ -1,0 +1,36 @@
+name: story_writer_tool
+description: "Генерирует структурированный текст истории по страницам на основе synopsis.json и beats.json"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.story_writer.story_writer_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Идентификатор сессии"
+    required: true
+  - name: project_id
+    type: str
+    description: "Идентификатор проекта"
+    required: true
+  - name: language
+    type: str
+    description: "Язык текста (например, ru, en); по умолчанию из 00_brief.json"
+    required: false
+  - name: target_age
+    type: str
+    description: "Целевая аудитория по возрасту; по умолчанию из 00_brief.json"
+    required: false
+  - name: words_per_page_min
+    type: int
+    description: "Желаемый минимум слов на страницу (мягкое ограничение)"
+    required: false
+  - name: words_per_page_max
+    type: int
+    description: "Желаемый максимум слов на страницу (мягкое ограничение)"
+    required: false
+  - name: tone
+    type: str
+    description: "Тон повествования (e.g., дружелюбный, сказочный)"
+    required: false
+
+

@@ -1,0 +1,15 @@
+name: spec_parser
+description: "Парсит текстовое описание в нормализованный spec (без выбора тулов)."
+category: "Агенты"
+source_type: custom_function
+implementation_source: custom_tools.agent_constructor.parse_spec
+parameters:
+  - name: description
+    type: string
+    description: "Текстовое описание агента."
+    required: true
+  - name: context
+    type: object
+    description: "Опциональный контекст/политики."
+    required: false
+

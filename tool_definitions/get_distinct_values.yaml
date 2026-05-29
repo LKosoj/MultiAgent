@@ -1,0 +1,35 @@
+name: get_distinct_values
+description: "Получает список всех уникальных значений из указанного поля таблицы в базе данных."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.get_distinct_values
+parameters:
+  - name: table_name
+    type: string
+    description: "Имя таблицы (с указанием схемы, если необходимо)."
+    required: true
+  - name: column_name
+    type: string
+    description: "Имя колонки для получения уникальных значений."
+    required: true
+  - name: limit
+    type: integer
+    description: "Максимальное количество значений для возврата (по умолчанию 500)."
+    required: false
+  - name: dsn
+    type: string
+    description: "DSN подключения к БД. Передавай dsn из контекста pipeline; если параметр не указан, tool использует workflow runtime context. Silent fallback на DB_DSN отключён."
+    required: false
+output:
+  type: object
+  properties:
+    success:
+      type: boolean
+    values:
+      type: array
+      items:
+        type: string
+    count:
+      type: integer
+    error_message:
+      type: string

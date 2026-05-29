@@ -1,0 +1,26 @@
+name: generate_image_to_file_tool
+description: "Генерирует изображение и сохраняет его в указанный файл. ВАЖНО: промпт должен быть СТРОГО на английском языке!"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.image_file_tools.generate_image_to_file_tool
+parameters:
+  - name: "prompt"
+    type: "str"
+    description: "Строка запроса для генерации изображения НА АНГЛИЙСКОМ ЯЗЫКЕ"
+    required: true
+  - name: "directory"
+    type: "str"
+    description: "Каталог для сохранения изображения"
+    required: true
+  - name: "filename"
+    type: "str"
+    description: "Имя файла для сохранения (с расширением)"
+    required: true
+  - name: "width"
+    type: "int"
+    description: "Ширина изображения (128-2048)"
+    required: false
+  - name: "height"
+    type: "int"
+    description: "Высота изображения (128-2048)"
+    required: false

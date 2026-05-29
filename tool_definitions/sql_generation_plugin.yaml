@@ -1,0 +1,23 @@
+name: sql_generation_plugin
+description: "Генерирует SQL-запрос на основе обогащенного контекста."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.sql_generation_plugin
+parameters:
+  - name: context
+    type: string
+    description: "Строка, содержащая полный контекст от Schema-RAG-Agent."
+    required: true
+  - name: user_query
+    type: string
+    description: "Оригинальный запрос пользователя."
+    required: true
+  - name: dsn
+    type: string
+    description: "Явный Database DSN для диалект-aware генерации литералов и quoting."
+    required: false
+output:
+  type: object
+  properties:
+    sql_query:
+      type: string

@@ -1,0 +1,1025 @@
+{
+  "translations": {
+    "title": "Название",
+    "description": "Описание",
+    "genre": "Жанр",
+    "target_age": "Возраст",
+    "language": "Язык",
+    "pages_min": "Мин. страниц",
+    "pages_max": "Макс. страниц",
+    "words_per_page_min": "Мин. слов на странице",
+    "words_per_page_max": "Макс. слов на странице",
+    "main_characters": "Главные персонажи",
+    "main_locations": "Основные локации",
+    "moral": "Мораль",
+    "storybook_prompt": "Промпт для сказки",
+    "name": "Имя",
+    "age": "Возраст",
+    "role": "Роль",
+    "immutable_attributes": "Неизменные атрибуты",
+    "variable_attributes": "Изменяемые атрибуты",
+    "pages": "Страницы",
+    "items": "Элементы",
+    "body": "Текст",
+    "page": "Страница",
+    "page_number": "Номер страницы",
+    "camera_plan": "План камеры",
+    "english_prompt": "Промпт (англ.)",
+    "video_prompt": "Видео-промпт",
+    "negative_prompt": "Негативный промпт",
+    "reference_image_paths": "Пути к референсам",
+    "shot_type": "Тип кадра",
+    "composition_stability": "Стабильность композиции",
+    "narrative_position": "Позиция в нарративе",
+    "scene_pacing": "Темп сцены",
+    "camera_position": "Позиция камеры",
+    "character_orientation": "Ориентация персонажа",
+    "logline": "Логлайн",
+    "vocabulary_limits": "Ограничения словаря",
+    "key_objects": "Ключевые объекты",
+    "atmosphere": "Атмосфера",
+    "lighting": "Освещение",
+    "color_palette": "Цветовая палитра",
+    "gesture_set": "Набор жестов",
+    "speech_patterns": "Манеры речи",
+    "no_go_rules": "Запреты",
+    "output_path": "Путь вывода",
+    "timing": "Тайминг",
+    "location_time": "Локация и время",
+    "action": "Действие",
+    "dialogue": "Диалоги",
+    "camera": "Камера",
+    "sound": "Звук",
+    "transition": "Переход",
+    "storyboard": "Раскадровка",
+    "scene_number": "Номер сцены",
+    "shot_number": "Номер кадра",
+    "concept": "Концепция",
+    "director_notes": "Заметки режиссёра",
+    "world_description": "Описание мира",
+    "link_type": "Тип связи",
+    "appearance": "Внешний вид",
+    "character": "Характер",
+    "animation": "Анимация",
+    "voice": "Голос",
+    "line": "Реплика",
+    "direction": "Ремарка",
+    "must_have_details": "Обязательные детали",
+    "character_appearance_changes": "Изменения внешности",
+    "characters_in_frame": "Персонажи в кадре",
+    "key_object": "Ключевой объект",
+    "emotion": "Эмоция",
+    "location_hint": "Подсказка по локации",
+    "goal": "Цель",
+    "consistency_rules": "Правила согласованности",
+    "name_field": "Имя (поле)",
+    "age_field": "Возраст (поле)",
+    "variable_attributes_field": "Изменяемые атрибуты (поле)",
+    "immutable_attributes_field": "Неизменные атрибуты (поле)",
+    "lighting_field": "Освещение (поле)",
+    "atmosphere_field": "Атмосфера (поле)",
+    "gesture_set_field": "Набор жестов (поле)",
+    "characters": "Персонажи",
+    "description_field": "Описание (поле)",
+    "*": "Все",
+    "reference_image_path_field": "Путь к референсу (поле)",
+    "no_go_rules_field": "Запреты (поле)",
+    "speech_patterns_field": "Манеры речи (поле)",
+    "screenplay": "Сценарий",
+    "key_objects_field": "Ключевые объекты (поле)",
+    "role_field": "Роль (поле)",
+    "id": "Идентификатор",
+    "color_palette_field": "Цветовая палитра (поле)"
+  },
+  "editor_settings": {
+    "use_universal_editor": true,
+    "debug_mode": false
+  },
+  "brief": {
+    "field_groups": {
+      "basic_info": {
+        "title": "Основная информация",
+        "fields": [
+          "title",
+          "genre",
+          "target_age",
+          "language"
+        ],
+        "layout": "grid",
+        "columns": 2
+      },
+      "content": {
+        "title": "Содержание",
+        "fields": [
+          "description",
+          "storybook_prompt"
+        ],
+        "layout": "vertical"
+      },
+      "characters_locations": {
+        "title": "Персонажи и локации",
+        "fields": [
+          "main_characters",
+          "main_locations"
+        ],
+        "layout": "vertical"
+      },
+      "settings": {
+        "title": "Настройки публикации",
+        "fields": [
+          "pages_min",
+          "pages_max",
+          "words_per_page_min",
+          "words_per_page_max"
+        ],
+        "layout": "grid",
+        "columns": 2
+      },
+      "additional": {
+        "title": "Дополнительно",
+        "fields": [
+          "moral"
+        ],
+        "layout": "vertical",
+        "collapsible": true,
+        "collapsed": false
+      }
+    },
+    "field_config": {
+      "title": {
+        "widget": "entry",
+        "width": 50,
+        "placeholder": "Введите название сказки"
+      },
+      "description": {
+        "widget": "text_area",
+        "height": 4,
+        "placeholder": "Опишите сюжет, персонажей и основные события"
+      },
+      "storybook_prompt": {
+        "widget": "text_area",
+        "height": 3,
+        "placeholder": "Промпт для генерации сказки"
+      },
+      "main_characters": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить персонажа",
+        "placeholder": "Имя персонажа"
+      },
+      "main_locations": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить локацию",
+        "placeholder": "Название локации"
+      },
+      "genre": {
+        "widget": "combobox",
+        "values": [
+          "сказка",
+          "рассказ",
+          "притча",
+          "басня",
+          "поэма",
+          "былина"
+        ],
+        "readonly": false
+      },
+      "language": {
+        "widget": "combobox",
+        "values": [
+          "ru",
+          "en",
+          "es",
+          "fr",
+          "de"
+        ],
+        "readonly": true
+      },
+      "target_age": {
+        "widget": "combobox",
+        "values": [
+          "3-5 лет",
+          "6-8 лет",
+          "9-12 лет",
+          "12+ лет"
+        ],
+        "readonly": false
+      },
+      "pages_min": {
+        "widget": "spinbox",
+        "width": 10
+      },
+      "pages_max": {
+        "widget": "spinbox",
+        "width": 10
+      },
+      "words_per_page_min": {
+        "widget": "spinbox",
+        "width": 10
+      },
+      "words_per_page_max": {
+        "widget": "spinbox",
+        "width": 10
+      },
+      "moral": {
+        "widget": "text_area",
+        "height": 2,
+        "hidden": false,
+        "placeholder": "Мораль или урок сказки (необязательно)"
+      }
+    }
+  },
+  "story": {
+    "field_groups": {
+      "story_header": {
+        "title": "Заголовок",
+        "hide_label": true,
+        "fields": [
+          "title"
+        ],
+        "layout": "vertical"
+      },
+      "story_content": {
+        "title": "Страницы сказки",
+        "hide_label": true,
+        "fields": [
+          "pages"
+        ],
+        "layout": "vertical"
+      }
+    },
+    "field_config": {
+      "title": {
+        "widget": "entry",
+        "hide_label": true,
+        "width": 50,
+        "readonly": true
+      },
+      "pages": {
+        "widget": "universal_array_editor",
+        "interface": "tabs",
+        "tab_title_field": "title",
+        "add_button_text": "➕ Добавить страницу",
+        "field_order": [
+          "title",
+          "body"
+        ],
+        "hide_label": true,
+        "page_field": {
+          "hidden": true
+        },
+        "title_field": {
+          "label": "Заголовок страницы",
+          "hide_label": true,
+          "widget": "entry",
+          "readonly": true
+        },
+        "body_field": {
+          "label": "Текст страницы",
+          "hide_label": true,
+          "widget": "text_area",
+          "height": 20
+        }
+      }
+    }
+  },
+  "characters": {
+    "field_groups": {
+      "characters_list": {
+        "title": "Персонажи",
+        "hide_label": true,
+        "fields": [
+          "*"
+        ],
+        "layout": "vertical"
+      }
+    },
+    "field_config": {
+      "*": {
+        "hide_label": true
+      },
+      "items": {
+        "widget": "universal_array_editor",
+        "interface": "dropdown_selector",
+        "display_field": "name",
+        "add_button_text": "➕ Добавить персонажа",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "hidden_fields": [
+          "name"
+        ],
+        "field_order": [
+          "name",
+          "age",
+          "role",
+          "immutable_attributes",
+          "variable_attributes",
+          "gesture_set",
+          "speech_patterns",
+          "no_go_rules"
+        ],
+        "hide_label": true
+      },
+      "name_field": {
+        "widget": "entry",
+        "width": 30,
+        "placeholder": "Имя персонажа"
+      },
+      "age_field": {
+        "widget": "combobox",
+        "values": [
+          "ребёнок",
+          "подросток",
+          "взрослый",
+          "пожилой",
+          "взрослая",
+          "пожилая"
+        ],
+        "readonly": false
+      },
+      "role_field": {
+        "widget": "combobox",
+        "values": [
+          "главный герой",
+          "главная героиня",
+          "вспомогательный персонаж",
+          "антагонист",
+          "второстепенный персонаж"
+        ],
+        "readonly": false
+      },
+      "immutable_attributes_field": {
+        "widget": "nested_group",
+        "title": "Неизменные атрибуты",
+        "collapsible": false
+      },
+      "variable_attributes_field": {
+        "widget": "nested_group",
+        "title": "Изменяемые атрибуты",
+        "collapsible": false
+      },
+      "reference_image_path_field": {
+        "hidden": true
+      },
+      "gesture_set_field": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить жест",
+        "placeholder": "Описание жеста"
+      },
+      "speech_patterns_field": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить манеру речи",
+        "placeholder": "Особенность речи"
+      },
+      "no_go_rules_field": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить ограничение",
+        "placeholder": "Что нельзя делать с персонажем"
+      }
+    }
+  },
+  "locations": {
+    "field_groups": {
+      "locations_list": {
+        "title": "Локации",
+        "hide_label": true,
+        "fields": [
+          "*"
+        ],
+        "layout": "vertical"
+      }
+    },
+    "field_config": {
+      "*": {
+        "hide_label": true
+      },
+      "items": {
+        "widget": "universal_array_editor",
+        "interface": "dropdown_selector",
+        "display_field": "name",
+        "add_button_text": "➕ Добавить локацию",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "hidden_fields": [
+          "name"
+        ],
+        "field_order": [
+          "name",
+          "description",
+          "key_objects",
+          "atmosphere",
+          "lighting",
+          "color_palette"
+        ],
+        "hide_label": true
+      },
+      "name_field": {
+        "widget": "entry",
+        "width": 30,
+        "placeholder": "Название локации"
+      },
+      "description_field": {
+        "widget": "text_area",
+        "height": 3,
+        "placeholder": "Детальное описание локации"
+      },
+      "key_objects_field": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить объект",
+        "placeholder": "Важный объект в локации"
+      },
+      "atmosphere_field": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Настроение и атмосфера"
+      },
+      "lighting_field": {
+        "widget": "combobox",
+        "values": [
+          "дневной свет",
+          "вечерний свет",
+          "утренний свет",
+          "закат",
+          "рассвет",
+          "лунный свет",
+          "искусственное освещение",
+          "сумрак"
+        ],
+        "readonly": false
+      },
+      "color_palette_field": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить цвет",
+        "placeholder": "Основной цвет палитры"
+      },
+      "reference_image_path_field": {
+        "hidden": true
+      }
+    }
+  },
+  "shots": {
+    "field_groups": {
+      "shots_header": {
+        "title": "Управление кадрами",
+        "hide_label": true,
+        "fields": [
+          "items"
+        ],
+        "layout": "vertical"
+      },
+      "consistency": {
+        "title": "Правила консистентности",
+        "fields": [
+          "consistency_rules"
+        ],
+        "layout": "vertical",
+        "collapsible": true,
+        "collapsed_by_default": true,
+        "hidden": true
+      }
+    },
+    "field_config": {
+      "items": {
+        "hide_label": true,
+        "widget": "dropdown_selector",
+        "display_fields": [
+          "scene_number",
+          "shot_number",
+          "shot_type"
+        ],
+        "display_separator": ".",
+        "add_button_text": "➕ Добавить кадр",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "_comment_field_order": "Порядок отображения полей в интерфейсе (остальные поля следуют в своем порядке)",
+        "field_order": [
+          "shot_type",
+          "timing",
+          "output_path",
+          "english_prompt",
+          "video_prompt",
+          "negative_prompt",
+          "reference_image_paths"
+        ],
+        "field_groups": {
+          "edit_fields": {
+            "title": "Редактируемые поля",
+            "fields": [
+              "shot_type",
+              "timing",
+              "output_path"
+            ],
+            "layout": "vertical",
+            "hide_label": true
+          },
+          "main_fields": {
+            "title": "",
+            "fields": [
+              "english_prompt",
+              "video_prompt",
+              "negative_prompt",
+              "reference_image_paths"
+            ],
+            "layout": "vertical",
+            "hide_label": true
+          },
+          "additional_fields": {
+            "title": "Дополнительные настройки",
+            "hide_label": false,
+            "fields": [
+              "*"
+            ],
+            "layout": "vertical",
+            "collapsible": true,
+            "collapsed": true
+          }
+        },
+        "_comment_hidden_fields": "Способ 1: Список полей для скрытия",
+        "hidden_fields": [
+          "scene_number",
+          "shot_number",
+          "page_number",
+          "image_path",
+          "video_path",
+          "should_use_prev_end_as_reference",
+          "continuity_score",
+          "composition_stability",
+          "spatial_changes_from_start",
+          "link_type",
+          "link_reasoning",
+          "project_id",
+          "width",
+          "height",
+          "true_cfg_scale",
+          "num_inference_steps",
+          "seed",
+          "number",
+          "characters",
+          "locations"
+        ],
+        "_comment_inline_fields": "Поля с inline=true отображаются на одной строке, width управляет шириной",
+        "scene_number_field": {
+          "widget": "entry",
+          "width": 10,
+          "inline": true
+        },
+        "shot_number_field": {
+          "widget": "entry",
+          "width": 10,
+          "hide_label": true,
+          "inline": true
+        },
+        "shot_type_field": {
+          "widget": "combobox",
+          "values": [
+            "start",
+            "end"
+          ],
+          "hide_label": true,
+          "inline": true,
+          "width": 20,
+          "readonly": true
+        },
+        "timing_field": {
+          "widget": "entry",
+          "width": 20,
+          "hide_label": true,
+          "inline": true
+        },
+        "output_path_field": {
+          "widget": "entry",
+          "width": 90,
+          "hide_label": true,
+          "inline": true
+        },
+        "composition_stability_field": {
+          "widget": "combobox",
+          "values": [
+            "stable",
+            "slightly_unstable",
+            "unstable"
+          ],
+          "readonly": false
+        },
+        "link_type_field": {
+          "widget": "combobox",
+          "values": [
+            "independent",
+            "continuation",
+            "reference_based"
+          ],
+          "readonly": false
+        },
+        "narrative_position_field": {
+          "widget": "combobox",
+          "values": [
+            "экспозиция",
+            "основное развитие",
+            "кульминация",
+            "развязка"
+          ],
+          "readonly": false
+        },
+        "scene_pacing_field": {
+          "widget": "combobox",
+          "values": [
+            "медленная",
+            "средняя",
+            "быстрая"
+          ],
+          "readonly": false
+        },
+        "camera_position_field": {
+          "widget": "combobox",
+          "values": [
+            "front",
+            "behind",
+            "side",
+            "above",
+            "below",
+            "angle"
+          ],
+          "readonly": false
+        },
+        "character_orientation_field": {
+          "widget": "combobox",
+          "values": [
+            "facing_camera",
+            "facing_away",
+            "profile",
+            "three_quarter"
+          ],
+          "readonly": false
+        },
+        "_comment_image_path": "Способ 2: Индивидуальная конфигурация поля",
+        "image_path_field": {
+          "hidden": true
+        },
+        "english_prompt_field": {
+          "widget": "text_area",
+          "height": 4,
+          "hide_label": true
+        },
+        "video_prompt_field": {
+          "widget": "text_area",
+          "height": 4,
+          "hide_label": true
+        },
+        "negative_prompt_field": {
+          "widget": "text_area",
+          "height": 2
+        },
+        "reference_image_paths_field": {
+          "widget": "text_area",
+          "height": 2
+        }
+      },
+      "consistency_rules": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить правило",
+        "collapsible": true,
+        "hidden": true
+      }
+    }
+  },
+  "synopsis": {
+    "field_groups": {
+      "main_info": {
+        "title": "Основная информация",
+        "fields": [
+          "logline",
+          "target_age"
+        ],
+        "layout": "vertical"
+      },
+      "content": {
+        "title": "Содержание",
+        "fields": [
+          "description",
+          "moral"
+        ],
+        "layout": "vertical"
+      },
+      "constraints": {
+        "title": "Ограничения",
+        "fields": [
+          "vocabulary_limits"
+        ],
+        "layout": "vertical",
+        "collapsible": true
+      }
+    },
+    "field_config": {
+      "logline": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Краткое описание сюжета в 1-2 предложениях"
+      },
+      "description": {
+        "widget": "text_area",
+        "height": 4,
+        "placeholder": "Подробное описание истории"
+      },
+      "moral": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Мораль или урок истории (необязательно)"
+      },
+      "target_age": {
+        "widget": "combobox",
+        "values": [
+          "3-5 лет",
+          "6-8 лет",
+          "9-12 лет",
+          "12+ лет",
+          "18+"
+        ],
+        "readonly": false
+      },
+      "vocabulary_limits": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Ограничения по словарю и содержанию"
+      }
+    }
+  },
+  "beats": {
+    "field_groups": {
+      "beats_list": {
+        "title": "Сюжетные точки",
+        "fields": [
+          "*"
+        ],
+        "layout": "vertical"
+      }
+    },
+    "field_config": {
+      "id": {
+        "widget": "spinbox",
+        "width": 10,
+        "readonly": true
+      },
+      "page_number": {
+        "widget": "spinbox",
+        "width": 10
+      },
+      "goal": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Цель или событие на этой странице"
+      },
+      "characters_in_frame": {
+        "widget": "list_editor",
+        "add_button_text": "+ Добавить персонажа",
+        "placeholder": "Имя персонажа"
+      },
+      "key_object": {
+        "widget": "entry",
+        "width": 30,
+        "placeholder": "Ключевой объект сцены"
+      },
+      "emotion": {
+        "widget": "combobox",
+        "values": [
+          "радость",
+          "грусть",
+          "удивление",
+          "страх",
+          "гнев",
+          "отвращение",
+          "интерес",
+          "растерянность",
+          "комичный ужас",
+          "ирония",
+          "абсурд",
+          "тоска"
+        ],
+        "readonly": false,
+        "placeholder": "Основная эмоция сцены"
+      },
+      "location_hint": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Описание места действия"
+      },
+      "must_have_details": {
+        "widget": "text_area",
+        "height": 3,
+        "placeholder": "Обязательные детали, которые должны быть на странице"
+      },
+      "character_appearance_changes": {
+        "widget": "text_area",
+        "height": 2,
+        "placeholder": "Изменения во внешности персонажей (необязательно)"
+      }
+    }
+  },
+  "screenplay": {
+    "field_groups": {
+      "screenplay_content": {
+        "title": "Сценарий",
+        "hide_label": true,
+        "fields": [
+          "screenplay"
+        ],
+        "layout": "vertical"
+      },
+      "project_info": {
+        "title": "Информация о проекте",
+        "fields": [
+          "concept",
+          "director_notes",
+          "characters",
+          "world_description"
+        ],
+        "layout": "vertical",
+        "hide_label": false,
+        "collapsible": true,
+        "collapsed": true
+      }
+    },
+    "field_config": {
+      "concept": {
+        "hide_label": true,
+        "widget": "nested_group"
+      },
+      "director_notes": {
+        "hide_label": true,
+        "widget": "nested_group"
+      },
+      "characters": {
+        "hide_label": true,
+        "widget": "universal_array_editor",
+        "interface": "tabs",
+        "tab_title_field": "name",
+        "add_button_text": "➕ Добавить персонажа",
+        "field_order": [
+          "name",
+          "age",
+          "role"
+        ],
+        "name_field": {
+          "widget": "entry",
+          "width": 30,
+          "placeholder": "Имя персонажа"
+        },
+        "appearance_field": {
+          "widget": "text_area",
+          "height": 3,
+          "placeholder": "Внешний вид персонажа"
+        },
+        "character_field": {
+          "widget": "text_area",
+          "height": 3,
+          "placeholder": "Характер и особенности персонажа"
+        },
+        "animation_field": {
+          "widget": "text_area",
+          "height": 2,
+          "placeholder": "Анимационные особенности"
+        },
+        "voice_field": {
+          "widget": "text_area",
+          "height": 2,
+          "placeholder": "Голос и манера речи"
+        }
+      },
+      "world_description": {
+        "widget": "text_area",
+        "height": 4,
+        "placeholder": "Описание мира и обстановки"
+      },
+      "screenplay": {
+        "widget": "dropdown_selector",
+        "display_fields": [
+          "location_time"
+        ],
+        "display_separator": ". ",
+        "add_button_text": "➕ Добавить сцену",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "hide_label": true,
+        "hidden_fields": [
+          "location_time"
+        ],
+        "field_order": [
+          "storyboard",
+          "action",
+          "dialogue",
+          "camera",
+          "sound",
+          "transition",
+          "characters"
+        ],
+        "scene_number_field": {
+          "widget": "spinbox",
+          "width": 10,
+          "hide_label": true,
+          "hidden": true,
+          "readonly": false
+        },
+        "location_time_field": {
+          "widget": "entry",
+          "width": 50,
+          "placeholder": "ЭКСТ./ИНТ. ЛОКАЦИЯ - ВРЕМЯ"
+        },
+        "action_field": {
+          "widget": "text_area",
+          "height": 5,
+          "placeholder": "Описание действия в сцене"
+        },
+        "characters_field": {
+          "widget": "list_editor",
+          "add_button_text": "+ Добавить персонажа",
+          "placeholder": "Имя персонажа",
+          "hidden": true
+        },
+        "dialogue_field": {
+          "widget": "universal_array_editor",
+          "interface": "tabs",
+          "hide_label": true,
+          "tab_title_field": "character",
+          "character_field": {
+            "widget": "entry",
+            "placeholder": "Персонаж"
+          },
+          "line_field": {
+            "widget": "text_area",
+            "height": 2,
+            "placeholder": "Текст реплики"
+          },
+          "direction_field": {
+            "widget": "text_area",
+            "height": 1,
+            "placeholder": "Ремарка"
+          }
+        },
+        "storyboard_field": {
+          "widget": "universal_array_editor",
+          "interface": "tabs",
+          "hide_label": true,
+          "tab_title_field": "shot_number",
+          "hidden_fields": [
+            "shot_number"
+          ],
+          "field_order": [
+            "description",
+            "camera_plan",
+            "timing"
+          ],
+          "shot_number_field": {
+            "widget": "spinbox",
+            "width": 10,
+            "readonly": false,
+            "hidden": true
+          },
+          "camera_plan_field": {
+            "widget": "combobox",
+            "values": [
+              "Сверхширокий план",
+              "Широкий план",
+              "Средний план",
+              "Крупный план",
+              "Экстремальный крупный план"
+            ],
+            "readonly": false,
+            "inline": true
+          },
+          "description_field": {
+            "widget": "text_area",
+            "height": 3,
+            "placeholder": "Описание кадра"
+          },
+          "timing_field": {
+            "widget": "entry",
+            "placeholder": "00:00",
+            "inline": true
+          }
+        },
+        "camera_field": {
+          "widget": "text_area",
+          "height": 2,
+          "placeholder": "Описание работы камеры"
+        },
+        "sound_field": {
+          "widget": "text_area",
+          "height": 3,
+          "placeholder": "Звуковое оформление (SFX, MUSIC)"
+        },
+        "transition_field": {
+          "widget": "combobox",
+          "values": [
+            "CUT TO:",
+            "MATCH CUT:",
+            "JUMP CUT TO:",
+            "DISSOLVE TO:",
+            "FADE TO BLACK.",
+            "FADE IN:",
+            "FADE OUT:"
+          ],
+          "readonly": false,
+          "width": 20
+        }
+      }
+    }
+  }
+}

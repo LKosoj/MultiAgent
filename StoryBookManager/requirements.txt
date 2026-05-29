@@ -1,0 +1,28 @@
+# StoryBook Manager Dependencies
+# ==============================
+
+# GUI Framework (встроен в Python, но указываем для документации)
+# tkinter - built-in
+
+# Работа с изображениями
+Pillow>=9.0.0
+
+# Работа с видео
+opencv-python>=4.5.0
+
+# JSON валидация
+jsonschema>=4.0.0
+
+# Мониторинг файловой системы
+watchdog>=2.1.0
+
+# Безопасное удаление файлов
+send2trash>=1.8.0
+
+# Дополнительные виджеты для tkinter
+tkinter-tooltip>=0.4.0
+
+# Уже установленные в основном проекте (для справки)
+# pyyaml>=6.0
+# aiofiles>=0.8.0
+# asyncio (built-in)
