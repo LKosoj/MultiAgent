@@ -57,7 +57,14 @@ _audit_handlers_lock = threading.Lock()
 # через env — редкое событие, рост `_stale_handlers` ограничен числом
 # переключений в рамках процесса (на практике 1-2). Каждый handler держит
 # один FD до atexit; это приемлемая цена за отсутствие race на emit.
+#
+# L36: cap на размер _stale_handlers. При превышении STALE_HANDLERS_CAP
+# закрываем и удаляем самый старый элемент. Вызывается под _audit_handlers_lock,
+# поэтому thread-safe (lock уже захвачен в _get_audit_handler).
 _stale_handlers: List[logging.handlers.RotatingFileHandler] = []
+_STALE_HANDLERS_CAP = 16
+
+
 def _sanitize_audit_text(value: str) -> str:
     """Regex-only sanitizer for audit/sqlrag text: PII plus DSN/secrets."""
     return pii_mask_sync(mask_dsn(value))
@@ -164,6 +171,7 @@ def _get_audit_handler(log_path: Path, max_bytes: int, backups: int) -> logging.
     и `handler.lock` сериализует его emit без участия `_audit_handlers_lock`.
     """
     key = str(log_path)
+    oldest_to_close = None
     with _audit_handlers_lock:
         cached = _audit_handlers.get(key)
         if cached is not None:
@@ -173,6 +181,18 @@ def _get_audit_handler(log_path: Path, max_bytes: int, backups: int) -> logging.
             # Другой поток мог только что получить эту ссылку и сейчас вызывает
             # `cached.emit()`; синхронный `cached.close()` дал бы ему
             # «I/O operation on closed file». Откладываем close до atexit.
+            # L36: перед добавлением в _stale_handlers — проверяем cap.
+            # При превышении сохраняем самый старый элемент для закрытия ПОСЛЕ
+            # выхода из lock. ВНИМАНИЕ (W7-T3): этот ранний close() нарушал бы
+            # инвариант «не закрывать stale-handler синхронно», т.к. поток,
+            # получивший ссылку ещё когда handler был cached, может быть в
+            # середине emit() и поймать «I/O operation on closed file».
+            # Поэтому путь emit в audit_logger обёрнут в try/except
+            # (ValueError, OSError) — именно это делает ранний close()
+            # race-safe. close() выполняем вне lock, чтобы не нарушать
+            # «откладываем close до освобождения lock» (строки 179-182).
+            if len(_stale_handlers) >= _STALE_HANDLERS_CAP:
+                oldest_to_close = _stale_handlers.pop(0)
             _stale_handlers.append(cached)
             _audit_handlers.pop(key, None)
         _ensure_audit_log_secure(log_path)
@@ -186,7 +206,12 @@ def _get_audit_handler(log_path: Path, max_bytes: int, backups: int) -> logging.
         # Хендлер сам форматирует только message (мы пишем готовый JSON-line).
         handler.setFormatter(logging.Formatter("%(message)s"))
         _audit_handlers[key] = handler
-        return handler
+    if oldest_to_close is not None:
+        try:
+            oldest_to_close.close()
+        except Exception as exc:
+            logger.debug("stale audit handler early-close failed: %s", exc)
+    return handler
 
 
 def audit_logger(audit_entry: Dict[str, object]) -> Dict[str, str]:
@@ -265,13 +290,34 @@ def audit_logger(audit_entry: Dict[str, object]) -> Dict[str, str]:
         )
         # Защищаем shouldRollover→doRollover→emit единым handler.lock, чтобы
         # два потока не вызвали doRollover одновременно и не съели backup-tier.
-        with handler.lock:
-            if handler.shouldRollover(record):
-                handler.doRollover()
+        #
+        # W7-T3 / L36: этот поток мог получить ссылку на handler, когда он был
+        # ещё cached, а затем (после >= _STALE_HANDLERS_CAP переключений конфига)
+        # тот же handler стал самым старым в _stale_handlers и был закрыт ранним
+        # close() в _get_audit_handler. Тогда I/O ниже даст
+        # «I/O operation on closed file» (ValueError) или OSError на FD.
+        # Глотаем эти ошибки: аудит — best-effort, ронять caller'а из-за гонки
+        # на закрытом stale-handler'е недопустимо. Именно эта обёртка делает
+        # ранний close() в _get_audit_handler race-safe, не нарушая W7-T3.
+        try:
+            with handler.lock:
+                if handler.shouldRollover(record):
+                    handler.doRollover()
+                    _ensure_audit_log_secure(log_path)
+                handler.emit(record)
+                handler.flush()
                 _ensure_audit_log_secure(log_path)
-            handler.emit(record)
-            handler.flush()
-            _ensure_audit_log_secure(log_path)
+        except (ValueError, OSError) as emit_err:
+            # Различаем гонку на закрытом stale-handler (W7-T3/L36 — глотаем как
+            # best-effort) от РЕАЛЬНОГО сбоя записи (disk full, EACCES, broken pipe).
+            # Реальный сбой происходит при ОТКРЫТОМ потоке → пробрасываем во внешний
+            # except (status="error"); глотаем только закрытый/None-поток, иначе это
+            # silent degradation (запрещена в AGENTS.md).
+            stream = getattr(handler, "stream", None)
+            if stream is None or getattr(stream, "closed", False):
+                logger.debug("audit emit on closed/stale handler skipped: %s", emit_err)
+            else:
+                raise
 
         logger.info("AUDIT LOGGED")
         return {"log_id": log_id, "status": "logged"}
@@ -369,6 +415,17 @@ def save_successful_sql(
         ])
 
         if execution_result:
+            # M117: предупреждение при выключенном PII-маскировании. execution_result
+            # может содержать реальные данные из БД (ФИО, адреса, зарплаты и т.п.).
+            # Caller обязан применить pii_masking() ДО вызова save_successful_sql.
+            # Предупреждаем только если данные реально будут записаны.
+            if os.getenv("PII_MASKING_ENABLED", "1") == "0":
+                logger.warning(
+                    "save_successful_sql: PII_MASKING_ENABLED=0 — execution_result "
+                    "may contain unmasked PII data written to sqlrag artifact %s. "
+                    "Apply pii_masking() before calling save_successful_sql.",
+                    filename,
+                )
             # EPIC 7.13: согласованная семантика при битом JSON.
             # Раньше блок except выставлял success=True при невалидном JSON —
             # это ложная информация (AGENTS.md: запрещено молчаливое искажение).

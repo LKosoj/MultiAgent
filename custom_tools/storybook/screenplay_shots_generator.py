@@ -4,7 +4,6 @@ import logging
 import re
 import random
 import threading
-import fcntl  # Для блокировки файлов
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -398,6 +397,11 @@ def screenplay_shots_generator_tool(
         scene_start_items: List[Dict[str, Any]],
         scene_end_items: List[Dict[str, Any]],
     ) -> None:
+        # NOTE: This function intentionally does NOT read the outer all_start_items/all_end_items.
+        # It builds the checkpoint exclusively from checkpoint_scene_items (scenes completed so far),
+        # which is protected by checkpoint_state_lock. Reading all_start_items/all_end_items here
+        # would create an unsynchronised cross-thread read since those lists are extended in the
+        # main thread after each future completes.
         with checkpoint_state_lock:
             checkpoint_scene_items[int(scene_number)] = {
                 "start": [dict(item) for item in scene_start_items],

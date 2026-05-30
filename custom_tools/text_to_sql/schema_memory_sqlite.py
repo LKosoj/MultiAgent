@@ -161,11 +161,12 @@ if sys.platform != "win32":
 
         def release(self) -> None:
             if self._fd is not None:
+                fd = self._fd
+                self._fd = None
                 try:
-                    fcntl.flock(self._fd, fcntl.LOCK_UN)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
                 finally:
-                    os.close(self._fd)
-                    self._fd = None
+                    os.close(fd)
 
         def __enter__(self) -> "_FileLock":
             self.acquire()
@@ -562,12 +563,12 @@ class SchemaMemoryManager:
                 # сразу, чтобы избежать гонки SELECT/UPDATE между сессиями.
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                except Exception:
+                except Exception as _begin_exc:
                     # Не все драйверы поддерживают BEGIN IMMEDIATE;
                     # допустим обычный неявный режим. Это НЕ silent fallback —
                     # отсутствие IMMEDIATE-mode не нарушает корректность,
                     # только ослабляет concurrency-гарантии до драйверного дефолта.
-                    pass
+                    logger.warning("BEGIN IMMEDIATE failed, falling back to default transaction mode: %s", _begin_exc)
 
                 cursor = conn.cursor()
 
@@ -1036,4 +1037,4 @@ class SchemaMemoryManager:
             logger.debug(f"Schema ready marker set for session {session_id}, version {schema_version}")
 
         except Exception as e:
-            logger.warning(f"Failed to set schema ready marker: {e}")
+            logger.error(f"Failed to set schema ready marker: {e}")

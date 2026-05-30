@@ -201,7 +201,7 @@ class SchemaLoader:
             logger.info(f"✅ Schema autosaved to: {json_path}")
             
         except Exception as e:
-            logger.warning(f"Failed to autosave schema: {e}")
+            logger.error(f"Failed to autosave schema: {e}")
 
 
 class SchemaIncludeFilterError(RuntimeError):
@@ -285,7 +285,7 @@ class SchemaFileManager:
             if not file_path.exists():
                 return None
             
-            raw = file_path.read_text(encoding="utf-8", errors="ignore")
+            raw = file_path.read_text(encoding="utf-8")
             return json.loads(raw)
         except Exception as e:
             logger.warning(f"Failed to load schema file: {e}")

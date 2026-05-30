@@ -16,12 +16,15 @@ def analysis(data: Dict, query: str) -> str:
 
 def fact_checking(claim: str, sources: List[str]) -> str:
     """Проверяет достоверность утверждения по указанным источникам.
-    
+
     Args:
         claim: Утверждение для проверки
         sources: Список источников для проверки утверждения
-    
+
     Returns:
         str: Результат проверки достоверности
     """
-    return f"Проверка '{claim}' по {len(sources)} источникам" 
+    return (
+        f"Инструмент fact_checking не реализован: для проверки '{claim}' "
+        "требуется реальная интеграция с источниками."
+    )

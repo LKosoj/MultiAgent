@@ -695,11 +695,17 @@ class WorkflowStateManager:
         }
         
         # Добавляем в семантический поиск через tools API
+        # save_memory — синхронная IO-функция; оборачиваем в executor чтобы не блокировать event loop.
         from memory.tools import save_memory
-        save_memory(
-            session_id=checkpoint.workflow_id,
-            agent_name="workflow_engine",
-            data=memory_data
+        import asyncio
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: save_memory(
+                session_id=checkpoint.workflow_id,
+                agent_name="workflow_engine",
+                data=memory_data,
+            ),
         )
     
     async def resume_workflow(self, workflow_id: str) -> WorkflowContext:
@@ -780,11 +786,6 @@ class WorkflowStateManager:
                 """,
                 (cutoff_iso,),
             )
-            conn.execute(
-                """
-                DELETE FROM workflow_events
-                WHERE timestamp < ?
-                """,
-                (cutoff_iso,),
-            )
+            # workflow_events таблица создаётся в workflow/events/store.py в отдельном файле БД;
+            # удалять её здесь нельзя — таблицы нет в workflow_state.db и запрос упадёт.
         logger.info(f"🧹 Очищены данные workflow_state.db старше {hours_to_keep} часов")

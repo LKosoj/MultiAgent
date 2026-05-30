@@ -31,9 +31,12 @@ class FileManager:
         self.projects_dir = app_settings.get_projects_directory()
         self.project_path = self.projects_dir / project_id
         self.backup_dir = app_settings.get_backup_directory() / "files"
-        
+
         # Создаем директорию для бэкапов файлов
         self.backup_dir.mkdir(parents=True, exist_ok=True)
+
+        # Кэшированный SchemaIntrospector (инициализируется лениво при первом вызове validate_data)
+        self._schema_introspector = None
     
     def load_json_file(self, file_type: str, file_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -137,9 +140,11 @@ class FileManager:
         try:
             # Используем гибридную генерацию схем вместо predefined schemas
             from gui.universal_json_editor import generate_hybrid_schema, SchemaIntrospector
-            
-            # Получаем UI config
-            introspector = SchemaIntrospector()
+
+            # Кэшируем SchemaIntrospector чтобы не перечитывать ui_config.json на каждый вызов
+            if self._schema_introspector is None:
+                self._schema_introspector = SchemaIntrospector()
+            introspector = self._schema_introspector
             ui_config = introspector.ui_config
             
             # Генерируем схему из данных
@@ -281,7 +286,14 @@ class FileManager:
             if not backup_path.exists():
                 logger.error(f"Бэкап файл не найден: {backup_path}")
                 return False
-            
+
+            # Проверяем, что backup_path находится внутри backup_dir
+            try:
+                backup_path.resolve().relative_to(self.backup_dir.resolve())
+            except ValueError:
+                logger.error(f"Небезопасный путь бэкапа: {backup_path} не принадлежит {self.backup_dir}")
+                return False
+
             # Создаем бэкап текущего файла перед восстановлением
             if target_path.exists():
                 current_backup = self._create_file_backup(target_path)

@@ -209,7 +209,10 @@ class SecurityValidator(BaseValidator):
             threats = []
             
             # SQL Injection проверки
-            if config.get("sql_injection_check", True):
+            # Для контракта sql_query паттерны DML (SELECT/INSERT/DELETE/UPDATE/UNION)
+            # являются ожидаемым выводом агента, а не инъекцией — пропускаем проверку.
+            is_sql_output = contract.get("name") == "sql_query" or config.get("is_sql_output", False)
+            if config.get("sql_injection_check", True) and not is_sql_output:
                 sql_patterns = [
                     r"union\s+select",
                     r"drop\s+table",
@@ -220,7 +223,7 @@ class SecurityValidator(BaseValidator):
                     r"script\s*>",
                     r"<\s*script"
                 ]
-                
+
                 for pattern in sql_patterns:
                     if re.search(pattern, content):
                         threats.append(f"Potential SQL injection: {pattern}")

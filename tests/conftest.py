@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sys
 
@@ -51,7 +52,15 @@ def _clear_text_to_sql_llm_safety_cache():
     """
     try:
         from custom_tools.text_to_sql.core._sql_generation_api import _clear_llm_safety_cache
+    except ImportError:
+        yield
+        return
     except Exception:
+        logging.getLogger(__name__).warning(
+            "_clear_text_to_sql_llm_safety_cache: не удалось импортировать "
+            "_clear_llm_safety_cache — LLM safety кэш не будет очищен между тестами",
+            exc_info=True,
+        )
         yield
         return
     _clear_llm_safety_cache()

@@ -1,11 +1,12 @@
 "use client";
 
-/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/exhaustive-deps */
+/* eslint-disable @typescript-eslint/no-explicit-any */
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { KeyValueList } from "../shared/KeyValueList";
 import { WorkflowResultView } from "../shared/WorkflowResultView";
+import { decodeGzipBase64, openReportFromPayload } from "../../utils/report";
 
 type Props = {
   runServiceAction: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
@@ -85,21 +86,6 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
   const runMetadataRef = useRef<Map<string, RunMeta>>(new Map());
   const effectiveQuery = naturalQuery.trim() || prompt.trim();
 
-  const decodeGzipBase64 = async (b64: string) => {
-    const binary = atob(b64);
-    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-    if (!("DecompressionStream" in window)) {
-      throw new Error("Браузер не поддерживает распаковку gzip");
-    }
-    const stream = new DecompressionStream("gzip");
-    const body = new Response(bytes).body;
-    if (!body) {
-      throw new Error("Не удалось распаковать отчёт");
-    }
-    const decompressed = body.pipeThrough(stream);
-    return new Response(decompressed).text();
-  };
-
   const extractFinalOutput = (payload: unknown) => {
     if (!payload) return null;
     if (typeof payload !== "object") return payload;
@@ -129,37 +115,13 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
     return null;
   };
 
-  const openReport = async (runIdValue: string, report: any) => {
-    const payload =
-      report?.base64_gzip ??
-      report?.content_b64_gzip ??
-      report?.report_b64_gzip ??
-      report?.base64;
-    if (!payload) {
-      throw new Error("Пустой отчёт");
-    }
-    const html = await decodeGzipBase64(payload);
-    const mimeType = report?.mime_type ?? "text/html";
-    const filename = report?.filename ?? `report_${runIdValue}.html`;
-    const blob = new Blob([html], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      link.click();
-    }
-    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
-  };
-
   const handleGenerateReport = async () => {
     if (!runId) return;
     setReportError(null);
     try {
       const resp = await runServiceAction("workflows.generate_report", { run_id: runId });
       const report = (resp as any)?.report ?? resp;
-      await openReport(runId, report);
+      await openReportFromPayload(runId, report);
     } catch (err) {
       setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
     }
@@ -278,6 +240,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
     if (tab === "history" && !loadedHistory) {
       void loadHistory();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tab, loadedConnections, loadedHistory]);
 
   useEffect(() => {
@@ -474,10 +437,13 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
       try {
         setReportPreviewError(null);
         const html = await decodeGzipBase64(payload);
-        if (revoked) return;
         const mimeType = report?.mime_type ?? "text/html";
         const blob = new Blob([html], { type: mimeType });
         const url = URL.createObjectURL(blob);
+        if (revoked) {
+          URL.revokeObjectURL(url);
+          return;
+        }
         if (reportPreviewUrlRef.current) {
           URL.revokeObjectURL(reportPreviewUrlRef.current);
         }
@@ -522,6 +488,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
     if (!active || !autoRefreshRun || !runId) return;
     const id = window.setInterval(() => void loadRunStatus(runId), 3000);
     return () => window.clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, autoRefreshRun, runId]);
 
   useEffect(() => {
@@ -530,11 +497,13 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
     if (resultFetchedRef.current.has(runId)) return;
     resultFetchedRef.current.add(runId);
     void loadRunResult(runId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId, runStatus]);
 
   useEffect(() => {
     if (!active || !runId) return;
     void loadRunLogs(runId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, runId]);
 
   useEffect(() => {
@@ -542,6 +511,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
     if (!active || !runLogsAutoRefresh || !runId || statusValue !== "running") return;
     const id = window.setInterval(() => void loadRunLogs(runId), 3000);
     return () => window.clearInterval(id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, runId, runLogsAutoRefresh, runStatus]);
 
   const historyDialects = useMemo(() => {
@@ -844,7 +814,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
                           onClick={async () => {
                             setReportError(null);
                             try {
-                              await openReport(runId, (workflowResult as any)?.report);
+                              await openReportFromPayload(runId, (workflowResult as any)?.report);
                             } catch (err) {
                               setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
                             }
@@ -1146,7 +1116,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
                           if ((workflowResult as any)?.report) {
                             setReportError(null);
                             try {
-                              await openReport(resultModal.runId!, (workflowResult as any)?.report);
+                              await openReportFromPayload(resultModal.runId!, (workflowResult as any)?.report);
                             } catch (err) {
                               setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
                             }

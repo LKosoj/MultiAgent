@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 from .base import BaseDBPlugin
+
+logger = logging.getLogger(__name__)
 
 
 class DuckDBPlugin(BaseDBPlugin):
@@ -228,8 +231,8 @@ class DuckDBPlugin(BaseDBPlugin):
             result = conn.execute(sql).fetchone()
             if result and result[0] is not None:
                 return int(result[0])
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("DuckDB estimate_row_count failed for %s: %s", table_name, e)
         return 1000000  # Conservative fallback
 
     def get_basic_column_stats(self, conn, table_name: str) -> Dict[str, Dict[str, Any]]:
@@ -293,9 +296,8 @@ class DuckDBPlugin(BaseDBPlugin):
                     # Skip stats for problematic columns
                     continue
 
-        except Exception:
-            # Return empty stats if something goes wrong
-            pass
+        except Exception as e:
+            logger.warning("DuckDB get_basic_column_stats failed for %s: %s", table_name, e)
 
         return stats
     

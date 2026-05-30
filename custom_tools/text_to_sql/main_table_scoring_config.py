@@ -192,10 +192,6 @@ def _coerce_weight(
     return value
 
 
-def _coerce_int(value: Any, field: str) -> int:
-    """Совместимость со старым API; использует _coerce_weight без ограничений."""
-    return _coerce_weight(value, field, min_value=-(2**31))
-
 
 def _not_found_message(path: Path, env_var: str) -> str:
     return (

@@ -154,6 +154,10 @@ jurisdictions:
       medium: "персональные данные"
       high: "любые данные связанные с личностью"
     negatives: {}
+    # fullname_exclusions: явная пустая заглушка. EU-юрисдикция не имеет
+    # географических исключений для full_name (в отличие от ru). Явное
+    # присутствие ключа делает поведение очевидным при use_fullname_exclusions: true.
+    fullname_exclusions: []
     sync_masking:
       rules:
         - id: email

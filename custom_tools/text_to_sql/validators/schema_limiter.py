@@ -370,8 +370,11 @@ class SchemaLimiter:
                             has_limit = True
                     if has_limit:
                         return sql
-                    rendered = target.sql(dialect=dialect)
-                    return f"{rendered.rstrip(';').rstrip()} LIMIT {default_limit}"
+                    # M50: дописываем LIMIT к хвосту ИСХОДНОЙ строки, а не к
+                    # результату target.sql() — sqlglot.Expression.sql() нормализует
+                    # запрос (регистр, кавычки, порядок аргументов), что может
+                    # сломать выполнение в строго-чувствительных к кавычкам СУБД.
+                    return f"{sql.rstrip(';').rstrip()} LIMIT {default_limit}"
             except Exception as e:
                 logger.warning(
                     "enforce_row_limit: sqlglot path failed (%s); using regex fallback.",

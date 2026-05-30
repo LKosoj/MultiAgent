@@ -809,18 +809,28 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 agent_name=step.agent_type
             )
     
-    async def _apply_decision_modifications(self, step: WorkflowStep, 
-                                          modifications: Dict[str, Any]):
-        """Применить модификации к шагу для retry"""
-        
+    def _apply_decision_modifications(self, step: WorkflowStep,
+                                      modifications: Dict[str, Any]) -> WorkflowStep:
+        """Применить модификации к шагу для retry.
+
+        Возвращает shallow-copy шага с изменённым task, чтобы не мутировать
+        оригинальный объект (который разделяется между retry-итерациями).
+
+        ВНИМАНИЕ: метод сейчас НЕ вызывается из кода (зарезервирован под интеграцию
+        с on_retry_modify_context_func, см. docs). Фикс M75 устранил мутацию
+        оригинала; сама проводка вызова — отдельная задача и здесь намеренно не
+        добавляется во избежание изменения поведения retry вне scope аудита.
+        """
+        import copy
+        modified = copy.copy(step)
+
         if modifications.get("enhance_prompt"):
-            # Можно расширить задачу дополнительными инструкциями
-            step.task += "\n\nДополнительные требования: предоставьте подробное обоснование и примеры."
-        
+            modified.task = step.task + "\n\nДополнительные требования: предоставьте подробное обоснование и примеры."
+
         if modifications.get("add_format_examples"):
-            step.task += "\n\nПример желаемого формата ответа: структурированный текст с четкими разделами."
-        
-        # Другие модификации можно добавить по мере необходимости
+            modified.task = modified.task + "\n\nПример желаемого формата ответа: структурированный текст с четкими разделами."
+
+        return modified
     
     def get_enhanced_stats(self) -> Dict[str, Any]:
         """Получить статистику enhanced компонентов"""
@@ -956,51 +966,29 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         """Выполнение шага через агента в enhanced режиме с дополнительной логикой"""
         # Специальная обработка для менеджера с предзагрузкой агентов
         if step.agent_type == 'manager' and step.metadata and step.metadata.get('preload_agents'):
-            # Используем метод из базового класса, но адаптируем pipeline_type
-            original_pipeline_type = step.metadata.get('pipeline_type', 'enhanced_workflow')
-            if 'pipeline_type' not in step.metadata:
-                step.metadata['pipeline_type'] = 'enhanced_workflow'
-            
-            result = await self._execute_manager_with_preloaded_agents(
-                step, context, task
+            # Работаем на per-call копии step и его metadata, чтобы не мутировать
+            # общий объект WorkflowStep (он может разделяться параллельными шагами
+            # из workflow_def.steps). Прежний код писал pipeline_type прямо в
+            # step.metadata и «восстанавливал» его — это гонка при конкурентных шагах.
+            import copy
+            local_step = copy.copy(step)
+            local_step.metadata = dict(step.metadata)
+            local_step.metadata.setdefault('pipeline_type', 'enhanced_workflow')
+
+            return await self._execute_manager_with_preloaded_agents(
+                local_step, context, task
             )
-            
-            # Восстанавливаем исходный pipeline_type
-            if original_pipeline_type:
-                step.metadata['pipeline_type'] = original_pipeline_type
-            else:
-                step.metadata.pop('pipeline_type', None)
-                
-            return result
         else:
-            # Временно изменяем pipeline_type для enhanced режима
-            original_pipeline_type = getattr(step, '_original_pipeline_type', None)
-            step._original_pipeline_type = 'enhanced_workflow'
-            
             logger.info(f"🤖 Delegating enhanced step '{step.id}' to parent with enhanced pipeline_type")
-            
-            # Используем логику базового класса с thread pool, но с enhanced pipeline_type
-            # Временно переопределяем создание агента для enhanced режима
-            original_create_agent = self.factory.create_agent
-            
-            def create_enhanced_agent(*args, **kwargs):
-                if 'pipeline_type' in kwargs:
-                    kwargs['pipeline_type'] = 'enhanced_workflow'
-                return original_create_agent(*args, **kwargs)
-            
-            self.factory.create_agent = create_enhanced_agent
-            
-            try:
-                # Используем thread pool логику из базового класса
-                result = await super()._execute_agent_step(step, context, task)
-                return result
-            finally:
-                # Восстанавливаем оригинальную функцию
-                self.factory.create_agent = original_create_agent
-                if original_pipeline_type:
-                    step._original_pipeline_type = original_pipeline_type
-                else:
-                    delattr(step, '_original_pipeline_type')
+
+            # Работаем на per-call копии, чтобы избежать гонки при параллельных шагах,
+            # которые могут разделять один объект WorkflowStep из workflow_def.steps.
+            import copy
+            local_step = copy.copy(step)
+            local_step._enhanced_pipeline_type = 'enhanced_workflow'
+
+            result = await super()._execute_agent_step(local_step, context, task)
+            return result
     
     def _is_tool_error_result(self, result: Any) -> bool:
         """

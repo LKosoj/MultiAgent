@@ -4,6 +4,7 @@
 """
 
 import logging
+import threading
 import uuid
 from typing import Dict, Any, Optional, Callable, Union, List
 from datetime import datetime, timedelta
@@ -199,10 +200,20 @@ class ToolManager:
     Автоматически создает корневой спан agent_run_<tool_name> для каждого инструмента
     """
     
+    _CLEANUP_INTERVAL = 100  # вызывать cleanup каждые N завершений
+
     def __init__(self):
         self.active_runs: Dict[str, Dict[str, Any]] = {}
+        self._runs_lock = threading.Lock()
+        self._completion_counter = 0
 
     def _sanitize_active_run(self, run_id: str) -> None:
+        """Редактирует чувствительные поля записи active_runs «на месте».
+
+        ИНВАРИАНТ: вызывается ТОЛЬКО при уже захваченном self._runs_lock и сам лок
+        НЕ берёт (threading.Lock нереентерабелен — повторный захват = deadlock).
+        Все 4 call-site (success/except в run_tool и tool_context) держат лок.
+        """
         run_data = self.active_runs.get(run_id)
         if not isinstance(run_data, dict):
             return
@@ -246,14 +257,15 @@ class ToolManager:
             safe_task_description = _redact_runtime_value(task_description)
             
             # Регистрируем запуск
-            self.active_runs[run_id] = {
-                "tool_name": tool_name,
-                "status": "running",
-                "task": safe_task_description,
-                "session_id": session_id,
-                "start_time": datetime.now(),
-                "kwargs": safe_kwargs
-            }
+            with self._runs_lock:
+                self.active_runs[run_id] = {
+                    "tool_name": tool_name,
+                    "status": "running",
+                    "task": safe_task_description,
+                    "session_id": session_id,
+                    "start_time": datetime.now(),
+                    "kwargs": safe_kwargs
+                }
             
             logger.info(f"🔧 Запуск инструмента {tool_name} с run_id: {run_id}")
             
@@ -324,12 +336,20 @@ class ToolManager:
                 tool_completed = True
 
                 # Обновляем статус
-                self.active_runs[run_id]["status"] = "completed"
-                self.active_runs[run_id]["end_time"] = datetime.now()
-                safe_result = _redact_runtime_value(result)
-                self.active_runs[run_id]["result"] = str(safe_result)[:200] if safe_result else "No result"
-                self._sanitize_active_run(run_id)
-                
+                do_cleanup = False  # инициализация до lock: иначе исключение внутри
+                                    # критической секции даст UnboundLocalError ниже.
+                with self._runs_lock:
+                    self.active_runs[run_id]["status"] = "completed"
+                    self.active_runs[run_id]["end_time"] = datetime.now()
+                    safe_result = _redact_runtime_value(result)
+                    self.active_runs[run_id]["result"] = str(safe_result)[:200] if safe_result else "No result"
+                    self._sanitize_active_run(run_id)
+                    # Периодическая автоочистка завершённых записей
+                    self._completion_counter += 1
+                    do_cleanup = self._completion_counter % self._CLEANUP_INTERVAL == 0
+                if do_cleanup:
+                    self.cleanup_completed()
+
                 logger.info(f"✅ Инструмент {tool_name} завершен с run_id: {run_id}")
                 
                 return result
@@ -360,11 +380,19 @@ class ToolManager:
 
         except Exception as e:
             # Обновляем статус при ошибке
-            if run_id in self.active_runs:
-                self.active_runs[run_id]["status"] = "failed"
-                self.active_runs[run_id]["error"] = str(_redact_runtime_value(str(e)))
-                self.active_runs[run_id]["end_time"] = datetime.now()
-                self._sanitize_active_run(run_id)
+            do_cleanup = False  # инициализация до lock (см. success-путь)
+            with self._runs_lock:
+                if run_id in self.active_runs:
+                    self.active_runs[run_id]["status"] = "failed"
+                    self.active_runs[run_id]["error"] = str(_redact_runtime_value(str(e)))
+                    self.active_runs[run_id]["end_time"] = datetime.now()
+                    self._sanitize_active_run(run_id)
+                # Периодическая автоочистка: учитываем и сбойные завершения, иначе
+                # failed-записи копятся в active_runs бесконечно (cleanup был только в success-пути).
+                self._completion_counter += 1
+                do_cleanup = self._completion_counter % self._CLEANUP_INTERVAL == 0
+            if do_cleanup:
+                self.cleanup_completed()
 
             # Закрываем span при ошибке
             if span:
@@ -481,7 +509,8 @@ class ToolManager:
                 "start_time": datetime.now(),
                 "kwargs": safe_kwargs
             }
-            self.active_runs[run_id] = run_data
+            with self._runs_lock:
+                self.active_runs[run_id] = run_data
             
             logger.info(f"🔧 Начало контекста инструмента {tool_name} с run_id: {run_id}")
             
@@ -504,23 +533,35 @@ class ToolManager:
                 
                 ctx = ToolContext(span, run_data)
                 yield ctx
-                
-                # Обновляем статус при успешном завершении
-                if run_data["status"] == "running":
-                    run_data["status"] = "completed"
-                if "result" in run_data:
-                    run_data["result"] = _redact_runtime_value(run_data["result"])
-                run_data["end_time"] = datetime.now()
-                self._sanitize_active_run(run_id)
-                
+
+                # Обновляем статус при успешном завершении под локом — иначе
+                # list_active_tools/cleanup_completed увидят частично обновлённый run_data.
+                do_cleanup = False  # инициализация до lock: иначе исключение внутри
+                                    # критической секции даст UnboundLocalError ниже.
+                with self._runs_lock:
+                    if run_data["status"] == "running":
+                        run_data["status"] = "completed"
+                    if "result" in run_data:
+                        run_data["result"] = _redact_runtime_value(run_data["result"])
+                    run_data["end_time"] = datetime.now()
+                    self._sanitize_active_run(run_id)
+                    # Периодическая автоочистка (как в run_tool): tool_context пишет в тот
+                    # же active_runs, без этого его записи копились бы бесконечно.
+                    self._completion_counter += 1
+                    do_cleanup = self._completion_counter % self._CLEANUP_INTERVAL == 0
+                if do_cleanup:
+                    self.cleanup_completed()
+
                 logger.info(f"✅ Контекст инструмента {tool_name} завершен с run_id: {run_id}")
-                
+
             finally:
                 # Закрываем span через finish_run_trace
                 if span:
                     try:
-                        # Итог по контексту может быть зафиксирован пользователем в run_data["result"], если он есть
-                        result_value = self.active_runs.get(run_id, {}).get("result")
+                        # Итог по контексту может быть зафиксирован пользователем в run_data["result"], если он есть.
+                        # Читаем под локом — иначе гонка с list_active_tools/cleanup_completed и другими писателями.
+                        with self._runs_lock:
+                            result_value = self.active_runs.get(run_id, {}).get("result")
                         if result_value:
                             safe_result = _redact_runtime_value(result_value)
                             if isinstance(result_value, (dict, list)):
@@ -541,12 +582,20 @@ class ToolManager:
                 
         except Exception as e:
             # Обновляем статус при ошибке
-            if run_id in self.active_runs:
-                self.active_runs[run_id]["status"] = "failed"
-                self.active_runs[run_id]["error"] = str(_redact_runtime_value(str(e)))
-                self.active_runs[run_id]["end_time"] = datetime.now()
-                self._sanitize_active_run(run_id)
-            
+            do_cleanup = False  # инициализация до lock (см. success-путь)
+            with self._runs_lock:
+                if run_id in self.active_runs:
+                    self.active_runs[run_id]["status"] = "failed"
+                    self.active_runs[run_id]["error"] = str(_redact_runtime_value(str(e)))
+                    self.active_runs[run_id]["end_time"] = datetime.now()
+                    self._sanitize_active_run(run_id)
+                # Периодическая автоочистка: учитываем и сбойные завершения tool_context
+                # (как в run_tool), иначе failed-записи копятся в active_runs.
+                self._completion_counter += 1
+                do_cleanup = self._completion_counter % self._CLEANUP_INTERVAL == 0
+            if do_cleanup:
+                self.cleanup_completed()
+
             # Закрываем span при ошибке
             if span:
                 try:
@@ -560,45 +609,58 @@ class ToolManager:
                         span.end()
                     except Exception:
                         pass
-            
+
             safe_error = str(_redact_runtime_value(str(e)))
             logger.error(f"❌ Ошибка в контексте инструмента {tool_name} с run_id {run_id}: {safe_error}")
             raise
     
     def get_tool_status(self, run_id: str) -> Optional[Dict[str, Any]]:
         """Получить статус выполнения инструмента"""
-        return self.active_runs.get(run_id)
+        with self._runs_lock:
+            return self.active_runs.get(run_id)
     
     def list_active_tools(self) -> Dict[str, Dict[str, Any]]:
         """Получить список активных инструментов"""
-        return {k: v for k, v in self.active_runs.items() if v.get("status") == "running"}
+        with self._runs_lock:
+            return {k: v for k, v in self.active_runs.items() if v.get("status") == "running"}
+
+    def list_run_snapshots(self) -> Dict[str, Dict[str, Any]]:
+        """Получить снэпшот всех запусков инструментов."""
+        with self._runs_lock:
+            return {
+                run_id: dict(run_data)
+                for run_id, run_data in self.active_runs.items()
+                if isinstance(run_data, dict)
+            }
     
     def cleanup_completed(self, max_age_minutes: int = 60):
         """Очистка завершенных запусков старше указанного времени"""
         cutoff_time = datetime.now() - timedelta(minutes=max_age_minutes)
-        
-        to_remove = []
-        for run_id, run_data in self.active_runs.items():
-            end_time = run_data.get("end_time")
-            if (end_time and end_time < cutoff_time and 
-                run_data.get("status") in ["completed", "failed"]):
-                to_remove.append(run_id)
-        
-        for run_id in to_remove:
-            del self.active_runs[run_id]
-            
+
+        with self._runs_lock:
+            to_remove = [
+                run_id for run_id, run_data in self.active_runs.items()
+                if (run_data.get("end_time") and run_data["end_time"] < cutoff_time
+                    and run_data.get("status") in ["completed", "failed"])
+            ]
+            for run_id in to_remove:
+                del self.active_runs[run_id]
+
         if to_remove:
             logger.info(f"🧹 Очищено {len(to_remove)} завершенных запусков инструментов")
 
 
 # Глобальный экземпляр менеджера инструментов
 _tool_manager = None
+_tool_manager_lock = threading.Lock()
 
 def get_tool_manager() -> ToolManager:
-    """Получить глобальный экземпляр менеджера инструментов"""
+    """Получить глобальный экземпляр менеджера инструментов (потокобезопасно)"""
     global _tool_manager
     if _tool_manager is None:
-        _tool_manager = ToolManager()
+        with _tool_manager_lock:
+            if _tool_manager is None:
+                _tool_manager = ToolManager()
     return _tool_manager
 
 
@@ -615,16 +677,84 @@ def with_telemetry(tool_name: str, task_description: str = None):
     """
     def decorator(func):
         def wrapper(*args, **kwargs):
-            # Извлекаем session_id из kwargs если есть
-            session_id = kwargs.get('session_id', str(uuid.uuid4())[:8])
-            
             # Формируем описание задачи
             description = task_description or f"Execute {tool_name}"
             if args:
                 description += f" with {len(args)} args"
             if kwargs:
                 description += f" and {len(kwargs)} kwargs"
-            
+
+            # Преобразуем positional args в именованные по сигнатуре функции
+            merged_kwargs = dict(kwargs)
+            if args:
+                try:
+                    sig = inspect.signature(func)
+                    bound = sig.bind_partial(*args, **kwargs)
+                    parameters = sig.parameters
+                    var_positional_name = next(
+                        (
+                            name for name, param in parameters.items()
+                            if param.kind == inspect.Parameter.VAR_POSITIONAL
+                        ),
+                        None,
+                    )
+                    if var_positional_name and bound.arguments.get(var_positional_name):
+                        # Функция объявляет *args: позиционный «хвост» нельзя пробросить
+                        # через run_tool (он вызывает tool_function(**kwargs)). Телеметрия
+                        # для таких вызовов неприменима — вызываем напрямую, сохраняя ВСЕ
+                        # аргументы. Это штатный путь, а не аномалия (потому debug, не warning).
+                        logger.debug(
+                            "with_telemetry: %s объявляет *args — прямой вызов без телеметрии",
+                            func.__name__,
+                        )
+                        return func(*args, **kwargs)
+
+                    has_bound_positional_only = any(
+                        param.kind == inspect.Parameter.POSITIONAL_ONLY and name in bound.arguments
+                        for name, param in parameters.items()
+                    )
+                    if has_bound_positional_only:
+                        logger.debug(
+                            "with_telemetry: %s получил positional-only аргументы — прямой вызов без телеметрии",
+                            func.__name__,
+                        )
+                        return func(*args, **kwargs)
+
+                    for name, value in bound.arguments.items():
+                        param = parameters.get(name)
+                        if param is None:
+                            continue
+                        if param.kind in (
+                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                            inspect.Parameter.KEYWORD_ONLY,
+                        ):
+                            merged_kwargs[name] = value
+                        elif param.kind == inspect.Parameter.VAR_KEYWORD and isinstance(value, dict):
+                            merged_kwargs.update(value)
+                except TypeError:
+                    # bind_partial повторяет ошибки Python (например duplicate values);
+                    # прямой вызов сохранит исходную семантику исключения.
+                    return func(*args, **kwargs)
+                except ValueError:
+                    return func(*args, **kwargs)
+                except Exception:
+                    # Если сигнатуру получить не удалось — передаём функцию напрямую с исходными аргументами
+                    logger.warning(
+                        "with_telemetry: не удалось получить сигнатуру %s, вызов без телеметрии",
+                        func.__name__,
+                    )
+                    return func(*args, **kwargs)
+
+            # session_id должен извлекаться ПОСЛЕ преобразования positional args:
+            # для функций вида f(session_id, x) вызов f("sid", 1) обязан сохранить "sid".
+            session_id = merged_kwargs.get('session_id') or str(uuid.uuid4())[:8]
+
+            # session_id уже захвачен и передаётся явно — убираем из merged_kwargs.
+            # Безопасно: run_tool переинъектирует session_id в kwargs функции инструмента
+            # (см. "if session_id and 'session_id' not in kwargs"), поэтому инструменты,
+            # читающие session_id из своих kwargs, всё равно его получат.
+            merged_kwargs.pop('session_id', None)
+
             # Используем менеджер инструментов
             tool_manager = get_tool_manager()
             return tool_manager.run_tool(
@@ -632,8 +762,7 @@ def with_telemetry(tool_name: str, task_description: str = None):
                 tool_function=func,
                 task_description=description,
                 session_id=session_id,
-                *args,
-                **kwargs
+                **merged_kwargs
             )
         return wrapper
     return decorator

@@ -298,6 +298,12 @@ class ProjectManager:
         """Загружает конкретный проект"""
         try:
             project_path = self.projects_dir / project_id
+            # Защита от path traversal через project_id
+            try:
+                project_path.resolve().relative_to(self.projects_dir.resolve())
+            except ValueError:
+                logger.error(f"Небезопасный project_id: {project_id}")
+                return None
             if project_path.exists():
                 return Project(project_id, project_path)
             else:
@@ -311,6 +317,12 @@ class ProjectManager:
         """Создает бэкап проекта"""
         try:
             project_path = self.projects_dir / project_id
+            # Защита от path traversal через project_id (L56)
+            try:
+                project_path.resolve().relative_to(self.projects_dir.resolve())
+            except ValueError:
+                logger.error(f"Небезопасный project_id: {project_id}")
+                return None
             if not project_path.exists():
                 logger.warning(f"Проект {project_id} не найден для создания бэкапа")
                 return None
@@ -391,6 +403,12 @@ class ProjectManager:
         """Удаляет проект (с созданием бэкапа)"""
         try:
             project_path = self.projects_dir / project_id
+            # Защита от path traversal через project_id (L56)
+            try:
+                project_path.resolve().relative_to(self.projects_dir.resolve())
+            except ValueError:
+                logger.error(f"Небезопасный project_id: {project_id}")
+                return False
             if not project_path.exists():
                 logger.warning(f"Проект {project_id} не найден для удаления")
                 return False
@@ -415,7 +433,13 @@ class ProjectManager:
     def get_project_files(self, project_id: str) -> Dict[str, str]:
         """Возвращает пути к основным файлам проекта"""
         project_path = self.projects_dir / project_id
-        
+        # Защита от path traversal через project_id (L56)
+        try:
+            project_path.resolve().relative_to(self.projects_dir.resolve())
+        except ValueError:
+            logger.error(f"Небезопасный project_id: {project_id}")
+            return {}
+
         files = {
             "brief": str(project_path / "00_brief.json"),
             "synopsis": str(project_path / "10_synopsis/synopsis.json"),

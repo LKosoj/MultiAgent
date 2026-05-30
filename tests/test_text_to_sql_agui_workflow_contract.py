@@ -1,6 +1,7 @@
 from pathlib import Path
 import asyncio
 import base64
+import concurrent.futures
 import contextlib
 import gzip
 import importlib
@@ -135,10 +136,22 @@ def _load_service_with_stubs(monkeypatch, wf_manager):
 class _WorkflowManagerStub:
     def __init__(self):
         self.calls = []
+        self.active_runs = {}
 
     def start_workflow(self, **kwargs):
         self.calls.append(kwargs)
         return kwargs["run_id"]
+
+    def get_active_run_snapshot(self, run_id):
+        run_data = self.active_runs.get(run_id)
+        return dict(run_data) if isinstance(run_data, dict) else {}
+
+    def update_active_run(self, run_id, updates):
+        run_data = self.active_runs.get(run_id)
+        if not isinstance(run_data, dict):
+            return False
+        run_data.update(updates)
+        return True
 
 
 class _StepResultStub:
@@ -1232,6 +1245,7 @@ def test_workflow_cached_report_rewrites_html_file_without_pii(monkeypatch, tmp_
     decoded = gzip.decompress(base64.b64decode(result["report"]["base64_gzip"])).decode("utf-8")
     disk_html = html_path.read_text(encoding="utf-8")
 
+    assert wf_manager.active_runs["run-1"]["report"]["base64_gzip"] == result["report"]["base64_gzip"]
     for content in (decoded, disk_html):
         assert "secret" not in content
         assert "api_key=abc" not in content
@@ -1273,6 +1287,7 @@ def test_workflow_generate_report_rewrites_html_file_without_pii(monkeypatch, tm
     decoded = gzip.decompress(base64.b64decode(result["report"]["base64_gzip"])).decode("utf-8")
     disk_html = html_path.read_text(encoding="utf-8")
 
+    assert wf_manager.active_runs["run-1"]["report"]["base64_gzip"] == result["report"]["base64_gzip"]
     for content in (decoded, disk_html):
         assert "secret" not in content
         assert "api_key=abc" not in content
@@ -1281,6 +1296,61 @@ def test_workflow_generate_report_rewrites_html_file_without_pii(monkeypatch, tm
         assert "***:***@example.com" in content
         assert "[EMAIL]" in content
         assert "[PHONE]" in content
+
+
+def test_ssrf_dns_timeout_cancels_future(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    callbacks = []
+
+    class _Future:
+        cancelled = False
+
+        def add_done_callback(self, callback):
+            callbacks.append(callback)
+
+        def result(self, timeout=None):
+            raise concurrent.futures.TimeoutError()
+
+        def cancel(self):
+            self.cancelled = True
+            return True
+
+    future = _Future()
+
+    class _Executor:
+        def submit(self, *_args, **_kwargs):
+            return future
+
+    monkeypatch.setattr(service, "_get_dns_resolve_executor", lambda: _Executor())
+
+    try:
+        with pytest.raises(ValueError, match="таймаут"):
+            service._validate_url_no_ssrf("https://example.test/image.png")
+        assert future.cancelled is True
+    finally:
+        for callback in callbacks:
+            callback(future)
+
+
+def test_ssrf_dns_resolver_busy_fails_before_queueing(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    acquired = 0
+    while service._DNS_RESOLVE_SEMAPHORE.acquire(blocking=False):
+        acquired += 1
+
+    class _Executor:
+        def submit(self, *_args, **_kwargs):
+            raise AssertionError("DNS work must not be queued while resolver is busy")
+
+    monkeypatch.setattr(service, "_get_dns_resolve_executor", lambda: _Executor())
+    try:
+        with pytest.raises(ValueError, match="busy"):
+            service._validate_url_no_ssrf("https://example.test/image.png")
+    finally:
+        for _ in range(acquired):
+            service._DNS_RESOLVE_SEMAPHORE.release()
 
 
 def test_telemetry_generate_report_rewrites_html_file_without_pii(monkeypatch, tmp_path):
@@ -2070,7 +2140,7 @@ async def test_workflow_checkpoint_migrates_legacy_raw_secrets(tmp_path):
 
 
 @pytest.mark.filterwarnings("ignore")
-def test_workflow_manager_accepts_explicit_run_id_contract():
+def test_workflow_manager_accepts_explicit_run_id_contract(monkeypatch):
     streamlit_api = _load_light_workflow_streamlit_api()
     WorkflowManager = streamlit_api.WorkflowManager
     _workflow_dsn_env = streamlit_api._workflow_dsn_env
@@ -2079,45 +2149,31 @@ def test_workflow_manager_accepts_explicit_run_id_contract():
     assert "run_id" in signature.parameters
     assert signature.parameters["run_id"].default is None
 
-    previous_dsn = os.environ.get("DB_DSN")
-    previous_limit = os.environ.get("DB_EXECUTOR_ROW_LIMIT")
-    previous_dry_run = os.environ.get("TEXT_TO_SQL_DRY_RUN_ONLY")
-    previous_safety = os.environ.get("TEXT_TO_SQL_SAFETY_LEVEL")
-    previous_validate = os.environ.get("TEXT_TO_SQL_VALIDATE_SCHEMA")
-    try:
-        with _workflow_dsn_env({
-            "dsn": "sqlite:///tmp/app.db",
-            "max_rows": 7,
-            "dry_run_only": True,
-            "safety_level": "strict",
-            "validate_schema": False,
-        }):
-            assert os.environ["DB_DSN"] == "sqlite:///tmp/app.db"
-            assert os.environ["DB_EXECUTOR_ROW_LIMIT"] == "7"
-            assert os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] == "True"
-            assert os.environ["TEXT_TO_SQL_SAFETY_LEVEL"] == "strict"
-            assert os.environ["TEXT_TO_SQL_VALIDATE_SCHEMA"] == "False"
-    finally:
-        if previous_dsn is None:
-            os.environ.pop("DB_DSN", None)
-        else:
-            os.environ["DB_DSN"] = previous_dsn
-        if previous_limit is None:
-            os.environ.pop("DB_EXECUTOR_ROW_LIMIT", None)
-        else:
-            os.environ["DB_EXECUTOR_ROW_LIMIT"] = previous_limit
-        if previous_dry_run is None:
-            os.environ.pop("TEXT_TO_SQL_DRY_RUN_ONLY", None)
-        else:
-            os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] = previous_dry_run
-        if previous_safety is None:
-            os.environ.pop("TEXT_TO_SQL_SAFETY_LEVEL", None)
-        else:
-            os.environ["TEXT_TO_SQL_SAFETY_LEVEL"] = previous_safety
-        if previous_validate is None:
-            os.environ.pop("TEXT_TO_SQL_VALIDATE_SCHEMA", None)
-        else:
-            os.environ["TEXT_TO_SQL_VALIDATE_SCHEMA"] = previous_validate
+    # Используем monkeypatch для изоляции env-переменных: cleanup гарантирован
+    # даже при падении теста для всех ключей, независимо от того, были ли
+    # они установлены до теста.
+    _ENV_KEYS = [
+        "DB_DSN",
+        "DB_EXECUTOR_ROW_LIMIT",
+        "TEXT_TO_SQL_DRY_RUN_ONLY",
+        "TEXT_TO_SQL_SAFETY_LEVEL",
+        "TEXT_TO_SQL_VALIDATE_SCHEMA",
+    ]
+    for key in _ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    with _workflow_dsn_env({
+        "dsn": "sqlite:///tmp/app.db",
+        "max_rows": 7,
+        "dry_run_only": True,
+        "safety_level": "strict",
+        "validate_schema": False,
+    }):
+        assert os.environ["DB_DSN"] == "sqlite:///tmp/app.db"
+        assert os.environ["DB_EXECUTOR_ROW_LIMIT"] == "7"
+        assert os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] == "True"
+        assert os.environ["TEXT_TO_SQL_SAFETY_LEVEL"] == "strict"
+        assert os.environ["TEXT_TO_SQL_VALIDATE_SCHEMA"] == "False"
 
 
 def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():

@@ -1744,7 +1744,7 @@ def artist_agent_batch_edit_tool(
     session_id: str,
     items: Any,
     max_concurrency: int = 5,
-    items_to_edit: Dict[int, Any] = {},
+    items_to_edit: Optional[Dict[int, Any]] = None,
     pipeline_type: str = "workflow",
     enable: bool = True,
     language: str = 'en'
@@ -2134,7 +2134,7 @@ def artist_agent_batch_edit_tool(
     
     # Определяем параллельность
     parallel_generation = items_obj.get("parallel_generation", True)
-    seed = items_obj.get("seed", None)
+    seed = items_obj.get("seed", seed)
     # Для видео-сцен: сцены обрабатываются параллельно независимо от parallel_generation
     scenes_max_concurrency = max_concurrency if is_video_batch else (max_concurrency if parallel_generation else 1)
     # Для иллюстраций: уважаем parallel_generation

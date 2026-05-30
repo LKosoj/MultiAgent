@@ -6,6 +6,7 @@
 """
 from typing import List, Optional, Dict, Any
 import logging
+import threading
 import urllib.parse
 import asyncio
 import aiohttp
@@ -77,6 +78,7 @@ class WebResearchTool:
             max_concurrent: Максимальное количество одновременных запросов
         """
         self.jina_api_key = jina_api_key or os.getenv('JINA_API_KEY', '')
+        self._session_lock = threading.Lock()
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
         self.max_concurrent = max_concurrent
@@ -85,12 +87,13 @@ class WebResearchTool:
 
     def close(self) -> None:
         """Закрывает сессию requests во избежание утечки соединений."""
-        session = getattr(self, "session", None)
-        if session is not None:
-            try:
-                session.close()
-            finally:
-                self.session = None  # type: ignore[assignment]
+        with self._session_lock:
+            session = getattr(self, "session", None)
+            if session is not None:
+                try:
+                    session.close()
+                finally:
+                    self.session = None  # type: ignore[assignment]
 
     def _get_semaphore(self):
         """Получает семафор для текущего event loop.
@@ -233,7 +236,7 @@ class WebResearchTool:
     async def search_with_fallback_async(self, query: str, max_results: int = 10) -> List[str]:
         """Асинхронный поиск с автоматическим переключением между поисковыми системами."""
         # Сначала пробуем DuckDuckGo
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         logger.info(f"Поиск в DuckDuckGo: '{query}'")
         ddg_results = await loop.run_in_executor(None, self.duckduckgo_search, query, max_results)
         
@@ -311,7 +314,7 @@ class WebResearchTool:
         """Асинхронное извлечение полного содержимого статьи."""
         try:
             # get_clean_text синхронная, но мы можем запустить её в executor
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             content, title = await loop.run_in_executor(None, get_clean_text, url)
             
             return {
@@ -546,7 +549,7 @@ class WebResearchTool:
         prompt = f"Сделай максимально подробный обзор текста, сохранив все детали и факты, математические формулы и т.д. Сохрани ссылки на статьи, из которых ты составляешь обзор. Обзор должен соответствовать запросу пользователя: {user_query}. Не включай в обозр информацию, не относящуюся к запросу пользователя! Обзор должен быть на русском языке. Текст:\n {text}"
         
         # Выполняем саммари в executor, так как call_openai_api синхронная
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         summary = await loop.run_in_executor(
             None, 
             lambda: call_openai_api(

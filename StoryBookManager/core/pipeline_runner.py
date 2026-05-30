@@ -31,6 +31,7 @@ class PipelineRunner:
         self.current_workflow_id: Optional[str] = None
         self._original_on_step_completed = None
         self._original_execute_workflow_step = None
+        self._hook_lock = threading.Lock()  # сериализует install/uninstall хуков
         self._pause_event = threading.Event()
         self._pause_event.set()  # не на паузе по умолчанию
         self._initialize_engine()
@@ -49,60 +50,71 @@ class PipelineRunner:
         """Оборачивает engine-хуки для step tracker, progress и паузы."""
         if not self.engine or not progress_callback:
             return
-        self._original_on_step_completed = self.engine._on_step_completed
-        self._original_execute_workflow_step = self.engine._execute_workflow_step
-        completed_count = [0]
-        original = self._original_on_step_completed
-        original_execute_step = self._original_execute_workflow_step
+        # Весь install под одним локом: claim-проверка, захват оригиналов, определение
+        # замыканий и запись hooked-методов в engine — атомарно. Иначе concurrent
+        # _uninstall_step_hook между захватом и записью потерял бы оригиналы, а второй
+        # install установил бы хуки дважды. Замыкания исполняются ПОЗЖЕ (во время workflow)
+        # и _hook_lock не берут — дедлока нет.
+        with self._hook_lock:
+            if self._original_on_step_completed is not None:
+                return
+            self._original_on_step_completed = self.engine._on_step_completed
+            self._original_execute_workflow_step = self.engine._execute_workflow_step
+            completed_count = [0]
+            original = self._original_on_step_completed
+            original_execute_step = self._original_execute_workflow_step
 
-        async def _hooked_execute_workflow_step(step, context, workflow_def):
-            try:
-                progress_callback(
-                    message=f"Шаг '{step.id}' выполняется",
-                    step_id=step.id,
-                    step_status="running",
-                )
-            except Exception as e:
-                logger.error(f"Ошибка в progress_callback для запуска шага {step.id}: {e}")
+            async def _hooked_execute_workflow_step(step, context, workflow_def):
+                try:
+                    progress_callback(
+                        message=f"Шаг '{step.id}' выполняется",
+                        step_id=step.id,
+                        step_status="running",
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка в progress_callback для запуска шага {step.id}: {e}")
 
-            return await original_execute_step(step, context, workflow_def)
+                return await original_execute_step(step, context, workflow_def)
 
-        async def _hooked_on_step_completed(workflow_id, step, step_result, context, step_results):
-            await original(workflow_id, step, step_result, context, step_results)
-            completed_count[0] += 1
-            progress = (completed_count[0] / total_steps) * 100 if total_steps > 0 else 0
-            duration = step_result.duration_seconds if hasattr(step_result, 'duration_seconds') else None
-            status = step_result.status.value if hasattr(step_result.status, 'value') else str(step_result.status)
-            try:
-                progress_callback(
-                    message=f"Шаг '{step.id}' завершён ({status})",
-                    progress=progress,
-                    step_id=step.id,
-                    step_status=status,
-                    step_duration=duration,
-                )
-            except Exception as e:
-                logger.error(f"Ошибка в progress_callback для шага {step.id}: {e}")
+            async def _hooked_on_step_completed(workflow_id, step, step_result, context, step_results):
+                await original(workflow_id, step, step_result, context, step_results)
+                completed_count[0] += 1
+                progress = (completed_count[0] / total_steps) * 100 if total_steps > 0 else 0
+                duration = step_result.duration_seconds if hasattr(step_result, 'duration_seconds') else None
+                status = step_result.status.value if hasattr(step_result.status, 'value') else str(step_result.status)
+                try:
+                    progress_callback(
+                        message=f"Шаг '{step.id}' завершён ({status})",
+                        progress=progress,
+                        step_id=step.id,
+                        step_status=status,
+                        step_duration=duration,
+                    )
+                except Exception as e:
+                    logger.error(f"Ошибка в progress_callback для шага {step.id}: {e}")
 
-            # Если pipeline на паузе — блокируем до resume
-            if not self._pause_event.is_set():
-                logger.info(f"⏸ Pipeline приостановлен после шага '{step.id}'")
-                loop = asyncio.get_running_loop()
-                # self._pause_event.wait() выполняем через executor, чтобы не блокировать event loop.
-                await loop.run_in_executor(None, self._pause_event.wait)
-                logger.info("▶ Pipeline возобновлён")
+                # Если pipeline на паузе — блокируем до resume
+                if not self._pause_event.is_set():
+                    logger.info(f"⏸ Pipeline приостановлен после шага '{step.id}'")
+                    loop = asyncio.get_running_loop()
+                    # self._pause_event.wait() выполняем через executor, чтобы не блокировать event loop.
+                    await loop.run_in_executor(None, self._pause_event.wait)
+                    logger.info("▶ Pipeline возобновлён")
 
-        self.engine._execute_workflow_step = _hooked_execute_workflow_step
-        self.engine._on_step_completed = _hooked_on_step_completed
+            self.engine._execute_workflow_step = _hooked_execute_workflow_step
+            self.engine._on_step_completed = _hooked_on_step_completed
 
     def _uninstall_step_hook(self):
         """Восстанавливает оригинальные engine-хуки."""
-        if self._original_on_step_completed is not None and self.engine:
-            self.engine._on_step_completed = self._original_on_step_completed
-            self._original_on_step_completed = None
-        if self._original_execute_workflow_step is not None and self.engine:
-            self.engine._execute_workflow_step = self._original_execute_workflow_step
-            self._original_execute_workflow_step = None
+        # Под тем же локом, что и install: иначе сброс _original_* мог бы гоняться
+        # с claim-проверкой в _install_step_hook.
+        with self._hook_lock:
+            if self._original_on_step_completed is not None and self.engine:
+                self.engine._on_step_completed = self._original_on_step_completed
+                self._original_on_step_completed = None
+            if self._original_execute_workflow_step is not None and self.engine:
+                self.engine._execute_workflow_step = self._original_execute_workflow_step
+                self._original_execute_workflow_step = None
 
     @staticmethod
     def _normalize_workflow_status(result: Any) -> Optional[str]:

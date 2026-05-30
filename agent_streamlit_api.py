@@ -14,7 +14,7 @@ import os
 import signal
 import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Callable, Union
+from typing import Dict, List, Any, Optional, Callable, Union, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import yaml
@@ -158,7 +158,7 @@ def _setup_process_run_log_capture(run_id: str) -> None:
 
             def flush(self):
                 if self._buffer.strip():
-                    _write_json_line(self.level, self.logger_name, self._buffer.strip())
+                    _write_json_line(self.level, self.logger_name, _strip_ansi(self._buffer.strip()))
                 self._buffer = ""
                 try:
                     self.stream.flush()
@@ -434,6 +434,9 @@ _GLOBAL_ACTIVE_RUNS = {}
 _GLOBAL_RUN_CALLBACKS = {}
 _GLOBAL_AGENT_PROCESSES = {}
 _GLOBAL_AGENT_RESULT_QUEUES = {}
+# Блокировки для потокобезопасного доступа к глобальным реестрам
+_GLOBAL_RUNS_LOCK = threading.RLock()
+_GLOBAL_PROCESSES_LOCK = threading.RLock()
 
 # Типы для callbacks
 AgentCallback = Callable[[str, str, Dict[str, Any]], None]  # (run_id, event_type, data)
@@ -663,14 +666,15 @@ class AgentManager:
             )
             
             # Сохраняем информацию об агенте
-            self.active_runs[agent_id] = {
-                "agent": agent,
-                "profile_name": profile_name,
-                "session_id": session_id,
-                "status": "created",
-                "created_time": datetime.now()
-            }
-            
+            with _GLOBAL_RUNS_LOCK:
+                self.active_runs[agent_id] = {
+                    "agent": agent,
+                    "profile_name": profile_name,
+                    "session_id": session_id,
+                    "status": "created",
+                    "created_time": datetime.now()
+                }
+
             logger.info(f"✅ Создан агент {agent_id} из профиля {profile_name}")
             return agent_id
             
@@ -698,11 +702,12 @@ class AgentManager:
         """
         if session_id is None:
             session_id = f"run-{uuid.uuid4().hex[:16]}"
-        run_id = session_id
-        
+        run_id = str(uuid.uuid4())
+
         # Определяем профиль агента (для процесса создадим внутри)
-        if agent_id_or_profile in self.active_runs:
-            agent_data = self.active_runs[agent_id_or_profile]
+        with _GLOBAL_RUNS_LOCK:
+            agent_data = self.active_runs.get(agent_id_or_profile)
+        if agent_data:
             profile_name = agent_data["profile_name"]
         else:
             profile_name = agent_id_or_profile
@@ -719,47 +724,54 @@ class AgentManager:
             proc.start()
 
             # Регистрируем активный запуск с PID
-            self.active_runs[run_id] = {
-                "profile_name": profile_name,
-                "status": "running",
-                "task": task,
-                "session_id": session_id,
-                "start_time": datetime.now(),
-                "step_count": 0,
-                "pid": proc.pid,
-            }
-            _GLOBAL_AGENT_PROCESSES[run_id] = proc
-            _GLOBAL_AGENT_RESULT_QUEUES[run_id] = result_queue
+            with _GLOBAL_RUNS_LOCK:
+                self.active_runs[run_id] = {
+                    "profile_name": profile_name,
+                    "status": "running",
+                    "task": task,
+                    "session_id": session_id,
+                    "start_time": datetime.now(),
+                    "step_count": 0,
+                    "pid": proc.pid,
+                }
+            with _GLOBAL_PROCESSES_LOCK:
+                _GLOBAL_AGENT_PROCESSES[run_id] = proc
+                _GLOBAL_AGENT_RESULT_QUEUES[run_id] = result_queue
 
             def _watchdog(_rid: str):
-                p = _GLOBAL_AGENT_PROCESSES.get(_rid)
+                with _GLOBAL_PROCESSES_LOCK:
+                    p = _GLOBAL_AGENT_PROCESSES.get(_rid)
                 if not p:
                     return
                 p.join()
                 try:
-                    run_data = self.active_runs.get(_rid)
-                    if not run_data:
-                        return
-                    if run_data.get("status") in ["completed", "failed", "cancelled"]:
-                        return
                     exit_code = p.exitcode
+                    with _GLOBAL_PROCESSES_LOCK:
+                        child_result_queue = _GLOBAL_AGENT_RESULT_QUEUES.pop(_rid, None)
                     child_result = None
-                    result_queue = _GLOBAL_AGENT_RESULT_QUEUES.pop(_rid, None)
-                    if result_queue is not None:
+                    if child_result_queue is not None:
                         try:
-                            child_result = result_queue.get(timeout=0.2)
+                            child_result = child_result_queue.get(timeout=0.2)
                         except Exception:
                             child_result = None
                     child_status = child_result.get("status") if isinstance(child_result, dict) else None
                     child_error = child_result.get("error") if isinstance(child_result, dict) else None
-                    run_data.update({
-                        "end_time": datetime.now(),
-                        "status": "completed" if exit_code == 0 and child_status != "failed" else "failed",
-                        "error": child_error if child_error else (None if exit_code == 0 else f"Процесс завершился с кодом {exit_code}"),
-                    })
-                    if isinstance(child_result, dict) and "result" in child_result:
-                        run_data["result"] = child_result["result"]
-                    self._notify_callback(_rid, run_data["status"], {"error": run_data.get("error")})
+                    with _GLOBAL_RUNS_LOCK:
+                        run_data = self.active_runs.get(_rid)
+                        if not run_data:
+                            return
+                        if run_data.get("status") in ["completed", "failed", "cancelled"]:
+                            return
+                        run_data.update({
+                            "end_time": datetime.now(),
+                            "status": "completed" if exit_code == 0 and child_status != "failed" else "failed",
+                            "error": child_error if child_error else (None if exit_code == 0 else f"Процесс завершился с кодом {exit_code}"),
+                        })
+                        if isinstance(child_result, dict) and "result" in child_result:
+                            run_data["result"] = child_result["result"]
+                        _notify_status = run_data["status"]
+                        _notify_error = run_data.get("error")
+                    self._notify_callback(_rid, _notify_status, {"error": _notify_error})
                 except Exception:
                     pass
 
@@ -808,18 +820,19 @@ class AgentManager:
 
             # Регистрируем начальное состояние
             # Создаем запись, если её еще нет
-            if run_id not in self.active_runs:
-                self.active_runs[run_id] = {}
-            self.active_runs[run_id].update({ # Use update to add new fields
-                "profile_name": profile_name,
-                "status": "running",
-                "task": task,
-                "session_id": session_id,
-                "start_time": datetime.now(),
-                "step_count": 0,
-                "enable_telemetry": enable_telemetry, # Store options for monitoring
-                "enable_memory": enable_memory,
-            })
+            with _GLOBAL_RUNS_LOCK:
+                if run_id not in self.active_runs:
+                    self.active_runs[run_id] = {}
+                self.active_runs[run_id].update({ # Use update to add new fields
+                    "profile_name": profile_name,
+                    "status": "running",
+                    "task": task,
+                    "session_id": session_id,
+                    "start_time": datetime.now(),
+                    "step_count": 0,
+                    "enable_telemetry": enable_telemetry, # Store options for monitoring
+                    "enable_memory": enable_memory,
+                })
             
             self._notify_callback(run_id, "started", {
                 "profile_name": profile_name,
@@ -908,13 +921,14 @@ class AgentManager:
             
             # Сохраняем результат
             # Создаем запись, если её еще нет
-            if run_id not in self.active_runs:
-                self.active_runs[run_id] = {}
-            self.active_runs[run_id].update({
-                "status": "completed",
-                "end_time": datetime.now(),
-                "result": result
-            })
+            with _GLOBAL_RUNS_LOCK:
+                if run_id not in self.active_runs:
+                    self.active_runs[run_id] = {}
+                self.active_runs[run_id].update({
+                    "status": "completed",
+                    "end_time": datetime.now(),
+                    "result": result
+                })
             
             self._notify_callback(run_id, "completed", {
                 "result": str(result) if result else None
@@ -923,28 +937,30 @@ class AgentManager:
         except Exception as e:
             # Сохраняем ошибку
             # Создаем запись, если её еще нет
-            if run_id not in self.active_runs:
-                self.active_runs[run_id] = {}
-            self.active_runs[run_id].update({
-                "status": "failed",
-                "end_time": datetime.now(),
-                "error": str(e)
-            })
-            
+            with _GLOBAL_RUNS_LOCK:
+                if run_id not in self.active_runs:
+                    self.active_runs[run_id] = {}
+                self.active_runs[run_id].update({
+                    "status": "failed",
+                    "end_time": datetime.now(),
+                    "error": str(e)
+                })
+
             self._notify_callback(run_id, "failed", {
                 "error": str(e)
             })
-            
+
             logger.error(f"❌ Ошибка выполнения агента {run_id}: {e}")
 
     def _notify_callback(self, run_id: str, event_type: str, data: Dict[str, Any]):
         """Уведомление EventBus о событии"""
         # Всегда записываем событие в статус для мониторинга
-        if run_id in self.active_runs:
-            self.active_runs[run_id][f"last_{event_type}"] = {
-                "timestamp": datetime.now(),
-                "data": data
-            }
+        with _GLOBAL_RUNS_LOCK:
+            if run_id in self.active_runs:
+                self.active_runs[run_id][f"last_{event_type}"] = {
+                    "timestamp": datetime.now(),
+                    "data": data
+                }
         
         # Получаем EventBus и отправляем ProgressEvent
         try:
@@ -965,10 +981,10 @@ class AgentManager:
         Returns:
             Словарь с событиями агента
         """
-        if run_id not in self.active_runs:
-            return {}
-            
-        run_data = self.active_runs[run_id]
+        with _GLOBAL_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                return {}
+            run_data = dict(self.active_runs[run_id])
         events = {}
         
         # Извлекаем все события, записанные в статус
@@ -989,10 +1005,10 @@ class AgentManager:
         Returns:
             Объект AgentRunStatus или None
         """
-        if run_id not in self.active_runs:
-            return None
-            
-        run_data = self.active_runs[run_id]
+        with _GLOBAL_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                return None
+            run_data = dict(self.active_runs[run_id])
         
         duration = None
         if run_data.get("end_time"):
@@ -1022,10 +1038,10 @@ class AgentManager:
         Returns:
             Объект AgentRunResult или None
         """
-        if run_id not in self.active_runs:
-            return None
-            
-        run_data = self.active_runs[run_id]
+        with _GLOBAL_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                return None
+            run_data = dict(self.active_runs[run_id])
         
         result = AgentRunResult(
             run_id=run_id,
@@ -1039,6 +1055,14 @@ class AgentManager:
         )
         
         return result
+
+    def list_active_run_snapshots(self) -> List[Tuple[str, Dict[str, Any]]]:
+        with _GLOBAL_RUNS_LOCK:
+            return [
+                (run_id, dict(run_data))
+                for run_id, run_data in self.active_runs.items()
+                if isinstance(run_data, dict)
+            ]
 
     # === Динамические агенты ===
     
@@ -1089,20 +1113,16 @@ class AgentManager:
         agent_id = f"dynamic_{definition.name}_{uuid.uuid4().hex[:8]}"
         
         try:
-            # Временно регистрируем профиль в AGENT_PROFILES
-            temp_profile_name = f"temp_{uuid.uuid4().hex[:8]}"
-            AGENT_PROFILES[temp_profile_name] = definition.to_profile_dict()
-            
-            try:
-                # Создаем агента
-                agent = self.factory.create_agent(
-                    profile_type=temp_profile_name,
-                    session_id=session_id,
-                    task="placeholder_task",
-                    pipeline_type="general"
-                )
-                
-                # Сохраняем информацию об агенте
+            agent = self.factory.create_agent(
+                profile_type=definition.name,
+                session_id=session_id,
+                task="placeholder_task",
+                pipeline_type="general",
+                profile_override=definition.to_profile_dict(),
+            )
+
+            # Сохраняем информацию об агенте
+            with _GLOBAL_RUNS_LOCK:
                 self.active_runs[agent_id] = {
                     "agent": agent,
                     "profile_name": definition.name,
@@ -1112,15 +1132,10 @@ class AgentManager:
                     "is_dynamic": True,
                     "definition": definition
                 }
-                
-                logger.info(f"✅ Создан динамический агент {agent_id}")
-                return agent_id
-                
-            finally:
-                # Удаляем временный профиль
-                if temp_profile_name in AGENT_PROFILES:
-                    del AGENT_PROFILES[temp_profile_name]
-                    
+
+            logger.info(f"✅ Создан динамический агент {agent_id}")
+            return agent_id
+
         except Exception as e:
             logger.error(f"❌ Ошибка создания динамического агента: {e}")
             raise
@@ -1144,11 +1159,10 @@ class AgentManager:
         Returns:
             run_id для отслеживания выполнения
         """
-        # Используем session_id как run_id для единой системы идентификаторов
         if session_id is None:
             session_id = f"run-{uuid.uuid4().hex[:16]}"
-        run_id = session_id
-        
+        run_id = str(uuid.uuid4())
+
         # Регистрируем callback если предоставлен
         if callback:
             self.run_callbacks[run_id] = [callback]
@@ -1172,40 +1186,50 @@ class AgentManager:
             proc.start()
 
             # Регистрируем начальное состояние с PID
-            self.active_runs[run_id] = {
-                "manager_profile": manager_definition_or_name if isinstance(manager_definition_or_name, str) else "manager",
-                "team_profiles": [td if isinstance(td, str) else getattr(td, 'name', 'unknown') for td in team_definitions_or_names],
-                "profile_name": f"Команда: {manager_definition_or_name if isinstance(manager_definition_or_name, str) else 'manager'} + {len(team_definitions_or_names)} агентов",
-                "status": "running",
-                "task": task,
-                "session_id": session_id,
-                "start_time": datetime.now(),
-                "step_count": 0,
-                "pid": proc.pid,
-            }
+            with _GLOBAL_RUNS_LOCK:
+                self.active_runs[run_id] = {
+                    "manager_profile": manager_definition_or_name if isinstance(manager_definition_or_name, str) else "manager",
+                    "team_profiles": [td if isinstance(td, str) else getattr(td, 'name', 'unknown') for td in team_definitions_or_names],
+                    "profile_name": f"Команда: {manager_definition_or_name if isinstance(manager_definition_or_name, str) else 'manager'} + {len(team_definitions_or_names)} агентов",
+                    "status": "running",
+                    "task": task,
+                    "session_id": session_id,
+                    "start_time": datetime.now(),
+                    "step_count": 0,
+                    "pid": proc.pid,
+                }
 
             def _watchdog(_rid: str):
-                p = _GLOBAL_AGENT_PROCESSES.get(_rid)
+                with _GLOBAL_PROCESSES_LOCK:
+                    p = _GLOBAL_AGENT_PROCESSES.get(_rid)
                 if not p:
                     return
                 p.join()
                 try:
-                    run_data = self.active_runs.get(_rid)
-                    if not run_data:
-                        return
-                    if run_data.get("status") in ["completed", "failed", "cancelled"]:
-                        return
+                    # exit_code читаем вне лока (как в watchdog одиночного агента):
+                    # runs-lock защищает только active_runs. Терминальный статус
+                    # (включая cancelled) перепроверяем под локом перед записью,
+                    # чтобы не затереть отмену/иной финальный статус от другого потока.
                     exit_code = p.exitcode
-                    run_data.update({
-                        "end_time": datetime.now(),
-                        "status": "completed" if exit_code == 0 else "failed",
-                        "error": None if exit_code == 0 else f"Процесс завершился с кодом {exit_code}",
-                    })
-                    self._notify_callback(_rid, run_data["status"], {"error": run_data.get("error")})
+                    with _GLOBAL_RUNS_LOCK:
+                        run_data = self.active_runs.get(_rid)
+                        if not run_data:
+                            return
+                        if run_data.get("status") in ["completed", "failed", "cancelled"]:
+                            return
+                        run_data.update({
+                            "end_time": datetime.now(),
+                            "status": "completed" if exit_code == 0 else "failed",
+                            "error": None if exit_code == 0 else f"Процесс завершился с кодом {exit_code}",
+                        })
+                        _notify_status = run_data["status"]
+                        _notify_error = run_data.get("error")
+                    self._notify_callback(_rid, _notify_status, {"error": _notify_error})
                 except Exception:
                     pass
 
-            _GLOBAL_AGENT_PROCESSES[run_id] = proc
+            with _GLOBAL_PROCESSES_LOCK:
+                _GLOBAL_AGENT_PROCESSES[run_id] = proc
             watcher = threading.Thread(target=_watchdog, args=(run_id,), daemon=True)
             watcher.start()
 
@@ -1275,16 +1299,17 @@ class AgentManager:
                         team_profiles.append(team_def.name)
 
                 # Регистрируем начальное состояние
-                self.active_runs[run_id] = {
-                    "manager_profile": manager_profile,
-                    "team_profiles": team_profiles,
-                    "profile_name": f"Команда: {manager_profile} + {len(team_profiles)} агентов",
-                    "status": "running",
-                    "task": task,
-                    "session_id": session_id,
-                    "start_time": datetime.now(),
-                    "step_count": 0
-                }
+                with _GLOBAL_RUNS_LOCK:
+                    self.active_runs[run_id] = {
+                        "manager_profile": manager_profile,
+                        "team_profiles": team_profiles,
+                        "profile_name": f"Команда: {manager_profile} + {len(team_profiles)} агентов",
+                        "status": "running",
+                        "task": task,
+                        "session_id": session_id,
+                        "start_time": datetime.now(),
+                        "step_count": 0
+                    }
 
                 self._notify_callback(run_id, "started", {
                     "manager_profile": manager_profile,
@@ -1356,11 +1381,12 @@ class AgentManager:
                     telemetry_manager.finish_run_trace(root_span, success=True)
 
                 # Сохраняем результат
-                self.active_runs[run_id].update({
-                    "status": "completed",
-                    "end_time": datetime.now(),
-                    "result": result
-                })
+                with _GLOBAL_RUNS_LOCK:
+                    self.active_runs[run_id].update({
+                        "status": "completed",
+                        "end_time": datetime.now(),
+                        "result": result
+                    })
 
                 self._notify_callback(run_id, "completed", {
                     "result": str(result) if result else None
@@ -1372,11 +1398,12 @@ class AgentManager:
                     telemetry_manager.finish_run_trace(root_span, success=False, error_message=str(e))
 
                 # Сохраняем ошибку
-                self.active_runs[run_id].update({
-                    "status": "failed",
-                    "end_time": datetime.now(),
-                    "error": str(e)
-                })
+                with _GLOBAL_RUNS_LOCK:
+                    self.active_runs[run_id].update({
+                        "status": "failed",
+                        "end_time": datetime.now(),
+                        "error": str(e)
+                    })
 
                 self._notify_callback(run_id, "failed", {
                     "error": str(e)
@@ -1394,17 +1421,17 @@ class AgentManager:
         Returns:
             True если отмена успешна
         """
-        if run_id not in self.active_runs:
-            return False
-            
-        run_data = self.active_runs[run_id]
-        
-        if run_data["status"] in ["completed", "failed", "cancelled"]:
-            return False
+        with _GLOBAL_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                return False
+            run_data = self.active_runs[run_id]
+            if run_data["status"] in ["completed", "failed", "cancelled"]:
+                return False
+            pid = run_data.get("pid")
 
         # Пытаемся завершить дочерний процесс, если он запущен
-        pid = run_data.get("pid")
-        proc = _GLOBAL_AGENT_PROCESSES.get(run_id)
+        with _GLOBAL_PROCESSES_LOCK:
+            proc = _GLOBAL_AGENT_PROCESSES.get(run_id)
         killed = False
         if proc is not None:
             try:
@@ -1473,18 +1500,20 @@ class AgentManager:
             except Exception as e:
                 logger.warning(f"⚠️ Не удалось послать сигнал процессу {pid}: {e}")
 
-        # Помечаем как отмененный
-        run_data.update({
-            "status": "cancelled",
-            "end_time": datetime.now()
-        })
+        # Помечаем как отмененный (повторная проверка под блокировкой, чтобы не перезаписать
+        # финальный статус, выставленный watchdog-потоком между двумя окнами блокировки)
+        with _GLOBAL_RUNS_LOCK:
+            run_data = self.active_runs.get(run_id)
+            if run_data is None or run_data.get("status") in ["completed", "failed", "cancelled"]:
+                return False
+            run_data.update({
+                "status": "cancelled",
+                "end_time": datetime.now()
+            })
 
         # Очищаем реестр процесса
-        if run_id in _GLOBAL_AGENT_PROCESSES:
-            try:
-                _GLOBAL_AGENT_PROCESSES.pop(run_id)
-            except Exception:
-                pass
+        with _GLOBAL_PROCESSES_LOCK:
+            _GLOBAL_AGENT_PROCESSES.pop(run_id, None)
 
         self._notify_callback(run_id, "cancelled", {})
         
@@ -1500,25 +1529,22 @@ class AgentManager:
         """
         current_time = datetime.now()
         to_remove = []
-        
-        for run_id, run_data in self.active_runs.items():
-            if run_data["status"] in ["completed", "failed", "cancelled"]:
-                end_time = run_data.get("end_time", run_data.get("start_time", current_time))
-                age_hours = (current_time - end_time).total_seconds() / 3600
-                
-                if age_hours > max_age_hours:
-                    to_remove.append(run_id)
-        
-        for run_id in to_remove:
-            del self.active_runs[run_id]
-            if run_id in self.run_callbacks:
-                del self.run_callbacks[run_id]
-            # Очищаем и реестр процессов, иначе глобальный словарь растёт бесконечно
-            if run_id in _GLOBAL_AGENT_PROCESSES:
-                try:
-                    _GLOBAL_AGENT_PROCESSES.pop(run_id)
-                except Exception:
-                    pass
+
+        with _GLOBAL_RUNS_LOCK:
+            for run_id, run_data in list(self.active_runs.items()):
+                if run_data["status"] in ["completed", "failed", "cancelled"]:
+                    end_time = run_data.get("end_time", run_data.get("start_time", current_time))
+                    age_hours = (current_time - end_time).total_seconds() / 3600
+                    if age_hours > max_age_hours:
+                        to_remove.append(run_id)
+
+            for run_id in to_remove:
+                del self.active_runs[run_id]
+                self.run_callbacks.pop(run_id, None)
+
+        with _GLOBAL_PROCESSES_LOCK:
+            for run_id in to_remove:
+                _GLOBAL_AGENT_PROCESSES.pop(run_id, None)
 
         if to_remove:
             logger.info(f"🧹 Очищено {len(to_remove)} старых запусков агентов")

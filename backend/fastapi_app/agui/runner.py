@@ -596,7 +596,7 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                     return
                 from .service import handle_service_action
 
-                result = handle_service_action(service_action, payload)
+                result = await asyncio.to_thread(handle_service_action, service_action, payload)
                 result_envelope = redact_pii_in_payload(_redact_payload(_service_result_envelope(
                     service_action,
                     True,

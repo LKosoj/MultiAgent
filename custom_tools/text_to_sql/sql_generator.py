@@ -13,6 +13,7 @@ shims на приватные методы (тесты вызывают `gen._ap
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,12 @@ from . import sql_postprocess
 
 def _redact_sql_generation_value(value: Any) -> Any:
     return redact_text_to_sql_value(value)
+
+
+# M91: паттерн допустимых SQL-идентификаторов (letters, digits, underscore, dot
+# для schema.table.column). Кавычки, точки с запятой, спецсимволы SQL — недопустимы
+# в именах таблиц/колонок из кэша памяти.
+_SAFE_IDENTIFIER_RE = re.compile(r'^[A-Za-z_Ѐ-ӿ][A-Za-z0-9_Ѐ-ӿ]*(?:\.[A-Za-z_Ѐ-ӿ][A-Za-z0-9_Ѐ-ӿ]*)*$')
 
 
 class SQLGenerator:
@@ -128,9 +135,25 @@ class SQLGenerator:
                         if isinstance(table_info, dict):
                             table_name = table_info.get("table_name")
                             if table_name:
+                                # M91: валидируем имя таблицы перед включением в schema-dict.
+                                if not isinstance(table_name, str) or not _SAFE_IDENTIFIER_RE.match(table_name):
+                                    logger.warning(
+                                        "_get_schema_from_cache: skipping table with invalid name %r",
+                                        table_name,
+                                    )
+                                    continue
                                 columns = {}
                                 for col in table_info.get("columns", []):
                                     if isinstance(col, dict) and "name" in col:
+                                        col_name = col["name"]
+                                        # M91: валидируем имя колонки.
+                                        if not isinstance(col_name, str) or not _SAFE_IDENTIFIER_RE.match(col_name):
+                                            logger.warning(
+                                                "_get_schema_from_cache: skipping column with invalid name %r "
+                                                "in table %r",
+                                                col_name, table_name,
+                                            )
+                                            continue
                                         col_data = {
                                             "type": col.get("type", ""),
                                             "description": col.get("description", "")
@@ -138,7 +161,7 @@ class SQLGenerator:
                                         for field in ["not_null", "default_value", "constraint_type", "references"]:
                                             if col.get(field):
                                                 col_data[field] = col[field]
-                                        columns[col["name"]] = col_data
+                                        columns[col_name] = col_data
 
                                 schema[table_name] = {
                                     "description": table_info.get("description", ""),
@@ -309,7 +332,10 @@ class SQLGenerator:
     def _get_linked_entities(self, context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(context, dict):
             return {}
-        linked = context.get("linked_entities", context)
+        # L53: при отсутствии ключа linked_entities возвращаем {}, а не весь
+        # context — иначе произвольные поля из user-запроса попадают в metrics/
+        # dimensions/filters как сырой контекст от LLM.
+        linked = context.get("linked_entities")
         return linked if isinstance(linked, dict) else {}
 
     def _get_schema_from_context(self, context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:

@@ -1020,9 +1020,12 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
     prompts_dir = f"{base}/40_prompts"
     
     # Проверяем целостность: существуют ли ВСЕ промпты (не только первый)
-    with open(f"{base}/10_synopsis/beats.json", "r", encoding="utf-8") as f:
-        _beats_check = json.load(f)
-    expected_count = len(_beats_check)
+    beats_path = f"{base}/10_synopsis/beats.json"
+    if not os.path.exists(beats_path):
+        raise FileNotFoundError(f"Файл beats.json не найден: {beats_path}")
+    with open(beats_path, "r", encoding="utf-8") as f:
+        beats = json.load(f)
+    expected_count = len(beats)
     if expected_count > 0 and os.path.isdir(prompts_dir):
         existing = [
             name for name in os.listdir(prompts_dir)
@@ -1037,9 +1040,17 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
             logger.warning(
                 f"⚠️ Неполный набор промптов ({len(existing)}/{expected_count}), перегенерируем"
             )
-    
-    with open(f"{base}/10_synopsis/beats.json", "r", encoding="utf-8") as f:
-        beats = json.load(f)
+
+    for _req_path in [
+        f"{base}/20_bible/characters.json",
+        f"{base}/20_bible/locations.json",
+        f"{base}/30_style/style_images.json",
+        f"{base}/30_style/negative_prompt_list.txt",
+        f"{base}/20_story/story.json",
+    ]:
+        if not os.path.exists(_req_path):
+            raise FileNotFoundError(f"Обязательный файл не найден: {_req_path}")
+
     with open(f"{base}/20_bible/characters.json", "r", encoding="utf-8") as f:
         characters = json.load(f)
     with open(f"{base}/20_bible/locations.json", "r", encoding="utf-8") as f:

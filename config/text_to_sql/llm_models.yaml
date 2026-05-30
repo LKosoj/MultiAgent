@@ -26,3 +26,17 @@ profiles:
     nlu:
       intent_max_tokens: 800
       nlp_max_tokens: 2000
+
+  # muni_ru: копия default — зарезервирован для тюнинга под муниципальный
+  # РФ-датасет. Добавлен для симметрии с остальными text-to-sql конфигами
+  # (similarity_thresholds, main_table_scoring и т.д.), все из которых
+  # содержат профиль muni_ru. Без этого профиля TEXT_TO_SQL_LLM_MODELS_PROFILE=muni_ru
+  # даёт KeyError при get_active_profile().
+  muni_ru:
+    schema_linking:
+      max_tokens: 20000
+    sql_generation:
+      max_tokens: 20000
+    nlu:
+      intent_max_tokens: 800
+      nlp_max_tokens: 2000

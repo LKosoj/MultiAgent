@@ -529,8 +529,12 @@ class SchemaCacheManager:
                     cache_info["cache_key"],
                 )
         except Exception as exc:
-            logger.warning(
-                "Не удалось деактивировать старые schema_linking-записи (cache_key=%s): %r",
+            # Деактивация провалилась — новая запись всё равно будет вставлена ниже,
+            # что создаст дублирующиеся активные записи с тем же cache_key.
+            # Логируем как error, а не warning, чтобы это было видно в мониторинге.
+            logger.error(
+                "Не удалось деактивировать старые schema_linking-записи (cache_key=%s): %r — "
+                "возможны дублирующиеся активные записи",
                 cache_info.get("cache_key"),
                 exc,
             )

@@ -30,6 +30,13 @@ def get_workflow_manager():
     from workflow.streamlit_api import WorkflowManager
     return WorkflowManager()
 
+@st.cache_data(ttl=5)
+def _load_trace_cached(run_id: str):
+    """Загрузка trace-файла с кэшированием на 5 секунд (снижает N+1 disk I/O при рендере)."""
+    from telemetry import get_telemetry_manager
+    tm = get_telemetry_manager()
+    return tm.load_trace_file(run_id)
+
 def main():
     """Главная функция приложения"""
     
@@ -417,9 +424,7 @@ def show_recent_activities():
             # Проверяем реальный статус из телеметрии
             real_status = run_data.get("status", "unknown")
             try:
-                from telemetry import get_telemetry_manager
-                tm = get_telemetry_manager()
-                trace_data = tm.load_trace_file(run_id)
+                trace_data = _load_trace_cached(run_id)
                 spans = trace_data.get("spans", [])
                 if spans:
                     has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
@@ -438,7 +443,7 @@ def show_recent_activities():
                     real_status = "cancelled"
             except Exception:
                 pass
-            
+
             activities.append({
                 "time": run_data.get("start_time", datetime.now()),
                 "type": "workflow",
@@ -453,9 +458,7 @@ def show_recent_activities():
             # Проверяем реальный статус из телеметрии
             real_status = run_data.get("status", "unknown")
             try:
-                from telemetry import get_telemetry_manager
-                tm = get_telemetry_manager()
-                trace_data = tm.load_trace_file(run_id)
+                trace_data = _load_trace_cached(run_id)
                 spans = trace_data.get("spans", [])
                 if spans:
                     has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
@@ -495,9 +498,7 @@ def show_recent_activities():
                     
                     # Проверяем реальный статус из телеметрии
                     try:
-                        from telemetry import get_telemetry_manager
-                        tm = get_telemetry_manager()
-                        trace_data = tm.load_trace_file(rid)
+                        trace_data = _load_trace_cached(rid)
                         spans = trace_data.get("spans", [])
                         if spans:
                             has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
@@ -509,7 +510,7 @@ def show_recent_activities():
                                 real_status = "running"
                     except Exception:
                         pass
-                    
+
                     activities.append({
                         "time": info.get("start_time", datetime.now()),
                         "type": "workflow",
@@ -518,17 +519,15 @@ def show_recent_activities():
                         "status": real_status,
                         "run_id": rid
                     })
-                    
+
                 # Agents из состояния - с проверкой телеметрии
                 for rid, info in (st.session_state.get("agent_runs") or {}).items():
                     status = agent_manager.get_agent_status(rid)
                     real_status = status.status if status else "unknown"
-                    
+
                     # Проверяем реальный статус из телеметрии
                     try:
-                        from telemetry import get_telemetry_manager
-                        tm = get_telemetry_manager()
-                        trace_data = tm.load_trace_file(rid)
+                        trace_data = _load_trace_cached(rid)
                         spans = trace_data.get("spans", [])
                         if spans:
                             has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
@@ -563,9 +562,9 @@ def show_recent_activities():
                 for tf in trace_files[:10]:
                     run_id = tf.get("run_id")
                     modified = tf.get("modified_time")
-                    # Загружаем детали, чтобы попытаться определить тип
+                    # Загружаем детали с кэшированием, чтобы попытаться определить тип
                     try:
-                        trace_data = tm.load_trace_file(run_id)
+                        trace_data = _load_trace_cached(run_id)
                         spans = trace_data.get("spans", [])
                     except Exception:
                         spans = []

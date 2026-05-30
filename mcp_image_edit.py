@@ -10,6 +10,7 @@ import os
 import sys
 import traceback
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 # Импорт официального MCP SDK
@@ -380,10 +381,19 @@ async def _handle_edit_image_file(arguments: Dict[str, Any]) -> Sequence[TextCon
         base_save_directory = os.getenv("IMG_SAVE_BASE_DIR", "")
         if base_save_directory and not os.path.isabs(image_path):
             # Если задан базовый каталог и путь относительный, ищем в базовом каталоге
-            full_image_path = os.path.normpath(os.path.join(base_save_directory, image_path))
+            full_image_path = os.path.realpath(os.path.join(base_save_directory, image_path))
         else:
             # Иначе используем путь как есть
-            full_image_path = os.path.normpath(image_path)
+            full_image_path = os.path.realpath(image_path)
+
+        # Проверяем path traversal: если задан базовый каталог, путь должен быть внутри него
+        if base_save_directory:
+            resolved_base = os.path.realpath(base_save_directory)
+            # is_relative_to (pathlib) корректнее строкового startswith: без ложных
+            # срабатываний на префиксах вида /images vs /images-evil и без проблем с
+            # завершающим разделителем.
+            if not Path(full_image_path).is_relative_to(Path(resolved_base)):
+                raise ValueError(f"Доступ запрещён: image_path выходит за пределы базового каталога")
         
         # Проверяем существование входного файла
         if not os.path.exists(full_image_path):
@@ -415,10 +425,17 @@ async def _handle_edit_image_file(arguments: Dict[str, Any]) -> Sequence[TextCon
         # Обрабатываем путь к выходному файлу с учетом базового каталога
         if base_save_directory and not os.path.isabs(output_path):
             # Если задан базовый каталог и путь относительный, сохраняем в базовом каталоге
-            full_output_path = os.path.normpath(os.path.join(base_save_directory, output_path))
+            full_output_path = os.path.realpath(os.path.join(base_save_directory, output_path))
         else:
             # Иначе используем путь как есть
-            full_output_path = os.path.normpath(output_path)
+            full_output_path = os.path.realpath(output_path)
+
+        # Проверяем path traversal: если задан базовый каталог, путь должен быть внутри него
+        if base_save_directory:
+            resolved_base = os.path.realpath(base_save_directory)
+            # is_relative_to (pathlib) корректнее строкового startswith (см. выше).
+            if not Path(full_output_path).is_relative_to(Path(resolved_base)):
+                raise ValueError(f"Доступ запрещён: output_path выходит за пределы базового каталога")
         
         # Создаем папку для выходного файла если нужно
         output_dir = os.path.dirname(full_output_path)

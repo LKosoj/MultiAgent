@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Callable, List, Optional
 
 from ..prompts import build_pii_detection_prompt
@@ -47,7 +48,10 @@ _SYNC_FALSE_TOKENS = frozenset({"", "0", "false", "no", "off"})
 # Кэш скомпилированных regex по (jurisdiction_name, tuple(pattern, ...)).
 # Инвалидируется автоматически при смене юрисдикции: ключ включает имя.
 # Риск переполнения минимален: на практике 2-3 юрисдикции в процессе.
+# M14: Lock защищает check-then-set от race condition при одновременном
+# первом вызове из разных потоков.
 _compiled_rules_cache: dict = {}
+_compiled_rules_cache_lock = threading.Lock()
 
 
 def _load_active_pii_jurisdiction(jur_name: Optional[str] = None):
@@ -89,7 +93,7 @@ def _is_likely_fullname(match: str) -> bool:
     """
     if not match:
         return False
-    exclusions = _ru_fullname_exclusions()
+    exclusions = _active_fullname_exclusions()
     tokens = match.split()
     for token in tokens:
         if token.casefold() in exclusions:
@@ -97,9 +101,16 @@ def _is_likely_fullname(match: str) -> bool:
     return True
 
 
-def _ru_fullname_exclusions() -> frozenset[str]:
+def _active_fullname_exclusions() -> frozenset[str]:
+    """Возвращает fullname_exclusions активной юрисдикции (не только ru)."""
     jur = _load_active_pii_jurisdiction()
     return frozenset(item.casefold() for item in jur.fullname_exclusions)
+
+
+# Backward-compat alias: старое имя _ru_fullname_exclusions было введено
+# когда функция работала только с ru-юрисдикцией. Оставлен для
+# внешних ссылок; новый код использует _active_fullname_exclusions.
+_ru_fullname_exclusions = _active_fullname_exclusions
 
 
 def _ru_fullname_enabled(jur: Any = None) -> bool:
@@ -147,13 +158,24 @@ def _get_compiled_rules(jur: Any, jur_name: str) -> list:
 
     Ключ включает имя юрисдикции — при смене env PII_JURISDICTION кэш
     инвалидируется автоматически. Рост кэша ограничен числом юрисдикций (2-3).
+    M14: Lock защищает check-then-set от race condition.
     """
     cache_key = (jur_name, tuple(r.pattern for r in jur.sync_masking_rules))
-    if cache_key not in _compiled_rules_cache:
-        _compiled_rules_cache[cache_key] = [
-            (rule, re.compile(rule.pattern)) for rule in jur.sync_masking_rules
-        ]
-    return _compiled_rules_cache[cache_key]
+    with _compiled_rules_cache_lock:
+        if cache_key not in _compiled_rules_cache:
+            _compiled_rules_cache[cache_key] = [
+                (rule, re.compile(rule.pattern)) for rule in jur.sync_masking_rules
+            ]
+        return _compiled_rules_cache[cache_key]
+
+
+def reset_compiled_rules_cache() -> None:
+    """Сбрасывает кэш скомпилированных regex (нужен в тестах после подмены конфига).
+
+    M14: вызывается из pii_categories_config.reset_cache() или напрямую в тестах.
+    """
+    with _compiled_rules_cache_lock:
+        _compiled_rules_cache.clear()
 
 
 def pii_mask_sync(text: str) -> str:

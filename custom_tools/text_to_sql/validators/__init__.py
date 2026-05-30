@@ -35,4 +35,7 @@ __all__ = [
     "reset_sqlglot_metrics",
     "record_sqlglot_metric",
     "SQLGLOT_AVAILABLE",
+    # _SQLGLOT_METRICS намеренно исключён из __all__: мутации должны идти
+    # через record_sqlglot_metric() — иначе race condition на счётчиках.
+    # Объект остаётся доступен через прямой импорт для обратной совместимости.
 ]

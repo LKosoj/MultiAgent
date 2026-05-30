@@ -79,6 +79,7 @@ class HeuristicLinker:
         temporal_hints: Any,
         identifier_hints: Any,
         primary_signal_present: bool,
+        _type_cfg: Any = None,
     ) -> int:
         """Считает бонус за type-hint совпадение (4.26).
 
@@ -90,11 +91,17 @@ class HeuristicLinker:
           * новый: ``type_hints: { numeric: { tokens: [...],
             weight_solo: 1, weight_with_signal: 3 } }`` — бонус работает
             всегда, но с разным весом.
+
+        ``_type_cfg`` передаётся caller'ом (``_score_columns_for_name``)
+        — один вызов ``load_type_categories_config()`` на таблицу, а не
+        на каждую колонку.
         """
 
-        # T5-linking / #14 LOW: категории SQL-типов берём из yaml
-        from ..type_categories_config import load_type_categories_config
-        _type_cfg = load_type_categories_config()
+        # T5-linking / #14 LOW: категории SQL-типов берём из yaml.
+        # Если _type_cfg не передан (backward-compat) — загружаем здесь.
+        if _type_cfg is None:
+            from ..type_categories_config import load_type_categories_config
+            _type_cfg = load_type_categories_config()
         col_category = _type_cfg.get_category(col_type)
 
         def _matches_category(yaml_categories: Tuple[str, ...]) -> bool:
@@ -502,6 +509,7 @@ class HeuristicLinker:
         from ..utils import get_table_columns
         from ..column_aliases_config import get_active_profile
         from ..nlu_config import canonicalize_token_via_morphemes
+        from ..type_categories_config import load_type_categories_config
 
         if not name:
             return []
@@ -514,6 +522,10 @@ class HeuristicLinker:
         numeric_hints = type_hints.get("numeric", [])
         temporal_hints = type_hints.get("temporal", [])
         identifier_hints = type_hints.get("identifier", [])
+
+        # Загружаем один раз на таблицу и передаём в _compute_type_hint_bonus,
+        # чтобы не вызывать load_type_categories_config() на каждую колонку (L48).
+        _type_cfg = load_type_categories_config()
 
         morphemes_cfg = self._get_morphemes_cfg()
         name_canonical = canonicalize_token_via_morphemes(name_lower, morphemes_cfg)
@@ -584,6 +596,7 @@ class HeuristicLinker:
                         temporal_hints,
                         identifier_hints,
                         primary_signal_present,
+                        _type_cfg=_type_cfg,
                     )
                     if type_bonus > 0:
                         score += type_bonus

@@ -357,31 +357,43 @@ class WorkflowEngine(DynamicAgentSystem):
             if resource_lease is not None:
                 await self._release_workflow_resources(context.workflow_id)
     
-    async def resume_workflow(self, workflow_id: str, 
+    async def resume_workflow(self, workflow_id: str,
                             client_id: Optional[str] = None) -> WorkflowResult:
         """
-        НОВЫЙ метод: Восстановление workflow с последнего checkpoint'а
-        
+        Восстановление workflow с последнего checkpoint'а.
+
+        НЕ РЕАЛИЗОВАНО (см. Raises). Для корректного resume нужны две вещи, которых
+        сейчас нет: (1) checkpoint должен хранить WorkflowDefinition — но
+        state_manager.save_checkpoint его не сериализует, а metadata не содержит
+        yaml_path; (2) цикл _execute_steps_sequential/_execute_steps_parallel должен
+        пропускать уже завершённые шаги — сейчас он прогоняет ВСЕ шаги, поэтому
+        наивный повторный запуск дублировал бы побочные эффекты. Прод восстанавливает
+        иначе и этот метод не вызывает: StoryBookManager/core/pipeline_runner.py
+        (resume_workflow_from_checkpoint / resume_pipeline) делает from_yaml +
+        execute_workflow. Реализация полноценного resume — отдельная фича (миграция
+        схемы checkpoint + skip-completed в исполнителе), а не багфикс.
+
         Args:
             workflow_id: ID workflow для восстановления
             client_id: ID клиента (опционально)
-            
+
         Returns:
             WorkflowResult с результатами продолжения выполнения
+
+        Raises:
+            WorkflowExecutionError: всегда — resume пока не реализован (см. описание выше).
+                Согласуется с объявленным типом возврата WorkflowResult и общим контрактом
+                ошибок workflow-слоя, поэтому existing except WorkflowExecutionError ловят его
+                штатно (в отличие от NotImplementedError, который прошёл бы мимо как 500).
+                Вызывающий код должен использовать execute_workflow с from_yaml (как
+                pipeline_runner) для реального восстановления.
         """
         logger.info(f"🔄 Восстанавливаем workflow {workflow_id}")
-        
-        try:
-            # Проверяем, что checkpoint существует; продолжать без workflow definition нельзя.
-            await self.state_manager.resume_workflow(workflow_id)
-            
-            raise WorkflowExecutionError(
-                f"Cannot resume workflow {workflow_id}: workflow definition is not stored in checkpoint"
-            )
-            
-        except Exception as e:
-            logger.error(f"❌ Не удалось восстановить workflow {workflow_id}: {e}")
-            raise WorkflowExecutionError(f"Failed to resume workflow {workflow_id}: {e}")
+        raise WorkflowExecutionError(
+            f"Cannot resume workflow {workflow_id}: resume is not yet implemented. "
+            "Workflow definition (yaml_path) must be provided alongside the checkpoint "
+            "to reconstruct execution from a saved step."
+        )
     
     async def get_workflow_status(self, workflow_id: str) -> Optional[WorkflowStatus]:
         """Получение статуса workflow"""
@@ -834,12 +846,21 @@ class WorkflowEngine(DynamicAgentSystem):
         # Выполняем с retry логикой
         retry_policy = step.retry_policy or workflow_def.global_retry_policy
 
-        step_result = await self.retry_engine.execute_with_retry(
-            step_id=step.id,
-            step_func=step_executor,
-            context=context.__dict__,
-            retry_policy=retry_policy
-        )
+        retry_kwargs = {
+            "step_id": step.id,
+            "step_func": step_executor,
+            "context": context.__dict__,
+            "retry_policy": retry_policy,
+        }
+        if step.timeout is not None:
+            retry_kwargs["timeout"] = step.timeout
+        try:
+            step_result = await self.retry_engine.execute_with_retry(**retry_kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'timeout'" not in str(exc) or "timeout" not in retry_kwargs:
+                raise
+            retry_kwargs.pop("timeout", None)
+            step_result = await self.retry_engine.execute_with_retry(**retry_kwargs)
 
         # Cross-step feedback retry (EPIC 6 Block A фикс): после успешного шага
         # проверяем step.output_retry_policy. Если condition (на свежем output
@@ -1060,11 +1081,14 @@ class WorkflowEngine(DynamicAgentSystem):
             token = set_tool_runtime_context(step.metadata or {})
             try:
                 # ПРЯМОЙ вызов указанного агента (без анализа задачи!)
+                # _enhanced_pipeline_type позволяет subclass'у передать pipeline_type
+                # без мутации self.factory (thread-safe альтернатива monkey-patching).
+                _pipeline_type = getattr(step, '_enhanced_pipeline_type', None) or "workflow"
                 agent = self.factory.create_agent(
                     profile_type=step.agent_type,
-                    session_id=context.session_id, 
+                    session_id=context.session_id,
                     task=task,
-                    pipeline_type="workflow"
+                    pipeline_type=_pipeline_type,
                 )
                 
                 # Выполняем задачу напрямую через агента
@@ -1498,7 +1522,7 @@ class WorkflowEngine(DynamicAgentSystem):
             
         except Exception as e:
             logger.error(f"❌ Ошибка выполнения workflow из {yaml_path}: {e}")
-            raise WorkflowExecutionError(f"Не удалось выполнить workflow из {yaml_path}: {e}")
+            raise WorkflowExecutionError(f"Не удалось выполнить workflow из {yaml_path}: {e}") from e
     
     async def load_and_validate_yaml(self, yaml_path: Union[str, Path]) -> WorkflowDefinition:
         """

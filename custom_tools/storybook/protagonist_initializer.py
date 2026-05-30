@@ -59,17 +59,17 @@ def protagonist_initializer_tool(session_id: str, project_id: str) -> str:
     # 1) Проверяем brief на наличие картинки героя
     brief_path = f"{base_dir}/00_brief.json"
     brief: Dict[str, Any] = {}
-    print(f"[DEBUG] protagonist_initializer: читаем бриф из {brief_path}")
+    logger.debug(f"protagonist_initializer: читаем бриф из {brief_path}")
     if os.path.exists(brief_path):
         try:
             with open(brief_path, "r", encoding="utf-8") as f:
                 brief = json.load(f)
-            print(f"[DEBUG] protagonist_initializer: бриф загружен, ключи: {list(brief.keys())}")
+            logger.debug(f"protagonist_initializer: бриф загружен, ключи: {list(brief.keys())}")
         except Exception as e:
-            print(f"[DEBUG] protagonist_initializer: ошибка чтения брифа: {e}")
+            logger.debug(f"protagonist_initializer: ошибка чтения брифа: {e}")
             brief = {}
     else:
-        print(f"[DEBUG] protagonist_initializer: файл брифа не найден: {brief_path}")
+        logger.debug(f"protagonist_initializer: файл брифа не найден: {brief_path}")
 
     candidate_keys = [
         "protagonist_picture", "protagonist_image", "hero_image"
@@ -77,23 +77,23 @@ def protagonist_initializer_tool(session_id: str, project_id: str) -> str:
     src_image: Optional[str] = None
     for k in candidate_keys:
         v = brief.get(k)
-        print(f"[DEBUG] protagonist_initializer: проверяем ключ {k} = {v}")
+        logger.debug(f"protagonist_initializer: проверяем ключ {k} = {v}")
         if isinstance(v, str) and v.strip():
             src_image = v.strip()
-            print(f"[DEBUG] protagonist_initializer: найден src_image = {src_image}")
+            logger.debug(f"protagonist_initializer: найден src_image = {src_image}")
             break
 
     if src_image and not os.path.isabs(src_image):
         # трактуем относительный путь относительно корня репозитория
         src_image = os.path.abspath(src_image)
 
-    print(f"[DEBUG] protagonist_initializer: src_image={src_image}")
-    print(f"[DEBUG] protagonist_initializer: файл существует={os.path.exists(src_image) if src_image else False}")
+    logger.debug(f"protagonist_initializer: src_image={src_image}")
+    logger.debug(f"protagonist_initializer: файл существует={os.path.exists(src_image) if src_image else False}")
 
     if src_image and os.path.exists(src_image):
         _ensure_parent_dir(base_path)
         shutil.copy2(src_image, base_path)
-        print(f"[DEBUG] protagonist_initializer: файл скопирован в {base_path}")
+        logger.debug(f"protagonist_initializer: файл скопирован в {base_path}")
         return os.path.abspath(base_path)
 
     # 2) Пытаемся сгенерировать героя на основе канона

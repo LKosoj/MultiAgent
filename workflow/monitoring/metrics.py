@@ -86,28 +86,30 @@ class Metric:
     
     def _cleanup_labels_index(self, removed_values: List[MetricValue]):
         """Очистить индекс от удаленных значений"""
-        for removed_value in removed_values:
-            labels_key = self._labels_to_key(removed_value.labels)
-            if labels_key in self.labels_index:
-                try:
-                    self.labels_index[labels_key].remove(removed_value)
-                    if not self.labels_index[labels_key]:
-                        del self.labels_index[labels_key]
-                except ValueError:
-                    pass  # Значение уже удалено
+        removed_set = set(id(v) for v in removed_values)
+        keys_to_delete = []
+        for labels_key, values_list in self.labels_index.items():
+            new_list = [v for v in values_list if id(v) not in removed_set]
+            if new_list:
+                self.labels_index[labels_key] = new_list
+            else:
+                keys_to_delete.append(labels_key)
+        for key in keys_to_delete:
+            del self.labels_index[key]
     
     def get_current_value(self, labels: Dict[str, str] = None) -> Optional[float]:
         """Получить текущее значение метрики"""
-        if not self.values:
-            return None
-        
-        if labels:
-            labels_key = self._labels_to_key(labels)
-            if labels_key in self.labels_index and self.labels_index[labels_key]:
-                return self.labels_index[labels_key][-1].value
-            return None
-        
-        return self.values[-1].value
+        with self._lock:
+            if not self.values:
+                return None
+
+            if labels:
+                labels_key = self._labels_to_key(labels)
+                if labels_key in self.labels_index and self.labels_index[labels_key]:
+                    return self.labels_index[labels_key][-1].value
+                return None
+
+            return self.values[-1].value
     
     def get_values_in_range(self, start_time: datetime, end_time: datetime,
                            labels: Dict[str, str] = None) -> List[MetricValue]:
@@ -303,8 +305,9 @@ class MetricsCollector:
                          labels: Dict[str, str] = None):
         """Увеличить счетчик"""
         if name in self.metrics:
-            current_value = self.metrics[name].get_current_value(labels) or 0.0
-            self.metrics[name].add_value(current_value + value, labels)
+            with self._lock:
+                current_value = self.metrics[name].get_current_value(labels) or 0.0
+                self.metrics[name].add_value(current_value + value, labels)
     
     def set_gauge(self, name: str, value: float, labels: Dict[str, str] = None):
         """Установить значение gauge"""

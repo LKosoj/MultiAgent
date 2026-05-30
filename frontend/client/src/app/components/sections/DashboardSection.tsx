@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Props = {
   runServiceAction: (
@@ -50,7 +50,6 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
   const [activeAgentRuns, setActiveAgentRuns] = useState<ActiveRun[]>([]);
   const [activeWorkflowRuns, setActiveWorkflowRuns] = useState<ActiveRun[]>([]);
   const [systemStatus, setSystemStatus] = useState<Record<string, unknown> | null>(null);
-  const [systemChecks, setSystemChecks] = useState<Record<string, unknown> | null>(null);
   const [configInfo, setConfigInfo] = useState<Record<string, unknown> | null>(null);
   const [traces, setTraces] = useState<TraceInfo[]>([]);
   const [systemTab, setSystemTab] = useState<"config" | "memory" | "telemetry">("config");
@@ -58,6 +57,11 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
   const [actionStatus, setActionStatus] = useState<string | null>(null);
   const mountedRef = useRef(true);
   const loadMetricsInFlightRef = useRef(false);
+  const metricsRef = useRef(metrics);
+
+  useEffect(() => {
+    metricsRef.current = metrics;
+  }, [metrics]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -78,7 +82,7 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
     }
   }, []);
 
-  const loadMetrics = async () => {
+  const loadMetrics = useCallback(async () => {
     if (!mountedRef.current) return;
     if (loadMetricsInFlightRef.current) return;
     loadMetricsInFlightRef.current = true;
@@ -120,20 +124,19 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
       const runsResp = getValue(2);
       const dbResp = getValue(3);
       const initResp = getValue(4);
-      const checksResp = getValue(5);
       const configResp = getValue(6);
       const tracesResp = getValue(7);
-      const agentsCount = Array.isArray((agentsResp as any)?.agents) ? (agentsResp as any).agents.length : (metrics[0]?.value ?? "—");
-      const workflowsCount = Array.isArray((workflowsResp as any)?.workflows) ? (workflowsResp as any).workflows.length : (metrics[1]?.value ?? "—");
-      const agentRuns = Array.isArray((runsResp as any)?.agents) ? (runsResp as any).agents.length : (metrics[2]?.value ?? "—");
-      const workflowRuns = Array.isArray((runsResp as any)?.workflows) ? (runsResp as any).workflows.length : (metrics[3]?.value ?? "—");
-      const dbPlugins = Array.isArray((dbResp as any)?.plugins) ? (dbResp as any).plugins.length : (metrics[4]?.value ?? "—");
+      const previousMetrics = metricsRef.current;
+      const agentsCount = Array.isArray((agentsResp as any)?.agents) ? (agentsResp as any).agents.length : (previousMetrics[0]?.value ?? "—");
+      const workflowsCount = Array.isArray((workflowsResp as any)?.workflows) ? (workflowsResp as any).workflows.length : (previousMetrics[1]?.value ?? "—");
+      const agentRuns = Array.isArray((runsResp as any)?.agents) ? (runsResp as any).agents.length : (previousMetrics[2]?.value ?? "—");
+      const workflowRuns = Array.isArray((runsResp as any)?.workflows) ? (runsResp as any).workflows.length : (previousMetrics[3]?.value ?? "—");
+      const dbPlugins = Array.isArray((dbResp as any)?.plugins) ? (dbResp as any).plugins.length : (previousMetrics[4]?.value ?? "—");
       if (runsResp !== null) {
         setActiveAgentRuns(Array.isArray((runsResp as any)?.agents) ? ((runsResp as any).agents as ActiveRun[]) : []);
         setActiveWorkflowRuns(Array.isArray((runsResp as any)?.workflows) ? ((runsResp as any).workflows as ActiveRun[]) : []);
       }
       if (initResp !== null) setSystemStatus((initResp as Record<string, unknown>) ?? null);
-      if (checksResp !== null) setSystemChecks((checksResp as Record<string, unknown>) ?? null);
       if (configResp !== null) setConfigInfo((configResp as Record<string, unknown>) ?? null);
       if (tracesResp && Array.isArray((tracesResp as any).traces)) {
         const items = ((tracesResp as any).traces as any[]).slice(0, 10).map((t) => ({
@@ -173,12 +176,12 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
     } finally {
       loadMetricsInFlightRef.current = false;
     }
-  };
+  }, [runServiceAction]);
 
   useEffect(() => {
     if (!serviceReady) return;
     void loadMetrics();
-  }, [autoTick, serviceReady]);
+  }, [autoTick, serviceReady, loadMetrics]);
 
   useEffect(() => {
     const id = window.setInterval(() => setAutoTick((t) => t + 1), 5000);

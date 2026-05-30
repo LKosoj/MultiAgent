@@ -194,8 +194,6 @@ class EditorPanel(ttk.Frame):
         # Также попробуем универсальный обработчик для отладки
         self.raw_text.bind("<Control-KeyPress>", self.handle_control_key)
         
-        # Дополнительная отладка - показать все нажатия клавиш
-        self.raw_text.bind("<KeyPress>", self.debug_keypress)
     
     def show_context_menu(self, event):
         """Показать контекстное меню"""
@@ -261,58 +259,40 @@ class EditorPanel(ttk.Frame):
     
     def handle_control_key(self, event):
         """Универсальный обработчик Ctrl+ комбинаций (независимо от раскладки)"""
-        print(f"🔥 DEBUG: Ctrl+{event.keysym} нажато (код: {event.keycode})")  # Отладка
-        
         # Определяем по keysym, а не по символу (работает на любой раскладке)
         if event.keysym.lower() == 'c':
-            print("🔥 DEBUG: Выполняется копирование")
             self.copy_text()
             return "break"
         elif event.keysym.lower() == 'v':
-            print("🔥 DEBUG: Выполняется вставка")
             self.paste_text()
             return "break"
         elif event.keysym.lower() == 'x':
-            print("🔥 DEBUG: Выполняется вырезание")
             self.cut_text()
             return "break"
         elif event.keysym.lower() == 'a':
-            print("🔥 DEBUG: Выполняется выделение всего")
             self.select_all_text()
             return "break"
-        
+
         # Для других комбинаций не перехватываем
         return None
-    
+
     def handle_control_keycode(self, event):
         """Обработчик Ctrl+ комбинаций по keycode (независимо от раскладки)"""
-        print(f"🎯 DEBUG keycode: {event.keycode}, keysym: {event.keysym}, state: {event.state}")
-        
         # Определяем по физическому коду клавиши (не зависит от раскладки)
         if event.keycode == 67:  # C
-            print("🔥 DEBUG: Копирование через keycode")
             self.copy_text()
             return "break"
         elif event.keycode == 86:  # V
-            print("🔥 DEBUG: Вставка через keycode")
             self.paste_text()
             return "break"
         elif event.keycode == 88:  # X
-            print("🔥 DEBUG: Вырезание через keycode")
             self.cut_text()
             return "break"
         elif event.keycode == 65:  # A
-            print("🔥 DEBUG: Выделение через keycode")
             self.select_all_text()
             return "break"
-        
+
         return None
-    
-    def debug_keypress(self, event):
-        """Отладочный метод для всех нажатий клавиш"""
-        if event.state & 0x4:  # Ctrl нажат
-            print(f"🔍 DEBUG: Клавиша {event.keysym} (код: {event.keycode}, состояние: {event.state})")
-        return None  # Не блокируем обработку
     
     def create_validation_panel(self, parent):
         """Создание панели валидации"""
@@ -1128,7 +1108,7 @@ class EditorPanel(ttk.Frame):
         
         # Создаем новый кадр с базовыми параметрами
         new_shot = {
-            "project_id": "ryaba",
+            "project_id": self.current_project.project_id if self.current_project else "",
             "page_number": 1,
             "scene_number": 1,
             "shot_number": 1,
@@ -1646,23 +1626,11 @@ class EditorPanel(ttk.Frame):
         # Камера (если есть)
         if 'camera' in self.current_scene_vars:
             scene['camera'] = self.current_scene_vars['camera'].get("1.0", "end-1c")
-        
-        # Диалоги
-        if 'dialogue' in self.current_scene_vars:
-            scene['dialogue'] = self.current_scene_vars['dialogue'].get("1.0", "end-1c")
-        
+
         # Раскадровка
         if 'storyboard' in self.current_scene_vars:
             scene['storyboard'] = self.current_scene_vars['storyboard'].get("1.0", "end-1c")
-        
-        # Визуальное описание
-        if 'visual' in self.current_scene_vars:
-            scene['visual'] = self.current_scene_vars['visual'].get("1.0", "end-1c")
-        
-        # Камера
-        if 'camera' in self.current_scene_vars:
-            scene['camera'] = self.current_scene_vars['camera'].get("1.0", "end-1c")
-        
+
         # Звук
         if 'sound' in self.current_scene_vars:
             scene['sound'] = self.current_scene_vars['sound'].get("1.0", "end-1c")

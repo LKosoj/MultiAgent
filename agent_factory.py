@@ -85,48 +85,6 @@ def _build_composite_prompt(profile: Dict[str, Any], pipeline_type: str = "gener
 
     return composite_prompt
 
-AUTHORIZED_IMPORTS = [
-  "typing",
-  "requests",
-  "zipfile",
-  "os",
-  "pandas",
-  "numpy",
-  "sympy",
-  "json",
-  "bs4",
-  "pubchempy",
-  "xml",
-  "yahoo_finance",
-  "Bio",
-  "scikit-learn",
-  "scipy",
-  "pydub",
-  "io",
-  "PIL",
-  "chess",
-  "PyPDF2",
-  "pptx",
-  "torch",
-  "datetime",
-  "fractions",
-  "csv",
-  "time",
-  "meteostat",
-  "matplotlib",
-  "networkx",
-  "seaborn",
-  "yfinance",
-  "coinmarketcap",
-  "coinpaprika",
-  "coinbase",
-  "pandas_market_calendars",
-  "urllib",
-  "random",
-  "ast",
-  "mplfinance"
-]
-
 def load_tools():
     """Загружает и инициализирует инструменты из YAML-конфигураций и MCP."""
     tool_mapping = {}
@@ -213,13 +171,33 @@ class AgentFactory:
         
         return created_tool
 
-    def create_agent(self, profile_type: str, session_id: str, task: str, pipeline_type: str = "general", preload_agents: Optional[List[str]] = None) -> CodeAgent:
+    def create_agent(self, profile_type: str, session_id: str, task: str, pipeline_type: str = "general", preload_agents: Optional[List[str]] = None, profile_override: Optional[Dict[str, Any]] = None) -> CodeAgent:
         """Создает агента определенного профиля."""
-        
-        if profile_type not in AGENT_PROFILES:
+
+        if profile_override is not None:
+            # Копируем безусловно, чтобы не мутировать переданный dict и не плодить
+            # асимметрию (копия только при строковой модели).
+            profile = dict(profile_override)
+            # AGENT_PROFILES конвертирует строковый ключ модели в объект в _load_agent_profiles();
+            # для profile_override (динамические агенты) делаем ту же конвертацию явно,
+            # иначе CodeAgent/ToolCallingAgent получат строку вместо модели и упадут.
+            model_val = profile.get('model')
+            if isinstance(model_val, str):
+                from agent_command import model_mapping
+                profile['model'] = model_mapping.get(model_val)
+                # ValueError ТОЛЬКО для непустого, но неизвестного ключа — иначе тихий
+                # None позже даст невнятный AttributeError в CodeAgent. Пустая строка ""
+                # — легитимный «модель не указана» (дефолт DynamicAgentDefinition.model):
+                # как и в _load_agent_profiles, оставляем None и даём даунстриму дефолт.
+                if profile['model'] is None and model_val:
+                    raise ValueError(
+                        f"Unknown model key in profile_override: {model_val!r}. "
+                        f"Доступные: {sorted(model_mapping.keys())}"
+                    )
+        elif profile_type not in AGENT_PROFILES:
             raise ValueError(f"Unknown profile type: {profile_type}")
-        
-        profile = AGENT_PROFILES[profile_type]
+        else:
+            profile = AGENT_PROFILES[profile_type]
         
         # Убедимся, что profile['tools'] это список
         profile_tools = profile.get('tools', [])
@@ -536,7 +514,12 @@ class AgentFactory:
         
         def wrapped_write_memory_to_messages(summary_mode: bool = False):
             """Обёртка для write_memory_to_messages с интеграцией RAG-саммари"""
-            
+
+            # H5: сбрасываем RAG-контекст в начале КАЖДОГО вызова (до любых условий),
+            # иначе при не-planning вызове (summary_mode=False / не manager) сохранится
+            # устаревший контекст предыдущего planning-цикла и попадёт в новый шаг.
+            wrapped_write_memory_to_messages._rag_context_messages = []
+
             # Определяем, первый ли это шаг
             is_first_step = hasattr(agent.memory, '_instance_step') and agent.memory._instance_step == 0
             step_info = "ПЕРВЫЙ ШАГ" if is_first_step else f"шаг {getattr(agent.memory, '_instance_step', 0)}"
@@ -584,6 +567,7 @@ class AgentFactory:
                 agent.memory.policy.scope_read == 'session'):
                 
                 try:
+                    # (сброс _rag_context_messages вынесен в начало функции — H5)
                     # Выполняем семантический поиск по текущей задаче
                     rag_results = agent.memory.search_memory(
                         query=agent.memory.current_run_context,
@@ -616,19 +600,14 @@ class AgentFactory:
                         if rag_context_lines:
                             # Создаем сводку из RAG
                             rag_summary = "Информация от команды:\n" + "\n".join(rag_context_lines[:10])  # Лимит 10 записей
-                            
-                            # Добавляем в system_prompt как дополнительный контекст
-                            # SystemPromptStep имеет атрибут system_prompt (строка)
-                            if hasattr(agent.memory.system_prompt, 'system_prompt'):
-                                original_prompt = agent.memory.system_prompt.system_prompt
-                                enhanced_prompt = original_prompt + "\n\n" + rag_summary
-                                # Обновляем атрибут, не заменяя весь объект
-                                agent.memory.system_prompt.system_prompt = enhanced_prompt
-                            else:
-                                # Fallback если структура другая
-                                logger.warning(f"⚠️ {agent.name}: Неожиданная структура system_prompt")
-                            
-                            logger.info(f"🔄 {agent.name}: Синхронизировано {len(rag_context_lines)} записей из RAG в system_prompt")
+
+                            # Добавляем RAG-контекст как отдельное сообщение, не мутируя system_prompt
+                            from smolagents.models import ChatMessage
+                            wrapped_write_memory_to_messages._rag_context_messages = [
+                                ChatMessage(role="user", content=rag_summary)
+                            ]
+
+                            logger.info(f"🔄 {agent.name}: Синхронизировано {len(rag_context_lines)} записей из RAG")
                         
                 except Exception as e:
                     logger.error(f"⚠️ Ошибка синхронизации RAG для {agent.name}: {e}")
@@ -729,9 +708,10 @@ class AgentFactory:
                             logger.debug(f"RAG-сообщение {i+1}: {str(msg)[:100]}")
                         logger.info("="*60)
                         
-                        # Объединяем все сообщения: стандартная память + семантический поиск + RAG-саммари
+                        # Объединяем все сообщения: стандартная память + RAG-контекст + семантический поиск + RAG-саммари
                         base_messages = agent.memory.system_prompt.to_messages(summary_mode=summary_mode)
-                        final_messages = base_messages + task_search_messages + summary_messages
+                        rag_ctx = getattr(wrapped_write_memory_to_messages, '_rag_context_messages', [])
+                        final_messages = base_messages + rag_ctx + task_search_messages + summary_messages
                         
                         # Логируем ФИНАЛЬНЫЙ результат, который получит агент
                         logger.info(f"✅ {agent.name} ИТОГО получает на вход ({len(final_messages)} сообщений):\n" + "="*60)
@@ -745,11 +725,11 @@ class AgentFactory:
                 except Exception as e:
                     logger.error(f"⚠️ Ошибка при получении RAG-саммари для {agent.name}: {e}")
             
-            # Возвращаем стандартные сообщения + семантический поиск (если есть)
-            if task_search_messages:
-                # Есть семантический поиск, но нет RAG-саммари
-                final_messages = (standard_messages or []) + task_search_messages
-                logger.info(f"✅ {agent.name} ИТОГО получает на вход стандартные сообщения + семантический поиск ({len(final_messages)} сообщений)")
+            # Возвращаем стандартные сообщения + RAG-контекст + семантический поиск (если есть)
+            rag_ctx = getattr(wrapped_write_memory_to_messages, '_rag_context_messages', [])
+            if task_search_messages or rag_ctx:
+                final_messages = (standard_messages or []) + rag_ctx + task_search_messages
+                logger.info(f"✅ {agent.name} ИТОГО получает на вход стандартные сообщения + контекст ({len(final_messages)} сообщений)")
                 return final_messages
             else:
                 # Только стандартные сообщения

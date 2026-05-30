@@ -25,6 +25,28 @@ from .models import TacticalMemoryItem, StrategicGoal, SystemContext
 logger = logging.getLogger(__name__)
 
 
+def _distance_to_score(distance: float, metric: str = "cosine") -> float:
+    """Конвертирует ChromaDB distance в score [0, 1] в зависимости от метрики.
+
+    cosine: distance ∈ [0, 2], score = 1 - d/2
+    l2:     distance ∈ [0, ∞), score = 1 / (1 + d)
+    ip:     hnswlib хранит distance = 1 - inner_product, диапазон [0, 2] для
+            нормализованных векторов — аналогично cosine. Используем ту же формулу.
+            См. https://github.com/nmslib/hnswlib#supported-distances
+    """
+    metric = (metric or "cosine").strip().lower()
+    if metric == "cosine":
+        return max(0.0, 1.0 - distance / 2)
+    elif metric == "l2":
+        return 1.0 / (1.0 + distance)
+    elif metric == "ip":
+        # ip-distance в hnswlib = 1 - inner_product → диапазон [0, 2] для нормализованных векторов
+        return max(0.0, 1.0 - distance / 2)
+    else:
+        # Неизвестная метрика — fallback на cosine-формулу
+        return max(0.0, 1.0 - distance / 2)
+
+
 #
 # Политики доступа и типизация артефактов
 # --------------------------------------
@@ -534,12 +556,13 @@ def get_memory(
                     # Определяем (session_id, agent_name, step) для каждого результата:
                     # - если session_id задан — можно парсить ID по префиксу (как было)
                     # - если session_id=None — берём из metadatas (иначе корректно не распарсить)
+                    _chroma_metric = os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine")
                     step_filters = []
                     for i, tactical_id in enumerate(relevant_ids):
                         try:
                             # Конвертируем distance в score (чем меньше distance, тем больше score)
                             distance = distances[i] if i < len(distances) else 1.0
-                            score = max(0.0, 1.0 - distance / 2)
+                            score = _distance_to_score(distance, _chroma_metric)
 
                             if session_id is None:
                                 md = metadatas[i] if i < len(metadatas) and isinstance(metadatas[i], dict) else {}
@@ -573,33 +596,40 @@ def get_memory(
                         # t = (session_id, agent_name, step, score)
                         step_filters = [t for t in step_filters if t[3] >= vector_threshold]
                         if not step_filters:
-                            return []
+                            # Нет кандидатов выше порога — пустой результат, но политики
+                            # должны применяться через общий путь (M71/L38)
+                            semantic_records = []
+                            use_semantic_results = True
+                        else:
+                            # Сохраняем порядок релевантности из ChromaDB
+                            semantic_records = []
+                            for sid, agent_name_from_id, step, score in step_filters:
+                                # Chroma хранит только активные записи => здесь всегда valid_to IS NULL
+                                sql = """
+                                    SELECT agent_name, step, instance_step, run_id, data, valid_from, valid_to
+                                    FROM agent_memory
+                                    WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+                                """
+                                params = [sid, agent_name_from_id, step]
+                                if run_id:
+                                    sql += " AND run_id = ?"
+                                    params.append(run_id)
+                                cursor.execute(sql, params)
+                                row = cursor.fetchone()
+                                if row:
+                                    # Всегда 8 полей: 7 из БД + score
+                                    semantic_records.append(row + (score,))
 
-                        # Сохраняем порядок релевантности из ChromaDB
-                        semantic_records = []
-                        for sid, agent_name_from_id, step, score in step_filters:
-                            # Chroma хранит только активные записи => здесь всегда valid_to IS NULL
-                            sql = """
-                                SELECT agent_name, step, instance_step, run_id, data, valid_from, valid_to
-                                FROM agent_memory
-                                WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
-                            """
-                            params = [sid, agent_name_from_id, step]
-                            if run_id:
-                                sql += " AND run_id = ?"
-                                params.append(run_id)
-                            cursor.execute(sql, params)
-                            row = cursor.fetchone()
-                            if row:
-                                # Всегда 8 полей: 7 из БД + score
-                                semantic_records.append(row + (score,))
-                        
-                        # Обрабатываем семантические результаты
-                        use_semantic_results = True
+                            # Обрабатываем семантические результаты
+                            use_semantic_results = True
                     else:
-                        return []
+                        # step_filters пуст после парсинга — пустой результат
+                        semantic_records = []
+                        use_semantic_results = True
                 else:
-                    return []
+                    # semantic_search_results пуст или без 'ids' — пустой результат
+                    semantic_records = []
+                    use_semantic_results = True
                     
             except Exception as e:
                 # Сюда теперь доходит и EmbeddingUnavailableError/EmbeddingFailedError
@@ -663,6 +693,8 @@ def get_memory(
         
         # Для семантического поиска используем сохраненные записи в правильном порядке
         if use_semantic_results:
+            # ВНИМАНИЕ: в этой ветке cursor.execute() не вызывался — cursor не содержит
+            # выполненного SQL-запроса. Не добавлять cursor.fetchall() в этом блоке.
             rows_to_process = semantic_records  # Уже содержат 8 полей (с score)
         else:
             # Добавляем score=None к обычным результатам для единообразия
@@ -949,16 +981,29 @@ def get_memory_summary(session_id: str) -> str:
     Example:
         get_memory_summary(session_id)
     """
-    if memory_manager.is_memory_updated:
-        memory = get_memory(session_id)
-        if len(memory) == 0:
-            return "В памяти нет информации"
-        summary = ""
-        for record in memory:
-            summary += f"Агент {record['agent_name']} шаг {record['step']}:\\n"
-            summary += f"{record['data']}\\n\\n"
-        system_prompt = """
-Ты - профессиональный редактор, который создает краткое содержание для информации, которая хранится в памяти работы агентов. 
+    need_update = False  # инициализация до with: гарантирует определённость на строке 990,
+                         # даже если lock.__enter__ бросит (структурная устойчивость)
+    with memory_manager.db_handler.lock:
+        need_update = memory_manager.is_memory_updated
+        if need_update:
+            # CAS-claim: сбрасываем флаг сразу под локом, чтобы конкурентный поток
+            # увидел False и не запускал второй (дорогой) LLM-вызов того же summary.
+            memory_manager.is_memory_updated = False
+    if need_update:
+        try:
+            memory = get_memory(session_id)
+            if len(memory) == 0:
+                # Флаг уже потреблён CAS-claim'ом выше — кэшируем результат, иначе
+                # следующие вызовы (need_update=False) вернут stale memory_manager.summary.
+                with memory_manager.db_handler.lock:
+                    memory_manager.summary = "В памяти нет информации"
+                return "В памяти нет информации"
+            summary = ""
+            for record in memory:
+                summary += f"Агент {record['agent_name']} шаг {record['step']}:\\n"
+                summary += f"{record['data']}\\n\\n"
+            system_prompt = """
+Ты - профессиональный редактор, который создает краткое содержание для информации, которая хранится в памяти работы агентов.
 Важно корректно извлечь информацию из памяти и создать краткое содержание. Не придумывай собственные источники информации, только используй то, что есть в предоставленных данных! Если в памяти нет информации, ответь, что в памяти нет информации.
 Пример ответа:
 Агент agent_name1:
@@ -968,35 +1013,44 @@ def get_memory_summary(session_id: str) -> str:
 Агент agent_name3:
 Информация 3
         """
-        model_prompt = f"Создай краткое содержание для следующего текста:\\n{summary}"
+            model_prompt = f"Создай краткое содержание для следующего текста:\\n{summary}"
 
-        # Создаем сообщения для модели в правильном формате ChatMessage
-        messages = [
-            ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
-            ChatMessage(role=MessageRole.USER, content=model_prompt)
-        ]            
-        response = model_summary(messages, max_tokens=60000)
+            # Создаем сообщения для модели в правильном формате ChatMessage
+            messages = [
+                ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
+                ChatMessage(role=MessageRole.USER, content=model_prompt)
+            ]
+            response = model_summary(messages, max_tokens=60000)
 
-        # Извлекаем текст из ответа
-        generated_text = ""
-        
-        # Проверяем различные форматы ответа
-        if hasattr(response, 'content') and isinstance(response.content, str):
-            # Если ответ имеет атрибут content (ChatMessage)
-            generated_text = response.content
-        elif hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
-            # Если ответ - объект с атрибутами (ChatCompletion)
-            generated_text = response.choices[0].message.content
-        elif isinstance(response, dict) and 'choices' in response:
-            # Если ответ - словарь
-            generated_text = response["choices"][0]["message"]["content"]
-        else:
-            # Если формат ответа неизвестен, пробуем преобразовать в строку
-            generated_text = str(response)
+            # Извлекаем текст из ответа
+            generated_text = ""
 
-        memory_manager.summary = generated_text
-        memory_manager.is_memory_updated = False
-    return memory_manager.summary
+            # Проверяем различные форматы ответа
+            if hasattr(response, 'content') and isinstance(response.content, str):
+                # Если ответ имеет атрибут content (ChatMessage)
+                generated_text = response.content
+            elif hasattr(response, 'choices') and hasattr(response.choices[0], 'message'):
+                # Если ответ - объект с атрибутами (ChatCompletion)
+                generated_text = response.choices[0].message.content
+            elif isinstance(response, dict) and 'choices' in response:
+                # Если ответ - словарь
+                generated_text = response["choices"][0]["message"]["content"]
+            else:
+                # Если формат ответа неизвестен, пробуем преобразовать в строку
+                generated_text = str(response)
+
+            with memory_manager.db_handler.lock:
+                memory_manager.summary = generated_text
+            return generated_text
+        except Exception:
+            # Восстанавливаем флаг: потерянное обновление пересчитается при следующем
+            # вызове (раннее CAS-сбрасывание не должно «съесть» апдейт при сбое LLM).
+            with memory_manager.db_handler.lock:
+                memory_manager.is_memory_updated = True
+                # Сохраняем контракт @tool: всегда возвращаем строку, а не бросаем.
+                return memory_manager.summary or 'Не удалось сформировать сводку памяти'
+    with memory_manager.db_handler.lock:
+        return memory_manager.summary
 
 
 @tool
@@ -1110,7 +1164,7 @@ def get_goals(session_id: str, status: str = 'all', query: str = None, include_h
                     memory_manager.db_handler.strategic_collection,
                     query,
                     n_results=20,
-                    where={"session_id": {"$eq": session_id}, "type": {"$eq": "goal"}}
+                    where={"$and": [{"session_id": {"$eq": session_id}}, {"type": {"$eq": "goal"}}]}
                 )
                 
                 if relevant_ids:
@@ -1506,47 +1560,52 @@ def summary_agent_memory_step(
         str: Краткое содержание или сообщение об ошибке
     """
     
+    # conn создаётся через sqlite3.connect(check_same_thread=False); межпоточную
+    # согласованность read→LLM→write обеспечивают db_handler.lock и условный
+    # UPDATE той же rowid, которую читали перед LLM-вызовом.
     conn = memory_manager.db_handler._get_connection()
     try:
         cursor = conn.cursor()
-        
-        # Получаем данные для конкретного шага
-        cursor.execute("""
-            SELECT data 
-            FROM agent_memory 
-            WHERE session_id = ? AND agent_name = ? AND step = ?
-        """, (session_id, agent_name, step))
-        
-        result = cursor.fetchone()
+
+        # Получаем данные для конкретного шага — внутри lock, чтобы закрыть TOCTOU
+        with memory_manager.db_handler.lock:
+            cursor.execute("""
+                SELECT rowid, data, valid_from, updated_at
+                FROM agent_memory
+                WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+            """, (session_id, agent_name, step))
+
+            result = cursor.fetchone()
+
         if not result:
             return f"Шаг {step} для агента {agent_name} в сессии {session_id} не найден"
-        
-        data = result[0]
+
+        memory_rowid, data, selected_valid_from, selected_updated_at = result
         if not data or data.strip() == '':
             return f"Данные для шага {step} пусты"
-        
+
         # Базовый prompt для суммаризации
         default_prompt = f"Создай краткое содержание для данных агента {agent_name}, шаг {step}"
         if prompt:
             summary_prompt = f"{prompt}\\n\\nДанные для суммаризации: {data}"
         else:
             summary_prompt = f"{default_prompt}\\n\\nДанные: {data}"
-        
+
         # Используем подходящую модель в зависимости от размера данных
         if len(data) > 80000:
             model = model_big
         else:
             model = model_summary
-        
+
         # Создаем сообщения для модели
         messages = [
             ChatMessage(role=MessageRole.SYSTEM, content="Ты специалист по созданию кратких содержаний данных агентов. Сохраняй ключевую информацию и выводы."),
             ChatMessage(role=MessageRole.USER, content=summary_prompt)
         ]
-        
+
         # Генерируем summary
         response = model(messages, max_tokens=4000)
-        
+
         # Извлекаем текст из ответа (аналогично get_memory_summary)
         if hasattr(response, 'content') and isinstance(response.content, str):
             generated_text = response.content
@@ -1556,26 +1615,45 @@ def summary_agent_memory_step(
             generated_text = response["choices"][0]["message"]["content"]
         else:
             generated_text = str(response)
-        
+
         # Недеструктивное сохранение: создаем дубликат записи с summary, закрывая старую
         try:
             current_time = datetime.now().isoformat()
-            
-            # Сначала закрываем текущую активную запись для этого шага
-            cursor.execute("""
-                UPDATE agent_memory 
-                SET valid_to = ?, updated_at = ?
-                WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
-            """, (current_time, current_time, session_id, agent_name, step))
-            
-            # Теперь вставляем новую запись с тем же step, но с summary данными
-            cursor.execute("""
-                INSERT INTO agent_memory (session_id, agent_name, step, data, valid_from, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, agent_name, step, generated_text, current_time, current_time, current_time))
-            
-            conn.commit()
-            
+
+            with memory_manager.db_handler.lock:
+                # Закрываем именно ту активную запись, которую читали до LLM.
+                cursor.execute("""
+                    UPDATE agent_memory
+                    SET valid_to = ?, updated_at = ?
+                    WHERE rowid = ?
+                      AND valid_to IS NULL
+                      AND (valid_from = ? OR (valid_from IS NULL AND ? IS NULL))
+                      AND (updated_at = ? OR (updated_at IS NULL AND ? IS NULL))
+                """, (
+                    current_time,
+                    current_time,
+                    memory_rowid,
+                    selected_valid_from,
+                    selected_valid_from,
+                    selected_updated_at,
+                    selected_updated_at,
+                ))
+
+                if cursor.rowcount == 0:
+                    # Запись была изменена или деактивирована пока выполнялся LLM-вызов.
+                    # Прерываем транзакцию, чтобы не создавать orphan-запись.
+                    conn.rollback()
+                    return f"Конфликт записи для шага {step}: запись была изменена параллельным потоком"
+
+                # Теперь вставляем новую запись с тем же step, но с summary данными
+                cursor.execute("""
+                    INSERT INTO agent_memory (session_id, agent_name, step, data, valid_from, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (session_id, agent_name, step, generated_text, current_time, current_time, current_time))
+
+                conn.commit()
+                memory_manager.is_memory_updated = True
+
             # Обновляем ChromaDB для тактической памяти
             try:
                 if memory_manager.db_handler.tactical_collection and memory_manager.db_handler.embedding_model:
@@ -1611,8 +1689,7 @@ def summary_agent_memory_step(
                             )
             except Exception as e:
                 print(f"Предупреждение: не удалось обновить ChromaDB для summary: {e}")
-            
-            memory_manager.is_memory_updated = True
+
             return generated_text
         except Exception as e:
             print(f"Ошибка при сохранении summary: {e}")

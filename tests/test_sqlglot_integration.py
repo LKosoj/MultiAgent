@@ -5,8 +5,8 @@ import os
 import pytest
 from unittest.mock import patch
 
-# Устанавливаем переменную окружения для тестов
-os.environ["USE_SQLGLOT"] = "1"
+# Не перетираем USE_SQLGLOT, если он явно выставлен в CI-окружении (например, =0).
+os.environ.setdefault("USE_SQLGLOT", "1")
 
 from custom_tools.text_to_sql.validators import (
     SQLSafetyValidator,
@@ -187,25 +187,22 @@ class TestSQLGlotIntegration:
 
 class TestSQLGlotDisabled:
     """Тесты когда sqlglot отключен."""
-    
-    def setup_method(self):
-        """Настройка для каждого теста."""
-        # Отключаем sqlglot для этих тестов
-        os.environ["USE_SQLGLOT"] = "0"
+
+    @pytest.fixture(autouse=True)
+    def _use_sqlglot_disabled(self, monkeypatch):
+        """Изолированно выставляет USE_SQLGLOT=0 на время каждого теста."""
+        monkeypatch.setenv("USE_SQLGLOT", "0")
         self.safety_validator = SQLSafetyValidator()
-    
-    def teardown_method(self):
-        """Восстанавливаем sqlglot после тестов."""
-        os.environ["USE_SQLGLOT"] = "1"
-    
+        yield  # явная setup/teardown-семантика; monkeypatch откатит env после теста
+
     def test_explicit_legacy_mode(self):
         """Тест явного legacy mode через USE_SQLGLOT=0."""
         assert not is_sqlglot_enabled()
-        
+
         # Legacy validation разрешена только потому, что режим явно выключил sqlglot.
         result = self.safety_validator.validate("SELECT * FROM users;")
         assert result["is_safe"] is True
-        
+
         # Запрещенные ключевые слова должны ловиться legacy методом
         result = self.safety_validator.validate("DROP TABLE users;")
         assert result["is_safe"] is False
@@ -216,7 +213,11 @@ class TestSQLGlotDisabled:
 
         monkeypatch.setenv("USE_SQLGLOT", "1")
         monkeypatch.setattr(validators, "SQLGLOT_AVAILABLE", False)
-        result = self.safety_validator.validate("SELECT * FROM users;")
+        # Construct a fresh validator AFTER setting USE_SQLGLOT=1 so it sees
+        # the updated env flag rather than the stale instance from the fixture
+        # (which was built under USE_SQLGLOT=0).
+        validator = SQLSafetyValidator()
+        result = validator.validate("SELECT * FROM users;")
 
         assert result["is_safe"] is False
         assert result["issues"][0]["issue_type"] == "SQLGLOT_UNAVAILABLE"

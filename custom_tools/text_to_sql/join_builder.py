@@ -25,6 +25,7 @@ class JoinBuilder:
         db_schema: Dict[str, Dict[str, Dict[str, str]]],
         *,
         inflector: Optional[List[Tuple[str, str]]] = None,
+        dsn: Optional[str] = None,
     ):
         """
         Args:
@@ -33,9 +34,12 @@ class JoinBuilder:
                 для match_table_base. Если ``None`` — правила берутся из
                 ``nlu_morphemes.yaml::table_name_inflections`` (yaml — source
                 of truth). Пустой список ``[]`` отключает плюрализацию.
+            dsn: явный DSN для диалект-aware квотирования идентификаторов
+                в build_joins. Если не передан — используется ANSI-диалект.
         """
         self.db_schema = db_schema
         self._inflector_override = inflector
+        self.dsn = dsn
     
     def build_joins(
         self, 
@@ -70,7 +74,7 @@ class JoinBuilder:
                 # если одно из окончаний уже подключено, а другое требуется — подключаем
                 if a in used_tables and (b in (required_tables - used_tables)):
                     join_clauses.append(
-                        f"{jt} JOIN {quote_identifier(b)} ON {quote_identifier(a)}.{quote_identifier(a_col)} = {quote_identifier(b)}.{quote_identifier(b_col)}"
+                        f"{jt} JOIN {quote_identifier(b, dsn=self.dsn)} ON {quote_identifier(a, dsn=self.dsn)}.{quote_identifier(a_col, dsn=self.dsn)} = {quote_identifier(b, dsn=self.dsn)}.{quote_identifier(b_col, dsn=self.dsn)}"
                     )
                     join_edges.append({
                         "from_table": a,
@@ -84,7 +88,7 @@ class JoinBuilder:
                 elif b in used_tables and (a in (required_tables - used_tables)):
                     effective_jt = self._invert_join_type(jt)
                     join_clauses.append(
-                        f"{effective_jt} JOIN {quote_identifier(a)} ON {quote_identifier(a)}.{quote_identifier(a_col)} = {quote_identifier(b)}.{quote_identifier(b_col)}"
+                        f"{effective_jt} JOIN {quote_identifier(a, dsn=self.dsn)} ON {quote_identifier(a, dsn=self.dsn)}.{quote_identifier(a_col, dsn=self.dsn)} = {quote_identifier(b, dsn=self.dsn)}.{quote_identifier(b_col, dsn=self.dsn)}"
                     )
                     join_edges.append({
                         "from_table": a,

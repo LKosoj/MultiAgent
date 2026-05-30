@@ -156,13 +156,12 @@ def check_and_mark_incomplete_traces():
         print("⚠️ Проверка трасс пропущена - продолжаем запуск")
 
 def run_streamlit():
+    """Запуск Streamlit приложения"""
     import os
 
     server_port = int(os.environ.get("STREAMLIT_SERVER_PORT", 8501))
     server_address = os.environ.get("STREAMLIT_SERVER_ADDRESS", "localhost")
     browser_gather_usage_stats = os.environ.get("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "False").lower() == "true"
-
-    """Запуск Streamlit приложения"""
     print()
     print("🚀 Запуск Streamlit приложения...")
     print(f"   URL: http://{server_address}:{server_port}")

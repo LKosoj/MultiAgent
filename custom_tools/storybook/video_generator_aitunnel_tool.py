@@ -3,6 +3,7 @@ import json
 import logging
 import mimetypes
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from math import gcd
@@ -46,6 +47,7 @@ _RESOLUTION_BY_SHORT_EDGE = {
     2160: "4K",
 }
 _AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
 
 
 def load_env_file() -> None:
@@ -59,7 +61,7 @@ def load_env_file() -> None:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
                 key, value = line.split("=", 1)
-                os.environ[key] = value
+                os.environ.setdefault(key, value)
 
 
 load_env_file()
@@ -711,21 +713,26 @@ def _download_video_aitunnel(video_url: str, output_path: str, headers: Dict[str
 def _get_aitunnel_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
     global _AITUNNEL_MODELS_CACHE
 
+    # Fast-path: avoid lock acquisition on cache-hit (double-checked locking).
     if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
         return _AITUNNEL_MODELS_CACHE
 
-    response = requests.get(_AITUNNEL_MODELS_URL, timeout=_DEFAULT_TIMEOUT_SECONDS)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"AITUNNEL models endpoint failed: {response.status_code} - {response.text}"
-        )
+    with _AITUNNEL_MODELS_CACHE_LOCK:
+        if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
+            return _AITUNNEL_MODELS_CACHE
 
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Неверный ответ публичного models endpoint: {payload}")
+        response = requests.get(_AITUNNEL_MODELS_URL, timeout=_DEFAULT_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AITUNNEL models endpoint failed: {response.status_code} - {response.text}"
+            )
 
-    _AITUNNEL_MODELS_CACHE = payload
-    return payload
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Неверный ответ публичного models endpoint: {payload}")
+
+        _AITUNNEL_MODELS_CACHE = payload
+        return payload
 
 
 def _parse_duration_from_timing(timing: str) -> int:

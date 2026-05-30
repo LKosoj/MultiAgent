@@ -469,38 +469,43 @@ def generate_image_tool(
         payload["negative_prompt"] = negative_prompt
 
     session = requests.Session()
-    session.headers.update(
-        {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        }
-    )
-
     try:
-        response = session.post(url, json=payload, timeout=120)
-    except requests.exceptions.RequestException as e:
-        return f"Ошибка сетевого запроса API изображений: {str(e)}"
+        session.headers.update(
+            {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            }
+        )
 
-    if response.status_code != 200:
-        return f"Ошибка API изображений: {response.status_code}: {response.text}"
+        try:
+            response = session.post(url, json=payload, timeout=120)
+        except requests.exceptions.RequestException as e:
+            return f"Ошибка сетевого запроса API изображений: {str(e)}"
 
-    try:
-        response_json = response.json()
-        item = response_json["data"][0]
-        b64_data = _b64_from_images_api_item(item)
-        if not b64_data:
-            return f"Ошибка API изображений: неожиданный формат ответа: {item!r}"
-    except (KeyError, IndexError, ValueError, TypeError) as e:
-        return f"Ошибка API изображений: неожиданный формат ответа: {str(e)}"
+        if response.status_code != 200:
+            return f"Ошибка API изображений: {response.status_code}: {response.text}"
 
-    image_bytes = base64.b64decode(b64_data)
-    image = Image.open(BytesIO(image_bytes))
+        try:
+            response_json = response.json()
+            item = response_json["data"][0]
+            b64_data = _b64_from_images_api_item(item)
+            if not b64_data:
+                return f"Ошибка API изображений: неожиданный формат ответа: {item!r}"
+        except (KeyError, IndexError, ValueError, TypeError) as e:
+            return f"Ошибка API изображений: неожиданный формат ответа: {str(e)}"
 
-    os.makedirs("plots", exist_ok=True)
-    filename = f"plots/image{number}_{random.randint(100, 999)}_{session_id}.png"
-    image.save(filename, format="PNG")
+        image_bytes = base64.b64decode(b64_data)
+        image = Image.open(BytesIO(image_bytes))
 
-    return filename
+        os.makedirs("plots", exist_ok=True)
+        filename = f"plots/image{number}_{random.randint(100, 999)}_{session_id}.png"
+        image.save(filename, format="PNG")
+
+        return filename
+    finally:
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
 
 
 def edit_image_tool(prompt: str, image_path: str, session_id: str, number: int, negative_prompt: str = "", width: int = 1920, height: int = 1080, true_cfg_scale: float = 4.0, num_inference_steps: int = 50, seed: int = None, output_path: str = None) -> str:
@@ -535,107 +540,24 @@ def edit_image_tool(prompt: str, image_path: str, session_id: str, number: int, 
     except Exception as mcp_error:
         return f"Ошибка редактирования через MCP: {mcp_error}"
 
-def _edit_file_via_direct_mcp(prompt: str, image_path: str, session_id: str, number: int, negative_prompt: str, width: int, height: int, true_cfg_scale: float, num_inference_steps: int, seed: int = None) -> str:
-    """Прямое подключение к MCP серверу image-editor для работы с файлами"""
-    async def call_mcp_edit_file():
-        from mcp import StdioServerParameters
-        from mcp.client.session import ClientSession
-        from mcp.client.stdio import stdio_client
-        import json
-        
-        # Загружаем настройки из mcp_servers.json
-        with open("mcp_servers.json", "r", encoding="utf-8") as f:
-            config = json.load(f)
-        
-        # Находим настройки image-editor сервера
-        edit_server_config = config["mcpServers"]["image-editor"]
-        
-        # Создаем параметры MCP сервера из конфигурации
-        server_params = StdioServerParameters(
-            command=edit_server_config["command"],
-            args=edit_server_config["args"],
-            env={
-                **os.environ,
-                **edit_server_config["env"]
-            }
-        )
-        
-        # Генерируем путь для выходного файла
-        output_path = f"plots/edited_image{number}_{random.randint(100, 999)}_{session_id}.png"
-        
-        # Подключаемся к MCP серверу
-        async with stdio_client(server_params) as streams:
-            read, write = streams
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                
-                # Вызываем edit_image_file
-                call_params = {
-                    "prompt": prompt,
-                    "image_path": image_path,
-                    "output_path": output_path,
-                    "negative_prompt": negative_prompt,
-                    "width": width,
-                    "height": height
-                }
-                
-                # Добавляем опциональные параметры только если они не None
-                if true_cfg_scale is not None:
-                    call_params["true_cfg_scale"] = true_cfg_scale
-                if num_inference_steps is not None:
-                    call_params["num_inference_steps"] = num_inference_steps
-                if seed is not None:
-                    call_params["seed"] = seed
-                
-                result = await session.call_tool("edit_image_file", call_params)
-                
-                # Проверяем результат (edit_image_file возвращает только текст)
-                for item in result.content:
-                    if hasattr(item, 'type') and item.type == 'text':
-                        if "✅" in item.text:
-                            return output_path  # Возвращаем путь к созданному файлу
-                        else:
-                            raise Exception(f"MCP ошибка: {item.text}")
-                        
-                raise Exception("Неожиданный результат от MCP сервера")
-    
-    # Выполняем асинхронный вызов с учетом существующего event loop
-    try:
-        # Проверяем, есть ли уже запущенный event loop
-        loop = asyncio.get_running_loop()
-        # Если есть, создаем задачу и ждем ее выполнения
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, call_mcp_edit_file())
-            try:
-                output_file_path = future.result(timeout=120)  # Редактирование может занимать больше времени
-            except Exception as e:
-                # Извлекаем оригинальную ошибку из ThreadPoolExecutor
-                if hasattr(e, '__cause__') and e.__cause__:
-                    raise e.__cause__
-                else:
-                    raise e
-    except RuntimeError:
-        # Если нет event loop, создаем новый
-        output_file_path = asyncio.run(call_mcp_edit_file())
-    
-    return output_file_path
+def _edit_file_via_direct_mcp(prompt: str, image_path: str, session_id: str, number: int, negative_prompt: str, width: int, height: int, true_cfg_scale: float, num_inference_steps: int, seed: int = None, output_path: str = None) -> str:
+    """Прямое подключение к MCP серверу image-editor для работы с файлами.
 
-def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_path: str, negative_prompt: str, width: int, height: int, true_cfg_scale: float, num_inference_steps: int, seed: int = None) -> str:
-    """Прямое подключение к MCP серверу image-editor для работы с файлами с указанным выходным путём"""
+    Если output_path не указан, генерирует имя файла из session_id и number.
+    """
     async def call_mcp_edit_file():
         from mcp import StdioServerParameters
         from mcp.client.session import ClientSession
         from mcp.client.stdio import stdio_client
         import json
-        
+
         # Загружаем настройки из mcp_servers.json
         with open("mcp_servers.json", "r", encoding="utf-8") as f:
             config = json.load(f)
-        
+
         # Находим настройки image-editor сервера
         edit_server_config = config["mcpServers"]["image-editor"]
-        
+
         # Создаем параметры MCP сервера из конфигурации
         server_params = StdioServerParameters(
             command=edit_server_config["command"],
@@ -645,23 +567,25 @@ def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_p
                 **edit_server_config["env"]
             }
         )
-        
+
+        # Определяем путь для выходного файла
+        resolved_output_path = output_path if output_path is not None else f"plots/edited_image{number}_{random.randint(100, 999)}_{session_id}.png"
+
         # Подключаемся к MCP серверу
         async with stdio_client(server_params) as streams:
             read, write = streams
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                
-                # Вызываем edit_image_file с указанным output_path
+
                 call_params = {
                     "prompt": prompt,
                     "image_path": image_path,
-                    "output_path": output_path,
+                    "output_path": resolved_output_path,
                     "negative_prompt": negative_prompt,
                     "width": width,
                     "height": height
                 }
-                
+
                 # Добавляем опциональные параметры только если они не None
                 if true_cfg_scale is not None:
                     call_params["true_cfg_scale"] = true_cfg_scale
@@ -669,48 +593,43 @@ def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_p
                     call_params["num_inference_steps"] = num_inference_steps
                 if seed is not None:
                     call_params["seed"] = seed
-                
+
                 result = await session.call_tool("edit_image_file", call_params)
-                
+
                 # Проверяем результат
                 for item in result.content:
                     if hasattr(item, 'type') and item.type == 'text':
                         if "✅" in item.text:
-                            # Извлекаем путь к созданному файлу из сообщения
-                            if "(URI: " in item.text:
-                                # Извлекаем file URI из сообщения
-                                uri_start = item.text.find("(URI: ") + 6
-                                uri_end = item.text.find(")", uri_start)
-                                if uri_end > uri_start:
-                                    file_uri = item.text[uri_start:uri_end]
-                                    # Конвертируем file URI обратно в путь
-                                    import urllib.parse
-                                    path = urllib.parse.urlparse(file_uri).path
-                                    return urllib.parse.unquote(path)
-                            
-                            if "'->" in item.text:
-                                output_file_path = item.text.split("'->")[-1].strip().strip("'")
-                                # Убираем URI часть, если есть
-                                if "(URI:" in output_file_path:
-                                    output_file_path = output_file_path.split("(URI:")[0].strip()
-                                return output_file_path
-                            # Возвращаем полный путь, если он в базовом каталоге
-                            # Загружаем базовый каталог из конфигурации MCP сервера
-                            try:
-                                import json
-                                with open("mcp_servers.json", "r", encoding="utf-8") as f:
-                                    config = json.load(f)
-                                base_save_directory = config["mcpServers"]["image-editor"]["env"].get("IMG_SAVE_BASE_DIR", "")
-                                if base_save_directory and not os.path.isabs(output_path):
-                                    return os.path.normpath(os.path.join(base_save_directory, output_path))
-                            except:
-                                pass
-                            return output_path
+                            if output_path is not None:
+                                # Для явно указанного пути — пробуем извлечь итоговый путь из ответа
+                                if "(URI: " in item.text:
+                                    uri_start = item.text.find("(URI: ") + 6
+                                    uri_end = item.text.find(")", uri_start)
+                                    if uri_end > uri_start:
+                                        file_uri = item.text[uri_start:uri_end]
+                                        import urllib.parse
+                                        path = urllib.parse.urlparse(file_uri).path
+                                        return urllib.parse.unquote(path)
+                                if "'->" in item.text:
+                                    out = item.text.split("'->")[-1].strip().strip("'")
+                                    if "(URI:" in out:
+                                        out = out.split("(URI:")[0].strip()
+                                    return out
+                                try:
+                                    import json as _json
+                                    with open("mcp_servers.json", "r", encoding="utf-8") as f:
+                                        cfg = _json.load(f)
+                                    base_dir = cfg["mcpServers"]["image-editor"]["env"].get("IMG_SAVE_BASE_DIR", "")
+                                    if base_dir and not os.path.isabs(resolved_output_path):
+                                        return os.path.normpath(os.path.join(base_dir, resolved_output_path))
+                                except Exception:
+                                    pass
+                            return resolved_output_path
                         else:
                             raise Exception(f"MCP ошибка: {item.text}")
-                        
+
                 raise Exception("Неожиданный результат от MCP сервера")
-    
+
     # Выполняем асинхронный вызов с учетом существующего event loop
     try:
         # Проверяем, есть ли уже запущенный event loop
@@ -720,7 +639,7 @@ def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_p
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(asyncio.run, call_mcp_edit_file())
             try:
-                output_file_path = future.result(timeout=120)  # Редактирование может занимать больше времени
+                output_file_path = future.result(timeout=120)
             except Exception as e:
                 # Извлекаем оригинальную ошибку из ThreadPoolExecutor
                 if hasattr(e, '__cause__') and e.__cause__:
@@ -730,8 +649,18 @@ def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_p
     except RuntimeError:
         # Если нет event loop, создаем новый
         output_file_path = asyncio.run(call_mcp_edit_file())
-    
+
     return output_file_path
+
+
+def _edit_file_via_direct_mcp_with_output(prompt: str, image_path: str, output_path: str, negative_prompt: str, width: int, height: int, true_cfg_scale: float, num_inference_steps: int, seed: int = None) -> str:
+    """Обратносовместимая обёртка над _edit_file_via_direct_mcp с явным output_path."""
+    if not output_path:
+        raise ValueError("output_path must be a non-empty string")
+    return _edit_file_via_direct_mcp(
+        prompt, image_path, "", 0, negative_prompt, width, height,
+        true_cfg_scale, num_inference_steps, seed, output_path=output_path
+    )
 
 def _edit_via_direct_mcp(prompt: str, image_b64: str, session_id: str, number: int, width: int, height: int) -> str:
     """Прямое подключение к MCP серверу image-editor"""
@@ -1016,12 +945,6 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
 
             encoded_images = [encode_image(path) for path in image_paths]
 
-            session = requests.Session()
-            session.headers.update({
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            })
-
             payload: Dict[str, Any] = {
                 "model": model,
                 "prompt": prompt,
@@ -1037,8 +960,18 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
             for idx in range(2, min(len(encoded_images), 10) + 1):
                 payload[f"image{idx}_url"] = f"data:image/jpeg;base64,{encoded_images[idx - 1]}"
 
-            session.headers.update({"X-Title": "MultiAgents Image Edit"})
-            return session.post(url_gen, json=payload, timeout=180)
+            session = requests.Session()
+            try:
+                session.headers.update({
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "X-Title": "MultiAgents Image Edit",
+                })
+                return session.post(url_gen, json=payload, timeout=180)
+            finally:
+                close = getattr(session, "close", None)
+                if callable(close):
+                    close()
 
         response = _edit_image_vse_post_edits_multipart(
             url_edits,

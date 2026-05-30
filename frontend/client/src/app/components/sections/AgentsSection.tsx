@@ -79,8 +79,6 @@ type Props = {
   setProfileSearch: (value: string) => void;
   filteredProfiles: AgentProfile[];
   handleSelectProfile: (profile: AgentProfile) => void;
-  handleTestRun: (profile: AgentProfile) => void;
-  handleCreateInstance: (profile: AgentProfile) => void;
   getModelLabel: (model: unknown) => string;
   selectedProfile: AgentProfile | null;
   agentRunForm: AgentRunForm;
@@ -126,8 +124,6 @@ export function AgentsSection({
   setProfileSearch,
   filteredProfiles,
   handleSelectProfile,
-  handleTestRun,
-  handleCreateInstance,
   getModelLabel,
   selectedProfile,
   agentRunForm,
@@ -222,22 +218,6 @@ export function AgentsSection({
       link.click();
     }
     window.setTimeout(() => URL.revokeObjectURL(url), 10000);
-  }, []);
-
-  const buildDisplayResult = React.useCallback((result: unknown) => {
-    if (!result || typeof result !== "object") return result;
-    const clone = { ...(result as any) };
-    if (clone.report && typeof clone.report === "object") {
-      const reportClone = { ...(clone.report as any) };
-      const keys = ["base64_gzip", "content_b64_gzip", "report_b64_gzip", "base64"];
-      keys.forEach((key) => {
-        if (reportClone[key]) {
-          reportClone[key] = "[base64 omitted]";
-        }
-      });
-      clone.report = reportClone;
-    }
-    return clone;
   }, []);
 
   // Автооткрытие отключено — отчёт открывается только по клику.

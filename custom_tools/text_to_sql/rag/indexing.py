@@ -273,10 +273,9 @@ class IndexingService:
                         # search.py:42-43 — cross-call идёт через host, чтобы
                         # monkeypatch на инстанс RAGSearcher перехватывал вызов.
                         (self._host or self)._remove_old_file_records(session_id, filename)
+                        known_files.pop(filename, None)
                     except Exception as e:
                         logger.warning(f"Failed to remove records for deleted file {filename}: {e}")
-                    finally:
-                        known_files.pop(filename, None)
 
                 # Если уже сканировали и нет новых файлов и ни у одного файла не поменялся mtime/size — выходим быстро
                 changed_candidates: List[Tuple[Path, Tuple[int, int]]] = []
@@ -819,7 +818,10 @@ class IndexingService:
                                 if not file_path.exists():
                                     orphaned_steps.append(step)
                                     orphaned_filenames.add(filename)
-                        except Exception:
+                        except (json.JSONDecodeError, TypeError, KeyError) as e:
+                            logger.debug(
+                                "Skipping orphan-check for step %s: %s", step, e
+                            )
                             continue
 
                     # Деактивируем осиротевшие записи

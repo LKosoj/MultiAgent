@@ -55,6 +55,24 @@ def _requires_closeup_tokens(camera_plan: str) -> Tuple[bool, bool]:
     return needs_close, needs_extreme
 
 
+_LLM_CACHE_MAXSIZE = 512
+
+# Кэши пишутся из воркеров ThreadPoolExecutor (_process_scene_qa), поэтому
+# неатомарная эвикция (len-check -> pop -> set) требует общей блокировки,
+# иначе возможна двойная эвикция / StopIteration в гонке.
+_CACHE_LOCK = threading.Lock()
+
+def _cache_set(cache: dict, key: Any, value: Any, maxsize: int = _LLM_CACHE_MAXSIZE) -> None:
+    """Insert into cache, evicting the oldest entry when maxsize is exceeded."""
+    with _CACHE_LOCK:
+        if len(cache) >= maxsize:
+            try:
+                cache.pop(next(iter(cache)))
+            except StopIteration:
+                pass
+        cache[key] = value
+
+
 _VIDEO_JUDGE_CACHE: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 _CLOSEUP_ROOM_CHECK_CACHE: Dict[Tuple[str, str], List[str]] = {}
 
@@ -119,7 +137,7 @@ def _llm_check_closeup_room_details(video_prompt: str, camera_plan: str) -> List
                     continue
                 seen.add(phrase)
                 result.append(phrase)
-        _CLOSEUP_ROOM_CHECK_CACHE[cache_key] = list(result)
+        _cache_set(_CLOSEUP_ROOM_CHECK_CACHE, cache_key, list(result))
         return result
     except Exception as e:
         logger.warning("close-up room-details LLM check failed: %s; skipping check", e)
@@ -180,8 +198,12 @@ def _llm_judge_video_prompt_lite(
         str(candidate_video_prompt or "").strip(),
         str(storyboard_camera_plan or "").strip() + "||" + str(storyboard_description or "").strip(),
     )
-    if key in _VIDEO_JUDGE_CACHE:
-        return _VIDEO_JUDGE_CACHE[key]
+    # .get() — одна атомарная операция под GIL: не упадёт с KeyError, даже если
+    # конкурентный _cache_set вытеснит ключ между проверкой и чтением (теперь, когда
+    # эвикция реальна). Двухшаговый `if key in cache: cache[key]` тут гонкоопасен.
+    cached = _VIDEO_JUDGE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     model_obj = model_override or model_mapping.get("model_lite") or model_hard
     needs_close, needs_extreme = _requires_closeup_tokens(storyboard_camera_plan)
@@ -252,7 +274,7 @@ def _llm_judge_video_prompt_lite(
     }
     if out["rewritten_candidate"] is not None:
         out["rewritten_candidate"] = out["rewritten_candidate"].replace("\n", " ").strip()
-    _VIDEO_JUDGE_CACHE[key] = out
+    _cache_set(_VIDEO_JUDGE_CACHE, key, out)
     return out
 
 
@@ -285,8 +307,10 @@ def _llm_judge_end_english_prompt_candidate(
         (storyboard_description or "").strip(),
         (transition_video_prompt or "").strip(),
     )
-    if key in _END_ENGLISH_JUDGE_CACHE:
-        return _END_ENGLISH_JUDGE_CACHE[key]
+    # .get() атомарен под GIL — безопасно при конкурентной эвикции (см. _VIDEO_JUDGE_CACHE).
+    cached = _END_ENGLISH_JUDGE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     model_obj = model_override or model_hard
     # --- Layer A: Role + validation scope ---
@@ -329,7 +353,7 @@ def _llm_judge_end_english_prompt_candidate(
     }
     if out["rewritten_candidate"] is not None:
         out["rewritten_candidate"] = out["rewritten_candidate"].replace("\n", " ").strip()
-    _END_ENGLISH_JUDGE_CACHE[key] = out
+    _cache_set(_END_ENGLISH_JUDGE_CACHE, key, out)
     return out
 
 
@@ -356,8 +380,10 @@ def _llm_judge_english_prompt_set_safe(
         (shot_type or "").strip().lower(),
         (transition_video_prompt or "").strip(),
     )
-    if key in _ENGLISH_SET_JUDGE_CACHE:
-        return _ENGLISH_SET_JUDGE_CACHE[key]
+    # .get() атомарен под GIL — безопасно при конкурентной эвикции (см. _VIDEO_JUDGE_CACHE).
+    cached = _ENGLISH_SET_JUDGE_CACHE.get(key)
+    if cached is not None:
+        return cached
 
     before_has_cyr = bool(re.search(r"[А-Яа-яЁё]", before_english_prompt or ""))
     after_has_cyr = bool(re.search(r"[А-Яа-яЁё]", after_english_prompt or ""))
@@ -366,7 +392,7 @@ def _llm_judge_english_prompt_set_safe(
             "ok": False,
             "reason": "language_changed_between_before_and_after_english_prompt",
         }
-        _ENGLISH_SET_JUDGE_CACHE[key] = out
+        _cache_set(_ENGLISH_SET_JUDGE_CACHE, key, out)
         return out
 
     model_obj = model_override or model_hard
@@ -402,7 +428,7 @@ def _llm_judge_english_prompt_set_safe(
     )
     obj = _extract_json_object(resp) or {}
     out = {"ok": bool(obj.get("ok")), "reason": str(obj.get("reason") or "")}
-    _ENGLISH_SET_JUDGE_CACHE[key] = out
+    _cache_set(_ENGLISH_SET_JUDGE_CACHE, key, out)
     return out
 
 
@@ -1814,33 +1840,35 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
             os.makedirs(os.path.dirname(shots_path), exist_ok=True)
             with open(shots_path, "a+", encoding="utf-8") as lock_f:
                 fcntl.flock(lock_f, fcntl.LOCK_EX)
-                # Reload latest file content (if any) and merge items by key to avoid stomping
-                on_disk = _read_json(shots_path) or {}
-                on_disk_items = on_disk.get("items") or []
-                if on_disk_items:
-                    # Build index from updated in-memory items
-                    updated_index: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
-                    for it in items:
-                        try:
-                            key = (int(it.get("scene_number")), int(it.get("shot_number")), str(it.get("shot_type")))
-                            updated_index[key] = it
-                        except Exception:
-                            continue
-                    merged_items = []
-                    for it in on_disk_items:
-                        try:
-                            key = (int(it.get("scene_number")), int(it.get("shot_number")), str(it.get("shot_type")))
-                        except Exception:
-                            merged_items.append(it)
-                            continue
-                        merged_items.append(updated_index.get(key, it))
-                    shots_data["items"] = merged_items
-                else:
-                    shots_data["items"] = items
+                try:
+                    # Reload latest file content (if any) and merge items by key to avoid stomping
+                    on_disk = _read_json(shots_path) or {}
+                    on_disk_items = on_disk.get("items") or []
+                    if on_disk_items:
+                        # Build index from updated in-memory items
+                        updated_index: Dict[Tuple[int, int, str], Dict[str, Any]] = {}
+                        for it in items:
+                            try:
+                                key = (int(it.get("scene_number")), int(it.get("shot_number")), str(it.get("shot_type")))
+                                updated_index[key] = it
+                            except Exception:
+                                continue
+                        merged_items = []
+                        for it in on_disk_items:
+                            try:
+                                key = (int(it.get("scene_number")), int(it.get("shot_number")), str(it.get("shot_type")))
+                            except Exception:
+                                merged_items.append(it)
+                                continue
+                            merged_items.append(updated_index.get(key, it))
+                        shots_data["items"] = merged_items
+                    else:
+                        shots_data["items"] = items
 
-                _write_json_atomic(shots_path, shots_data)
-                _write_json_atomic(report_path, report)
-                fcntl.flock(lock_f, fcntl.LOCK_UN)
+                    _write_json_atomic(shots_path, shots_data)
+                    _write_json_atomic(report_path, report)
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
         except Exception as e:
             logger.error(f"🧪 shots_prompt_qa_tool: не удалось сохранить shots.json/report: {e}")
 

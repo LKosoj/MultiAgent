@@ -218,17 +218,20 @@ class TestSchemaLinker:
         assert table is None
         assert column is None
     
-    def test_cache_info_includes_params(self, schema_linker):
+    def test_cache_info_includes_params(self, schema_linker, monkeypatch):
         """Тест включения параметров окружения в кэш-ключ."""
         import os
-        
-        # Устанавливаем тестовые параметры окружения. DB_DSN обязателен после
-        # Phase 6 fail-fast (см. doc/TEXT_TO_SQL_CHANGELOG.md): без него
-        # SchemaCacheManager.prepare_cache_info бросает ValueError.
-        os.environ["SCHEMA_LINKING_USE_LLM"] = "1"
-        os.environ["SCHEMA_TABLE_CANDIDATES_K"] = "3"
-        dsn = os.environ.setdefault("DB_DSN", "postgresql://test/test")
-        
+
+        # Устанавливаем тестовые параметры окружения через monkeypatch — cleanup
+        # гарантирован даже при падении теста.
+        # DB_DSN обязателен после Phase 6 fail-fast (см. doc/TEXT_TO_SQL_CHANGELOG.md):
+        # без него SchemaCacheManager.prepare_cache_info бросает ValueError.
+        monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+        monkeypatch.setenv("SCHEMA_TABLE_CANDIDATES_K", "3")
+        dsn = os.environ.get("DB_DSN", "postgresql://test/test")
+        if not os.environ.get("DB_DSN"):
+            monkeypatch.setenv("DB_DSN", dsn)
+
         entities = {"metrics": ["revenue"], "dimensions": ["date"]}
         schema = {
             "sales": {
@@ -237,27 +240,23 @@ class TestSchemaLinker:
                 "date": {"type": "DATE"}
             }
         }
-        
+
         cache_info = schema_linker._prepare_cache_info(entities, schema, dsn=dsn)
-        
+
         # Проверяем, что ключ включает основные поля
         assert "session_id" in cache_info
         assert "cache_kind" in cache_info
         assert "cache_key" in cache_info
         assert "schema_version" in cache_info
-        
+
         # Ключ должен измениться при изменении параметров окружения
         cache_key_1 = cache_info["cache_key"]
-        
-        os.environ["SCHEMA_TABLE_CANDIDATES_K"] = "7"
+
+        monkeypatch.setenv("SCHEMA_TABLE_CANDIDATES_K", "7")
         cache_info_2 = schema_linker._prepare_cache_info(entities, schema, dsn=dsn)
         cache_key_2 = cache_info_2["cache_key"]
-        
+
         assert cache_key_1 != cache_key_2
-        
-        # Очищаем переменные окружения
-        os.environ.pop("SCHEMA_LINKING_USE_LLM", None)
-        os.environ.pop("SCHEMA_TABLE_CANDIDATES_K", None)
 
 
 class TestDBPluginMethods:

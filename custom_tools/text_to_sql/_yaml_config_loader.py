@@ -166,7 +166,13 @@ def build_mapping_error_message(path: Path, yaml_filename: str) -> str:
     return f"{yaml_filename} at {path} must contain a mapping at the top level"
 
 
-def coerce_str_list(value: Any, field: str, *, yaml_filename: str) -> list:
+def coerce_str_list(
+    value: Any,
+    field: str,
+    *,
+    yaml_filename: str,
+    reject_empty_strings: bool = False,
+) -> list:
     """Привести yaml-значение к ``list[str]``.
 
     Контракт (идентичный в schema_linking_examples / significance / nlu):
@@ -174,13 +180,20 @@ def coerce_str_list(value: Any, field: str, *, yaml_filename: str) -> list:
       * ``list`` из строк → ``list(value)``;
       * иначе → ``ValueError`` с упоминанием yaml-файла и поля.
 
-    Пустые строки НЕ отвергаются (по совместимости с местами вызова).
+    При ``reject_empty_strings=True`` пустые строки ``""`` отвергаются
+    с ``ValueError`` — используй для полей significance/schema-linking,
+    где ``"" in column_name.lower()`` всегда True и создаёт silent-баг.
     """
     if value is None:
         return []
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise ValueError(f"{yaml_filename}: {field} must be a list of strings")
-    return list(value)
+    result = list(value)
+    if reject_empty_strings and "" in result:
+        raise ValueError(
+            f"{yaml_filename}: {field} must not contain empty strings"
+        )
+    return result
 
 
 def resolve_active_profile_name(

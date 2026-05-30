@@ -364,6 +364,20 @@ class SchemaLinkingCore:
                 for v in linked_filters.values()
             )
         )
+        # M70: error выставляем на основе стратегии, а не только наличия linked output.
+        # Если linking_strategy="none" — ничего не отработало → error.
+        # Если LLM провалился, но heuristic fallback дал хоть что-то (strategy=
+        # "heuristic") — linked output есть, но первоначальная LLM-ошибка была:
+        # её отражаем только если совсем ничего не прилинковано.
+        has_any_linked = self._has_linked_entities({
+            "metrics": linked_metrics,
+            "dimensions": linked_dimensions,
+            "filters": linked_filters,
+        }) or has_linked_filters
+        if linking_strategy == "none" or (unlinked and not has_any_linked):
+            error_value = unlinked[0] if unlinked else "Schema linking produced no result"
+        else:
+            error_value = None
         return {
             "linked_entities": {
                 "metrics": linked_metrics,
@@ -376,11 +390,7 @@ class SchemaLinkingCore:
             "main_table": joins_info["main_table"],
             "unlinked_entities": unlinked,
             "linking_strategy": linking_strategy,
-            "error": unlinked[0] if unlinked and not self._has_linked_entities({
-                "metrics": linked_metrics,
-                "dimensions": linked_dimensions,
-                "filters": linked_filters,
-            }) and not has_linked_filters else None,
+            "error": error_value,
         }
 
     def _pick_main_table_from_linked(

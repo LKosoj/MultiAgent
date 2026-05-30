@@ -163,7 +163,20 @@ class LLMLinker:
             )
 
             schema_str = self.schema_limiter.build_schema_summary(filtered_schema)
-            prompt = build_schema_linking_prompt(entities, schema_str, dsn=dsn)
+            # L58: entities могут содержать PII (значения фильтров из
+            # пользовательского запроса). LLM-линкеру нужны КЛЮЧИ фильтров
+            # (имена колонок), а не фактические значения — редактируем значения
+            # filters перед передачей в промпт.
+            entities_for_prompt = entities
+            if isinstance(entities_for_prompt, dict) and isinstance(
+                entities_for_prompt.get("filters"), dict
+            ):
+                entities_for_prompt = dict(entities_for_prompt)
+                entities_for_prompt["filters"] = {
+                    k: _redact_linking_value(v)
+                    for k, v in entities_for_prompt["filters"].items()
+                }
+            prompt = build_schema_linking_prompt(entities_for_prompt, schema_str, dsn=dsn)
 
             logger.info(f"Schema linking prompt length: {len(prompt)}")
             logger.debug(

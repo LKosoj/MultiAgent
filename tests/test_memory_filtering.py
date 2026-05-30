@@ -1,6 +1,7 @@
 import pytest
 import json
 import sqlite3
+import threading
 import types
 import memory.tools as memory_tools
 from memory.tools import get_memory
@@ -90,7 +91,9 @@ def test_get_memory_with_partial_filters(mock_memory_manager):
 class _SQLiteDBHandler:
     def __init__(self, db_path):
         self.db_path = str(db_path)
+        self.lock = threading.Lock()
         self.tactical_collection = None
+        self.embedding_model = None
 
     def _get_connection(self):
         return sqlite3.connect(self.db_path)
@@ -108,11 +111,12 @@ def _make_sqlite_db_handler(tmp_path):
                 step INTEGER,
                 instance_step INTEGER,
                 run_id TEXT,
-                data TEXT,
-                valid_from TEXT,
-                valid_to TEXT,
-                updated_at TEXT
-            )
+                    data TEXT,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    created_at TEXT,
+                    updated_at TEXT
+                )
             """
         )
         conn.commit()
@@ -214,6 +218,91 @@ def test_get_memory_cache_filters_match_compact_and_legacy_spaced_json(monkeypat
 
     assert [item["step"] for item in results] == [1, 2]
     assert {item["data"]["format"] for item in results} == {"compact", "spaced"}
+
+
+def test_summary_agent_memory_step_detects_replaced_active_row(monkeypatch, tmp_path):
+    db_handler = _make_sqlite_db_handler(tmp_path)
+    memory_manager = types.SimpleNamespace(
+        db_handler=db_handler,
+        is_memory_updated=False,
+    )
+    monkeypatch.setattr(memory_tools, "memory_manager", memory_manager)
+    _insert_memory_row(
+        db_handler,
+        step=1,
+        data_text="old data that is long enough to summarize",
+    )
+
+    class _Response:
+        content = "summary from stale data"
+
+    def fake_model_summary(_messages, max_tokens):
+        assert max_tokens == 4000
+        with db_handler.lock:
+            conn = db_handler._get_connection()
+            try:
+                conn.execute(
+                    """
+                    UPDATE agent_memory
+                    SET valid_to = ?, updated_at = ?
+                    WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+                    """,
+                    (
+                        "2026-01-01T00:00:01",
+                        "2026-01-01T00:00:01",
+                        "sess",
+                        "Schema-RAG-Agent",
+                        1,
+                    ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO agent_memory (
+                        session_id, agent_name, step, instance_step, run_id,
+                        data, valid_from, valid_to, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?)
+                    """,
+                    (
+                        "sess",
+                        "Schema-RAG-Agent",
+                        1,
+                        "fresh data from another writer",
+                        "2026-01-01T00:00:02",
+                        "2026-01-01T00:00:02",
+                        "2026-01-01T00:00:02",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        return _Response()
+
+    monkeypatch.setattr(memory_tools, "model_summary", fake_model_summary)
+
+    result = memory_tools.summary_agent_memory_step(
+        "sess",
+        "Schema-RAG-Agent",
+        1,
+    )
+
+    assert "Конфликт записи" in result
+    assert memory_manager.is_memory_updated is False
+
+    conn = db_handler._get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT data
+            FROM agent_memory
+            WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+            """,
+            ("sess", "Schema-RAG-Agent", 1),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert rows == [("fresh data from another writer",)]
 
 
 def test_schema_conflict_lookup_matches_compact_and_legacy_spaced_json(tmp_path):

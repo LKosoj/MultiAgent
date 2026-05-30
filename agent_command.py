@@ -86,8 +86,11 @@ def _get_model(name: str) -> RetryOpenAIServerModel:
     if name not in _MODEL_CONFIGS:
         raise AttributeError(f"Unknown model: {name!r}")
     config = dict(_MODEL_CONFIGS[name])
+    api_key = os.getenv("OPENAI_API_KEY_DB")
+    if not api_key:
+        raise EnvironmentError("OPENAI_API_KEY_DB is required but not set")
     config.setdefault("api_base", os.getenv("OPENAI_API_BASE_DB"))
-    config.setdefault("api_key", os.getenv("OPENAI_API_KEY_DB"))
+    config.setdefault("api_key", api_key)
     config.setdefault("custom_role_conversions", custom_role_conversions)
     config.setdefault("extra_headers", {"X-Title": "MAgent"})
     return RetryOpenAIServerModel(**config)
@@ -168,7 +171,7 @@ def __getattr__(name: str):
     if name in _MODEL_CONFIGS:
         return _get_model(name)
     if name == "AGENT_PROFILES":
-        return _load_agent_profiles()
+        return dict(_load_agent_profiles())
     raise AttributeError(f"module 'agent_command' has no attribute {name!r}")
 
 

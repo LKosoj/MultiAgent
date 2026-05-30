@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
     exp = None  # type: ignore
 
 from ._schema_scope import ScopeResolver
+from .safety import _set_operation_classes
 
 
 class CTECollector:
@@ -42,7 +43,9 @@ class CTECollector:
         # что характерно для рекурсивных CTE. Для не-Select тел регистрируем CTE
         # с пустым набором проектируемых колонок (или с alias-колонками, если заданы),
         # чтобы такая таблица не помечалась как UNKNOWN_TABLE.
-        select_like = (exp.Select, getattr(exp, "Union", ()))
+        # M49: используем _set_operation_classes() из safety.py, чтобы корректно
+        # включить Intersect/Except в sqlglot 27+, где они НЕ наследуются от Union.
+        select_like = (getattr(exp, 'Select', type(None)),) + _set_operation_classes()
         for cte in getattr(with_expr, "expressions", []) or []:
             alias = getattr(cte, "alias", None)
             select_expr = getattr(cte, "this", None)

@@ -1,9 +1,10 @@
+import asyncio
 import os
+import threading
 import uuid
 import json
 import logging
 import traceback
-import asyncio
 import matplotlib
 
 # Устанавливаем переменную окружения для отключения параллелизма токенизаторов
@@ -34,8 +35,8 @@ class DynamicAgentSystem:
     
     def __init__(self):
         self.factory = AgentFactory()
-        self.task_queue = asyncio.Queue()
         self.agent_pool = {}
+        self._coordinate_lock = threading.Lock()
     
     def get_available_agents(self, session_id: str) -> Dict[str, Dict[str, Any]]:
         """Возвращает словарь всех доступных агентов с их описаниями, зависимостями и возможностями
@@ -140,6 +141,24 @@ researcher --> agent3
         return agents_info, diagram_result
     
     async def coordinate(self, initial_task: str, session_id: str = None, show: bool = False, preload_agents: List[str] = None):
+        """Сериализованная публичная точка входа для shared-state agent system."""
+        await self._acquire_coordinate_lock()
+        try:
+            return await self._coordinate_unlocked(
+                initial_task=initial_task,
+                session_id=session_id,
+                show=show,
+                preload_agents=preload_agents,
+            )
+        finally:
+            self._coordinate_lock.release()
+
+    async def _acquire_coordinate_lock(self) -> None:
+        """Захватывает cross-thread lock, не блокируя event loop."""
+        while not self._coordinate_lock.acquire(blocking=False):
+            await asyncio.sleep(0.05)
+
+    async def _coordinate_unlocked(self, initial_task: str, session_id: str = None, show: bool = False, preload_agents: List[str] = None):
         """Координация выполнения задачи
         
         Args:
@@ -152,6 +171,11 @@ researcher --> agent3
             session_id = str(uuid.uuid4())
         
         logger.info(f"🚀 Начинаем координацию задачи: '{initial_task}' (session: {session_id})")
+
+        # Сбрасываем состояние фабрики и пула перед каждым новым запросом,
+        # чтобы агенты из предыдущих сессий не протекали в текущую.
+        self.factory.agents.clear()
+        self.agent_pool.clear()
 
         # --- Этап 1: Проверка безопасности на входе ---
         # try:
@@ -438,13 +462,13 @@ researcher --> agent3
             
             if 'manager' not in agent_types:
                 agent_types.append('manager')
-            return list(set(agent_types)), None # Возвращаем уникальные
+            return list(set(agent_types)), 'general'  # Возвращаем уникальные
 
+        except ValueError:
+            raise
         except Exception as e:
-            if "DB_DSN обязателен" in str(e):
-                raise
-            print(f"Ошибка при анализе задачи: {str(e)}. Возвращается базовый набор агентов.")
-            return ['researcher', 'manager'], None
+            logger.error(f"Ошибка при анализе задачи: {str(e)}. Возвращается базовый набор агентов.\n{traceback.format_exc()}")
+            return ['researcher', 'manager'], 'general'
     
     def create_agent_summary(self, agent):
         """Создает сводку результатов работы агента на основе его памяти"""

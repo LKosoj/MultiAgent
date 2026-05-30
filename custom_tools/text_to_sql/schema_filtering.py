@@ -443,9 +443,11 @@ class SchemaRelevanceFilter:
         if matching_columns > 0:
             score += matching_columns * 2.0
         
-        # Нормализуем по количеству колонок (чтобы большие таблицы не имели преимущества)
+        # Нормализуем по количеству колонок (чтобы большие таблицы не имели преимущества).
+        # Применяем только если хотя бы одна колонка совпала — иначе обнуление
+        # score умножением на 0 скрыло бы точное совпадение имени таблицы.
         total_columns = len(table_columns)
-        if total_columns > 0:
+        if total_columns > 0 and matching_columns > 0:
             score = score * (matching_columns / total_columns) * 100
         
         return score

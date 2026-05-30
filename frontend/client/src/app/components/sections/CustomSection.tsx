@@ -80,7 +80,10 @@ export function CustomSection({ runServiceAction, isBusy, results, clearResults 
                     <span className="app-subtitle">{entry.timestamp}</span>
                   </div>
                   <KeyValueList data={entry.data} />
-                  {imageSrc ? <img className="image-preview" src={imageSrc} alt={entry.action} /> : null}
+                  {imageSrc ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img className="image-preview" src={imageSrc} alt={entry.action} />
+                  ) : null}
                 </div>
               );
             })

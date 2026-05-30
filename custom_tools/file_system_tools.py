@@ -1,7 +1,12 @@
 import os
+import re
 import sys
 import subprocess
 import logging
+
+# Абсолютный путь к каталогу 'plots' относительно расположения модуля,
+# чтобы проверка каталога не зависела от текущей рабочей директории (CWD).
+_PROJECT_PLOTS = os.path.realpath(os.path.join(os.path.dirname(__file__), '..', 'plots'))
 
 def file_write(session_id: str, filename: str, content: str, append: bool = False) -> str:
     """Записывает содержимое в файл в каталог 'plots'. Если append=True, дописывает в конец файла.
@@ -117,12 +122,13 @@ def file_list(session_id: str, dir_name: str) -> str:
     Returns:
         str: Список файлов в директории
     """
-    allowed_dirs = ['plots']
-    if not any(allowed_dir in dir_name for allowed_dir in allowed_dirs):
+    allowed_dirs = [_PROJECT_PLOTS]
+    real_dir = os.path.realpath(dir_name)
+    if not any(real_dir == allowed or real_dir.startswith(allowed + os.sep) for allowed in allowed_dirs):
         return f"Ошибка чтения содержимого директории, указан не корректный каталог: {dir_name}"
     try:
         # Получаем список файлов в директории
-        files = os.listdir(dir_name)
+        files = os.listdir(real_dir)
         # Фильтруем список файлов, оставляя только те, которые содержат идентификатор сессии
         files = [file for file in files if session_id in file]
         return f"Список файлов в директории '{dir_name}': {files}"
@@ -130,43 +136,9 @@ def file_list(session_id: str, dir_name: str) -> str:
         return f"Ошибка при получении списка файлов: {str(e)}"
 
 
-# Список потенциально опасных пакетов для системной безопасности
-DANGEROUS_PACKAGES = {
-    # Пакеты для выполнения системных команд
-    'plumbum', 'pexpect', 'sh', 'invoke', 'fabric', 'paramiko',
-    
-    # Пакеты для работы с процессами и системой
-    'psutil', 'supervisor', 'daemon', 'python-daemon',
-    
-    # Пакеты для удаленного выполнения кода
-    'rpyc', 'pyro4', 'celery', 'rq', 'dramatiq',
-    
-    # Пакеты для работы с файловой системой (потенциально опасные)
-    'pathlib2', 'send2trash', 'watchdog', 'scandir',
-    
-    # Сетевые пакеты с возможностью атак
-    'scapy', 'nmap', 'python-nmap', 'netaddr', 'netifaces',
-    
-    # Пакеты для работы с безопасностью (могут быть злоупотреблены)
-    'keyring', 'cryptography', 'pycrypto', 'pycryptodome',
-    
-    # Пакеты для веб-скрейпинга (могут перегружать сервера)
-    'scrapy', 'selenium', 'playwright', 'pyautogui',
-    
-    # Пакеты для работы с базами данных (могут повредить данные)
-    'sqlalchemy-utils', 'alembic', 'migrate',
-    
-    # Пакеты для компиляции и выполнения кода
-    'cython', 'numba', 'cffi', 'pybind11',
-    
-    # Пакеты для работы с архивами (zip bombs)
-    'zipfile36', 'patool', 'pyunpack',
-    
-    # Другие потенциально опасные пакеты
-    'schedule', 'APScheduler', 'crontab', 'python-crontab'
-}
-
-# Безопасные пакеты для анализа данных и научных вычислений
+# Безопасные пакеты для анализа данных и научных вычислений (allow-list).
+# install_package разрешает только пакеты из этого множества; прежний deny-list
+# DANGEROUS_PACKAGES удалён как мёртвый — фильтрация теперь строго по allow-list.
 SAFE_PACKAGES = {
     'numpy', 'pandas', 'matplotlib', 'seaborn', 'plotly', 'bokeh',
     'scipy', 'scikit-learn', 'statsmodels', 'sympy',
@@ -202,16 +174,17 @@ def install_package(package_name: str, version: str = None) -> str:
     """
     # Нормализуем имя пакета (убираем лишние символы, приводим к нижнему регистру)
     clean_package_name = package_name.strip().lower().replace('_', '-')
-    
-    # Проверяем безопасность пакета
-    if clean_package_name in DANGEROUS_PACKAGES:
-        return (f"🚫 БЛОКИРОВАНО: Пакет '{package_name}' заблокирован по соображениям безопасности. "
-                f"Этот пакет может выполнять системные команды или иметь другие потенциально опасные возможности. "
-                f"Если установка действительно необходима, обратитесь к администратору.")
-    
-    # Информируем о статусе безопасности
-    #safety_status = "✅ БЕЗОПАСНЫЙ" if clean_package_name in SAFE_PACKAGES else "⚠️ НЕ ОПРЕДЕЛЕН"
-    safety_status = "✅ БЕЗОПАСНЫЙ"
+
+    # Проверяем по разрешённому списку (allowlist): только явно разрешённые пакеты
+    if clean_package_name not in SAFE_PACKAGES:
+        return (f"БЛОКИРОВАНО: Пакет '{package_name}' не входит в список разрешённых пакетов. "
+                f"Для установки пакета вне списка обратитесь к администратору.")
+
+    # Валидируем версию, чтобы исключить инъекцию посторонних символов в spec
+    if version is not None and not re.fullmatch(r'[A-Za-z0-9_.+-]+', version):
+        return f"Ошибка: некорректная версия пакета '{package_name}': {version}"
+
+    safety_status = "БЕЗОПАСНЫЙ"
     logging.info(f"Статус безопасности пакета '{package_name}': {safety_status}")
     
     try:
@@ -221,7 +194,7 @@ def install_package(package_name: str, version: str = None) -> str:
     except ImportError:
         try:
             # Формируем команду для установки
-            package_spec = f"{package_name}=={version}" if version else package_name
+            package_spec = f"{clean_package_name}=={version}" if version else clean_package_name
             logging.info(f"Устанавливаем пакет: {package_spec} ({safety_status})")
             
             # Выполняем установку

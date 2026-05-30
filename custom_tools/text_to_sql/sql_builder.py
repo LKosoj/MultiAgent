@@ -57,11 +57,19 @@ def build_sql_from_linked_entities(
     if not (metrics or dimensions):
         return {}
 
+    # M67: FROM выбирается из metrics в первую очередь — fact-таблица должна
+    # быть главной в FROM/LEFT JOIN семантике. Только если metrics пусты —
+    # используем первую dimension.
     from_table = None
-    for entity in metrics + dimensions:
+    for entity in metrics:
         if entity.get("table"):
             from_table = entity["table"]
             break
+    if not from_table:
+        for entity in dimensions:
+            if entity.get("table"):
+                from_table = entity["table"]
+                break
     if not from_table:
         return {}
 
@@ -270,7 +278,10 @@ def build_sql_from_linked_entities(
 def _get_linked_entities(context: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(context, dict):
         return {}
-    linked = context.get("linked_entities", context)
+    # L53: при отсутствии ключа linked_entities возвращаем {}, а не весь
+    # context — иначе произвольные поля из user-запроса попадают в metrics/
+    # dimensions/filters как сырой контекст от LLM.
+    linked = context.get("linked_entities")
     return linked if isinstance(linked, dict) else {}
 
 
@@ -382,7 +393,20 @@ def filter_value_conditions(
     value: Any,
     filter_info: Dict[str, Any],
     dsn: str | None = None,
+    *,
+    _depth: int = 0,
 ) -> Optional[List[str]]:
+    # M47: защита от неограниченной рекурсии через вложенные dict с ключом "value".
+    # _depth — keyword-only, чтобы внешний код не мог случайно обойти cap позиционным аргументом.
+    _MAX_DEPTH = 10
+    if _depth >= _MAX_DEPTH:
+        logger.warning(
+            "filter_value_conditions: max recursion depth %d exceeded; "
+            "ignoring deeply nested filter value",
+            _MAX_DEPTH,
+        )
+        return None
+
     operator = str(filter_info.get("operator") or "=").strip().upper()
     operator_aliases = {
         "EQ": "=",
@@ -403,7 +427,7 @@ def filter_value_conditions(
             nested_info = dict(filter_info)
             nested_info["operator"] = value.get("operator")
             nested_value = value.get("value")
-            return filter_value_conditions(expr, nested_value, nested_info, dsn=dsn)
+            return filter_value_conditions(expr, nested_value, nested_info, dsn=dsn, _depth=_depth + 1)
 
         conditions: List[str] = []
         start_val = value.get("start")
@@ -430,14 +454,14 @@ def filter_value_conditions(
             if not isinstance(value["values"], list):
                 return None
             in_conditions = filter_value_conditions(
-                expr, value["values"], {"operator": "IN"}, dsn=dsn
+                expr, value["values"], {"operator": "IN"}, dsn=dsn, _depth=_depth + 1
             )
             if in_conditions is None:
                 return None
             conditions.extend(in_conditions)
         if "value" in value:
             nested_conditions = filter_value_conditions(
-                expr, value.get("value"), filter_info, dsn=dsn
+                expr, value.get("value"), filter_info, dsn=dsn, _depth=_depth + 1
             )
             if nested_conditions is None:
                 return None

@@ -44,7 +44,7 @@ def load_env_file():
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    os.environ[key] = value
+                    os.environ.setdefault(key, value)
     else:
         logger.warning(f"⚠️ .env не найден. Searched in: {possible_paths}")
 
@@ -95,10 +95,10 @@ def video_generator_veo_tool(
         Словарь с результатами генерации видео для каждого кадра.
     """
     if not project_id:
-        print("DEBUG: project_id is missing")
+        logger.error("project_id is missing")
         return {"status": "error", "message": "project_id обязателен", "results": []}
-    
-    print(f"DEBUG: Starting video generation for project: {project_id}, enable: {enable}")
+
+    logger.debug(f"Starting video generation for project: {project_id}, enable: {enable}")
 
     shots_file_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
     
@@ -136,37 +136,33 @@ def video_generator_veo_tool(
             logger.error(f"❌ Ошибка перезагрузки shots.json после обновления описаний: {e}")
             return {"status": "error", "message": f"Ошибка перезагрузки shots.json: {e}", "results": []}
 
-    # Принудительно перезагружаем env variables для отладки
-    load_env_file()
-
     # Логика инициализации клиента:
     # 1. Проверяем PROJECT_ID для Vertex AI (приоритет для last_frame)
     # 2. Иначе проверяем GEMINI_API_KEY
-    
-    # Используем дефолт из оригинального veo.py если в env нет
-    project_id_vertex = os.getenv('GOOGLE_CLOUD_PROJECT', 'gen-lang-client-0611452273')
+    project_id_vertex = os.getenv('GOOGLE_CLOUD_PROJECT')
     location_vertex = os.getenv('GOOGLE_CLOUD_LOCATION', 'us-central1')
     api_key = os.getenv("GEMINI_API_KEY")
-    
+
+    if not project_id_vertex and not api_key:
+        logger.error("No credentials found: set GOOGLE_CLOUD_PROJECT (Vertex AI) or GEMINI_API_KEY")
+        return {"status": "error", "message": "Credentials not found: set GOOGLE_CLOUD_PROJECT or GEMINI_API_KEY", "results": []}
+
     # Флаг использования Vertex
     use_vertex = False
-    
+
     # Если хотим last_frame (а мы хотим), то предпочтительно Vertex.
     # Проверяем, есть ли у нас PROJECT_ID.
     if project_id_vertex:
-        print(f"DEBUG: Using Vertex AI with project: {project_id_vertex}")
+        logger.debug(f"Using Vertex AI with project: {project_id_vertex}")
         use_vertex = True
-    elif api_key:
-        print(f"DEBUG: Using Gemini API Key (Warning: last_frame may not work)")
     else:
-        print("DEBUG: No credentials found (GEMINI_API_KEY or GOOGLE_CLOUD_PROJECT)")
-        return {"status": "error", "message": "Credentials not found", "results": []}
+        logger.debug("Using Gemini API Key (Warning: last_frame may not work)")
 
     # Подготовка задач
     video_items = []
     seen_shots = set()
     
-    print(f"DEBUG: Processing {len(items_list)} items from shots.json")
+    logger.debug(f"Processing {len(items_list)} items from shots.json")
 
     for item in items_list:
         if item.get("shot_type") != "start": 
@@ -177,7 +173,7 @@ def video_generator_veo_tool(
         video_path = item.get("video_path")
         
         if not video_path or os.path.exists(video_path):
-            print(f"DEBUG: Skip existing or invalid video path: {video_path}")
+            logger.debug(f"Skip existing or invalid video path: {video_path}")
             continue
             
         # Поиск изображений (аналогично mm_tool)
@@ -194,7 +190,7 @@ def video_generator_veo_tool(
                 start_img = potential_start
 
         if not start_img or not os.path.exists(start_img):
-            print(f"DEBUG: Start image not found for {scene}-{shot}: {start_img}")
+            logger.debug(f"Start image not found for {scene}-{shot}: {start_img}")
             continue
             
         # End image
@@ -333,7 +329,7 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
             }
             
         # Получение видео
-        logger.info(f"DEBUG: Operation Response for {scene}-{shot}: {operation.response}")
+        logger.debug(f"Operation Response for {scene}-{shot}: {operation.response}")
 
         if hasattr(operation.response, 'rai_media_filtered_count') and operation.response.rai_media_filtered_count and operation.response.rai_media_filtered_count > 0:
              logger.warning(f"⚠️ Video generation filtered by safety settings. Reasons: {operation.response.rai_media_filtered_reasons}")
@@ -362,7 +358,7 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
             if not use_vertex and api_key:
                 download_url = f"{video_uri}&key={api_key}"
                 
-            resp = requests.get(download_url, stream=True)
+            resp = requests.get(download_url, stream=True, timeout=(30, 600))
             if resp.status_code != 200:
                  return {"success": False, "error": f"Download failed: {resp.status_code} {resp.text}", "scene": scene, "shot": shot}
                  

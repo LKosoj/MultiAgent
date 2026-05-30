@@ -43,6 +43,9 @@ class MySQLPlugin(BaseDBPlugin):
         )
         try:
             with conn.cursor() as cur:
+                # NOTE: SET SESSION TRANSACTION READ ONLY blocks DML (INSERT/UPDATE/DELETE)
+                # but does NOT block DDL (DROP, ALTER, CREATE) in MySQL 8.x.
+                # For full protection, use a MySQL user with only SELECT privileges (GRANT SELECT ON ...).
                 cur.execute("SET SESSION TRANSACTION READ ONLY;")
         except Exception as e:
             if self.read_only_fail_open_enabled(dsn):

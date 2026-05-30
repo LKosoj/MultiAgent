@@ -19,6 +19,7 @@ import re
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, asdict
 import threading
@@ -214,11 +215,12 @@ class LocalJSONLExporter(SpanExporter):
         """
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
-        self._file_handles: Dict[str, Any] = {}
         self._lock = threading.Lock()
         # Кэш соответствий trace_id -> run_id, чтобы наследники без явного run_id
         # попадали в тот же файл трассы, что и корневой span
-        self._trace_to_run: Dict[int, str] = {}
+        # Ограничен 10 000 записями для предотвращения утечки памяти при долгой работе
+        self._trace_to_run: OrderedDict[int, str] = OrderedDict()
+        self._trace_to_run_max = 10_000
         
         logger.info(f"📊 LocalJSONLExporter инициализирован: {self.traces_dir}")
 
@@ -293,6 +295,9 @@ class LocalJSONLExporter(SpanExporter):
                 if trace_id is not None:
                     with self._lock:
                         self._trace_to_run[trace_id] = run_id
+                        self._trace_to_run.move_to_end(trace_id)
+                        if len(self._trace_to_run) > self._trace_to_run_max:
+                            self._trace_to_run.popitem(last=False)
             else:
                 # Пробуем восстановить по trace_id, иначе используем unknown
                 if trace_id is not None:
@@ -384,13 +389,7 @@ class LocalJSONLExporter(SpanExporter):
 
     def shutdown(self) -> None:
         """Закрытие экспортера"""
-        with self._lock:
-            for file_handle in self._file_handles.values():
-                try:
-                    file_handle.close()
-                except:
-                    pass
-            self._file_handles.clear()
+        pass
 
 class RunIdPropagatingSpanProcessor(SpanProcessor):
     """
@@ -593,17 +592,6 @@ class SmolagentsTelemetryManager:
                 
             span.set_attribute("end_time", datetime.now().isoformat())
             span.end()
-            # Добавляем служебный маркер о завершении run_id, чтобы UI не считал трассу активной
-            try:
-                # Пишем минимальное событие в файл, чтобы обновился mtime и счётчик
-                exporter = LocalJSONLExporter(self.traces_dir)
-                exporter.export_event(span.get_span_context(), {
-                    "event": "run_finished",
-                    "success": success,
-                    "error": error_message or ""
-                })
-            except Exception:
-                pass
             
         except Exception as e:
             logger.error(f"❌ Ошибка завершения span: {e}")
@@ -1025,30 +1013,33 @@ class SmolagentsTelemetryManager:
 
 # Глобальный экземпляр менеджера телеметрии
 _telemetry_manager: Optional[SmolagentsTelemetryManager] = None
+_telemetry_manager_lock = threading.Lock()
 
-def get_telemetry_manager(traces_dir: str = "logs/traces", 
+def get_telemetry_manager(traces_dir: str = "logs/traces",
                          service_name: str = "multiagent-system",
                          enabled: bool = True) -> SmolagentsTelemetryManager:
     """
     Получить глобальный экземпляр менеджера телеметрии
-    
+
     Args:
         traces_dir: Директория для сохранения трасс
         service_name: Имя сервиса
         enabled: Включена ли телеметрия
-        
+
     Returns:
         Экземпляр SmolagentsTelemetryManager
     """
     global _telemetry_manager
-    
+
     if _telemetry_manager is None:
-        _telemetry_manager = SmolagentsTelemetryManager(
-            traces_dir=traces_dir,
-            service_name=service_name,
-            enabled=enabled
-        )
-    
+        with _telemetry_manager_lock:
+            if _telemetry_manager is None:
+                _telemetry_manager = SmolagentsTelemetryManager(
+                    traces_dir=traces_dir,
+                    service_name=service_name,
+                    enabled=enabled
+                )
+
     return _telemetry_manager
 
 def configure_telemetry(enabled: bool = True, traces_dir: str = "logs/traces"):

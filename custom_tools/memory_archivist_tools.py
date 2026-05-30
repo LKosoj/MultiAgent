@@ -338,7 +338,8 @@ def _global_search(
                         
                         try:
                             data_dict = json.loads(row[5])
-                        except:
+                        except Exception as e:
+                            logger.warning("_global_search: не удалось разобрать JSON для записи (session=%s agent=%s step=%s): %s", row[0], row[1], row[2], e)
                             data_dict = {"raw_data": row[5]}
                         
                         record = {
@@ -489,7 +490,8 @@ def _read_all_memory(
         for row in cursor.fetchall():
             try:
                 data_dict = json.loads(row[5])
-            except:
+            except Exception as e:
+                logger.warning("_read_all_memory: не удалось разобрать JSON для записи (session=%s agent=%s step=%s): %s", row[0], row[1], row[2], e)
                 data_dict = {"raw_data": row[5]}
             
             record = {
@@ -585,14 +587,16 @@ def _get_global_stats(memory_manager) -> Dict[str, Any]:
             try:
                 tactical_count = memory_manager.db_handler.tactical_collection.count()
                 chroma_stats["tactical_collection_count"] = tactical_count
-            except:
+            except Exception as e:
+                logger.warning("_get_global_stats: не удалось получить статистику tactical_collection: %s", e)
                 chroma_stats["tactical_collection_count"] = "N/A"
-        
+
         if memory_manager.db_handler.strategic_collection:
             try:
                 strategic_count = memory_manager.db_handler.strategic_collection.count()
                 chroma_stats["strategic_collection_count"] = strategic_count
-            except:
+            except Exception as e:
+                logger.warning("_get_global_stats: не удалось получить статистику strategic_collection: %s", e)
                 chroma_stats["strategic_collection_count"] = "N/A"
         
         return {

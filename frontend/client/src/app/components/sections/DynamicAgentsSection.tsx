@@ -290,16 +290,6 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
     };
   }, [resultModal.open, resultModal.runId, runResults]);
 
-  useEffect(() => {
-    if (!logsModal.open || !logsModal.runId) return;
-    if (!logsModalAutoRefresh) return;
-    void handleRunLogs(logsModal.runId);
-    const intervalId = window.setInterval(() => {
-      void handleRunLogs(logsModal.runId!);
-    }, 4000);
-    return () => window.clearInterval(intervalId);
-  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh]);
-
   const formattedRunLogs = useMemo(() => {
     return runLogs
       .map((entry: any) => {
@@ -471,11 +461,21 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
     setRunEvents((prev) => ({ ...prev, [runId]: (resp as any)?.events ?? resp }));
   };
 
-  const handleRunLogs = async (runId: string) => {
+  const handleRunLogs = useCallback(async (runId: string) => {
     const resp = await runServiceAction("logs.run_logs", { run_id: runId, limit: 20000 });
     const items = (resp as any)?.logs ?? resp;
     setRunLogs(Array.isArray(items) ? items : []);
-  };
+  }, [runServiceAction]);
+
+  useEffect(() => {
+    if (!logsModal.open || !logsModal.runId) return;
+    if (!logsModalAutoRefresh) return;
+    void handleRunLogs(logsModal.runId);
+    const intervalId = window.setInterval(() => {
+      void handleRunLogs(logsModal.runId!);
+    }, 4000);
+    return () => window.clearInterval(intervalId);
+  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh, handleRunLogs]);
 
   const handleRunResult = async (runId: string) => {
     let resp = (await runServiceAction("agents.result", { run_id: runId })) as any;

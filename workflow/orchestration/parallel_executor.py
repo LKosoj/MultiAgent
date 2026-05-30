@@ -63,6 +63,7 @@ class ParallelWorkflowExecutor:
             "total_steps": 0,
             "parallel_executed": 0,
             "sequential_executed": 0,
+            "completed": 0,
             "skipped": 0,
             "failed": 0
         }
@@ -256,6 +257,7 @@ class ParallelWorkflowExecutor:
             
             if result.status == StepStatus.COMPLETED:
                 self.execution_stats["parallel_executed"] += 1
+                self.execution_stats["completed"] += 1
             elif result.status == StepStatus.FAILED:
                 self.execution_stats["failed"] += 1
             
@@ -322,9 +324,12 @@ class ParallelWorkflowExecutor:
         """Получить статистику выполнения"""
         total = self.execution_stats["total_steps"]
         if total > 0:
+            skipped = self.execution_stats["skipped"]
+            executed = total - skipped
+            success_rate = (self.execution_stats["completed"] / executed * 100) if executed > 0 else 0.0
             return {
                 **self.execution_stats,
                 "parallel_percentage": (self.execution_stats["parallel_executed"] / total) * 100,
-                "success_rate": ((total - self.execution_stats["failed"]) / total) * 100
+                "success_rate": success_rate
             }
         return self.execution_stats

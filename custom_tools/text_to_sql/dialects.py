@@ -198,9 +198,22 @@ def quote_single_identifier(identifier: str, dsn: str | None = None) -> str:
 
 
 def escape_sql_string(value) -> str:
-    """Простейшее экранирование одинарных кавычек по стандарту SQL: ' → ''"""
-    s = str(value)
-    return s.replace("'", "''")
+    """Deprecated: использует ручное экранирование только одинарных кавычек.
+
+    Не учитывает диалект, NUL-байты и backslash в MySQL. Используйте
+    :func:`sql_string_literal` вместо этой функции.
+    """
+    import warnings
+    warnings.warn(
+        "escape_sql_string is deprecated and handles only single-quote escaping. "
+        "Use sql_string_literal(value, dsn=dsn) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    # Сохраняем историческую семантику: возвращаем ТОЛЬКО экранированное содержимое
+    # (без обрамляющих кавычек). Делегирование в sql_string_literal меняло бы
+    # return-значение (добавляло кавычки) и ломало callers вида "'" + escape(v) + "'".
+    return str(value).replace("'", "''")
 
 
 def sql_string_literal(value, dsn: str | None = None) -> str:

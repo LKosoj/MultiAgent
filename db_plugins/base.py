@@ -238,8 +238,6 @@ class BaseDBPlugin:
             return "FK"
         elif "UNIQUE" in constraint_str:
             return "UNIQUE"
-        elif constraint_str in {"PK", "FK", "UNIQUE"}:
-            return constraint_str
         else:
             return ""
     

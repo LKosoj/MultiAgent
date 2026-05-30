@@ -587,3 +587,6 @@ def compose_pii_description(
 def reset_cache() -> None:
     """Сброс кэша (нужен в тестах после подмены env-переменной)."""
     _loader.reset_cache()
+    from .core._pii import reset_compiled_rules_cache
+
+    reset_compiled_rules_cache()

@@ -1015,27 +1015,40 @@ class UnifiedLoggingManager:
     def shutdown(self):
         """Завершение работы системы логирования"""
         self.event_bus.shutdown()
+        global _logging_manager
+        # Restore монки-патча И сброс singleton — атомарно под одним _init_lock.
+        # Иначе конкурентный get_logging_manager() между restore и reset мог бы увидеть
+        # _logging_manager != None и закэшировать уже остановленный экземпляр (event_bus
+        # закрыт) вместо пересоздания.
+        with _init_lock:
+            if getattr(logging, "_unified_logging_patched", False):
+                logging.getLogger = _original_get_logger  # type: ignore[assignment]
+                logging._unified_logging_patched = False
+            _logging_manager = None
 
 
 # Глобальный экземпляр менеджера
 _logging_manager: Optional[UnifiedLoggingManager] = None
 _original_get_logger = logging.getLogger
+_init_lock = threading.Lock()
 
 def get_logging_manager(logs_dir: str = "logs") -> UnifiedLoggingManager:
     """
     Получить глобальный экземпляр менеджера логирования
-    
+
     Args:
         logs_dir: Директория для логов
-        
+
     Returns:
         Экземпляр UnifiedLoggingManager
     """
     global _logging_manager
-    
+
     if _logging_manager is None:
-        _logging_manager = UnifiedLoggingManager(logs_dir)
-    
+        with _init_lock:
+            if _logging_manager is None:
+                _logging_manager = UnifiedLoggingManager(logs_dir)
+
     return _logging_manager
 
 def get_run_logger(run_id: str, logger_name: str = "multiagent") -> RunIdLoggerAdapter:
@@ -1097,18 +1110,13 @@ def run_id_context(run_id: str):
     previous = get_current_run_id()
     try:
         set_current_run_id(run_id)
-        # Также устанавливаем в os.environ для обратной совместимости
-        # (некоторые старые части кода могут всё ещё использовать это)
-        os.environ["RUN_ID"] = run_id
+        # NOTE: os.environ["RUN_ID"] is intentionally NOT set here — it is
+        # process-global and would be overwritten by concurrent threads,
+        # causing cross-thread run_id leakage.  Use threading.local exclusively.
         yield
     finally:
         try:
             set_current_run_id(previous)
-            # Восстанавливаем или удаляем переменную окружения
-            if previous is not None:
-                os.environ["RUN_ID"] = previous
-            else:
-                os.environ.pop("RUN_ID", None)
         except Exception:
             pass
 

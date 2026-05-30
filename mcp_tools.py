@@ -5,7 +5,9 @@ import mcp
 from mcp import StdioServerParameters
 from smolagents.mcp_client import MCPClient
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-import random
+
+# Метаданные загруженных MCP-серверов
+mcp_server_metadata: dict = {}
 
 
 def load_mcp_servers_from_json(json_path: str):
@@ -113,8 +115,9 @@ def load_mcp_servers_from_json(json_path: str):
             print(f"Предупреждение: Неизвестный тип MCP-сервера: {server_type} для {server_name}")
     
     # Сохраняем метаданные для возможного использования
-    globals()['mcp_server_metadata'] = server_metadata
-    
+    global mcp_server_metadata
+    mcp_server_metadata = server_metadata
+
     return servers
 
 def get_server_info(server_id: str = None):
@@ -127,17 +130,15 @@ def get_server_info(server_id: str = None):
     Returns:
         dict: Информация о сервере(ах)
     """
-    metadata = globals().get('mcp_server_metadata', {})
     if server_id:
-        return metadata.get(server_id, {})
-    return metadata
+        return mcp_server_metadata.get(server_id, {})
+    return mcp_server_metadata
 
 
 def list_active_servers():
     """Выводит список активных MCP серверов."""
-    metadata = globals().get('mcp_server_metadata', {})
     print("\n=== Активные MCP серверы ===")
-    for server_id, info in metadata.items():
+    for server_id, info in mcp_server_metadata.items():
         print(f"• {info['name']} ({server_id})")
         if info['description']:
             print(f"  Описание: {info['description']}")
@@ -149,19 +150,24 @@ def list_active_servers():
         print()
 
 
-# Загружаем серверы из JSON конфигурации
-servers = load_mcp_servers_from_json("mcp_servers.json")
-
 mcp_tools = []
 mcp_clients = {}
 
+# Загружаем серверы из JSON конфигурации
+_mcp_config_path = os.environ.get("MCP_SERVERS_CONFIG", "mcp_servers.json")
 try:
-    server_ids = list(globals().get('mcp_server_metadata', {}).keys())
+    servers = load_mcp_servers_from_json(_mcp_config_path)
+except Exception as e:
+    print(f"Предупреждение: не удалось загрузить конфигурацию MCP-серверов ({_mcp_config_path}): {e}")
+    servers = []
+
+try:
+    server_ids = list(mcp_server_metadata.keys())
     for index, server in enumerate(servers):
         mcp_client = MCPClient(server, structured_output=False)
         server_id = server_ids[index] if index < len(server_ids) else f"server_{index}"
         mcp_clients[server_id] = mcp_client
-        server_name = globals().get('mcp_server_metadata', {}).get(server_id, {}).get("name")
+        server_name = mcp_server_metadata.get(server_id, {}).get("name")
         if server_name:
             mcp_clients[server_name] = mcp_client
         mcp_tools.extend(mcp_client.get_tools())

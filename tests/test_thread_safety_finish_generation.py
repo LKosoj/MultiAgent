@@ -157,27 +157,39 @@ class TestElapsedTimeDisplay(unittest.TestCase):
     def _get_source(self):
         return SOURCE_PATH.read_text(encoding="utf-8")
 
+    def _get_method_body(self, source: str, method_sig: str) -> str:
+        """Возвращает тело метода от его def до следующего def на том же уровне.
+
+        Поднимает informative AssertionError вместо ValueError при отсутствии метода.
+        """
+        try:
+            start = source.index(method_sig)
+        except ValueError:
+            self.fail(
+                f"Метод '{method_sig}' не найден в {SOURCE_PATH} — "
+                "возможно, он был переименован или удалён"
+            )
+        try:
+            next_def = source.index("\n    def ", start + 1)
+        except ValueError:
+            next_def = len(source)
+        return source[start:next_def]
+
     def test_start_generation_records_time(self):
         source = self._get_source()
-        start = source.index("def start_generation(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
+        body = self._get_method_body(source, "def start_generation(self")
         self.assertIn("_generation_start_time", body)
         self.assertIn("time.time()", body)
 
     def test_finish_generation_shows_elapsed(self):
         source = self._get_source()
-        start = source.index("def finish_generation(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
+        body = self._get_method_body(source, "def finish_generation(self")
         self.assertIn("Завершено за", body)
         self.assertIn("_generation_start_time", body)
 
     def test_elapsed_format_minutes_seconds(self):
         source = self._get_source()
-        start = source.index("def finish_generation(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
+        body = self._get_method_body(source, "def finish_generation(self")
         self.assertIn("мин", body)
         self.assertIn("сек", body)
 

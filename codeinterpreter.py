@@ -1,24 +1,23 @@
 import asyncio
-from contextlib import contextmanager
 import datetime
 from functools import wraps
 from typing import Callable
 import os
 from typing import Any, Dict, Optional, List
 import httpx
+import html
 import numpy as np
 import openai
 import pandas as pd
 import subprocess
 import sys
 import logging
-import signal
 import matplotlib
 import matplotlib.pyplot as plt
 import ast
 import plotly.express as px
 import json
-from io import StringIO
+import tempfile
 matplotlib.use("Agg")
 import uuid
 import re
@@ -31,29 +30,92 @@ from smolagents import tool
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-class TimeoutException(Exception):
-    pass
 
 class SecurityError(Exception):
     """Исключение для потенциально опасного кода"""
     pass
 
-@contextmanager
-def timeout(seconds: int):
-    """Контекстный менеджер для установки тайм-аута выполнения кода"""
-    def timeout_handler(signum, frame):
-        raise TimeoutException(f"Время выполнения кода истекло! Лимит: {seconds} сек.")
 
-    # Устанавливаем обработчик сигнала
-    original_handler = signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    
-    try:
-        yield
-    finally:
-        # Восстанавливаем исходный обработчик и отключаем таймер
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, original_handler)
+_EXEC_RUNNER = r"""
+import builtins
+import io
+import json
+import logging
+import os
+import sys
+import types
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import plotly.express as px
+
+
+def _safe_value(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_safe_value(item) for item in list(value)[:50]]
+    if isinstance(value, dict):
+        return {str(k): _safe_value(v) for k, v in list(value.items())[:50]}
+    return repr(value)[:2000]
+
+
+def _write(payload):
+    with open(os.environ["CODEINTERPRETER_RESULT_PATH"], "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+
+
+code = sys.stdin.read()
+output_buffer = io.StringIO()
+exec_globals = {
+    "__name__": "__main__",
+    "plt": plt,
+    "np": np,
+    "pd": pd,
+    "px": px,
+    "matplotlib": matplotlib,
+    "logging": logging,
+    "os": os,
+    "__captured_values__": {},
+}
+
+
+def _captured_print(*args, **kwargs):
+    kwargs.pop("file", None)
+    builtins.print(*args, file=output_buffer, **kwargs)
+
+
+try:
+    if "rm -r" in code or "os.system" in code:
+        raise RuntimeError("Обнаружен потенциально опасный код")
+    exec_globals["print"] = _captured_print
+    exec(code, exec_globals, exec_globals)
+    result = {}
+    for key, value in exec_globals.items():
+        if key.startswith("__") and key != "__captured_values__":
+            continue
+        if key == "print" or isinstance(value, types.ModuleType):
+            continue
+        result[key] = _safe_value(value)
+    result["__captured_print__"] = output_buffer.getvalue().strip()
+    _write({"status": "ok", "result": result})
+except ModuleNotFoundError as exc:
+    _write({
+        "status": "module_not_found",
+        "missing_package": getattr(exc, "name", "") or str(exc).split("'")[1],
+        "error": str(exc),
+        "output": output_buffer.getvalue().strip(),
+    })
+except Exception as exc:
+    _write({
+        "status": "error",
+        "error": str(exc),
+        "output": output_buffer.getvalue().strip() or f"Неожиданная ошибка: {exc}",
+    })
+"""
 
 def async_handle_exceptions(func):
     """Асинхронный декоратор для обработки исключений с детальным логированием"""
@@ -84,12 +146,13 @@ class CodeInterpreterPlugin():
         """
         super().__init__()
         self.api_key = os.getenv('OPENAI_API_KEY')
-        openai.api_base = 'https://api.vsegpt.ru/v1'
+        _api_base = os.getenv('OPENAI_API_BASE', 'https://api.vsegpt.ru/v1')
         # httpx.AsyncClient создаётся OpenAI SDK автоматически; внешний экземпляр без
         # управляемого закрытия приводил к утечке соединений при завершении работы.
         self._http_client = httpx.AsyncClient()
         self.client = openai.AsyncOpenAI(
             api_key=self.api_key,
+            base_url=_api_base,
             http_client=self._http_client,
             timeout=300.0,
             max_retries=3,
@@ -331,14 +394,58 @@ class CodeInterpreterPlugin():
             logging.error(f"Ошибка при отладке: {e}")
             return None
 
+    def _execute_code_subprocess(self, code: str) -> Dict[str, Any]:
+        fd, result_path = tempfile.mkstemp(prefix="codeinterpreter_", suffix=".json")
+        os.close(fd)
+        env = os.environ.copy()
+        env["CODEINTERPRETER_RESULT_PATH"] = result_path
+        try:
+            try:
+                completed = subprocess.run(
+                    [sys.executable, "-c", _EXEC_RUNNER],
+                    input=code,
+                    text=True,
+                    capture_output=True,
+                    timeout=self.timeout_seconds,
+                    env=env,
+                )
+            except subprocess.TimeoutExpired:
+                return {"status": "timeout"}
+
+            payload = None
+            try:
+                if os.path.getsize(result_path) > 0:
+                    with open(result_path, "r", encoding="utf-8") as fh:
+                        payload = json.load(fh)
+            except Exception as exc:
+                logging.warning("Не удалось прочитать результат subprocess: %s", exc)
+
+            if isinstance(payload, dict):
+                return payload
+
+            output = "\n".join(
+                part for part in (completed.stdout.strip(), completed.stderr.strip()) if part
+            )
+            return {
+                "status": "error",
+                "error": f"Subprocess exited with code {completed.returncode}",
+                "output": output or "Код завершился без результата",
+            }
+        finally:
+            try:
+                os.unlink(result_path)
+            except OSError:
+                pass
+
     @async_handle_exceptions
-    async def _execute_code(self, code: str) -> Optional[Dict[str, Any]]:
+    async def _execute_code(self, code: str, _install_depth: int = 0) -> Optional[Dict[str, Any]]:
         """
         Выполняет код с установленным тайм-аутом.
-        
+
         Args:
             code (str): Код для выполнения
-            
+            _install_depth (int): Глубина рекурсии установки пакетов (внутренний параметр)
+
         Returns:
             Optional[Dict[str, Any]]: Локальные переменные после выполнения или None в случае ошибки
         """
@@ -346,43 +453,47 @@ class CodeInterpreterPlugin():
             logging.error("Передан пустой код")
             return None
 
-        output_buffer = StringIO()
-        original_stdout = sys.stdout
-        sys.stdout = output_buffer
-        exec_globals: Dict[str, Any] = {
-            "__name__": "__main__",
-            "plt": plt,
-            "np": np,
-            "pd": pd,
-            "px": px,
-            "matplotlib": matplotlib,
-            "logging": logging,
-            "os": os,
-            "__captured_values__": {},
-        }
         try:
-            with timeout(self.timeout_seconds):
-                if "rm -r" in code or "os.system" in code:
-                    raise SecurityError("Обнаружен потенциально опасный код")
-
-                exec(code, exec_globals, exec_globals)
-                captured_output = output_buffer.getvalue().strip()
-                exec_globals['__captured_print__'] = captured_output
-                return exec_globals
-        except TimeoutException as e:
-            logging.error(str(e))
-            return {'error': str(e), 'output': 'Превышен лимит времени выполнения'}
+            loop = asyncio.get_running_loop()
+            payload = await loop.run_in_executor(None, self._execute_code_subprocess, code)
+            status = payload.get("status")
+            if status == "ok":
+                return payload.get("result", {})
+            if status == "timeout":
+                msg = f"Время выполнения кода истекло! Лимит: {self.timeout_seconds} сек."
+                logging.error(msg)
+                return {'error': msg, 'output': 'Превышен лимит времени выполнения'}
+            if status == "module_not_found":
+                if _install_depth >= 5:
+                    logging.error("Превышена глубина автоустановки пакетов: %s", payload.get("error"))
+                    return {'error': payload.get("error", ""), 'output': 'Превышен лимит автоустановки пакетов'}
+                missing_package = str(payload.get("missing_package") or "").strip()
+                if not missing_package:
+                    return {'error': payload.get("error", ""), 'output': payload.get("output", "")}
+                logging.info(f"Устанавливаем отсутствующую библиотеку: {missing_package}")
+                if await self.install_package(missing_package):
+                    return await self._execute_code(code, _install_depth=_install_depth + 1)
+                return {'error': payload.get("error", ""), 'output': f'Не удалось установить пакет: {missing_package}'}
+            return {
+                'error': payload.get("error", "Неизвестная ошибка"),
+                'output': payload.get("output", "Неожиданная ошибка"),
+            }
+        except subprocess.TimeoutExpired:
+            msg = f"Время выполнения кода истекло! Лимит: {self.timeout_seconds} сек."
+            logging.error(msg)
+            return {'error': msg, 'output': 'Превышен лимит времени выполнения'}
         except ModuleNotFoundError as e:
+            if _install_depth >= 5:
+                logging.error(f"Превышена глубина автоустановки пакетов: {e}")
+                return {'error': str(e), 'output': 'Превышен лимит автоустановки пакетов'}
             missing_package = str(e).split("'")[1]
             logging.info(f"Устанавливаем отсутствующую библиотеку: {missing_package}")
             if await self.install_package(missing_package):
-                return await self._execute_code(code)
+                return await self._execute_code(code, _install_depth=_install_depth + 1)
             return {'error': str(e), 'output': f'Не удалось установить пакет: {missing_package}'}
         except Exception as e:
             logging.exception(f"Неожиданная ошибка при выполнении кода: {e}")
             return {'error': str(e), 'output': f'Неожиданная ошибка: {str(e)}'}
-        finally:
-            sys.stdout = original_stdout
 
     async def preinstall_required_packages(self, code: str):
         required = re.findall(r'^\s*import (\w+)|^\s*from (\w+)', code, re.M)
@@ -512,7 +623,7 @@ class CodeInterpreterPlugin():
                     '    </div>'
                 ])
 
-            result_str = result
+            result_str = html.escape(str(result))
             #print(f"result_str: {result_str}")
             html_content.extend([
                 '    <div class="result-container">',
@@ -641,10 +752,9 @@ class CodeInterpreterPlugin():
                     logging.info("Код успешно выполнен.")
                     
                     explanation = await self.explain_code(generated_code)
-                    
+
                     report = self.generate_report(generated_code, explanation, result)
                     self.advanced_visualization(report, session_id)
-                    self.clean_data(session_id)
                     return report
 
                 # Если обнаружена ошибка
@@ -661,7 +771,8 @@ class CodeInterpreterPlugin():
                     if attempt == attempts - 1:
                         #logging.warning(f"Попытка {attempt + 1}: Обнаружена ошибка выполнения кода {error_message}. Итоговый код:\n {generated_code}")
                         logging.error("Все попытки выполнения кода завершились неудачей.")
-                        self.clean_data(session_id)
+                        # clean_data вызывается единожды в блоке finally — здесь явный вызов убран,
+                        # чтобы не чистить дважды (инвариант «clean_data только в finally»).
                         return f"Обнаружена ошибка выполнения кода {error_message}. Итоговый код:\n {generated_code}"
 
                     logging.warning(f"Попытка {attempt + 1}: Обнаружена ошибка выполнения кода {error_message}. Пытаемся отладить.")

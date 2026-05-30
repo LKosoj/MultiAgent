@@ -28,6 +28,8 @@ class SQLitePlugin(BaseDBPlugin):
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         elif dsn.startswith("file:"):
             parsed = urlparse(driver_dsn)
+            if parsed.path in {":memory:", "/:memory:"}:
+                return sqlite3.connect(":memory:")
             query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
             query = dict(query_pairs)
             mode = query.get("mode")

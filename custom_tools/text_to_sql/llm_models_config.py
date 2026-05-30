@@ -167,8 +167,12 @@ _loader: YamlConfigLoader["LLMModelsConfig"] = YamlConfigLoader["LLMModelsConfig
 def load_llm_models_config() -> LLMModelsProfile:
     """Загрузить активный профиль LLM-параметров.
 
-    Возвращает уже выбранный профиль (с учётом env / явного `default`).
-    Кэшируется по абсолютному пути yaml-файла.
+    Возвращает ``LLMModelsProfile`` для активного профиля (с учётом env /
+    явного ``default``). ВНИМАНИЕ: в отличие от ``load_column_aliases_config()``
+    и ``load_type_categories_config()``, которые возвращают полный объект-конфиг
+    со всеми профилями, эта функция возвращает уже выбранный профиль
+    ``LLMModelsProfile``. Для доступа к полному объекту конфига используйте
+    ``_load_config_object()``. Кэшируется по абсолютному пути yaml-файла.
     """
     return get_active_profile()
 

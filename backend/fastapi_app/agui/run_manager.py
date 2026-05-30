@@ -73,15 +73,41 @@ class RunInfo:
     )
 
 
+_EVICT_TTL_SECONDS: int = 30 * 60  # 30 minutes
+
+
 class RunManager:
-    def __init__(self, store: EventStore) -> None:
+    def __init__(self, store: EventStore, evict_ttl_seconds: int = _EVICT_TTL_SECONDS) -> None:
         self._store = store
         self._runs: dict[str, RunInfo] = {}
         self._lock = asyncio.Lock()
+        self._evict_ttl_seconds = evict_ttl_seconds
+
+    def _evict_stale(self) -> int:
+        """Remove terminal RunInfo entries whose finished_at_ms is older than TTL.
+
+        Returns the number of evicted entries. MUST be called while holding
+        self._lock (it mutates self._runs); does not cancel running tasks.
+        """
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - self._evict_ttl_seconds * 1000
+        to_delete = [
+            run_id
+            for run_id, info in self._runs.items()
+            if info.status in _TERMINAL_STATUSES
+            and info.finished_at_ms is not None
+            and info.finished_at_ms < cutoff_ms
+        ]
+        for run_id in to_delete:
+            del self._runs[run_id]
+        return len(to_delete)
 
     async def start_run(self, input_data: RunAgentInput) -> RunInfo:
         async with self._lock:
+            self._evict_stale()
             if input_data.run_id in self._runs:
+                raise ValueError(f"run_id already exists: {input_data.run_id}")
+            if self._store.latest_seq(input_data.run_id) is not None:
                 raise ValueError(f"run_id already exists: {input_data.run_id}")
             info = RunInfo(
                 run_id=input_data.run_id,

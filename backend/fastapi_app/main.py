@@ -106,6 +106,14 @@ async def _cancel_if_orphaned(run_id: str) -> None:
     await run_manager.cancel_if_orphaned(run_id)
 
 
+async def _check_disconnected(request: Request) -> bool:
+    """Return True if the client has disconnected; treat exceptions as disconnect."""
+    try:
+        return await request.is_disconnected()
+    except Exception:
+        return True
+
+
 async def _stream_agent_events(
     run_id: str,
     request: Request,
@@ -115,7 +123,7 @@ async def _stream_agent_events(
     terminal_seen = False
     try:
         async for event in stream:
-            if await request.is_disconnected():
+            if await _check_disconnected(request):
                 break
             if is_terminal_event(event):
                 terminal_seen = True
@@ -143,14 +151,14 @@ async def replay_events(
             last_seq = stored.seq
             if stored.event_type not in _AGUI_EVENT_TYPES:
                 continue
-            if await request.is_disconnected():
+            if await _check_disconnected(request):
                 return
             yield _encode_payload(_redact_gateway_payload(stored.payload))
         if follow and info is not None:
             stream = run_manager.stream_live(run_id, after=last_seq)
             try:
                 async for event in stream:
-                    if await request.is_disconnected():
+                    if await _check_disconnected(request):
                         break
                     yield encoder.encode(event)
             finally:

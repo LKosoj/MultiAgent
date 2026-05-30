@@ -37,7 +37,7 @@ try:
     pii_patterns = [
         r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b',  # Номера карт
         r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
-        r'\b\+?[1-9]\d{1,14}\b',   # Телефоны
+        r'(?<!\d)(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b',   # Телефоны (RU)
         r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'  # Email
     ]
     _pii_regex_scanner = Regex(patterns=pii_patterns, is_blocked=True)
@@ -80,11 +80,15 @@ def prompt_injection_detector(text: str) -> Dict[str, bool]:
         return {"is_injection": is_injection, "risk_score": risk_score}
         
     except Exception as e:
-        logger.error(f"❌ Ошибка в LLM-Guard сканере: {e}")
-        # Fallback к простой проверке
-        injection_keywords = ["забудь", "игнорируй", "предыдущие инструкции", "действуй как"]
+        logger.warning(f"⚠️  LLM-Guard сканер недоступен ({type(e).__name__}: {e}), используется keyword-fallback")
+        # Fallback к проверке по ключевым словам (ru+en)
+        injection_keywords = [
+            "забудь", "игнорируй", "предыдущие инструкции", "действуй как",
+            "forget", "ignore", "previous instructions", "act as", "jailbreak",
+            "disregard", "override", "bypass", "do not follow",
+        ]
         is_injection = any(keyword in text.lower() for keyword in injection_keywords)
-        return {"is_injection": is_injection}
+        return {"is_injection": is_injection, "degraded": True}
 
 
 def pii_scanner(text: str) -> Dict[str, object]:
@@ -128,7 +132,7 @@ def pii_scanner(text: str) -> Dict[str, object]:
             import re
             if re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', text):
                 pii_types.append('EMAIL')
-            if re.search(r'\b\+?[1-9]\d{1,14}\b', text):
+            if re.search(r'(?<!\d)(\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b', text):
                 pii_types.append('PHONE')
             if re.search(r'\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b', text):
                 pii_types.append('CREDIT_CARD')

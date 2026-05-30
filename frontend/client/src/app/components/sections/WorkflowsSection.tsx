@@ -2,7 +2,6 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { ActionCard } from "../shared/ActionCard";
 import { KeyValueList } from "../shared/KeyValueList";
 import { WorkflowResultView } from "../shared/WorkflowResultView";
 
@@ -134,7 +133,6 @@ type Props = {
   setBuilderSteps: React.Dispatch<React.SetStateAction<string>>;
   setBuilderYaml: React.Dispatch<React.SetStateAction<string>>;
   setBuilderSaveName: React.Dispatch<React.SetStateAction<string>>;
-  setBuilderError: React.Dispatch<React.SetStateAction<string | null>>;
   handleGenerateYaml: () => void;
   handleSaveYaml: () => void;
 };
@@ -196,7 +194,6 @@ export function WorkflowsSection({
   setBuilderSteps,
   setBuilderYaml,
   setBuilderSaveName,
-  setBuilderError,
   handleGenerateYaml,
   handleSaveYaml,
 }: Props) {
@@ -246,7 +243,7 @@ export function WorkflowsSection({
       let resp: unknown;
       try {
         resp = await runServiceAction("workflows.generate_report", { run_id: runId });
-      } catch (err) {
+      } catch {
         resp = await runServiceAction("telemetry.generate_report", { run_id: runId, persist: false });
       }
       const report = (resp as any)?.report ?? resp;
@@ -256,7 +253,7 @@ export function WorkflowsSection({
     }
   };
 
-  const handleRunLogs = async (runId: string) => {
+  const handleRunLogs = useCallback(async (runId: string) => {
     if (runLogsInFlightRef.current.has(runId)) return;
     runLogsInFlightRef.current.add(runId);
     try {
@@ -266,7 +263,7 @@ export function WorkflowsSection({
     } finally {
       runLogsInFlightRef.current.delete(runId);
     }
-  };
+  }, [runServiceAction]);
 
   useEffect(() => {
     setIsMounted(true);
@@ -290,7 +287,7 @@ export function WorkflowsSection({
       void handleRunLogs(logsModal.runId!);
     }, 4000);
     return () => window.clearInterval(intervalId);
-  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh]);
+  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh, handleRunLogs]);
 
   useEffect(() => {
     if (!resultModal.open || !resultModal.runId) {
@@ -368,7 +365,7 @@ export function WorkflowsSection({
         reportPreviewUrlRef.current = null;
       }
     };
-    }, [resultModal.open, resultModal.runId, workflowResults]);
+    }, [resultModal.open, resultModal.runId, workflowResults, runServiceAction]);
 
   const formattedRunLogs = useMemo(() => {
     return runLogs

@@ -2,6 +2,7 @@
 Budget Manager для контроля затрат и ресурсов
 """
 import logging
+import threading
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from dataclasses import dataclass
@@ -62,6 +63,7 @@ class BudgetManager:
     """Менеджер бюджетов ресурсов"""
     
     def __init__(self):
+        self._lock = threading.Lock()
         # Бюджеты по workflow
         self.workflow_budgets: Dict[str, Dict[BudgetType, BudgetLimit]] = {}
         
@@ -153,75 +155,94 @@ class BudgetManager:
         
         return True
     
-    def consume_budget(self, entity_id: str, budget_type: BudgetType, 
-                      amount: float, entity_type: str = "workflow", 
+    def consume_budget(self, entity_id: str, budget_type: BudgetType,
+                      amount: float, entity_type: str = "workflow",
                       description: str = "") -> bool:
         """Потратить бюджет"""
-        
-        # Сначала проверяем возможность
-        if not self.check_budget(entity_id, budget_type, amount, entity_type):
-            return False
-        
-        budget_dict = (self.workflow_budgets if entity_type == "workflow" 
-                      else self.step_budgets)
-        
-        if entity_id not in budget_dict or budget_type not in budget_dict[entity_id]:
-            logger.warning(f"⚠️ Cannot consume budget - {entity_type} '{entity_id}' not found")
-            return False
-        
-        budget_limit = budget_dict[entity_id][budget_type]
-        old_usage = budget_limit.current_usage
-        budget_limit.current_usage += amount
-        
-        # Записываем потребление
-        consumption_record = {
-            "timestamp": datetime.now().isoformat(),
-            "entity_id": entity_id,
-            "entity_type": entity_type,
-            "budget_type": budget_type.value,
-            "amount": amount,
-            "total_usage": budget_limit.current_usage,
-            "remaining": budget_limit.get_remaining(),
-            "description": description
-        }
-        
-        history_key = f"{entity_type}:{entity_id}"
-        if history_key not in self.consumption_history:
-            self.consumption_history[history_key] = []
-        
-        self.consumption_history[history_key].append(consumption_record)
-        
+
+        with self._lock:
+            # Проверяем и списываем атомарно под lock
+            budget_dict = (self.workflow_budgets if entity_type == "workflow"
+                          else self.step_budgets)
+
+            if entity_id not in budget_dict:
+                logger.warning(f"⚠️ No budget found for {entity_type} '{entity_id}'")
+                return True  # Разрешаем если бюджет не настроен
+
+            if budget_type not in budget_dict[entity_id]:
+                logger.warning(f"⚠️ No {budget_type.value} budget for {entity_type} '{entity_id}'")
+                return True
+
+            budget_limit = budget_dict[entity_id][budget_type]
+
+            if budget_limit.current_usage + amount > budget_limit.limit:
+                logger.warning(f"💸 Budget exceeded for {entity_type} '{entity_id}': "
+                             f"{budget_type.value} {budget_limit.current_usage + amount} > {budget_limit.limit}")
+                return False
+
+            old_usage = budget_limit.current_usage
+            budget_limit.current_usage += amount
+            new_usage = budget_limit.current_usage
+            new_remaining = budget_limit.get_remaining()
+            new_status = budget_limit.get_status()
+            # Снимок скаляров под локом для алерта: сам алерт уходит в asyncio.create_task
+            # уже ПОСЛЕ выхода из лока, и читать живой budget_limit там нельзя — другой
+            # поток может успеть изменить current_usage и алерт сообщит завышенный процент.
+            alert_usage_pct = budget_limit.get_usage_percentage()
+            alert_limit = budget_limit.limit
+
+            # Записываем потребление под тем же локом, чтобы избежать race condition
+            consumption_record = {
+                "timestamp": datetime.now().isoformat(),
+                "entity_id": entity_id,
+                "entity_type": entity_type,
+                "budget_type": budget_type.value,
+                "amount": amount,
+                "total_usage": new_usage,
+                "remaining": new_remaining,
+                "description": description
+            }
+
+            history_key = f"{entity_type}:{entity_id}"
+            self.consumption_history.setdefault(history_key, []).append(consumption_record)
+
         # Проверяем пороги и отправляем алерты
-        status = budget_limit.get_status()
-        if status in [BudgetStatus.WARNING, BudgetStatus.CRITICAL, BudgetStatus.EXHAUSTED]:
-            # Создаем task для отправки алерта
+        if new_status in [BudgetStatus.WARNING, BudgetStatus.CRITICAL, BudgetStatus.EXHAUSTED]:
+            # Создаем task для отправки алерта (передаём снимок скаляров, не живой объект)
             import asyncio
-            asyncio.create_task(self._send_budget_alert(entity_id, entity_type, budget_type, status, budget_limit))
-        
+            asyncio.create_task(self._send_budget_alert(
+                entity_id, entity_type, budget_type, new_status,
+                alert_usage_pct, new_remaining, alert_limit,
+            ))
+
         logger.debug(f"💰 Consumed {amount} {budget_type.value} for {entity_type} '{entity_id}' "
-                    f"({old_usage:.1f} -> {budget_limit.current_usage:.1f})")
+                    f"({old_usage:.1f} -> {new_usage:.1f})")
         
         return True
     
-    async def _send_budget_alert(self, entity_id: str, entity_type: str, 
+    async def _send_budget_alert(self, entity_id: str, entity_type: str,
                                budget_type: BudgetType, status: BudgetStatus,
-                               budget_limit: BudgetLimit):
-        """Отправить алерт о состоянии бюджета"""
-        
+                               usage_percentage: float, remaining: float, limit: float):
+        """Отправить алерт о состоянии бюджета.
+
+        Принимает скаляры (снятые под локом в consume_budget), а не живой BudgetLimit,
+        чтобы отложенный asyncio-task сообщал значения на момент пересечения порога.
+        """
+
         alert_data = {
             "entity_id": entity_id,
             "entity_type": entity_type,
             "budget_type": budget_type.value,
             "status": status.value,
-            "usage_percentage": budget_limit.get_usage_percentage(),
-            "remaining": budget_limit.get_remaining(),
-            "limit": budget_limit.limit,
+            "usage_percentage": usage_percentage,
+            "remaining": remaining,
+            "limit": limit,
             "timestamp": datetime.now().isoformat()
         }
-        
+
         logger.warning(f"🚨 Budget alert: {entity_type} '{entity_id}' "
                       f"{budget_type.value} budget is {status.value} "
-                      f"({budget_limit.get_usage_percentage():.1f}%)")
+                      f"({usage_percentage:.1f}%)")
         
         # Вызываем зарегистрированные callback'и
         for callback in self.alert_callbacks:

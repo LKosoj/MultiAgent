@@ -3,11 +3,12 @@ import logging
 import re
 import base64
 import html
+import ipaddress
+import socket
 from datetime import datetime
-from typing import Union, List
+from typing import Union, List, Optional, Tuple
 import subprocess
 import tempfile
-import re
 from pathlib import Path
 import markdown2
 from bs4 import BeautifulSoup
@@ -19,6 +20,113 @@ import glob
 import hashlib
 import requests
 import mimetypes
+from urllib.parse import urlsplit
+
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    addr = ipaddress.ip_address(ip_str)
+    return not (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        or not addr.is_global
+    )
+
+
+def _validate_public_image_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"URL scheme is not allowed: {parsed.scheme}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must contain a hostname")
+    lowered = hostname.lower().rstrip(".")
+    if lowered in {"localhost", "metadata.google.internal"}:
+        raise ValueError(f"URL hostname is not allowed: {hostname}")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        is_ip_literal = False
+    else:
+        is_ip_literal = True
+    if is_ip_literal:
+        if not _is_public_ip(hostname):
+            raise ValueError(f"URL points to a non-public IP address: {hostname}")
+        return
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve image hostname: {hostname}") from exc
+    if not infos:
+        raise ValueError(f"Could not resolve image hostname: {hostname}")
+    for info in infos:
+        ip = info[4][0]
+        if not _is_public_ip(ip):
+            raise ValueError(f"Image URL resolves to a non-public IP address: {ip}")
+
+
+def _image_content_type(url: str, header_value: Optional[str]) -> str:
+    content_type = (header_value or "").split(";", 1)[0].strip().lower()
+    if not content_type or "/" not in content_type or content_type == "application/octet-stream":
+        content_type = mimetypes.guess_type(url)[0] or ""
+    if not content_type.startswith("image/"):
+        raise ValueError(f"Remote resource is not an image: {content_type or 'unknown'}")
+    return content_type
+
+
+def _download_image_for_embed(url: str) -> Optional[Tuple[str, bytes]]:
+    _validate_public_image_url(url)
+    with requests.get(url, stream=True, timeout=20, allow_redirects=False) as response:
+        if 300 <= response.status_code < 400:
+            raise ValueError(f"Image URL returned redirect {response.status_code}; redirects are not allowed")
+        response.raise_for_status()
+
+        content_type = _image_content_type(url, response.headers.get('Content-Type'))
+
+        chunks = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                logging.warning(f"Изображение {url} превышает {MAX_IMAGE_BYTES} байт, пропускаем")
+                return None
+            chunks.append(chunk)
+
+        return content_type, b''.join(chunks)
+
+
+def _local_image_for_embed(src: str, plots_dir: str) -> Optional[Tuple[str, bytes]]:
+    root = Path(plots_dir).resolve()
+    raw_path = Path(src)
+    candidates = [raw_path.resolve() if raw_path.is_absolute() else raw_path.resolve()]
+    if not raw_path.is_absolute():
+        candidates.append((root / raw_path).resolve())
+
+    for candidate in candidates:
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if not candidate.is_file():
+            continue
+        mime_type = mimetypes.guess_type(str(candidate))[0] or ""
+        if not mime_type.startswith("image/"):
+            raise ValueError(f"Local resource is not an image: {src}")
+        with candidate.open("rb") as f_img:
+            img_data = f_img.read(MAX_IMAGE_BYTES + 1)
+        if len(img_data) > MAX_IMAGE_BYTES:
+            raise ValueError(f"Local image exceeds {MAX_IMAGE_BYTES} bytes: {src}")
+        return mime_type, img_data
+    return None
+
 
 class HTMLVisualizer:
     """Утилита для создания расширенной HTML-визуализации"""
@@ -163,19 +271,19 @@ class HTMLVisualizer:
                     #'smart-quotes',     # Умные кавычки
                 ]
                 
-                html = markdown2.markdown(processed_text, extras=base_extras)
-                
+                html_str = markdown2.markdown(processed_text, extras=base_extras)
+
             except Exception as e:
                 logging.warning(f"Ошибка при обработке markdown: {str(e)}")
                 # Используем минимальный набор опций
-                html = markdown2.markdown(processed_text)
-                
+                html_str = markdown2.markdown(processed_text)
+
             # В HTML, обратные слеши могли быть преобразованы в &amp;#92; - исправляем это
-            html = html.replace('&amp;#92;_', '_')
-            html = html.replace('\\_', '_')
-            
+            html_str = html_str.replace('&amp;#92;_', '_')
+            html_str = html_str.replace('\\_', '_')
+
             # Парсим HTML
-            soup = BeautifulSoup(html, 'html.parser')
+            soup = BeautifulSoup(html_str, 'html.parser')
             
             # 1. Обрабатываем ссылки в формате [N] - сноски на источники
             if reference_links:
@@ -329,38 +437,24 @@ class HTMLVisualizer:
                         if src.startswith(('http://', 'https://')):
                             # Удаленное изображение
                             logging.info(f"Попытка встроить удаленное изображение: {src}")
-                            response = requests.get(src, stream=True, timeout=20)
-                            response.raise_for_status() # Проверка на ошибки HTTP
-                            
-                            content_type = response.headers.get('Content-Type')
-                            # Пытаемся угадать тип, если Content-Type неполный или отсутствует
-                            if not content_type or '/' not in content_type:
-                                guessed_type = mimetypes.guess_type(src)[0]
-                                if guessed_type:
-                                    content_type = guessed_type
-                                else: # Fallback, если не удалось угадать
-                                    content_type = 'application/octet-stream'
-                            
-                            img_data = response.content
+                            downloaded = _download_image_for_embed(src)
+                            if downloaded is None:
+                                continue
+                            content_type, img_data = downloaded
                             base64_data = base64.b64encode(img_data).decode('utf-8')
                             img_tag['src'] = f"data:{content_type};base64,{base64_data}"
                             logging.info(f"Успешно встроено удаленное изображение: {src}")
                         
-                        elif os.path.exists(src): # Проверяем, что это локальный файл и он существует
-                            # Локальное изображение (путь разрешается относительно CWD или абсолютный)
-                            logging.info(f"Попытка встроить локальное изображение: {src}")
-                            mime_type, _ = mimetypes.guess_type(src)
-                            if not mime_type:
-                                mime_type = 'application/octet-stream' # Fallback
-                            
-                            with open(src, 'rb') as f_img:
-                                img_data = f_img.read()
-                            base64_data = base64.b64encode(img_data).decode('utf-8')
-                            img_tag['src'] = f"data:{mime_type};base64,{base64_data}"
-                            logging.info(f"Успешно встроено локальное изображение: {src}")
-                        
                         else:
-                            # Если base_url предоставлен и src выглядит как относительный путь, 
+                            local_image = _local_image_for_embed(src, self.plots_dir)
+                            if local_image is not None:
+                                mime_type, img_data = local_image
+                                base64_data = base64.b64encode(img_data).decode('utf-8')
+                                img_tag['src'] = f"data:{mime_type};base64,{base64_data}"
+                                logging.info(f"Успешно встроено локальное изображение: {src}")
+                                continue
+
+                            # Если base_url предоставлен и src выглядит как относительный путь,
                             # пробуем преобразовать в абсолютный URL
                             if base_url and src.startswith('/'):
                                 from urllib.parse import urljoin, urlparse
@@ -368,31 +462,23 @@ class HTMLVisualizer:
                                 # Формируем базовый URL без пути для корректного соединения
                                 base_domain = f"{parsed_base.scheme}://{parsed_base.netloc}"
                                 absolute_url = urljoin(base_domain, src)
-                                
+
                                 logging.info(f"Преобразование относительного пути '{src}' в абсолютный URL: {absolute_url}")
-                                
+
                                 # Пробуем загрузить изображение по абсолютному URL
                                 try:
-                                    response = requests.get(absolute_url, stream=True, timeout=20)
-                                    response.raise_for_status()
-                                    
-                                    content_type = response.headers.get('Content-Type')
-                                    if not content_type or '/' not in content_type:
-                                        guessed_type = mimetypes.guess_type(absolute_url)[0]
-                                        if guessed_type:
-                                            content_type = guessed_type
-                                        else:
-                                            content_type = 'application/octet-stream'
-                                    
-                                    img_data = response.content
+                                    downloaded = _download_image_for_embed(absolute_url)
+                                    if downloaded is None:
+                                        continue
+                                    content_type, img_data = downloaded
                                     base64_data = base64.b64encode(img_data).decode('utf-8')
                                     img_tag['src'] = f"data:{content_type};base64,{base64_data}"
                                     logging.info(f"Успешно встроено изображение из абсолютного URL: {absolute_url}")
                                     continue  # Переходим к следующему изображению
-                                    
+
                                 except Exception as e:
                                     logging.warning(f"Не удалось загрузить изображение по абсолютному URL {absolute_url}: {e}")
-                            
+
                             # Если преобразование не удалось или base_url не предоставлен, логируем предупреждение
                             logging.warning(f"Ссылка на изображение '{src}' не является URL, файл не найден локально, и это не data URI.")
 
@@ -418,7 +504,7 @@ class HTMLVisualizer:
                     diagram_id = f"mermaid-diagram-{str(uuid.uuid4())[:8]}"
                     
                     # Создаем простой HTML-контейнер для mermaid-диаграммы
-                    simple_html = f'<div class="mermaid">{original_content}</div>'
+                    simple_html = f'<div class="mermaid">{html.escape(original_content)}</div>'
                     
                     # Заменяем плейсхолдер напрямую, без использования BeautifulSoup
                     result_html = result_html.replace(placeholder, simple_html)
@@ -518,7 +604,7 @@ class HTMLVisualizer:
                     # Создаем простой div с классом mermaid и оригинальным кодом диаграммы
                     # Оборачиваем код диаграммы в тег pre, чтобы предотвратить автоматическую конвертацию
                     # переносов строк в <br/> при отображении HTML
-                    mermaid_html = f'<div class="mermaid">{mermaid_content}</div>'
+                    mermaid_html = f'<div class="mermaid">{html.escape(mermaid_content)}</div>'
                     result_html = result_html.replace(placeholder, mermaid_html)
                 
             # Восстанавливаем оригинальные HTML-контейнеры диаграмм
@@ -537,7 +623,7 @@ class HTMLVisualizer:
                 placeholder = f"<div id='{block_id}'></div>"
                 if placeholder in result_html:
                     # Создаем базовый контейнер без форматирования, с оригинальным кодом
-                    simple_html = f'<div class="mermaid">{original_content}</div>'
+                    simple_html = f'<div class="mermaid">{html.escape(original_content)}</div>'
                     
                     # Заменяем плейсхолдер напрямую, без использования BeautifulSoup
                     result_html = result_html.replace(placeholder, simple_html)
@@ -626,11 +712,21 @@ class HTMLVisualizer:
             else:
                 title_str = title
             
+            # Escape user-controlled strings before inserting into HTML
+            safe_title = html.escape(title_str)
+            safe_time = html.escape(creation_time_str)
+            # XSS-safe и не ломает рендеринг: Mermaid читает исходник диаграммы из
+            # element.textContent, а браузер раскодирует &lt;/&gt; обратно в </> ДО
+            # парсинга Mermaid. Поэтому html.escape (а не re.sub по тегам, который молча
+            # выкидывал бы легитимные node-label аннотации и пропускал бы кривые теги).
+            # Один safe_code используется и в .mermaid-контейнере, и в <pre> с кодом.
+            safe_code = html.escape(mermaid_code)
+
             # Формируем HTML контейнер для диаграммы
-            html = [
+            html_parts = [
                 f'<div class="mermaid-container" id="{diagram_id}">',
                 '    <div class="mermaid-header">',
-                f'        <h3 class="mermaid-title">{title_str} <span class="file-time">({creation_time_str})</span></h3>',
+                f'        <h3 class="mermaid-title">{safe_title} <span class="file-time">({safe_time})</span></h3>',
                 '        <div class="mermaid-controls">',
                 f'            <select class="mermaid-theme-select" onchange="changeTheme(this.value, \'{content_id}\', \'{code_id}\')">',
                 '                <option value="default">Светлая тема</option>',
@@ -657,22 +753,25 @@ class HTMLVisualizer:
                 '        </div>',
                 '    </div>',
                 f'    <div class="mermaid-content" id="{content_id}">',
-                f'        <div class="mermaid">{mermaid_code}</div>',
+                f'        <div class="mermaid">{safe_code}</div>',
                 '        <div class="zoom-controls">',
                 f'            <div class="zoom-btn" onclick="zoomIn(\'{content_id}\')">+</div>',
                 f'            <div class="zoom-btn" onclick="zoomOut(\'{content_id}\')">-</div>',
                 f'            <div class="zoom-btn" onclick="resetZoom(\'{content_id}\')">↺</div>',
                 '        </div>',
                 '    </div>',
-                f'    <pre class="mermaid-code" id="{code_id}">{mermaid_code}</pre>',
+                f'    <pre class="mermaid-code" id="{code_id}">{safe_code}</pre>',
                 '</div>'
             ]
-            
-            return '\n'.join(html)
+
+            return '\n'.join(html_parts)
             
         except Exception as e:
             print(f"Ошибка при создании HTML-контейнера для mermaid диаграммы: {str(e)}")
-            return f'<div class="mermaid">{mermaid_code}</div>'
+            # html.escape и здесь: Mermaid читает textContent (браузер раскодирует обратно),
+            # рендеринг не ломается, а сырой user-controlled mermaid_code не попадает в DOM.
+            safe_fallback = html.escape(mermaid_code)
+            return f'<div class="mermaid">{safe_fallback}</div>'
     
     def advanced_visualization(self, result, session_id, show=False, base_url=None):
         """
@@ -1712,9 +1811,8 @@ class HTMLVisualizer:
                 f.write(html_content)
 
             logging.info(f"HTML страница с графиками сохранена в {output_path}")
-            self.clean_data(session_id)            
             return output_path
-            
+
         except Exception as e:
             print(f"Ошибка при создании HTML-страницы: {str(e)}")
             logging.error(f"Ошибка при создании HTML-страницы: {str(e)}")
@@ -1908,9 +2006,15 @@ class HTMLVisualizer:
 
     def clean_data(self, session_id):
         #return
-        """Удаляет файлы с суффиксом _{session_id} в каталоге plots."""
+        """Удаляет файлы с суффиксом _{session_id}. в каталоге plots."""
+        if not os.path.isdir('plots'):
+            return
         for file in os.listdir('plots'):
-            if f'_{session_id}' in file:
+            # Привязываем суффикс к точке-перед-расширением (_{session_id}.), чтобы не
+            # удалять файлы других сессий с пересекающимися ID (напр. _1 в _12.png).
+            # Дополнительно ловим файлы без расширения, чьё имя оканчивается ровно
+            # на _{session_id}, иначе они бы утекли.
+            if f'_{session_id}.' in file or file.endswith(f'_{session_id}'):
                 os.remove(os.path.join('plots', file))
 
     def _detect_and_save_mermaid(self, result, session_id, base_url=None):
@@ -2019,7 +2123,7 @@ class HTMLVisualizer:
                         html_result = html_result.replace(placeholder, html_container)
                     else:
                         # Если не удалось создать контейнер, используем простой div
-                        simple_html = f'<div class="mermaid">{mermaid_code}</div>'
+                        simple_html = f'<div class="mermaid">{html.escape(mermaid_code)}</div>'
                         html_result = html_result.replace(placeholder, simple_html)
                         
                 except Exception as e:
@@ -2027,7 +2131,7 @@ class HTMLVisualizer:
                     # В случае ошибки используем простой div с оригинальным кодом
                     html_result = html_result.replace(
                         placeholder, 
-                        f'<div class="mermaid">{mermaid_blocks[placeholder]["code"]}</div>'
+                        f'<div class="mermaid">{html.escape(mermaid_blocks[placeholder]["code"])}</div>'
                     )
             
             if mermaid_count > 0:

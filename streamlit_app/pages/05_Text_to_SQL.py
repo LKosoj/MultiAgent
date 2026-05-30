@@ -526,9 +526,6 @@ def run_agents_text_to_sql(natural_query, max_rows, safety_level, include_explan
     Используйте generate_sql_query() с text_to_sql_pipeline.yaml вместо этого.
     """
     try:
-        # Пробрасываем DSN в окружение для корректного выбора плагина/диалекта
-        if st.session_state.selected_dsn:
-            os.environ["DB_DSN"] = st.session_state.selected_dsn
         session_id = _compute_session_id_from_dsn(st.session_state.selected_dsn or "t2s")
 
         # Формируем задачу для менеджера
@@ -691,8 +688,6 @@ def run_yaml_text_to_sql(natural_query, max_rows, safety_level, include_explanat
     Используйте generate_sql_query() с text_to_sql_pipeline.yaml вместо этого.
     """
     try:
-        if st.session_state.selected_dsn:
-            os.environ["DB_DSN"] = st.session_state.selected_dsn
         session_id = _compute_session_id_from_dsn(st.session_state.selected_dsn or "t2s")
 
         from workflow.engine import WorkflowEngine
@@ -810,13 +805,27 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
 
             wf_manager = WorkflowManager()
 
-            # Polling до завершения workflow
+            # Polling до завершения workflow (таймаут 5 минут)
             terminal_statuses = {"completed", "failed", "cancelled"}
             status_obj = None
+            poll_deadline = time.time() + 300  # 5 minutes
+            # Early-exit: если статус подряд возвращается None (run_id не в реестре),
+            # нет смысла ждать весь таймаут — прерываемся после 10 итераций подряд.
+            none_streak = 0
             while True:
                 status_obj = wf_manager.get_workflow_status(run_id)
                 if status_obj is not None and status_obj.status in terminal_statuses:
                     break
+                if status_obj is None:
+                    none_streak += 1
+                    if none_streak > 10:
+                        st.error("⛔ run_id не найден в реестре, выполнение прервано.")
+                        return
+                else:
+                    none_streak = 0
+                if time.time() >= poll_deadline:
+                    st.error("⏱️ Превышен таймаут ожидания workflow (5 минут). Попробуйте позже.")
+                    return
                 time.sleep(0.5)
 
             execution_time = (time.time() - start_time) * 1000  # ms
@@ -1033,9 +1042,19 @@ def show_agent_workflow_results():
                     st.caption(f"Прошло ~ {int(elapsed)} сек")
             except Exception:
                 pass
-            # Автообновление статуса каждые 2 секунды
-            time.sleep(2)
-            st.experimental_rerun()
+            # Автообновление статуса: throttle через session_state-метку, БЕЗ
+            # блокировки UI-потока (исходный time.sleep(2) замораживал воркер).
+            # Trade-off: в классическом Streamlit непрерывный неблокирующий поллинг
+            # без st.fragment/компонента невозможен — поэтому есть кнопка
+            # «🔄 Обновить статус» как явный fallback. Безусловный st.rerun() здесь
+            # НЕЛЬЗЯ: он даёт busy-loop (rerun каждые ~0мс, 100% CPU + долбёжка backend).
+            # Ключ throttle композитный с job_id: новый запуск не наследует
+            # устаревшую метку предыдущего (иначе первый rerun мог запаздывать).
+            rerun_key = f"_agent_last_rerun_{job_id}"
+            last_check = st.session_state.get(rerun_key, 0)
+            if time.time() - last_check >= 2:
+                st.session_state[rerun_key] = time.time()
+                st.rerun()
             return
         elif status == "error":
             st.error(f"❌ Ошибка: {job.get('error')}")
@@ -1390,6 +1409,7 @@ def save_to_history(sql_data):
     
     history_entry = _redact_payload(history_entry)
     st.session_state.sql_history.append(history_entry)
+    st.session_state.sql_history = st.session_state.sql_history[-100:]
     # Персистим в JSONL, чтобы история переживала перезапуск
     try:
         file_path = _history_file_path()

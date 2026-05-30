@@ -212,7 +212,7 @@ class SignificanceConfig:
 
 
 def _coerce_str_list(value: Any, field: str) -> list[str]:
-    return coerce_str_list(value, field, yaml_filename="significance.yaml")
+    return coerce_str_list(value, field, yaml_filename="significance.yaml", reject_empty_strings=True)
 
 
 def _coerce_pattern_pairs(value: Any, field: str) -> list[Tuple[Pattern[str], str]]:

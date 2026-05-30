@@ -68,6 +68,10 @@ class SecurityConfig:
     sql_execution_enabled: bool = False
     max_sql_rows: int = 1000
     query_timeout_seconds: int = 30
+    # TODO: эти поля (allowed_functions, allowed_sql_operations, blocked_sql_keywords,
+    # table_whitelist, table_blacklist) в настоящее время НЕ применяются при выполнении
+    # SQL-запросов (deny-list мёртв при USE_SQLGLOT=1). Требуется enforcement в агенте
+    # перед отправкой запроса, иначе они создают иллюзию защиты.
     allowed_functions: List[str] = None
     allowed_sql_operations: List[str] = None
     blocked_sql_keywords: List[str] = None
@@ -198,7 +202,7 @@ class SystemConfiguration:
             telemetry=TelemetryConfig(**data.get("telemetry", {})),
             logging=LoggingConfig(**data.get("logging", {})),
             llm=LLMConfig(**data.get("llm", {})),
-            security=SecurityConfig(**data.get("security", {})),
+            security=SecurityConfig(**{k: v for k, v in data.get("security", {}).items() if v is not None}),
             resource_limits=ResourceLimits(**data.get("resource_limits", {})),
             ui=UIConfig(**data.get("ui", {})),
             performance=PerformanceConfig(**data.get("performance", {})),
@@ -415,9 +419,9 @@ class ConfigurationManager:
                             span_context = current_span.get_span_context()
                             span_id = format(span_context.span_id, '016x')[:8]  # Первые 8 символов
                             span_info = f"[{span_id}]"
-                    except:
+                    except Exception:
                         pass
-                    
+
                     # Из явно переданных данных
                     if hasattr(record, 'span_id') and record.span_id:
                         span_info = f"[{record.span_id[:8]}]"
@@ -444,7 +448,8 @@ class ConfigurationManager:
             elif config.format == "json":
                 # JSON формат с дополнительными полями
                 formatter = logging.Formatter(
-                    '{"timestamp": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s", "run_id": "%(run_id)s", "span_id": "%(span_id)s"}'
+                    '{"timestamp": "%(asctime)s", "level": "%(levelname)s", "logger": "%(name)s", "message": "%(message)s", "run_id": "%(run_id)s", "span_id": "%(span_id)s"}',
+                    defaults={"run_id": "", "span_id": ""},
                 )
             else:  # detailed
                 formatter = SpanAwareFormatter(
@@ -1045,23 +1050,33 @@ class ConfigurationManager:
             except ImportError:
                 logger.warning("⚠️ Не удалось импортировать agent_command")
             
-            # Если это НЕ логическая модель, проверяем внешние провайдеры
-            if not test_api_key and test_provider in ["anthropic", "local"]:
+            # Если это НЕ логическая модель, проверяем внешние провайдеры.
+            # local не требует API-ключа (requires_api_key=False, см. описание провайдеров).
+            if not test_api_key and test_provider == "anthropic":
                 result["error_message"] = f"Не указан API ключ для {test_provider}"
                 result["suggestions"].append(f"Добавьте API ключ для {test_provider}")
                 return result
             
             # Тест для стандартных провайдеров
             if test_provider == "openai":
-                # Здесь можно добавить реальный тест OpenAI API
+                if not test_api_key:
+                    result["error_message"] = "Не указан API ключ для openai"
+                    result["suggestions"].append("Добавьте API ключ для openai")
+                    return result
+                # TODO: выполнить реальный minimal API-вызов для проверки ключа
                 result["success"] = True
-                result["test_response"] = "OpenAI API тест (симулированный)"
-                
+                result["test_response"] = "OpenAI API тест (симулированный — реальная проверка не выполнена)"
+
             elif test_provider == "anthropic":
-                # Здесь можно добавить реальный тест Anthropic API
-                result["success"] = True  
-                result["test_response"] = "Anthropic API тест (симулированный)"
-                
+                # TODO: выполнить реальный minimal API-вызов для проверки ключа
+                result["success"] = True
+                result["test_response"] = "Anthropic API тест (симулированный — реальная проверка не выполнена)"
+
+            elif test_provider == "local":
+                # local-провайдер использует собственное подключение и не требует API-ключа
+                result["success"] = True
+                result["test_response"] = "Local провайдер тест (симулированный — реальная проверка не выполнена)"
+
             else:
                 result["error_message"] = f"Неподдерживаемый провайдер: {test_provider}"
                 result["suggestions"].append("Используйте: openai, anthropic, или модели системы")

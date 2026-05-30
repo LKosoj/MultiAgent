@@ -389,47 +389,49 @@ class DBPluginManager:
             start_time = time.time()
             
             conn = plugin.connect(dsn)
-            
+
             if conn:
                 connection_time = (time.time() - start_time) * 1000  # ms
                 result.connection_time_ms = round(connection_time, 2)
-                
-                # Пытаемся выполнить простой запрос для проверки
+
                 try:
-                    # Для разных БД используем разные тестовые запросы
-                    test_query = self._get_test_query(result.plugin_name)
-                    if hasattr(plugin, 'execute_select'):
-                        test_result = plugin.execute_select(conn, test_query, row_limit=1)
-                        result.metadata["test_query_success"] = True
-                        result.metadata["test_query"] = test_query
-                    else:
-                        result.validation_warnings.append("Плагин не поддерживает execute_select")
-                        
-                except Exception as e:
-                    result.validation_warnings.append(f"Тестовый запрос не выполнился: {e}")
-                    result.metadata["test_query_success"] = False
-                
-                # Пытаемся получить информацию о схеме
-                try:
-                    if hasattr(plugin, 'introspect_schema'):
-                        schema_info = plugin.introspect_schema(conn)
-                        result.metadata["tables_count"] = len(schema_info) if schema_info else 0
-                        result.metadata["schema_introspection_success"] = True
-                    else:
-                        result.validation_warnings.append("Плагин не поддерживает introspect_schema")
-                        
-                except Exception as e:
-                    result.validation_warnings.append(f"Интроспекция схемы не удалась: {e}")
-                    result.metadata["schema_introspection_success"] = False
-                
-                # Закрываем соединение
-                try:
-                    plugin.close(conn)
-                except Exception as e:
-                    result.validation_warnings.append(f"Ошибка закрытия соединения: {e}")
-                
-                result.success = True
-                
+                    # Пытаемся выполнить простой запрос для проверки
+                    try:
+                        # Для разных БД используем разные тестовые запросы
+                        test_query = self._get_test_query(result.plugin_name)
+                        if hasattr(plugin, 'execute_select'):
+                            test_result = plugin.execute_select(conn, test_query, row_limit=1)
+                            result.metadata["test_query_success"] = True
+                            result.metadata["test_query"] = test_query
+                        else:
+                            result.validation_warnings.append("Плагин не поддерживает execute_select")
+
+                    except Exception as e:
+                        result.validation_warnings.append(f"Тестовый запрос не выполнился: {e}")
+                        result.metadata["test_query_success"] = False
+
+                    # Пытаемся получить информацию о схеме
+                    try:
+                        if hasattr(plugin, 'introspect_schema'):
+                            schema_info = plugin.introspect_schema(conn)
+                            result.metadata["tables_count"] = len(schema_info) if schema_info else 0
+                            result.metadata["schema_introspection_success"] = True
+                        else:
+                            result.validation_warnings.append("Плагин не поддерживает introspect_schema")
+
+                    except Exception as e:
+                        result.validation_warnings.append(f"Интроспекция схемы не удалась: {e}")
+                        result.metadata["schema_introspection_success"] = False
+
+                    result.success = True
+
+                finally:
+                    # Закрываем соединение гарантированно
+                    try:
+                        plugin.close(conn)
+                    except Exception as e:
+                        result.validation_warnings.append(f"Ошибка закрытия соединения: {e}")
+
             else:
                 result.error_message = "Плагин вернул None вместо соединения"
                 

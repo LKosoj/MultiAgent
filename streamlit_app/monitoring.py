@@ -1,3 +1,4 @@
+import copy
 import logging
 import threading
 import time
@@ -67,16 +68,26 @@ class StaleRunMonitor:
         logger.debug("Начинаем проверку зависших запусков...")
         
         # Получаем менеджеры
-        from agent_streamlit_api import _GLOBAL_ACTIVE_RUNS as agent_runs
-        from workflow.streamlit_api import _GLOBAL_WORKFLOW_ACTIVE_RUNS as workflow_runs
+        from agent_streamlit_api import _GLOBAL_ACTIVE_RUNS as agent_runs, _GLOBAL_RUNS_LOCK
+        from workflow.streamlit_api import (
+            _GLOBAL_WORKFLOW_ACTIVE_RUNS as workflow_runs,
+            _GLOBAL_WORKFLOW_RUNS_LOCK,
+        )
         from telemetry import get_telemetry_manager
-        
+
         telemetry_manager = get_telemetry_manager()
         if not telemetry_manager.is_enabled():
             logger.debug("Телеметрия отключена, проверка отменена.")
             return
 
-        all_runs = {**agent_runs, **workflow_runs}
+        # Snapshot перед итерацией под локами соответствующих модулей: иначе
+        # параллельная мутация shared-dict даёт RuntimeError (изменение размера при
+        # итерации) или гонку. copy.copy значений безопасен уже после снимка ключей.
+        with _GLOBAL_RUNS_LOCK:
+            agent_snapshot = dict(agent_runs)
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            workflow_snapshot = dict(workflow_runs)
+        all_runs = {k: copy.copy(v) for k, v in {**agent_snapshot, **workflow_snapshot}.items()}
         now = datetime.now()
         processed_count = 0
 
@@ -109,7 +120,7 @@ class StaleRunMonitor:
                 # Если процесс мертв, но статус "running" - это точно зомби
                 if process_dead:
                     logger.error(f"Запуск-зомби {run_id}: процесс с PID {pid} не существует, но статус 'running'.")
-                    self._mark_as_failed(telemetry_manager, run_id, run_data, "Процесс-зомби")
+                    self._mark_as_failed(telemetry_manager, run_id, "Процесс-зомби")
                     processed_count += 1
                     continue
 
@@ -121,7 +132,7 @@ class StaleRunMonitor:
                     from telemetry.helpers import is_trace_completed
                     if not is_trace_completed(spans):
                         logger.error(f"Зависший запуск {run_id}: превышен порог выполнения и трасса не завершена.")
-                        self._mark_as_failed(telemetry_manager, run_id, run_data, "Превышен порог выполнения")
+                        self._mark_as_failed(telemetry_manager, run_id, "Превышен порог выполнения")
                         processed_count += 1
                 except Exception as e:
                     logger.error(f"Не удалось проверить трассу для {run_id}: {e}")
@@ -131,13 +142,28 @@ class StaleRunMonitor:
         else:
             logger.debug("Зависших запусков не обнаружено.")
 
-    def _mark_as_failed(self, telemetry_manager, run_id: str, run_data: Dict[str, Any], reason: str):
+    def _mark_as_failed(self, telemetry_manager, run_id: str, reason: str):
         """Помечает запуск и его трассу как ошибочные."""
         try:
-            # 1. Обновляем статус в in-memory реестре
-            run_data["status"] = "failed"
-            run_data["end_time"] = datetime.now()
-            run_data["error"] = f"Монитор: {reason}"
+            # 1. Обновляем статус в оригинальных реестрах под локом,
+            #    чтобы не конкурировать с UI-потоками, читающими/пишущими эти же dict-ы.
+            from agent_streamlit_api import _GLOBAL_ACTIVE_RUNS as agent_runs, _GLOBAL_RUNS_LOCK
+            from workflow.streamlit_api import (
+                _GLOBAL_WORKFLOW_ACTIVE_RUNS as workflow_runs,
+                _GLOBAL_WORKFLOW_RUNS_LOCK,
+            )
+            # Пишем под тем же локом, которым эти реестры защищаются в остальных
+            # потоках (UI/worker) — иначе взаимного исключения нет.
+            for registry, reg_lock in (
+                (agent_runs, _GLOBAL_RUNS_LOCK),
+                (workflow_runs, _GLOBAL_WORKFLOW_RUNS_LOCK),
+            ):
+                with reg_lock:
+                    if run_id in registry:
+                        registry[run_id]["status"] = "failed"
+                        registry[run_id]["end_time"] = datetime.now()
+                        registry[run_id]["error"] = f"Монитор: {reason}"
+                        break
             logger.info(f"Статус запуска {run_id} обновлен на 'failed'.")
 
             # 2. Помечаем трассу как ошибочную

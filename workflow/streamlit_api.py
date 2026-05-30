@@ -13,7 +13,7 @@ import uuid
 import signal
 import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Union, Callable
+from typing import Dict, List, Any, Optional, Union, Callable, Tuple
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
@@ -441,6 +441,9 @@ _GLOBAL_WORKFLOW_PROCESSES = {}
 # что без mutex даёт race condition (особенно pop+get на одном run_id).
 _GLOBAL_WORKFLOW_PROCESSES_LOCK = threading.RLock()
 _GLOBAL_WORKFLOW_ENV_LOCK = threading.Lock()
+# RLock для _GLOBAL_WORKFLOW_ACTIVE_RUNS и _GLOBAL_WORKFLOW_RUN_CALLBACKS:
+# main-поток пишет, watchdog-поток читает/пишет, UI-поток отменяет — нужна синхронизация.
+_GLOBAL_WORKFLOW_RUNS_LOCK = threading.RLock()
 
 # Типы для callbacks
 ProgressCallback = Callable[[str, str, Dict[str, Any]], None]  # (run_id, event_type, data)
@@ -453,6 +456,14 @@ def _workflow_dsn_env(parameters: Dict[str, Any]):
         yield
         return
 
+    # WONTFIX (аудит L4): рекомендация «отпускать лок на время yield» сознательно
+    # ОТКЛОНЕНА — она ломает корректность. Держим мьютекс на всё время выполнения
+    # (включая yield), чтобы гарантировать атомарность set→yield→restore для os.environ.
+    # os.environ — process-global, а workflow исполняется ВНУТРИ этого процесса
+    # (loop.run_until_complete у вызывающего) и читает DB_DSN/лимиты/safety на ПРОТЯЖЕНИИ
+    # всего исполнения. Если отпустить лок на время yield, конкурентный запуск перезапишет
+    # эти переменные посреди работы текущего — поэтому одновременные in-process запуски
+    # обязаны сериализоваться. Это намеренный bottleneck ради корректности, а не упущение.
     with _GLOBAL_WORKFLOW_ENV_LOCK:
         dsn = parameters.get("dsn")
         row_limit = parameters.get("max_rows")
@@ -831,11 +842,12 @@ class WorkflowManager:
 
         # Регистрируем callbacks
         if progress_callback or log_callback:
-            self.run_callbacks[run_id] = []
-            if progress_callback:
-                self.run_callbacks[run_id].append(('progress', progress_callback))
-            if log_callback:
-                self.run_callbacks[run_id].append(('log', log_callback))
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                self.run_callbacks[run_id] = []
+                if progress_callback:
+                    self.run_callbacks[run_id].append(('progress', progress_callback))
+                if log_callback:
+                    self.run_callbacks[run_id].append(('log', log_callback))
 
         # Запускаем в отдельном процессе для возможности реальной отмены
         try:
@@ -849,18 +861,19 @@ class WorkflowManager:
             proc.start()
 
             # Регистрируем запуск в активных с PID
-            self.active_runs[run_id] = {
-                "run_id": run_id,
-                "workflow_name": WorkflowDefinition.from_yaml(workflow_file).name,
-                "status": "running",
-                "start_time": datetime.now(),
-                "parameters": _redact_public_payload(parameters),
-                "session_id": session_id,
-                "client_id": client_id,
-                "pid": proc.pid,
-                "use_enhanced_engine": use_enhanced, # Store options for monitoring
-                "enable_telemetry": enable_telemetry, # Store options for monitoring
-            }
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                self.active_runs[run_id] = {
+                    "run_id": run_id,
+                    "workflow_name": matched_workflow_def.name,
+                    "status": "running",
+                    "start_time": datetime.now(),
+                    "parameters": _redact_public_payload(parameters),
+                    "session_id": session_id,
+                    "client_id": client_id,
+                    "pid": proc.pid,
+                    "use_enhanced_engine": use_enhanced, # Store options for monitoring
+                    "enable_telemetry": enable_telemetry, # Store options for monitoring
+                }
 
             # Сохраняем процесс в глобальном реестре и запускаем наблюдатель
             with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
@@ -872,27 +885,37 @@ class WorkflowManager:
                 if not p:
                     return
                 p.join()
-                # Обновляем статус по завершению процесса, если не был отмечен иначе
-                run_data = self.active_runs.get(_rid)
+                # Ранний выход под локом, если процесс уже отмечен терминально.
+                # run_data НЕ удерживаем через медленный I/O — после него re-fetch
+                # из реестра, чтобы не писать в осиротевший/заменённый dict.
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    rd = self.active_runs.get(_rid)
+                    if not rd:
+                        return
+                    if rd.get("status") in ["completed", "failed", "cancelled"]:
+                        return
                 try:
-                    if not run_data:
-                        return
-                    if run_data.get("status") in ["completed", "failed", "cancelled"]:
-                        return
                     exit_code = p.exitcode
                     stored_payload = _workflow_result_payload_from_store(_rid, strict=True)
-                    if stored_payload:
-                        _merge_workflow_result_payload(run_data, stored_payload)
                     stored_status = stored_payload.get("status") if stored_payload else None
                     stored_error = stored_payload.get("error") if stored_payload else None
                     if not stored_payload and exit_code == 0:
                         stored_status = "failed"
                         stored_error = "Workflow process exited successfully without terminal WORKFLOW_RESULT"
-                    run_data.update({
-                        "end_time": datetime.now(),
-                        "status": stored_status or "failed",
-                        "error": stored_error if stored_payload else (stored_error or f"Процесс завершился с кодом {exit_code}"),
-                    })
+                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                        # Re-fetch + перепроверка терминального статуса под локом: за время
+                        # медленного I/O (_workflow_result_payload_from_store) другой поток
+                        # мог выставить completed/failed/cancelled или убрать запись —
+                        # не затираем его и не воскрешаем удалённый run.
+                        run_data = self.active_runs.get(_rid)
+                        if run_data and run_data.get("status") not in ["completed", "failed", "cancelled"]:
+                            if stored_payload:
+                                _merge_workflow_result_payload(run_data, stored_payload)
+                            run_data.update({
+                                "end_time": datetime.now(),
+                                "status": stored_status or "failed",
+                                "error": stored_error if stored_payload else (stored_error or f"Процесс завершился с кодом {exit_code}"),
+                            })
                 except Exception as exc:
                     safe_error = _redact_error_text(exc)
                     logger.warning(
@@ -900,38 +923,41 @@ class WorkflowManager:
                         _rid,
                         safe_error,
                     )
-                    if run_data and run_data.get("status") not in ["completed", "failed", "cancelled"]:
-                        run_data.update({
-                            "end_time": datetime.now(),
-                            "status": "failed",
-                            "error": f"Не удалось обработать результат workflow-процесса: {safe_error}",
-                        })
+                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                        run_data = self.active_runs.get(_rid)
+                        if run_data and run_data.get("status") not in ["completed", "failed", "cancelled"]:
+                            run_data.update({
+                                "end_time": datetime.now(),
+                                "status": "failed",
+                                "error": f"Не удалось обработать результат workflow-процесса: {safe_error}",
+                            })
 
             watcher = threading.Thread(target=_watchdog, args=(run_id,), daemon=True)
             watcher.start()
         except Exception as e:
             error_message = f"Не удалось запустить workflow в отдельном процессе: {_redact_error_text(e)}"
-            self.active_runs[run_id] = {
-                "run_id": run_id,
-                "workflow_name": WorkflowDefinition.from_yaml(workflow_file).name,
-                "status": "failed",
-                "start_time": datetime.now(),
-                "end_time": datetime.now(),
-                "parameters": _redact_public_payload(parameters),
-                "session_id": session_id,
-                "client_id": client_id,
-                "error": error_message,
-                "use_enhanced_engine": use_enhanced,
-                "enable_telemetry": enable_telemetry,
-            }
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                self.active_runs[run_id] = {
+                    "run_id": run_id,
+                    "workflow_name": matched_workflow_def.name,
+                    "status": "failed",
+                    "start_time": datetime.now(),
+                    "end_time": datetime.now(),
+                    "parameters": _redact_public_payload(parameters),
+                    "session_id": session_id,
+                    "client_id": client_id,
+                    "error": error_message,
+                    "use_enhanced_engine": use_enhanced,
+                    "enable_telemetry": enable_telemetry,
+                }
             result_appended = _append_workflow_result_event(
                 run_id,
                 None,
                 "failed",
                 error_message,
-                artifacts={"metadata": {"workflow_name": WorkflowDefinition.from_yaml(workflow_file).name}},
+                artifacts={"metadata": {"workflow_name": matched_workflow_def.name}},
                 snapshot={
-                    "workflow_name": WorkflowDefinition.from_yaml(workflow_file).name,
+                    "workflow_name": matched_workflow_def.name,
                     "parameters": parameters,
                     "session_id": session_id,
                     "client_id": client_id,
@@ -940,7 +966,8 @@ class WorkflowManager:
             if not result_appended:
                 append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
                 error_message = f"{error_message}; {append_error}"
-                self.active_runs[run_id]["error"] = error_message
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    self.active_runs[run_id]["error"] = error_message
             logger.error(error_message)
             raise WorkflowExecutionError(error_message) from e
 
@@ -1027,11 +1054,16 @@ class WorkflowManager:
         except Exception as e:
             # Обработка ошибок workflow
             safe_error = _redact_error_text(e)
-            self.active_runs[run_id].update({
-                "status": "failed",
-                "end_time": datetime.now(),
-                "error": safe_error
-            })
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                # Guard: run_id мог не успеть зарегистрироваться в active_runs, если
+                # исключение возникло до инициализации записи — не падаем KeyError'ом
+                # (консистентно с защищённым except в _execute_workflow_in_context).
+                if run_id in self.active_runs:
+                    self.active_runs[run_id].update({
+                        "status": "failed",
+                        "end_time": datetime.now(),
+                        "error": safe_error
+                    })
             self._notify_progress(run_id, "failed", {"error": safe_error})
             logger.error("❌ Ошибка выполнения workflow %s: %s", run_id, safe_error)
             raise
@@ -1041,24 +1073,24 @@ class WorkflowManager:
                                     client_id: Optional[str] = None) -> Any:
         """Выполнение workflow в контексте run_id"""
         try:
-            # Инициализируем статус выполнения
-            if run_id not in self.active_runs:
-                self.active_runs[run_id] = {
-                    "run_id": run_id,
-                    "workflow_name": "",
-                    "status": "running",
-                    "start_time": datetime.now(),
-                }
-            
-            run_data = self.active_runs[run_id]
-            run_data["status"] = "running"
-            run_data["start_time"] = datetime.now()
-            
-            # Загружаем workflow definition
+            # Загружаем workflow definition до входа в лок (медленный from_yaml вне лока)
             workflow_def = WorkflowDefinition.from_yaml(workflow_file)
-            run_data["workflow_name"] = workflow_def.name
-            run_data["total_steps"] = len(workflow_def.steps)
-            
+
+            # Инициализируем статус выполнения и пишем метаданные в одном блоке под локом
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                if run_id not in self.active_runs:
+                    self.active_runs[run_id] = {
+                        "run_id": run_id,
+                        "workflow_name": "",
+                        "status": "running",
+                        "start_time": datetime.now(),
+                    }
+                run_data = self.active_runs[run_id]
+                run_data["status"] = "running"
+                run_data["start_time"] = datetime.now()
+                run_data["workflow_name"] = workflow_def.name
+                run_data["total_steps"] = len(workflow_def.steps)
+
             self._notify_progress(run_id, "started", {"workflow_name": workflow_def.name})
             
             # Выполняем workflow асинхронно
@@ -1113,33 +1145,42 @@ class WorkflowManager:
                         error_message = f"Workflow завершился со статусом {result_status_value}"
                 execution_state = _text_to_sql_execution_state(parameters)
 
-                run_data.update({
-                    "run_id": run_id,
-                    "status": "completed" if is_success else "failed",
-                    "end_time": datetime.now(),
-                    "current_step": None,
-                    "progress_percentage": 100.0 if is_success else run_data.get("progress_percentage", 0.0),
-                    "workflow_id": getattr(result, "workflow_id", None),
-                    "final_output": getattr(result, "final_output", None),
-                    "error": error_message,
-                    "step_outputs": {
-                        step_id: result.step_results[step_id].output
-                        for step_id in result.step_results.keys()
-                    } if result.step_results else {},
-                    "step_results": {step_id: {
-                        "status": result.step_results[step_id].status.value if hasattr(result.step_results[step_id].status, "value") else str(result.step_results[step_id].status),
-                        "output": str(result.step_results[step_id].output)[:500] if result.step_results[step_id].output else None
-                    } for step_id in result.step_results.keys()} if result.step_results else {}
-                })
-                if execution_state:
-                    run_data["execution"] = execution_state
+                # M16: финальная запись статуса/результата конкурирует с watchdog-потоком
+                # и cancel_workflow — пишем под локом, как и остальные блоки в этом методе.
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    run_data.update({
+                        "run_id": run_id,
+                        "status": "completed" if is_success else "failed",
+                        "end_time": datetime.now(),
+                        "current_step": None,
+                        "progress_percentage": 100.0 if is_success else run_data.get("progress_percentage", 0.0),
+                        "workflow_id": getattr(result, "workflow_id", None),
+                        "final_output": getattr(result, "final_output", None),
+                        "error": error_message,
+                        "step_outputs": {
+                            step_id: result.step_results[step_id].output
+                            for step_id in result.step_results.keys()
+                        } if result.step_results else {},
+                        "step_results": {step_id: {
+                            "status": result.step_results[step_id].status.value if hasattr(result.step_results[step_id].status, "value") else str(result.step_results[step_id].status),
+                            "output": str(result.step_results[step_id].output)[:500] if result.step_results[step_id].output else None
+                        } for step_id in result.step_results.keys()} if result.step_results else {}
+                    })
+                    if execution_state:
+                        run_data["execution"] = execution_state
+                    # Снимок под локом: status/error/artifacts читаем здесь же, а не
+                    # после release — иначе watchdog мог бы переписать run_data между
+                    # выходом из лока и чтением ниже.
+                    _status_snap = run_data["status"]
+                    _error_snap = run_data.get("error")
+                    _artifacts_snap = _workflow_artifacts_from_run_data(run_data)
 
                 result_appended = _append_workflow_result_event(
                     run_id,
                     getattr(result, "final_output", None),
-                    run_data["status"],
-                    run_data.get("error"),
-                    artifacts=_workflow_artifacts_from_run_data(run_data),
+                    _status_snap,
+                    _error_snap,
+                    artifacts=_artifacts_snap,
                     snapshot={
                         "workflow_name": workflow_def.name,
                         "parameters": parameters,
@@ -1149,15 +1190,19 @@ class WorkflowManager:
                 )
                 if not result_appended:
                     append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
-                    run_data.update({
-                        "status": "failed",
-                        "end_time": datetime.now(),
-                        "error": append_error,
-                    })
+                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                        run_data.update({
+                            "status": "failed",
+                            "end_time": datetime.now(),
+                            "error": append_error,
+                        })
                     self._notify_progress(run_id, "failed", {"error": append_error})
                     raise WorkflowExecutionError(append_error)
-                run_data["workflow_result_event_appended"] = True
-                self._notify_progress(run_id, run_data["status"], {"result": "success" if is_success else "failed", "error": run_data.get("error")})
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    run_data["workflow_result_event_appended"] = True
+                    _notify_status = run_data["status"]
+                    _notify_error = run_data.get("error")
+                self._notify_progress(run_id, _notify_status, {"result": "success" if is_success else "failed", "error": _notify_error})
                 if not is_success:
                     raise WorkflowExecutionError(error_message or "Workflow failed")
                 return result
@@ -1169,23 +1214,26 @@ class WorkflowManager:
             # Обновляем статус при ошибке
             safe_error = _redact_error_text(e)
             had_stored_result = False
-            if run_id in self.active_runs:
-                existing_output = self.active_runs[run_id].get("final_output")
-                had_stored_result = self.active_runs[run_id].get("workflow_result_event_appended") is True
-                self.active_runs[run_id].update({
-                    "status": "failed",
-                    "end_time": datetime.now(),
-                    "error": safe_error
-                })
-            else:
-                existing_output = None
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                if run_id in self.active_runs:
+                    existing_output = self.active_runs[run_id].get("final_output")
+                    had_stored_result = self.active_runs[run_id].get("workflow_result_event_appended") is True
+                    self.active_runs[run_id].update({
+                        "status": "failed",
+                        "end_time": datetime.now(),
+                        "error": safe_error
+                    })
+                else:
+                    existing_output = None
             if not had_stored_result:
-                artifacts = _workflow_artifacts_from_run_data(self.active_runs[run_id]) if run_id in self.active_runs else None
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    artifacts = _workflow_artifacts_from_run_data(self.active_runs[run_id]) if run_id in self.active_runs else None
                 result_appended = _append_workflow_result_event(run_id, existing_output, "failed", error=safe_error, artifacts=artifacts)
                 if not result_appended:
                     append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
-                    if run_id in self.active_runs:
-                        self.active_runs[run_id]["error"] = append_error
+                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                        if run_id in self.active_runs:
+                            self.active_runs[run_id]["error"] = append_error
                     self._notify_progress(run_id, "failed", {"error": append_error})
                     raise WorkflowExecutionError(append_error) from e
             self._notify_progress(run_id, "failed", {"error": safe_error})
@@ -1194,24 +1242,25 @@ class WorkflowManager:
     def _notify_progress(self, run_id: str, event_type: str, data: Dict[str, Any]):
         """Уведомление о прогрессе выполнения workflow"""
         # Всегда записываем событие в статус для мониторинга
-        if run_id in self.active_runs:
-            self.active_runs[run_id][f"last_{event_type}"] = {
-                "timestamp": datetime.now(),
-                "data": data
-            }
-        
-        # Вызываем зарегистрированные callbacks
-        if run_id in self.run_callbacks:
-            for callback_type, callback_func in self.run_callbacks[run_id]:
-                if callback_type == "progress":
-                    try:
-                        callback_func(run_id, event_type, data)
-                    except Exception as e:
-                        logger.warning(
-                            "⚠️ Ошибка в progress callback для %s: %s",
-                            run_id,
-                            _redact_error_text(e),
-                        )
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            if run_id in self.active_runs:
+                self.active_runs[run_id][f"last_{event_type}"] = {
+                    "timestamp": datetime.now(),
+                    "data": data
+                }
+            callbacks_snapshot = list(self.run_callbacks.get(run_id, []))
+
+        # Вызываем зарегистрированные callbacks вне блокировки
+        for callback_type, callback_func in callbacks_snapshot:
+            if callback_type == "progress":
+                try:
+                    callback_func(run_id, event_type, data)
+                except Exception as e:
+                    logger.warning(
+                        "⚠️ Ошибка в progress callback для %s: %s",
+                        run_id,
+                        _redact_error_text(e),
+                    )
         
         # Получаем EventBus и отправляем ProgressEvent
         try:
@@ -1236,30 +1285,32 @@ class WorkflowManager:
         Returns:
             Объект WorkflowRunStatus или None
         """
-        if run_id not in self.active_runs:
-            stored_payload = _workflow_result_payload_from_store(run_id)
-            if not stored_payload:
-                return None
-            artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
-            snapshot = stored_payload.get("snapshot") if isinstance(stored_payload.get("snapshot"), dict) else {}
-            return WorkflowRunStatus(
-                run_id=run_id,
-                workflow_name=snapshot.get("workflow_name", "unknown"),
-                status=stored_payload.get("status", "unknown"),
-                progress_percentage=100.0 if stored_payload.get("status") == "completed" else 0.0,
-                error_message=_redact_error_text(stored_payload.get("error")) if stored_payload.get("error") else None,
-                step_results=_redact_public_payload(artifacts.get("step_results") or {}),
-                parameters=_redact_public_payload(snapshot.get("parameters") or {}),
-            )
-            
-        run_data = self.active_runs[run_id]
-        if run_data.get("status") not in ["completed", "failed", "cancelled"]:
-            stored_payload = _workflow_result_payload_from_store(run_id)
-            stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
-            if stored_status in {"completed", "failed", "cancelled"}:
-                _merge_workflow_result_payload(run_data, stored_payload)
-                if not run_data.get("end_time"):
-                    run_data["end_time"] = datetime.now()
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                stored_payload = _workflow_result_payload_from_store(run_id)
+                if not stored_payload:
+                    return None
+                artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
+                snapshot = stored_payload.get("snapshot") if isinstance(stored_payload.get("snapshot"), dict) else {}
+                return WorkflowRunStatus(
+                    run_id=run_id,
+                    workflow_name=snapshot.get("workflow_name", "unknown"),
+                    status=stored_payload.get("status", "unknown"),
+                    progress_percentage=100.0 if stored_payload.get("status") == "completed" else 0.0,
+                    error_message=_redact_error_text(stored_payload.get("error")) if stored_payload.get("error") else None,
+                    step_results=_redact_public_payload(artifacts.get("step_results") or {}),
+                    parameters=_redact_public_payload(snapshot.get("parameters") or {}),
+                )
+
+            run_data = self.active_runs[run_id]
+            if run_data.get("status") not in ["completed", "failed", "cancelled"]:
+                stored_payload = _workflow_result_payload_from_store(run_id)
+                stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
+                if stored_status in {"completed", "failed", "cancelled"}:
+                    _merge_workflow_result_payload(run_data, stored_payload)
+                    if not run_data.get("end_time"):
+                        run_data["end_time"] = datetime.now()
+            run_data = dict(run_data)
         
         # Вычисляем длительность
         duration = None
@@ -1293,22 +1344,24 @@ class WorkflowManager:
 
     def get_workflow_artifacts(self, run_id: str) -> Optional[WorkflowArtifacts]:
         """Получить артефакты выполнения workflow."""
-        if run_id not in self.active_runs:
-            stored_payload = _workflow_result_payload_from_store(run_id)
-            if not stored_payload:
-                return None
-            artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
-            return WorkflowArtifacts(
-                run_id=run_id,
-                final_output=_redact_public_payload(artifacts.get("final_output", stored_payload.get("result"))),
-                step_outputs=_redact_public_payload(artifacts.get("step_outputs") or {}),
-                metadata=_redact_public_payload(artifacts.get("metadata") or {}),
-            )
-        run_data = self.active_runs[run_id]
-        if not run_data.get("final_output") and not run_data.get("step_outputs"):
-            stored_payload = _workflow_result_payload_from_store(run_id)
-            if stored_payload:
-                _merge_workflow_result_payload(run_data, stored_payload)
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                stored_payload = _workflow_result_payload_from_store(run_id)
+                if not stored_payload:
+                    return None
+                artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
+                return WorkflowArtifacts(
+                    run_id=run_id,
+                    final_output=_redact_public_payload(artifacts.get("final_output", stored_payload.get("result"))),
+                    step_outputs=_redact_public_payload(artifacts.get("step_outputs") or {}),
+                    metadata=_redact_public_payload(artifacts.get("metadata") or {}),
+                )
+            run_data = self.active_runs[run_id]
+            if not run_data.get("final_output") and not run_data.get("step_outputs"):
+                stored_payload = _workflow_result_payload_from_store(run_id)
+                if stored_payload:
+                    _merge_workflow_result_payload(run_data, stored_payload)
+            run_data = dict(run_data)
         return WorkflowArtifacts(
             run_id=run_id,
             final_output=_redact_public_payload(run_data.get("final_output")),
@@ -1320,6 +1373,42 @@ class WorkflowManager:
             }),
         )
 
+    def get_active_run_snapshot(self, run_id: str) -> Dict[str, Any]:
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            run_data = self.active_runs.get(run_id)
+            return dict(run_data) if isinstance(run_data, dict) else {}
+
+    def update_active_run(self, run_id: str, updates: Dict[str, Any]) -> bool:
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            run_data = self.active_runs.get(run_id)
+            if not isinstance(run_data, dict):
+                return False
+            run_data.update(updates)
+            return True
+
+    def list_active_run_snapshots(self) -> List[Tuple[str, Dict[str, Any]]]:
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            return [
+                (run_id, dict(run_data))
+                for run_id, run_data in self.active_runs.items()
+                if isinstance(run_data, dict)
+            ]
+
+    def cleanup_completed_runs(self, max_age_hours: float = 24) -> int:
+        cutoff = datetime.now().timestamp() - max_age_hours * 3600
+        cleaned = 0
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            for run_id, run_data in list(self.active_runs.items()):
+                if not isinstance(run_data, dict):
+                    continue
+                status = run_data.get("status")
+                end_time = run_data.get("end_time")
+                end_ts = end_time.timestamp() if isinstance(end_time, datetime) else None
+                if status in {"completed", "failed", "cancelled"} and end_ts is not None and end_ts < cutoff:
+                    self.active_runs.pop(run_id, None)
+                    cleaned += 1
+        return cleaned
+
     def cancel_workflow(self, run_id: str) -> bool:
         """
         Отменить выполнение workflow
@@ -1330,12 +1419,15 @@ class WorkflowManager:
         Returns:
             True если отмена успешна
         """
-        if run_id not in self.active_runs:
-            logger.warning(f"Попытка отменить несуществующий workflow: {run_id}")
-            return False
-            
-        run_data = self.active_runs[run_id]
-        
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            if run_id not in self.active_runs:
+                logger.warning(f"Попытка отменить несуществующий workflow: {run_id}")
+                return False
+            run_data = self.active_runs[run_id]
+            # Снимок pid под локом, чтобы дальше не читать run_data вне лока
+            # (гонка с watchdog-потоком). Статус ниже перечитывается под локом в current_status.
+            pid = run_data.get("pid")
+
         try:
             stored_payload = _workflow_result_payload_from_store(run_id, strict=True)
         except Exception as exc:
@@ -1347,21 +1439,23 @@ class WorkflowManager:
             return False
         stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
         if stored_status in {"completed", "failed", "cancelled"}:
-            _merge_workflow_result_payload(run_data, stored_payload)
-            if not run_data.get("end_time"):
-                run_data["end_time"] = datetime.now()
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                _merge_workflow_result_payload(run_data, stored_payload)
+                if not run_data.get("end_time"):
+                    run_data["end_time"] = datetime.now()
             logger.warning(
                 f"Попытка отменить workflow с уже сохранённым WORKFLOW_RESULT: {run_id} "
                 f"(статус: {stored_status})"
             )
             return False
 
-        if run_data["status"] in ["completed", "failed", "cancelled"]:
-            logger.warning(f"Попытка отменить уже завершенный workflow: {run_id} (статус: {run_data['status']})")
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            current_status = run_data["status"]
+        if current_status in ["completed", "failed", "cancelled"]:
+            logger.warning(f"Попытка отменить уже завершенный workflow: {run_id} (статус: {current_status})")
             return False
 
-        # Пытаемся завершить дочерний процесс
-        pid = run_data.get("pid")
+        # Пытаемся завершить дочерний процесс (pid взят из снимка под локом выше)
         with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
             proc = _GLOBAL_WORKFLOW_PROCESSES.get(run_id)
         killed = False
@@ -1435,9 +1529,10 @@ class WorkflowManager:
             return False
         stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
         if stored_status in {"completed", "failed", "cancelled"}:
-            _merge_workflow_result_payload(run_data, stored_payload)
-            if not run_data.get("end_time"):
-                run_data["end_time"] = datetime.now()
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                _merge_workflow_result_payload(run_data, stored_payload)
+                if not run_data.get("end_time"):
+                    run_data["end_time"] = datetime.now()
             logger.warning(
                 f"Workflow {run_id} уже сохранил terminal WORKFLOW_RESULT во время cancel "
                 f"(статус: {stored_status})"
@@ -1449,18 +1544,28 @@ class WorkflowManager:
             )
             return False
 
-        # Обновляем статус
-        run_data.update({
-            "status": "cancelled",
-            "end_time": datetime.now()
-        })
+        # Обновляем статус (CAS: под тем же локом перепроверяем, что run не стал
+        # терминальным между check-after-kill и этой записью — иначе watchdog мог
+        # пометить completed/failed, и cancelled затёр бы реальный исход).
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            _live_status = str(run_data.get("status") or "").lower()
+            if _live_status in {"completed", "failed", "cancelled"}:
+                logger.warning(
+                    f"Workflow {run_id} стал терминальным ({_live_status}) во время cancel — cancelled не записан"
+                )
+                return False
+            run_data.update({
+                "status": "cancelled",
+                "end_time": datetime.now()
+            })
         if not _append_workflow_result_event(run_id, None, "cancelled"):
             error_message = "Не удалось записать terminal WORKFLOW_RESULT для отмененного workflow"
-            run_data.update({
-                "status": "failed",
-                "end_time": datetime.now(),
-                "error": error_message,
-            })
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                run_data.update({
+                    "status": "failed",
+                    "end_time": datetime.now(),
+                    "error": error_message,
+                })
             self._notify_progress(run_id, "failed", {"error": error_message})
             return False
 

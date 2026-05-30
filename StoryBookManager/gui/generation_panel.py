@@ -34,6 +34,7 @@ class GenerationPanel(ttk.Frame):
         self.pipeline_runner = PipelineRunner()
         self.generation_thread: Optional[threading.Thread] = None
         self.is_generating = False
+        self._generation_lock = threading.Lock()
         self.pipeline_steps: List[str] = []
         self.pipeline_inputs: Dict[str, Any] = {}
         self.supported_languages: List[str] = []
@@ -574,26 +575,42 @@ class GenerationPanel(ttk.Frame):
             self.add_log("❌ Для восстановления отсутствует workflow_id", "error")
             return
 
-        self.step_tracker.reset()
-        for step_id in completed_steps:
-            self.step_tracker.update_step(step_id, "completed")
+        # Тот же guard от двойного запуска, что и в обычных стартах pipeline:
+        # без него двойной клик «Возобновить» мог пройти is_generating==False дважды.
+        already_running = False
+        with self._generation_lock:
+            if self.is_generating:
+                already_running = True
+            else:
+                self.is_generating = True
+        if already_running:
+            self.add_log("Генерация уже выполняется", "warning")
+            return
 
-        # Раньше восстановление шло через _run_from_step_thread и current_step,
-        # теперь используем checkpoint context, чтобы не терять промежуточные outputs.
-        self.add_log(f"▶ Возобновление pipeline из checkpoint {workflow_id}", "info")
-        self.start_generation("Восстановление pipeline", {
-            "project_id": self.current_project.project_id,
-            "workflow_id": workflow_id,
-            "completed_steps": completed_steps,
-            "current_step": current_step,
-        })
+        try:
+            self.step_tracker.reset()
+            for step_id in completed_steps:
+                self.step_tracker.update_step(step_id, "completed")
 
-        self.generation_thread = threading.Thread(
-            target=self._run_resume_pipeline_thread,
-            args=(workflow_id, completed_steps),
-            daemon=True
-        )
-        self.generation_thread.start()
+            # Раньше восстановление шло через _run_from_step_thread и current_step,
+            # теперь используем checkpoint context, чтобы не терять промежуточные outputs.
+            self.add_log(f"▶ Возобновление pipeline из checkpoint {workflow_id}", "info")
+            self.start_generation("Восстановление pipeline", {
+                "project_id": self.current_project.project_id,
+                "workflow_id": workflow_id,
+                "completed_steps": completed_steps,
+                "current_step": current_step,
+            })
+
+            self.generation_thread = threading.Thread(
+                target=self._run_resume_pipeline_thread,
+                args=(workflow_id, completed_steps),
+                daemon=True
+            )
+            self.generation_thread.start()
+        except Exception:
+            self.is_generating = False
+            raise
 
     def run_full_pipeline(self):
         """Запуск полного pipeline"""
@@ -609,45 +626,63 @@ class GenerationPanel(ttk.Frame):
             messagebox.showwarning("Предупреждение", "Выберите проект")
             return
 
-        if self.is_generating:
+        already_running = False
+        with self._generation_lock:
+            if self.is_generating:
+                already_running = True
+            else:
+                self.is_generating = True
+        if already_running:
             messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
             return
 
         task = self.task_text.get("1.0", tk.END).strip()
         if not task:
+            self.is_generating = False
             messagebox.showwarning("Предупреждение", "Введите описание сказки")
             return
 
         try:
             pipeline_inputs = self._collect_pipeline_params()
         except ValueError as e:
+            self.is_generating = False
             messagebox.showerror("Ошибка параметров pipeline", str(e))
             return
-        
-        # Валидация проекта перед запуском
-        validation_result = self.pipeline_runner.validate_project_for_pipeline(self.current_project.project_id)
-        if not validation_result.get("valid", False):
-            result = messagebox.askyesno(
-                "Ошибки валидации",
-                f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
+
+        try:
+            # Валидация проекта перед запуском
+            validation_result = self.pipeline_runner.validate_project_for_pipeline(self.current_project.project_id)
+            if not validation_result.get("valid", False):
+                result = messagebox.askyesno(
+                    "Ошибки валидации",
+                    f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
+                )
+                if not result:
+                    # Отмена ДО start_generation: снимаем guard-флаг и явно
+                    # возвращаем кнопки в disabled (идемпотентно — они и так
+                    # disabled, но защищает от будущих правок порядка вызовов).
+                    self.is_generating = False
+                    self.stop_button.config(state="disabled")
+                    self.pause_button.config(state="disabled", text="⏸ Пауза")
+                    return
+
+            # Запуск в отдельном потоке
+            self.start_generation("Полный pipeline", {
+                "project_id": self.current_project.project_id,
+                "task": task,
+                **pipeline_inputs,
+            })
+
+            # Запускаем pipeline
+            self.generation_thread = threading.Thread(
+                target=self._run_full_pipeline_thread,
+                args=(self.current_project.project_id, task, pipeline_inputs),
+                daemon=True
             )
-            if not result:
-                return
-        
-        # Запуск в отдельном потоке
-        self.start_generation("Полный pipeline", {
-            "project_id": self.current_project.project_id,
-            "task": task,
-            **pipeline_inputs,
-        })
-        
-        # Запускаем pipeline
-        self.generation_thread = threading.Thread(
-            target=self._run_full_pipeline_thread,
-            args=(self.current_project.project_id, task, pipeline_inputs),
-            daemon=True
-        )
-        self.generation_thread.start()
+            self.generation_thread.start()
+        except Exception:
+            self.is_generating = False
+            raise
     
     def _run_full_pipeline_thread(self, project_id: str, task: str,
                                   pipeline_inputs: Dict[str, Any]):
@@ -854,46 +889,63 @@ class GenerationPanel(ttk.Frame):
             messagebox.showwarning("Предупреждение", "Выберите шаг для запуска")
             return
         
-        if self.is_generating:
+        already_running = False
+        with self._generation_lock:
+            if self.is_generating:
+                already_running = True
+            else:
+                self.is_generating = True
+        if already_running:
             messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
             return
 
         try:
             pipeline_inputs = self._collect_pipeline_params()
         except ValueError as e:
+            self.is_generating = False
             messagebox.showerror("Ошибка параметров pipeline", str(e))
             return
 
         task = self.task_text.get("1.0", tk.END).strip() or None
-        
-        # Валидация проекта перед запуском
-        validation_result = self.pipeline_runner.validate_project_for_pipeline(
-            self.current_project.project_id,
-            start_step=step_id,
-        )
-        if not validation_result.get("valid", False):
-            result = messagebox.askyesno(
-                "Ошибки валидации",
-                f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
+
+        try:
+            # Валидация проекта перед запуском
+            validation_result = self.pipeline_runner.validate_project_for_pipeline(
+                self.current_project.project_id,
+                start_step=step_id,
             )
-            if not result:
-                return
-        
-        # Запуск в отдельном потоке
-        self.start_generation(f"Частичный pipeline с {step_id}", {
-            "project_id": self.current_project.project_id,
-            "start_step": step_id,
-            **pipeline_inputs,
-            **({"task": task} if task else {}),
-        })
-        
-        # Запускаем pipeline
-        self.generation_thread = threading.Thread(
-            target=self._run_from_step_thread,
-            args=(self.current_project.project_id, step_id, task, pipeline_inputs),
-            daemon=True
-        )
-        self.generation_thread.start()
+            if not validation_result.get("valid", False):
+                result = messagebox.askyesno(
+                    "Ошибки валидации",
+                    f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
+                )
+                if not result:
+                    # Отмена ДО start_generation: снимаем guard-флаг и явно
+                    # возвращаем кнопки в disabled (идемпотентно — они и так
+                    # disabled, но защищает от будущих правок порядка вызовов).
+                    self.is_generating = False
+                    self.stop_button.config(state="disabled")
+                    self.pause_button.config(state="disabled", text="⏸ Пауза")
+                    return
+
+            # Запуск в отдельном потоке
+            self.start_generation(f"Частичный pipeline с {step_id}", {
+                "project_id": self.current_project.project_id,
+                "start_step": step_id,
+                **pipeline_inputs,
+                **({"task": task} if task else {}),
+            })
+
+            # Запускаем pipeline
+            self.generation_thread = threading.Thread(
+                target=self._run_from_step_thread,
+                args=(self.current_project.project_id, step_id, task, pipeline_inputs),
+                daemon=True
+            )
+            self.generation_thread.start()
+        except Exception:
+            self.is_generating = False
+            raise
 
     def _restart_pipeline_step_from_tracker(self, step_id: str):
         """Перезапускает шаг из контекстного меню StepTracker."""
@@ -909,31 +961,42 @@ class GenerationPanel(ttk.Frame):
             messagebox.showwarning("Предупреждение", "Выберите проект")
             return
 
-        if self.is_generating:
+        already_running = False
+        with self._generation_lock:
+            if self.is_generating:
+                already_running = True
+            else:
+                self.is_generating = True
+        if already_running:
             messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
             return
 
         try:
             pipeline_inputs = self._collect_pipeline_params()
         except ValueError as e:
+            self.is_generating = False
             messagebox.showerror("Ошибка параметров pipeline", str(e))
             return
 
         task = self.task_text.get("1.0", tk.END).strip() or None
 
-        self.start_generation(f"Перезапуск шага {step_id}", {
-            "project_id": self.current_project.project_id,
-            "step_id": step_id,
-            **pipeline_inputs,
-            **({"task": task} if task else {}),
-        })
+        try:
+            self.start_generation(f"Перезапуск шага {step_id}", {
+                "project_id": self.current_project.project_id,
+                "step_id": step_id,
+                **pipeline_inputs,
+                **({"task": task} if task else {}),
+            })
 
-        self.generation_thread = threading.Thread(
-            target=self._run_single_step_thread,
-            args=(self.current_project.project_id, step_id, task, pipeline_inputs),
-            daemon=True,
-        )
-        self.generation_thread.start()
+            self.generation_thread = threading.Thread(
+                target=self._run_single_step_thread,
+                args=(self.current_project.project_id, step_id, task, pipeline_inputs),
+                daemon=True,
+            )
+            self.generation_thread.start()
+        except Exception:
+            self.is_generating = False
+            raise
 
     def regenerate_image(self):
         """Регенерация изображения"""
@@ -1003,9 +1066,14 @@ class GenerationPanel(ttk.Frame):
         messagebox.showinfo("Информация", "Функция автоматического исправления ошибок будет реализована позже")
     
     def start_generation(self, generation_type: str, params: Dict[str, Any]):
-        """Начало генерации"""
+        """Начало генерации.
+
+        Предусловие: self.is_generating уже выставлен в True под self._generation_lock
+        вызывающим (test-and-set guard в run_full_pipeline/run_from_step/resume/restart).
+        Поэтому здесь флаг повторно НЕ ставим — иначе дублируется защита от гонки и
+        новый, не прошедший guard вызывающий мог бы её незаметно обойти.
+        """
         import time
-        self.is_generating = True
         self._is_paused = False
         self._generation_start_time = time.time()
         self._cancel_event.clear()
@@ -1030,6 +1098,9 @@ class GenerationPanel(ttk.Frame):
             elapsed_str = f"{minutes} мин {seconds} сек"
 
         def _update_ui():
+            # Сброс is_generating=False намеренно без _generation_lock: запись bool
+            # атомарна в CPython, а блокировки требует только test-and-set в guard'ах
+            # запуска (там lock уже берётся). _update_ui всегда исполняется в Tk-потоке.
             self.is_generating = False
             self._is_paused = False
             self.stop_button.config(state="disabled")

@@ -88,6 +88,71 @@ _LLM_SAFETY_QUEUE_OVERLOAD_FACTOR = 2
 _LLM_SAFETY_CACHE: "OrderedDict[str, Tuple[float, Dict[str, object]]]" = OrderedDict()
 _LLM_SAFETY_CACHE_LOCK = threading.RLock()
 
+# M6: опциональный negative-TTL кэш для timeout-результатов.
+# По умолчанию выключен: timeout не должен залипать после восстановления LLM.
+# Включается только явным TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_S > 0.
+_LLM_SAFETY_TIMEOUT_CACHE: "OrderedDict[str, float]" = OrderedDict()
+
+
+# Дефолт negative-TTL вынесен в константу: используется и как env-default,
+# и как fail-safe значение при некорректной конфигурации (см. ниже).
+_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_DEFAULT_S = 0.0
+
+
+def _get_llm_safety_timeout_negative_ttl_s() -> float:
+    # Fail-safe: этот геттер вызывается из negative-TTL путей (cache_check вне
+    # try-блока в sql_safety_check и cache_put внутри `except TimeoutError`).
+    # ValueError отсюда вылетел бы МИМО `except (RuntimeError, ..., ValueError)`
+    # (тот ловит только тело try) и сломал бы fail-closed. Поэтому при
+    # некорректном env логируем warning и возвращаем дефолт, а не бросаем.
+    raw = os.getenv(
+        "TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_S",
+        str(_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_DEFAULT_S),
+    )
+    try:
+        value = float(raw)
+        if value < 0:
+            raise ValueError("must be non-negative")
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_S=%r; "
+            "using default %ss",
+            raw,
+            _LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_DEFAULT_S,
+        )
+        return _LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_DEFAULT_S
+    return value
+
+
+def _llm_safety_timeout_cache_check(key: str) -> bool:
+    """Возвращает True если key находится в negative-TTL кэше (ещё не протух)."""
+    neg_ttl = _get_llm_safety_timeout_negative_ttl_s()
+    if neg_ttl == 0:
+        return False
+    now = time.time()
+    with _LLM_SAFETY_CACHE_LOCK:
+        ts = _LLM_SAFETY_TIMEOUT_CACHE.get(key)
+        if ts is None:
+            return False
+        if now - ts > neg_ttl:
+            _LLM_SAFETY_TIMEOUT_CACHE.pop(key, None)
+            return False
+        return True
+
+
+def _llm_safety_timeout_cache_put(key: str) -> None:
+    """Добавляет key в negative-TTL кэш с текущим временем."""
+    neg_ttl = _get_llm_safety_timeout_negative_ttl_s()
+    if neg_ttl == 0:
+        return
+    cap = _get_llm_safety_timeout_cache_max()
+    now = time.time()
+    with _LLM_SAFETY_CACHE_LOCK:
+        _LLM_SAFETY_TIMEOUT_CACHE[key] = now
+        _LLM_SAFETY_TIMEOUT_CACHE.move_to_end(key)
+        while len(_LLM_SAFETY_TIMEOUT_CACHE) > cap:
+            _LLM_SAFETY_TIMEOUT_CACHE.popitem(last=False)
+
 
 def _get_llm_safety_timeout_s() -> float:
     raw = os.getenv("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_S", "30")
@@ -128,10 +193,24 @@ def _get_llm_safety_cache_max() -> int:
     return value
 
 
+def _get_llm_safety_timeout_cache_max() -> int:
+    raw = os.getenv("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX", "512")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX: {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX must be positive")
+    return value
+
+
 def _clear_llm_safety_cache() -> None:
     """Полная очистка TTL-кеша LLM safety (используется в тестах)."""
     with _LLM_SAFETY_CACHE_LOCK:
         _LLM_SAFETY_CACHE.clear()
+        _LLM_SAFETY_TIMEOUT_CACHE.clear()
 
 
 def _llm_safety_cache_key(sql_query: str, dsn: Optional[str] = None) -> str:
@@ -605,6 +684,9 @@ def sql_safety_check(
     # safe-ответ мог бы скрыть новый static-deny после reload конфигурации или
     # изменения валидатора.
     cache_key = _llm_safety_cache_key(sql_query, dsn=effective_dsn)
+
+    # M6: сначала проверяем positive cache — если успешный аудит уже есть
+    # (в том числе после восстановления LLM), используем его, минуя negative-TTL.
     cached = _llm_safety_cache_get(cache_key)
     if cached is not None:
         cached_advisory = cached.get("advisory_issues")
@@ -612,6 +694,21 @@ def sql_safety_check(
             safety_result["advisory_issues"] = copy.deepcopy(cached_advisory)
         safety_result["llm_audit"] = cached.get("llm_audit", "ok")
         safety_result["safety_status"] = "safe"
+        return safety_result
+
+    # M6: только если positive cache пуст — проверяем negative-TTL кэш.
+    # Если этот SQL уже таймаутил в течение последних
+    # TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_S секунд (по умолчанию 60),
+    # не порождаем новую LLM-задачу.
+    if _llm_safety_timeout_cache_check(cache_key):
+        safety_result["is_safe"] = False
+        safety_result["safety_status"] = "failed"
+        safety_result["llm_audit"] = "timeout"
+        safety_result["llm_audit_error"] = "repeated timeout (negative-TTL cache hit)"
+        safety_result.setdefault("issues", []).append({
+            "issue_type": "LLM_AUDIT_TIMEOUT",
+            "description": "LLM-based safety audit recently timed out; skipping retry.",
+        })
         return safety_result
 
     # Дополнительный LLM-аудит: содержательные LLM-находки идут в advisory,
@@ -645,6 +742,17 @@ def sql_safety_check(
             "issue_type": "LLM_AUDIT_TIMEOUT",
             "description": f"LLM-based safety audit timed out: {safe_error}",
         })
+        # M6: кешируем факт таймаута в negative-TTL кэш, чтобы повторные
+        # запросы того же SQL не порождали новых LLM-задач во время деградации.
+        # Defense-in-depth: ошибка наполнения кэша (например, невалидный
+        # TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX) не должна вылетать наружу —
+        # safety_result уже помечен fail-closed (failed/timeout), кэш опционален.
+        try:
+            _llm_safety_timeout_cache_put(cache_key)
+        except Exception as cache_exc:  # noqa: BLE001 — кэш best-effort
+            logger.debug(
+                "negative-TTL timeout cache put failed (ignored): %s", cache_exc
+            )
     except (RuntimeError, json.JSONDecodeError, ValueError) as e:
         # Узкий список: реальные runtime-ошибки LLM-вызова.
         # - RuntimeError: call_openai_api недоступен, сетевой сбой.

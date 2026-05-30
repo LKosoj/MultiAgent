@@ -110,24 +110,34 @@ def _has_cycle(joins: List[Dict[str, Any]]) -> bool:
         graph[b].add(a)
 
     visited: set = set()
-    rec_stack: set = set()
 
-    def _dfs(node: str, parent: Optional[str]) -> bool:
-        visited.add(node)
-        rec_stack.add(node)
-        for neighbor in graph[node]:
-            if neighbor == parent:
-                continue
-            if neighbor in rec_stack:
-                return True
-            if neighbor not in visited and _dfs(neighbor, node):
-                return True
-        rec_stack.discard(node)
-        return False
-
-    for node in list(graph.keys()):
-        if node not in visited and _dfs(node, None):
-            return True
+    for start in list(graph.keys()):
+        if start in visited:
+            continue
+        # Итеративный DFS с явным стеком: (node, parent).
+        # rec_stack хранит узлы на текущем пути от корня — аналог
+        # call-stack рекурсивной версии.
+        stack = [(start, None)]
+        rec_stack: set = set()
+        while stack:
+            node, parent = stack[-1]
+            if node not in visited:
+                visited.add(node)
+                rec_stack.add(node)
+            # Ищем необработанного соседа
+            advanced = False
+            for neighbor in graph[node]:
+                if neighbor == parent:
+                    continue
+                if neighbor in rec_stack:
+                    return True
+                if neighbor not in visited:
+                    stack.append((neighbor, node))
+                    advanced = True
+                    break
+            if not advanced:
+                rec_stack.discard(node)
+                stack.pop()
     return False
 
 

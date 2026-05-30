@@ -45,6 +45,31 @@ def _load_run_manager_with_runner_stub(monkeypatch, run_agent):
 
 
 @pytest.mark.asyncio
+async def test_start_run_rejects_run_id_with_persisted_history(tmp_path, monkeypatch):
+    async def fake_run_agent(_input_data):
+        raise AssertionError("run_agent must not start for an existing persisted run_id")
+        yield
+
+    rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    store.append(
+        run_id,
+        EventType.RUN_FINISHED.value,
+        {
+            "type": EventType.RUN_FINISHED.value,
+            "threadId": f"thread-{run_id}",
+            "runId": run_id,
+            "timestamp": int(time.time() * 1000),
+        },
+    )
+    manager = rm.RunManager(store, evict_ttl_seconds=0)
+
+    with pytest.raises(ValueError, match="run_id already exists"):
+        await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+
+
+@pytest.mark.asyncio
 async def test_short_run_subscribers_always_receive_finished(tmp_path, monkeypatch):
     """100 одновременных коротких run'ов: каждый подписчик должен получить RUN_FINISHED.
 

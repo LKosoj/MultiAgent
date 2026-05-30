@@ -74,16 +74,22 @@ def story_editor_tool(
     style_data = {}
     
     # Загружаем контекстные данные
-    for filename, var_name in [
-        ("characters.json", "characters_data"),
-        ("consistency_rules.json", "consistency_rules"), 
-        ("locations.json", "locations_data"),
+    for filename, dest in [
+        ("characters.json", "characters"),
+        ("consistency_rules.json", "consistency"),
+        ("locations.json", "locations"),
     ]:
         file_path = f"{bible_dir}/{filename}"
         if os.path.exists(file_path):
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
-                    locals()[var_name] = json.load(f)
+                    _data = json.load(f)
+                if dest == "characters":
+                    characters_data = _data
+                elif dest == "consistency":
+                    consistency_rules = _data
+                elif dest == "locations":
+                    locations_data = _data
             except Exception as e:
                 logger.warning(f"Не удалось загрузить {filename}: {e}")
     
@@ -169,12 +175,8 @@ def story_editor_tool(
             "instruction": f"Отредактируй и улучши текст глав {chapters_to_edit}, сохранив структуру и сюжет."
         }
         
-        payload = f"Название: {title}\nГлавы: {pages_to_edit}\nПерсонажи: {characters_data}\nЛокации: {locations_data}\nКонсистентность: {consistency_rules}\nСтиль: {style_data}\nБриф: {brief}\n\n"
-        payload += "Используя инструкции выше, отредактируй и улучши текст глав ниже, сохранив структуру и сюжет. Не используй текст инструкций для редактирования, используй только данные из инструкций.\n\nТЕКСТ ГЛАВ:\n\n{chapters_to_edit}"
-
-
         # Вызываем ИИ для редактирования
-        edited_result = _edit_chapters_batch(payload, system_prompt)
+        edited_result = _edit_chapters_batch(payload_json, system_prompt)
         if edited_result:
             edited_title = edited_result.get("title", title)
             edited_chapters = edited_result.get("pages", [])
@@ -236,12 +238,17 @@ def story_editor_tool(
         "pages": edited_pages
     }
     
-    # Создаем бэкап оригинала
-    backup_path = f"{story_path}.backup"
-    if not os.path.exists(backup_path):
-        import shutil
-        shutil.copy2(story_path, backup_path)
-        logger.info(f"Создан бэкап оригинала: {backup_path}")
+    # Создаем rolling backup: каждый запуск сохраняет предыдущую версию с timestamp.
+    import shutil
+    from datetime import datetime as _dt
+    _ts = _dt.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = f"{story_path}.backup_{_ts}"
+    _n = 1
+    while os.path.exists(backup_path):
+        backup_path = f"{story_path}.backup_{_ts}_{_n}"
+        _n += 1
+    shutil.copy2(story_path, backup_path)
+    logger.info(f"Создан бэкап предыдущей версии: {backup_path}")
     
     # Сохраняем отредактированную версию
     with open(story_path, "w", encoding="utf-8") as f:

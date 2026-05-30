@@ -103,7 +103,7 @@ profiles:
   # Также ужесточены keyword'ы (SET/RESET/USE/SHOW/ANALYZE) и лимиты длины
   # запроса / IN-списка. Активируется env TEXT_TO_SQL_SAFETY_PROFILE=extended.
   # ---------------------------------------------------------------------------
-  extended:
+  extended: &extended_profile
     forbidden_keywords:
       - INSERT
       - UPDATE
@@ -208,97 +208,8 @@ profiles:
   # существующие deployment'ы могут использовать имя 'strict'). По
   # содержимому идентичен `extended`. Не удалять без согласованного
   # переименования в doc/MultiAgent/06_*.md и doc/TEXT_TO_SQL_CONFIG.md.
+  # L42: используем YAML anchor вместо дублирования — при добавлении новой
+  # функции/ключевого слова достаточно обновить только `extended`.
   # ---------------------------------------------------------------------------
   strict:
-    forbidden_keywords:
-      - INSERT
-      - UPDATE
-      - DELETE
-      - DROP
-      - TRUNCATE
-      - ALTER
-      - CREATE
-      - REPLACE
-      - VACUUM
-      - ATTACH
-      - DETACH
-      - GRANT
-      - REVOKE
-      - PRAGMA
-      - CALL
-      - EXEC
-      - EXECUTE
-      - MERGE
-      - COPY
-      - SET
-      - RESET
-      - USE
-      - SHOW
-      - ANALYZE
-    # W8-T8: synchronized with `extended` profile (PG admin + ClickHouse table fns).
-    forbidden_functions:
-      - pg_sleep
-      - pg_read_file
-      - pg_read_binary_file
-      - pg_ls_dir
-      - lo_export
-      - lo_import
-      - load_file
-      - into outfile
-      - into dumpfile
-      - xp_cmdshell
-      - xp_regread
-      - sp_executesql
-      - information_schema
-      - pg_catalog
-      - mysql.user
-      - current_user
-      - current_setting
-      - pg_read_server_files
-      - pg_terminate_backend
-      - pg_cancel_backend
-      - dblink
-      - dblink_exec
-      - dblink_send_query
-      - file
-      - url
-      - s3
-      - hdfs
-      - mysql
-      - postgresql
-      - remote
-      - remoteSecure
-      - cluster
-      - clusterAllReplicas
-      - system.shutdown
-      - system.kill
-    ast_forbidden_stmt_classes:
-      - Insert
-      - Update
-      - Delete
-      - Drop
-      - Create
-      - Alter
-      - TruncateTable
-      - Merge
-      - Set
-      - Use
-    ast_forbidden_command_words:
-      - LOAD
-      - BACKUP
-      - RESTORE
-      - LISTEN
-      - NOTIFY
-      - INSTALL
-      - INVALIDATE
-      - REFRESH
-      - LOCK
-      - UNLOCK
-      - SET
-      - RESET
-      - USE
-      - SHOW
-      - ANALYZE
-      - KILL
-    max_query_length: 4000
-    max_in_list_size: 200
+    <<: *extended_profile

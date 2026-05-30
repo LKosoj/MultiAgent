@@ -35,12 +35,12 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
         # Удаляем существующие коллекции
         try:
             handler.chroma_client.delete_collection("strategic_memory")
-        except:
+        except Exception:
             pass  # Коллекция может не существовать
-        
+
         try:
             handler.chroma_client.delete_collection("tactical_memory")
-        except:
+        except Exception:
             pass  # Коллекция может не существовать
     except Exception as e:
         print(f"⚠️ Предупреждение при удалении коллекций: {e}")

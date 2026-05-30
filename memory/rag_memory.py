@@ -499,6 +499,7 @@ class RagMemory(AgentMemory):
         # и НЕ режем весь контекст тупо посередине: сначала выкидываем низкоприоритетные секции.
         full_context = "\n\n".join(context_parts)
 
+        trimmed_parts = context_parts
         if len(full_context) > token_limit:
             # Пытаемся убрать "Последние действия" как наименее важную секцию
             trimmed_parts = [p for p in context_parts if not p.startswith("[Последние действия]:")]
@@ -506,7 +507,7 @@ class RagMemory(AgentMemory):
 
         if len(full_context) > token_limit:
             # Если всё ещё не помещается — убираем "Релевантную информацию"
-            trimmed_parts = [p for p in (trimmed_parts if 'trimmed_parts' in locals() else context_parts)
+            trimmed_parts = [p for p in trimmed_parts
                              if not p.startswith("[Релевантная информация]:")]
             full_context = "\n\n".join(trimmed_parts)
 
@@ -833,8 +834,7 @@ class RagMemory(AgentMemory):
         Args:
             model: LLM-модель для суммаризации
         """
-        self._summary_model = model_summary
-        #self._summary_model = model
+        self._summary_model = model
         
     def search_memory(self, query: str, max_results: int = 10) -> List[Dict]:
         """

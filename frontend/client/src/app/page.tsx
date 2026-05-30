@@ -14,7 +14,6 @@ import { TextToSqlSection } from "./components/sections/TextToSqlSection";
 import {
   ConfigSection,
   TelemetrySection,
-  LogsSection,
   ToolsSection,
   SystemSection,
 } from "./components/sections/ActionCardSections";
@@ -116,7 +115,6 @@ const wildcardRenderer = defineToolCallRenderer({
 });
 
 const nowStamp = () => new Date().toLocaleTimeString("ru-RU");
-const DEBUG_SERVICE = false;
 
 const stringifyValue = (value: unknown) => {
   if (value === null || value === undefined) return "";
@@ -127,18 +125,6 @@ const stringifyValue = (value: unknown) => {
     return JSON.stringify(value);
   } catch {
     return "";
-  }
-};
-
-const toDisplayValue = (value: unknown, fallback = "—") => {
-  if (value === null || value === undefined) return fallback;
-  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return fallback;
   }
 };
 
@@ -157,12 +143,12 @@ const getModelKey = (model: unknown) => {
   return stringifyValue(model);
 };
 
-function AguiStudio({ backendUrl }: { backendUrl: string }) {
+function AguiStudio() {
   const { agent } = useAgent({ agentId: "default" });
   const { copilotkit } = useCopilotKit();
 
   const [results, setResults] = useState<ServiceResult[]>([]);
-  const [pendingTick, setPendingTick] = useState(0);
+  const [, setPendingTick] = useState(0);
   const [activeSection, setActiveSection] = useState("dashboard");
   const [serviceReady, setServiceReady] = useState(false);
 
@@ -210,7 +196,6 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
   const [workflowInputs, setWorkflowInputs] = useState<Record<string, unknown>>({});
   const [workflowParams, setWorkflowParams] = useState<Record<string, string>>({});
   const [workflowOptions, setWorkflowOptions] = useState({ useEnhanced: true, enableTelemetry: true });
-  const [workflowYaml, setWorkflowYaml] = useState<Record<string, string>>({});
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRunInfo[]>([]);
   const [workflowRunsLoading, setWorkflowRunsLoading] = useState(false);
   const [workflowRunsError, setWorkflowRunsError] = useState<string | null>(null);
@@ -605,25 +590,18 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
       );
       return queued;
     },
-    [copilotkit, agent],
+    [copilotkit, agent, appendResult],
   );
 
   useEffect(() => {
     currentWorkflowRunIdRef.current = currentWorkflowRunId;
   }, [currentWorkflowRunId]);
 
-  const clearResults = () => setResults([]);
   const clearProgressResults = () => {
     setResults((prev) => prev.filter((entry) => entry.action !== "service.progress"));
   };
   const pendingNonSilent = Array.from(pendingMapRef.current.values()).filter((pending) => !pending.silent);
   const isBusy = pendingNonSilent.length > 0;
-
-  const buildSessionId = () => {
-    const now = new Date();
-    const stamp = now.toISOString().replace(/[-:]/g, "").slice(0, 15);
-    return `ui_${stamp}`;
-  };
 
   // Agents logic
   const loadAgentProfiles = useCallback(async () => {
@@ -736,60 +714,6 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
     setSelectedProfile(profile);
     setAgentTab("run");
   }, []);
-
-  const handleCreateInstance = useCallback(
-    async (profile: AgentProfile) => {
-      const sessionId = buildSessionId();
-      const result = (await runServiceAction("agents.create", {
-        profile_name: profile.name,
-        session_id: sessionId,
-      })) as { agent_id?: string };
-      if (result?.agent_id) {
-        setCreatedAgents((prev) => ({
-          ...prev,
-          [result.agent_id as string]: {
-            profile_name: profile.name,
-            session_id: sessionId,
-            created_at: new Date().toISOString(),
-          },
-        }));
-      }
-    },
-    [runServiceAction],
-  );
-
-  const handleTestRun = useCallback(
-    async (profile: AgentProfile) => {
-      const testTasks: Record<string, string> = {
-        researcher: "Найди информацию о последних достижениях в области ИИ",
-        analyst: "Проанализируй текущие тренды на рынке технологий",
-        manager: "Создай план работы команды на неделю",
-        code_executor: "Напиши простую Python функцию для сортировки списка",
-        validator: "Проверь корректность данного JSON: {'test': 'value'}",
-        visualizer: "Создай диаграмму процесса разработки ПО",
-      };
-      const task = testTasks[profile.name] ?? "Выполни простую тестовую задачу";
-      const response = (await runServiceAction("agents.run", {
-        agent_id_or_profile: profile.name,
-        task,
-        enable_telemetry: true,
-      })) as { run_id?: string };
-      const runId = response?.run_id ?? "unknown";
-      setAgentRunHistory((prev) => [
-        {
-          run_id: runId,
-          profile_name: profile.name,
-          status: "running",
-          task,
-          start_time: new Date().toLocaleTimeString("ru-RU"),
-        },
-        ...prev,
-      ]);
-      setAgentTab("monitor");
-      void refreshActiveRuns();
-    },
-    [refreshActiveRuns, runServiceAction],
-  );
 
   const handleRunAgent = useCallback(async () => {
     if (!selectedProfile || !agentRunForm.task.trim()) return;
@@ -1358,8 +1282,6 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
     void loadMemoryStatus();
   }, [activeSection, loadMemoryStatus]);
 
-  const backendHint = `Backend: ${backendUrl}`;
-
   return (
     <div className="app-shell">
       <header className="app-header">
@@ -1416,8 +1338,6 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
               setProfileSearch={setProfileSearch}
               filteredProfiles={filteredProfiles}
               handleSelectProfile={handleSelectProfile}
-              handleTestRun={handleTestRun}
-              handleCreateInstance={handleCreateInstance}
               getModelLabel={getModelLabel}
               selectedProfile={selectedProfile}
               agentRunForm={agentRunForm}
@@ -1505,7 +1425,6 @@ function AguiStudio({ backendUrl }: { backendUrl: string }) {
               setBuilderSteps={setBuilderSteps}
               setBuilderYaml={setBuilderYaml}
               setBuilderSaveName={setBuilderSaveName}
-              setBuilderError={setBuilderError}
               handleGenerateYaml={handleGenerateYaml}
               handleSaveYaml={handleSaveYaml}
             />
@@ -1814,7 +1733,7 @@ export default function Page() {
 
   return (
     <CopilotKitProvider agents__unsafe_dev_only={{ default: agent as any }} renderToolCalls={[wildcardRenderer]} showDevConsole="auto">
-      <AguiStudio backendUrl={backendUrl} />
+      <AguiStudio />
     </CopilotKitProvider>
   );
 }

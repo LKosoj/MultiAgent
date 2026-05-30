@@ -443,7 +443,7 @@ class _RegexValidator:
         """
         found = False
         for forbidden_keyword in self.forbidden_keywords:
-            if re.search(fr"\b{forbidden_keyword}\b", upper_sql):
+            if re.search(fr"\b{re.escape(forbidden_keyword)}\b", upper_sql):
                 issues.append({
                     "issue_type": "FORBIDDEN_STATEMENT",
                     "description": f"Forbidden SQL keyword '{forbidden_keyword}' detected."
@@ -558,7 +558,7 @@ class _RegexValidator:
                 logger.warning(
                     "sqlglot tokenize failed in contains_comments: %s; sql=%r",
                     e,
-                    source[:200],
+                    _redact_safety_value(source[:200]),
                 )
                 return True
             for tok in tokens:
@@ -1173,6 +1173,11 @@ class SQLSafetyValidator:
         return result
 
     def _validate_inner(self, sql_query: str, dsn: str | None = None) -> Dict[str, Any]:
+        with self._reload_lock:
+            _regex = self._regex
+            _sqlglot_v = self._sqlglot
+            _max_query_length = self.max_query_length
+
         q = sql_query.strip()
 
         safety_level = os.getenv("TEXT_TO_SQL_SAFETY_LEVEL", "strict").strip().lower()
@@ -1191,6 +1196,12 @@ class SQLSafetyValidator:
             # должен быть удалён в будущем. В production по умолчанию режим
             # отключён hard-fail'ом; поднять флаг SQL_SAFETY_ALLOW_LEGACY=1
             # можно только осознанно.
+            # Всегда логируем WARNING при USE_SQLGLOT=0, независимо от среды,
+            # чтобы некорректная конфигурация была видна (M119).
+            logger.warning(
+                "SQL safety: USE_SQLGLOT=0 — legacy regex-only validation is active; "
+                "AST-проверки отключены. Рекомендуется USE_SQLGLOT=1 в production."
+            )
             env_name = (
                 os.getenv("ENV") or os.getenv("APP_ENV") or ""
             ).strip().lower()
@@ -1211,10 +1222,22 @@ class SQLSafetyValidator:
                     "SQL safety: legacy USE_SQLGLOT=0 mode allowed in production via "
                     "SQL_SAFETY_ALLOW_LEGACY=1; regex-only validation is unsafe."
                 )
-            return self._validate_legacy(q, dsn=dsn)
+            return self._validate_legacy(
+                q,
+                dsn=dsn,
+                _regex_snap=_regex,
+                _sqlglot_snap=_sqlglot_v,
+                _max_query_length_snap=_max_query_length,
+            )
 
         if self._sqlglot_available:
-            return self._validate_with_sqlglot(q, dsn=dsn)
+            return self._validate_with_sqlglot(
+                q,
+                dsn=dsn,
+                _regex_snap=_regex,
+                _sqlglot_snap=_sqlglot_v,
+                _max_query_length_snap=_max_query_length,
+            )
 
         return {
             "is_safe": False,
@@ -1227,8 +1250,20 @@ class SQLSafetyValidator:
     # ------------------------------------------------------------------
     # ORCHESTRATION (legacy + sqlglot paths)
     # ------------------------------------------------------------------
-    def _validate_legacy(self, sql_query: str, dsn: str | None = None) -> Dict[str, Any]:
+    def _validate_legacy(
+        self,
+        sql_query: str,
+        dsn: str | None = None,
+        _regex_snap=None,
+        _sqlglot_snap=None,
+        _max_query_length_snap=None,
+    ) -> Dict[str, Any]:
         """Legacy read-only validation used only when sqlglot is explicitly disabled."""
+        # Используем снапшот объектов из _validate_inner (если переданы), чтобы
+        # один validate()-вызов работал с консистентной парой объектов (M25/M26/M30).
+        regex = _regex_snap if _regex_snap is not None else self._regex
+        sqlglot_v = _sqlglot_snap if _sqlglot_snap is not None else self._sqlglot
+
         with _SQLGLOT_METRICS_LOCK:
             _SQLGLOT_METRICS["fallback_count"] += 1
 
@@ -1236,7 +1271,6 @@ class SQLSafetyValidator:
         strict_dsn = bool(dsn and str(dsn).strip())
         dialect_name = get_current_dialect_name(dsn, strict=strict_dsn)
         masked_sql = self._mask_string_literals(sql_query, dialect_name)
-        upper_sql = masked_sql.upper().strip()
 
         if self._contains_comments(masked_sql, original_query=sql_query, dialect=dialect_name):
             issues.append({
@@ -1244,10 +1278,23 @@ class SQLSafetyValidator:
                 "description": "SQL comments are not allowed."
             })
 
+        # L55: маскируем quoted-идентификаторы через лексер, чтобы
+        # check_forbidden_functions не давал ложных срабатываний на
+        # идентификаторы вида "current_user" или `current_user`.
+        # Аналогично _validate_with_sqlglot (строка ~1306).
+        # Маскировщик берёт forbidden_keywords из снапшота regex (а не из
+        # self.forbidden_keywords), чтобы пара (regex, keywords) была
+        # консистентной при конкурентном reload() (M25/M26/M30).
+        masked_for_regex = self._masker.mask_identifiers_via_lex(
+            masked_sql, dialect_name, regex.forbidden_keywords
+        )
+        upper_sql = masked_for_regex.upper().strip()
+        upper_for_functions = masked_sql.upper().strip()
+
         # EPIC 2.8: накапливаем все запрещённые ключевые слова, без early break,
         # чтобы дать пользователю полную картину нарушений за один проход.
-        self._regex.check_forbidden_keywords(upper_sql, issues)
-        self._regex.check_forbidden_functions(upper_sql, issues)
+        regex.check_forbidden_keywords(upper_sql, issues)
+        regex.check_forbidden_functions(upper_for_functions, issues)
 
         if len([s for s in masked_sql.split(";") if s.strip()]) > 1:
             issues.append({
@@ -1255,20 +1302,21 @@ class SQLSafetyValidator:
                 "description": "Multiple statements are not allowed."
             })
 
-        if self._has_explain_analyze(upper_sql):
+        if regex.has_explain_analyze(upper_sql):
             issues.append({
                 "issue_type": "FORBIDDEN_EXPLAIN_ANALYZE",
                 "description": "EXPLAIN ANALYZE executes the query and is not allowed."
             })
 
-        if not self._is_valid_select_or_cte(masked_sql, sql_query, dsn=dsn):
+        if not sqlglot_v.is_valid_select_or_cte(masked_sql, sql_query, dsn=dsn):
             issues.append({
                 "issue_type": "NOT_SELECT",
                 "description": "Only SELECT queries, CTEs, and safe DESCRIBE/EXPLAIN commands are allowed."
             })
 
-        self._check_in_lists(masked_sql, issues)
-        if len(sql_query) > self.max_query_length:
+        regex.check_in_lists(masked_sql, issues)
+        max_query_length = _max_query_length_snap if _max_query_length_snap is not None else self.max_query_length
+        if len(sql_query) > max_query_length:
             issues.append({
                 "issue_type": "QUERY_TOO_LARGE",
                 "description": "Query is too long."
@@ -1276,8 +1324,20 @@ class SQLSafetyValidator:
 
         return {"is_safe": len(issues) == 0, "issues": issues}
 
-    def _validate_with_sqlglot(self, sql_query: str, dsn: str | None = None) -> Dict[str, Any]:
+    def _validate_with_sqlglot(
+        self,
+        sql_query: str,
+        dsn: str | None = None,
+        _regex_snap=None,
+        _sqlglot_snap=None,
+        _max_query_length_snap=None,
+    ) -> Dict[str, Any]:
         """Валидация с использованием sqlglot AST."""
+        # Используем снапшот объектов из _validate_inner (если переданы),
+        # чтобы один validate()-вызов работал с консистентной парой (M25/M26/M30).
+        regex = _regex_snap if _regex_snap is not None else self._regex
+        sqlglot_v = _sqlglot_snap if _sqlglot_snap is not None else self._sqlglot
+
         with _SQLGLOT_METRICS_LOCK:
             _SQLGLOT_METRICS["parse_attempts"] += 1
             _SQLGLOT_METRICS["validation_count"] += 1
@@ -1303,12 +1363,18 @@ class SQLSafetyValidator:
         # EPIC 2.8: накапливаем все нарушения; AST-парсинг пропускаем, если
         # найден forbidden keyword — sqlglot всё равно не сможет надёжно
         # распарсить DML/DDL, но все накопленные issues остаются в ответе.
-        masked_for_regex = self._mask_identifiers_via_lex(masked_sql, dialect_name)
+        # Маскировщик берёт forbidden_keywords из снапшота regex (а не из
+        # self.forbidden_keywords), чтобы пара (regex, keywords) была
+        # консистентной при конкурентном reload() (M25/M26/M30).
+        masked_for_regex = self._masker.mask_identifiers_via_lex(
+            masked_sql, dialect_name, regex.forbidden_keywords
+        )
         upper_sql = masked_for_regex.upper().strip()
-        has_forbidden_keyword = self._regex.check_forbidden_keywords(upper_sql, issues)
-        if self._regex.check_forbidden_functions(upper_sql, issues):
+        upper_for_functions = masked_sql.upper().strip()
+        has_forbidden_keyword = regex.check_forbidden_keywords(upper_sql, issues)
+        if regex.check_forbidden_functions(upper_for_functions, issues):
             has_forbidden_keyword = True
-        if self._has_explain_analyze(upper_sql):
+        if regex.has_explain_analyze(upper_sql):
             issues.append({
                 "issue_type": "FORBIDDEN_EXPLAIN_ANALYZE",
                 "description": "EXPLAIN ANALYZE executes the query and is not allowed."
@@ -1363,7 +1429,7 @@ class SQLSafetyValidator:
 
                     # Проверка каждого стейтмента
                     for stmt in statements:
-                        self._validate_statement_ast(stmt, issues)
+                        sqlglot_v.validate_statement_ast(stmt, issues)
 
             except Exception as e:
                 with _SQLGLOT_METRICS_LOCK:
@@ -1377,7 +1443,8 @@ class SQLSafetyValidator:
 
         # Проверка длины запроса — выполняется всегда, чтобы пользователь видел
         # все нарушения за один проход (EPIC 2.8).
-        if len(sql_query) > self.max_query_length:
+        max_query_length = _max_query_length_snap if _max_query_length_snap is not None else self.max_query_length
+        if len(sql_query) > max_query_length:
             issues.append({
                 "issue_type": "QUERY_TOO_LARGE",
                 "description": "Query is too long."

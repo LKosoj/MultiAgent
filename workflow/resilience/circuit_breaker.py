@@ -1,6 +1,7 @@
 """
 Circuit Breaker Pattern для защиты от cascade failures
 """
+import collections
 import logging
 from typing import Dict, Any, Callable, Optional
 from datetime import datetime, timedelta
@@ -42,7 +43,7 @@ class AgentCircuitBreaker:
         self.total_calls = 0
         self.total_failures = 0
         self.total_successes = 0
-        self.state_changes = []
+        self.state_changes = collections.deque(maxlen=100)
         
     async def call(self, agent_func: Callable, *args, **kwargs) -> Any:
         """Выполнить вызов агента через circuit breaker"""

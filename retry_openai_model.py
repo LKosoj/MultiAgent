@@ -23,6 +23,7 @@ import random
 import logging
 import re
 import copy
+import threading
 from typing import Any, Dict, List, Optional
 from smolagents import OpenAIServerModel, ChatMessage, logger
 import httpx
@@ -83,6 +84,7 @@ class RetryOpenAIServerModel:
         retry_delay_base: float = 2.0,
         retry_on_errors: Optional[List[str]] = None,
         fallback_models: Optional[str] = None,
+        debug_logging: bool = False,
         **kwargs
     ):
         """
@@ -104,6 +106,7 @@ class RetryOpenAIServerModel:
         self.api_base = api_base
         self.api_key = api_key
         self.kwargs = kwargs
+        self.debug_logging = debug_logging
         
         # Парсим fallback модели
         self.model_ids = [model_id.strip()]
@@ -113,6 +116,7 @@ class RetryOpenAIServerModel:
         
         self.current_model_index = 0
         self.connection_error_count = 0  # Счетчик connection errors подряд
+        self._state_lock = threading.Lock()
         
         # Извлекаем client_kwargs из kwargs, если есть
         client_kwargs = kwargs.pop('client_kwargs', {})
@@ -346,41 +350,42 @@ class RetryOpenAIServerModel:
     def _should_fallback(self, error: Exception) -> bool:
         """
         Определяет, нужно ли переключиться на fallback модель.
-        
+
         Args:
             error: Исключение для анализа
-            
+
         Returns:
             bool: True если нужно переключиться на fallback модель
         """
         error_str = str(error).lower()
-        
-        # Для connection error требуем несколько ошибок подряд
-        if "connection error" in error_str:
-            self.connection_error_count += 1
-            # Переключаемся на fallback только после 3 connection errors подряд
-            return self.connection_error_count >= 3
-        else:
-            # Сбрасываем счетчик, если ошибка не connection error
-            self.connection_error_count = 0
-            # Для других ошибок переключаемся сразу
-            fallback_keywords = [
-                '429', 'rate limit', 'http 429', 'quota exceeded', 'billing', 'insufficient funds',
-                # Добавляем 400 ошибки "Model not found" - retry бессмысленны, нужен fallback
-                'model not found', '404: model not found', 'http 400', '400 bad request',
-                # Добавляем 404 ошибки "Not Found" - часто означают недоступность endpoint или модели
-                '404', 'not found', 'http 404', '404 not found',
-                # Добавляем 503 ошибки "Service Unavailable" - часто означают проблемы с моделью
-                '503', 'service unavailable', 'http 503',
-                # Добавляем ошибки некорректного response объекта - retry бессмысленны, нужен fallback
-                'вернула некорректный response объект', 'отсутствует атрибут', "'nonetype' object has no attribute",
-                "'nonetype' object is not subscriptable",  # response.choices = None
-                'response object has no attribute', 'invalid response structure',
-                # Добавляем ошибки пустых ответов - retry бессмысленны, нужен fallback
-                'вернула пустой ответ', 'empty response', 'does not contain any json blob',
-                'the model output does not contain any json blob', 'вернула none'
-            ]
-            return any(keyword in error_str for keyword in fallback_keywords)
+
+        with self._state_lock:
+            # Для connection error требуем несколько ошибок подряд
+            if "connection error" in error_str:
+                self.connection_error_count += 1
+                # Переключаемся на fallback только после 3 connection errors подряд
+                return self.connection_error_count >= 3
+            else:
+                # Сбрасываем счетчик, если ошибка не connection error
+                self.connection_error_count = 0
+                # Для других ошибок переключаемся сразу
+                fallback_keywords = [
+                    '429', 'rate limit', 'http 429', 'quota exceeded', 'billing', 'insufficient funds',
+                    # Добавляем 400 ошибки "Model not found" - retry бессмысленны, нужен fallback
+                    'model not found', '404: model not found', 'http 400', '400 bad request',
+                    # Добавляем 404 ошибки "Not Found" - часто означают недоступность endpoint или модели
+                    '404', 'not found', 'http 404', '404 not found',
+                    # Добавляем 503 ошибки "Service Unavailable" - часто означают проблемы с моделью
+                    '503', 'service unavailable', 'http 503',
+                    # Добавляем ошибки некорректного response объекта - retry бессмысленны, нужен fallback
+                    'вернула некорректный response объект', 'отсутствует атрибут', "'nonetype' object has no attribute",
+                    "'nonetype' object is not subscriptable",  # response.choices = None
+                    'response object has no attribute', 'invalid response structure',
+                    # Добавляем ошибки пустых ответов - retry бессмысленны, нужен fallback
+                    'вернула пустой ответ', 'empty response', 'does not contain any json blob',
+                    'the model output does not contain any json blob', 'вернула none'
+                ]
+                return any(keyword in error_str for keyword in fallback_keywords)
     
     def _switch_to_fallback(self) -> bool:
         """
@@ -397,31 +402,32 @@ class RetryOpenAIServerModel:
         if len(self.model_ids) <= 1:
             return False
 
-        prev_index = self.current_model_index
-        prev_model_id = self.model_ids[prev_index]
+        # Вычисляем новый индекс и model_id под локом, затем освобождаем лок.
+        # Создание HTTP-клиента и модели выполняется вне лока, чтобы не блокировать
+        # другие потоки на время I/O-инициализации.
+        with self._state_lock:
+            prev_index = self.current_model_index
+            prev_model_id = self.model_ids[prev_index]
+            next_index = (self.current_model_index + 1) % len(self.model_ids)
+            new_model_id = self.model_ids[next_index]
 
-        next_index = (self.current_model_index + 1) % len(self.model_ids)
-        new_model_id = self.model_ids[next_index]
+        # wrapped_to_primary/wrapping_note — чистые функции от снимка prev_index/next_index
+        # (захвачены под локом выше и больше не меняются), поэтому вычисляем их вне лока.
         wrapped_to_primary = next_index == 0 and prev_index == (len(self.model_ids) - 1)
         wrapping_note = " (достигли конца fallback, возвращаемся на основную модель)" if wrapped_to_primary else ""
-        
-        # Создаем новую модель с теми же параметрами
-        # Для новой модели создаем новый HTTP клиент с нуля
+
+        # Создаем новую модель с теми же параметрами вне лока.
         custom_http_client = self._create_custom_http_client(self.max_retries)
         client_kwargs = {'http_client': custom_http_client}
         try:
-            self.model = self._create_model(new_model_id, client_kwargs)
-            self.current_model_index = next_index
-            self.connection_error_count = 0  # Сбрасываем счетчик при переключении
-            logger.warning(
-                f"Успешно переключились на следующую модель (циклически){wrapping_note}:\n"
-                f"Предыдущая модель: {prev_model_id}\n"
-                f"Новая модель: {new_model_id}\n"
-                f"Индекс модели: {self.current_model_index} (предыдущий: {prev_index})\n"
-                f"Все модели в цикле: {self.model_ids}"
-            )
-            return True
+            new_model = self._create_model(new_model_id, client_kwargs)
         except Exception as e:
+            # Закрываем созданный http-клиент, иначе при ошибке создания модели
+            # соединение/пул утекут.
+            try:
+                custom_http_client.close()
+            except Exception:
+                pass
             logger.error(
                 f"Ошибка при создании модели {new_model_id} при переключении (циклически):\n"
                 f"Тип ошибки: {type(e).__name__}\n"
@@ -432,6 +438,46 @@ class RetryOpenAIServerModel:
                 f"Индексы: prev={prev_index}, next={next_index}"
             )
             return False
+
+        # Атомарно обновляем состояние под локом только если индекс не изменился
+        # другим потоком (compare-and-swap): предотвращает ABA-гонку при конкурентном
+        # вызове _switch_to_fallback из нескольких потоков.
+        with self._state_lock:
+            if self.current_model_index != prev_index:
+                # Другой поток уже переключил модель — не откатываем его изменение.
+                # Закрываем созданный, но неиспользованный HTTP-клиент во избежание утечки.
+                # Закрываем напрямую custom_http_client (ссылка из строки выше), а не через
+                # getattr(new_model, '_client') — у OpenAIServerModel такого атрибута нет.
+                try:
+                    custom_http_client.close()
+                except Exception:
+                    pass
+                # На случай, если модель сама владеет внутренними ресурсами/клиентом —
+                # закрываем и её, если поддерживает close() (idempotent для httpx).
+                try:
+                    if hasattr(new_model, "close"):
+                        new_model.close()
+                except Exception:
+                    pass
+                logger.debug(
+                    "CAS-discard: модель уже переключена другим потоком "
+                    "(current_model_index=%s != prev_index=%s); "
+                    "созданный кандидат %s отброшен, ресурсы закрыты.",
+                    self.current_model_index, prev_index, new_model_id,
+                )
+                return True
+            self.model = new_model
+            self.current_model_index = next_index
+            self.connection_error_count = 0  # Сбрасываем счетчик при переключении
+
+        logger.warning(
+            f"Успешно переключились на следующую модель (циклически){wrapping_note}:\n"
+            f"Предыдущая модель: {prev_model_id}\n"
+            f"Новая модель: {new_model_id}\n"
+            f"Индекс модели: {next_index} (предыдущий: {prev_index})\n"
+            f"Все модели в цикле: {self.model_ids}"
+        )
+        return True
     
     def _create_custom_http_client(self, max_retries: int):
         """
@@ -1158,7 +1204,7 @@ class RetryOpenAIServerModel:
                     response = self._normalize_response_content(response)
 
                     # Пишем лог ответа (один файл на ответ)
-                    if 1 == 1:
+                    if self.debug_logging:
                         try:
                             self._write_response_log(response, attempt, current_model_id)
                         except Exception as log_err:
@@ -1361,6 +1407,8 @@ class RetryOpenAIServerModel:
         """
         Проксирует все остальные атрибуты к оригинальной модели.
         """
+        if name == 'model':
+            raise AttributeError('model not initialized')
         return getattr(self.model, name)
     
     def generate(self, messages: List[ChatMessage], **kwargs) -> Any:

@@ -2,6 +2,7 @@
 Contract Registry для управления схемами артефактов и валидаторами
 """
 import logging
+from collections import OrderedDict
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 
@@ -15,10 +16,15 @@ logger = logging.getLogger(__name__)
 class ContractRegistry:
     """Реестр контрактов и валидаторов"""
     
+    # Максимальное число записей в кэше валидации (in-process LRU-like cap).
+    _CACHE_MAX_SIZE = 256
+
     def __init__(self):
         self.contracts: Dict[str, Contract] = {}
-        self.validation_results_cache: Dict[str, Dict[str, Any]] = {}
-        
+        # OrderedDict используется как LRU-кэш с ограничением _CACHE_MAX_SIZE,
+        # чтобы не допустить неограниченного роста памяти при долгой работе.
+        self.validation_results_cache: OrderedDict = OrderedDict()
+
         self._load_default_contracts()
     
     def _load_default_contracts(self):
@@ -85,6 +91,7 @@ class ContractRegistry:
         
         # Подготавливаем контракт для валидаторов
         contract_dict = {
+            "name": contract.name,
             "schema": contract.schema,
             "business_rules": contract.business_rules,
             "quality_thresholds": contract.quality_thresholds
@@ -149,9 +156,11 @@ class ContractRegistry:
             "artifact_hash": str(hash(str(artifact)))
         }
         
-        # Кэшируем результат
+        # Кэшируем результат (LRU: удаляем самую старую запись при переполнении)
         cache_key = f"{contract.name}:{result['artifact_hash']}"
         self.validation_results_cache[cache_key] = result
+        while len(self.validation_results_cache) > self._CACHE_MAX_SIZE:
+            self.validation_results_cache.popitem(last=False)
         
         return result
     

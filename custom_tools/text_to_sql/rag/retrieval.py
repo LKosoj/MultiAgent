@@ -313,12 +313,11 @@ class RetrievalService:
         embedding-based key (legacy путь). И тот, и другой используют
         precise hash (без квантования — см. embedding_utils.py:W5-T2).
         """
-        from ..utils import dsn_to_sanitized_name, get_schema_version
+        from ..utils import get_schema_version
 
         # W5-T4: используем _get_session_id() (через embeddings) — он
         # делает fail-fast при пустом DSN, чтобы избежать cross-tenant
         # leak (раньше: "" → "default"/"db" → общее namespace).
-        dsn = os.getenv("DB_DSN", "")
         session_id_cache = self._embeddings._get_session_id()
         cache_kind = "vector_db_search"
 
@@ -354,7 +353,6 @@ class RetrievalService:
             "cache_kind": cache_kind,
             "cache_key": cache_key,
             "schema_version": schema_version,
-            "dsn": dsn,
             "cacheable": cacheable,
         }
 
@@ -482,6 +480,8 @@ class RetrievalService:
         # лагающей Chroma), бросаем RuntimeError немедленно. Без этого
         # `executor.submit` мог бы блокироваться внутри.
         timeout_sec = _chroma_query_timeout_sec()
+        # _get_chroma_pool() гарантирует инициализацию _CHROMA_POOL_MAX_WORKERS
+        # под локом до возврата executor — читаем глобал только после этого вызова.
         executor = _get_chroma_pool()
         # Сколько задач уже выполняется/висит в очереди — приблизительная
         # оценка по приватному `_work_queue`. Это лучший доступный сигнал;
@@ -489,6 +489,7 @@ class RetrievalService:
         # (изменения в Python) — пропускаем guard и полагаемся на timeout.
         try:
             queued = executor._work_queue.qsize()  # type: ignore[attr-defined]
+            # _CHROMA_POOL_MAX_WORKERS гарантированно не None после _get_chroma_pool().
             max_workers = _CHROMA_POOL_MAX_WORKERS or _chroma_pool_max_workers()
             if queued >= max_workers:
                 # Все воркеры заняты и есть очередь — fail-fast.

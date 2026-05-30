@@ -106,7 +106,7 @@ class EmbeddingUtils:
     def _hash_key(self, obj: Any) -> str:
         """Создает хэш от объекта."""
         payload = json.dumps(obj, ensure_ascii=False, sort_keys=True)
-        return hashlib.md5(payload.encode("utf-8")).hexdigest()
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     # ---- Ранжирование и вычисление similarity ----
     def _create_embedding_safe(self, text: str, purpose: str = "passage") -> Optional[List[float]]:

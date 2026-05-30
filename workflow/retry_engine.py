@@ -34,11 +34,12 @@ class RetryEngine:
         self.default_policy = RetryPolicy()
         self.active_retries = {}  # Отслеживание активных retry
         
-    async def execute_with_retry(self, 
+    async def execute_with_retry(self,
                                step_id: str,
                                step_func: Callable,
                                context: Dict[str, Any],
-                               retry_policy: Optional[RetryPolicy] = None) -> StepResult:
+                               retry_policy: Optional[RetryPolicy] = None,
+                               timeout: Optional[int] = None) -> StepResult:
         """
         Выполнение функции с политикой повторных попыток
         
@@ -77,7 +78,7 @@ class RetryEngine:
                     logger.info(f"🔄 {step_id}: Попытка {attempt + 1}/{policy.max_retries + 1}")
                     
                     # Выполняем функцию
-                    output = await self._execute_with_timeout(step_func, context)
+                    output = await self._execute_with_timeout(step_func, context, timeout=timeout)
                     
                     # Успешное выполнение
                     result.status = StepStatus.COMPLETED

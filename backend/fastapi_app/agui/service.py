@@ -17,13 +17,13 @@ import platform
 import sys
 import hashlib
 import colorsys
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 import os
 import re
 import tempfile
-import urllib.request
 from collections import Counter
 from urllib.parse import quote, unquote, urlsplit
 
@@ -314,24 +314,45 @@ def _save_db_test_config_secrets(secrets: Dict[str, str]) -> None:
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1  # fdopen owns the descriptor now
             json.dump(secrets, handle, ensure_ascii=False, indent=2)
         os.replace(temp_name, path)
         path.chmod(0o600)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+    finally:
+        # Очистка в ЛЮБОМ исходе (в т.ч. BaseException: KeyboardInterrupt/SystemExit).
+        # На успехе fd уже == -1 (закрыт os.fdopen-контекстом), а temp_name переименован
+        # в path → unlink(missing_ok=True) — безопасный no-op (path не трогаем).
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
         try:
             Path(temp_name).unlink(missing_ok=True)
         except OSError:
             pass
-        raise
 
 
 def _save_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> None:
     path = _db_test_configs_path()
-    path.write_text(json.dumps(configs, ensure_ascii=False, indent=2), encoding="utf-8")
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1  # fdopen owns the descriptor now
+            json.dump(configs, handle, ensure_ascii=False, indent=2)
+        os.replace(temp_name, path)
+    finally:
+        # Очистка в ЛЮБОМ исходе (в т.ч. BaseException). На успехе fd уже == -1,
+        # temp_name переименован в path → unlink(missing_ok=True) — безопасный no-op.
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _serialize_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -1667,7 +1688,10 @@ def _workflow_report_text(final_output: Any) -> str:
 def _workflow_generate_report(wf_manager: Any, run_id: str) -> Dict[str, Any]:
     from html_utils import html_visualizer
 
-    run_data = wf_manager.active_runs.get(run_id, {})
+    if hasattr(wf_manager, "get_active_run_snapshot"):
+        run_data = wf_manager.get_active_run_snapshot(run_id)
+    else:
+        run_data = dict(wf_manager.active_runs.get(run_id, {}))
     cached = run_data.get("report") if isinstance(run_data, dict) else None
     if isinstance(cached, dict) and cached.get("base64_gzip"):
         sanitized = _redact_payload(cached)
@@ -1678,8 +1702,8 @@ def _workflow_generate_report(wf_manager: Any, run_id: str) -> Dict[str, Any]:
             session_id = run_id
         filename = sanitized.get("filename") or f"interactive_plots_{session_id}.html"
         _sanitize_existing_report_file(str(filename), str(session_id))
-        if isinstance(run_data, dict):
-            run_data["report"] = sanitized
+        if hasattr(wf_manager, "update_active_run"):
+            wf_manager.update_active_run(run_id, {"report": sanitized})
         return sanitized
 
     artifacts = wf_manager.get_workflow_artifacts(run_id)
@@ -1704,7 +1728,9 @@ def _workflow_generate_report(wf_manager: Any, run_id: str) -> Dict[str, Any]:
         "filename": f"interactive_plots_{session_id}.html",
         "base64_gzip": b64,
     }
-    if isinstance(run_data, dict):
+    if hasattr(wf_manager, "update_active_run"):
+        wf_manager.update_active_run(run_id, {"report": report})
+    elif isinstance(run_data, dict):
         run_data["report"] = report
     return report
 
@@ -2167,13 +2193,15 @@ def _active_runs() -> Dict[str, Any]:
     agent_manager = _agent_manager()
     wf_manager = _wf_manager()
 
+    agent_runs = agent_manager.list_active_run_snapshots() if hasattr(agent_manager, "list_active_run_snapshots") else list(agent_manager.active_runs.items())
+    workflow_runs = wf_manager.list_active_run_snapshots() if hasattr(wf_manager, "list_active_run_snapshots") else list(wf_manager.active_runs.items())
     active_agents = [
         _redact_payload({"run_id": run_id, **_serialize(data)})
-        for run_id, data in agent_manager.active_runs.items()
+        for run_id, data in agent_runs
     ]
     active_workflows = [
         _redact_payload({"run_id": run_id, **_serialize(data)})
-        for run_id, data in wf_manager.active_runs.items()
+        for run_id, data in workflow_runs
     ]
     return {
         "agents": active_agents,
@@ -2459,12 +2487,200 @@ def _logs_analytics(max_files: int = 20) -> Dict[str, Any]:
     }
 
 
+# Общий (module-level) executor для блокирующего getaddrinfo в SSRF-проверке.
+# Переиспользуется между вызовами: создавать/закрывать ThreadPoolExecutor per-call
+# нельзя — его __exit__ делает shutdown(wait=True), блокируя asyncio event loop и
+# плодя короткоживущие потоки на каждый DNS-запрос.
+_DNS_RESOLVE_EXECUTOR = None
+_DNS_RESOLVE_MAX_WORKERS = 4
+_DNS_RESOLVE_EXECUTOR_LOCK = threading.Lock()
+_DNS_RESOLVE_SEMAPHORE = threading.BoundedSemaphore(_DNS_RESOLVE_MAX_WORKERS)
+_DNS_PIN_LOCK = threading.Lock()
+
+
+def _get_dns_resolve_executor():
+    global _DNS_RESOLVE_EXECUTOR
+    if _DNS_RESOLVE_EXECUTOR is None:
+        with _DNS_RESOLVE_EXECUTOR_LOCK:
+            if _DNS_RESOLVE_EXECUTOR is None:
+                import concurrent.futures
+                _DNS_RESOLVE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_DNS_RESOLVE_MAX_WORKERS, thread_name_prefix="ssrf-dns"
+                )
+    return _DNS_RESOLVE_EXECUTOR
+
+
+def _release_dns_resolve_slot(_future: Any) -> None:
+    try:
+        _DNS_RESOLVE_SEMAPHORE.release()
+    except ValueError:
+        logger.debug("DNS resolve semaphore release ignored: slot already released")
+
+
+def _validate_url_no_ssrf(url: str) -> list[str]:
+    """Raise ValueError if url is not a safe external http/https URL.
+
+    Проверяются как IP-литералы, так и DNS-имена: имя резолвится через
+    getaddrinfo и КАЖДЫЙ полученный адрес проверяется на loopback/private/
+    link-local и т.п. Это закрывает обход через домены, указывающие на
+    приватные адреса (напр. *.nip.io, localtest.me). Остаточный риск
+    DNS-rebinding (смена записи между проверкой и коннектом) полностью не
+    устраняется без пиннинга IP на этап соединения.
+    """
+    import ipaddress
+    import socket
+
+    def _check_ip(ip_str: str) -> None:
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            # fail-closed: не удалось разобрать адрес — блокируем, а не пропускаем
+            raise ValueError(f"Не удалось классифицировать адрес: {ip_str!r}")
+        # `not is_global` — fail-closed catch-all: разрешаем ТОЛЬКО глобально
+        # маршрутизируемые адреса. Покрывает диапазоны, не отлавливаемые остальными
+        # флагами в Python 3.12: CGNAT 100.64.0.0/10 (RFC 6598), 192.0.0.0/24
+        # (IETF Protocol Assignments), 198.18.0.0/15 (benchmarking) — у них
+        # is_private/is_reserved == False, но is_global == False. Явные флаги
+        # оставлены для ясности и устойчивости к сдвигам семантики is_global между
+        # минорными версиями Python (defense-in-depth).
+        if (addr.is_loopback or addr.is_private or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified
+                or not addr.is_global):
+            raise ValueError(f"URL points to a non-public IP address: {ip_str}")
+
+    try:
+        parsed = urlsplit(url)
+    except Exception as exc:
+        raise ValueError(f"Invalid URL: {exc}") from exc
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"URL scheme '{parsed.scheme}' is not allowed; use http or https")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must contain a hostname")
+    lowered = hostname.lower()
+    # Block localhost / loopback aliases by name
+    if lowered in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}:
+        raise ValueError("URL points to a loopback address")
+    # Block metadata service hostnames
+    if lowered in {"metadata.google.internal", "169.254.169.254"}:
+        raise ValueError(f"URL points to a metadata service: {hostname}")
+
+    # IP-литерал → проверяем напрямую и выходим
+    is_ip_literal = True
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        is_ip_literal = False
+    if is_ip_literal:
+        _check_ip(hostname)
+        return [hostname]
+
+    # DNS-имя → резолвим и проверяем каждый адрес. getaddrinfo блокирующий и
+    # без нативного таймаута, поэтому используем общий пул плюс semaphore как
+    # backpressure: зависшие worker'ы не должны создавать бесконечную очередь.
+    import concurrent.futures
+
+    if not _DNS_RESOLVE_SEMAPHORE.acquire(blocking=False):
+        raise ValueError("DNS resolver is busy; retry later")
+    future = None
+    try:
+        future = _get_dns_resolve_executor().submit(socket.getaddrinfo, hostname, None)
+        future.add_done_callback(_release_dns_resolve_slot)
+        infos = future.result(timeout=5)
+    except concurrent.futures.TimeoutError:
+        if future is not None:
+            future.cancel()
+        raise ValueError("DNS-резолвинг превысил таймаут")
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve hostname '{hostname}': {exc}") from exc
+    except Exception:
+        if future is None:
+            _release_dns_resolve_slot(None)
+        raise
+    resolved_ips: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        _check_ip(ip)
+        if ip not in resolved_ips:
+            resolved_ips.append(ip)
+    if not resolved_ips:
+        raise ValueError(f"Could not resolve hostname '{hostname}'")
+    return resolved_ips
+
+
+@contextmanager
+def _pin_dns_resolution(hostname: str, resolved_ips: list[str]):
+    """Temporarily force socket DNS for hostname to already validated IPs."""
+    import socket
+
+    normalized = hostname.lower().rstrip(".")
+    original_getaddrinfo = socket.getaddrinfo
+
+    def _pinned_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if str(host).lower().rstrip(".") != normalized:
+            return original_getaddrinfo(host, port, family, type, proto, flags)
+        pinned = []
+        for ip in resolved_ips:
+            pinned.extend(original_getaddrinfo(ip, port, family, type, proto, flags))
+        return pinned
+
+    with _DNS_PIN_LOCK:
+        socket.getaddrinfo = _pinned_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
 def _download_url_to_file(url: str, session_id: str) -> str:
+    import requests as _requests
+
+    resolved_ips = _validate_url_no_ssrf(url)
+    parsed = urlsplit(url)
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must contain a hostname")
     plots_dir = _project_root() / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
     filename = f"url_input_{session_id}_{uuid.uuid4().hex[:8]}.png"
     dest = plots_dir / filename
-    urllib.request.urlretrieve(url, dest)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{filename}.", suffix=".tmp", dir=str(plots_dir))
+    try:
+        with _requests.Session() as session:
+            session.trust_env = False
+            with _pin_dns_resolution(hostname, resolved_ips):
+                response_ctx = session.get(url, allow_redirects=False, stream=True, timeout=10)
+            with response_ctx as response:
+                if response.status_code in range(300, 400):
+                    raise ValueError(f"URL returned a redirect ({response.status_code}); redirects are not allowed")
+                response.raise_for_status()
+                # Лимит размера: атакующий, контролирующий URL, иначе мог бы стримить
+                # бесконечный ответ и исчерпать диск (stream=True не читает тело целиком).
+                max_bytes = 50 * 1024 * 1024  # 50 МБ
+                downloaded = 0
+                with os.fdopen(fd, "wb") as fh:
+                    fd = -1  # fdopen owns the descriptor now
+                    for chunk in response.iter_content(chunk_size=65536):
+                        downloaded += len(chunk)
+                        if downloaded > max_bytes:
+                            raise ValueError(f"Загружаемый файл превышает лимит {max_bytes} байт")
+                        fh.write(chunk)
+        os.replace(temp_name, dest)
+    finally:
+        # Чистим дескриптор и временный файл в ЛЮБОМ исходе. При успехе fd уже == -1
+        # (закрыт контекст-менеджером os.fdopen), а temp_name переименован в dest →
+        # unlink(missing_ok=True) станет безопасным no-op (dest не трогаем). При ошибке
+        # (в т.ч. превышение size-limit) гарантированно не оставляем открытый дескриптор
+        # и частично записанный temp-файл.
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            Path(temp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
     return str(dest)
 
 
@@ -2884,17 +3100,7 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         return {"cancelled": wf_manager.cancel_workflow(run_id)}
     if action == "workflows.cleanup":
         max_age_hours = float(payload.get("max_age_hours", 24))
-        cutoff = datetime.now().timestamp() - max_age_hours * 3600
-        cleaned = 0
-        for run_id, run_data in list(wf_manager.active_runs.items()):
-            status = run_data.get("status")
-            end_time = run_data.get("end_time")
-            end_ts = None
-            if isinstance(end_time, datetime):
-                end_ts = end_time.timestamp()
-            if status in {"completed", "failed", "cancelled"} and end_ts is not None and end_ts < cutoff:
-                wf_manager.active_runs.pop(run_id, None)
-                cleaned += 1
+        cleaned = wf_manager.cleanup_completed_runs(max_age_hours)
         return {"cleaned": cleaned}
     if action == "workflows.get_yaml":
         workflow_name = payload.get("workflow_name")
@@ -2926,6 +3132,10 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         yaml_content = payload.get("yaml")
         if not workflow_name or not yaml_content:
             raise ValueError("workflow_name and yaml are required")
+        try:
+            yaml.safe_load(str(yaml_content))
+        except yaml.YAMLError as exc:
+            raise ValueError(f"Invalid YAML: {exc}") from exc
         workflow_path = _workflow_pipeline_path(workflow_name)
         workflow_path.parent.mkdir(exist_ok=True)
         if workflow_path.exists():
@@ -3352,32 +3562,7 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         if not run_id or not span_id:
             raise ValueError("run_id and span_id are required")
         return {"logs": _redact_payload(_serialize(logging_manager.get_logs_for_span(run_id, span_id)))}
-    if action == "logs.search":
-        query = payload.get("query", "")
-        level = payload.get("level")
-        limit = int(payload.get("limit", 100))
-        start_time = payload.get("start_time")
-        end_time = payload.get("end_time")
-        start_dt = datetime.fromisoformat(start_time) if start_time else None
-        end_dt = datetime.fromisoformat(end_time) if end_time else None
-        return {
-            "logs": _redact_payload(_serialize(
-                _search_logs_advanced(
-                    query=query,
-                    level=level,
-                    limit=limit,
-                    start_time=start_dt,
-                    end_time=end_dt,
-                    use_regex=bool(payload.get("use_regex", False)),
-                    case_sensitive=bool(payload.get("case_sensitive", False)),
-                    invert_search=bool(payload.get("invert_search", False)),
-                    logger_name=payload.get("logger_name"),
-                    run_id=payload.get("run_id"),
-                    span_id=payload.get("span_id"),
-                )
-            ))
-        }
-    if action == "logs.search_advanced":
+    if action in ("logs.search", "logs.search_advanced"):
         query = payload.get("query", "")
         level = payload.get("level")
         limit = int(payload.get("limit", 100))
@@ -3977,7 +4162,8 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
             raise ValueError(f"tool is not callable: {tool_name}")
         return {"result": _serialize(result), "tool": _serialize(config)}
     if action == "tools.active_runs":
-        return {"runs": _redact_payload(_serialize(tool_manager.active_runs))}
+        runs = tool_manager.list_run_snapshots() if hasattr(tool_manager, "list_run_snapshots") else dict(tool_manager.active_runs)
+        return {"runs": _redact_payload(_serialize(runs))}
     if action == "tools.cleanup":
         max_age_minutes = int(payload.get("max_age_minutes", 60))
         tool_manager.cleanup_completed(max_age_minutes=max_age_minutes)

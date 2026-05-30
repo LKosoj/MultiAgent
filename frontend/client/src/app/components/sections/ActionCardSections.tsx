@@ -1,9 +1,10 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { ActionCard } from "../shared/ActionCard";
 import { KeyValueList } from "../shared/KeyValueList";
+import { openReportFromPayload } from "../../utils/report";
 
 type ActionCardProps = {
   runServiceAction: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
@@ -23,19 +24,64 @@ type ProgressSectionProps = ActionCardProps & {
   clearResults: () => void;
 };
 
-const decodeGzipBase64 = async (b64: string) => {
-  const binary = atob(b64);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  if (!("DecompressionStream" in window)) {
-    throw new Error("Браузер не поддерживает распаковку gzip");
+const MERMAID_TEMPLATES: Record<string, string> = {
+  Граф: `graph TD
+  A[Начало] --> B[Процесс]
+  B --> C{Решение?}
+  C -->|Да| D[Действие 1]
+  C -->|Нет| E[Действие 2]
+  D --> F[Конец]
+  E --> F`,
+  Последовательность: `sequenceDiagram
+  participant A as Пользователь
+  participant B as Агент
+  participant C as БД
+
+  A->>B: Запрос
+  B->>C: Запрос данных
+  C-->>B: Данные
+  B-->>A: Ответ`,
+  "Диаграмма классов": `classDiagram
+  class Agent {
+    +String name
+    +String type
+    +execute(task)
+    +getStatus()
   }
-  const stream = new DecompressionStream("gzip");
-  const body = new Response(bytes).body;
-  if (!body) {
-    throw new Error("Не удалось распаковать отчёт");
+  class Workflow {
+    +String name
+    +List steps
+    +run()
   }
-  const decompressed = body.pipeThrough(stream);
-  return new Response(decompressed).text();
+  Agent --|> Workflow : uses`,
+};
+
+const PLANTUML_TEMPLATES: Record<string, string> = {
+  "Диаграмма классов": `@startuml
+class Agent {
+  - name: String
+  - type: String
+  + execute(task: String): Result
+  + getStatus(): Status
+}
+
+class Workflow {
+  - steps: List<Step>
+  + run(): Result
+}
+
+Agent --> Workflow
+@enduml`,
+  "Диаграмма последовательности": `@startuml
+actor User
+participant Agent
+participant Database
+
+User -> Agent: Запрос
+Agent -> Database: Запрос данных
+Database --> Agent: Данные
+Agent --> User: Результат
+@enduml`,
 };
 
 export function ConfigSection({ runServiceAction, isBusy }: ActionCardProps) {
@@ -54,20 +100,28 @@ export function ConfigSection({ runServiceAction, isBusy }: ActionCardProps) {
   const [performanceForm, setPerformanceForm] = useState<any>({});
   const [networkForm, setNetworkForm] = useState<any>({});
 
-  const loadConfig = async () => {
-    const resp = await runServiceAction("config.get", {});
-    setConfig((resp as any)?.config ?? resp);
-  };
+  const loadConfig = useCallback(async () => {
+    try {
+      const resp = await runServiceAction("config.get", {});
+      setConfig((resp as any)?.config ?? resp);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Не удалось загрузить конфигурацию");
+    }
+  }, [runServiceAction]);
 
-  const loadProviders = async () => {
-    const resp = await runServiceAction("config.llm_providers", {});
-    setProviders((resp as any)?.providers ?? {});
-  };
+  const loadProviders = useCallback(async () => {
+    try {
+      const resp = await runServiceAction("config.llm_providers", {});
+      setProviders((resp as any)?.providers ?? {});
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Не удалось загрузить провайдеры");
+    }
+  }, [runServiceAction]);
 
   useEffect(() => {
     void loadConfig();
     void loadProviders();
-  }, []);
+  }, [loadConfig, loadProviders]);
 
   useEffect(() => {
     if (!config) return;
@@ -111,8 +165,12 @@ export function ConfigSection({ runServiceAction, isBusy }: ActionCardProps) {
 
   const handleLlmTest = async () => {
     setLlmTest(null);
-    const resp = await runServiceAction("config.test_llm", { provider: llmForm.provider, model: llmForm.model });
-    setLlmTest((resp as any)?.result ?? resp);
+    try {
+      const resp = await runServiceAction("config.test_llm", { provider: llmForm.provider, model: llmForm.model });
+      setLlmTest((resp as any)?.result ?? resp);
+    } catch (err) {
+      setStatus(err instanceof Error ? err.message : "Не удалось протестировать LLM");
+    }
   };
 
   const providerInfo = providers?.[llmForm.provider] ?? {};
@@ -908,6 +966,7 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
   const [telemetryEnabled, setTelemetryEnabled] = useState<boolean | null>(null);
   const [telemetryConfig, setTelemetryConfig] = useState<any | null>(null);
   const [reportError, setReportError] = useState<string | null>(null);
+  const [telemetryError, setTelemetryError] = useState<string | null>(null);
   const [reportCache, setReportCache] = useState<Record<string, any>>({});
   const [isMounted, setIsMounted] = useState(false);
   const mountedRef = useRef(false);
@@ -915,34 +974,42 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
   const tracesInFlightRef = useRef(false);
   const runLogsInFlightRef = useRef<Set<string>>(new Set());
 
-  const loadTraces = async () => {
+  const loadTraces = useCallback(async () => {
     if (tracesInFlightRef.current) return;
     tracesInFlightRef.current = true;
+    setTelemetryError(null);
     try {
       const resp = await runServiceAction("telemetry.list_traces", {});
       const items = (resp as any)?.traces ?? [];
       if (!mountedRef.current) return;
       setTraces(Array.isArray(items) ? items.filter((trace) => trace?.run_id !== "unknown") : []);
+    } catch (err) {
+      setTelemetryError(err instanceof Error ? err.message : "Не удалось загрузить трассы");
     } finally {
       tracesInFlightRef.current = false;
     }
-  };
+  }, [runServiceAction]);
 
   const applyFilter = async () => {
-    const resp = await runServiceAction("telemetry.filter_traces", filter);
-    setTraces((resp as any)?.traces ?? []);
-  };
-
-  const loadAnalytics = async () => {
-    const resp = await runServiceAction("telemetry.analytics", { days: 7 });
-    setAnalytics((resp as any)?.result ?? resp);
+    setTelemetryError(null);
+    try {
+      const resp = await runServiceAction("telemetry.filter_traces", filter);
+      setTraces((resp as any)?.traces ?? []);
+    } catch (err) {
+      setTelemetryError(err instanceof Error ? err.message : "Не удалось применить фильтр");
+    }
   };
 
   const loadTraceDetails = async (runId: string) => {
-    const resp = await runServiceAction("telemetry.trace_file", { run_id: runId });
-    setSelected((resp as any)?.trace ?? resp);
-    setSelectedRunId(runId);
-    setSpanLogs(null);
+    setTelemetryError(null);
+    try {
+      const resp = await runServiceAction("telemetry.trace_file", { run_id: runId });
+      setSelected((resp as any)?.trace ?? resp);
+      setSelectedRunId(runId);
+      setSpanLogs(null);
+    } catch (err) {
+      setTelemetryError(err instanceof Error ? err.message : "Не удалось загрузить детали трассы");
+    }
   };
   const findReportEvent = (events: any[]) => {
     for (const ev of events) {
@@ -959,21 +1026,31 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
   };
 
   const loadTraceEvents = async (runId: string) => {
-    const resp = await runServiceAction("telemetry.trace_events", { run_id: runId });
-    const events = (resp as any)?.events ?? resp;
-    setTraceEvents(events);
-    if (Array.isArray(events)) {
-      const report = findReportEvent(events);
-      if (report) {
-        setReportCache((prev) => ({ ...prev, [runId]: report }));
+    setTelemetryError(null);
+    try {
+      const resp = await runServiceAction("telemetry.trace_events", { run_id: runId });
+      const events = (resp as any)?.events ?? resp;
+      setTraceEvents(events);
+      if (Array.isArray(events)) {
+        const report = findReportEvent(events);
+        if (report) {
+          setReportCache((prev) => ({ ...prev, [runId]: report }));
+        }
       }
+    } catch (err) {
+      setTelemetryError(err instanceof Error ? err.message : "Не удалось загрузить события трассы");
     }
   };
   const loadSpanLogs = async (runId: string, spanId: string) => {
-    const resp = await runServiceAction("logs.span_logs", { run_id: runId, span_id: spanId });
-    setSpanLogs((resp as any)?.logs ?? resp);
+    setTelemetryError(null);
+    try {
+      const resp = await runServiceAction("logs.span_logs", { run_id: runId, span_id: spanId });
+      setSpanLogs((resp as any)?.logs ?? resp);
+    } catch (err) {
+      setTelemetryError(err instanceof Error ? err.message : "Не удалось загрузить логи спана");
+    }
   };
-  const loadRunLogs = async (runId: string) => {
+  const loadRunLogs = useCallback(async (runId: string) => {
     if (runLogsInFlightRef.current.has(runId)) return;
     runLogsInFlightRef.current.add(runId);
     try {
@@ -984,36 +1061,12 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
     } finally {
       runLogsInFlightRef.current.delete(runId);
     }
-  };
-  const openReport = async (runId: string, report: any) => {
-    const payload =
-      report?.base64_gzip ??
-      report?.content_b64_gzip ??
-      report?.report_b64_gzip ??
-      report?.base64;
-    if (!payload) {
-      throw new Error("Пустой отчёт");
-    }
-    const html = await decodeGzipBase64(payload);
-    const mimeType = report?.mime_type ?? "text/html";
-    const filename = report?.filename ?? `report_${runId}.html`;
-    const blob = new Blob([html], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      link.click();
-    }
-    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
-  };
-
+  }, [runServiceAction]);
   const handleGenerateReport = async (runId: string) => {
     setReportError(null);
     try {
       if (reportCache[runId]) {
-        await openReport(runId, reportCache[runId]);
+        await openReportFromPayload(runId, reportCache[runId]);
         return;
       }
       const traceResp = await runServiceAction("telemetry.trace_events", { run_id: runId });
@@ -1022,25 +1075,25 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
         const cached = findReportEvent(events);
         if (cached) {
           setReportCache((prev) => ({ ...prev, [runId]: cached }));
-          await openReport(runId, cached);
+          await openReportFromPayload(runId, cached);
           return;
         }
       }
       const resp = await runServiceAction("telemetry.generate_report", { run_id: runId });
       const report = (resp as any)?.report ?? resp;
       setReportCache((prev) => ({ ...prev, [runId]: report }));
-      await openReport(runId, report);
+      await openReportFromPayload(runId, report);
     } catch (err) {
       setReportError(err instanceof Error ? err.message : "Не удалось сформировать отчёт");
     }
   };
 
-  const loadTelemetrySettings = async () => {
+  const loadTelemetrySettings = useCallback(async () => {
     const resp = await runServiceAction("config.get", {});
     const cfg = (resp as any)?.config ?? resp;
     setTelemetryConfig(cfg?.telemetry ?? null);
     setTelemetryEnabled(!!cfg?.telemetry?.enabled);
-  };
+  }, [runServiceAction]);
 
   const handleTelemetryToggle = async () => {
     if (telemetryEnabled) {
@@ -1054,19 +1107,19 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
 
   useEffect(() => {
     void loadTraces();
-  }, []);
+  }, [loadTraces]);
 
   useEffect(() => {
     if (!autoRefresh) return;
     const id = window.setInterval(() => void loadTraces(), 5000);
     return () => window.clearInterval(id);
-  }, [autoRefresh]);
+  }, [autoRefresh, loadTraces]);
 
   useEffect(() => {
     if (tab === "settings") {
       void loadTelemetrySettings();
     }
-  }, [tab]);
+  }, [tab, loadTelemetrySettings]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1098,7 +1151,7 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
       void loadRunLogs(logsModal.runId!);
     }, 4000);
     return () => window.clearInterval(intervalId);
-  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh]);
+  }, [logsModal.open, logsModal.runId, logsModalAutoRefresh, loadRunLogs]);
 
   const formattedRunLogs = runLogs
     .map((entry: any) => {
@@ -1194,6 +1247,7 @@ export function TelemetrySection({ runServiceAction, isBusy }: ActionCardProps) 
             {traces.length === 0 ? <div className="card-description">Нет трасс.</div> : null}
           </div>
           {reportError ? <div className="card-description">Ошибка отчёта: {reportError}</div> : null}
+          {telemetryError ? <div className="card-description">Ошибка: {telemetryError}</div> : null}
           {selected ? (
             <div className="card">
               <div className="card-title">Детали трассы</div>
@@ -1564,10 +1618,10 @@ export function LogsSection({ runServiceAction, isBusy }: ActionCardProps) {
   const [spanLogs, setSpanLogs] = useState<any | null>(null);
   const [analytics, setAnalytics] = useState<any | null>(null);
 
-  const loadFiles = async () => {
+  const loadFiles = useCallback(async () => {
     const resp = await runServiceAction("logs.files", {});
     setFiles((resp as any)?.files ?? []);
-  };
+  }, [runServiceAction]);
 
   const searchLogs = async () => {
     const resp = await runServiceAction("logs.search", search);
@@ -1647,7 +1701,7 @@ export function LogsSection({ runServiceAction, isBusy }: ActionCardProps) {
 
   useEffect(() => {
     void loadFiles();
-  }, []);
+  }, [loadFiles]);
 
   return (
     <div className="section" id="logs">
@@ -2035,72 +2089,12 @@ export function ToolsSection({ runServiceAction, isBusy }: ActionCardProps) {
     data: null,
   });
 
-  const mermaidTemplates: Record<string, string> = {
-    Граф: `graph TD
-  A[Начало] --> B[Процесс]
-  B --> C{Решение?}
-  C -->|Да| D[Действие 1]
-  C -->|Нет| E[Действие 2]
-  D --> F[Конец]
-  E --> F`,
-    Последовательность: `sequenceDiagram
-  participant A as Пользователь
-  participant B as Агент
-  participant C as БД
-
-  A->>B: Запрос
-  B->>C: Запрос данных
-  C-->>B: Данные
-  B-->>A: Ответ`,
-    "Диаграмма классов": `classDiagram
-  class Agent {
-    +String name
-    +String type
-    +execute(task)
-    +getStatus()
-  }
-  class Workflow {
-    +String name
-    +List steps
-    +run()
-  }
-  Agent --|> Workflow : uses`,
-  };
-
-  const plantumlTemplates: Record<string, string> = {
-    "Диаграмма классов": `@startuml
-class Agent {
-  - name: String
-  - type: String
-  + execute(task: String): Result
-  + getStatus(): Status
-}
-
-class Workflow {
-  - steps: List<Step>
-  + run(): Result
-}
-
-Agent --> Workflow
-@enduml`,
-    "Диаграмма последовательности": `@startuml
-actor User
-participant Agent
-participant Database
-
-User -> Agent: Запрос
-Agent -> Database: Запрос данных
-Database --> Agent: Данные
-Agent --> User: Результат
-@enduml`,
-  };
-
-  const loadTools = async () => {
+  const loadTools = useCallback(async () => {
     const defs = await runServiceAction("tools.list_definitions", {});
     const mcp = await runServiceAction("tools.list_mcp", {});
     setToolsList((defs as any)?.tools ?? []);
     setToolsMcp((mcp as any)?.tools ?? []);
-  };
+  }, [runServiceAction]);
 
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -2338,13 +2332,9 @@ Agent --> User: Результат
   useEffect(() => {
     setIsMounted(true);
     void loadTools();
-    if (!mermaidCode) {
-      setMermaidCode(mermaidTemplates["Граф"]);
-    }
-    if (!plantumlCode) {
-      setPlantumlCode(plantumlTemplates["Диаграмма классов"]);
-    }
-  }, []);
+    setMermaidCode((current) => current || MERMAID_TEMPLATES["Граф"]);
+    setPlantumlCode((current) => current || PLANTUML_TEMPLATES["Диаграмма классов"]);
+  }, [loadTools]);
 
   useEffect(() => {
     if (!toolDetailsModal.open) return;
@@ -2368,11 +2358,11 @@ Agent --> User: Результат
   }, [tab, runServiceAction]);
 
   useEffect(() => {
-    const options = diagramEditorType === "mermaid" ? Object.keys(mermaidTemplates) : Object.keys(plantumlTemplates);
+    const options = diagramEditorType === "mermaid" ? Object.keys(MERMAID_TEMPLATES) : Object.keys(PLANTUML_TEMPLATES);
     if (options.length && !options.includes(diagramTemplate)) {
       setDiagramTemplate(options[0]);
     }
-  }, [diagramEditorType]);
+  }, [diagramEditorType, diagramTemplate]);
 
   const getToolLabel = (tool: any) => {
     if (!tool) return "Без названия";
@@ -2489,6 +2479,7 @@ Agent --> User: Результат
                 </div>
               ) : null}
               {diagramPreview?.base64 ? (
+                // eslint-disable-next-line @next/next/no-img-element
                 <img className="image-preview" src={`data:${diagramPreview.mime_type};base64,${diagramPreview.base64}`} alt="diagram preview" />
               ) : null}
             </div>
@@ -2508,7 +2499,7 @@ Agent --> User: Результат
                 <label className="field">
                   <span className="label">Шаблон</span>
                   <select value={diagramTemplate} onChange={(e) => setDiagramTemplate(e.target.value)}>
-                    {(diagramEditorType === "mermaid" ? Object.keys(mermaidTemplates) : Object.keys(plantumlTemplates)).map((name) => (
+                    {(diagramEditorType === "mermaid" ? Object.keys(MERMAID_TEMPLATES) : Object.keys(PLANTUML_TEMPLATES)).map((name) => (
                       <option key={name} value={name}>
                         {name}
                       </option>
@@ -2522,9 +2513,9 @@ Agent --> User: Результат
                   type="button"
                   onClick={() => {
                     if (diagramEditorType === "mermaid") {
-                      setMermaidCode(mermaidTemplates[diagramTemplate] ?? "");
+                      setMermaidCode(MERMAID_TEMPLATES[diagramTemplate] ?? "");
                     } else {
-                      setPlantumlCode(plantumlTemplates[diagramTemplate] ?? "");
+                      setPlantumlCode(PLANTUML_TEMPLATES[diagramTemplate] ?? "");
                     }
                   }}
                   disabled={isBusy}
@@ -2557,6 +2548,7 @@ Agent --> User: Результат
                 />
               </label>
               {diagramPreview?.base64 ? (
+                // eslint-disable-next-line @next/next/no-img-element
                 <img className="image-preview" src={`data:${diagramPreview.mime_type};base64,${diagramPreview.base64}`} alt="diagram preview" />
               ) : null}
             </div>
@@ -2646,6 +2638,10 @@ Agent --> User: Результат
                     ))}
                   </div>
                 </details>
+              ) : null}
+              {previewImage?.base64 ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img className="image-preview" src={`data:${previewImage.mime_type};base64,${previewImage.base64}`} alt="image preview" />
               ) : null}
             </div>
           ) : null}

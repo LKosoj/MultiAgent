@@ -19,7 +19,7 @@ def load_env_file():
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    os.environ[key] = value
+                    os.environ.setdefault(key, value)
 
 load_env_file()
 
@@ -289,32 +289,39 @@ def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, A
         logger.info(f"📹 Используем start + end изображения для анимации")
     else:
         logger.info(f"📹 Используем только start изображение")
-    
+
+    if not ak or not sk:
+        return {
+            "success": False,
+            "error": "KLING_API_KEY или KLING_API_SECRET_KEY не заданы",
+            "scene_number": scene_number,
+            "shot_number": shot_number,
+            "video_path": video_path,
+        }
+
     try:
         # Создаем директорию для видео
         os.makedirs(os.path.dirname(video_path), exist_ok=True)
-        
+
         # Кодируем start изображение в base64
         with open(start_image, "rb") as img_file:
             image_data = base64.b64encode(img_file.read()).decode('utf-8')
-        
+
         # Кодируем end изображение в base64 (если есть)
         image_tail_data = None
         if end_image:
             with open(end_image, "rb") as img_file:
                 image_tail_data = base64.b64encode(img_file.read()).decode('utf-8')
-        
+
         # Определяем длительность видео из timing
         duration = _parse_duration_from_timing(timing)
-        
+
         token = encode_jwt_token(ak, sk)
         # Подготавливаем запрос к Kling AI API
         headers = {
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json"
         }
-        
-        duration = 5
 
         payload = {
             "model_name": "kling-v2-1",
@@ -414,11 +421,14 @@ def _wait_for_video_completion(task_id: str, session_id: str, token: str, max_wa
         URL видео или None в случае ошибки
     """
     
-    time.sleep(50)
     start_time = time.time()
     check_interval = 10  # Проверяем каждые 10 секунд
-    
+    first_check = True
+
     while time.time() - start_time < max_wait_time:
+        if first_check:
+            time.sleep(50)
+            first_check = False
         try:
             token = encode_jwt_token(ak, sk)
             headers = {

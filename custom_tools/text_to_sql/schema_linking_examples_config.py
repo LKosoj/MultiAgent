@@ -131,7 +131,7 @@ class SchemaLinkingExamplesConfig:
 
 
 def _coerce_str_list(value: Any, field: str) -> List[str]:
-    return coerce_str_list(value, field, yaml_filename="schema_linking_examples.yaml")
+    return coerce_str_list(value, field, yaml_filename="schema_linking_examples.yaml", reject_empty_strings=True)
 
 
 def _coerce_id_rule_list(value: Any, field: str) -> List[Dict[str, str]]:

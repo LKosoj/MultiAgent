@@ -427,6 +427,62 @@ def test_impala_connect_requires_explicit_fail_open_when_read_only_unenforced(mo
     assert closed["called"] is True
 
 
+def test_duckdb_connect_uses_read_only_mode_for_file_db(monkeypatch):
+    """DuckDBPlugin должен открывать файловую БД в режиме read_only=True по умолчанию.
+    Это покрывает дыру безопасности: DML-операции к production-БД недопустимы."""
+    connect_calls = []
+
+    class FakeDuckConn:
+        def close(self):
+            pass
+
+    def fake_connect(path, read_only=False):
+        connect_calls.append({"path": path, "read_only": read_only})
+        return FakeDuckConn()
+
+    fake_duckdb = SimpleNamespace(connect=fake_connect)
+    monkeypatch.setitem(sys.modules, "duckdb", fake_duckdb)
+
+    DuckDBPlugin().connect("duckdb:///tmp/test.db")
+
+    assert connect_calls, "duckdb.connect не был вызван"
+    # Первый вызов обязан быть с read_only=True для файловой БД
+    assert connect_calls[0]["read_only"] is True, (
+        "DuckDBPlugin должен открывать файловую БД с read_only=True; "
+        f"фактический вызов: {connect_calls[0]}"
+    )
+
+
+def test_duckdb_connect_falls_back_to_rw_only_with_explicit_fail_open(monkeypatch):
+    """При ошибке read-only открытия и выставленном fail_open DuckDB должен
+    переключаться на read-write. Без fail_open — пробрасывать RuntimeError."""
+    class ReadOnlyError(Exception):
+        pass
+
+    rw_calls = []
+
+    def fake_connect(path, read_only=False):
+        if read_only:
+            raise ReadOnlyError("cannot open in read-only mode")
+        rw_calls.append({"path": path, "read_only": read_only})
+        return SimpleNamespace(close=lambda: None)
+
+    fake_duckdb = SimpleNamespace(connect=fake_connect)
+    monkeypatch.setitem(sys.modules, "duckdb", fake_duckdb)
+
+    # Без fail_open — должен упасть с RuntimeError
+    with pytest.raises(RuntimeError, match="read-only"):
+        DuckDBPlugin().connect("duckdb:///tmp/locked.db")
+
+    # С явным fail_open — подключается в RW режиме (read_only=False) без RuntimeError
+    conn = DuckDBPlugin().connect("duckdb:///tmp/locked.db?read_only_fail_open=1")
+    assert conn is not None
+    assert len(rw_calls) == 1, "Ожидался ровно один вызов fake_connect с read_only=False"
+    assert rw_calls[0]["read_only"] is False, (
+        f"Ожидался read_only=False в fallback-вызове; фактически: {rw_calls[0]}"
+    )
+
+
 def test_get_distinct_values_uses_plugin_query_builder(monkeypatch):
     import db_plugins
 

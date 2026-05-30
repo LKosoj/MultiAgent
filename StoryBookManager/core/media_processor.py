@@ -276,19 +276,19 @@ class MediaProcessor:
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
                 return None
-            
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-            
-            cap.release()
-            
+            try:
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            finally:
+                cap.release()
+
             if fps > 0:
                 duration = frame_count / fps
                 return round(duration, 2)
-            
+
         except Exception as e:
             logger.error(f"Ошибка получения длительности видео {video_path}: {e}")
-        
+
         return None
     
     def get_video_thumbnail(self, video_path: str, time_offset: float = 1.0) -> Optional[str]:
@@ -325,19 +325,22 @@ class MediaProcessor:
             cap = cv2.VideoCapture(str(video_path))
             if not cap.isOpened():
                 return None
-            
-            # Переходим к нужному времени
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_number = int(fps * time_offset)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
-            
-            # Читаем кадр
-            ret, frame = cap.read()
-            cap.release()
-            
+
+            ret, frame = False, None
+            try:
+                # Переходим к нужному времени
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                frame_number = int(fps * time_offset)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+
+                # Читаем кадр
+                ret, frame = cap.read()
+            finally:
+                cap.release()
+
             if not ret:
                 return None
-            
+
             # Сохраняем кадр как изображение
             cv2.imwrite(str(cache_path), frame)
             
