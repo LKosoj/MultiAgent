@@ -670,7 +670,14 @@ class PipelineRunner:
         return {"status": "paused", "workflow_id": workflow_id}
 
     async def resume_pipeline(self) -> Dict[str, Any]:
-        """Снимает pipeline с паузы через engine.resume_workflow()."""
+        """Снимает pipeline с паузы.
+
+        Помечает workflow как RUNNING (сохраняет checkpoint со статусом RUNNING)
+        и разблокирует приостановленный цикл выполнения через _pause_event. Это
+        локальное снятие паузы StoryBookManager, а НЕ generic-resume движка
+        (engine.resume_workflow), который перезапускает workflow с checkpoint'а,
+        пропуская уже завершённые шаги.
+        """
         if not self.current_workflow_id:
             return {"status": "error", "message": "Нет активного pipeline для возобновления"}
 

@@ -600,6 +600,54 @@ class SQLiteWorkflowStore:
             
         return checkpoints
 
+    async def save_workflow_definition(self, workflow_id: str, definition_json: str) -> None:
+        """Сохраняет сериализованное определение workflow в workflow_metadata.
+
+        Upsert по workflow_id: определение нужно для generic resume, чтобы
+        reconstruct-ить шаги из checkpoint'а без обращения к исходному yaml-файлу.
+        """
+        try:
+            now = datetime.now().isoformat()
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO workflow_metadata (workflow_id, definition, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(workflow_id) DO UPDATE SET
+                        definition = excluded.definition,
+                        updated_at = excluded.updated_at
+                    """,
+                    (workflow_id, definition_json, now, now),
+                )
+        except Exception as e:
+            logger.error(
+                "❌ Ошибка сохранения определения workflow %s: %s",
+                workflow_id,
+                _redact_checkpoint_error_text(e),
+            )
+            raise
+
+    async def get_workflow_definition(self, workflow_id: str) -> Optional[str]:
+        """Возвращает сериализованный JSON определения workflow или None."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    "SELECT definition FROM workflow_metadata WHERE workflow_id = ?",
+                    (workflow_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                return row["definition"]
+        except Exception as e:
+            logger.error(
+                "❌ Ошибка чтения определения workflow %s: %s",
+                workflow_id,
+                _redact_checkpoint_error_text(e),
+            )
+            return None
+
 
 class WorkflowStateManager:
     """Менеджер состояния workflow с интеграцией в существующую память"""
@@ -743,6 +791,26 @@ class WorkflowStateManager:
                 metadata={'final_output': final_output}
             )
     
+    async def save_workflow_definition(self, workflow_id: str, definition: "WorkflowDefinition") -> None:
+        """Сериализует WorkflowDefinition (JSON) и сохраняет для последующего resume."""
+        definition_json = json.dumps(definition.to_dict(), ensure_ascii=False)
+        await self.store.save_workflow_definition(workflow_id, definition_json)
+
+    async def get_workflow_definition(self, workflow_id: str) -> Optional["WorkflowDefinition"]:
+        """Читает и десериализует WorkflowDefinition. None если запись отсутствует/повреждена."""
+        from .models import WorkflowDefinition
+
+        raw = await self.store.get_workflow_definition(workflow_id)
+        if raw is None:
+            return None
+        try:
+            return WorkflowDefinition.from_dict(json.loads(raw))
+        except (json.JSONDecodeError, KeyError, ValueError, TypeError) as e:
+            logger.error(
+                "❌ Повреждённое определение workflow %s: %s", workflow_id, e
+            )
+            return None
+
     async def cleanup_old_checkpoints(self, days_to_keep: int = 30):
         """Очистка старых checkpoint'ов"""
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)

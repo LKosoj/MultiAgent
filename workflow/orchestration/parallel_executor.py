@@ -75,20 +75,31 @@ class ParallelWorkflowExecutor:
                                    dependency_checker: Callable,
                                    condition_checker: Callable,
                                    stop_checker: Optional[Callable] = None,
-                                   stop_on_failure: bool = False) -> Dict[str, StepResult]:
+                                   stop_on_failure: bool = False,
+                                   initial_step_results: Optional[Dict[str, StepResult]] = None) -> Dict[str, StepResult]:
         """Выполнить шаги с учетом зависимостей параллельно"""
-        
+
         dependency_graph = DependencyGraph(steps)
-        
+
         # Проверяем наличие циклов
         if dependency_graph.has_cycles():
             raise ValueError("Обнаружены циклические зависимости в workflow")
-        
-        step_results = {}
+
+        # Пред-заполнение для resume: ключи initial_step_results — это уже
+        # завершённые шаги. Помещая их в completed_steps, мы исключаем их из
+        # get_ready_steps, поэтому они не запускаются повторно, а их выходы
+        # (через восстановленный context.step_outputs) доступны зависимым шагам.
+        step_results = dict(initial_step_results or {})
         context._workflow_step_results = step_results
-        completed_steps = set()  # Включает COMPLETED, SKIPPED, FAILED
-        
+        completed_steps = set(step_results.keys())  # COMPLETED (+ восстановленные при resume)
+
         self.execution_stats["total_steps"] = len(steps)
+        # Resume: восстановленные шаги уже выполнены в прошлом запуске — учитываем их
+        # в "completed", иначе success_rate занижается (они в знаменателе executed, но
+        # никогда не пройдут через инкремент ниже).
+        self.execution_stats["completed"] += sum(
+            1 for r in step_results.values() if r.status == StepStatus.COMPLETED
+        )
         
         logger.info(f"🚀 Начинаем параллельное выполнение {len(steps)} шагов (max_concurrent: {self.max_concurrent})")
         

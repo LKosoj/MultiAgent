@@ -13,7 +13,7 @@ import logging
 import re
 import uuid
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, List, Any, Optional, Union
+from typing import Awaitable, Callable, Dict, List, Any, Optional, Set, Union
 from pathlib import Path
 import traceback
 
@@ -24,7 +24,7 @@ from agent_system import DynamicAgentSystem
 from .models import (
     WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
     StepResult, StepStatus, WorkflowStep, RetryPolicy, ResourceLimits,
-    WorkflowExecutionError, WorkflowStepError
+    WorkflowExecutionError, WorkflowStepError, WorkflowNotFoundError
 )
 from .state_manager import WorkflowStateManager
 from .retry_engine import RetryEngine
@@ -56,7 +56,7 @@ class WorkflowEngine(DynamicAgentSystem):
     
     ДОБАВЛЯЕТ новые workflow возможности:
     - 🆕 execute_workflow() - надежное выполнение
-    - 🆕 resume_workflow() - восстановление после сбоев  
+    - 🆕 resume_workflow() - восстановление с последнего checkpoint (PAUSED/FAILED)
     - 🆕 workflow state management
     - 🆕 resource isolation
     - 🆕 retry policies
@@ -86,14 +86,22 @@ class WorkflowEngine(DynamicAgentSystem):
     
     async def execute_workflow(self, workflow_definition: WorkflowDefinition,
                               context: Optional[WorkflowContext] = None,
-                              client_id: Optional[str] = None) -> WorkflowResult:
+                              client_id: Optional[str] = None,
+                              *,
+                              skip_steps: Optional[Set[str]] = None,
+                              restored_step_results: Optional[Dict[str, StepResult]] = None) -> WorkflowResult:
         """
         НОВЫЙ метод: Надежное выполнение workflow
-        
+
         Args:
             workflow_definition: Определение workflow (объект WorkflowDefinition)
             context: Контекст выполнения (опционально)
             client_id: ID клиента для квотирования (опционально)
+            skip_steps: ID уже завершённых шагов, которые нужно пропустить (resume).
+                Если None — обычный запуск (определение персистится для будущего resume).
+            restored_step_results: Результаты пропускаемых шагов из checkpoint'а;
+                пред-заполняют step_results, чтобы зависимости и подстановки выходов
+                завершённых шагов резолвились корректно.
 
         Returns:
             WorkflowResult с полными результатами выполнения
@@ -116,14 +124,42 @@ class WorkflowEngine(DynamicAgentSystem):
         logger.info(f"🚀 Начинаем выполнение workflow '{workflow_def.name}' (ID: {workflow_id})")
         
         try:
-            # 1-2. Инициализация и начальный checkpoint (через helper)
-            resource_lease = await self._on_workflow_started(workflow_def, context, client_id, start_time)
+            # 1-2. Инициализация и начальный checkpoint (через helper).
+            # restored_step_results непуст только на resume — тогда первый checkpoint
+            # сразу содержит уже завершённые шаги (см. _on_workflow_started).
+            resource_lease = await self._on_workflow_started(
+                workflow_def, context, client_id, start_time,
+                step_results=restored_step_results,
+            )
+
+            # 2.5. Персистим определение только при обычном (не-resume) запуске,
+            # чтобы resume_workflow мог восстановить шаги из checkpoint'а.
+            # skip_steps is None ⇒ это первый запуск (на resume передаётся set,
+            # пусть и пустой — поэтому проверяем именно `is None`, а не truthiness).
+            # Best-effort: сбой персиста определения не должен ронять валидный запуск —
+            # он лишь делает данный workflow невосстановимым (resume_workflow вернёт ошибку).
+            if skip_steps is None:
+                try:
+                    await self.state_manager.save_workflow_definition(workflow_id, workflow_def)
+                except Exception as persist_exc:
+                    logger.warning(
+                        "⚠️ Не удалось сохранить определение workflow %s — resume будет недоступен: %s",
+                        workflow_id, persist_exc,
+                    )
 
             # 3. Выполняем шаги workflow
             if workflow_def.parallel_execution:
-                step_results = await self._execute_steps_parallel(workflow_def, context)
+                step_results = await self._execute_steps_parallel(
+                    workflow_def, context,
+                    skip_steps=skip_steps,
+                    restored_step_results=restored_step_results,
+                )
             else:
-                step_results = await self._execute_steps_sequential(workflow_def, context)
+                step_results = await self._execute_steps_sequential(
+                    workflow_def, context,
+                    skip_steps=skip_steps,
+                    restored_step_results=restored_step_results,
+                )
 
             # 4. Обработка результатов и завершение (общая логика)
             result = await self._finalize_workflow_execution(
@@ -134,7 +170,13 @@ class WorkflowEngine(DynamicAgentSystem):
         except Exception as e:
             logger.error(f"❌ Workflow '{workflow_def.name}' failed: {e}")
             if 'resource_lease' in locals():
-                await self._on_workflow_failed(workflow_def, context, resource_lease, e)
+                # Оба исполнителя (sequential/parallel) публикуют текущий step_results на
+                # context — забираем частичный прогресс, чтобы FAILED-checkpoint его сохранил.
+                partial_results = getattr(context, "_workflow_step_results", None)
+                await self._on_workflow_failed(
+                    workflow_def, context, resource_lease, e,
+                    step_results=partial_results,
+                )
             raise
 
     async def _get_workflow_status(self, workflow_id: str) -> Optional[WorkflowStatus]:
@@ -188,11 +230,23 @@ class WorkflowEngine(DynamicAgentSystem):
         )
         return result
     
-    async def _execute_steps_sequential(self, workflow_def, context):
+    async def _execute_steps_sequential(self, workflow_def, context,
+                                        skip_steps: Optional[Set[str]] = None,
+                                        restored_step_results: Optional[Dict[str, StepResult]] = None):
         """Последовательное выполнение шагов (старая логика)"""
-        step_results = {}
-        
+        # Пред-заполняем результатами уже завершённых шагов (resume): их статусы
+        # видны _check_step_dependencies, поэтому зависящие шаги не получают SKIPPED.
+        step_results = dict(restored_step_results or {})
+        # Публикуем на context (как и параллельный путь), чтобы execute_workflow мог
+        # сохранить частичный прогресс в FAILED-checkpoint при сбое (dict мутируется in-place).
+        context._workflow_step_results = step_results
+
         for step in workflow_def.steps:
+            # Resume: пропускаем уже завершённые шаги (их результат уже в step_results).
+            if skip_steps is not None and step.id in skip_steps:
+                logger.info("⏭️ Пропускаем уже завершённый шаг %s (resume)", step.id)
+                continue
+
             if await self._is_workflow_cancelled(context.workflow_id):
                 logger.info(
                     "🚫 Workflow %s отменён до запуска шага %s",
@@ -252,17 +306,23 @@ class WorkflowEngine(DynamicAgentSystem):
         
         return step_results
     
-    async def _execute_steps_parallel(self, workflow_def, context):
+    async def _execute_steps_parallel(self, workflow_def, context,
+                                      skip_steps: Optional[Set[str]] = None,
+                                      restored_step_results: Optional[Dict[str, StepResult]] = None):
         """Параллельное выполнение шагов"""
         from .orchestration.parallel_executor import ParallelWorkflowExecutor
-        
+
         # Сохраняем workflow_definition как временный атрибут для параллельных задач
         context._workflow_definition = workflow_def
-        
+
         parallel_executor = ParallelWorkflowExecutor(
             max_concurrent=workflow_def.max_parallel_steps
         )
-        
+
+        # Resume: пропуск завершённых шагов в параллельном пути обеспечивается
+        # через initial_step_results — его ключи попадают в completed_steps
+        # исполнителя, поэтому get_ready_steps их не возвращает (skip_steps здесь
+        # совпадает с restored_step_results.keys() по построению в resume_workflow).
         return await parallel_executor.execute_steps_parallel(
             workflow_def.steps,
             context,
@@ -271,6 +331,7 @@ class WorkflowEngine(DynamicAgentSystem):
             condition_checker=self._should_skip_step_by_condition,
             stop_checker=lambda: self._is_workflow_cancelled(context.workflow_id),
             stop_on_failure=(workflow_def.error_handling.get("on_failure", "continue") != "continue"),
+            initial_step_results=restored_step_results,
         )
     
     async def _execute_workflow_step_wrapper(self, step, context):
@@ -360,18 +421,13 @@ class WorkflowEngine(DynamicAgentSystem):
     async def resume_workflow(self, workflow_id: str,
                             client_id: Optional[str] = None) -> WorkflowResult:
         """
-        Восстановление workflow с последнего checkpoint'а.
+        Восстановление workflow с последнего checkpoint'а (generic resume).
 
-        НЕ РЕАЛИЗОВАНО (см. Raises). Для корректного resume нужны две вещи, которых
-        сейчас нет: (1) checkpoint должен хранить WorkflowDefinition — но
-        state_manager.save_checkpoint его не сериализует, а metadata не содержит
-        yaml_path; (2) цикл _execute_steps_sequential/_execute_steps_parallel должен
-        пропускать уже завершённые шаги — сейчас он прогоняет ВСЕ шаги, поэтому
-        наивный повторный запуск дублировал бы побочные эффекты. Прод восстанавливает
-        иначе и этот метод не вызывает: StoryBookManager/core/pipeline_runner.py
-        (resume_workflow_from_checkpoint / resume_pipeline) делает from_yaml +
-        execute_workflow. Реализация полноценного resume — отдельная фича (миграция
-        схемы checkpoint + skip-completed в исполнителе), а не багфикс.
+        Загружает последний checkpoint и сохранённое при первом запуске определение
+        workflow, затем повторно вызывает execute_workflow, пропуская уже завершённые
+        шаги. Результаты завершённых шагов восстанавливаются из checkpoint'а, поэтому
+        зависимости и подстановки {step.field} для оставшихся шагов резолвятся корректно,
+        а побочные эффекты завершённых шагов не дублируются.
 
         Args:
             workflow_id: ID workflow для восстановления
@@ -381,18 +437,67 @@ class WorkflowEngine(DynamicAgentSystem):
             WorkflowResult с результатами продолжения выполнения
 
         Raises:
-            WorkflowExecutionError: всегда — resume пока не реализован (см. описание выше).
-                Согласуется с объявленным типом возврата WorkflowResult и общим контрактом
-                ошибок workflow-слоя, поэтому existing except WorkflowExecutionError ловят его
-                штатно (в отличие от NotImplementedError, который прошёл бы мимо как 500).
-                Вызывающий код должен использовать execute_workflow с from_yaml (как
-                pipeline_runner) для реального восстановления.
+            WorkflowNotFoundError: checkpoint для workflow не найден.
+            WorkflowExecutionError: checkpoint не resumable (resume доступен только
+                для PAUSED/FAILED), определение не было сохранено, либо checkpoint
+                повреждён (отсутствует context).
         """
         logger.info(f"🔄 Восстанавливаем workflow {workflow_id}")
-        raise WorkflowExecutionError(
-            f"Cannot resume workflow {workflow_id}: resume is not yet implemented. "
-            "Workflow definition (yaml_path) must be provided alongside the checkpoint "
-            "to reconstruct execution from a saved step."
+
+        checkpoint = await self.state_manager.store.get_latest_checkpoint(workflow_id)
+        if not checkpoint:
+            raise WorkflowNotFoundError(
+                f"Workflow {workflow_id} не найден: checkpoint отсутствует"
+            )
+
+        if not checkpoint.resumable:
+            raise WorkflowExecutionError(
+                f"Workflow {workflow_id} не может быть восстановлен "
+                f"(статус: {checkpoint.status.value}). Resume доступен только для PAUSED/FAILED."
+            )
+
+        definition = await self.state_manager.get_workflow_definition(workflow_id)
+        if definition is None:
+            raise WorkflowExecutionError(
+                f"Workflow {workflow_id} не может быть восстановлен: определение не сохранено "
+                "(execute_workflow персистит его автоматически при первом запуске)."
+            )
+
+        context = checkpoint.context
+        if context is None:
+            raise WorkflowExecutionError(
+                f"Workflow {workflow_id} не может быть восстановлен: checkpoint не содержит context."
+            )
+        if client_id is not None:
+            context.client_id = client_id
+
+        # completed_steps в checkpoint содержит только COMPLETED-шаги (не SKIPPED/FAILED).
+        # Восстанавливаем результаты ровно для них: FAILED/SKIPPED-шаги будут переоценены
+        # и при необходимости перезапущены, без устаревших записей в step_results.
+        skip_steps = set(checkpoint.completed_steps or [])
+        restored = {
+            sid: result
+            for sid, result in (checkpoint.step_results or {}).items()
+            if sid in skip_steps
+        }
+
+        # client_id мог быть не передан явно — берём его из восстановленного context
+        # (выше context.client_id уже синхронизирован с явным client_id, если тот задан),
+        # чтобы acquire_workflow_resources учитывал ресурсы на правильного клиента, а не на None.
+        effective_client_id = context.client_id
+
+        logger.info(
+            "🔄 Resume workflow %s: пропускаем %d уже завершённых шагов",
+            workflow_id,
+            len(skip_steps),
+        )
+
+        return await self.execute_workflow(
+            definition,
+            context=context,
+            client_id=effective_client_id,
+            skip_steps=skip_steps,
+            restored_step_results=restored,
         )
     
     async def get_workflow_status(self, workflow_id: str) -> Optional[WorkflowStatus]:
@@ -438,8 +543,14 @@ class WorkflowEngine(DynamicAgentSystem):
     # ===========================================
     
     async def _on_workflow_started(self, workflow_def: WorkflowDefinition, context: WorkflowContext,
-                                   client_id: Optional[str], start_time: datetime):
-        """Общая инициализация workflow: выделение ресурсов и первый checkpoint"""
+                                   client_id: Optional[str], start_time: datetime,
+                                   step_results: Optional[Dict[str, StepResult]] = None):
+        """Общая инициализация workflow: выделение ресурсов и первый checkpoint.
+
+        На resume в step_results передаются уже восстановленные шаги, чтобы первый
+        RUNNING-checkpoint не затирал прогресс пустым словарём (иначе падение процесса
+        до завершения первого нового шага сбросило бы skip-список при повторном resume).
+        """
         resource_lease = await self.resource_manager.acquire_workflow_resources(
             workflow_id=context.workflow_id,
             client_id=client_id,
@@ -449,7 +560,7 @@ class WorkflowEngine(DynamicAgentSystem):
             workflow_id=context.workflow_id,
             status=WorkflowStatus.RUNNING,
             context=context,
-            step_results={},
+            step_results=step_results or {},
             metadata={"workflow_name": workflow_def.name, "start_time": start_time.isoformat()}
         )
         return resource_lease
@@ -464,14 +575,20 @@ class WorkflowEngine(DynamicAgentSystem):
         context: WorkflowContext,
         resource_lease,
         error: Exception,
+        step_results: Optional[Dict[str, StepResult]] = None,
     ) -> None:
-        """Общий финал workflow при ошибке: checkpoint FAILED и освобождение ресурсов."""
+        """Общий финал workflow при ошибке: checkpoint FAILED и освобождение ресурсов.
+
+        step_results — частичный прогресс на момент сбоя (уже завершённые шаги).
+        Без него FAILED-checkpoint был бы пустым и resume_workflow перезапускал бы
+        весь workflow с нуля, а не «с последнего успешного шага».
+        """
         try:
             await self.state_manager.save_checkpoint(
                 workflow_id=context.workflow_id,
                 status=WorkflowStatus.FAILED,
                 context=context,
-                step_results={},
+                step_results=step_results or {},
                 current_step=context.current_step,
                 metadata={"workflow_name": workflow_def.name, "error": str(error)},
             )

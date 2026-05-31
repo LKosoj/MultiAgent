@@ -6,7 +6,7 @@ import asyncio
 import logging
 import uuid
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 from ..enhanced_engine import EnhancedWorkflowEngine
 from ..models import (
@@ -133,6 +133,9 @@ class EventDrivenWorkflowEngine(EnhancedWorkflowEngine):
         workflow_definition: WorkflowDefinition,
         context: Optional[WorkflowContext] = None,
         client_id: Optional[str] = None,
+        *,
+        skip_steps: Optional[Set[str]] = None,
+        restored_step_results: Optional[Dict[str, "StepResult"]] = None,
     ) -> WorkflowResult:
         """Выполнение workflow c генерацией событий lifecycle."""
 
@@ -159,6 +162,8 @@ class EventDrivenWorkflowEngine(EnhancedWorkflowEngine):
                 workflow_definition,
                 context=workflow_context,
                 client_id=client_id,
+                skip_steps=skip_steps,
+                restored_step_results=restored_step_results,
             )
         except Exception as exc:  # pylint: disable=broad-except
             await self._emit_event(

@@ -3,7 +3,7 @@ Enhanced Workflow Engine с интеллектуальным управлени�
 """
 import logging
 import hashlib
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Set, Union
 from pathlib import Path
 from datetime import datetime
 import yaml
@@ -213,9 +213,25 @@ class EnhancedWorkflowEngine(WorkflowEngine):
     
     async def execute_workflow(self, workflow_definition: WorkflowDefinition,
                               context: Optional[WorkflowContext] = None,
-                              client_id: Optional[str] = None) -> WorkflowResult:
+                              client_id: Optional[str] = None,
+                              *,
+                              skip_steps: Optional[Set[str]] = None,
+                              restored_step_results: Optional[Dict[str, StepResult]] = None) -> WorkflowResult:
         """Enhanced выполнение workflow"""
-        
+
+        # Generic resume (skip_steps задан) выполняется через базовый исполнитель,
+        # который поддерживает пропуск завершённых шагов. Enhanced-слой пока не
+        # реализует resume поверх интеллектуального исполнителя — делегируем в legacy.
+        # ВАЖНО: при resume intelligent-фичи (адаптивная маршрутизация, enhanced-хуки)
+        # НЕ применяются — перезапускаемые шаги исполняются базовой логикой. Это
+        # осознанный компромисс: восстановление прогресса важнее enhanced-семантики.
+        if skip_steps is not None:
+            return await super().execute_workflow(
+                workflow_definition, context, client_id,
+                skip_steps=skip_steps,
+                restored_step_results=restored_step_results,
+            )
+
         # Проверяем включен ли enhanced layer
         if not self.feature_manager.is_enhanced_enabled(context.workflow_id if context else None):
             if workflow_definition.requires_enhanced_engine:
