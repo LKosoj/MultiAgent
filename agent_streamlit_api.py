@@ -451,7 +451,7 @@ class AgentProfile:
     model_key: str = ""
     tools: List[str] = None
     max_steps: int = 20
-    planning_interval: Optional[int] = None
+    planning_interval: Optional[Union[int, str]] = None
     memory_policy: Dict[str, Any] = None
     pipeline_prompts: Dict[str, str] = None
     metadata: Dict[str, Any] = None
@@ -524,7 +524,7 @@ class DynamicAgentDefinition:
     tools: List[str] = None
     instructions: str = ""
     max_steps: int = 20
-    planning_interval: Optional[int] = None
+    planning_interval: Optional[Union[int, str]] = None
     memory_policy: Dict[str, Any] = None
     metadata: Dict[str, Any] = None
 

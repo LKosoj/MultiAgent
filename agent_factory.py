@@ -6,7 +6,12 @@ from smolagents import CodeAgent, ToolCallingAgent, DuckDuckGoSearchTool, OpenAI
 from smolagents.memory import ActionStep, FinalAnswerStep
 from typing import Dict, Any, List, Optional
 from datetime import datetime
-from agent_command import AGENT_PROFILES
+from agent_command import AGENT_PROFILES, model_mapping
+from adaptive_planning import (
+    normalize_planning_interval,
+    AdaptivePlanningToolCallingAgent,
+    AdaptivePlanningCodeAgent,
+)
 from mcp_tools import mcp_clients, mcp_tools
 from memory.rag_memory import create_rag_memory
 
@@ -222,7 +227,7 @@ class AgentFactory:
                 steps = 20
         
         # Получаем planning_interval из профиля, если установлен, иначе None
-        planning_interval = profile.get('planning_interval', None)
+        planning_cfg = normalize_planning_interval(profile.get('planning_interval', None))
 
         try:
             # Определяем тип агента на основе конфигурации
@@ -247,12 +252,13 @@ class AgentFactory:
                 logger.debug(f"📄 Полный промпт для {agent_id}:\n{composite_prompt}")
                 max_tool_threads = profile.get('max_tool_threads', None)
                 
-                agent = ToolCallingAgent(
+                _agent_cls = AdaptivePlanningToolCallingAgent if planning_cfg.adaptive else ToolCallingAgent
+                agent = _agent_cls(
                     tools=tools,
                     model=profile.get('model'),
                     max_steps=steps,
                     verbosity_level=1,
-                    planning_interval=planning_interval,
+                    planning_interval=planning_cfg.smol_interval,
                     name=agent_id,
                     provide_run_summary=provide_run_summary,  # Передаем агенту
                     instructions=composite_prompt,  # Дополнительные инструкции!
@@ -300,12 +306,13 @@ class AgentFactory:
                 logger.info(f"📝 Композитный промпт для {agent_id} (CodeAgent): {len(composite_prompt)} символов")
                 logger.debug(f"📄 Полный промпт для {agent_id}:\n{composite_prompt}")
                 
-                agent = CodeAgent(
+                _agent_cls = AdaptivePlanningCodeAgent if planning_cfg.adaptive else CodeAgent
+                agent = _agent_cls(
                     tools=tools,
                     model=profile.get('model'),
                     max_steps=steps,
                     verbosity_level=1,
-                    planning_interval=planning_interval,
+                    planning_interval=planning_cfg.smol_interval,
                     name=agent_id,
                     provide_run_summary=provide_run_summary,  # Передаем агенту
                     instructions=composite_prompt,  # Дополнительные инструкции!
@@ -335,6 +342,17 @@ class AgentFactory:
                 # Оборачиваем методы для инициализации запуска
                 self._wrap_agent_run_methods(agent)
             
+            if planning_cfg.adaptive:
+                # model_mapping.get() инициализирует модель и может бросить
+                # EnvironmentError без OPENAI_API_KEY_DB — деградируем в None,
+                # тогда Mixin делает обычный (тяжёлый) replan.
+                try:
+                    agent._monitor_model = model_mapping.get('model_lite')
+                except Exception as e:
+                    logger.warning(f"⚠️ Adaptive planning: модель-монитор недоступна ({e}); replan останется безусловным")
+                    agent._monitor_model = None
+                agent._adaptive_force_every = planning_cfg.force_every
+                logger.info(f"🧭 Adaptive planning включён для {agent_id} (force_every={planning_cfg.force_every}, monitor={'ok' if agent._monitor_model else 'none'})")
             setattr(agent, 'agent_id', agent_id)
             setattr(agent, 'profile_type', profile_type)
             setattr(agent, 'session_id', session_id)

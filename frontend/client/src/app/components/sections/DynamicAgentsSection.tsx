@@ -11,7 +11,7 @@ type DynamicProfile = {
   model?: string;
   tools?: string[];
   max_steps?: number;
-  planning_interval?: number | null;
+  planning_interval?: number | string | null;
   memory_policy?: Record<string, unknown>;
   metadata?: Record<string, unknown>;
 };
@@ -60,7 +60,7 @@ type DefinitionState = {
   description: string;
   model: string;
   max_steps: number;
-  planning_interval: number | null;
+  planning_interval: number | string | null;
   instructions: string;
   tools: string[];
   memory_policy: Record<string, unknown>;
@@ -313,7 +313,7 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
       tools: definition.tools,
       instructions: definition.instructions,
       max_steps: definition.max_steps,
-      planning_interval: definition.planning_interval ? definition.planning_interval : null,
+      planning_interval: typeof definition.planning_interval === "string" ? definition.planning_interval : (definition.planning_interval || null),
       memory_policy: definition.memory_policy,
       metadata: {
         ...definition.metadata,
@@ -714,11 +714,33 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
               </label>
               <label className="field">
                 <span className="label">Интервал планирования</span>
-                <input
-                  type="number"
-                  value={definition.planning_interval ?? ""}
-                  onChange={(e) => updateNumber("planning_interval", Number(e.target.value) || 0)}
-                />
+                {typeof definition.planning_interval === "string" ? (
+                  <div className="badge-row">
+                    <span className="badge muted">{definition.planning_interval}</span>
+                    <button
+                      className="button ghost"
+                      type="button"
+                      onClick={() => updateNumber("planning_interval", 0)}
+                    >
+                      Сбросить
+                    </button>
+                  </div>
+                ) : (
+                  <div className="badge-row">
+                    <input
+                      type="number"
+                      value={definition.planning_interval ?? ""}
+                      onChange={(e) => updateNumber("planning_interval", Number(e.target.value) || 0)}
+                    />
+                    <button
+                      className="button ghost"
+                      type="button"
+                      onClick={() => updateDefinition("planning_interval", "adaptive")}
+                    >
+                      Адаптивный
+                    </button>
+                  </div>
+                )}
               </label>
               <label className="field">
                 <span className="label">Max tool threads</span>

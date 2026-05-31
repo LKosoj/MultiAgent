@@ -13,7 +13,7 @@ type AgentProfile = {
   model_real_id?: string;
   tools?: string[];
   max_steps?: number;
-  planning_interval?: number | null;
+  planning_interval?: number | string | null;
   memory_policy?: Record<string, unknown>;
 };
 

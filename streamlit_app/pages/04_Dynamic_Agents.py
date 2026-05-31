@@ -114,6 +114,15 @@ def show_agent_constructor():
                 value=0,
                 help="Интервал для пересмотра плана (0 = отключено)"
             )
+
+            adaptive_planning = st.checkbox(
+                "🧭 Адаптивное планирование",
+                value=False,
+                help="Перепланировать только при сбое/дрейфе: лёгкая модель-монитор "
+                     "оценивает ход плана. Переопределяет числовой интервал выше.",
+            )
+            if adaptive_planning:
+                planning_interval = "adaptive"
         
         # Инструкции
         st.markdown("### 📋 Инструкции и промпт")
@@ -248,7 +257,7 @@ def show_agent_preview(name, agent_type, description, model, max_steps,
         "tools": tools,
         "instructions": instructions,
         "max_steps": max_steps,
-        "planning_interval": planning_interval if planning_interval > 0 else None,
+        "planning_interval": planning_interval if isinstance(planning_interval, int) and planning_interval > 0 else (planning_interval if isinstance(planning_interval, str) else None),
         "memory_policy": {
             "enable_memory": enable_memory,
             "provide_run_summary": provide_run_summary
@@ -259,7 +268,7 @@ def show_agent_preview(name, agent_type, description, model, max_steps,
             "created_by": "streamlit_constructor"
         }
     }
-    
+
     # Отображаем в виде JSON
     col1, col2 = st.columns(2)
     
@@ -302,7 +311,7 @@ def create_dynamic_agent(name, agent_type, description, model, max_steps,
             tools=tools,
             instructions=instructions,
             max_steps=max_steps,
-            planning_interval=planning_interval if planning_interval > 0 else None,
+            planning_interval=planning_interval if isinstance(planning_interval, int) and planning_interval > 0 else (planning_interval if isinstance(planning_interval, str) else None),
             memory_policy={
                 "enable_memory": enable_memory,
                 "provide_run_summary": provide_run_summary
@@ -374,7 +383,7 @@ def save_agent_template(name, agent_type, description, model, max_steps,
         "tools": tools,
         "instructions": instructions,
         "max_steps": max_steps,
-        "planning_interval": planning_interval if planning_interval > 0 else None,
+        "planning_interval": planning_interval if isinstance(planning_interval, int) and planning_interval > 0 else (planning_interval if isinstance(planning_interval, str) else None),
         "memory_policy": {
             "enable_memory": enable_memory,
             "provide_run_summary": provide_run_summary
