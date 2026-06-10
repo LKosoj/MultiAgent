@@ -17,8 +17,6 @@ from typing import Any
 
 import pytest
 
-import url_safety
-
 _LIGHT_WORKFLOW_MODULES = [
     "workflow",
     "workflow.engine",
@@ -1324,7 +1322,7 @@ def test_ssrf_dns_timeout_cancels_future(monkeypatch):
         def submit(self, *_args, **_kwargs):
             return future
 
-    monkeypatch.setattr(url_safety, "_get_dns_resolve_executor", lambda: _Executor())
+    monkeypatch.setattr(service, "_get_dns_resolve_executor", lambda: _Executor())
 
     try:
         with pytest.raises(ValueError, match="таймаут"):
@@ -1339,20 +1337,20 @@ def test_ssrf_dns_resolver_busy_fails_before_queueing(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
     acquired = 0
-    while url_safety._DNS_RESOLVE_SEMAPHORE.acquire(blocking=False):
+    while service._DNS_RESOLVE_SEMAPHORE.acquire(blocking=False):
         acquired += 1
 
     class _Executor:
         def submit(self, *_args, **_kwargs):
             raise AssertionError("DNS work must not be queued while resolver is busy")
 
-    monkeypatch.setattr(url_safety, "_get_dns_resolve_executor", lambda: _Executor())
+    monkeypatch.setattr(service, "_get_dns_resolve_executor", lambda: _Executor())
     try:
         with pytest.raises(ValueError, match="busy"):
             service._validate_url_no_ssrf("https://example.test/image.png")
     finally:
         for _ in range(acquired):
-            url_safety._DNS_RESOLVE_SEMAPHORE.release()
+            service._DNS_RESOLVE_SEMAPHORE.release()
 
 
 def test_telemetry_generate_report_rewrites_html_file_without_pii(monkeypatch, tmp_path):

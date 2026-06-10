@@ -3,6 +3,8 @@ import logging
 import re
 import base64
 import html
+import ipaddress
+import socket
 from datetime import datetime
 from typing import Union, List, Optional, Tuple
 import subprocess
@@ -18,9 +20,55 @@ import glob
 import hashlib
 import requests
 import mimetypes
-from url_safety import validate_url_no_ssrf
+from urllib.parse import urlsplit
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _is_public_ip(ip_str: str) -> bool:
+    addr = ipaddress.ip_address(ip_str)
+    return not (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        or not addr.is_global
+    )
+
+
+def _validate_public_image_url(url: str) -> None:
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError(f"URL scheme is not allowed: {parsed.scheme}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("URL must contain a hostname")
+    lowered = hostname.lower().rstrip(".")
+    if lowered in {"localhost", "metadata.google.internal"}:
+        raise ValueError(f"URL hostname is not allowed: {hostname}")
+    try:
+        ipaddress.ip_address(hostname)
+    except ValueError:
+        is_ip_literal = False
+    else:
+        is_ip_literal = True
+    if is_ip_literal:
+        if not _is_public_ip(hostname):
+            raise ValueError(f"URL points to a non-public IP address: {hostname}")
+        return
+
+    try:
+        infos = socket.getaddrinfo(hostname, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Could not resolve image hostname: {hostname}") from exc
+    if not infos:
+        raise ValueError(f"Could not resolve image hostname: {hostname}")
+    for info in infos:
+        ip = info[4][0]
+        if not _is_public_ip(ip):
+            raise ValueError(f"Image URL resolves to a non-public IP address: {ip}")
 
 
 def _image_content_type(url: str, header_value: Optional[str]) -> str:
@@ -33,7 +81,7 @@ def _image_content_type(url: str, header_value: Optional[str]) -> str:
 
 
 def _download_image_for_embed(url: str) -> Optional[Tuple[str, bytes]]:
-    validate_url_no_ssrf(url)
+    _validate_public_image_url(url)
     with requests.get(url, stream=True, timeout=20, allow_redirects=False) as response:
         if 300 <= response.status_code < 400:
             raise ValueError(f"Image URL returned redirect {response.status_code}; redirects are not allowed")

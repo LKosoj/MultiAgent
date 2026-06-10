@@ -25,7 +25,6 @@ import importlib
 import shutil
 from urllib.parse import urlparse
 from smolagents import tool
-from url_safety import validate_url_no_ssrf
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -868,17 +867,9 @@ class CodeInterpreterPlugin():
             Optional[str]: Путь к сохраненному файлу или None в случае ошибки
         """
         try:
-            # SSRF-guard: блокируем не-public адреса до любого сетевого вызова.
-            # Валидация резолвит DNS блокирующе — уводим её в отдельный поток.
-            try:
-                await asyncio.to_thread(validate_url_no_ssrf, url)
-            except ValueError as e:
-                logging.error(f"Загрузка файла отклонена SSRF-проверкой: {e}")
-                return None
-
             # Создаем директорию для временных файлов, если её нет
             os.makedirs('data', exist_ok=True)
-
+            
             # Получаем имя файла из URL
             parsed_url = urlparse(url)
             filename = os.path.basename(parsed_url.path)
@@ -893,9 +884,8 @@ class CodeInterpreterPlugin():
             # Полный путь для сохранения файла
             save_path = os.path.join('data', filename)
             
-            # Асинхронно скачиваем файл; редиректы запрещены явно, чтобы публичный
-            # URL не мог перенаправить запрос на внутренний адрес после валидации.
-            async with httpx.AsyncClient(follow_redirects=False) as client:
+            # Асинхронно скачиваем файл
+            async with httpx.AsyncClient() as client:
                 response = await client.get(url)
                 response.raise_for_status()  # Проверяем статус ответа
                 

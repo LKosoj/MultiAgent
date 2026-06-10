@@ -1,5 +1,4 @@
 import base64
-import socket
 from pathlib import Path
 
 import pytest
@@ -17,7 +16,7 @@ def test_download_image_for_embed_rejects_loopback_without_request(monkeypatch):
 
     monkeypatch.setattr(html_utils.requests, "get", fake_get)
 
-    with pytest.raises(ValueError, match="non-public|not allowed|loopback"):
+    with pytest.raises(ValueError, match="non-public|not allowed"):
         html_utils._download_image_for_embed("http://127.0.0.1/image.png")
 
     assert called is False
@@ -34,7 +33,7 @@ def test_download_image_for_embed_rejects_dns_to_private_ip(monkeypatch):
         called = True
         raise AssertionError("requests.get must not be called for private DNS results")
 
-    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+    monkeypatch.setattr(html_utils.socket, "getaddrinfo", fake_getaddrinfo)
     monkeypatch.setattr(html_utils.requests, "get", fake_get)
 
     with pytest.raises(ValueError, match="non-public"):
