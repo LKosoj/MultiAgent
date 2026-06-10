@@ -4,6 +4,8 @@ EPIC 1.6: при reverse-edge (b in used_tables, а подключаем a) join
 должен инвертироваться: LEFT<->RIGHT, симметричные (INNER/FULL/FULL OUTER/
 CROSS/NATURAL) остаются без изменений. Неизвестный join_type — fail-fast.
 """
+import logging
+
 import pytest
 
 from custom_tools.text_to_sql.join_builder import JoinBuilder
@@ -92,3 +94,84 @@ def test_unknown_join_type_raises():
             required_tables={"A", "B"},
             joins_from_schema=[_edge("SIDEWAYS")],
         )
+
+
+# ---------------------------------------------------------------------------
+# T9: multi-FK warning diagnostics
+# ---------------------------------------------------------------------------
+
+def test_multi_fk_warns_on_dropped_edge(caplog):
+    """Два FK-ребра A->B (author_id->id и reviewer_id->id).
+
+    Ожидание: ровно один JOIN в результате И ровно один WARNING
+    с упоминанием A, B и отброшенной колонки reviewer_id.
+    """
+    builder = JoinBuilder(db_schema={})
+    edges = [
+        {
+            "from_table": "A",
+            "from_column": "author_id",
+            "to_table": "B",
+            "to_column": "id",
+            "join_type": "LEFT",
+        },
+        {
+            "from_table": "A",
+            "from_column": "reviewer_id",
+            "to_table": "B",
+            "to_column": "id",
+            "join_type": "LEFT",
+        },
+    ]
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.join_builder"):
+        result = builder.build_joins(
+            main_table="A",
+            required_tables={"A", "B"},
+            joins_from_schema=edges,
+        )
+
+    assert result["success"] is True
+    assert len(result["join_clauses"]) == 1
+
+    multi_fk_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "Multiple FK" in r.message
+    ]
+    assert len(multi_fk_warnings) == 1, (
+        f"Expected 1 multi-FK warning, got {len(multi_fk_warnings)}: "
+        f"{[r.message for r in multi_fk_warnings]}"
+    )
+    warn_msg = multi_fk_warnings[0].message
+    assert "A" in warn_msg
+    assert "B" in warn_msg
+    assert "reviewer_id" in warn_msg
+
+
+def test_single_fk_no_multi_fk_warning(caplog):
+    """Одиночный FK — никакого multi-FK warning быть не должно."""
+    builder = JoinBuilder(db_schema={})
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.join_builder"):
+        result = builder.build_joins(
+            main_table="A",
+            required_tables={"A", "B"},
+            joins_from_schema=[
+                {
+                    "from_table": "A",
+                    "from_column": "author_id",
+                    "to_table": "B",
+                    "to_column": "id",
+                    "join_type": "LEFT",
+                }
+            ],
+        )
+
+    assert result["success"] is True
+    assert len(result["join_clauses"]) == 1
+
+    multi_fk_warnings = [
+        r for r in caplog.records
+        if r.levelno == logging.WARNING and "Multiple FK" in r.message
+    ]
+    assert len(multi_fk_warnings) == 0, (
+        f"Unexpected multi-FK warning(s): {[r.message for r in multi_fk_warnings]}"
+    )

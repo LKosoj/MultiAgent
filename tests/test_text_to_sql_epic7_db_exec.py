@@ -332,3 +332,76 @@ def test_classify_statement_uses_regex_when_sqlglot_disabled(monkeypatch):
     assert _classify_statement("EXPLAIN SELECT 1") == "explain"
     assert _classify_statement("SHOW TABLES") == "show"
     assert _classify_statement("INSERT INTO t VALUES (1)") == "unknown"
+
+
+# === T12: guard на non-dict ответ plugin.explain() ===
+
+
+@pytest.mark.parametrize(
+    "bad_return",
+    [None, [], ["x"], "str"],
+    ids=["none", "empty_list", "list_with_item", "string"],
+)
+def test_explain_strategy_non_dict_does_not_raise(bad_return):
+    """_explain_strategy не кидает при non-dict ответе plugin.explain(); success=False."""
+    import time as _time
+    from custom_tools.text_to_sql.core._db_exec import _explain_strategy
+
+    class BadPlugin:
+        def explain(self, conn, sql):
+            return bad_return
+
+    result = _explain_strategy(
+        sql_query="EXPLAIN SELECT 1",
+        plugin=BadPlugin(),
+        conn=None,
+        start=_time.time(),
+        row_limit=500,
+    )
+    assert result["success"] is False
+    assert result["error_message"]  # непустое
+
+
+def test_explain_strategy_non_dict_logs_warning(caplog):
+    """При non-dict ответе plugin.explain() логируется warning на нужном логгере."""
+    import logging
+    import time as _time
+    from custom_tools.text_to_sql.core._db_exec import _explain_strategy
+
+    class BadPlugin:
+        def explain(self, conn, sql):
+            return None
+
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.core._db_exec"):
+        _explain_strategy(
+            sql_query="EXPLAIN SELECT 1",
+            plugin=BadPlugin(),
+            conn=None,
+            start=_time.time(),
+            row_limit=500,
+        )
+
+    assert any(
+        "_explain_strategy" in r.message and "unexpected type" in r.message
+        for r in caplog.records
+    )
+
+
+def test_explain_strategy_valid_dict_returns_success():
+    """Регрессия: корректный dict {"plan": "Seq Scan on t", "issues": []} → success=True."""
+    import time as _time
+    from custom_tools.text_to_sql.core._db_exec import _explain_strategy
+
+    class GoodPlugin:
+        def explain(self, conn, sql):
+            return {"plan": "Seq Scan on t", "issues": []}
+
+    result = _explain_strategy(
+        sql_query="EXPLAIN SELECT 1",
+        plugin=GoodPlugin(),
+        conn=None,
+        start=_time.time(),
+        row_limit=500,
+    )
+    assert result["success"] is True
+    assert result["data"] == [["Seq Scan on t"]]

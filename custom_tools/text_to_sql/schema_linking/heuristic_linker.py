@@ -270,25 +270,36 @@ class HeuristicLinker:
                 for t, table_schema in db_schema.items():
                     if t == main_table:
                         continue
-                    col_with_score = self._best_column_with_score(d, t, table_schema)
-                    if col_with_score is None:
+                    # T6: перебираем ранжированных кандидатов и берём первую НЕ-FK.
+                    # Раньше брали top-1 и отбрасывали если FK — теряя всю таблицу.
+                    ranked = self._score_columns_for_name(d, table_schema)
+                    if not ranked:
                         continue
-                    candidate, cand_score = col_with_score
-                    # 4.13: источник истины — метаданные колонки (constraint_type == "FK")
-                    candidate_meta = get_table_columns(table_schema).get(candidate)
-                    if not (isinstance(candidate_meta, dict) and is_fk(candidate_meta)):
+                    ranked.sort(key=lambda x: (-x[1], x[0]))
+                    table_cols = get_table_columns(table_schema)
+                    for candidate, cand_score in ranked:
+                        col_meta = table_cols.get(candidate)
+                        if isinstance(col_meta, dict) and is_fk(col_meta):
+                            continue
                         other_candidates.append((t, candidate, cand_score))
+                        break
+                    # если все кандидаты FK — таблица не добавляется (поведение сохраняется)
 
                 # Проверяем main_table как отдельного кандидата,
-                # также фильтруем FK-колонки (как для других таблиц)
+                # также фильтруем FK-колонки (как для других таблиц).
+                # T6: перебираем ранжированных кандидатов и берём первую НЕ-FK.
                 main_candidate = None
                 main_tbl_schema = db_schema.get(main_table, {})
-                _main_col_result = self._best_column_with_score(d, main_table, main_tbl_schema)
-                if _main_col_result is not None:
-                    _mc, _ms = _main_col_result
-                    _mc_meta = get_table_columns(main_tbl_schema).get(_mc)
-                    if not (isinstance(_mc_meta, dict) and is_fk(_mc_meta)):
+                _main_ranked = self._score_columns_for_name(d, main_tbl_schema)
+                if _main_ranked:
+                    _main_ranked.sort(key=lambda x: (-x[1], x[0]))
+                    _main_tbl_cols = get_table_columns(main_tbl_schema)
+                    for _mc, _ms in _main_ranked:
+                        _mc_meta = _main_tbl_cols.get(_mc)
+                        if isinstance(_mc_meta, dict) and is_fk(_mc_meta):
+                            continue
                         main_candidate = (_mc, _ms)
+                        break
 
                 if other_candidates or main_candidate:
                     # Выбираем победителя: сначала по score DESC, при равенстве

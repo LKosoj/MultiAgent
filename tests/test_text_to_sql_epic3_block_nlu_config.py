@@ -16,7 +16,9 @@ import pytest
 from custom_tools.text_to_sql import nlu, nlu_config, schema_filtering
 from custom_tools.text_to_sql.nlu import NLUProcessor
 from custom_tools.text_to_sql.nlu_config import (
+    NLUMorphemes,
     NLUMorphemesRegistry,
+    canonicalize_token_via_morphemes,
     load_nlu_morphemes,
     nlu_morphemes_scope,
 )
@@ -341,3 +343,70 @@ def test_expand_entity_tokens_canonical_match():
     assert "revenue" in tokens
     assert "выруч" in tokens
     assert "сумм" in tokens
+
+
+# --------------------------------------------------------------------------
+# T7: canonicalize_token_via_morphemes — префикс-матч (не substring)
+# --------------------------------------------------------------------------
+
+def _make_morphemes_cfg() -> NLUMorphemes:
+    """Минимальный NLUMorphemes для тестирования canonicalize_token_via_morphemes."""
+    raw = {
+        "version": 1,
+        "language": "ru",
+        "enabled": True,
+        "intents": [
+            {"canonical": "revenue", "morphemes": ["выруч", "revenue", "amount", "сумм", "доход"]},
+            {"canonical": "count",   "morphemes": ["количеств", "count", "число"]},
+        ],
+        "dimensions": [
+            {"canonical": "region",  "morphemes": ["регион", "region", "облас"]},
+        ],
+        "relative_date": {"triggers": [], "periods": [], "days_pattern": r"(\d+)\s*(?:дн|day)"},
+        "patterns": {
+            "date_iso": [], "region": [], "amount_greater": [],
+            "amount_less": [], "amount_between": [], "top_n": [],
+        },
+        "order": {"triggers": [], "desc_triggers": []},
+        "intent_rules": [],
+        "default_intent": "query",
+        "top_n_intent": "top_n",
+        "tokenizer": {"adpositions": []},
+        "regions": {"normalize": {}},
+    }
+    return NLUMorphemes(raw, source_path="<test>")
+
+
+def test_canonicalize_no_false_positive_substring():
+    """'account'/'accounts'/'discount'/'recount' НЕ должны канонизироваться в 'count'."""
+    cfg = _make_morphemes_cfg()
+    for token in ("account", "accounts", "discount", "recount"):
+        result = canonicalize_token_via_morphemes(token, cfg)
+        assert result == token.lower(), (
+            f"Ложная канонизация: {token!r} → {result!r} (ожидался identity)"
+        )
+
+
+def test_canonicalize_by_design_preserved():
+    """By-design сценарии: revenue/count/region и их флективные формы."""
+    cfg = _make_morphemes_cfg()
+
+    cases = {
+        # (token, expected_canonical)
+        "amount":      "revenue",
+        "amounts":     "revenue",
+        "revenue":     "revenue",
+        "выручка":     "revenue",
+        "выручки":     "revenue",
+        "доход":       "revenue",
+        "count":       "count",
+        "counts":      "count",
+        "количество":  "count",
+        "region":      "region",
+        "область":     "region",
+    }
+    for token, expected in cases.items():
+        result = canonicalize_token_via_morphemes(token, cfg)
+        assert result == expected, (
+            f"canonicalize({token!r}): ожидалось {expected!r}, получено {result!r}"
+        )

@@ -280,3 +280,43 @@ def test_code_formatter_sqlglot_error_returns_error_without_sql_body(monkeypatch
     assert "formatted_sql_query" not in result, (
         "W2-T7: SQL-тело не должно эхоироваться в formatted_sql_query при ошибке sqlglot"
     )
+
+
+# === T5: parse_with_timeout — per-call executor не исчерпывается после двух таймаутов ===
+
+
+def test_parse_with_timeout_pool_not_exhausted_after_two_timeouts(monkeypatch):
+    """После двух зависаний с TimeoutError третий вызов (без зависания) успешно возвращает результат.
+
+    При module-level singleton-пуле max_workers=2 оба слота были бы заняты зависшими
+    потоками и третий вызов тоже завис бы. Per-call executor не имеет этой проблемы.
+    """
+    import threading
+    import sqlglot
+
+    call_count = 0
+    fake_result = [object()]
+    hang_event = threading.Event()
+
+    def fake_parse(sql, read=None):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            # Зависаем на 2 с — дольше любого таймаута в тесте (0.2 с).
+            hang_event.wait(timeout=2.0)
+            return []
+        # Третий вызов — мгновенный возврат.
+        return fake_result
+
+    monkeypatch.setattr(sqlglot, "parse", fake_parse)
+
+    with pytest.raises(TimeoutError):
+        parse_with_timeout("SELECT 1", timeout_s=0.2)
+
+    with pytest.raises(TimeoutError):
+        parse_with_timeout("SELECT 1", timeout_s=0.2)
+
+    # Третий вызов должен пройти без зависания.
+    result = parse_with_timeout("SELECT 1", timeout_s=1.0)
+    assert len(result) == 1
+    assert result[0] is fake_result[0]

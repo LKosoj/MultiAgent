@@ -279,3 +279,75 @@ def test_extract_intent_llm_entities_as_string_raises_valueerror(monkeypatch):
     processor = NLUProcessor()
     with pytest.raises(RuntimeError, match="unavailable or returned invalid data"):
         processor.extract_intent("покажи выручку")
+
+
+# ---------------------------------------------------------------------------
+# T8: при недоступном конфиге пустой/пробельный ввод возвращает нейтральный дефолт
+# ---------------------------------------------------------------------------
+
+def test_extract_intent_empty_string_missing_config_returns_default(tmp_path, monkeypatch):
+    """T8: extract_intent('') при несуществующем конфиге не кидает, возвращает intent='query'."""
+    missing_path = tmp_path / "does_not_exist.yaml"
+    assert not missing_path.exists()
+
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(missing_path))
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    result = processor.extract_intent("")
+    assert result == {
+        "intent": "query",
+        "entities": {"metrics": [], "dimensions": [], "filters": {}},
+    }
+
+
+def test_extract_intent_whitespace_missing_config_returns_default(tmp_path, monkeypatch):
+    """T8: extract_intent('   ') при несуществующем конфиге не кидает, возвращает intent='query'."""
+    missing_path = tmp_path / "does_not_exist.yaml"
+    assert not missing_path.exists()
+
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(missing_path))
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    result = processor.extract_intent("   ")
+    assert result == {
+        "intent": "query",
+        "entities": {"metrics": [], "dimensions": [], "filters": {}},
+    }
+
+
+def test_extract_intent_empty_string_broken_yaml_returns_default(tmp_path, monkeypatch):
+    """T8: extract_intent('') при битом yaml-конфиге не пробрасывает YAMLError.
+
+    Битый yaml — это разновидность «конфиг недоступен», поэтому пустой ввод
+    должен мягко деградировать к нейтральному intent, а не падать.
+    """
+    broken_path = tmp_path / "broken.yaml"
+    broken_path.write_text("intents: [unclosed\n  - : : :", encoding="utf-8")
+
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(broken_path))
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    result = processor.extract_intent("")
+    assert result == {
+        "intent": "query",
+        "entities": {"metrics": [], "dimensions": [], "filters": {}},
+    }
+
+
+def test_extract_intent_nonempty_missing_config_still_raises(tmp_path, monkeypatch):
+    """T8 регрессия: непустой ввод при недоступном конфиге по-прежнему кидает FileNotFoundError.
+    Мягкий fallback только для пустого ввода — не для реального запроса.
+    """
+    missing_path = tmp_path / "does_not_exist.yaml"
+    assert not missing_path.exists()
+
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(missing_path))
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    with pytest.raises(FileNotFoundError, match="NLU morphemes config not found"):
+        processor.extract_intent("любой текст")

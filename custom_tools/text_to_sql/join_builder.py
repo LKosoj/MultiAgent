@@ -99,6 +99,17 @@ class JoinBuilder:
                     })
                     used_tables.add(a)
                     progress = True
+                elif (
+                    a in used_tables
+                    and b in used_tables
+                    and (a in required_tables or b in required_tables)
+                ):
+                    logger.warning(
+                        "Multiple FK edges between %s and %s: edge (%s.%s -> %s.%s) "
+                        "skipped because both %s and %s are already joined; "
+                        "join ambiguity may produce incorrect SQL",
+                        a, b, a, a_col, b, b_col, a, b,
+                    )
         
         unconnected_tables = required_tables - used_tables
         

@@ -118,8 +118,9 @@ class ColumnMetadataHelper:
 
         # ПРОВЕРКА ОПИСАНИЯ - только для действительно важных терминов
         if isinstance(col_info, dict):
-            description = col_info.get('description', '').lower()
-            if description:
+            col_desc = col_info.get('description') or ''
+            if col_desc:
+                description = col_desc.lower()
                 for keyword in config.critical_description_keywords:
                     if keyword in description:
                         return True
@@ -145,9 +146,9 @@ class ColumnMetadataHelper:
         # Кастомная граница: alphanumeric не должен примыкать с обеих сторон.
         # ``_`` намеренно НЕ включён в lookaround → выступает разделителем.
         word_pattern = (
-            r'(?<![A-Za-z0-9])'
+            r'(?<![A-Za-z0-9Ѐ-ӿ])'
             + re.escape(pattern)
-            + r'(?![A-Za-z0-9])'
+            + r'(?![A-Za-z0-9Ѐ-ӿ])'
         )
         if re.search(word_pattern, col_name):
             return True

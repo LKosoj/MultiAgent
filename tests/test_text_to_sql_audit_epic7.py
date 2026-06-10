@@ -536,3 +536,39 @@ def test_sanitize_audit_obj_masks_card_number_in_result_data():
     # Числовые значения не тронуты
     assert sanitized["rows_affected"] == 1
     assert sanitized["success"] is True
+
+
+def test_t11_sanitize_audit_obj_tuple_dag_no_empty_placeholder():
+    """DAG: shared tuple referenced via two dict paths must not yield empty () via cycle-guard."""
+    from custom_tools.text_to_sql.core._audit import _sanitize_audit_obj
+
+    shared_t = ("4111 1111 1111 1111", 99)
+    payload = {"path1": shared_t, "path2": shared_t}
+    result = _sanitize_audit_obj(payload)
+
+    # Both paths must point to the same sanitized tuple (memo reuse).
+    assert result["path1"] is result["path2"]
+    # Must NOT be the empty placeholder — data must not be lost.
+    assert result["path1"] != ()
+    # Card number must be masked; int must be intact.
+    assert result["path1"][0] == "[CARD]"
+    assert result["path1"][1] == 99
+
+
+def test_t11_sanitize_audit_obj_tuple_cycle_graceful():
+    """Cycle through a tuple: no RecursionError; back-reference yields () gracefully."""
+    from custom_tools.text_to_sql.core._audit import _sanitize_audit_obj
+
+    lst = []
+    t = (lst, "test@example.com")
+    lst.append(t)  # lst[0] is t, t[0] is lst → cycle
+
+    result = _sanitize_audit_obj(t)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    # Email in position 1 must be masked.
+    assert result[1] == "[EMAIL]"
+    # Back-reference: the inner list's first element is the in-progress tuple → ().
+    assert isinstance(result[0], list)
+    assert result[0][0] == ()

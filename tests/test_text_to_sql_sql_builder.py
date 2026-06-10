@@ -169,16 +169,122 @@ def test_schema_linking_prompt_escapes_schema_str_against_injection():
         entities={"metrics": [], "dimensions": [], "filters": {}},
         schema_str=malicious_schema,
     )
-    # Строка должна быть JSON-экранирована: кавычки и спецсимволы обёрнуты в строку
-    # Проверяем что инъекционная строка не вставлена «сырой» — она должна быть в JSON-обёртке
-    assert "Ignore previous instructions" not in prompt or (
-        '"Ignore previous instructions' in prompt or
-        "\\n" in prompt or
-        'JSON' in prompt
-    ), "Инъекционная строка не экранирована в промпте"
+    # Сырой (неэкранированный) перенос строки не должен попасть в промпт:
+    # json.dumps превращает реальный \n в литеральные символы "\n". Если бы
+    # schema_str вставлялась «сырой», подстрока с настоящим переводом строки
+    # оказалась бы в промпте — этот assert тогда упадёт (ловит регрессию).
+    assert "orders\nIgnore previous instructions" not in prompt, (
+        "schema_str вставлена сырой — реальный перевод строки не экранирован"
+    )
     # Более точная проверка: schema_str обёрнута в JSON-кавычки
     import json
     escaped = json.dumps(malicious_schema, ensure_ascii=False)
     assert escaped in prompt, (
         f"Ожидаем json.dumps-обёртку схемы в промпте; escaped={escaped!r}"
     )
+
+
+# === T10(a): operator-dict + sibling min/max/start/end ===
+
+
+def test_filter_value_conditions_operator_dict_with_min_max_siblings():
+    # {"operator": ">", "value": 5, "min": 1, "max": 100} → 3 conditions: >, >=, <=
+    value = {"operator": ">", "value": 5, "min": 1, "max": 100}
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', value, info)
+    assert conds is not None, f"Expected conditions, got None"
+    assert len(conds) == 3, f"Expected 3 conditions, got {conds}"
+    assert '"t"."col" > 5' in conds
+    assert '"t"."col" >= 1' in conds
+    assert '"t"."col" <= 100' in conds
+
+
+def test_filter_value_conditions_operator_dict_with_start_end_siblings():
+    # {"operator": "!=", "value": 0, "start": 10, "end": 20} → 3 conditions: !=, >=, <=
+    value = {"operator": "!=", "value": 0, "start": 10, "end": 20}
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', value, info)
+    assert conds is not None, f"Expected conditions, got None"
+    assert len(conds) == 3, f"Expected 3 conditions, got {conds}"
+    assert '"t"."col" != 0' in conds
+    assert '"t"."col" >= 10' in conds
+    assert '"t"."col" <= 20' in conds
+
+
+def test_filter_value_conditions_operator_dict_no_siblings():
+    # {"operator": ">", "value": 42} → only 1 condition (no siblings)
+    value = {"operator": ">", "value": 42}
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', value, info)
+    assert conds == ['"t"."col" > 42'], f"Unexpected: {conds}"
+
+
+def test_filter_value_conditions_operator_dict_no_value_returns_none():
+    # {"operator": ">"} without "value" key → None
+    value = {"operator": ">"}
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', value, info)
+    assert conds is None
+
+
+# === T10(b): None filtering in IN list ===
+
+
+def test_filter_value_conditions_in_list_filters_none():
+    # [1, None, 2] → IN (1, 2) — None dropped
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', [1, None, 2], info)
+    assert conds == ['"t"."col" IN (1, 2)'], f"Unexpected: {conds}"
+
+
+def test_filter_value_conditions_in_list_only_none_gives_false():
+    # [None] → ["1 = 0"] after filtering
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', [None], info)
+    assert conds == ["1 = 0"]
+
+
+def test_filter_value_conditions_in_list_no_none_unchanged():
+    # [1, 2, 3] → IN (1, 2, 3), no change
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', [1, 2, 3], info)
+    assert conds == ['"t"."col" IN (1, 2, 3)']
+
+
+def test_filter_value_conditions_empty_list_gives_false():
+    # [] → ["1 = 0"]
+    info = {"operator": "="}
+    conds = sql_builder.filter_value_conditions('"t"."col"', [], info)
+    assert conds == ["1 = 0"]
+
+
+# === T10(c): sql_literal rejects inf/nan ===
+
+
+def test_sql_literal_inf_raises():
+    import pytest
+    with pytest.raises(ValueError, match="non-finite"):
+        sql_builder.sql_literal(float("inf"))
+
+
+def test_sql_literal_neg_inf_raises():
+    import pytest
+    with pytest.raises(ValueError, match="non-finite"):
+        sql_builder.sql_literal(float("-inf"))
+
+
+def test_sql_literal_nan_raises():
+    import pytest
+    with pytest.raises(ValueError, match="non-finite"):
+        sql_builder.sql_literal(float("nan"))
+
+
+def test_sql_literal_finite_floats_unchanged():
+    assert sql_builder.sql_literal(3.14) == "3.14"
+    assert sql_builder.sql_literal(0.0) == "0.0"
+    assert sql_builder.sql_literal(-42.5) == "-42.5"
+
+
+def test_sql_literal_int_unchanged():
+    assert sql_builder.sql_literal(42) == "42"
+    assert sql_builder.sql_literal(0) == "0"

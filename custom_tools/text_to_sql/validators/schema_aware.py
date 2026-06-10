@@ -245,6 +245,16 @@ class SQLSchemaValidator:
                 has_from_tables = True
                 continue
             if not real_table_name:
+                func_name = self._scope.get_table_func_name(table_node)
+                if func_name is not None:
+                    has_from_tables = True
+                    issues.append({
+                        "issue_type": "UNKNOWN_TABLE",
+                        "description": (
+                            f"Table function '{func_name}()' is not a recognised schema "
+                            f"source; only declared schema tables are allowed"
+                        ),
+                    })
                 continue
             has_from_tables = True
             resolved = self._scope.resolve_table_name_detailed(real_table_name, db_schema)

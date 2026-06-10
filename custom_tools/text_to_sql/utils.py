@@ -297,13 +297,10 @@ def redact_text_to_sql_value(value: Any) -> Any:
 
 
 # === EPIC 7.27: защита от долгого sqlglot.parse ===
-# Module-level executor: per-call overhead минимален, daemon-потоки не блокируют
-# завершение процесса. max_workers=2 — для редких таймаутов; нормальные вызовы
-# быстрые, так что очередь не создаётся.
-_SQLGLOT_PARSE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="sqlglot-parse",
-)
+# Executor создаётся per-call (в parse_with_timeout) и сразу shutdown(wait=False).
+# Это исключает ситуацию, когда зависший parse навсегда занимает слот в
+# singleton-пуле. Overhead одного потока на вызов незначителен: нормальные
+# вызовы завершаются быстро, а таймаут-сценарий редок.
 
 
 def _get_max_sql_length() -> int:
@@ -349,18 +346,22 @@ def parse_with_timeout(
 
     import sqlglot  # lazy
 
-    future = _SQLGLOT_PARSE_EXECUTOR.submit(sqlglot.parse, sql, read=read)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="sqlglot-parse")
+    future = executor.submit(sqlglot.parse, sql, read=read)
     try:
-        return future.result(timeout=effective_timeout)
-    except concurrent.futures.TimeoutError as exc:
         try:
-            from .validators import record_sqlglot_metric
-            record_sqlglot_metric("parse_timeout")
-        except Exception:
-            logger.debug("record_sqlglot_metric unavailable; skipping parse_timeout metric")
-        raise TimeoutError(
-            f"sqlglot.parse exceeded timeout of {effective_timeout}s"
-        ) from exc
+            return future.result(timeout=effective_timeout)
+        except concurrent.futures.TimeoutError as exc:
+            try:
+                from .validators import record_sqlglot_metric
+                record_sqlglot_metric("parse_timeout")
+            except Exception:
+                logger.debug("record_sqlglot_metric unavailable; skipping parse_timeout metric")
+            raise TimeoutError(
+                f"sqlglot.parse exceeded timeout of {effective_timeout}s"
+            ) from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def get_repo_root() -> Path:
@@ -769,10 +770,12 @@ def get_schema_version(db_schema: Optional[Dict[str, Any]] = None) -> str:
     # Сохраняем в кэш
     if version == "unknown":
         logger.warning(
-            "get_schema_version: не удалось вычислить версию схемы (ключ %s); кэшируется \"unknown\"",
+            "get_schema_version: версия схемы неизвестна (\"unknown\", ключ %s); "
+            "результат не кэшируется, будет повторный расчёт при следующем вызове",
             cache_key,
         )
-    _schema_version_cache[cache_key] = version
+    else:
+        _schema_version_cache[cache_key] = version
     return version
 
 

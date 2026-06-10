@@ -68,6 +68,20 @@ class ScopeResolver:
         else:
             return self.clean_identifier(table_node)
 
+    def get_table_func_name(self, table_node) -> "str | None":
+        """Если table_node — табличная функция (exp.Table с пустым .name и exp.Func в .this),
+        вернуть имя функции (url/s3/file/remote/...), иначе None."""
+        if not SQLGLOT_AVAILABLE or exp is None:
+            return None
+        if not hasattr(table_node, 'name') or table_node.name:
+            return None
+        this_node = table_node.args.get('this') if hasattr(table_node, 'args') else None
+        if not isinstance(this_node, exp.Func):
+            return None
+        if isinstance(this_node, exp.Anonymous):
+            return str(this_node.name).lower() or "unknown_function"
+        return type(this_node).__name__.lower()
+
     def normalize_table_name(self, table_node, db_schema: Dict[str, Dict[str, Dict[str, str]]]) -> str:
         """Нормализует имя таблицы из AST узла."""
         if hasattr(table_node, 'db') and table_node.db:

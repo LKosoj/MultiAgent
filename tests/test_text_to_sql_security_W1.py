@@ -620,3 +620,39 @@ def test_a6_text_to_sql_mask_pii_shared_container_reuses_sanitized_copy():
     assert redacted["first"]["email"] == "[EMAIL]"
     assert redacted["second"]["phone"] == "[PHONE]"
     assert "alice@example.com" not in str(redacted)
+
+
+def test_t11_mask_pii_in_obj_tuple_dag_no_empty_placeholder():
+    """DAG: shared tuple referenced via two dict paths must not yield empty () via cycle-guard."""
+    from custom_tools.text_to_sql.core._pii import mask_pii_in_obj
+
+    shared_t = ("alice@example.com", 42)
+    payload = {"path1": shared_t, "path2": shared_t}
+    result = mask_pii_in_obj(payload)
+
+    # Both paths must point to the same sanitized tuple (memo reuse).
+    assert result["path1"] is result["path2"]
+    # Must NOT be the empty placeholder — data must not be lost.
+    assert result["path1"] != ()
+    # Email must be masked; int must be intact.
+    assert result["path1"][0] == "[EMAIL]"
+    assert result["path1"][1] == 42
+
+
+def test_t11_mask_pii_in_obj_tuple_cycle_graceful():
+    """Cycle through a tuple: no RecursionError; back-reference yields () gracefully."""
+    from custom_tools.text_to_sql.core._pii import mask_pii_in_obj
+
+    lst = []
+    t = (lst, "alice@example.com")
+    lst.append(t)  # lst[0] is t, t[0] is lst → cycle
+
+    result = mask_pii_in_obj(t)
+
+    assert isinstance(result, tuple)
+    assert len(result) == 2
+    # Email in position 1 must be masked.
+    assert result[1] == "[EMAIL]"
+    # Back-reference: the inner list's first element is the in-progress tuple → ().
+    assert isinstance(result[0], list)
+    assert result[0][0] == ()

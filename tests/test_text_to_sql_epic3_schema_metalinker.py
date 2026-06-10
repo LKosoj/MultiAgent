@@ -22,6 +22,21 @@ from custom_tools.text_to_sql.utils import (
     get_table_description,
 )
 from custom_tools.text_to_sql.validators import SchemaLimiter
+from custom_tools.text_to_sql import significance_config
+
+_ENV_PATH_VAR = "TEXT_TO_SQL_SIGNIFICANCE_PATH"
+_ENV_PROFILE_VAR = "TEXT_TO_SQL_SIGNIFICANCE_PROFILE"
+
+_MINIMAL_YAML = """
+version: 2
+profiles:
+  default:
+    high_priority_exact: []
+    high_priority_compound: []
+    medium_priority_patterns: []
+    critical_description_keywords:
+      - "важный"
+"""
 
 
 # ---------------------------------------------------------------------------
@@ -201,3 +216,71 @@ def test_matches_exactly_word_boundary_underscore():
     assert match("username", "user") is False
     assert match("users", "user") is False
     assert match("useragent", "user") is False
+
+
+# ---------------------------------------------------------------------------
+# T1 — description=None краш и кириллическая граница слова
+# ---------------------------------------------------------------------------
+
+
+def test_is_semantic_significant_column_description_none_no_crash(
+    tmp_path, monkeypatch
+):
+    """``is_semantic_significant_column`` не падает с AttributeError при description=None.
+
+    Фикс T1(a): ``col_info.get('description') or ''`` вместо
+    ``col_info.get('description', '')``, чтобы явный None не приводил к
+    ``None.lower()`` → AttributeError.
+    """
+    cfg_file = tmp_path / "significance.yaml"
+    cfg_file.write_text(_MINIMAL_YAML, encoding="utf-8")
+    monkeypatch.setenv(_ENV_PATH_VAR, str(cfg_file))
+    significance_config.reset_cache()
+
+    result = ColumnMetadataHelper.is_semantic_significant_column(
+        "foobar", {"description": None}
+    )
+    assert result is False
+
+
+def test_is_semantic_significant_column_description_none_vs_missing(
+    tmp_path, monkeypatch
+):
+    """description=None и отсутствующий description дают одинаковый результат."""
+    cfg_file = tmp_path / "significance.yaml"
+    cfg_file.write_text(_MINIMAL_YAML, encoding="utf-8")
+    monkeypatch.setenv(_ENV_PATH_VAR, str(cfg_file))
+    significance_config.reset_cache()
+
+    result_none = ColumnMetadataHelper.is_semantic_significant_column(
+        "foobar", {"description": None}
+    )
+    result_missing = ColumnMetadataHelper.is_semantic_significant_column(
+        "foobar", {}
+    )
+    assert result_none == result_missing
+
+
+def test_matches_exactly_cyrillic_adjacent_does_not_match():
+    """Кириллический символ вплотную к паттерну → не матчится.
+
+    Фикс T1(b): lookaround расширен диапазоном ``Ѐ-ӿ``, чтобы
+    ``значениеvalue`` не давало ложный матч по ``value``.
+    """
+    match = ColumnMetadataHelper._matches_exactly
+
+    # Кириллица непосредственно предшествует паттерну.
+    assert match("значениеvalue", "value") is False
+    # Кириллица непосредственно следует за паттерном.
+    assert match("valueзначение", "value") is False
+
+
+def test_matches_exactly_ascii_boundary_preserved():
+    """ASCII-границы после добавления кириллического диапазона не сломаны."""
+    match = ColumnMetadataHelper._matches_exactly
+
+    assert match("user", "user") is True      # точное совпадение
+    assert match("user_id", "user") is True   # _ — разделитель
+    assert match("superuser", "user") is False
+    assert match("username", "user") is False
+    assert match("users", "user") is False

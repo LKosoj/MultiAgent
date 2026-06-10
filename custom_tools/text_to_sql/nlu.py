@@ -10,6 +10,7 @@ Fallback-эвристика (``_fallback_extract_intent``/``_fallback_tokenize``
 import re
 import logging
 import os
+import yaml
 from typing import Any, Dict, List
 
 from .nlu_config import NLUMorphemesRegistry, load_nlu_morphemes
@@ -133,9 +134,14 @@ class NLUProcessor:
         # через registry).
         if not text or not text.strip():
             logger.warning("extract_intent: пустой или пробельный ввод, пропускаем NLU")
-            cfg = load_nlu_morphemes(registry=self._morphemes_registry)
+            try:
+                cfg = load_nlu_morphemes(registry=self._morphemes_registry)
+                default_intent = cfg.default_intent
+            except (FileNotFoundError, ValueError, OSError, yaml.YAMLError):
+                logger.warning("extract_intent: конфиг NLU недоступен, используем нейтральный intent")
+                default_intent = "query"
             return {
-                "intent": cfg.default_intent,
+                "intent": default_intent,
                 "entities": {"metrics": [], "dimensions": [], "filters": {}},
             }
 

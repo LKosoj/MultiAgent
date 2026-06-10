@@ -485,6 +485,13 @@ def _explain_strategy(
         return _build_failure_result(start, "EXPLAIN requires plugin explain support")
     explain_body = _extract_explain_body(sql_query)
     explain_result = plugin.explain(conn, explain_body)
+    if not isinstance(explain_result, dict):
+        logger.warning(
+            "_explain_strategy: plugin.explain() returned unexpected type %s; "
+            "expected dict. Degrading to failure result.",
+            type(explain_result).__name__,
+        )
+        return _build_failure_result(start, "EXPLAIN plugin returned invalid response format")
     # Проверяем наличие issues (например, EXPLAIN_UNSUPPORTED) и plan=None.
     issues = explain_result.get("issues") or []
     plan = explain_result.get("plan")

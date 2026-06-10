@@ -47,6 +47,8 @@ logger = logging.getLogger(__name__)
 _CHROMA_POOL: Optional[ThreadPoolExecutor] = None
 _CHROMA_POOL_LOCK = threading.Lock()
 _CHROMA_POOL_MAX_WORKERS: Optional[int] = None
+_CHROMA_INFLIGHT: int = 0
+_CHROMA_INFLIGHT_LOCK = threading.Lock()
 
 
 def _chroma_pool_max_workers() -> int:
@@ -483,49 +485,40 @@ class RetrievalService:
         # _get_chroma_pool() гарантирует инициализацию _CHROMA_POOL_MAX_WORKERS
         # под локом до возврата executor — читаем глобал только после этого вызова.
         executor = _get_chroma_pool()
-        # Сколько задач уже выполняется/висит в очереди — приблизительная
-        # оценка по приватному `_work_queue`. Это лучший доступный сигнал;
-        # внутри stdlib иного публичного API нет. Если оценить нельзя
-        # (изменения в Python) — пропускаем guard и полагаемся на timeout.
-        try:
-            queued = executor._work_queue.qsize()  # type: ignore[attr-defined]
-            # _CHROMA_POOL_MAX_WORKERS гарантированно не None после _get_chroma_pool().
-            max_workers = _CHROMA_POOL_MAX_WORKERS or _chroma_pool_max_workers()
-            if queued >= max_workers:
-                # Все воркеры заняты и есть очередь — fail-fast.
+        # Overload-guard считает inflight (running+queued) через атомарный счётчик
+        # _CHROMA_INFLIGHT под локом. Декремент — в finally, гарантируем при любом исходе.
+        global _CHROMA_INFLIGHT
+        max_workers = _CHROMA_POOL_MAX_WORKERS or _chroma_pool_max_workers()
+        with _CHROMA_INFLIGHT_LOCK:
+            current_inflight = _CHROMA_INFLIGHT
+            if current_inflight >= max_workers:
                 raise RuntimeError(
-                    f"Chroma query pool overloaded: {queued} queued tasks, "
-                    f"max_workers={max_workers}. Likely Chroma is hanging "
-                    "(workers blocked in sync C-call, cannot be cancelled)."
+                    f"Chroma query pool overloaded: {current_inflight} inflight tasks "
+                    f"(running+queued), max_workers={max_workers}."
                 )
-        except AttributeError:
-            # _work_queue не доступен — пропускаем overload-guard,
-            # полагаемся на timeout ниже.
-            pass
-
-        _future = executor.submit(
-            lambda: collection.query(
-                query_embeddings=[query_embedding],
-                n_results=n_results,
-            )
-        )
+            _CHROMA_INFLIGHT += 1
         try:
-            raw = _future.result(timeout=timeout_sec)
-        except FuturesTimeout:
-            # cancel() НЕ прервёт уже-запущенный chroma запрос (sync C-call),
-            # но снимет future из очереди если ещё не стартовал. Worker'а
-            # ждать НЕ ДОЛЖНЫ — иначе timeout-guard теряет смысл; pool
-            # переживёт «застрявший» worker (он отъест 1 слот из max_workers,
-            # это видно через overload-guard выше).
-            _future.cancel()
-            logger.error(
-                "ChromaDB query exceeded %ds (RAG_CHROMA_QUERY_TIMEOUT_SEC); "
-                "worker remains stuck in pool (cannot cancel sync C-call)",
-                timeout_sec,
+            _future = executor.submit(
+                lambda: collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=n_results,
+                )
             )
-            raise RuntimeError(
-                f"ChromaDB query exceeded {timeout_sec}s"
-            )
+            try:
+                raw = _future.result(timeout=timeout_sec)
+            except FuturesTimeout:
+                _future.cancel()
+                logger.error(
+                    "ChromaDB query exceeded %ds (RAG_CHROMA_QUERY_TIMEOUT_SEC); "
+                    "worker remains stuck in pool (cannot cancel sync C-call)",
+                    timeout_sec,
+                )
+                raise RuntimeError(
+                    f"ChromaDB query exceeded {timeout_sec}s"
+                )
+        finally:
+            with _CHROMA_INFLIGHT_LOCK:
+                _CHROMA_INFLIGHT -= 1
 
         try:
             docs = raw.get("documents", [[]])[0] if raw else []

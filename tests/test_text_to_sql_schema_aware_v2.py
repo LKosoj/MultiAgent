@@ -226,3 +226,60 @@ def test_two_validator_calls_share_no_state():
     assert r1["is_valid"] is True, r1["issues"]
     assert r2["is_valid"] is True, r2["issues"]
     assert r3 == r1
+
+
+# ---------- table-function detection (url/s3/file/remote) ----------
+
+_TF_SCHEMA = {"users": {"columns": {"id": {"type": "INTEGER"}, "name": {"type": "TEXT"}}}}
+
+
+@pytest.mark.parametrize("func_call", [
+    "url('https://example.com/data.csv', 'CSV', 'id UInt64, name String')",
+    "s3('s3://bucket/key', 'CSV', 'id UInt64')",
+    "file('/tmp/data.csv', 'CSV', 'id UInt64')",
+    "remote('host', db, tbl)",
+])
+def test_table_function_in_from_is_unknown_table(func_call):
+    """Табличные функции в FROM → is_valid False и issue_type UNKNOWN_TABLE."""
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        f"SELECT id FROM {func_call}",
+        _TF_SCHEMA,
+    )
+    assert result["is_valid"] is False, f"Expected invalid for {func_call}: {result}"
+    assert any(
+        issue["issue_type"] == "UNKNOWN_TABLE" for issue in result["issues"]
+    ), f"No UNKNOWN_TABLE in {result['issues']}"
+
+
+def test_known_schema_table_no_false_positive():
+    """Обычная таблица из схемы → валидна, нет ложного UNKNOWN_TABLE."""
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        "SELECT id, name FROM users",
+        _TF_SCHEMA,
+    )
+    assert result["is_valid"] is True, result["issues"]
+    assert not any(i["issue_type"] == "UNKNOWN_TABLE" for i in result["issues"])
+
+
+def test_cte_no_false_positive():
+    """CTE → нет ложного UNKNOWN_TABLE на имя CTE."""
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        "WITH cte AS (SELECT id FROM users) SELECT id FROM cte",
+        _TF_SCHEMA,
+    )
+    # CTE name is a row-source, not a table-function: must not emit UNKNOWN_TABLE
+    assert not any(i["issue_type"] == "UNKNOWN_TABLE" for i in result["issues"]), result["issues"]
+
+
+def test_subquery_in_from_does_not_crash():
+    """Подзапрос FROM (SELECT...) AS sub → не падает, is_valid True для корректного SQL."""
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        "SELECT sub.id FROM (SELECT id FROM users) AS sub",
+        _TF_SCHEMA,
+    )
+    # Подзапрос не таблица-функция; не должно быть UNKNOWN_TABLE
+    assert not any(i["issue_type"] == "UNKNOWN_TABLE" for i in result["issues"]), result["issues"]

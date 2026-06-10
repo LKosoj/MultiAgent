@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 # ``jurisdictions.<name>.sync_masking.rules``. Python-код ниже — только
 # generic compile/apply engine.
 
+_TUPLE_IN_PROGRESS = object()
+
 _SYNC_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
 _SYNC_FALSE_TOKENS = frozenset({"", "0", "false", "no", "off"})
 
@@ -231,7 +233,8 @@ def mask_pii_in_obj(value: Any, _memo: Optional[dict[int, Any]] = None) -> Any:
         _memo = {}
     obj_id = id(value)
     if obj_id in _memo:
-        return _memo[obj_id]
+        v = _memo[obj_id]
+        return () if v is _TUPLE_IN_PROGRESS else v
 
     if isinstance(value, dict):
         # Ключи оставляем как есть (это metadata-field-names, не PII).
@@ -247,7 +250,7 @@ def mask_pii_in_obj(value: Any, _memo: Optional[dict[int, Any]] = None) -> Any:
         redacted_list.extend(mask_pii_in_obj(item, _memo) for item in value)
         return redacted_list
     # tuple
-    _memo[obj_id] = ()
+    _memo[obj_id] = _TUPLE_IN_PROGRESS
     redacted_tuple = tuple(mask_pii_in_obj(item, _memo) for item in value)
     _memo[obj_id] = redacted_tuple
     return redacted_tuple

@@ -44,6 +44,21 @@ __all__ = [
 
 _SAFE_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# Слова, которые Postgres-синтаксис резервирует, но sqlglot регистрирует только
+# как часть многословных токенов (ORDER BY, GROUP BY, …) — и потому их TokenType
+# остаётся None при одиночном lookup через Tokenizer.KEYWORDS.
+_POSTGRES_EXTRA_RESERVED: frozenset = frozenset({
+    "ORDER", "GROUP", "USER", "CHECK", "VALUE",
+    "ANALYSE", "ASYMMETRIC", "BOTH", "CAST",
+    "CURRENT_CATALOG", "CURRENT_ROLE", "DEFERRABLE",
+    "FOREIGN", "INITIALLY", "LEADING", "LOCALTIME", "LOCALTIMESTAMP",
+    "PLACING", "PRIMARY", "SESSION_USER", "SIMILAR",
+    "SYMMETRIC", "TO", "TRAILING", "VARIADIC", "VERBOSE",
+})
+_POSTGRES_FAMILY_DIALECTS: frozenset = frozenset({
+    "postgres", "redshift", "materialize", "risingwave",
+})
+
 
 def should_quote_name(
     name: str,
@@ -97,9 +112,11 @@ def is_reserved_keyword(name: str, dialect_name: str) -> bool:
     if tokenizer_cls is None:
         return False
     tt = tokenizer_cls.KEYWORDS.get(name.upper())
-    if tt is None:
-        return False
-    return tt is not TokenType.VAR
+    if tt is not None:
+        return tt is not TokenType.VAR
+    if dialect_name in _POSTGRES_FAMILY_DIALECTS:
+        return name.upper() in _POSTGRES_EXTRA_RESERVED
+    return False
 
 
 def apply_dialect_quoting(

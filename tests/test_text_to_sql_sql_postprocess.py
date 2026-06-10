@@ -77,6 +77,51 @@ def test_apply_dialect_quoting_quotes_known_columns(monkeypatch):
     assert '"orders"' in result
 
 
+# ---------------------------------------------------------------------------
+# T3 — _POSTGRES_EXTRA_RESERVED supplement-set
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("word", ["order", "user", "value", "group", "check"])
+def test_is_reserved_keyword_postgres_extra(word):
+    """Слова из supplement-set считаются reserved для postgres."""
+    assert sql_postprocess.is_reserved_keyword(word, "postgres") is True
+
+
+@pytest.mark.parametrize("word", ["ORDER", "User", "VALUE"])
+def test_is_reserved_keyword_postgres_extra_case_insensitive(word):
+    """Проверка регистронезависимости supplement-set."""
+    assert sql_postprocess.is_reserved_keyword(word, "postgres") is True
+
+
+@pytest.mark.parametrize("dialect", ["redshift", "materialize", "risingwave"])
+def test_is_reserved_keyword_postgres_family_dialects(dialect):
+    """Supplement-set работает для всей postgres-семьи диалектов."""
+    assert sql_postprocess.is_reserved_keyword("order", dialect) is True
+
+
+@pytest.mark.parametrize("word", ["order_amount", "user_id", "value_total"])
+def test_is_reserved_keyword_postgres_compound_names_not_reserved(word):
+    """Составные имена со словами из supplement-set НЕ резервированы."""
+    assert sql_postprocess.is_reserved_keyword(word, "postgres") is False
+
+
+@pytest.mark.parametrize("word", ["order", "user", "value", "select"])
+@pytest.mark.parametrize("dialect", ["ansi", "", "sql"])
+def test_is_reserved_keyword_ansi_always_false(word, dialect):
+    """Для ansi/""/sql is_reserved_keyword всегда False — путь не меняем."""
+    assert sql_postprocess.is_reserved_keyword(word, dialect) is False
+
+
+def test_should_quote_name_order_postgres():
+    """should_quote_name("order", "postgres", ...) True из-за supplement-set."""
+    assert sql_postprocess.should_quote_name("order", "postgres", set(), set(), set()) is True
+
+
+def test_should_quote_name_order_id_postgres_not_quoted():
+    """order_id не резервировано и не mixed-case — не квотируем."""
+    assert sql_postprocess.should_quote_name("order_id", "postgres", set(), set(), set()) is False
+
+
 def test_apply_manual_quoting_unparseable_raises(monkeypatch):
     """Парсер AST упал → SQLPostprocessError.
 

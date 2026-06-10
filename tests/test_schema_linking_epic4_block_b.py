@@ -836,3 +836,201 @@ def test_type_hint_works_without_name_match(tmp_path, monkeypatch):
     # важно, что хоть какая-то найдена (раньше было None).
     result = core.best_column_for("revenue", "orders", table_schema)
     assert result in {"gross_take", "qty"}
+
+
+# ---------------------------------------------------------------------- #
+# T6 — FK-фильтр применяется ДО усечения до top-1 при выборе dimension
+# ---------------------------------------------------------------------- #
+
+
+def test_t6_other_table_fk_top1_skip_to_non_fk():
+    """T6 other-tables: если top-1 кандидат — FK-колонка, берётся следующий.
+
+    region_id — exact match (score=10), но FK.
+    region_label — description содержит "region_id" (score=7), не FK.
+    До фикса: top-1 → region_id, он FK → таблица locations пропускается целиком.
+    После фикса: итерируем ranked, region_id пропускается, берётся region_label.
+    """
+    core = _make_core(relevant_tables=["orders"])
+    db_schema = {
+        "orders": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "amount": {"type": "DECIMAL", "description": "сумма"},
+                "location_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "locations(id)",
+                },
+            }
+        },
+        "locations": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                # Exact match на имя запроса — top-1, но FK
+                "region_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "regions(id)",
+                    "description": "region_id reference key",
+                },
+                # Description-hit (score=7), не FK — должна подхватиться
+                "region_label": {
+                    "type": "TEXT",
+                    "description": "region_id display label",
+                },
+            }
+        },
+    }
+    entities = {"metrics": ["amount"], "dimensions": ["region_id"], "filters": {}}
+    _metrics, dimensions, _filters, _unlinked = core.heuristic_linking(entities, db_schema)
+
+    matched = [d for d in dimensions if d.get("name") == "region_id"]
+    assert matched, f"dimension 'region_id' не найдено в {dimensions}"
+    assert matched[0]["table"] == "locations", (
+        f"Ожидалась таблица locations, получили {matched[0]['table']}"
+    )
+    assert matched[0]["column"] == "region_label", (
+        f"FK-колонка region_id должна быть пропущена, ожидалась region_label, "
+        f"получили {matched[0]['column']}"
+    )
+
+
+def test_t6_main_table_fk_top1_skip_to_non_fk():
+    """T6 main_table: аналогично, но FK и не-FK в main_table orders.
+
+    order_region_id — exact match на запрос 'order_region_id' (FK).
+    order_region_name — description-hit (не FK).
+    После фикса: итерируем ranked в main_table-ветке, FK пропускается.
+    """
+    core = _make_core(relevant_tables=["orders"])
+    db_schema = {
+        "orders": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "amount": {"type": "DECIMAL", "description": "сумма заказа"},
+                # Exact match — top-1, но FK
+                "order_region_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "regions(id)",
+                    "description": "order_region_id ref",
+                },
+                # Description-hit — не FK
+                "order_region_name": {
+                    "type": "TEXT",
+                    "description": "order_region_id display",
+                },
+            }
+        },
+    }
+    entities = {
+        "metrics": ["amount"],
+        "dimensions": ["order_region_id"],
+        "filters": {},
+    }
+    _metrics, dimensions, _filters, _unlinked = core.heuristic_linking(entities, db_schema)
+
+    matched = [d for d in dimensions if d.get("name") == "order_region_id"]
+    assert matched, f"dimension 'order_region_id' не найдено в {dimensions}"
+    assert matched[0]["table"] == "orders"
+    assert matched[0]["column"] == "order_region_name", (
+        f"FK-колонка order_region_id должна быть пропущена, ожидалась order_region_name, "
+        f"получили {matched[0]['column']}"
+    )
+
+
+def test_t6_edge_all_candidates_fk_not_linked():
+    """T6 edge: все кандидаты FK → измерение НЕ связывается через FK-колонку.
+
+    Таблица all_fk содержит только FK-колонки, совпадающие с запросом.
+    Ожидаемый результат: измерение попадает в unlinked (или не связывается).
+    """
+    core = _make_core(relevant_tables=["orders"])
+    db_schema = {
+        "orders": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "amount": {"type": "DECIMAL", "description": "сумма"},
+                # FK-колонка, совпадающая с запросом только частично
+                "ref_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "refs(id)",
+                    "description": "only_fk_match",
+                },
+            }
+        },
+        "only_fk_table": {
+            "columns": {
+                # Все колонки — FK
+                "only_fk_match": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "other(id)",
+                    "description": "only_fk_match reference",
+                },
+                "also_fk": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "other2(id)",
+                    "description": "also only_fk_match",
+                },
+            }
+        },
+    }
+    entities = {"metrics": ["amount"], "dimensions": ["only_fk_match"], "filters": {}}
+    _metrics, dimensions, _filters, _unlinked = core.heuristic_linking(entities, db_schema)
+
+    # Ни одно измерение не должно иметь column с constraint_type=FK
+    fk_linked = [
+        d for d in dimensions
+        if d.get("name") == "only_fk_match"
+        and d.get("table") == "only_fk_table"
+    ]
+    assert not fk_linked, (
+        f"Измерение не должно связываться с FK-only таблицей: {fk_linked}"
+    )
+
+
+def test_t6_regression_top1_not_fk_unchanged():
+    """T6 регрессия: если top-1 кандидат не FK — поведение прежнее.
+
+    region_name — exact match (score=10), не FK → должна быть выбрана.
+    Новый код не должен нарушить этот сценарий.
+    """
+    core = _make_core(relevant_tables=["orders"])
+    db_schema = {
+        "orders": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "amount": {"type": "DECIMAL", "description": "сумма"},
+                "loc_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "locations(id)",
+                },
+            }
+        },
+        "locations": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                # Exact match, не FK — должна выбраться как top-1
+                "region_name": {
+                    "type": "TEXT",
+                    "description": "display name for region",
+                },
+                "region_code": {
+                    "type": "TEXT",
+                    "description": "short code",
+                },
+            }
+        },
+    }
+    entities = {"metrics": ["amount"], "dimensions": ["region_name"], "filters": {}}
+    _metrics, dimensions, _filters, _unlinked = core.heuristic_linking(entities, db_schema)
+
+    matched = [d for d in dimensions if d.get("name") == "region_name"]
+    assert matched, f"dimension 'region_name' не найдено в {dimensions}"
+    assert matched[0]["table"] == "locations"
+    assert matched[0]["column"] == "region_name"

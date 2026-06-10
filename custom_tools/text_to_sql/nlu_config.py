@@ -479,10 +479,9 @@ def canonicalize_token_via_morphemes(
     Поведение:
       * Если ``cfg.enabled`` is ``False`` или ``cfg`` is ``None`` —
         возвращаем ``token.lower()`` без изменений (identity).
-      * Иначе: ищем токен среди ``intents`` и ``dimensions``. Если хотя
-        бы одна морфема входит в lower-форму токена (или токен входит
-        в морфему — поддержка точных значений вроде ``revenue``),
-        возвращаем ``canonical``.
+      * Иначе: ищем токен среди ``intents`` и ``dimensions``. Если
+        lower-форма токена начинается с морфемы (префикс-матч), возвращаем
+        ``canonical``.
       * Если совпадений нет — возвращаем ``token.lower()`` (identity).
 
     Никаких хардкодов морфем здесь нет: всё берётся из yaml. Если
@@ -494,10 +493,9 @@ def canonicalize_token_via_morphemes(
     if cfg is None or not getattr(cfg, "enabled", False):
         return lowered
 
-    # Для коротких морфем («id», «am») двунаправленный substring даёт
-    # ложные канонизации (внутри «valid», «name» и т.п.). Минимальная
-    # длина для substring-режима — 3 символа; для более коротких морфем
-    # требуем точного совпадения.
+    # Для коротких морфем («id», «am») префикс-матч всё равно может давать
+    # ложные совпадения. Минимальная длина для префикс-режима — 3 символа;
+    # для более коротких морфем требуем точного совпадения.
     min_substring_len = 3
     for group in list(cfg.intents) + list(cfg.dimensions):
         morphemes = group.get("morphemes") or []
@@ -512,6 +510,6 @@ def canonicalize_token_via_morphemes(
                 if morpheme_lower == lowered:
                     return canonical.lower()
                 continue
-            if morpheme_lower in lowered or lowered in morpheme_lower:
+            if lowered.startswith(morpheme_lower):
                 return canonical.lower()
     return lowered

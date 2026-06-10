@@ -5,6 +5,7 @@
 знает, какой именно валидатор использовать.
 """
 import logging
+import math
 from typing import Any, Dict, List, Optional, Set
 
 from .dialects import (
@@ -427,7 +428,16 @@ def filter_value_conditions(
             nested_info = dict(filter_info)
             nested_info["operator"] = value.get("operator")
             nested_value = value.get("value")
-            return filter_value_conditions(expr, nested_value, nested_info, dsn=dsn, _depth=_depth + 1)
+            operator_conds = filter_value_conditions(expr, nested_value, nested_info, dsn=dsn, _depth=_depth + 1)
+            if operator_conds is None:
+                return None
+            sibling_dict = {k: v for k, v in value.items() if k not in ("operator", "value")}
+            if not sibling_dict:
+                return operator_conds
+            sibling_conds = filter_value_conditions(expr, sibling_dict, filter_info, dsn=dsn, _depth=_depth + 1)
+            if sibling_conds is None:
+                return operator_conds
+            return operator_conds + sibling_conds
 
         conditions: List[str] = []
         start_val = value.get("start")
@@ -478,7 +488,7 @@ def filter_value_conditions(
     if isinstance(value, (list, tuple, set)):
         if operator not in {"=", "IN"}:
             return None
-        values = list(value)
+        values = [item for item in value if item is not None]
         if not values:
             return ["1 = 0"]
         literals = ", ".join(sql_literal(item, dsn=dsn) for item in values)
@@ -495,6 +505,11 @@ def sql_literal(value: Any, dsn: str | None = None) -> str:
     if isinstance(value, bool):
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
+        if math.isinf(value) or math.isnan(value):
+            raise ValueError(
+                f"sql_literal: non-finite float value {value!r} cannot be represented "
+                "as a SQL literal; use NULL or exclude the filter"
+            )
         return str(value)
     # Decimal — числовой литерал без кавычек: str(Decimal) даёт точное число.
     from decimal import Decimal

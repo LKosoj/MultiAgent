@@ -25,6 +25,7 @@ from ._pii import pii_mask_sync
 
 logger = logging.getLogger(__name__)
 
+_TUPLE_IN_PROGRESS = object()
 
 # EPIC 7.9: RotatingFileHandler заменяет ручной цикл переименования.
 # Handler кэшируется по абсолютному пути файла (под Lock'ом), чтобы:
@@ -80,7 +81,8 @@ def _sanitize_audit_obj(value: Any, _memo: Optional[dict[int, Any]] = None) -> A
         _memo = {}
     obj_id = id(value)
     if obj_id in _memo:
-        return _memo[obj_id]
+        v = _memo[obj_id]
+        return () if v is _TUPLE_IN_PROGRESS else v
     if isinstance(value, dict):
         sanitized: dict[Any, Any] = {}
         _memo[obj_id] = sanitized
@@ -97,7 +99,7 @@ def _sanitize_audit_obj(value: Any, _memo: Optional[dict[int, Any]] = None) -> A
         _memo[obj_id] = sanitized_list
         sanitized_list.extend(_sanitize_audit_obj(item, _memo) for item in value)
         return sanitized_list
-    _memo[obj_id] = ()
+    _memo[obj_id] = _TUPLE_IN_PROGRESS
     sanitized_tuple = tuple(_sanitize_audit_obj(item, _memo) for item in value)
     _memo[obj_id] = sanitized_tuple
     return sanitized_tuple
