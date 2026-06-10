@@ -178,29 +178,37 @@ researcher --> agent3
         self.agent_pool.clear()
 
         # --- Этап 1: Проверка безопасности на входе ---
-        # try:
-        #     print("🛡️  Запуск Input-Guard-Agent для проверки безопасности...")
-        #     guard_agent = self.factory.create_agent('input_guard_agent', session_id, initial_task)
-        #     guard_response_str = guard_agent.run(initial_task)
-            
-        #     # Парсим JSON-ответ от guard_agent
-        #     guard_response = json.loads(guard_response_str)
+        # Этап гейтится флагом enable профиля input_guard_agent.yaml: при
+        # enable: false профиль не попадает в AGENT_PROFILES и проверка пропускается.
+        if 'input_guard_agent' in AGENT_PROFILES:
+            try:
+                logger.info("🛡️ Запуск Input-Guard-Agent для проверки безопасности...")
+                guard_agent = self.factory.create_agent('input_guard_agent', session_id, initial_task)
+                guard_response = json.loads(str(guard_agent.run(initial_task)))
 
-        #     if guard_response.get("decision") == "BLOCK":
-        #         reason = guard_response.get("reason", "Причина не указана.")
-        #         print(f"❌ ЗАПРОС ЗАБЛОКИРОВАН: {reason}")
-        #         error_report = f"Ваш запрос был заблокирован по соображениям безопасности: {reason}"
-        #         html_visualizer.advanced_visualization(error_report, session_id, show)
-        #         return error_report
-            
-        #     print("✅ Проверка безопасности пройдена.")
+                if guard_response.get("decision") == "BLOCK":
+                    reason = guard_response.get("reason", "Причина не указана.")
+                    logger.warning(f"❌ ЗАПРОС ЗАБЛОКИРОВАН: {reason}")
+                    error_report = f"Ваш запрос был заблокирован по соображениям безопасности: {reason}"
+                    html_visualizer.advanced_visualization(error_report, session_id, show)
+                    return error_report
 
-        # except Exception as e:
-        #     print(f"Критическая ошибка в Input-Guard-Agent: {str(e)}")
-        #     error_report = "Ошибка в модуле безопасности. Невозможно обработать запрос."
-        #     html_visualizer.advanced_visualization(error_report, session_id, show)
-        #     return error_report
-            
+                logger.info("✅ Проверка безопасности пройдена.")
+            except Exception as e:
+                # Fail-closed: сбой модуля безопасности не пропускает запрос дальше.
+                logger.exception(f"Критическая ошибка в Input-Guard-Agent: {e}")
+                error_report = "Ошибка в модуле безопасности. Невозможно обработать запрос."
+                html_visualizer.advanced_visualization(error_report, session_id, show)
+                return error_report
+            finally:
+                # Guard — служебный агент: убираем его из фабрики, чтобы он не
+                # попал в managed_agents менеджера на этапе 2.
+                self.factory.agents = [
+                    a for a in self.factory.agents
+                    if getattr(a, 'profile_type', None) != 'input_guard_agent'
+                ]
+
+
         # --- Этап 2: Основная логика координации ---
         try:
             # Определяем агентов: либо предварительно заданные, либо через анализ задачи

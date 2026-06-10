@@ -36,6 +36,65 @@ class SecurityError(Exception):
     pass
 
 
+# Deny-list для пользовательского кода: defense-in-depth поверх изоляции
+# subprocess + таймаута, НЕ полноценный sandbox (getattr-обходы не ловятся).
+_DENIED_IMPORTS = frozenset({"subprocess", "ctypes", "pty", "importlib"})
+_DENIED_CALLS = {
+    "os": frozenset({
+        "system", "popen", "fork", "forkpty", "kill", "killpg",
+        "execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe",
+        "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
+        "remove", "unlink", "rmdir", "removedirs",
+    }),
+    "shutil": frozenset({"rmtree"}),
+}
+_DENIED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__"})
+
+
+def _find_dangerous_code(code: str) -> Optional[str]:
+    """Возвращает описание первой опасной конструкции в коде или None.
+
+    AST-проверка вместо прежнего substring-поиска ("rm -r"/"os.system"),
+    который обходился тривиальной конкатенацией строк.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None  # синтаксическую ошибку отдаст сам интерпретатор в subprocess
+
+    # Карта алиасов: import os as o → вызовы o.system тоже блокируются
+    aliases: Dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                aliases[alias.asname or root] = root
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.split(".")[0] in _DENIED_IMPORTS:
+                    return f"import {alias.name}"
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if root in _DENIED_IMPORTS:
+                return f"from {node.module} import ..."
+            denied_names = _DENIED_CALLS.get(root)
+            if denied_names:
+                for alias in node.names:
+                    if alias.name in denied_names or alias.name == "*":
+                        return f"from {node.module} import {alias.name}"
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in _DENIED_BUILTINS:
+                return f"{func.id}(...)"
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                module = aliases.get(func.value.id, func.value.id)
+                if func.attr in _DENIED_CALLS.get(module, frozenset()):
+                    return f"{module}.{func.attr}(...)"
+    return None
+
+
 _EXEC_RUNNER = r"""
 import builtins
 import io
@@ -89,8 +148,6 @@ def _captured_print(*args, **kwargs):
 
 
 try:
-    if "rm -r" in code or "os.system" in code:
-        raise RuntimeError("Обнаружен потенциально опасный код")
     exec_globals["print"] = _captured_print
     exec(code, exec_globals, exec_globals)
     result = {}
@@ -395,6 +452,15 @@ class CodeInterpreterPlugin():
             return None
 
     def _execute_code_subprocess(self, code: str) -> Dict[str, Any]:
+        dangerous = _find_dangerous_code(code)
+        if dangerous:
+            logging.warning("Выполнение кода заблокировано: %s", dangerous)
+            return {
+                "status": "error",
+                "error": f"Обнаружен потенциально опасный код: {dangerous}",
+                "output": "Выполнение заблокировано проверкой безопасности",
+            }
+
         fd, result_path = tempfile.mkstemp(prefix="codeinterpreter_", suffix=".json")
         os.close(fd)
         env = os.environ.copy()
