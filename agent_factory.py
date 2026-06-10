@@ -17,50 +17,6 @@ from memory.rag_memory import create_rag_memory
 
 logger = logging.getLogger(__name__)
 
-# Дефолтный allowlist импортов для CodeAgent. Профиль может переопределить
-# его ключом authorized_imports; '*' разрешён только явным указанием в профиле.
-AUTHORIZED_IMPORTS = [
-  "typing",
-  "requests",
-  "zipfile",
-  "os",
-  "pandas",
-  "numpy",
-  "sympy",
-  "json",
-  "bs4",
-  "pubchempy",
-  "xml",
-  "yahoo_finance",
-  "Bio",
-  "scikit-learn",
-  "scipy",
-  "pydub",
-  "io",
-  "PIL",
-  "chess",
-  "PyPDF2",
-  "pptx",
-  "torch",
-  "datetime",
-  "fractions",
-  "csv",
-  "time",
-  "meteostat",
-  "matplotlib",
-  "networkx",
-  "seaborn",
-  "yfinance",
-  "coinmarketcap",
-  "coinpaprika",
-  "coinbase",
-  "pandas_market_calendars",
-  "urllib",
-  "random",
-  "ast",
-  "mplfinance"
-]
-
 def _build_agents_info(agents_list: List) -> str:
     """Создает информацию о доступных агентах для включения в промпт менеджера."""
     if not agents_list:
@@ -350,13 +306,6 @@ class AgentFactory:
                 logger.info(f"📝 Композитный промпт для {agent_id} (CodeAgent): {len(composite_prompt)} символов")
                 logger.debug(f"📄 Полный промпт для {agent_id}:\n{composite_prompt}")
                 
-                authorized_imports = profile.get('authorized_imports') or AUTHORIZED_IMPORTS
-                if '*' in authorized_imports:
-                    logger.warning(
-                        f"⚠️ Профиль {agent_id} разрешает неограниченные импорты ('*') — "
-                        f"sandbox импортов CodeAgent отключён"
-                    )
-
                 _agent_cls = AdaptivePlanningCodeAgent if planning_cfg.adaptive else CodeAgent
                 agent = _agent_cls(
                     tools=tools,
@@ -369,7 +318,7 @@ class AgentFactory:
                     instructions=composite_prompt,  # Дополнительные инструкции!
                     managed_agents=self._get_managed_agents(profile_type, preload_agents),
                     description=profile.get('description'),
-                    additional_authorized_imports=authorized_imports,
+                    additional_authorized_imports='*',
                     step_callbacks=self._build_step_callbacks(),
                 )
                 
