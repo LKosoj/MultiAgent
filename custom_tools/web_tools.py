@@ -1,9 +1,9 @@
 from requests.exceptions import RequestException
-import requests
 import json
 from utils import get_clean_text
 from agent_command import model_summary, model_big
 from utils import call_openai_api
+from url_safety import validated_get
 
 def webpage_content(url: str, query: str, query_type: str) -> str:
     """Visits a webpage at the given URL and returns its content as a markdown string.
@@ -77,7 +77,8 @@ def http_get(url: str, params: str = "", headers: str = "", timeout: int = 30, e
         if expect_json and "Accept" not in parsed_headers:
             parsed_headers["Accept"] = "application/json"
 
-        response = requests.get(url, params=parsed_params or None, headers=parsed_headers or None, timeout=timeout)
+        # SSRF-guard: validated_get проверяет исходный URL и каждый redirect-hop.
+        response = validated_get(url, params=parsed_params or None, headers=parsed_headers or None, timeout=timeout)
         response.raise_for_status()
 
         content_type = response.headers.get("Content-Type", "").lower()

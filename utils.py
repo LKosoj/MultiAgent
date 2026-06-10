@@ -14,6 +14,7 @@ from agent_command import model_code, model_big, model_summary, model_reranker, 
 from smolagents import logger, ChatMessage, MessageRole
 import httpx
 from openai import OpenAI
+from url_safety import validated_get
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -192,7 +193,8 @@ def get_clean_text(url):
                 'Sec-Fetch-Site': 'cross-site'
             })
         
-        response = requests.get(url, headers=headers, timeout=20, stream=True)
+        # SSRF-guard: validated_get проверяет исходный URL и каждый redirect-hop.
+        response = validated_get(url, headers=headers, timeout=20, stream=True)
         response.raise_for_status()
         
         # Проверка на PDF по URL или Content-Type
@@ -217,6 +219,10 @@ def get_clean_text(url):
         print(f"Ошибка загрузки страницы {url}: {e}")
         return get_clean_text_jina(url)
         #return "", f"Ошибка при загрузке веб-страницы {url}: {str(e)}"
+    except ValueError as e:
+        # SSRF-guard отклонил URL или redirect-hop — jina-fallback не нужен
+        print(f"Страница {url} отклонена SSRF-проверкой: {e}")
+        return "", f"Небезопасный URL: {e}"
     except Exception as e:
         print(f"Произошла непредвиденная ошибка при загрузке страницы {url}: {e}")
         return get_clean_text_jina(url)
