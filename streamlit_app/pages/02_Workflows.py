@@ -473,7 +473,7 @@ def init_session_state():
         st.session_state.constructor_steps = []
     if "available_agents" not in st.session_state:
         st.session_state.available_agents = []
-    
+
     # Состояния для редактирования
     if "editing_pipeline" not in st.session_state:
         st.session_state.editing_pipeline = None
@@ -481,6 +481,18 @@ def init_session_state():
         st.session_state.editing_pipeline_file = None
     if "show_save_as_dialog" not in st.session_state:
         st.session_state.show_save_as_dialog = False
+    # Подтверждение удаления пайплайна: хранит имя пайплайна, ожидающего удаления
+    if "confirm_delete_pipeline" not in st.session_state:
+        st.session_state.confirm_delete_pipeline = None
+    # Подтверждение перезаписи YAML в конструкторе
+    if "confirm_save_pipeline" not in st.session_state:
+        st.session_state.confirm_save_pipeline = False
+    # Подтверждение отмены воркфлоу в мониторинге: хранит run_id
+    if "confirm_cancel_run" not in st.session_state:
+        st.session_state.confirm_cancel_run = None
+    # Флаги для удаления кастомных параметров (вне формы)
+    if "custom_param_remove_keys" not in st.session_state:
+        st.session_state.custom_param_remove_keys = []
 
 def show_available_workflows():
     """Отображение доступных пайплайнов"""
@@ -607,7 +619,30 @@ def show_available_workflows():
                             st.code(yaml_content, language='yaml')
                         except Exception as e:
                             st.error(f"Ошибка чтения файла: {e}")
-    
+
+                    # Удаление пайплайна с подтверждением
+                    if st.session_state.confirm_delete_pipeline == workflow.name:
+                        st.warning(f"Удалить пайплайн **{workflow.name}**? Это действие необратимо.")
+                        del_col1, del_col2 = st.columns(2)
+                        with del_col1:
+                            if st.button("✅ Да, удалить", key=f"do_delete_{workflow.name}", type="primary"):
+                                wf_mgr = get_workflow_manager()
+                                ok, msg = wf_mgr.delete_workflow(workflow.name)
+                                st.session_state.confirm_delete_pipeline = None
+                                if ok:
+                                    st.success(f"✅ Пайплайн '{workflow.name}' удалён")
+                                    st.rerun()
+                                else:
+                                    st.error(f"❌ {msg}")
+                        with del_col2:
+                            if st.button("❌ Отмена", key=f"cancel_delete_{workflow.name}"):
+                                st.session_state.confirm_delete_pipeline = None
+                                st.rerun()
+                    else:
+                        if st.button(f"🗑️ Удалить пайплайн", key=f"delete_pipeline_{workflow.name}"):
+                            st.session_state.confirm_delete_pipeline = workflow.name
+                            st.rerun()
+
     except Exception as e:
         st.error(f"❌ Ошибка загрузки пайплайнов: {e}")
 
@@ -852,7 +887,9 @@ def show_workflow_execution():
                         workflow_name=workflow.name,
                         parameters=pipeline_params,
                         progress_callback=progress_callback,
-                        log_callback=log_callback
+                        log_callback=log_callback,
+                        use_enhanced=use_enhanced,
+                        enable_telemetry=enable_telemetry,
                     )
                     # Локально логируем старт без утечки RUN_ID
                     try:
@@ -988,12 +1025,25 @@ def show_workflow_monitoring():
                         
                         with action_col1:
                             if status.status == "running":
-                                if st.button(f"⏹️ Отменить", key=f"cancel_{run_id}"):
-                                    if wf_manager.cancel_workflow(run_id):
-                                        st.success("✅ Пайплайн отменен")
+                                if st.session_state.confirm_cancel_run == run_id:
+                                    st.warning("Отменить выполнение?")
+                                    cc1, cc2 = st.columns(2)
+                                    with cc1:
+                                        if st.button("✅ Да", key=f"do_cancel_{run_id}"):
+                                            st.session_state.confirm_cancel_run = None
+                                            if wf_manager.cancel_workflow(run_id):
+                                                st.success("✅ Пайплайн отменен")
+                                            else:
+                                                st.error("❌ Не удалось отменить")
+                                            st.rerun()
+                                    with cc2:
+                                        if st.button("❌ Нет", key=f"no_cancel_{run_id}"):
+                                            st.session_state.confirm_cancel_run = None
+                                            st.rerun()
+                                else:
+                                    if st.button(f"⏹️ Отменить", key=f"cancel_{run_id}"):
+                                        st.session_state.confirm_cancel_run = run_id
                                         st.rerun()
-                                    else:
-                                        st.error("❌ Не удалось отменить")
                             elif status.status == "cancelled":
                                 st.caption("Отменено")
                         
@@ -1007,6 +1057,10 @@ def show_workflow_monitoring():
                         
                         with action_col3:
                             if st.button(f"🔍 Трассы", key=f"traces_{run_id}"):
+                                try:
+                                    st.query_params["run_id"] = run_id
+                                except Exception:
+                                    pass
                                 st.switch_page("pages/08_Logs_Traces.py")
                     
                     else:
@@ -1056,6 +1110,14 @@ def show_workflow_monitoring():
             from workflow.streamlit_api import WorkflowManager
             wf_manager = get_workflow_manager()
             wf_manager.cleanup_completed_runs(max_age_hours=1)
+            # Синхронизируем session_state.workflow_runs: убираем run_id, которых
+            # уже нет в active_runs (cleanup_completed_runs удалил их оттуда).
+            remaining = set(wf_manager.active_runs.keys())
+            st.session_state.workflow_runs = {
+                rid: info
+                for rid, info in st.session_state.workflow_runs.items()
+                if rid in remaining
+            }
             st.success("✅ Завершенные запуски очищены")
             st.rerun()
     
@@ -1347,6 +1409,7 @@ def show_pipeline_constructor():
                         custom_params[param_name] = param_value
             
             # Показываем существующие кастомные параметры
+            # Удаление отмечается чекбоксом (st.button недостижим внутри st.form).
             custom_params_to_remove = []
             for i, (param_name, param_value) in enumerate(custom_params.items()):
                 col1, col2, col3 = st.columns([2, 2, 1])
@@ -1363,16 +1426,22 @@ def show_pipeline_constructor():
                         key=f"custom_value_{i}"
                     )
                 with col3:
-                    if st.button("🗑️", key=f"remove_custom_{i}", help="Удалить параметр"):
+                    mark_remove = st.checkbox(
+                        "🗑️ Удалить",
+                        key=f"remove_custom_{param_name}",
+                        help="Отметьте, затем нажмите 'Сохранить основную информацию'"
+                    )
+                    if mark_remove:
                         custom_params_to_remove.append(param_name)
-                
-                # Обновляем если изменилось
-                if new_name != param_name or new_value != param_value:
-                    if param_name in custom_params:
-                        del custom_params[param_name]
-                    if new_name.strip():
-                        custom_params[new_name.strip()] = new_value
-            
+
+                # Обновляем если изменилось (и не помечено на удаление)
+                if param_name not in custom_params_to_remove:
+                    if new_name != param_name or new_value != param_value:
+                        if param_name in custom_params:
+                            del custom_params[param_name]
+                        if new_name.strip():
+                            custom_params[new_name.strip()] = new_value
+
             # Удаляем отмеченные параметры
             for param_to_remove in custom_params_to_remove:
                 if param_to_remove in custom_params:
@@ -1463,6 +1532,11 @@ def show_pipeline_constructor():
                     notification_webhook = ""
                 
                 st.markdown("**Параллельное выполнение:**")
+                st.caption(
+                    "⚠️ Список параллельных групп (`parallel_groups`) не реализован движком "
+                    "— движок поддерживает только флаг `parallel_execution` (bool). "
+                    "Конфигурация ниже будет записана в YAML, но игнорируется при исполнении."
+                )
                 parallel_groups_enabled = st.checkbox("Использовать параллельные группы")
                 if parallel_groups_enabled:
                     parallel_groups_config = st.text_area(
@@ -1500,6 +1574,10 @@ def show_pipeline_constructor():
                 )
                 
                 st.markdown("**Эскалация:**")
+                st.caption(
+                    "⚠️ `escalation_policy` не реализована движком (WorkflowDefinition/WorkflowEngine). "
+                    "Конфигурация ниже будет записана в YAML, но игнорируется при исполнении."
+                )
                 escalation_enabled = st.checkbox("Включить эскалацию ошибок")
                 if escalation_enabled:
                     escalation_levels = st.number_input(
@@ -1874,29 +1952,17 @@ def show_pipeline_constructor():
         st.markdown("*Используйте кнопки для изменения порядка или вставки новых шагов*")
         
         # Функция для перемещения шага с валидацией зависимостей
+        # Возвращает (moved: bool, conflicts: list).
+        # Рендеринг предупреждений и кнопки «Исправить» — в основном потоке.
         def move_step(from_index, to_index):
             if 0 <= from_index < len(st.session_state.constructor_steps) and 0 <= to_index < len(st.session_state.constructor_steps):
-                # Получаем шаг который перемещаем
-                moving_step = st.session_state.constructor_steps[from_index]
-                
-                # Проверяем конфликты зависимостей
                 conflicts = validate_step_dependencies_after_move(from_index, to_index)
-                
                 if conflicts:
-                    st.warning(f"⚠️ Обнаружены конфликты зависимостей: {', '.join(conflicts)}")
-                    if st.button("🔧 Исправить автоматически", key=f"fix_deps_{from_index}_{to_index}"):
-                        fix_dependencies_after_move(from_index, to_index)
-                        step = st.session_state.constructor_steps.pop(from_index)
-                        st.session_state.constructor_steps.insert(to_index, step)
-                        st.success("✅ Зависимости исправлены автоматически!")
-                        return True
-                    return False
-                else:
-                    # Нет конфликтов, безопасно перемещаем
-                    step = st.session_state.constructor_steps.pop(from_index)
-                    st.session_state.constructor_steps.insert(to_index, step)
-                    return True
-            return False
+                    return False, conflicts
+                step = st.session_state.constructor_steps.pop(from_index)
+                st.session_state.constructor_steps.insert(to_index, step)
+                return True, []
+            return False, []
         
         # Функция валидации зависимостей
         def validate_step_dependencies_after_move(from_index, to_index):
@@ -1966,6 +2032,23 @@ def show_pipeline_constructor():
             st.session_state.constructor_steps.insert(position, new_step)
             return True
         
+        # Отображение предупреждения о конфликтах зависимостей после перемещения шага
+        move_conflict = st.session_state.pop("_move_conflict", None)
+        if move_conflict:
+            conflicts = move_conflict["conflicts"]
+            st.warning(f"⚠️ Конфликты зависимостей при перемещении: {', '.join(conflicts)}")
+            fix_col1, fix_col2 = st.columns([1, 4])
+            with fix_col1:
+                if st.button("🔧 Исправить автоматически", key="fix_deps_btn"):
+                    fix_dependencies_after_move(move_conflict["from"], move_conflict["to"])
+                    step = st.session_state.constructor_steps.pop(move_conflict["from"])
+                    st.session_state.constructor_steps.insert(move_conflict["to"], step)
+                    st.success("✅ Зависимости исправлены автоматически!")
+                    st.rerun()
+            with fix_col2:
+                if st.button("Отменить перемещение", key="cancel_move_btn"):
+                    st.rerun()
+
         # Отображение шагов с кнопками управления
         for i, step in enumerate(st.session_state.constructor_steps):
             # Контейнер для каждого шага
@@ -1985,16 +2068,24 @@ def show_pipeline_constructor():
                         # Кнопка "Вверх"
                         if i > 0:  # Не для первого элемента
                             if st.button("⬆️", key=f"up_{i}", help="Переместить вверх"):
-                                move_step(i, i-1)
+                                moved, conflicts = move_step(i, i - 1)
+                                if conflicts:
+                                    st.session_state["_move_conflict"] = {
+                                        "from": i, "to": i - 1, "conflicts": conflicts
+                                    }
                                 st.rerun()
                         else:
                             st.markdown("⬆️", help="Первый шаг")
-                    
+
                     with action_col2:
                         # Кнопка "Вниз"
                         if i < len(st.session_state.constructor_steps) - 1:  # Не для последнего элемента
                             if st.button("⬇️", key=f"down_{i}", help="Переместить вниз"):
-                                move_step(i, i+1)
+                                moved, conflicts = move_step(i, i + 1)
+                                if conflicts:
+                                    st.session_state["_move_conflict"] = {
+                                        "from": i, "to": i + 1, "conflicts": conflicts
+                                    }
                                 st.rerun()
                         else:
                             st.markdown("⬇️", help="Последний шаг")
@@ -2136,36 +2227,59 @@ def show_pipeline_constructor():
             
             with col1:
                 save_button_text = "💾 Обновить пайплайн" if is_editing else "💾 Сохранить пайплайн"
-                if st.button(save_button_text, type="primary"):
+                if is_editing and st.session_state.get("confirm_save_pipeline"):
+                    # Ожидаем подтверждения перезаписи
+                    st.warning(
+                        f"Перезаписать файл **{Path(st.session_state.editing_pipeline_file).name}**? "
+                        "Будет создана резервная копия."
+                    )
+                    sc1, sc2 = st.columns(2)
+                    with sc1:
+                        if st.button("✅ Да, перезаписать", key="do_save_pipeline", type="primary"):
+                            st.session_state.confirm_save_pipeline = False
+                            success, message = save_pipeline_to_file_edit_mode(
+                                st.session_state.editing_pipeline_file,
+                                yaml_content
+                            )
+                            if success:
+                                st.success(f"✅ {message}")
+                                st.session_state.constructor_steps = []
+                                if "pipeline_info" in st.session_state:
+                                    del st.session_state.pipeline_info
+                                del st.session_state.editing_pipeline
+                                del st.session_state.editing_pipeline_file
+                                st.cache_data.clear()
+                                time.sleep(1)
+                                st.switch_page("pages/02_Workflows.py")
+                            else:
+                                st.session_state.confirm_save_pipeline = False
+                                st.error(f"❌ {message}")
+                    with sc2:
+                        if st.button("❌ Отмена", key="cancel_save_pipeline"):
+                            st.session_state.confirm_save_pipeline = False
+                            st.rerun()
+                elif st.button(save_button_text, type="primary"):
                     if is_editing:
-                        # Режим редактирования - перезаписываем существующий файл
-                        success, message = save_pipeline_to_file_edit_mode(
-                            st.session_state.editing_pipeline_file,
-                            yaml_content
-                        )
+                        # Режим редактирования — запрашиваем подтверждение
+                        st.session_state.confirm_save_pipeline = True
+                        st.rerun()
                     else:
-                        # Режим создания нового пайплайна
+                        # Режим создания нового пайплайна (новый файл — без подтверждения)
                         success, message = save_pipeline_to_file(
                             st.session_state.pipeline_info["name"],
                             yaml_content
                         )
-                    
-                    if success:
-                        st.success(f"✅ {message}")
-                        # Очищаем конструктор
-                        st.session_state.constructor_steps = []
-                        if "pipeline_info" in st.session_state:
-                            del st.session_state.pipeline_info
-                        if is_editing:
-                            del st.session_state.editing_pipeline
-                            del st.session_state.editing_pipeline_file
-                        # Обновляем список пайплайнов
-                        st.cache_data.clear()
-                        st.success("🔄 Список пайплайнов обновлен!")
-                        time.sleep(1)
-                        st.switch_page("pages/02_Workflows.py")
-                    else:
-                        st.error(f"❌ {message}")
+                        if success:
+                            st.success(f"✅ {message}")
+                            st.session_state.constructor_steps = []
+                            if "pipeline_info" in st.session_state:
+                                del st.session_state.pipeline_info
+                            st.cache_data.clear()
+                            st.success("🔄 Список пайплайнов обновлен!")
+                            time.sleep(1)
+                            st.switch_page("pages/02_Workflows.py")
+                        else:
+                            st.error(f"❌ {message}")
             
             # Кнопка "Сохранить как" только в режиме редактирования
             if is_editing:
@@ -2418,27 +2532,48 @@ def save_pipeline_to_file(pipeline_name, yaml_content):
     except Exception as e:
         return False, f"Ошибка сохранения: {e}"
 
+def _rotate_backups(backups_dir: Path, stem: str, max_keep: int = 5) -> None:
+    """Оставить не более max_keep резервных копий для пайплайна stem, удалив старые."""
+    try:
+        existing = sorted(
+            (p for p in backups_dir.glob("*.yaml") if p.name.startswith(stem + ".")),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for old in existing[:-max_keep]:
+            try:
+                old.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def save_pipeline_to_file_edit_mode(existing_file_path, yaml_content):
     """Сохранение пайплайна в режиме редактирования (перезапись существующего файла)"""
     try:
         from pathlib import Path
-        
+
         pipeline_file = Path(existing_file_path)
-        
-        # Создаем резервную копию
-        backup_file = pipeline_file.with_suffix(f".backup_{int(time.time())}.yaml")
+
+        # Резервная копия кладётся в подпапку .backups/ рядом с YAML-файлами
+        backups_dir = pipeline_file.parent / ".backups"
+        backups_dir.mkdir(exist_ok=True)
+        backup_name = f"{pipeline_file.stem}.backup_{int(time.time())}.yaml"
+        backup_file = backups_dir / backup_name
         if pipeline_file.exists():
             with open(pipeline_file, 'r', encoding='utf-8') as f:
                 backup_content = f.read()
             with open(backup_file, 'w', encoding='utf-8') as f:
                 f.write(backup_content)
-        
+            # Ротация: оставляем только 5 последних бэкапов для этого файла
+            _rotate_backups(backups_dir, stem=pipeline_file.stem, max_keep=5)
+
         # Сохраняем обновленный файл
         with open(pipeline_file, 'w', encoding='utf-8') as f:
             f.write(yaml_content)
-        
-        return True, f"Пайплайн обновлен: '{pipeline_file.name}' (резервная копия: '{backup_file.name}')"
-        
+
+        return True, f"Пайплайн обновлен: '{pipeline_file.name}' (резервная копия: '.backups/{backup_name}')"
+
     except Exception as e:
         return False, f"Ошибка обновления: {e}"
 

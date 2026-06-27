@@ -984,17 +984,18 @@ class ConfigurationManager:
 
     def test_llm_connection(self, provider: str = None, model: str = None, custom_config: Dict = None) -> Dict[str, Any]:
         """
-        Тестировать соединение с LLM
-        
-        Args:
-            provider: Провайдер для тестирования (по умолчанию текущий)
-            model: Модель для тестирования (по умолчанию текущая)
-            custom_config: Кастомная конфигурация для теста
-            
+        Тестировать соединение с LLM.
+
         Returns:
-            Результат тестирования соединения
+            dict с полями: ok (bool), simulated (bool), message (str),
+            response_time_ms (float), а также legacy-поля success/error_message/suggestions
+            для обратной совместимости.
         """
-        result = {
+        result: Dict[str, Any] = {
+            "ok": False,
+            "simulated": False,
+            "message": "",
+            # legacy-поля
             "success": False,
             "provider": provider or self._config.llm.provider,
             "model": model or self._config.llm.model,
@@ -1003,36 +1004,51 @@ class ConfigurationManager:
             "test_response": "",
             "suggestions": []
         }
-        
+
+        def _finish(ok: bool, simulated: bool, message: str, elapsed_ms: float) -> Dict[str, Any]:
+            result["ok"] = ok
+            result["simulated"] = simulated
+            result["message"] = message
+            result["success"] = ok
+            result["response_time_ms"] = elapsed_ms
+            result["test_response"] = message
+            if not ok:
+                result["error_message"] = message
+            return result
+
+        import time
+        start_time = time.time()
+
         try:
-            import time
-            start_time = time.time()
-            
-            # Если используется кастомная конфигурация для теста
             if custom_config:
                 test_provider = custom_config.get("provider", provider)
-                test_model = custom_config.get("model", model) 
+                test_model = custom_config.get("model", model)
                 test_api_key = custom_config.get("api_key")
+                if not test_api_key:
+                    # Переиспользуем сохранённый ключ ТОЛЬКО для того же провайдера/эндпоинта,
+                    # чтобы не отправить реальный ключ на чужой base_url.
+                    cfg_base = getattr(self._config.llm, "base_url", None)
+                    cfg_provider = getattr(self._config.llm, "provider", None)
+                    custom_base = custom_config.get("base_url")
+                    custom_provider = custom_config.get("provider")
+                    same_base = (not custom_base) or custom_base == cfg_base
+                    same_provider = (not custom_provider) or str(custom_provider).lower() == str(cfg_provider).lower()
+                    if same_base and same_provider:
+                        test_api_key = self._config.llm.api_key
                 test_base_url = custom_config.get("base_url")
             else:
                 test_provider = provider or self._config.llm.provider
                 test_model = model or self._config.llm.model
                 test_api_key = self._config.llm.api_key
                 test_base_url = self._config.llm.base_url
-            
+
             # Пытаемся использовать реальные модели системы из agent_command.py
             try:
                 from agent_command import model_mapping
-                
-                # Проверяем, есть ли логическая модель в системе
+
                 if test_model in model_mapping:
                     system_model = model_mapping[test_model]
-                    
-                    # ИСПОЛЬЗУЕМ СУЩЕСТВУЮЩУЮ МОДЕЛЬ ИЗ СИСТЕМЫ (с её подключениями)
                     if hasattr(system_model, 'model_id'):
-                        # Модель готова к использованию с существующими подключениями
-                        result["success"] = True
-                        result["test_response"] = f"✅ Логическая модель '{test_model}' → {system_model.model_id}"
                         result["model_info"] = {
                             "logical_name": test_model,
                             "real_model_id": system_model.model_id,
@@ -1041,54 +1057,95 @@ class ConfigurationManager:
                             "api_base": getattr(system_model, 'api_base', 'Из переменной окружения'),
                             "uses_system_connection": True
                         }
-                        result["response_time_ms"] = (time.time() - start_time) * 1000
-                        return result
+                        elapsed = (time.time() - start_time) * 1000
+                        return _finish(
+                            ok=True,
+                            simulated=True,
+                            message=f"Логическая модель '{test_model}' → {system_model.model_id} (проверка атрибутов, реальный запрос не выполнен)",
+                            elapsed_ms=elapsed
+                        )
                     else:
-                        result["error_message"] = f"Модель {test_model} найдена, но model_id недоступен"
-                        return result
-                
+                        elapsed = (time.time() - start_time) * 1000
+                        return _finish(
+                            ok=False,
+                            simulated=False,
+                            message=f"Модель {test_model} найдена, но model_id недоступен",
+                            elapsed_ms=elapsed
+                        )
             except ImportError:
                 logger.warning("⚠️ Не удалось импортировать agent_command")
-            
-            # Если это НЕ логическая модель, проверяем внешние провайдеры.
-            # local не требует API-ключа (requires_api_key=False, см. описание провайдеров).
-            if not test_api_key and test_provider == "anthropic":
-                result["error_message"] = f"Не указан API ключ для {test_provider}"
-                result["suggestions"].append(f"Добавьте API ключ для {test_provider}")
-                return result
-            
-            # Тест для стандартных провайдеров
+
+            # Внешние провайдеры: пытаемся реальный лёгкий HTTP-запрос
             if test_provider == "openai":
                 if not test_api_key:
-                    result["error_message"] = "Не указан API ключ для openai"
                     result["suggestions"].append("Добавьте API ключ для openai")
-                    return result
-                # TODO: выполнить реальный minimal API-вызов для проверки ключа
-                result["success"] = True
-                result["test_response"] = "OpenAI API тест (симулированный — реальная проверка не выполнена)"
+                    return _finish(ok=False, simulated=False,
+                                   message="Не указан API ключ для openai",
+                                   elapsed_ms=(time.time() - start_time) * 1000)
+                try:
+                    import urllib.request
+                    base = (test_base_url or "https://api.openai.com/v1").rstrip("/")
+                    req = urllib.request.Request(
+                        f"{base}/models",
+                        headers={"Authorization": f"Bearer {test_api_key}"}
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        status = resp.getcode()
+                    elapsed = (time.time() - start_time) * 1000
+                    return _finish(ok=(status == 200), simulated=False,
+                                   message=f"OpenAI API ответил статусом {status}",
+                                   elapsed_ms=elapsed)
+                except Exception as exc:
+                    elapsed = (time.time() - start_time) * 1000
+                    result["suggestions"].append("Проверьте API ключ и сетевое соединение")
+                    return _finish(ok=False, simulated=False,
+                                   message=f"Ошибка соединения с OpenAI: {exc}",
+                                   elapsed_ms=elapsed)
 
             elif test_provider == "anthropic":
-                # TODO: выполнить реальный minimal API-вызов для проверки ключа
-                result["success"] = True
-                result["test_response"] = "Anthropic API тест (симулированный — реальная проверка не выполнена)"
+                if not test_api_key:
+                    result["suggestions"].append("Добавьте API ключ для anthropic")
+                    return _finish(ok=False, simulated=False,
+                                   message="Не указан API ключ для anthropic",
+                                   elapsed_ms=(time.time() - start_time) * 1000)
+                try:
+                    import urllib.request
+                    req = urllib.request.Request(
+                        "https://api.anthropic.com/v1/models",
+                        headers={
+                            "x-api-key": test_api_key,
+                            "anthropic-version": "2023-06-01"
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        status = resp.getcode()
+                    elapsed = (time.time() - start_time) * 1000
+                    return _finish(ok=(status == 200), simulated=False,
+                                   message=f"Anthropic API ответил статусом {status}",
+                                   elapsed_ms=elapsed)
+                except Exception as exc:
+                    elapsed = (time.time() - start_time) * 1000
+                    result["suggestions"].append("Проверьте API ключ и сетевое соединение")
+                    return _finish(ok=False, simulated=False,
+                                   message=f"Ошибка соединения с Anthropic: {exc}",
+                                   elapsed_ms=elapsed)
 
             elif test_provider == "local":
-                # local-провайдер использует собственное подключение и не требует API-ключа
-                result["success"] = True
-                result["test_response"] = "Local провайдер тест (симулированный — реальная проверка не выполнена)"
+                # Для local-провайдера реальная проверка невозможна без знания эндпоинта
+                elapsed = (time.time() - start_time) * 1000
+                return _finish(ok=True, simulated=True,
+                               message="Local провайдер: реальная проверка не выполнена (неизвестен эндпоинт)",
+                               elapsed_ms=elapsed)
 
             else:
-                result["error_message"] = f"Неподдерживаемый провайдер: {test_provider}"
                 result["suggestions"].append("Используйте: openai, anthropic, или модели системы")
-                return result
-            
-            result["response_time_ms"] = (time.time() - start_time) * 1000
-            
+                return _finish(ok=False, simulated=False,
+                               message=f"Неподдерживаемый провайдер: {test_provider}",
+                               elapsed_ms=(time.time() - start_time) * 1000)
+
         except Exception as e:
-            result["error_message"] = str(e)
-            result["suggestions"].append("Проверьте настройки API и сетевое соединение")
-            
-        return result
+            return _finish(ok=False, simulated=False, message=str(e),
+                           elapsed_ms=(time.time() - start_time) * 1000)
 
 
 # Глобальный экземпляр менеджера

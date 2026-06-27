@@ -778,34 +778,64 @@ class WidgetFactory:
         add_context_menu(widget)
         
         def get_typed_value():
-            """Получает значение с правильным типом на основе схемы"""
+            """Получает значение с правильным типом на основе схемы.
+
+            При неуспешной конверсии числового типа помечает поле красным и
+            бросает ValueError — вызывающий код должен обработать ошибку и
+            показать её пользователю, а не класть строку в JSON вместо числа.
+            """
             raw_value = widget_var.get()
             if not raw_value.strip():
+                # Сбрасываем индикатор ошибки при очистке поля
+                try:
+                    widget.configure(background="white")
+                except Exception:
+                    pass
                 return None
-            
+
             # Определяем тип из схемы
             field_type = field_info.get("schema", {}).get("type")
-            
+
             try:
                 if field_type == "integer":
-                    return int(raw_value)
+                    result = int(raw_value)
                 elif field_type == "number":
-                    return float(raw_value)
+                    result = float(raw_value)
                 elif field_type == "boolean":
-                    return raw_value.lower() in ("true", "1", "yes", "on")
+                    result = raw_value.lower() in ("true", "1", "yes", "on")
                 else:
-                    return raw_value
+                    result = raw_value
+                # Успех — сбрасываем индикатор ошибки
+                try:
+                    widget.configure(background="white")
+                except Exception:
+                    pass
+                return result
             except (ValueError, TypeError):
-                # Если преобразование не удалось, возвращаем строку
-                return raw_value
+                # Помечаем поле как невалидное визуально
+                try:
+                    widget.configure(background="#ffcccc")
+                except Exception:
+                    pass
+                field_title = field_info.get("title", field_info.get("name", ""))
+                raise ValueError(
+                    f"Поле '{field_title}': невозможно преобразовать '{raw_value}' в тип {field_type}"
+                )
         
+        def _validate_entry():
+            try:
+                get_typed_value()
+                return self._validate_string(widget_var.get(), field_info)
+            except ValueError:
+                return False
+
         return {
             "widget": widget,
             "get_value": get_typed_value,
             "set_value": lambda v: widget_var.set(str(v or "")),
-            "validate": lambda: self._validate_string(widget_var.get(), field_info)
+            "validate": _validate_entry
         }
-    
+
     def _create_text_area(self, field_info: Dict[str, Any], value: Any) -> Dict[str, Any]:
         """Создает многострочное поле ввода"""
         config = field_info.get("config", {})
@@ -908,7 +938,9 @@ class WidgetFactory:
     
     def _create_checkbox(self, field_info: Dict[str, Any], value: Any) -> Dict[str, Any]:
         """Создает checkbox"""
-        widget_var = tk.BooleanVar(value=bool(value))
+        # Нормализация: bool("False") == True, поэтому строки обрабатываем явно
+        bool_value = value if isinstance(value, bool) else str(value).lower() in ("true", "1", "yes")
+        widget_var = tk.BooleanVar(value=bool_value)
         widget_var.trace_add('write', lambda *args: self.on_change())
         
         widget = ttk.Checkbutton(
@@ -1031,10 +1063,19 @@ class WidgetFactory:
             
             nested_widgets[prop_name] = widget_info
         
+        def _nested_get_value():
+            result = {}
+            for name, widget in nested_widgets.items():
+                try:
+                    result[name] = widget["get_value"]()
+                except ValueError as e:
+                    raise ValueError(f"поле '{name}': {e}") from e
+            return result
+
         return {
             "widget": group_frame,
-            "get_value": lambda: {name: widget["get_value"]() for name, widget in nested_widgets.items()},
-            "set_value": lambda v: [widget["set_value"](v.get(name) if isinstance(v, dict) else None) 
+            "get_value": _nested_get_value,
+            "set_value": lambda v: [widget["set_value"](v.get(name) if isinstance(v, dict) else None)
                                   for name, widget in nested_widgets.items()],
             "validate": lambda: all(widget["validate"]() for widget in nested_widgets.values())
         }
@@ -1195,20 +1236,26 @@ class WidgetFactory:
         def get_array_data():
             """Получает данные всех элементов"""
             result = []
+            conversion_errors = []
             for i, item_data in enumerate(items_list):
                 if i in item_widgets:
                     item_result = {}
                     widgets = item_widgets[i]
-                    
+
                     for field_name, widget_info in widgets.items():
                         if not subfield_configs.get(field_name, {}).get("hidden", False):
-                            item_result[field_name] = widget_info["get_value"]()
+                            try:
+                                item_result[field_name] = widget_info["get_value"]()
+                            except ValueError as e:
+                                conversion_errors.append(f"[{i}].{field_name}: {e}")
                         elif field_name in item_data:
                             item_result[field_name] = item_data[field_name]
-                    
+
                     result.append(item_result)
                 else:
                     result.append(item_data)
+            if conversion_errors:
+                raise ValueError("Невалидные поля массива:\n" + "\n".join(conversion_errors))
             return result
         
         def set_array_data(new_data):
@@ -1300,19 +1347,25 @@ class WidgetFactory:
         
         def get_array_data():
             result = []
+            conversion_errors = []
             for i, item in enumerate(items_list):
                 if i in item_widgets:
                     item_result = {}
                     for field_name, w in item_widgets[i].items():
                         if not subfield_configs.get(field_name, {}).get("hidden", False):
-                            item_result[field_name] = w["get_value"]()
+                            try:
+                                item_result[field_name] = w["get_value"]()
+                            except ValueError as e:
+                                conversion_errors.append(f"[{i}].{field_name}: {e}")
                         elif field_name in item:
                             item_result[field_name] = item[field_name]
                     result.append(item_result)
                 else:
                     result.append(item)
+            if conversion_errors:
+                raise ValueError("Невалидные поля массива:\n" + "\n".join(conversion_errors))
             return result
-        
+
         def set_array_data(new_data):
             items_list.clear()
             if isinstance(new_data, list):
@@ -1415,19 +1468,25 @@ class WidgetFactory:
         
         def get_array_data():
             result = []
+            conversion_errors = []
             for i, item in enumerate(items_list):
                 if i in item_widgets:
                     item_result = {}
                     for field_name, w in item_widgets[i].items():
                         if not subfield_configs.get(field_name, {}).get("hidden", False):
-                            item_result[field_name] = w["get_value"]()
+                            try:
+                                item_result[field_name] = w["get_value"]()
+                            except ValueError as e:
+                                conversion_errors.append(f"[{i}].{field_name}: {e}")
                         elif field_name in item:
                             item_result[field_name] = item[field_name]
                     result.append(item_result)
                 else:
                     result.append(item)
+            if conversion_errors:
+                raise ValueError("Невалидные поля массива:\n" + "\n".join(conversion_errors))
             return result
-        
+
         def set_array_data(new_data):
             items_list.clear()
             if isinstance(new_data, list):
@@ -1441,15 +1500,29 @@ class WidgetFactory:
             "validate": lambda: True
         }
     
-    def _create_object_form(self, parent, object_data, object_schema, subfield_configs):
-        """Создает форму для объекта на основе схемы"""
+    _MAX_OBJECT_FORM_DEPTH = 10
+
+    def _create_object_form(self, parent, object_data, object_schema, subfield_configs, _depth: int = 0):
+        """Создает форму для объекта на основе схемы.
+
+        _depth — внутренний счётчик глубины рекурсии; при превышении
+        _MAX_OBJECT_FORM_DEPTH показывает заглушку вместо краша.
+        """
+        if _depth > self._MAX_OBJECT_FORM_DEPTH:
+            ttk.Label(
+                parent,
+                text=f"⚠ Данные слишком вложены (глубина > {self._MAX_OBJECT_FORM_DEPTH}). Редактирование недоступно.",
+                foreground="red"
+            ).pack(anchor="w", pady=2)
+            return {}
+
         properties = object_schema.get("properties", {})
         widgets = {}
-        
+
         # Проверяем, есть ли группировка полей
         field_groups = subfield_configs.get("field_groups", {})
         if field_groups:
-            return self._create_grouped_object_form(parent, object_data, object_schema, subfield_configs, field_groups)
+            return self._create_grouped_object_form(parent, object_data, object_schema, subfield_configs, field_groups, _depth=_depth)
         
         # Применяем порядок полей из field_order
         field_order = subfield_configs.get("field_order", [])
@@ -1525,15 +1598,17 @@ class WidgetFactory:
                     if not field_config:
                         field_config = {"widget": "entry"}
                     
+                    _humanize = self.introspector._humanize_field_name if self.introspector else lambda n: n.replace("_", " ").title()
+                    _det_widget = self.introspector._determine_widget if self.introspector else lambda s, c: c.get("widget", "entry")
                     field_info = {
                         "name": field_name,
                         "type": field_schema.get("type"),
-                        "title": field_config.get("label", self.introspector._humanize_field_name(field_name)),
-                        "widget": self.introspector._determine_widget(field_schema, field_config),
+                        "title": field_config.get("label", _humanize(field_name)),
+                        "widget": _det_widget(field_schema, field_config),
                         "schema": field_schema,
                         "config": field_config
                     }
-                    
+
                     # Контейнер для inline поля
                     field_container = ttk.Frame(inline_frame)
                     field_container.pack(side="left", padx=(0, 10))
@@ -1562,15 +1637,17 @@ class WidgetFactory:
                 i = j  # Переходим к следующему не-inline полю
             else:
                 # Обычное поле
+                _humanize = self.introspector._humanize_field_name if self.introspector else lambda n: n.replace("_", " ").title()
+                _det_widget = self.introspector._determine_widget if self.introspector else lambda s, c: c.get("widget", "entry")
                 field_info = {
                     "name": prop_name,
                     "type": prop_schema.get("type"),
-                    "title": prop_config.get("label", self.introspector._humanize_field_name(prop_name)),
-                    "widget": self.introspector._determine_widget(prop_schema, prop_config),
+                    "title": prop_config.get("label", _humanize(prop_name)),
+                    "widget": _det_widget(prop_schema, prop_config),
                     "schema": prop_schema,
                     "config": prop_config
                 }
-                
+
                 # Фрейм для поля
                 field_frame = ttk.Frame(parent)
                 field_frame.pack(fill="x", pady=2)
@@ -1591,7 +1668,7 @@ class WidgetFactory:
         
         return widgets
     
-    def _create_grouped_object_form(self, parent, object_data, object_schema, subfield_configs, field_groups):
+    def _create_grouped_object_form(self, parent, object_data, object_schema, subfield_configs, field_groups, _depth: int = 0):
         """Создает форму для объекта с группировкой полей"""
         properties = object_schema.get("properties", {})
         widgets = {}
@@ -1674,15 +1751,17 @@ class WidgetFactory:
                         inline_field_key = f"{inline_field_name}_field"
                         inline_field_config = subfield_configs.get(inline_field_key, subfield_configs.get(inline_field_name, {}))
                         
+                        _humanize = self.introspector._humanize_field_name if self.introspector else lambda n: n.replace("_", " ").title()
+                        _det_widget = self.introspector._determine_widget if self.introspector else lambda s, c: c.get("widget", "entry")
                         field_info = {
                             "name": inline_field_name,
                             "type": inline_field_schema.get("type"),
-                            "title": inline_field_config.get("label", self.introspector._humanize_field_name(inline_field_name)),
-                            "widget": self.introspector._determine_widget(inline_field_schema, inline_field_config),
+                            "title": inline_field_config.get("label", _humanize(inline_field_name)),
+                            "widget": _det_widget(inline_field_schema, inline_field_config),
                             "schema": inline_field_schema,
                             "config": inline_field_config
                         }
-                        
+
                         # Контейнер для inline поля
                         field_container = ttk.Frame(inline_frame)
                         field_container.pack(side="left", padx=(0, 10))
@@ -1711,15 +1790,17 @@ class WidgetFactory:
                     i = j  # Переходим к следующему не-inline полю
                 else:
                     # Обычное поле
+                    _humanize = self.introspector._humanize_field_name if self.introspector else lambda n: n.replace("_", " ").title()
+                    _det_widget = self.introspector._determine_widget if self.introspector else lambda s, c: c.get("widget", "entry")
                     field_info = {
                         "name": field_name,
                         "type": prop_schema.get("type"),
-                        "title": prop_config.get("label", self.introspector._humanize_field_name(field_name)),
-                        "widget": self.introspector._determine_widget(prop_schema, prop_config),
+                        "title": prop_config.get("label", _humanize(field_name)),
+                        "widget": _det_widget(prop_schema, prop_config),
                         "schema": prop_schema,
                         "config": prop_config
                     }
-                    
+
                     # Фрейм для поля
                     field_frame = ttk.Frame(group_frame)
                     field_frame.pack(fill="x", pady=2)
@@ -1847,16 +1928,20 @@ class WidgetFactory:
         copy_btn.pack(side="left", padx=(0, 2))
         
         delete_btn = ttk.Button(button_frame, text="🗑️", state="disabled")
-        delete_btn.pack(side="left")
-        
+        delete_btn.pack(side="left", padx=(0, 2))
+
+        undo_btn = ttk.Button(button_frame, text="↩", state="disabled")
+        undo_btn.pack(side="left")
+
         # Фрейм для редактирования выбранного элемента
         hide_edit_label = config.get("hide_edit_label", False)
         edit_title = "" if hide_edit_label else "Редактирование элемента"
         edit_frame = ttk.LabelFrame(main_frame, text=edit_title)
         edit_frame.pack(fill="both", expand=True, pady=(5, 0))
-        
+
         current_editor = None
         current_index = None
+        _undo_stack = []  # [(index, item), ...] — для undo удалений
         
         def update_dropdown():
             """Обновляет список в dropdown"""
@@ -1923,13 +2008,31 @@ class WidgetFactory:
             self.on_change()
 
         def delete_item():
-            """Удаляет выбранный элемент"""
+            """Удаляет выбранный элемент (с подтверждением и undo)"""
             nonlocal current_index
             if current_index is not None and 0 <= current_index < len(items_list):
+                if not messagebox.askyesno(
+                    "Удаление",
+                    f"Удалить элемент {current_index + 1}?",
+                    icon="warning"
+                ):
+                    return
+                _undo_stack.append((current_index, items_list[current_index]))
                 items_list.pop(current_index)
                 clear_editor()
                 update_dropdown()
                 self.on_change()
+
+        def undo_delete():
+            """Откатывает последнее удаление"""
+            if not _undo_stack:
+                return
+            idx, item = _undo_stack.pop()
+            items_list.insert(idx, item)
+            update_dropdown()
+            dropdown.current(idx)
+            on_selection_change()
+            self.on_change()
 
         def copy_item_to_clipboard():
             """Копирует текущий элемент в буфер обмена как JSON"""
@@ -1976,11 +2079,20 @@ class WidgetFactory:
             items_list = data if isinstance(data, list) else []
             update_dropdown()
         
+        def _on_undo_delete():
+            undo_delete()
+            undo_btn.config(state="normal" if _undo_stack else "disabled")
+
+        def _on_delete_item():
+            delete_item()
+            undo_btn.config(state="normal" if _undo_stack else "disabled")
+
         # Привязываем события
         dropdown.bind("<<ComboboxSelected>>", on_selection_change)
         add_btn.config(command=add_item)
-        delete_btn.config(command=delete_item)
+        delete_btn.config(command=_on_delete_item)
         copy_btn.config(command=copy_item_to_clipboard)
+        undo_btn.config(command=_on_undo_delete)
         
         # Инициализация
         update_dropdown()
@@ -2051,16 +2163,20 @@ class WidgetFactory:
         copy_btn.pack(side="left", padx=(0, 2))
         
         delete_btn = ttk.Button(button_frame, text="🗑️", width=3, state="disabled")
-        delete_btn.pack(side="left")
-        
+        delete_btn.pack(side="left", padx=(0, 2))
+
+        undo_btn2 = ttk.Button(button_frame, text="↩", width=3, state="disabled")
+        undo_btn2.pack(side="left")
+
         # Фрейм для редактирования выбранного элемента
         hide_edit_label = config.get("hide_edit_label", False)
         edit_title = "" if hide_edit_label else "Редактирование элемента"
         edit_frame = ttk.LabelFrame(main_frame, text=edit_title)
         edit_frame.pack(fill="both", expand=True, pady=(5, 0))
-        
+
         current_editor = None
         current_index = None
+        _undo_stack2 = []  # [(index, item), ...] — для undo удалений
         
         def update_dropdown():
             """Обновляет список в dropdown"""
@@ -2133,12 +2249,32 @@ class WidgetFactory:
             self.on_change()
 
         def delete_item():
-            """Удаляет выбранный элемент"""
+            """Удаляет выбранный элемент (с подтверждением и undo)"""
             if current_index is not None and 0 <= current_index < len(items_list):
+                if not messagebox.askyesno(
+                    "Удаление",
+                    f"Удалить элемент {current_index + 1}?",
+                    icon="warning"
+                ):
+                    return
+                _undo_stack2.append((current_index, items_list[current_index]))
                 items_list.pop(current_index)
                 clear_editor()
                 update_dropdown()
+                undo_btn2.config(state="normal")
                 self.on_change()
+
+        def undo_delete2():
+            """Откатывает последнее удаление"""
+            if not _undo_stack2:
+                return
+            idx, item = _undo_stack2.pop()
+            items_list.insert(idx, item)
+            update_dropdown()
+            dropdown.current(idx)
+            on_selection_change()
+            undo_btn2.config(state="normal" if _undo_stack2 else "disabled")
+            self.on_change()
 
         def get_data():
             """Возвращает текущие данные"""
@@ -2183,14 +2319,24 @@ class WidgetFactory:
         delete_btn.config(command=delete_item)
         edit_btn.config(command=lambda: on_selection_change())
         copy_btn.config(command=copy_item_to_clipboard)
+        undo_btn2.config(command=undo_delete2)
         
         # Инициализация
         update_dropdown()
         
+        def set_data(new_value):
+            """Устанавливает данные в dropdown-селектор"""
+            nonlocal items_list
+            items_list = new_value if isinstance(new_value, list) else []
+            update_dropdown()
+            if items_list:
+                dropdown.current(0)
+                on_selection_change()
+
         return {
             "widget": main_frame,
             "get_value": get_data,
-            "set": lambda new_value: None,  # TODO: реализовать set
+            "set_value": set_data,
             "validate": lambda: True
         }
     
@@ -2385,8 +2531,47 @@ class UniversalFormGenerator:
         # Сохраняем виджет для получения значений
         self.widgets[field_name] = widget_info
     
+    def _collect_form_fields(self):
+        """Собирает данные полей формы без показа диалогов.
+
+        Возвращает (result: dict, invalid_fields: list[str]).
+        Вызывается и из get_form_data (с UI), и из validate_form (без UI).
+        """
+        result = {}
+        invalid_fields = []
+
+        for field_name, widget_info in self.widgets.items():
+            try:
+                value = widget_info["get_value"]()
+
+                # Обработка пустых значений
+                if value == "" or value is None:
+                    # Проверяем, является ли поле обязательным
+                    if field_name in self.schema_info["validation"]["required"]:
+                        result[field_name] = value  # Оставляем для валидации
+                    # Для необязательных полей пропускаем пустые значения
+                else:
+                    result[field_name] = value
+
+            except ValueError as e:
+                # Ошибка конверсии типа — поле уже помечено красным виджетом
+                field_title = self.schema_info["fields"].get(field_name, {}).get("title", field_name)
+                invalid_fields.append(f"'{field_title}': {e}")
+                logger.warning(f"Невалидное поле {field_name}: {e}")
+            except Exception as e:
+                logger.error(f"Ошибка получения значения поля {field_name}: {e}")
+                field_title = self.schema_info["fields"].get(field_name, {}).get("title", field_name)
+                invalid_fields.append(f"'{field_title}': {e}")
+
+        return result, invalid_fields
+
     def get_form_data(self) -> Any:
-        """Получает данные из формы"""
+        """Получает данные из формы.
+
+        При ошибке конверсии поля показывает пользователю сообщение и
+        не возвращает данные (возвращает None) вместо того, чтобы молча
+        класть строку или None в JSON.
+        """
         # Если исходные данные были массивом, возвращаем массив
         if isinstance(self.data, list):
             # Для массива возвращаем значение поля "items" (если есть)
@@ -2398,27 +2583,26 @@ class UniversalFormGenerator:
                     return self.data  # Возвращаем исходные данные
             else:
                 return self.data  # Если нет виджета items, возвращаем исходные данные
-        
-        # Для объектов работаем как раньше
-        result = {}
-        
-        for field_name, widget_info in self.widgets.items():
-            try:
-                value = widget_info["get_value"]()
-                
-                # Обработка пустых значений
-                if value == "" or value is None:
-                    # Проверяем, является ли поле обязательным
-                    if field_name in self.schema_info["validation"]["required"]:
-                        result[field_name] = value  # Оставляем для валидации
-                    # Для необязательных полей пропускаем пустые значения
-                else:
-                    result[field_name] = value
-                    
-            except Exception as e:
-                logger.error(f"Ошибка получения значения поля {field_name}: {e}")
-                result[field_name] = None
-        
+
+        result, invalid_fields = self._collect_form_fields()
+
+        if invalid_fields:
+            messagebox.showerror(
+                "Ошибка в полях формы",
+                "Следующие поля содержат некорректные значения:\n\n" + "\n".join(invalid_fields)
+            )
+            return None
+
+        # Round-trip валидация собранного объекта
+        try:
+            json.loads(json.dumps(result, ensure_ascii=False))
+        except (TypeError, ValueError) as e:
+            messagebox.showerror(
+                "Ошибка сериализации",
+                f"Данные формы не могут быть сохранены в JSON:\n{e}"
+            )
+            return None
+
         return result
     
     def set_form_data(self, data: Any) -> None:
@@ -2446,17 +2630,33 @@ class UniversalFormGenerator:
                 logger.error(f"Ошибка установки значения поля {field_name}: {e}")
     
     def validate_form(self) -> List[str]:
-        """Валидирует данные формы"""
+        """Валидирует данные формы.
+
+        Намеренно НЕ вызывает get_form_data(), чтобы избежать двойного
+        messagebox: get_form_data показывает диалог при ошибке конверсии,
+        а вызывающий слой (кнопка сохранения) — показывает ошибки валидации.
+        Ошибки конверсии собираются через _collect_form_fields() без UI.
+        """
         errors = []
-        form_data = self.get_form_data()
-        
-        # Для массивов валидация другая - проверяем что массив не пустой
-        if isinstance(form_data, list):
-            if not form_data:
-                errors.append("Массив не должен быть пустым")
-            # Для массивов больше нечего валидировать на уровне формы
+
+        # Для массивов валидация отдельная — массив нельзя получить через
+        # _collect_form_fields (который работает только с dict-формами).
+        if isinstance(self.data, list):
+            if "items" in self.widgets:
+                try:
+                    arr = self.widgets["items"]["get_value"]()
+                    if isinstance(arr, list) and not arr:
+                        errors.append("Массив не должен быть пустым")
+                except Exception as e:
+                    logger.error(f"Ошибка валидации массива items: {e}")
             return errors
-        
+
+        # Для объектов — собираем без диалогов
+        form_data, invalid_fields = self._collect_form_fields()
+
+        for msg in invalid_fields:
+            errors.append(f"Некорректное значение: {msg}")
+
         # Для объектов - обычная валидация полей
         if not isinstance(form_data, dict):
             errors.append("Некорректный формат данных")

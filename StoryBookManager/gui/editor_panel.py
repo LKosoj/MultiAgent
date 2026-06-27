@@ -8,6 +8,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import json
+import threading
 from typing import Optional, Dict, Any, Callable
 import logging
 
@@ -36,7 +37,14 @@ class EditorPanel(ttk.Frame):
         self.file_manager: Optional[FileManager] = None
         self.current_file_type: Optional[str] = None
         self.current_data: Optional[Dict[str, Any]] = None
-        self.has_changes = False
+        # dict[file_type -> bool] отслеживает изменения по каждому файлу отдельно
+        self._changes: Dict[str, bool] = {}
+        self._is_loading = False  # guard: async I/O в процессе
+        self.is_raw_json_valid = True  # актуальность JSON в raw-редакторе
+        self._prev_file_selection: Optional[str] = None  # для восстановления при Cancel
+        self._file_data_cache: Dict[str, Any] = {}  # file_type -> последние данные формы
+        self._pending_load_file_type: Optional[str] = None  # загрузить после save_done
+        self._file_var_trace_id: Optional[str] = None  # id trace для безопасного снятия
         
         # Универсальный редактор (теперь базовый режим)
         self._ui_config_error: Optional[str] = None
@@ -63,7 +71,8 @@ class EditorPanel(ttk.Frame):
         button_frame = ttk.Frame(header_frame)
         button_frame.pack(side="right")
         
-        ttk.Button(button_frame, text="💾 Сохранить", command=self.save_current_file).pack(side="left", padx=2)
+        self._save_button = ttk.Button(button_frame, text="💾 Сохранить", command=self.save_current_file)
+        self._save_button.pack(side="left", padx=2)
         ttk.Button(button_frame, text="🔄 Обновить", command=self.reload_current_file).pack(side="left", padx=2)
         ttk.Button(button_frame, text="✓ Валидация", command=self.validate_current_file).pack(side="left", padx=2)
         ttk.Button(button_frame, text="⚙️ UI конфиг", command=self.reload_ui_config).pack(side="left", padx=2)
@@ -81,7 +90,7 @@ class EditorPanel(ttk.Frame):
         
         ttk.Label(file_frame, text="Файл:").pack(side="left")
         self.file_var = tk.StringVar()
-        self.file_var.trace_add('write', self.on_file_selected)
+        self._file_var_trace_id = self.file_var.trace_add('write', self.on_file_selected)
         self.file_combo = ttk.Combobox(file_frame, textvariable=self.file_var, width=30, state="readonly")
         self.file_combo.pack(side="left", padx=5)        
         # Статус файла
@@ -152,10 +161,12 @@ class EditorPanel(ttk.Frame):
         """Создание редактора сырого JSON"""
         # Текстовое поле с подсветкой синтаксиса
         self.raw_text = scrolledtext.ScrolledText(
-            self.raw_frame, 
+            self.raw_frame,
             wrap=tk.NONE,
             font=("Courier", 10),
-            tabs="4c"
+            tabs="4c",
+            undo=True,
+            maxundo=100,
         )
         self.raw_text.pack(fill="both", expand=True)
         
@@ -330,7 +341,10 @@ class EditorPanel(ttk.Frame):
             # Сброс состояния
             self.current_file_type = None
             self.current_data = None
-            self.has_changes = False
+            self._changes = {}
+            self._prev_file_selection = None
+            self._file_data_cache = {}
+            self._pending_load_file_type = None
             
             # Очистка редакторов
             self.clear_editors()
@@ -401,29 +415,43 @@ class EditorPanel(ttk.Frame):
     
     def on_file_selected(self, *args):
         """Обработчик выбора файла"""
+        if getattr(self, "_is_loading", False):
+            return
         selection = self.file_var.get()
         if not selection or not self.file_manager:
             return
-        
+
         # Извлекаем тип файла
         file_type = selection.split(" - ")[0]
-        
+
         if file_type != self.current_file_type:
-            # Проверяем несохраненные изменения
-            if self.has_changes:
+            # Сбрасываем актуальные данные текущего файла в кэш перед переключением (фикс #2)
+            if self.current_file_type is not None and self.current_data is not None:
+                self._file_data_cache[self.current_file_type] = self.current_data
+
+            # Проверяем несохраненные изменения для текущего файла
+            if self._changes.get(self.current_file_type, False):
                 result = messagebox.askyesnocancel(
                     "Несохраненные изменения",
                     "У вас есть несохраненные изменения. Сохранить?"
                 )
                 if result is True:
+                    # Фикс #4: не вызываем load_file сразу — отложим до _on_save_done
+                    self._pending_load_file_type = file_type
                     self.save_current_file()
-                elif result is None:  # Cancel
                     return
-            
+                elif result is None:  # Cancel — восстанавливаем предыдущий выбор
+                    # Снимаем trace чтобы не зациклить on_file_selected (фикс #1)
+                    self.file_var.trace_remove('write', self._file_var_trace_id)
+                    self.file_var.set(self._prev_file_selection or "")
+                    self._file_var_trace_id = self.file_var.trace_add('write', self.on_file_selected)
+                    return
+
+            self._prev_file_selection = selection
             self.load_file(file_type)
     
     def load_file(self, file_type: str):
-        """Загрузка файла"""
+        """Загрузка файла (I/O выполняется в фоновом потоке)"""
         if self._ui_config_error:
             messagebox.showerror(
                 "Ошибка конфигурации UI",
@@ -432,29 +460,55 @@ class EditorPanel(ttk.Frame):
             )
             return
 
-        try:
-            self.current_file_type = file_type
-            self.current_data = self.file_manager.load_json_file(file_type)
-            self.has_changes = False
-            
-            if self.current_data is None:
-                self.status_label.config(text="Файл не найден")
-                self.clear_editors()
+        if self._is_loading:
+            return
+
+        self._is_loading = True
+        self.current_file_type = file_type
+        self.status_label.config(text="Загрузка…")
+        self._save_button.config(state="disabled")
+
+        def _do_load():
+            try:
+                data = self.file_manager.load_json_file(file_type)
+            except Exception as exc:
+                self.after(0, lambda: self._on_load_error(file_type, exc))
                 return
-            
-            # Обновляем редакторы
-            self.update_structured_editor()
-            self.update_raw_editor()
-            
-            # Валидация
-            self.validate_current_file()
-            
-            self.status_label.config(text="Файл загружен")
-            logger.info(f"Загружен файл {file_type}")
-            
-        except Exception as e:
-            logger.error(f"Ошибка загрузки файла {file_type}: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось загрузить файл:\n{e}")
+            self.after(0, lambda: self._on_load_done(file_type, data))
+
+        threading.Thread(target=_do_load, daemon=True).start()
+
+    def _on_load_done(self, file_type: str, data):
+        """Вызывается в Tk-потоке после успешной загрузки файла"""
+        self._is_loading = False
+        self.current_data = data
+        self._changes.pop(file_type, None)  # сбрасываем флаг только для этого файла
+        if data is not None:
+            self._file_data_cache[file_type] = data  # наполняем кэш при загрузке (фикс #2)
+
+        if data is None:
+            self.status_label.config(text="Файл не найден")
+            self.clear_editors()
+            self._update_save_button_state()
+            return
+
+        # Обновляем редакторы
+        self.update_structured_editor()
+        self.update_raw_editor()
+
+        # Валидация
+        self.validate_current_file()
+
+        self.status_label.config(text="Файл загружен")
+        self._update_save_button_state()
+        logger.info(f"Загружен файл {file_type}")
+
+    def _on_load_error(self, file_type: str, exc: Exception):
+        """Вызывается в Tk-потоке при ошибке загрузки"""
+        self._is_loading = False
+        self._update_save_button_state()
+        logger.error(f"Ошибка загрузки файла {file_type}: {exc}")
+        messagebox.showerror("Ошибка", f"Не удалось загрузить файл:\n{exc}")
     
     def update_structured_editor(self):
         """Обновление структурированного редактора"""
@@ -1950,25 +2004,52 @@ class EditorPanel(ttk.Frame):
     
     def on_structured_data_changed(self, *args):
         """Обработчик изменения структурированных данных"""
-        self.has_changes = True
+        if self.current_file_type:
+            self._changes[self.current_file_type] = True
         self.status_label.config(text="Файл изменен *")
-        
-        # Обновляем raw редактор
+
+        # Обновляем raw редактор (обновляет self.current_data)
         self.sync_structured_to_raw()
+        # Обновляем кэш актуальными данными (фикс #2)
+        if self.current_file_type is not None and self.current_data is not None:
+            self._file_data_cache[self.current_file_type] = self.current_data
+        # Синхронизируем кнопку Save (фикс #3)
+        self._update_save_button_state()
     
     def on_raw_text_changed(self, event):
         """Обработчик изменения raw текста"""
-        self.has_changes = True
+        if self.current_file_type:
+            self._changes[self.current_file_type] = True
         self.status_label.config(text="Файл изменен *")
-        
+
         # Проверяем валидность JSON
         try:
             json_text = self.raw_text.get("1.0", tk.END)
-            json.loads(json_text)
+            parsed = json.loads(json_text)
             self.raw_text.config(background="white")
+            self.is_raw_json_valid = True
+            # Обновляем кэш при валидном raw-JSON (фикс #2)
+            if self.current_file_type is not None:
+                self.current_data = parsed
+                self._file_data_cache[self.current_file_type] = parsed
         except json.JSONDecodeError:
             self.raw_text.config(background="#FFE6E6")  # Светло-красный
-    
+            self.is_raw_json_valid = False
+
+        self._update_save_button_state()
+
+    @property
+    def has_changes(self) -> bool:
+        """True, если хоть один файл имеет несохранённые изменения"""
+        return any(self._changes.values())
+
+    def _update_save_button_state(self):
+        """Дизейблит кнопку Сохранить при невалидном raw-JSON или во время загрузки"""
+        current_tab = self.editor_notebook.index(self.editor_notebook.select())
+        raw_tab_active = (current_tab == 1)
+        disabled = self._is_loading or (raw_tab_active and not self.is_raw_json_valid)
+        self._save_button.config(state="disabled" if disabled else "normal")
+
     def sync_structured_to_raw(self):
         """Синхронизация структурированных данных в raw редактор"""
         try:
@@ -2257,49 +2338,89 @@ class EditorPanel(ttk.Frame):
             logger.warning(f"Ошибка синхронизации локаций: {e}")
     
     def save_current_file(self):
-        """Сохранение текущего файла"""
+        """Сохранение текущего файла (I/O в фоновом потоке)"""
         if not self.file_manager or not self.current_file_type:
             messagebox.showwarning("Предупреждение", "Нет файла для сохранения")
             return
-        
+
+        if self._is_loading:
+            return
+
+        # Сбор данных из UI происходит в Tk-потоке до запуска фона
         try:
-            # Получаем данные из активного редактора
             current_tab = self.editor_notebook.index(self.editor_notebook.select())
-            
             if current_tab == 1:  # Raw JSON редактор
-                # Парсим JSON из текстового поля
                 json_text = self.raw_text.get("1.0", tk.END)
-                self.current_data = json.loads(json_text)
+                data_to_save = json.loads(json_text)
+                self.current_data = data_to_save
             else:
-                # Данные уже синхронизированы из структурированной формы
-                pass
-            
-            # Сохраняем файл
-            success = self.file_manager.save_json_file(
-                self.current_data, 
-                self.current_file_type,
-                create_backup=True
-            )
-            
-            if success:
-                self.has_changes = False
-                self.status_label.config(text="Файл сохранен")
-                self.validate_current_file()
-                
-                # Уведомляем о сохранении
-                if self.on_file_changed:
-                    file_path = self.file_manager._get_default_file_path(self.current_file_type)
-                    self.on_file_changed(self.current_file_type, file_path)
-                
-                messagebox.showinfo("Успех", "Файл сохранен")
-            else:
-                messagebox.showerror("Ошибка", "Не удалось сохранить файл")
-            
+                data_to_save = self.current_data
         except json.JSONDecodeError as e:
             messagebox.showerror("Ошибка JSON", f"Некорректный JSON:\n{e}")
-        except Exception as e:
-            logger.error(f"Ошибка сохранения файла: {e}")
-            messagebox.showerror("Ошибка", f"Ошибка сохранения:\n{e}")
+            return
+
+        file_type = self.current_file_type
+        self._is_loading = True
+        self.status_label.config(text="Сохранение…")
+        self._save_button.config(state="disabled")
+
+        def _do_save():
+            try:
+                success = self.file_manager.save_json_file(
+                    data_to_save,
+                    file_type,
+                    create_backup=True,
+                )
+            except Exception as exc:
+                self.after(0, lambda: self._on_save_error(exc))
+                return
+            self.after(0, lambda: self._on_save_done(file_type, success))
+
+        threading.Thread(target=_do_save, daemon=True).start()
+
+    def _on_save_done(self, file_type: str, success: bool):
+        """Вызывается в Tk-потоке после завершения сохранения"""
+        self._is_loading = False
+        if success:
+            self._changes.pop(file_type, None)
+            self.status_label.config(text="Файл сохранен")
+            self.validate_current_file()
+            if self.on_file_changed:
+                file_path = self.file_manager._get_default_file_path(file_type)
+                self.on_file_changed(file_type, file_path)
+            messagebox.showinfo("Успех", "Файл сохранен")
+        else:
+            messagebox.showerror("Ошибка", "Не удалось сохранить файл")
+        self._update_save_button_state()
+        # Фикс #4: pending-загрузку инициируем ТОЛЬКО при успешном сохранении —
+        # иначе уход на новый файл потерял бы несохранённые правки текущего.
+        pending = self._pending_load_file_type
+        self._pending_load_file_type = None
+        if pending is not None:
+            if success:
+                self._prev_file_selection = self.file_var.get()
+                self.load_file(pending)
+            else:
+                # Сейв не удался — остаёмся на текущем файле, возвращаем выбор в комбобоксе
+                self.file_var.trace_remove('write', self._file_var_trace_id)
+                self.file_var.set(self._prev_file_selection or "")
+                self._file_var_trace_id = self.file_var.trace_add('write', self.on_file_selected)
+
+    def _on_save_error(self, exc: Exception):
+        """Вызывается в Tk-потоке при ошибке сохранения"""
+        self._is_loading = False
+        pending = self._pending_load_file_type
+        self._pending_load_file_type = None
+        self._update_save_button_state()
+        logger.error(f"Ошибка сохранения файла: {exc}")
+        messagebox.showerror("Ошибка", f"Ошибка сохранения:\n{exc}")
+        # Сейв упал с исключением — остаёмся на текущем файле, симметрично
+        # _on_save_done(success=False) возвращаем выбор комбобокса (иначе он
+        # показывал бы pending-файл, а редактор — данные текущего).
+        if pending is not None:
+            self.file_var.trace_remove('write', self._file_var_trace_id)
+            self.file_var.set(self._prev_file_selection or "")
+            self._file_var_trace_id = self.file_var.trace_add('write', self.on_file_selected)
     
     def reload_current_file(self):
         """Перезагрузка текущего файла"""
@@ -2440,28 +2561,66 @@ class EditorPanel(ttk.Frame):
     def has_unsaved_changes(self) -> bool:
         """Проверка наличия несохраненных изменений"""
         return self.has_changes
-    
+
     def save_all_files(self):
-        """Сохранение всех файлов"""
-        if self.has_changes:
+        """Сохранение всех файлов, имеющих несохранённые изменения"""
+        if not self.file_manager:
+            return
+        dirty_types = [ft for ft, changed in self._changes.items() if changed]
+        if not dirty_types:
+            return
+        # Если в dirty только текущий файл — делегируем стандартному save
+        if len(dirty_types) == 1 and dirty_types[0] == self.current_file_type:
             self.save_current_file()
-    
+            return
+        # Несколько файлов: сохраняем не-текущие из кэша (без I/O), текущий — через save_current_file
+        saved, errors = [], []
+        for ft in dirty_types:
+            if ft == self.current_file_type:
+                continue
+            cached_data = self._file_data_cache.get(ft)
+            if cached_data is None:
+                # Данных в кэше нет — не трогаем диск, оставляем файл dirty
+                logger.warning(f"save_all_files: нет кэша для {ft}, пропуск (файл остаётся dirty)")
+                continue
+            try:
+                self.file_manager.save_json_file(cached_data, ft, create_backup=True)
+                self._changes.pop(ft, None)
+                saved.append(ft)
+            except Exception as exc:
+                errors.append(f"{ft}: {exc}")
+        # Текущий файл сохраняем через стандартный метод (с UI sync)
+        if self.current_file_type in dirty_types:
+            self.save_current_file()
+        if errors:
+            messagebox.showwarning("Ошибки сохранения", "\n".join(errors))
+
     def undo(self):
-        """Отмена последнего действия"""
-        # TODO: Реализовать undo/redo функциональность
+        """Отмена последнего действия (per-widget edit_undo)"""
+        # raw_text имеет undo=True и поддерживает edit_undo нативно
         try:
-            widget = self.focus_get()
-            if hasattr(widget, 'edit_undo'):
-                widget.edit_undo()
+            focused = self.focus_get()
+            if focused is not None and hasattr(focused, 'edit_undo'):
+                focused.edit_undo()
+                return
         except Exception:
             pass
-    
-    def redo(self):
-        """Повтор последнего отмененного действия"""
-        # TODO: Реализовать undo/redo функциональность
+        # Fallback: попробуем raw_text напрямую
         try:
-            widget = self.focus_get()
-            if hasattr(widget, 'edit_redo'):
-                widget.edit_redo()
+            self.raw_text.edit_undo()
+        except Exception:
+            pass
+
+    def redo(self):
+        """Повтор последнего отменённого действия (per-widget edit_redo)"""
+        try:
+            focused = self.focus_get()
+            if focused is not None and hasattr(focused, 'edit_redo'):
+                focused.edit_redo()
+                return
+        except Exception:
+            pass
+        try:
+            self.raw_text.edit_redo()
         except Exception:
             pass

@@ -3,6 +3,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { KeyValueList } from "../shared/KeyValueList";
+import { decodeGzipBase64, openReportFromPayload } from "../../utils/report";
 
 type DynamicProfile = {
   name?: string;
@@ -52,6 +53,7 @@ type ActiveRun = {
 type Props = {
   runServiceAction: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
   isBusy: boolean;
+  notify?: (msg: string, type: "error" | "success" | "info") => void;
 };
 
 type DefinitionState = {
@@ -84,22 +86,8 @@ const DEFAULT_DEFINITION: DefinitionState = {
 
 const managerOptions = ["manager", "project_manager", "custom"];
 
-const decodeGzipBase64 = async (b64: string) => {
-  const binary = atob(b64);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  if (!("DecompressionStream" in window)) {
-    throw new Error("Браузер не поддерживает распаковку gzip");
-  }
-  const stream = new DecompressionStream("gzip");
-  const body = new Response(bytes).body;
-  if (!body) {
-    throw new Error("Не удалось распаковать отчёт");
-  }
-  const decompressed = body.pipeThrough(stream);
-  return new Response(decompressed).text();
-};
 
-export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
+export function DynamicAgentsSection({ runServiceAction, isBusy, notify }: Props) {
   const [profiles, setProfiles] = useState<DynamicProfile[]>([]);
   const [availableTools, setAvailableTools] = useState<string[]>([]);
   const [agentProfiles, setAgentProfiles] = useState<AgentProfile[]>([]);
@@ -112,6 +100,7 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
   const [lastCreatedAgentId, setLastCreatedAgentId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [status, setStatus] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [templates, setTemplates] = useState<Record<string, DynamicProfile>>(() => {
     try {
       const saved = localStorage.getItem("agui-dynamic-templates");
@@ -362,7 +351,9 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
       setStatus("Агент создан");
       await loadProfiles();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Ошибка создания агента");
+      const msg = err instanceof Error ? err.message : "Ошибка создания агента";
+      setError(msg);
+      notify?.(msg, "error");
     }
   };
 
@@ -575,27 +566,7 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
   };
 
   const openReport = async (runId: string, report: any) => {
-    const payload =
-      report?.base64_gzip ??
-      report?.content_b64_gzip ??
-      report?.report_b64_gzip ??
-      report?.base64;
-    if (!payload) {
-      throw new Error("Пустой отчёт");
-    }
-    const html = await decodeGzipBase64(payload);
-    const mimeType = report?.mime_type ?? "text/html";
-    const filename = report?.filename ?? `report_${runId}.html`;
-    const blob = new Blob([html], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      link.click();
-    }
-    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+    await openReportFromPayload(runId, report);
   };
 
   const handleCancelRun = async (runId: string) => {
@@ -815,16 +786,46 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
               <button className="button secondary" type="button" onClick={handlePreview} disabled={isBusy}>
                 Предпросмотр
               </button>
-              <button className="button" type="button" onClick={handleRegister} disabled={isBusy || !definition.name.trim()}>
+              <button
+                className="button"
+                type="button"
+                disabled={isBusy || isSubmitting || !definition.name.trim()}
+                onClick={async () => {
+                  if (isSubmitting) return;
+                  setIsSubmitting(true);
+                  try { await handleRegister(); } finally { setIsSubmitting(false); }
+                }}
+              >
+                {isSubmitting ? <span className="spinner" /> : null}
                 Зарегистрировать профиль
               </button>
-              <button className="button" type="button" onClick={handleCreate} disabled={isBusy || !definition.name.trim()}>
+              <button
+                className="button"
+                type="button"
+                disabled={isBusy || isSubmitting || !definition.name.trim()}
+                onClick={async () => {
+                  if (isSubmitting) return;
+                  setIsSubmitting(true);
+                  try { await handleCreate(); } finally { setIsSubmitting(false); }
+                }}
+              >
+                {isSubmitting ? <span className="spinner" /> : null}
                 Создать агента
               </button>
               <button className="button ghost" type="button" onClick={saveTemplate} disabled={isBusy || !definition.name.trim()}>
                 Сохранить шаблон
               </button>
-              <button className="button ghost" type="button" onClick={handleTestRun} disabled={isBusy}>
+              <button
+                className="button ghost"
+                type="button"
+                disabled={isBusy || isSubmitting}
+                onClick={async () => {
+                  if (isSubmitting) return;
+                  setIsSubmitting(true);
+                  try { await handleTestRun(); } finally { setIsSubmitting(false); }
+                }}
+              >
+                {isSubmitting ? <span className="spinner" /> : null}
                 Тестовый запуск
               </button>
             </div>
@@ -1007,10 +1008,29 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
               <span>Телеметрия</span>
             </label>
             <div className="button-row">
-              <button className="button" type="button" onClick={() => handleRunTeam(false)} disabled={isBusy}>
+              <button
+                className="button"
+                type="button"
+                disabled={isBusy || isSubmitting}
+                onClick={async () => {
+                  if (isSubmitting) return;
+                  setIsSubmitting(true);
+                  try { await handleRunTeam(false); } finally { setIsSubmitting(false); }
+                }}
+              >
+                {isSubmitting ? <span className="spinner" /> : null}
                 Запустить команду
               </button>
-              <button className="button secondary" type="button" onClick={() => handleRunTeam(true)} disabled={isBusy}>
+              <button
+                className="button secondary"
+                type="button"
+                disabled={isBusy || isSubmitting}
+                onClick={async () => {
+                  if (isSubmitting) return;
+                  setIsSubmitting(true);
+                  try { await handleRunTeam(true); } finally { setIsSubmitting(false); }
+                }}
+              >
                 Запустить без команды
               </button>
             </div>
@@ -1299,6 +1319,7 @@ export function DynamicAgentsSection({ runServiceAction, isBusy }: Props) {
                     <iframe
                       title={`report-${resultModal.runId}`}
                       src={reportPreviewUrl}
+                      sandbox="allow-scripts allow-same-origin"
                       style={{ width: "100%", height: 520, border: "1px solid var(--line-muted)", borderRadius: 12 }}
                     />
                   </div>

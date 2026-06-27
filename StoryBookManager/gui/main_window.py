@@ -8,6 +8,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import logging
+from pathlib import Path
 from typing import Optional
 
 from StoryBookManager.config.settings import app_settings
@@ -28,17 +29,21 @@ class MainWindow:
         self.root = root
         self.project_manager = ProjectManager()
         self.current_project = None
-        
+        self._autosave_after_id = None
+
         # Настройка главного окна
         self.setup_window()
-        
+
         # Сначала UI (панели), затем меню: пункты меню ссылаются на self.project_panel и др.
         self.create_ui()
         self.create_menu()
-        
+
         # Загрузка начальных данных
         self.load_initial_data()
-        
+
+        # Запуск таймера автосохранения
+        self._start_autosave_timer()
+
         logger.info("Главное окно инициализировано")
     
     def setup_window(self):
@@ -54,8 +59,11 @@ class MainWindow:
         
         # Иконка приложения (если есть)
         try:
-            # TODO: Добавить иконку приложения
-            pass
+            icon_path = Path(__file__).parent.parent / "assets" / "icon.png"
+            if icon_path.exists():
+                from PIL import ImageTk, Image
+                self._icon_img = ImageTk.PhotoImage(Image.open(icon_path))
+                self.root.iconphoto(True, self._icon_img)
         except Exception:
             pass
         
@@ -180,7 +188,10 @@ class MainWindow:
     def create_panels(self):
         """Создание основных панелей"""
         # Панель проектов
-        self.project_panel = ProjectPanel(self.notebook, self.project_manager, self.on_project_selected)
+        self.project_panel = ProjectPanel(
+            self.notebook, self.project_manager, self.on_project_selected,
+            on_projects_changed=self.on_projects_changed,
+        )
         self.notebook.add(self.project_panel, text="📁 Проекты")
         
         # Панель редактора
@@ -192,7 +203,11 @@ class MainWindow:
         self.notebook.add(self.media_panel, text="🖼️ Медиа", state="disabled")
         
         # Панель генерации
-        self.generation_panel = GenerationPanel(self.notebook, self.on_generation_started)
+        self.generation_panel = GenerationPanel(
+            self.notebook,
+            self.on_generation_started,
+            on_generation_complete=self.on_generation_complete,
+        )
         self.notebook.add(self.generation_panel, text="🚀 Генерация", state="disabled")
         
         # Обработчик смены вкладок
@@ -259,14 +274,51 @@ class MainWindow:
     def on_file_changed(self, file_type: str, file_path: str):
         """Обработчик изменения файла"""
         logger.info(f"Изменен файл {file_type}: {file_path}")
-        # TODO: Реализовать автосохранение и отслеживание изменений
-    
+
     def on_generation_started(self, generation_type: str, params: dict):
         """Обработчик начала генерации"""
         logger.info(f"Запущена генерация {generation_type} с параметрами: {params}")
         self.set_status(f"Генерация {generation_type}...")
-        # TODO: Реализовать отслеживание прогресса генерации
-    
+
+    def on_generation_complete(self):
+        """Обновляет медиа-панель и редактор после завершения генерации."""
+        if self.current_project:
+            try:
+                self.media_panel.refresh_media()
+            except Exception as e:
+                logger.warning(f"Ошибка обновления медиа после генерации: {e}")
+            # Перезагружаем редактор только если нет несохранённых изменений
+            try:
+                if self.editor_panel.has_unsaved_changes():
+                    answer = messagebox.askyesno(
+                        "Несохранённые изменения",
+                        "В редакторе есть несохранённые изменения.\n"
+                        "Перезагрузить файлы (изменения будут потеряны)?",
+                    )
+                    if not answer:
+                        return
+                self.editor_panel.load_project(self.current_project)
+            except Exception as e:
+                logger.warning(f"Ошибка обновления редактора после генерации: {e}")
+        self.set_status("Генерация завершена")
+
+    def on_projects_changed(self):
+        """Синхронизирует зависимые панели после создания/удаления проекта."""
+        if self.current_project is None:
+            return
+        # Если текущий проект был удалён — сбрасываем панели
+        try:
+            existing_ids = {p.project_id for p in self.project_manager.get_projects()}
+        except Exception as e:
+            logger.warning(f"on_projects_changed: не удалось получить список проектов: {e}")
+            return
+        if self.current_project.project_id not in existing_ids:
+            self.current_project = None
+            self.project_info_label.config(text="Проект не выбран")
+            for tab_id in range(1, self.notebook.index("end")):
+                self.notebook.tab(tab_id, state="disabled")
+            self.set_status("Проект удалён")
+
     def on_tab_changed(self, event):
         """Обработчик смены вкладок"""
         try:
@@ -310,9 +362,13 @@ class MainWindow:
             messagebox.showwarning("Предупреждение", "Выберите проект для запуска pipeline")
     
     def run_from_step(self):
-        """Запуск pipeline с определенного шага"""
-        # TODO: Реализовать диалог выбора шага
-        messagebox.showinfo("Информация", "Функция запуска с определенного шага будет реализована позже")
+        """Запуск pipeline с определенного шага — открывает вкладку генерации."""
+        if not self.current_project:
+            messagebox.showwarning("Предупреждение", "Выберите проект для запуска pipeline")
+            return
+        # Переключаемся на вкладку генерации (индекс 3)
+        self.notebook.select(3)
+        self.generation_panel.run_from_step()
     
     def backup_project(self):
         """Создание backup проекта"""
@@ -342,9 +398,22 @@ class MainWindow:
             messagebox.showinfo("Успех", "Кэш медиа файлов очищен")
     
     def view_logs(self):
-        """Просмотр логов"""
-        # TODO: Реализовать просмотрщик логов
-        messagebox.showinfo("Информация", "Просмотрщик логов будет реализован позже")
+        """Просмотр логов приложения в отдельном окне."""
+        from StoryBookManager.config.settings import app_settings
+        log_file = app_settings.get_logs_directory() / "storybook_manager.log"
+        win = tk.Toplevel(self.root)
+        win.title(f"Логи — {log_file}")
+        win.geometry("900x600")
+        from tkinter import scrolledtext
+        text = scrolledtext.ScrolledText(win, wrap=tk.WORD, font=("Courier", 9), state="normal")
+        text.pack(fill="both", expand=True, padx=5, pady=5)
+        try:
+            content = log_file.read_text(encoding="utf-8", errors="replace") if log_file.exists() else "(файл логов не найден)"
+        except Exception as e:
+            content = f"Ошибка чтения логов: {e}"
+        text.insert("1.0", content)
+        text.see(tk.END)
+        text.config(state="disabled")
     
     def show_settings(self):
         """Показ настроек"""
@@ -357,7 +426,29 @@ class MainWindow:
         self.project_manager.backup_dir = app_settings.get_backup_directory()
         logging.getLogger().setLevel(app_settings.get("log_level", "INFO"))
         self.refresh_projects()
+        self._start_autosave_timer()
         self.set_status("Настройки применены")
+
+    def _start_autosave_timer(self):
+        """Перезапускает таймер автосохранения согласно текущим настройкам."""
+        if self._autosave_after_id is not None:
+            self.root.after_cancel(self._autosave_after_id)
+            self._autosave_after_id = None
+        interval_sec = int(app_settings.get("auto_save_interval", 0))
+        if interval_sec > 0:
+            self._autosave_after_id = self.root.after(interval_sec * 1000, self._autosave_tick)
+
+    def _autosave_tick(self):
+        """Периодически сохраняет несохранённые изменения редактора."""
+        try:
+            if self.current_project and self.editor_panel.has_unsaved_changes():
+                self.editor_panel.save_all_files()
+                logger.debug("Автосохранение выполнено")
+        except Exception as e:
+            logger.warning(f"Ошибка автосохранения: {e}")
+        finally:
+            # Перепланируем следующий тик
+            self._start_autosave_timer()
     
     def show_user_guide(self):
         """Показ руководства пользователя"""

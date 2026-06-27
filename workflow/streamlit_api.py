@@ -763,8 +763,8 @@ class WorkflowManager:
                       client_id: Optional[str] = None,
                       progress_callback: Optional[ProgressCallback] = None,
                       log_callback: Optional[LogCallback] = None,
-                      use_enhanced: bool = True, # New parameter
-                      enable_telemetry: bool = False, # New parameter
+                      use_enhanced: bool = True,
+                      enable_telemetry: bool = False,
                       run_id: Optional[str] = None
                       ) -> str:
         """
@@ -1408,6 +1408,42 @@ class WorkflowManager:
                     self.active_runs.pop(run_id, None)
                     cleaned += 1
         return cleaned
+
+    def delete_workflow(self, name: str) -> Tuple[bool, str]:
+        """
+        Удалить YAML-файл пайплайна по имени.
+
+        Args:
+            name: Имя пайплайна (поле WorkflowDefinition.name).
+
+        Returns:
+            (True, путь) при успехе; (False, сообщение об ошибке) при неудаче.
+        """
+        if not self.pipelines_dir.exists():
+            return False, f"Директория пайплайнов не найдена: {self.pipelines_dir}"
+
+        target_file: Optional[Path] = None
+        for yaml_file in self.pipelines_dir.glob("*.yaml"):
+            try:
+                wf_def = WorkflowDefinition.from_yaml(yaml_file)
+                if wf_def.name == name:
+                    target_file = yaml_file
+                    break
+            except Exception:
+                continue
+
+        if target_file is None:
+            return False, f"Пайплайн '{name}' не найден"
+
+        if any(v.get("workflow_name") == name for v in self.active_runs.values()):
+            return False, "Пайплайн выполняется, дождитесь завершения"
+
+        try:
+            target_file.unlink()
+            logger.info("Пайплайн '%s' удалён: %s", name, target_file)
+            return True, str(target_file)
+        except Exception as exc:
+            return False, f"Ошибка удаления '{target_file}': {_redact_error_text(exc)}"
 
     def cancel_workflow(self, run_id: str) -> bool:
         """

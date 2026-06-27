@@ -11,8 +11,6 @@ from datetime import datetime
 import pandas as pd
 import os
 from typing import Any
-import asyncio
-import threading
 import uuid
 import time
 import hashlib
@@ -366,14 +364,6 @@ def show_sql_generation():
     if st.session_state.agent_run:
         show_agent_workflow_results()
 
-def _compute_session_id_from_dsn(dsn: str) -> str:
-    try:
-        from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
-        return dsn_to_sanitized_name(dsn)
-    except Exception:
-        # Фоллбек
-        return f"session_{abs(hash(dsn)) % (10**10)}"
-
 def _history_file_path() -> Path:
     try:
         return (project_root / "logs" / "sql_history.jsonl")
@@ -496,248 +486,6 @@ def _load_schema_from_memory(dsn: str):
     except Exception:
         return None
 
-def _extract_workflow_steps(workflow_result) -> list:
-    """Извлекает шаги из WorkflowResult для отображения step-by-step."""
-    try:
-        steps_ui = []
-        # workflow_result.step_results: Dict[str, StepResult]
-        for step_id, step_res in getattr(workflow_result, 'step_results', {}).items():
-            try:
-                steps_ui.append({
-                    "id": step_id,
-                    "status": getattr(step_res, 'status', None).value if getattr(step_res, 'status', None) else None,
-                    "output": getattr(step_res, 'output', None),
-                    "error": getattr(step_res, 'error', None),
-                    "duration_seconds": getattr(step_res, 'duration_seconds', None),
-                    "agent": getattr(step_res, 'agent_name', None),
-                })
-            except Exception:
-                continue
-        # Стабильный порядок по id
-        steps_ui.sort(key=lambda x: x.get('id', ''))
-        return steps_ui
-    except Exception:
-        return []
-
-def run_agents_text_to_sql(natural_query, max_rows, safety_level, include_explanation,
-                           validate_schema, dry_run_only, use_schema_suggestions):
-    """
-    DEPRECATED: Старый агентный подход.
-    Используйте generate_sql_query() с text_to_sql_pipeline.yaml вместо этого.
-    """
-    try:
-        session_id = _compute_session_id_from_dsn(st.session_state.selected_dsn or "t2s")
-
-        # Формируем задачу для менеджера
-        task = (
-            f"Сформируй SQL-запрос по описанию на русском и выполни его.\n "
-            f"Описание: {natural_query}.\n\n"
-            f"{'А так же объясни полученные результаты' if include_explanation else ''}."
-        )
-
-        # Фоновый запуск в отдельном потоке, чтобы не блокировать UI
-        # run_id генерируется внутри потока; здесь лишь регистрируем задачу
-        job_id = str(uuid.uuid4())[:8]
-        jobs = get_job_registry()
-        lock = get_job_registry_lock()
-        with lock:
-            jobs[job_id] = {
-            "status": "running",
-            "mode": "agent",
-            "session_id": session_id,
-            "natural_query": natural_query,
-            "started_at": datetime.now().isoformat(),
-        }
-
-        def _worker(job_id_local: str, task_local: str, session_local: str):
-            try:
-                # Генерируем единый run_id в потоке
-                run_id_local = f"run-{uuid.uuid4().hex[:16]}"
-                
-                # Используем thread-safe run_id_context вместо глобального os.environ
-                try:
-                    from unified_logging import get_run_logger, run_id_context
-                    
-                    with run_id_context(run_id_local):
-                        _rlog_thr = get_run_logger(run_id_local, __name__)
-                        _rlog_thr.info("Фоновый поток динамического агента запущен")
-                        
-                        # КРИТИЧНО: Инициализируем корневой span УЖЕ ВНУТРИ run_id_context
-                        root_span = None
-                        try:
-                            from telemetry import get_telemetry_manager
-                            telemetry_manager = get_telemetry_manager()
-                            if telemetry_manager and telemetry_manager.is_enabled():
-                                root_span = telemetry_manager.start_run_trace(
-                                    run_id=run_id_local,
-                                    agent_name="DynamicAgentSystem",
-                                    task=task_local,
-                                    profile_type="text_to_sql_coordination",
-                                    pipeline_name="text_to_sql",
-                                    session_id=session_local
-                                )
-                                _rlog_thr.info(f"🔍 Создан корневой span для Text-to-SQL run_id: {run_id_local}")
-                        except Exception as e:
-                            _rlog_thr.warning(f"⚠️ Не удалось создать корневой span: {e}")
-                            telemetry_manager = None
-                        
-                        # Запускаем DynamicAgentSystem в контексте корневого span
-                        try:
-                            from agent_system import DynamicAgentSystem
-                            system_local = DynamicAgentSystem()
-                            
-                            # КРИТИЧНО: Выполняем coordinate в контексте корневого span
-                            if root_span is not None:
-                                # Используем OpenTelemetry context для span
-                                from opentelemetry import trace
-                                with trace.use_span(root_span):
-                                    result_text_local = asyncio.run(system_local.coordinate(initial_task=task_local, session_id=run_id_local, show=False))
-                            else:
-                                # Fallback без span context
-                                result_text_local = asyncio.run(system_local.coordinate(initial_task=task_local, session_id=run_id_local, show=False))
-                            
-                            # Успешное завершение
-                            if root_span is not None:
-                                telemetry_manager.finish_run_trace(root_span, success=True)
-                                
-                        except Exception as coord_err:
-                            # Ошибка координации
-                            if root_span is not None:
-                                telemetry_manager.finish_run_trace(root_span, success=False, error_message=str(coord_err))
-                            raise
-                        
-                except ImportError:
-                    # Fallback если run_id_context недоступен  
-                    os.environ["RUN_ID"] = run_id_local
-                    try:
-                        from unified_logging import get_run_logger
-                        _rlog_thr = get_run_logger(run_id_local, __name__)
-                        _rlog_thr.info("Фоновый поток агента запущен (fallback)")
-                    except Exception:
-                        _rlog_thr = None
-                    
-                    # Инициализируем корневой span для fallback тоже
-                    root_span = None
-                    try:
-                        from telemetry import get_telemetry_manager
-                        telemetry_manager = get_telemetry_manager()
-                        if telemetry_manager and telemetry_manager.is_enabled():
-                            root_span = telemetry_manager.start_run_trace(
-                                run_id=run_id_local,
-                                agent_name="DynamicAgentSystem",
-                                task=task_local,
-                                profile_type="text_to_sql_coordination",
-                                pipeline_name="text_to_sql_fallback",
-                                session_id=session_local
-                            )
-                    except Exception:
-                        telemetry_manager = None
-                    
-                    # Запускаем DynamicAgentSystem с fallback
-                    try:
-                        from agent_system import DynamicAgentSystem
-                        system_local = DynamicAgentSystem()
-                        
-                        # Выполняем в контексте корневого span (fallback)
-                        if root_span is not None:
-                            from opentelemetry import trace
-                            with trace.use_span(root_span):
-                                result_text_local = asyncio.run(system_local.coordinate(initial_task=task_local, session_id=run_id_local, show=False))
-                        else:
-                            result_text_local = asyncio.run(system_local.coordinate(initial_task=task_local, session_id=session_local, show=False))
-                        
-                        if root_span is not None:
-                            telemetry_manager.finish_run_trace(root_span, success=True)
-                            
-                    except Exception as coord_err:
-                        if root_span is not None:
-                            telemetry_manager.finish_run_trace(root_span, success=False, error_message=str(coord_err))
-                        raise
-                # Обновляем запись задачи
-                lock = get_job_registry_lock()
-                with lock:
-                    jobs[job_id_local].update({
-                    "status": "done",
-                    "report": result_text_local,
-                    "finished_at": datetime.now().isoformat(),
-                    "run_id": run_id_local,
-                })
-            except Exception as worker_err:
-                lock = get_job_registry_lock()
-                with lock:
-                    jobs[job_id_local].update({
-                    "status": "error",
-                    "error": str(worker_err),
-                    "finished_at": datetime.now().isoformat(),
-                })
-
-        t = threading.Thread(target=_worker, args=(job_id, task, session_id), daemon=True)
-        t.start()
-
-        # Фиксируем job_id в состоянии и информируем пользователя
-        st.session_state.agent_job_id = job_id
-        st.session_state.agent_run = None
-        st.info(f"🚀 Агентный пайплайн запущен в фоне (job_id={job_id}). Run ID появится после старта.")
-    except Exception as e:
-        st.error(f"❌ Ошибка агентного запуска: {e}")
-
-def run_yaml_text_to_sql(natural_query, max_rows, safety_level, include_explanation,
-                         validate_schema, dry_run_only, use_schema_suggestions, pipeline_name: str):
-    """
-    DEPRECATED: Старый YAML подход с data_analysis pipeline.
-    Используйте generate_sql_query() с text_to_sql_pipeline.yaml вместо этого.
-    """
-    try:
-        session_id = _compute_session_id_from_dsn(st.session_state.selected_dsn or "t2s")
-
-        from workflow.engine import WorkflowEngine
-        engine = WorkflowEngine()
-
-        # Генерируем и пробрасываем единый run_id для корреляции трасс
-        run_id = f"run-{uuid.uuid4().hex[:16]}"
-        os.environ["RUN_ID"] = run_id
-
-        variables = {
-            "analysis_request": natural_query,
-            "database_url": st.session_state.selected_dsn,
-            "include_explanation": include_explanation,
-            "dry_run_only": dry_run_only,
-            "run_id": run_id,
-        }
-
-        with st.spinner("Запуск YAML workflow..."):
-            workflow_result = asyncio.run(engine.execute_pipeline_by_name(pipeline_name=pipeline_name, **variables))
-
-        # Готовим компактное представление результата для UI
-        result_summary = {
-            "status": str(getattr(workflow_result, "status", "unknown")),
-            "duration_seconds": getattr(workflow_result, "duration_seconds", None),
-            "total_steps": getattr(workflow_result, "total_steps", None),
-            "completed_steps": getattr(workflow_result, "completed_steps", None),
-            "failed_steps": getattr(workflow_result, "failed_steps", None),
-        }
-
-        # Извлекаем шаги для пошагового отображения
-        yaml_steps = _extract_workflow_steps(workflow_result)
-
-        st.session_state.agent_run = {
-            "mode": "yaml",
-            "session_id": session_id,
-            "pipeline": pipeline_name,
-            "summary": result_summary,
-            "steps": yaml_steps,
-            "natural_query": natural_query,
-            "timestamp": datetime.now(),
-            "run_id": run_id,
-        }
-
-        st.success(f"✅ YAML workflow выполнен (Run ID: {run_id})")
-        # Сохраняем для показа кнопки вне формы
-        st.session_state.last_yaml_run_id = run_id
-    except Exception as e:
-        st.error(f"❌ Ошибка YAML workflow: {e}")
-
-
 def _extract_sql_from_structured_payload(payload: object) -> str:
     """Возвращает SQL только из явных структурированных SQL-полей."""
     if isinstance(payload, dict):
@@ -797,21 +545,18 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
             "client_id": st.session_state.get("user_id", "streamlit_user"),
         }
 
-        with st.spinner("⚡ Выполняем Text-to-SQL workflow..."):
+        with st.spinner("⚡ Запускаем Text-to-SQL workflow..."):
             start_time = time.time()
             response = handle_service_action("presets.text_to_sql.generate", payload)
             run_id = response["run_id"]
             session_id = response["session_id"]
-
             wf_manager = WorkflowManager()
 
-            # Polling до завершения workflow (таймаут 5 минут)
-            terminal_statuses = {"completed", "failed", "cancelled"}
-            status_obj = None
-            poll_deadline = time.time() + 300  # 5 minutes
-            # Early-exit: если статус подряд возвращается None (run_id не в реестре),
-            # нет смысла ждать весь таймаут — прерываемся после 10 итераций подряд.
-            none_streak = 0
+        terminal_statuses = {"completed", "failed", "cancelled"}
+        status_obj = None
+        poll_deadline = time.time() + 300  # 5 minutes
+        none_streak = 0
+        with st.spinner("⏳ Ожидаем завершения workflow..."):
             while True:
                 status_obj = wf_manager.get_workflow_status(run_id)
                 if status_obj is not None and status_obj.status in terminal_statuses:
@@ -828,7 +573,7 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
                     return
                 time.sleep(0.5)
 
-            execution_time = (time.time() - start_time) * 1000  # ms
+        execution_time = (time.time() - start_time) * 1000  # ms
 
         artifacts = wf_manager.get_workflow_artifacts(run_id)
         step_outputs = (artifacts.step_outputs if artifacts and artifacts.step_outputs else {}) or {}
@@ -841,7 +586,65 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
             # старое имя сохраняем как fallback для уже сохранённых запусков.
             sql_query = _extract_sql_from_structured_payload(step_outputs)
 
-            st.session_state.generated_sql = {
+            # --- Диалект из DSN ---
+            dialect_label = "Unknown"
+            try:
+                from db_plugins.streamlit_api import get_db_plugin_manager
+                _db_mgr = get_db_plugin_manager()
+                _dsn_val = _db_mgr.validate_dsn(selected_dsn)
+                _scheme = _dsn_val.detected_scheme or "unknown"
+                dialect_label = _db_mgr.get_dialect_info(_scheme).get("dialect_label", _scheme)
+            except Exception:
+                pass
+
+            # --- Объяснение из sql_generation.description (если include_explanation) ---
+            explanation_text = None
+            if include_explanation:
+                _sql_gen_out = step_outputs.get("sql_generation") or {}
+                if isinstance(_sql_gen_out, dict):
+                    explanation_text = _sql_gen_out.get("description") or _sql_gen_out.get("explanation")
+                if not explanation_text:
+                    explanation_text = "LLM не вернул описание."
+
+            # --- Валидация из sql_verification ---
+            _verif_out = step_outputs.get("sql_verification") or {}
+            if isinstance(_verif_out, dict) and _verif_out:
+                _v_status = _verif_out.get("verification_status", "").strip().lower()
+                _is_approved = _v_status == "approved"
+                _recs = _verif_out.get("recommendations") or []
+                # Собираем объект валидации, совместимый с show_validation_results
+                class _ValidationResult:
+                    is_safe = _is_approved
+                    is_valid = _is_approved
+                    risk_level = "low" if _is_approved else "high"
+                    safety_issues = (
+                        [{"issue_type": "REJECTED", "description": str(r)} for r in _recs]
+                        if not _is_approved else []
+                    )
+                    schema_issues = []
+                    suggestions = [str(r) for r in _recs] if _is_approved and _recs else []
+                validation_result = _ValidationResult()
+            elif validate_schema:
+                # validate_schema=True, но вывод верификатора недоступен
+                class _ValidationSkipped:
+                    is_safe = True
+                    is_valid = True
+                    risk_level = "low"
+                    safety_issues = []
+                    schema_issues = []
+                    suggestions = ["Данные верификатора недоступны в артефактах workflow."]
+                validation_result = _ValidationSkipped()
+            else:
+                validation_result = None
+
+            # --- Уверенность ---
+            # Верификатор не возвращает числовой confidence; используем статус как прокси
+            if isinstance(_verif_out, dict) and _verif_out:
+                confidence_val = 0.95 if _verif_out.get("verification_status", "").strip().lower() == "approved" else 0.3
+            else:
+                confidence_val = 0.0
+
+            generated_sql_record = {
                 "final_output": final_output,
                 "query": sql_query,
                 "formatted": sql_query,
@@ -851,6 +654,8 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
                 "execution_time_ms": execution_time,
                 "generation_time": execution_time,
                 "status": "completed",
+                "dialect": dialect_label,
+                "confidence": confidence_val,
                 "execution_status": {
                     "dry_run_only": bool(dry_run_only),
                     "executed": not bool(dry_run_only),
@@ -878,6 +683,11 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
                     "sql_pipeline": step_outputs.get("sql_pipeline"),
                 },
             }
+            if validation_result is not None:
+                generated_sql_record["validation"] = validation_result
+            if explanation_text is not None:
+                generated_sql_record["explanation"] = explanation_text
+            st.session_state.generated_sql = generated_sql_record
 
             st.success(f"✅ Text-to-SQL workflow выполнен за {execution_time:.1f}ms (Run ID: {run_id})")
 
@@ -920,16 +730,9 @@ def generate_sql_query(natural_query, max_rows, safety_level, include_explanatio
         st.info("Убедитесь, что файл находится в workflow_pipelines/text_to_sql_pipeline.yaml")
 
     except Exception as e:
-        st.error(f"❌ Ошибка выполнения workflow: {e}")
-        st.exception(e)
-
-def execute_sql_query(sql_query, max_rows):
-    """
-    DEPRECATED: Функция больше не используется.
-    Workflow pipeline выполняет SQL автоматически через db_audit_agent.
-    """
-    st.warning("⚠️ Эта функция устарела. SQL выполняется автоматически в workflow pipeline.")
-    pass
+        import logging as _logging
+        _logging.getLogger(__name__).exception("generate_sql_query failed")
+        st.error(f"❌ Ошибка выполнения workflow: {type(e).__name__}: {e}")
 
 def explain_natural_query(natural_query):
     """
@@ -1099,7 +902,6 @@ def show_agent_workflow_results():
             st.text(run_info["report"])
         # Best-effort: выделим предполагаемые шаги из отчета (по заголовкам/иконкам)
         try:
-            import re
             steps = []
             for line in run_info["report"].splitlines():
                 if line.strip().startswith("📋 Результаты агента") or line.strip().startswith("🔍 Промежуточные шаги"):
@@ -1163,25 +965,20 @@ def show_sql_code():
     
     with col2:
         st.markdown("### ⚙️ Действия")
-        
-        # Копирование SQL
-        if st.button("📋 Копировать SQL"):
-            st.code(sql_data.get('query', ''), language='sql')
-        
+
+        # Копирование через нативную иконку st.code (кнопка-обманка убрана)
+
         # Сохранение в историю
         if st.button("💾 Сохранить в историю"):
             save_to_history(sql_data)
             st.success("✅ Сохранено в историю")
-        
+
         # Редактирование
         if st.button("✏️ Редактировать"):
             show_sql_editor()
-        
-        # Повторное выполнение
-        if 'execution' in sql_data:
-            if st.button("🔄 Повторить выполнение"):
-                execute_sql_query(sql_data['query'], 100)
-                st.rerun()
+
+        # Кнопка "Повторить выполнение" скрыта: execute_sql_query устарела,
+        # SQL выполняется автоматически в workflow pipeline.
 
 def show_sql_editor():
     """Редактор SQL запроса"""
@@ -1208,9 +1005,8 @@ def show_sql_editor():
             st.rerun()
     
     with col2:
-        if st.button("🚀 Выполнить отредактированный"):
-            execute_sql_query(edited_sql, 100)
-            st.rerun()
+        # Кнопка "Выполнить отредактированный" скрыта: execute_sql_query устарела.
+        st.info("ℹ️ Для выполнения SQL повторно запустите генерацию.")
 
 def show_execution_results():
     """Отображение результатов выполнения"""
@@ -1477,10 +1273,13 @@ def show_database_connections():
                 dsn = st.text_input(
                     "🔗 DSN (строка подключения)",
                     value=st.session_state.selected_dsn,
+                    type="password",
                     placeholder="postgresql://user:password@host:5432/database.schema",
-                    help="Строка подключения к базе данных. Схема определяется автоматически или используется по умолчанию."
+                    help="Строка подключения к базе данных. Пароль скрыт. Схема определяется автоматически или используется по умолчанию."
                 )
-                
+                if st.session_state.selected_dsn:
+                    st.caption(f"Активное подключение: `{_redact_dsn(st.session_state.selected_dsn)}`")
+
                 # Информация о схемах по умолчанию
                 st.info("💡 **Автоматическое определение схемы**: Если схема не указана в DSN, будет использована схема по умолчанию для данной БД")
             
@@ -1808,8 +1607,24 @@ def show_sql_history():
                search_query.lower() in h.get("sql_query", "").lower()
         ]
     
-    # Отображение истории
-    for entry in reversed(filtered_history[-20:]):  # Последние 20 записей
+    # Отображение истории с пагинацией
+    total_filtered = len(filtered_history)
+    page_size = 20
+    total_pages = max(1, (total_filtered + page_size - 1) // page_size)
+    if total_pages > 1:
+        page = st.number_input(
+            f"Страница (из {total_pages})", min_value=1, max_value=total_pages, value=1, step=1
+        )
+    else:
+        page = 1
+    page_start = (page - 1) * page_size
+    page_entries = list(reversed(filtered_history))[page_start: page_start + page_size]
+
+    total_in_memory = len(st.session_state.sql_history)
+    if total_in_memory >= 100:
+        st.info("ℹ️ В памяти хранится до 100 записей. Более ранняя история доступна в файле logs/sql_history.jsonl.")
+
+    for entry in page_entries:
         with st.expander(f"🕐 {entry['timestamp'].strftime('%H:%M:%S')} - {entry['natural_query'][:50]}...", expanded=False):
             
             col1, col2 = st.columns([2, 1])

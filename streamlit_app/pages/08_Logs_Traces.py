@@ -50,6 +50,7 @@
 - Детальная статистика и анализ спанов
 """
 
+import html as _html
 import streamlit as st
 import streamlit.components.v1 as components
 import sys
@@ -85,6 +86,33 @@ from html_utils import html_visualizer
 from telemetry.helpers import is_trace_completed, get_trace_status
 
 _is_trace_completed = is_trace_completed
+
+try:
+    from telemetry.smolagents_telemetry import _redact_payload as _sm_redact
+except ImportError:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "telemetry.smolagents_telemetry._redact_payload not available; "
+        "span attributes/events will NOT be redacted — secrets may be exposed."
+    )
+    def _sm_redact(payload):  # type: ignore[misc]
+        return payload
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _cached_load_trace_file(file_path: str, mtime: float, size: int, _manager) -> dict:
+    """Кешированная загрузка файла трассы. Ключ включает путь, mtime и size."""
+    run_id = Path(file_path).stem
+    return _manager.load_trace_file(run_id)
+
+
+def _load_trace_file_cached(telemetry_manager, trace_file: dict) -> dict:
+    """Загрузка файла трассы с кешированием по (path, mtime, size)."""
+    fp = trace_file.get("file_path", "")
+    mt = trace_file.get("modified_time", datetime.min).timestamp()
+    sz = trace_file.get("size_bytes", 0)
+    return _cached_load_trace_file(fp, mt, sz, telemetry_manager)
+
 
 def main():
     st.set_page_config(
@@ -186,14 +214,14 @@ def show_telemetry_traces():
             if auto_refresh:
                 import time as _t
                 # Инициализация таймера
-                if "__traces_last_refresh" not in st.session_state:
-                    st.session_state.__traces_last_refresh = _t.time()
+                if "traces_last_refresh_ts" not in st.session_state:
+                    st.session_state["traces_last_refresh_ts"] = _t.time()
                 now = _t.time()
-                if now - st.session_state.__traces_last_refresh >= 5:
-                    st.session_state.__traces_last_refresh = now
+                if now - st.session_state["traces_last_refresh_ts"] >= 5:
+                    st.session_state["traces_last_refresh_ts"] = now
                     st.rerun()
                 else:
-                    remain = 5 - (now - st.session_state.__traces_last_refresh)
+                    remain = 5 - (now - st.session_state["traces_last_refresh_ts"])
                     st.caption(f"⏱️ Обновление через {remain:.1f}с")
 
         # Расширенные фильтры для трасс
@@ -519,14 +547,36 @@ def show_telemetry_traces():
                 st.metric("📈 Соответствие фильтрам", f"{filter_ratio:.1f}%")
             
             st.markdown(f"### 📋 Трассы ({len(filtered_traces)} найдено)")
-            
-            # Показываем трассы с дополнительной информацией
-            display_limit = min(20, len(filtered_traces))
-            for i, trace_file in enumerate(filtered_traces[:display_limit]):
-                show_trace_summary_enhanced(telemetry_manager, trace_file, i+1)
-            
-            if len(filtered_traces) > display_limit:
-                st.info(f"Показано {display_limit} из {len(filtered_traces)} трасс. Используйте дополнительные фильтры для уточнения результатов.")
+
+            # Пагинация: 20 трасс на страницу
+            _page_size = 20
+            _total_pages = max(1, (len(filtered_traces) + _page_size - 1) // _page_size)
+            _page_key = "traces_list_page"
+            if _page_key not in st.session_state:
+                st.session_state[_page_key] = 0
+            _page = st.session_state[_page_key]
+            # Сбрасываем страницу если вышли за границы
+            if _page >= _total_pages:
+                _page = 0
+                st.session_state[_page_key] = 0
+            _start = _page * _page_size
+            _end = min(_start + _page_size, len(filtered_traces))
+
+            for i, trace_file in enumerate(filtered_traces[_start:_end], start=_start + 1):
+                show_trace_summary_enhanced(telemetry_manager, trace_file, i)
+
+            if _total_pages > 1:
+                _pcol1, _pcol2, _pcol3 = st.columns([1, 2, 1])
+                with _pcol1:
+                    if _page > 0 and st.button("◀ Назад", key="traces_page_prev"):
+                        st.session_state[_page_key] = _page - 1
+                        st.rerun()
+                with _pcol2:
+                    st.caption(f"Страница {_page + 1} из {_total_pages}  ({_start + 1}–{_end} из {len(filtered_traces)})")
+                with _pcol3:
+                    if _page < _total_pages - 1 and st.button("Вперёд ▶", key="traces_page_next"):
+                        st.session_state[_page_key] = _page + 1
+                        st.rerun()
         else:
             st.info("🔍 Трассы не найдены. Измените фильтры или проверьте наличие данных.")
             st.markdown("**💡 Попробуйте:**")
@@ -587,8 +637,8 @@ def get_filtered_traces(telemetry_manager, trace_files, date_filter,
         filtered_by_agent = []
         for trace_file in filtered:
             try:
-                trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
-                if any(agent_filter.lower() in span.get("name", "").lower() 
+                trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
+                if any(agent_filter.lower() in span.get("name", "").lower()
                       for span in trace_content.get("spans", [])):
                     filtered_by_agent.append(trace_file)
             except:
@@ -600,8 +650,8 @@ def get_filtered_traces(telemetry_manager, trace_files, date_filter,
         status_filtered = []
         for trace_file in filtered:
             try:
-                trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
-                
+                trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
+
                 has_errors = any(
                     span.get("status", {}).get("status_code") == "ERROR"
                     for span in trace_content.get("spans", [])
@@ -646,10 +696,10 @@ def get_filtered_traces_advanced(telemetry_manager, trace_files,
     
     for trace_file in filtered:
         try:
-            # Загружаем содержимое трассы
-            trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+            # Загружаем содержимое трассы (кешировано)
+            trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
             spans = trace_content.get("spans", [])
-            
+
             if not spans:
                 continue
             
@@ -881,7 +931,7 @@ def show_trace_summary_enhanced(telemetry_manager, trace_file, index=1):
     ):
         # Показ финального ответа пользователю ТОЛЬКО для завершённых трасс
         try:
-            trace_check = telemetry_manager.load_trace_file(run_id)
+            trace_check = _load_trace_file_cached(telemetry_manager, trace_file)
             spans_check = trace_check.get("spans", [])
             trace_status = get_trace_status(spans_check)
 
@@ -928,25 +978,36 @@ def show_trace_summary_enhanced(telemetry_manager, trace_file, index=1):
                         # Если не строка или нет content — ничего не показываем здесь
                     except Exception:
                         pass
-                    # Поиск уже сохранённого отчёта в КАЖДОМ корневом спане
+                    # Поиск уже сохранённого отчёта: сначала sidecar-файл, затем legacy-события
                     saved_report_html = None
                     try:
-                        root_spans = [s for s in spans_check if not s.get("parent_span_id")]
-                        for root in root_spans:
-                            for ev in (root.get("events") or []):
-                                if (ev.get("name") or "").lower() == "report_generated":
-                                    attrs = ev.get("attributes", {}) or {}
-                                    b64 = attrs.get("report.content_b64_gzip") or attrs.get("report_b64_gzip")
-                                    if b64:
-                                        try:
-                                            saved_report_html = gzip.decompress(base64.b64decode(b64)).decode("utf-8", errors="replace")
-                                            break
-                                        except Exception:
-                                            pass
-                            if saved_report_html:
-                                break
+                        _sidecar = Path(project_root) / "logs" / "traces" / f"{run_id}.report.json"
+                        if _sidecar.exists():
+                            with open(_sidecar, "r", encoding="utf-8") as _sf:
+                                _sp = json.load(_sf)
+                            _b64 = _sp.get("content_b64_gzip")
+                            if _b64:
+                                saved_report_html = gzip.decompress(base64.b64decode(_b64)).decode("utf-8", errors="replace")
                     except Exception:
                         pass
+                    if not saved_report_html:
+                        try:
+                            root_spans = [s for s in spans_check if not s.get("parent_span_id")]
+                            for root in root_spans:
+                                for ev in (root.get("events") or []):
+                                    if (ev.get("name") or "").lower() == "report_generated":
+                                        attrs = ev.get("attributes", {}) or {}
+                                        b64 = attrs.get("report.content_b64_gzip") or attrs.get("report_b64_gzip")
+                                        if b64:
+                                            try:
+                                                saved_report_html = gzip.decompress(base64.b64decode(b64)).decode("utf-8", errors="replace")
+                                                break
+                                            except Exception:
+                                                pass
+                                if saved_report_html:
+                                    break
+                        except Exception:
+                            pass
 
                     # Кнопка формирования отчёта (если ещё нет сохранённого)
                     try:
@@ -988,65 +1049,29 @@ def show_trace_summary_enhanced(telemetry_manager, trace_file, index=1):
                             except Exception:
                                 report_text = str(final_answer)
 
-                            # Генерация HTML и сохранение в трассу (gzip+base64 в событии report_generated)
+                            # Генерация HTML и сохранение в отдельный файл-отчёт (не трогаем исходный JSONL)
                             try:
                                 path_to_html = html_visualizer.advanced_visualization(report_text, session_id, show=True)
                                 with open(path_to_html, 'r', encoding='utf-8') as f:
                                     html_content = f.read()
-                                gz = gzip.compress(html_content.encode('utf-8'))
-                                b64 = base64.b64encode(gz).decode('ascii')
 
-                                traces_dir = Path(project_root) / "logs/traces"
-                                jsonl_path = traces_dir / f"{run_id}.jsonl"
-                                tmp_path = traces_dir / f"{run_id}.jsonl.tmp"
-                                lines = []
-                                if jsonl_path.exists():
-                                    with open(jsonl_path, 'r', encoding='utf-8') as fr:
-                                        lines = fr.readlines()
-                                # Разбираем весь файл, чтобы выбрать правильный корневой (agent_run_*)
-                                objs = []
-                                for line in lines:
-                                    try:
-                                        objs.append(json.loads(line))
-                                    except Exception:
-                                        # сохраняем как есть (строка не-JSON)
-                                        objs.append(line)
-                                # Ищем индекс целевого корневого
-                                root_indices = [i for i, o in enumerate(objs) if isinstance(o, dict) and not o.get("parent_span_id")]
-                                target_idx = None
-                                for i in root_indices:
-                                    o = objs[i]
-                                    name = (o.get("name") or "").lower()
-                                    if name.startswith("agent_run_"):
-                                        target_idx = i
-                                        break
-                                if target_idx is None and root_indices:
-                                    target_idx = root_indices[0]
-                                # Перезаписываем файл с добавленным событием
-                                with open(tmp_path, 'w', encoding='utf-8') as fw:
-                                    for i, o in enumerate(objs):
-                                        if isinstance(o, dict) and target_idx is not None and i == target_idx:
-                                            events = o.get("events") or []
-                                            events = [e for e in events if (e.get("name") or "").lower() != "report_generated"]
-                                            events.append({
-                                                "name": "report_generated",
-                                                "attributes": {
-                                                    "report.mime_type": "text/html",
-                                                    "report.filename": f"interactive_plots_{session_id}.html",
-                                                    "report.generated_at": datetime.now().isoformat(),
-                                                    "report.size_bytes": len(html_content.encode('utf-8')),
-                                                    "report.session_id": session_id,
-                                                    "report.content_b64_gzip": b64
-                                                }
-                                            })
-                                            o["events"] = events
-                                            fw.write(json.dumps(o, ensure_ascii=False) + "\n")
-                                        else:
-                                            if isinstance(o, dict):
-                                                fw.write(json.dumps(o, ensure_ascii=False) + "\n")
-                                            else:
-                                                fw.write(o)
-                                tmp_path.replace(jsonl_path)
+                                traces_dir = Path(project_root) / "logs" / "traces"
+                                report_path = traces_dir / f"{run_id}.report.json"
+                                report_payload = {
+                                    "run_id": run_id,
+                                    "session_id": session_id,
+                                    "generated_at": datetime.now().isoformat(),
+                                    "mime_type": "text/html",
+                                    "filename": f"interactive_plots_{session_id}.html",
+                                    "size_bytes": len(html_content.encode("utf-8")),
+                                    "content_b64_gzip": base64.b64encode(
+                                        gzip.compress(html_content.encode("utf-8"))
+                                    ).decode("ascii"),
+                                }
+                                _tmp_report = report_path.with_suffix(".tmp")
+                                with open(_tmp_report, "w", encoding="utf-8") as fw:
+                                    json.dump(report_payload, fw, ensure_ascii=False)
+                                _tmp_report.replace(report_path)
 
                                 st.success("Отчёт сформирован и сохранён в трассе")
                                 saved_report_html = html_content
@@ -1088,7 +1113,7 @@ def show_trace_summary_enhanced(telemetry_manager, trace_file, index=1):
         
         try:
             # Загружаем содержимое трассы
-            trace_content = telemetry_manager.load_trace_file(run_id)
+            trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
             spans = trace_content.get("spans", [])
             
             if not spans:
@@ -1327,17 +1352,18 @@ def _get_raw_result_for_report(telemetry_manager, run_id: str):
         import json
         
         # Пытаемся найти JSONL файл трассы
-        trace_file_path = os.path.join("logs/traces", f"{run_id}.jsonl")
+        _traces_dir = str(Path(project_root) / "logs" / "traces")
+        trace_file_path = os.path.join(_traces_dir, f"{run_id}.jsonl")
         if not os.path.exists(trace_file_path):
-            pattern = os.path.join("logs/traces", f"*{run_id}*.jsonl")
+            pattern = os.path.join(_traces_dir, f"*{run_id}*.jsonl")
             files = glob.glob(pattern)
             if files:
                 trace_file_path = files[0]
             else:
                 trace_file_path = None
-        
+
         spans = []
-        
+
         # Читаем JSONL файл напрямую (если найден)
         if trace_file_path and os.path.exists(trace_file_path):
             with open(trace_file_path, 'r', encoding='utf-8') as f:
@@ -1350,10 +1376,17 @@ def _get_raw_result_for_report(telemetry_manager, run_id: str):
                         except:
                             continue
         else:
-            # Fallback к telemetry_manager
-            trace = telemetry_manager.load_trace_file(run_id)
+            # Fallback к telemetry_manager (через кэш)
+            _fb_path = os.path.join(_traces_dir, f"{run_id}.jsonl")
+            _fb_stat = os.stat(_fb_path) if os.path.exists(_fb_path) else None
+            _fb_tf = {
+                "file_path": _fb_path,
+                "modified_time": datetime.fromtimestamp(_fb_stat.st_mtime) if _fb_stat else datetime.min,
+                "size_bytes": _fb_stat.st_size if _fb_stat else 0,
+            }
+            trace = _load_trace_file_cached(telemetry_manager, _fb_tf)
             spans = trace.get("spans", [])
-        
+
         # Определяем тип запуска по корневому span
         run_type = "unknown"
         root_span = None
@@ -1432,10 +1465,11 @@ def _get_final_answer_for_run(telemetry_manager, run_id: str):
         import json
         
         # Пытаемся найти JSONL файл трассы
-        trace_file_path = os.path.join("logs/traces", f"{run_id}.jsonl")
+        _traces_dir = str(Path(project_root) / "logs" / "traces")
+        trace_file_path = os.path.join(_traces_dir, f"{run_id}.jsonl")
         if not os.path.exists(trace_file_path):
             # Ищем любой файл с этим run_id в названии
-            pattern = os.path.join("logs/traces", f"*{run_id}*.jsonl")
+            pattern = os.path.join(_traces_dir, f"*{run_id}*.jsonl")
             files = glob.glob(pattern)
             if files:
                 trace_file_path = files[0]
@@ -1456,10 +1490,17 @@ def _get_final_answer_for_run(telemetry_manager, run_id: str):
                         except:
                             continue
         else:
-            # Fallback к telemetry_manager
-            trace = telemetry_manager.load_trace_file(run_id)
+            # Fallback к telemetry_manager (через кэш)
+            _fb_path = os.path.join(_traces_dir, f"{run_id}.jsonl")
+            _fb_stat = os.stat(_fb_path) if os.path.exists(_fb_path) else None
+            _fb_tf = {
+                "file_path": _fb_path,
+                "modified_time": datetime.fromtimestamp(_fb_stat.st_mtime) if _fb_stat else datetime.min,
+                "size_bytes": _fb_stat.st_size if _fb_stat else 0,
+            }
+            trace = _load_trace_file_cached(telemetry_manager, _fb_tf)
             spans = trace.get("spans", [])
-        
+
         # НОВАЯ ЛОГИКА: Сначала определяем ТИП запуска по корневому span
         run_type = "unknown"
         root_span = None
@@ -1652,248 +1693,6 @@ def show_trace_summary(telemetry_manager, trace_file):
     
     return show_trace_summary_enhanced(telemetry_manager, trace_file)
 
-def show_trace_summary_original(telemetry_manager, trace_file):
-    """Оригинальная функция отображения краткой информации о трассе"""
-    
-    run_id = trace_file["run_id"]
-    
-    with st.expander(f"🔍 {run_id} ({trace_file['modified_time'].strftime('%H:%M:%S')})", expanded=False):
-        # Показ финального ответа ТОЛЬКО для завершённых трасс
-        try:
-            trace_check = telemetry_manager.load_trace_file(run_id)
-            spans_check = trace_check.get("spans", [])
-            trace_status = get_trace_status(spans_check)
-
-            if trace_status["is_completed"]:
-                if trace_status.get("has_errors"):
-                    st.warning(f"⚠️ Обнаружены ошибки, но трасса завершена: {trace_status['error_reason']}")
-                final_answer = _get_final_answer_for_run(telemetry_manager, run_id)
-                if final_answer:
-                    st.markdown("### 🟢 Финальный ответ")
-                    # В кратком виде сырой ответ не показываем; только последующие действия (отчёт)
-                    # Кнопка формирования отчёта
-                    try:
-                        # Для краткого вида также учитываем сохранённость отчёта и скрываем кнопку
-                        saved_report_html_summary = None
-                        try:
-                            root_spans = [s for s in spans_check if not s.get("parent_span_id")]
-                            for root in root_spans:
-                                for ev in (root.get("events") or []):
-                                    if (ev.get("name") or "").lower() == "report_generated":
-                                        attrs = ev.get("attributes", {}) or {}
-                                        b64 = attrs.get("report.content_b64_gzip") or attrs.get("report_b64_gzip")
-                                        if b64:
-                                            try:
-                                                saved_report_html_summary = gzip.decompress(base64.b64decode(b64)).decode("utf-8", errors="replace")
-                                                break
-                                            except Exception:
-                                                pass
-                                if saved_report_html_summary:
-                                    break
-                        except Exception:
-                            pass
-
-                        # Проверяем как сохранённый отчёт, так и флаг в session_state
-                        report_already_generated_summary = saved_report_html_summary or st.session_state.get(f"report_generated_{run_id}", False)
-                        if not report_already_generated_summary and st.button("🧾 Сформировать отчёт", key=f"make_report_summary_{run_id}"):
-                            # Извлекаем session_id
-                            session_id = None
-                            for s in spans_check:
-                                attrs = s.get("attributes", {}) or {}
-                                for k in ("session_id", "session.id", "sessionId", "session", "run_id", "run.id"):
-                                    if attrs.get(k):
-                                        session_id = attrs.get(k)
-                                        break
-                                if session_id:
-                                    break
-                            if not session_id:
-                                session_id = run_id
-                            # Формируем тело отчёта - используем специальную функцию для сырого результата
-                            report_text = None
-                            try:
-                                # Пытаемся получить сырой результат (без форматирования) для качественного отчёта
-                                raw_result = _get_raw_result_for_report(telemetry_manager, run_id)
-                                if raw_result:
-                                    report_text = str(raw_result)
-                                else:
-                                    # Fallback к обычному final_answer с очисткой форматирования
-                                    if isinstance(final_answer, str):
-                                        # Проверяем, это ли форматированный workflow результат
-                                        if final_answer.startswith("📊 Workflow результат:"):
-                                            # Извлекаем чистый контент без эмодзи и форматирования
-                                            lines = final_answer.split('\n')
-                                            # Ищем строку "Основной результат:" и берём всё после неё
-                                            content_start = False
-                                            clean_content = []
-                                            for line in lines:
-                                                if line.strip() == "Основной результат:":
-                                                    content_start = True
-                                                    continue
-                                                if content_start:
-                                                    clean_content.append(line)
-                                            report_text = '\n'.join(clean_content).strip()
-                                            
-                                            # Если не нашли основной результат, используем всё как есть
-                                            if not report_text:
-                                                report_text = final_answer
-                                        else:
-                                            report_text = final_answer
-                                    elif isinstance(final_answer, dict) and "content" in final_answer:
-                                        report_text = str(final_answer.get("content"))
-                                    else:
-                                        report_text = str(final_answer)
-                            except Exception:
-                                report_text = str(final_answer)
-                            # Вызов визуализатора
-                            try:
-                                path_to_html = html_visualizer.advanced_visualization(report_text, session_id, show=True)
-                                with open(path_to_html, 'r', encoding='utf-8') as f:
-                                    html_content = f.read()
-                                gz = gzip.compress(html_content.encode('utf-8'))
-                                b64 = base64.b64encode(gz).decode('ascii')
-
-                                traces_dir = Path(project_root) / "logs/traces"
-                                jsonl_path = traces_dir / f"{run_id}.jsonl"
-                                tmp_path = traces_dir / f"{run_id}.jsonl.tmp"
-                                lines = []
-                                if jsonl_path.exists():
-                                    with open(jsonl_path, 'r', encoding='utf-8') as fr:
-                                        lines = fr.readlines()
-                                # Разбираем и выбираем целевой корневой (agent_run_*)
-                                objs = []
-                                for line in lines:
-                                    try:
-                                        objs.append(json.loads(line))
-                                    except Exception:
-                                        objs.append(line)
-                                root_indices = [i for i, o in enumerate(objs) if isinstance(o, dict) and not o.get("parent_span_id")]
-                                target_idx = None
-                                for i in root_indices:
-                                    o = objs[i]
-                                    name = (o.get("name") or "").lower()
-                                    if name.startswith("agent_run_"):
-                                        target_idx = i
-                                        break
-                                if target_idx is None and root_indices:
-                                    target_idx = root_indices[0]
-                                with open(tmp_path, 'w', encoding='utf-8') as fw:
-                                    for i, o in enumerate(objs):
-                                        if isinstance(o, dict) and target_idx is not None and i == target_idx:
-                                            events = o.get("events") or []
-                                            events = [e for e in events if (e.get("name") or "").lower() != "report_generated"]
-                                            events.append({
-                                                "name": "report_generated",
-                                                "attributes": {
-                                                    "report.mime_type": "text/html",
-                                                    "report.filename": f"interactive_plots_{session_id}.html",
-                                                    "report.generated_at": datetime.now().isoformat(),
-                                                    "report.size_bytes": len(html_content.encode('utf-8')),
-                                                    "report.session_id": session_id,
-                                                    "report.content_b64_gzip": b64
-                                                }
-                                            })
-                                            o["events"] = events
-                                            fw.write(json.dumps(o, ensure_ascii=False) + "\n")
-                                        else:
-                                            if isinstance(o, dict):
-                                                fw.write(json.dumps(o, ensure_ascii=False) + "\n")
-                                            else:
-                                                fw.write(o)
-                                tmp_path.replace(jsonl_path)
-
-                                st.success("Отчёт сформирован и сохранён в трассе")
-                                saved_report_html_summary = html_content
-                                # Сохраняем в session_state, чтобы скрыть кнопку после генерации
-                                st.session_state[f"report_generated_{run_id}"] = True
-                                st.rerun()  # Перезагружаем для обновления UI
-                            except Exception as viz_e:
-                                st.error(f"Не удалось сформировать/сохранить отчёт: {viz_e}")
-                    except Exception:
-                        pass
-
-                    # Если отчёт был ранее сохранён — показать
-                    try:
-                        if saved_report_html_summary:
-                            with st.expander("📄 Отчёт", expanded=True):
-                                components.html(saved_report_html_summary, height=800, scrolling=True)
-                                st.download_button(
-                                    label="⬇️ Скачать отчёт",
-                                    data=saved_report_html_summary,
-                                    file_name=f"interactive_plots_{run_id}.html",
-                                    mime="text/html"
-                                )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-        
-        try:
-            # Загружаем содержимое трассы
-            trace_content = telemetry_manager.load_trace_file(run_id)
-            spans = trace_content.get("spans", [])
-            
-            if not spans:
-                st.warning("⚠️ Трасса пуста или содержимое недоступно")
-                return
-            
-            # Основная информация
-            col1, col2, col3 = st.columns(3)
-            
-            with col1:
-                st.metric("📊 Спанов", len(spans))
-                st.metric("📁 Размер файла", f"{trace_file['size_bytes']} байт")
-            
-            with col2:
-                # Определяем статус
-                has_errors = any(
-                    span.get("status", {}).get("status_code") == "ERROR"
-                    for span in spans
-                )
-                
-                if has_errors:
-                    st.error("❌ Есть ошибки")
-                else:
-                    st.success("✅ Без ошибок")
-                
-                # Продолжительность
-                if spans:
-                    start_times = [span.get("start_time_unix_nano", 0) for span in spans if span.get("start_time_unix_nano")]
-                    end_times = [span.get("end_time_unix_nano", 0) for span in spans if span.get("end_time_unix_nano")]
-                    
-                    if start_times and end_times:
-                        duration_ns = max(end_times) - min(start_times)
-                        duration_ms = duration_ns / 1_000_000
-                        st.metric("⏱️ Длительность", f"{duration_ms:.1f}ms")
-            
-            with col3:
-                # Основной агент/workflow
-                root_spans = [span for span in spans if not span.get("parent_span_id")]
-                if root_spans:
-                    main_operation = root_spans[0].get("name", "Unknown")
-                    st.info(f"**Операция:** {main_operation}")
-                
-                # Атрибуты
-                for span in spans[:1]:  # Берем первый спан
-                    attributes = span.get("attributes", {})
-                    if "agent_name" in attributes:
-                        st.info(f"**Агент:** {attributes['agent_name']}")
-                    if "session_id" in attributes:
-                        st.info(f"**Сессия:** {attributes['session_id']}")
-            
-            # Детальный просмотр
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                if st.button(f"🔍 Детальный просмотр", key=f"detail_{run_id}"):
-                    show_detailed_trace(telemetry_manager, run_id, trace_content)
-            
-            with col2:
-                if st.button(f"📋 Скопировать Run ID", key=f"copy_{run_id}"):
-                    st.code(run_id)
-        
-        except Exception as e:
-            st.error(f"❌ Ошибка загрузки трассы: {e}")
-
 def show_detailed_trace(telemetry_manager, run_id, trace_content):
     """Детальное отображение трассы"""
     
@@ -2012,7 +1811,14 @@ def show_span_tree_interactive(spans, run_id: str):
         short_id = span.get("span_id", "")[:6]
         return f"{name} · {short_id}"
 
+    # Счётчик отрисованных узлов — защита от зависания при >200 видимых спанов
+    _TREE_NODE_CAP = 200
+    _nodes_rendered: list[int] = [0]
+
     def render_node(span, level: int = 0):
+        if _nodes_rendered[0] >= _TREE_NODE_CAP:
+            return
+        _nodes_rendered[0] += 1
         span_id = span["span_id"]
         is_expanded = (span_id in expanded_ids) or (level == 0)
         with st.expander(node_label(span), expanded=is_expanded):
@@ -2029,12 +1835,17 @@ def show_span_tree_interactive(spans, run_id: str):
                 new_expanded.update(path_ids)
                 new_expanded.add(span_id)
                 st.session_state[exp_key] = list(new_expanded)
-            # Дети
+            # Дети (рекурсия только если не достигнут лимит)
             for child in children.get(span_id, []):
                 render_node(child, level + 1)
 
     for root in roots:
         render_node(root, 0)
+
+    if _nodes_rendered[0] >= _TREE_NODE_CAP:
+        _hidden = len(spans_sorted) - _TREE_NODE_CAP
+        st.info(f"Показано {_TREE_NODE_CAP} из {len(spans_sorted)} спанов. "
+                f"Ещё {_hidden} скрыто — используйте таблицу спанов для полного просмотра.")
 
 def show_selected_span_details(spans, run_id: str):
     """Отображает подробности по выбранному спану справа от дерева с интегрированными логами."""
@@ -2072,7 +1883,7 @@ def show_selected_span_details(spans, run_id: str):
 
     # Атрибуты спана
     with st.expander("🔖 Атрибуты", expanded=True):
-        attributes = span.get("attributes", {})
+        attributes = _sm_redact(span.get("attributes", {}))
         if isinstance(attributes, (dict, list)):
             try:
                 st.json(attributes)
@@ -2081,11 +1892,11 @@ def show_selected_span_details(spans, run_id: str):
                 st.code(str(attributes), language="text")
         else:
             st.code(str(attributes), language="text")
-    
+
     # События спана
     if span.get("events"):
         with st.expander("📋 События"):
-            events = span.get("events")
+            events = _sm_redact(span.get("events"))
             if isinstance(events, (dict, list)):
                 try:
                     st.json(events)
@@ -2165,9 +1976,9 @@ def show_selected_span_details(spans, run_id: str):
                             f'background-color: {color}15; border-radius: 3px;">'
                             f'<div style="font-size: 0.8em; color: #666;">'
                             f'{icon} <strong>{log.timestamp.strftime("%H:%M:%S.%f")[:-3]}</strong> '
-                            f'[{log.level}] <em>{log.logger_name}</em>'
+                            f'[{_html.escape(log.level)}] <em>{_html.escape(log.logger_name)}</em>'
                             f'</div>'
-                            f'<div style="margin-top: 2px;">{log.message}</div>'
+                            f'<div style="margin-top: 2px;">{_html.escape(log.message)}</div>'
                             f'</div>',
                             unsafe_allow_html=True
                         )
@@ -2221,9 +2032,9 @@ def show_selected_span_details(spans, run_id: str):
                             st.markdown(
                                 f'<div style="padding: 3px 8px; margin: 2px 0; background-color: #f8f9fa; border-radius: 3px; border-left: 2px solid #ddd;">'
                                 f'<div style="font-size: 0.8em; color: #666;">'
-                                f'{icon} <strong>{log.timestamp.strftime("%H:%M:%S")}</strong> [{log.level}] <em>{log.logger_name}</em>'
+                                f'{icon} <strong>{log.timestamp.strftime("%H:%M:%S")}</strong> [{_html.escape(log.level)}] <em>{_html.escape(log.logger_name)}</em>'
                                 f'</div>'
-                                f'<div style="margin-top: 1px; color: #333;">{log.message}</div>'
+                                f'<div style="margin-top: 1px; color: #333;">{_html.escape(log.message)}</div>'
                                 f'</div>',
                                 unsafe_allow_html=True
                             )
@@ -2311,19 +2122,19 @@ def export_traces(telemetry_manager, trace_files):
                     # Собираем все трассы в один JSON
                     all_traces = {}
                     for trace_file in trace_files:
-                        trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                        trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                         all_traces[trace_file["run_id"]] = trace_content
-                    
+
                     export_data = json.dumps(all_traces, indent=2, default=str)
                     filename = f"traces_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                     mime_type = "application/json"
-                
+
                 elif export_format == "CSV сводка":
                     # Создаем CSV сводку
                     csv_data = []
                     for trace_file in trace_files:
                         try:
-                            trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                            trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                             spans = trace_content.get("spans", [])
                             
                             has_errors = any(
@@ -2359,7 +2170,7 @@ def export_traces(telemetry_manager, trace_files):
                     # Каждая трасса на отдельной строке
                     jsonl_lines = []
                     for trace_file in trace_files:
-                        trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                        trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                         jsonl_lines.append(json.dumps(trace_content, default=str))
                     
                     export_data = "\n".join(jsonl_lines)
@@ -2391,12 +2202,15 @@ def show_system_logs():
     with ctrl2:
         auto_logs = st.checkbox("Авто", key="logs_auto_refresh", help="Автообновление каждые 5 секунд")
         if auto_logs:
-            try:
-                import time as _t
-                _t.sleep(5)
+            import time as _t
+            if "logs_last_refresh_ts" not in st.session_state:
+                st.session_state["logs_last_refresh_ts"] = _t.time()
+            _now = _t.time()
+            if _now - st.session_state["logs_last_refresh_ts"] >= 5:
+                st.session_state["logs_last_refresh_ts"] = _now
                 st.rerun()
-            except Exception:
-                pass
+            else:
+                st.caption(f"⏱️ Обновление через {5 - (_now - st.session_state['logs_last_refresh_ts']):.1f}с")
 
     try:
         from unified_logging import get_logging_manager
@@ -2852,8 +2666,9 @@ def apply_log_filters(lines, log_level_filter="Все", search_term="", use_rege
             agent_module_filter, event_type_filter,
             False, case_sensitive
         )
-        # Исключаем найденные строки
-        filtered_lines = [line for line in temp_filtered if line not in filtered_lines]
+        # Исключаем найденные строки (O(N) с set-lookup)
+        _excluded = set(filtered_lines)
+        filtered_lines = [line for line in temp_filtered if line not in _excluded]
     
     return filtered_lines
 
@@ -2886,29 +2701,27 @@ def extract_time_from_log(log_line):
 
 def add_context_lines(all_lines, filtered_lines, context_count, max_lines):
     """Добавление контекстных строк вокруг найденных"""
-    
+
     if not filtered_lines or context_count == 0:
         return filtered_lines
-    
-    # Найдем индексы отфильтрованных строк в общем списке
-    context_lines = set()
+
     recent_lines = all_lines[-max_lines:]
-    
+    # Строим индекс: строка → первый встреченный индекс (O(N) вместо O(N²))
+    line_index_map: dict[str, int] = {}
+    for idx, ln in enumerate(recent_lines):
+        if ln not in line_index_map:
+            line_index_map[ln] = idx
+
+    context_indices: set[int] = set()
     for filtered_line in filtered_lines:
-        try:
-            line_index = recent_lines.index(filtered_line)
-            # Добавляем контекст
-            start_idx = max(0, line_index - context_count)
-            end_idx = min(len(recent_lines), line_index + context_count + 1)
-            
-            for i in range(start_idx, end_idx):
-                context_lines.add((i, recent_lines[i]))
-        except ValueError:
+        line_index = line_index_map.get(filtered_line)
+        if line_index is None:
             continue
-    
-    # Сортируем по индексу и возвращаем только строки
-    sorted_context = sorted(context_lines, key=lambda x: x[0])
-    return [line for _, line in sorted_context]
+        start_idx = max(0, line_index - context_count)
+        end_idx = min(len(recent_lines), line_index + context_count + 1)
+        context_indices.update(range(start_idx, end_idx))
+
+    return [recent_lines[i] for i in sorted(context_indices)]
 
 def format_log_line(line, search_term="", case_sensitive=False, use_regex=False):
     """Форматирование строки лога с подсветкой"""
@@ -3166,9 +2979,9 @@ def show_performance_metrics(telemetry_manager, trace_files):
         
         for trace_file in recent_traces:
             try:
-                trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                 spans = trace_content.get("spans", [])
-                
+
                 if spans:
                     # Вычисляем метрики
                     start_times = [s.get("start_time_unix_nano", 0) for s in spans if s.get("start_time_unix_nano")]
@@ -3223,7 +3036,7 @@ def show_error_analysis(telemetry_manager, trace_files):
         
         for trace_file in trace_files[-20:]:  # Последние 20 трасс
             try:
-                trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                 spans = trace_content.get("spans", [])
                 
                 trace_has_errors = False
@@ -3317,7 +3130,7 @@ def show_usage_patterns(telemetry_manager, trace_files):
                 hourly_usage[hour] = hourly_usage.get(hour, 0) + 1
                 
                 # Анализ по агентам
-                trace_content = telemetry_manager.load_trace_file(trace_file["run_id"])
+                trace_content = _load_trace_file_cached(telemetry_manager, trace_file)
                 spans = trace_content.get("spans", [])
                 
                 for span in spans:

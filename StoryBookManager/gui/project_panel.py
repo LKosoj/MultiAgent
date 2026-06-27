@@ -7,9 +7,10 @@
 
 import json
 from pathlib import Path
+import threading
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
-from typing import Any, Callable, Optional, List, Dict
+from typing import Any, Callable, Optional, List, Dict, Tuple
 import logging
 from datetime import datetime
 
@@ -25,15 +26,23 @@ logger = logging.getLogger(__name__)
 class ProjectPanel(ttk.Frame):
     """Панель для управления проектами"""
     
-    def __init__(self, parent, project_manager: ProjectManager, on_project_selected: Callable):
+    def __init__(self, parent, project_manager: ProjectManager, on_project_selected: Callable,
+                 on_projects_changed: Optional[Callable] = None):
         super().__init__(parent)
-        
+
         self.project_manager = project_manager
         self.on_project_selected = on_project_selected
+        self.on_projects_changed = on_projects_changed
         self.projects: List[Project] = []
         self.selected_project: Optional[Project] = None
         self.project_items: Dict[str, Project] = {}  # Словарь для связи item_id -> Project
-        
+        # Кэш размеров: project_path_str -> (dir_mtime, size_str)
+        self._size_cache: Dict[str, Tuple[float, str]] = {}
+        self._size_bytes_cache: Dict[str, int] = {}
+        self._size_thread: Optional[threading.Thread] = None
+        self._search_after_id: Optional[str] = None
+        self._thumbnail_path: Optional[str] = None
+
         self.create_ui()
         self.refresh_projects()
     
@@ -266,25 +275,27 @@ class ProjectPanel(ttk.Frame):
         for item in self.projects_tree.get_children():
             self.projects_tree.delete(item)
         self.project_items.clear()
-        
+
         search_text = self.search_var.get().lower()
-        
+
         for project in self.projects:
             # Фильтрация по поисковому запросу
             if search_text and search_text not in project.name.lower() and search_text not in project.project_id.lower():
                 continue
-            
+
             # Получаем информацию для отображения
             preview_info = project.get_preview_info()
-            
+
             # Форматируем данные
             pages_count = preview_info.get("pages_count", 0)
             modified_date = preview_info.get("modified_date")
             modified_str = modified_date.strftime("%d.%m.%Y") if modified_date else "-"
-            
-            # Вычисляем размер проекта
-            size_str = self.calculate_project_size(project)
-            
+
+            # Берём размер из кэша (если есть) — без блокирующего rglob
+            cache_key = str(project.project_path)
+            cached = self._size_cache.get(cache_key)
+            size_str = cached[1] if cached is not None else "..."
+
             # Добавляем в дерево
             item_id = self.projects_tree.insert(
                 "", "end",
@@ -292,32 +303,97 @@ class ProjectPanel(ttk.Frame):
                 values=(project.name, pages_count, modified_str, size_str),
                 tags=(project.project_id,)
             )
-            
-            # Сохраняем ссылку на проект в словаре
-            if not hasattr(self, 'project_items'):
-                self.project_items = {}
+
             self.project_items[item_id] = project
+
+        # Запускаем фоновый расчёт размеров (обновит ячейки после завершения)
+        self._load_sizes_in_background()
     
     def calculate_project_size(self, project: Project) -> str:
-        """Вычисляет размер проекта"""
+        """Вычисляет размер проекта с кэшированием по mtime директории"""
+        path = project.project_path
+        cache_key = str(path)
+        try:
+            current_mtime = path.stat().st_mtime if path.exists() else 0.0
+        except OSError as e:
+            logger.warning("Не удалось получить mtime для %s: %s", path, e)
+            current_mtime = 0.0
+
+        cached = self._size_cache.get(cache_key)
+        if cached is not None and cached[0] == current_mtime:
+            return cached[1]
+
         try:
             total_size = 0
-            if project.project_path.exists():
-                for file_path in project.project_path.rglob("*"):
+            if path.exists():
+                for file_path in path.rglob("*"):
                     if file_path.is_file():
                         total_size += file_path.stat().st_size
-            
-            # Форматируем размер
+
             if total_size < 1024:
-                return f"{total_size} B"
+                size_str = f"{total_size} B"
             elif total_size < 1024 * 1024:
-                return f"{total_size / 1024:.1f} KB"
+                size_str = f"{total_size / 1024:.1f} KB"
             elif total_size < 1024 * 1024 * 1024:
-                return f"{total_size / (1024 * 1024):.1f} MB"
+                size_str = f"{total_size / (1024 * 1024):.1f} MB"
             else:
-                return f"{total_size / (1024 * 1024 * 1024):.1f} GB"
-        except Exception:
+                size_str = f"{total_size / (1024 * 1024 * 1024):.1f} GB"
+
+            self._size_cache[cache_key] = (current_mtime, size_str)
+            self._size_bytes_cache[cache_key] = total_size
+            return size_str
+        except Exception as e:
+            logger.warning("Ошибка вычисления размера проекта %s: %s", path, e)
             return "?"
+
+    def _load_sizes_in_background(self):
+        """Загружает размеры всех проектов в фоновом потоке и обновляет дерево.
+
+        Если все проекты уже есть в _size_bytes_cache — поток не запускается
+        и _apply_size_updates не планируется. Это разрывает цикл пересортировки:
+        после первого прогона кэш заполнен, и повторный вызов populate_projects_tree
+        (из on_sort_changed) не порождает нового потока.
+        """
+        if self._size_thread is not None and self._size_thread.is_alive():
+            return
+
+        projects_snapshot = list(self.projects)
+
+        # Только проекты без кэшированного значения требуют фонового расчёта
+        uncached = [p for p in projects_snapshot if str(p.project_path) not in self._size_bytes_cache]
+        if not uncached:
+            return
+
+        def worker():
+            updates: Dict[str, str] = {}
+            for project in uncached:
+                try:
+                    size_str = self.calculate_project_size(project)
+                    updates[project.project_id] = size_str
+                except Exception as e:
+                    logger.warning("Ошибка фонового расчёта размера %s: %s", project.project_id, e)
+
+            self.after(0, lambda: self._apply_size_updates(updates))
+
+        self._size_thread = threading.Thread(target=worker, daemon=True)
+        self._size_thread.start()
+
+    def _apply_size_updates(self, updates: Dict[str, str]):
+        """Обновляет колонку размера в дереве после фоновой загрузки"""
+        for item_id, project in list(self.project_items.items()):
+            size_str = updates.get(project.project_id)
+            if size_str is not None:
+                try:
+                    values = list(self.projects_tree.item(item_id, "values"))
+                    if len(values) >= 4:
+                        values[3] = size_str
+                        self.projects_tree.item(item_id, values=values)
+                except Exception as e:
+                    logger.debug("Не удалось обновить размер в дереве для %s: %s", item_id, e)
+
+        # Если текущая сортировка — по размеру, перестроить список с актуальными байтами
+        if self.sort_var.get() == "size":
+            self.on_sort_changed()
     
     def on_project_select(self, event):
         """Обработчик выбора проекта"""
@@ -333,16 +409,16 @@ class ProjectPanel(ttk.Frame):
         """Получает объект проекта из элемента дерева"""
         try:
             # Сначала пробуем получить из нашего словаря
-            if hasattr(self, 'project_items') and item_id in self.project_items:
+            if item_id in self.project_items:
                 return self.project_items[item_id]
-            
+
             # Fallback: поиск по project_id
             project_id = self.projects_tree.item(item_id, "text")
             for project in self.projects:
                 if project.project_id == project_id:
                     return project
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Ошибка получения проекта из item_id=%s: %s", item_id, e)
         return None
     
     def update_preview(self, project: Optional[Project]):
@@ -411,16 +487,40 @@ class ProjectPanel(ttk.Frame):
             logger.error(f"Ошибка обновления превью проекта: {e}")
     
     def update_thumbnail(self, thumbnail_path: Optional[str]):
-        """Обновление thumbnail изображения"""
-        if thumbnail_path and thumbnail_path.endswith(('.png', '.jpg', '.jpeg')):
+        """Обновление thumbnail изображения (PIL-загрузка в фоновом потоке)"""
+        self._thumbnail_path = thumbnail_path
+
+        if not thumbnail_path or not thumbnail_path.endswith(('.png', '.jpg', '.jpeg')):
+            self.thumbnail_label.config(text="Нет изображения", image="")
+            return
+
+        self.thumbnail_label.config(text="Загрузка...", image="")
+
+        def _load():
             try:
-                # TODO: Загрузить и показать thumbnail
-                # Требует PIL/Pillow
-                self.thumbnail_label.config(text="[Изображение]")
-            except Exception:
-                self.thumbnail_label.config(text="Ошибка загрузки")
-        else:
-            self.thumbnail_label.config(text="Нет изображения")
+                from PIL import Image, ImageTk  # type: ignore
+                img = Image.open(thumbnail_path)
+                img.thumbnail((150, 150))
+                photo = ImageTk.PhotoImage(img)
+            except ImportError:
+                logger.debug("PIL не установлен — thumbnail не отображается")
+                self.after(0, lambda: self.thumbnail_label.config(text="[Изображение]", image=""))
+                return
+            except Exception as e:
+                logger.warning("Ошибка загрузки thumbnail %s: %s", thumbnail_path, e)
+                self.after(0, lambda: self.thumbnail_label.config(text="Ошибка загрузки", image=""))
+                return
+
+            def _apply():
+                # Guard: если пользователь переключился на другой проект — не применяем
+                if self._thumbnail_path != thumbnail_path:
+                    return
+                self._thumbnail_photo = photo
+                self.thumbnail_label.config(image=self._thumbnail_photo, text="")
+
+            self.after(0, _apply)
+
+        threading.Thread(target=_load, daemon=True).start()
     
     def on_project_double_click(self, event):
         """Обработчик двойного клика по проекту"""
@@ -432,19 +532,42 @@ class ProjectPanel(ttk.Frame):
             self.on_project_selected(self.selected_project)
     
     def backup_selected_project(self):
-        """Создание backup выбранного проекта"""
-        if self.selected_project:
+        """Создание backup выбранного проекта (в фоновом потоке)"""
+        if not self.selected_project:
+            messagebox.showwarning("Предупреждение", "Выберите проект")
+            return
+
+        project_id = self.selected_project.project_id
+
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Backup проекта")
+        progress_dialog.geometry("300x100")
+        progress_dialog.transient(self)
+        progress_dialog.grab_set()
+        ttk.Label(progress_dialog, text=f"Создание backup {project_id}...").pack(pady=20)
+        progress_bar = ttk.Progressbar(progress_dialog, mode="indeterminate")
+        progress_bar.pack(fill="x", padx=20, pady=5)
+        progress_bar.start()
+
+        def worker():
             try:
-                backup_path = self.project_manager.backup_project(self.selected_project.project_id)
+                backup_path = self.project_manager.backup_project(project_id)
+            except Exception as e:
+                logger.error("Ошибка создания backup %s: %s", project_id, e)
+                self.after(0, lambda: (progress_dialog.destroy(),
+                                       messagebox.showerror("Ошибка", f"Ошибка создания backup:\n{e}")))
+                return
+
+            def on_done():
+                progress_dialog.destroy()
                 if backup_path:
                     messagebox.showinfo("Успех", f"Backup создан:\n{backup_path}")
                 else:
                     messagebox.showerror("Ошибка", "Не удалось создать backup")
-            except Exception as e:
-                logger.error(f"Ошибка создания backup: {e}")
-                messagebox.showerror("Ошибка", f"Ошибка создания backup:\n{e}")
-        else:
-            messagebox.showwarning("Предупреждение", "Выберите проект")
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def export_selected_project(self):
         """Экспорт выбранного проекта в ZIP архив"""
@@ -481,20 +604,29 @@ class ProjectPanel(ttk.Frame):
         
         def update_progress(current, total):
             if total > 0:
-                progress_var.set((current / total) * 100)
-                progress_dialog.update()
-                
-        try:
-            success = self.project_manager.export_project(project_id, file_path, progress_callback=update_progress)
-            progress_dialog.destroy()
-            if success:
-                messagebox.showinfo("Успех", f"Проект экспортирован:\n{file_path}")
-            else:
-                messagebox.showerror("Ошибка", "Не удалось экспортировать проект")
-        except Exception as e:
-            progress_dialog.destroy()
-            logger.error(f"Ошибка экспорта: {e}")
-            messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{e}")
+                self.after(0, lambda: progress_var.set((current / total) * 100))
+
+        def worker():
+            try:
+                success = self.project_manager.export_project(
+                    project_id, file_path, progress_callback=update_progress
+                )
+            except Exception as e:
+                logger.error("Ошибка экспорта %s: %s", project_id, e)
+                self.after(0, lambda: (progress_dialog.destroy(),
+                                       messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{e}")))
+                return
+
+            def on_done():
+                progress_dialog.destroy()
+                if success:
+                    messagebox.showinfo("Успех", f"Проект экспортирован:\n{file_path}")
+                else:
+                    messagebox.showerror("Ошибка", "Не удалось экспортировать проект")
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
     
     def show_in_folder(self):
         """Показать проект в папке"""
@@ -599,8 +731,11 @@ class ProjectPanel(ttk.Frame):
                 if not found:
                     logger.warning(f"⚠️ Созданный проект '{project_id}' не найден в списке проектов")
                 
+                if self.on_projects_changed:
+                    self.on_projects_changed()
+
                 logger.info(f"✅✅✅ СОЗДАНИЕ ПРОЕКТА ПОЛНОСТЬЮ ЗАВЕРШЕНО: {project_id}")
-                        
+
             except Exception as e:
                 logger.error(f"❌❌❌ КРИТИЧЕСКАЯ ОШИБКА при создании проекта: {e}")
                 logger.exception("Полный traceback ошибки:")
@@ -613,29 +748,47 @@ class ProjectPanel(ttk.Frame):
         if not self.selected_project:
             messagebox.showwarning("Предупреждение", "Выберите проект для удаления")
             return
-        
-        # Подтверждение удаления
-        result = messagebox.askyesno(
-            "Подтверждение удаления",
-            f"Вы действительно хотите удалить проект '{self.selected_project.name}'?\n\n"
-            "Проект будет перемещен в backup перед удалением.",
-            default="no"
-        )
-        
-        if result:
+
+        project = self.selected_project
+        # Кастомный диалог подтверждения — требует ввода имени проекта
+        confirmed = _DeleteConfirmDialog(self, project.name).confirmed
+        if not confirmed:
+            return
+
+        project_id = project.project_id
+
+        progress_dialog = tk.Toplevel(self)
+        progress_dialog.title("Удаление проекта")
+        progress_dialog.geometry("300x100")
+        progress_dialog.transient(self)
+        progress_dialog.grab_set()
+        ttk.Label(progress_dialog, text=f"Удаление {project_id}...").pack(pady=20)
+        progress_bar = ttk.Progressbar(progress_dialog, mode="indeterminate")
+        progress_bar.pack(fill="x", padx=20, pady=5)
+        progress_bar.start()
+
+        def worker():
             try:
-                success = self.project_manager.delete_project(
-                    self.selected_project.project_id, 
-                    create_backup=True
-                )
+                success = self.project_manager.delete_project(project_id, create_backup=True)
+            except Exception as e:
+                logger.error("Ошибка удаления проекта %s: %s", project_id, e)
+                self.after(0, lambda: (progress_dialog.destroy(),
+                                       messagebox.showerror("Ошибка", f"Ошибка удаления проекта:\n{e}")))
+                return
+
+            def on_done():
+                progress_dialog.destroy()
                 if success:
-                    messagebox.showinfo("Успех", "Проект удален")
+                    messagebox.showinfo("Успех", "Проект удален (backup создан)")
                     self.refresh_projects()
+                    if self.on_projects_changed:
+                        self.on_projects_changed()
                 else:
                     messagebox.showerror("Ошибка", "Не удалось удалить проект")
-            except Exception as e:
-                logger.error(f"Ошибка удаления проекта: {e}")
-                messagebox.showerror("Ошибка", f"Ошибка удаления проекта:\n{e}")
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
     
     def show_context_menu(self, event):
         """Показ контекстного меню"""
@@ -662,16 +815,20 @@ class ProjectPanel(ttk.Frame):
                 context_menu.grab_release()
     
     def on_search_changed(self, *args):
-        """Обработчик изменения поискового запроса"""
-        # Обновляем список с учетом фильтра
-        for item in self.projects_tree.get_children():
-            self.projects_tree.delete(item)
+        """Обработчик изменения поискового запроса — дебаунс 300 мс"""
+        if self._search_after_id is not None:
+            self.after_cancel(self._search_after_id)
+        self._search_after_id = self.after(300, self._apply_search)
+
+    def _apply_search(self):
+        """Применяет текущий фильтр поиска — перерисовывает дерево без rglob"""
+        self._search_after_id = None
         self.populate_projects_tree()
-    
+
     def on_sort_changed(self, *args):
         """Обработчик изменения сортировки"""
         sort_by = self.sort_var.get()
-        
+
         if sort_by == "name":
             self.projects.sort(key=lambda p: p.name.lower())
         elif sort_by == "created":
@@ -679,14 +836,64 @@ class ProjectPanel(ttk.Frame):
         elif sort_by == "modified":
             self.projects.sort(key=lambda p: p.modified_date or datetime.min, reverse=True)
         elif sort_by == "size":
-            # Сортировка по размеру требует вычисления размера для каждого проекта
-            pass
-        
-        # Обновляем отображение
-        for item in self.projects_tree.get_children():
-            self.projects_tree.delete(item)
+            # Сортировка по кэшированным байтам; проекты без кэша идут в конец (0)
+            def _cached_size_bytes(p: Project) -> int:
+                return self._size_bytes_cache.get(str(p.project_path), 0)
+
+            self.projects.sort(key=_cached_size_bytes, reverse=True)
+
         self.populate_projects_tree()
     
+class _DeleteConfirmDialog:
+    """Диалог подтверждения удаления проекта — требует ввода имени проекта"""
+
+    def __init__(self, parent, project_name: str):
+        self.confirmed = False
+        dialog = tk.Toplevel(parent)
+        dialog.title("Подтверждение удаления")
+        dialog.geometry("420x200")
+        dialog.transient(parent)
+        dialog.grab_set()
+        dialog.resizable(False, False)
+
+        ttk.Label(
+            dialog,
+            text=f"Вы собираетесь удалить проект:\n«{project_name}»\n\nПроект будет перемещён в backup.",
+            wraplength=380, justify="center"
+        ).pack(pady=(15, 10))
+
+        ttk.Label(dialog, text="Введите название проекта для подтверждения:").pack()
+        entry_var = tk.StringVar()
+        entry = ttk.Entry(dialog, textvariable=entry_var, width=35)
+        entry.pack(pady=(5, 10))
+        entry.focus_set()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack()
+
+        delete_btn = ttk.Button(
+            btn_frame, text="Удалить", state="disabled",
+            command=lambda: self._confirm(dialog)
+        )
+        delete_btn.pack(side="left", padx=(0, 10))
+        ttk.Button(btn_frame, text="Отмена", command=dialog.destroy).pack(side="left")
+
+        def on_entry_changed(*_):
+            if entry_var.get().strip() == project_name:
+                delete_btn.config(state="normal")
+            else:
+                delete_btn.config(state="disabled")
+
+        entry_var.trace_add("write", on_entry_changed)
+        dialog.bind("<Return>", lambda e: self._confirm(dialog) if delete_btn["state"] == "normal" else None)
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
+        dialog.wait_window()
+
+    def _confirm(self, dialog: tk.Toplevel):
+        self.confirmed = True
+        dialog.destroy()
+
+
 class NewProjectDialog:
     """Диалог создания нового проекта"""
     

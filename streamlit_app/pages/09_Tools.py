@@ -158,35 +158,44 @@ def generate_diagram_from_prompt(prompt, diagram_type, detail_level, include_exa
             status_placeholder = st.empty()
             progress_placeholder = st.empty()
             
+            timed_out = True
             while time.time() - start_time < max_wait_seconds:
                 status = manager.get_agent_status(run_id)
                 elapsed = int(time.time() - start_time)
                 progress_placeholder.progress(min(elapsed / max_wait_seconds, 0.95))
-                
+
                 if status and getattr(status, 'status', '') in ("completed", "failed"):
+                    timed_out = False
                     break
-                    
+
                 status_placeholder.info(f"⏳ {agent_profile} создаёт диаграмму... ({elapsed}с)")
                 time.sleep(1)
-                
+
             status_placeholder.empty()
             progress_placeholder.empty()
-            
+
+            agent_status_val = getattr(status, 'status', '') if status else ''
+
             # Получаем результат
             result_obj = manager.get_agent_result(run_id)
             final_output = getattr(result_obj, 'final_output', None) if result_obj else None
-            
+
+            if timed_out:
+                st.error(f"⏰ Агент не завершил работу за {max_wait_seconds}с (таймаут)")
+            elif agent_status_val == "failed":
+                st.error("❌ Агент завершился с ошибкой")
+
             if final_output:
                 st.success("✅ Диаграмма успешно создана!")
-                
+
                 # Показываем описание пользователя
                 st.markdown("**📝 Ваше описание:**")
                 st.info(prompt)
-                
+
                 # Показываем результат работы агента
                 st.markdown("**🤖 Результат работы агента:**")
                 st.text(final_output)
-                
+
                 # Ищем созданные файлы диаграмм
                 diagram_files = []
                 for ext in ['*.mmd', '*.puml', '*.svg', '*.png']:
@@ -203,8 +212,7 @@ def generate_diagram_from_prompt(prompt, diagram_type, detail_level, include_exa
                             
                             # Показываем диаграмму
                             if diagram_file.endswith('.mmd'):
-                                st.markdown("**🔍 Предпросмотр:**")
-                                st.markdown(f"```mermaid\n{diagram_content}\n```")
+                                st.caption("ℹ️ Предпросмотр недоступен — откройте код на mermaid.live")
                                 st.markdown("**📋 Код Mermaid:**")
                                 st.code(diagram_content, language='text')
                             elif diagram_file.endswith('.puml'):
@@ -238,483 +246,14 @@ def generate_diagram_from_prompt(prompt, diagram_type, detail_level, include_exa
                 else:
                     st.warning("⚠️ Агент выполнил задачу, но файлы диаграмм не найдены")
                     
-            else:
-                st.error("❌ Агент не смог создать диаграмму")
-                
+            elif not timed_out and agent_status_val != "failed":
+                st.error("❌ Агент не вернул результат")
+
     except Exception as e:
         st.error(f"❌ Ошибка создания диаграммы: {e}")
         import traceback
         with st.expander("🔍 Детали ошибки", expanded=False):
             st.code(traceback.format_exc())
-
-def show_mermaid_editor():
-    """Редактор Mermaid диаграмм"""
-    
-    st.markdown("### 📊 Mermaid диаграммы")
-    
-    # Шаблоны
-    templates = {
-        "Пустая": "",
-        "Граф": """graph TD
-    A[Начало] --> B[Процесс]
-    B --> C{Решение?}
-    C -->|Да| D[Действие 1]
-    C -->|Нет| E[Действие 2]
-    D --> F[Конец]
-    E --> F""",
-        "Последовательность": """sequenceDiagram
-    participant A as Пользователь
-    participant B as Агент
-    participant C as БД
-    
-    A->>B: Запрос
-    B->>C: Запрос данных
-    C-->>B: Данные
-    B-->>A: Ответ""",
-        "Диаграмма классов": """classDiagram
-    class Agent {
-        +String name
-        +String type
-        +execute(task)
-        +getStatus()
-    }
-    
-    class Workflow {
-        +String name
-        +List steps
-        +run()
-    }
-    
-    Agent --|> Workflow : uses""",
-        "Архитектура системы": """graph TB
-    subgraph "Frontend"
-        A[Streamlit UI]
-        B[Agent API]
-    end
-    
-    subgraph "Backend"
-        C[Agent Factory]
-        D[Workflow Engine]
-        E[DB Plugins]
-    end
-    
-    subgraph "Storage"
-        F[SQLite]
-        G[ChromaDB]
-    end
-    
-    A --> B
-    B --> C
-    B --> D
-    D --> E
-    C --> F
-    C --> G"""
-    }
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.markdown("**🎨 Шаблоны:**")
-        selected_template = st.selectbox("Выберите шаблон", list(templates.keys()))
-        
-        if st.button("📋 Загрузить шаблон"):
-            st.session_state.mermaid_code = templates[selected_template]
-            st.rerun()
-    
-    with col2:
-        # Редактор кода
-        if "mermaid_code" not in st.session_state:
-            st.session_state.mermaid_code = templates["Граф"]
-        
-        mermaid_code = st.text_area(
-            "Код Mermaid диаграммы",
-            value=st.session_state.mermaid_code,
-            height=300,
-            help="Введите код Mermaid диаграммы"
-        )
-        
-        st.session_state.mermaid_code = mermaid_code
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("🔍 Предпросмотр диаграммы"):
-                if mermaid_code.strip():
-                    try:
-                        st.markdown("### 📊 Предпросмотр:")
-                        st.markdown(f"```mermaid\n{mermaid_code}\n```")
-                    except Exception as e:
-                        st.error(f"❌ Ошибка рендеринга: {e}")
-                else:
-                    st.warning("⚠️ Введите код диаграммы")
-        
-        with col2:
-            if st.button("🤖 Генерация через агента"):
-                generate_diagram_with_agent(mermaid_code, "mermaid")
-
-def show_plantuml_editor():
-    """Редактор PlantUML диаграмм"""
-    
-    st.markdown("### 🌱 PlantUML диаграммы")
-    
-    # Шаблоны PlantUML
-    plantuml_templates = {
-        "Пустая": "@startuml\n\n@enduml",
-        "Диаграмма классов": """@startuml
-class Agent {
-  - name: String
-  - type: String
-  + execute(task: String): Result
-  + getStatus(): Status
-}
-
-class Workflow {
-  - steps: List<Step>
-  + run(): Result
-}
-
-Agent --> Workflow
-@enduml""",
-        "Диаграмма последовательности": """@startuml
-actor User
-participant Agent
-participant Database
-
-User -> Agent: Запрос
-Agent -> Database: Запрос данных
-Database --> Agent: Данные
-Agent --> User: Результат
-@enduml""",
-        "Диаграмма компонентов": """@startuml
-package "MultiAgent System" {
-  [Agent Factory]
-  [Workflow Engine]
-  [DB Plugins]
-  [Memory System]
-}
-
-[Streamlit UI] --> [Agent Factory]
-[Streamlit UI] --> [Workflow Engine]
-[Agent Factory] --> [Memory System]
-[Workflow Engine] --> [DB Plugins]
-@enduml"""
-    }
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        st.markdown("**🎨 Шаблоны PlantUML:**")
-        selected_template = st.selectbox("Выберите шаблон", list(plantuml_templates.keys()))
-        
-        if st.button("📋 Загрузить шаблон PlantUML"):
-            st.session_state.plantuml_code = plantuml_templates[selected_template]
-            st.rerun()
-    
-    with col2:
-        # Редактор кода PlantUML
-        if "plantuml_code" not in st.session_state:
-            st.session_state.plantuml_code = plantuml_templates["Диаграмма классов"]
-        
-        plantuml_code = st.text_area(
-            "Код PlantUML диаграммы",
-            value=st.session_state.plantuml_code,
-            height=300,
-            help="Введите код PlantUML диаграммы"
-        )
-        
-        st.session_state.plantuml_code = plantuml_code
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("🔍 Сохранить как текст"):
-                if plantuml_code.strip():
-                    st.download_button(
-                        label="💾 Скачать PlantUML",
-                        data=plantuml_code,
-                        file_name=f"diagram_{datetime.now().strftime('%Y%m%d_%H%M%S')}.puml",
-                        mime="text/plain"
-                    )
-                else:
-                    st.warning("⚠️ Введите код диаграммы")
-        
-        with col2:
-            if st.button("🎨 Генерация через PlantUML агента"):
-                generate_diagram_with_agent(plantuml_code, "plantuml")
-
-def show_flowchart_creator():
-    """Создатель блок-схем"""
-    
-    st.markdown("### 🔄 Конструктор блок-схем")
-    
-    st.info("💡 Используйте форму ниже для создания блок-схемы процесса")
-    
-    # Форма создания блок-схемы
-    with st.form("flowchart_form"):
-        process_title = st.text_input("📋 Название процесса")
-        
-        process_description = st.text_area(
-            "📝 Описание процесса",
-            height=100,
-            placeholder="Опишите процесс, для которого нужно создать блок-схему..."
-        )
-        
-        include_decision_points = st.checkbox("❓ Включить точки принятия решений")
-        include_parallel_processes = st.checkbox("🔀 Включить параллельные процессы")
-        
-        flowchart_style = st.selectbox(
-            "🎨 Стиль диаграммы",
-            ["Простой", "Детальный", "Архитектурный"]
-        )
-        
-        if st.form_submit_button("🎨 Создать блок-схему"):
-            if process_title and process_description:
-                create_flowchart(
-                    process_title, process_description, include_decision_points,
-                    include_parallel_processes, flowchart_style
-                )
-            else:
-                st.error("❌ Заполните название и описание процесса")
-
-def create_flowchart(title, description, include_decisions, include_parallel, style):
-    """Создание блок-схемы"""
-    
-    st.markdown(f"### 🔄 Блок-схема: {title}")
-    
-    # Простой генератор Mermaid блок-схемы
-    mermaid_code = f"""graph TD
-    A[📍 Начало: {title}] --> B[📋 {description[:30]}...]
-    B --> C{{❓ Проверка условий}}
-    """
-    
-    if include_decisions:
-        mermaid_code += """
-    C -->|✅ Условие выполнено| D[✔️ Основной процесс]
-    C -->|❌ Условие не выполнено| E[⚠️ Альтернативный процесс]
-    D --> F[📤 Результат]
-    E --> F
-        """
-    else:
-        mermaid_code += """
-    C --> D[✔️ Основной процесс]
-    D --> F[📤 Результат]
-        """
-    
-    if include_parallel:
-        mermaid_code += """
-    F --> G[🔀 Параллельный процесс 1]
-    F --> H[🔀 Параллельный процесс 2]
-    G --> I[🏁 Завершение]
-    H --> I
-        """
-    else:
-        mermaid_code += """
-    F --> I[🏁 Завершение]
-        """
-    
-    # Отображаем сгенерированную диаграмму
-    st.markdown("**📊 Сгенерированная блок-схема:**")
-    st.markdown(f"```mermaid\n{mermaid_code}\n```")
-    
-    # Код для копирования
-    st.markdown("**📋 Код Mermaid:**")
-    st.code(mermaid_code, language="text")
-
-def show_architecture_diagram():
-    """Диаграмма архитектуры системы"""
-    
-    st.markdown("### 🏗️ Диаграмма архитектуры")
-    
-    # Готовые архитектурные диаграммы
-    arch_diagrams = {
-        "MultiAgent System": """graph TB
-    subgraph "🖥️ Frontend Layer"
-        A[Streamlit UI]
-        B[Agent Management]
-        C[Workflow Control]
-    end
-    
-    subgraph "⚙️ API Layer"
-        D[Agent API]
-        E[Workflow API]
-        F[DB Plugin API]
-        G[Memory API]
-    end
-    
-    subgraph "🤖 Core Layer"
-        H[Agent Factory]
-        I[Workflow Engine]
-        J[Text-to-SQL]
-    end
-    
-    subgraph "🔌 Plugin Layer"
-        K[PostgreSQL Plugin]
-        L[MySQL Plugin]
-        M[SQLite Plugin]
-    end
-    
-    subgraph "💾 Storage Layer"
-        N[SQLite DB]
-        O[ChromaDB]
-        P[File Storage]
-    end
-    
-    A --> D
-    B --> D
-    C --> E
-    D --> H
-    E --> I
-    F --> K
-    F --> L
-    F --> M
-    G --> N
-    G --> O
-    H --> N
-    I --> J
-    J --> F""",
-        
-        "Text-to-SQL Pipeline": """graph LR
-    A[📝 Natural Language Query] --> B[🔍 NLU Processing]
-    B --> C[🎯 Schema Linking]
-    C --> D[🔍 RAG Search]
-    D --> E[🤖 SQL Generation]
-    E --> F[🔒 Safety Validation]
-    F --> G[📊 Query Execution]
-    G --> H[📋 Result Formatting]
-    
-    subgraph "🗄️ Knowledge Base"
-        I[Schema Cache]
-        J[Query History]
-        K[Best Practices]
-    end
-    
-    C --> I
-    D --> J
-    E --> K""",
-        
-        "Agent Memory System": """graph TD
-    A[🤖 Agent] --> B[💭 Memory Manager]
-    B --> C[🎯 Tactical Memory]
-    B --> D[🗺️ Strategic Memory]
-    
-    C --> E[💾 SQLite Storage]
-    D --> E
-    
-    E --> F[🔍 ChromaDB]
-    F --> G[📊 Vector Search]
-    
-    G --> H[🧠 RAG Retrieval]
-    H --> A
-    
-    subgraph "🔧 Processing"
-        I[📝 Embedding Model]
-        J[🔄 Indexing]
-        K[🧹 Cleanup]
-    end
-    
-    F --> I
-    I --> J
-    J --> K"""
-    }
-    
-    selected_arch = st.selectbox("Выберите архитектурную диаграмму", list(arch_diagrams.keys()))
-    
-    if selected_arch:
-        st.markdown(f"### 🏗️ {selected_arch}")
-        st.markdown(f"```mermaid\n{arch_diagrams[selected_arch]}\n```")
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.download_button(
-                label="💾 Скачать Mermaid код",
-                data=arch_diagrams[selected_arch],
-                file_name=f"{selected_arch.lower().replace(' ', '_')}_architecture.mmd",
-                mime="text/plain"
-            )
-        
-        with col2:
-            if st.button("✏️ Редактировать диаграмму"):
-                st.session_state.mermaid_code = arch_diagrams[selected_arch]
-                st.info("💡 Диаграмма загружена в редактор Mermaid")
-
-def show_er_diagram():
-    """ER-диаграмма"""
-    
-    st.markdown("### 🗄️ ER-диаграмма базы данных")
-    
-    # Пример ER-диаграммы для системы памяти агентов
-    er_diagram = """erDiagram
-    AGENTS {
-        string agent_id PK
-        string name
-        string type
-        datetime created_at
-        json config
-    }
-    
-    SESSIONS {
-        string session_id PK
-        string agent_id FK
-        datetime started_at
-        datetime ended_at
-        string status
-    }
-    
-    TACTICAL_MEMORIES {
-        int id PK
-        string session_id FK
-        string agent_id FK
-        text content
-        text context
-        datetime created_at
-        json metadata
-    }
-    
-    STRATEGIC_MEMORIES {
-        int id PK
-        string agent_id FK
-        text summary
-        text insights
-        datetime created_at
-        datetime updated_at
-    }
-    
-    WORKFLOW_RUNS {
-        string run_id PK
-        string workflow_name
-        json parameters
-        datetime started_at
-        datetime completed_at
-        string status
-        json results
-    }
-    
-    AGENTS ||--o{ SESSIONS : has
-    SESSIONS ||--o{ TACTICAL_MEMORIES : generates
-    AGENTS ||--o{ STRATEGIC_MEMORIES : accumulates
-    SESSIONS ||--o{ WORKFLOW_RUNS : executes"""
-    
-    st.markdown("**🗄️ ER-диаграмма системы памяти агентов:**")
-    st.markdown(f"```mermaid\n{er_diagram}\n```")
-    
-    # Объяснение структуры
-    with st.expander("📋 Описание структуры БД"):
-        st.markdown("""
-        **🏗️ Структура базы данных MultiAgent System:**
-        
-        - **AGENTS**: Основная информация об агентах
-        - **SESSIONS**: Сессии выполнения агентов
-        - **TACTICAL_MEMORIES**: Краткосрочная память (конкретные действия)
-        - **STRATEGIC_MEMORIES**: Долгосрочная память (обобщения и планы)
-        - **WORKFLOW_RUNS**: История выполнения пайплайнов
-        
-        **🔗 Связи:**
-        - Один агент может иметь много сессий
-        - Одна сессия генерирует много тактических воспоминаний
-        - Один агент накапливает стратегические воспоминания
-        - Сессии могут выполнять пайплайны
-        """)
 
 def generate_diagram_with_agent(code, diagram_type):
     """Генерация диаграммы через агента"""
@@ -779,24 +318,33 @@ def generate_diagram_with_agent(code, diagram_type):
             status_placeholder = st.empty()
             progress_placeholder = st.empty()
             
+            timed_out = True
             while time.time() - start_time < max_wait_seconds:
                 status = manager.get_agent_status(run_id)
                 elapsed = int(time.time() - start_time)
                 progress_placeholder.progress(min(elapsed / max_wait_seconds, 0.95))
-                
+
                 if status and getattr(status, 'status', '') in ("completed", "failed"):
+                    timed_out = False
                     break
-                    
+
                 status_placeholder.info(f"⏳ {agent_profile} анализирует и улучшает диаграмму... ({elapsed}с)")
                 time.sleep(1)
-                
+
             status_placeholder.empty()
             progress_placeholder.empty()
-            
+
+            agent_status_val = getattr(status, 'status', '') if status else ''
+
             # Получаем результат
             result_obj = manager.get_agent_result(run_id)
             final_output = getattr(result_obj, 'final_output', None) if result_obj else None
-            
+
+            if timed_out:
+                st.error(f"⏰ Агент не завершил работу за {max_wait_seconds}с (таймаут)")
+            elif agent_status_val == "failed":
+                st.error("❌ Агент завершился с ошибкой")
+
             if final_output:
                 st.success("✅ Диаграмма успешно обработана агентом!")
                 st.markdown("**🤖 Результат работы агента:**")
@@ -814,9 +362,10 @@ def generate_diagram_with_agent(code, diagram_type):
                             with open(diagram_file, 'r', encoding='utf-8') as f:
                                 diagram_content = f.read()
                             
-                            st.markdown("**🎨 Улучшенная диаграмма:**")
                             if diagram_file.endswith('.mmd'):
-                                st.markdown(f"```mermaid\n{diagram_content}\n```")
+                                st.caption("ℹ️ Предпросмотр недоступен — откройте код на mermaid.live")
+                                st.markdown("**📋 Код Mermaid:**")
+                                st.code(diagram_content, language='text')
                             else:
                                 st.code(diagram_content, language='text')
                                 
@@ -834,9 +383,9 @@ def generate_diagram_with_agent(code, diagram_type):
                 else:
                     st.warning("⚠️ Агент не создал файл диаграммы, но обработка выполнена")
                     
-            else:
-                st.error("❌ Агент не смог обработать диаграмму")
-    
+            elif not timed_out and agent_status_val != "failed":
+                st.error("❌ Агент не вернул результат")
+
     except Exception as e:
         st.error(f"❌ Ошибка генерации через агента: {e}")
         import traceback
@@ -1002,24 +551,33 @@ def generate_image_with_agent(prompt, style, size, quality, n_images, negative_p
             status_placeholder = st.empty()
             progress_placeholder = st.empty()
             
+            timed_out = True
             while time.time() - start_time < max_wait_seconds:
                 status = manager.get_agent_status(run_id)
                 elapsed = int(time.time() - start_time)
                 progress_placeholder.progress(min(elapsed / max_wait_seconds, 0.95))
-                
+
                 if status and getattr(status, 'status', '') in ("completed", "failed"):
+                    timed_out = False
                     break
-                    
+
                 status_placeholder.info(f"⏳ Агент генерирует изображение... ({elapsed}с)")
                 time.sleep(1)
-                
+
             status_placeholder.empty()
             progress_placeholder.empty()
-            
+
+            agent_status_val = getattr(status, 'status', '') if status else ''
+
+            if timed_out:
+                st.error(f"⏰ Агент не завершил работу за {max_wait_seconds}с (таймаут)")
+            elif agent_status_val == "failed":
+                st.error("❌ Агент завершился с ошибкой")
+
             # Получаем результат
             result_obj = manager.get_agent_result(run_id)
             final_output = getattr(result_obj, 'final_output', None) if result_obj else None
-            
+
             if final_output:
                 st.success("✅ Изображения успешно сгенерированы!")
                 st.text(f"Результат: {final_output}")
@@ -1033,7 +591,8 @@ def generate_image_with_agent(prompt, style, size, quality, n_images, negative_p
                     generated_files = glob.glob(f"*{session_id}*.png")
                     
             else:
-                st.error("❌ Агент не смог сгенерировать изображения")
+                if not timed_out and agent_status_val != "failed":
+                    st.error("❌ Агент не вернул результат")
                 generated_files = []
         
         # Показываем параметры генерации
@@ -1268,39 +827,24 @@ def edit_images_with_agent(image_inputs, prompt, input_type, width=1024, height=
                 f"Верни ТОЛЬКО путь к созданному файлу и краткое описание выполненных изменений."
             )
             
-            # Запускаем агента с детальной диагностикой ошибок
+            # Запускаем агента
             try:
-                st.info("🔧 Создание AgentManager...")
-                
-                # Альтернативный подход: используем кэшированный singleton AgentManager
-                @st.cache_resource
-                def get_agent_manager():
-                    try:
+                try:
+                    @st.cache_resource
+                    def get_agent_manager():
                         from agent_streamlit_api import AgentManager
                         return AgentManager()
-                    except Exception as e:
-                        st.error(f"Ошибка при создании кэшированного AgentManager: {e}")
-                        raise
-                
-                try:
+
                     manager = get_agent_manager()
-                    st.success("✅ AgentManager создан успешно (кэшированный)")
-                except Exception as cache_error:
-                    st.warning(f"⚠️ Кэшированный AgentManager не работает: {cache_error}")
-                    st.info("🔄 Пробуем создать AgentManager напрямую...")
-                    
-                    # Fallback: создаём напрямую без кэша
+                except Exception:
                     from agent_streamlit_api import AgentManager
                     manager = AgentManager()
-                    st.success("✅ AgentManager создан успешно (прямое создание)")
-                
-                st.info("🚀 Запуск агента artist_agent...")
+
                 run_id = manager.run_agent(
                     agent_id_or_profile="artist_agent",
                     task=task,
                     session_id=session_id
                 )
-                st.success(f"✅ Агент запущен успешно для обработки {images_count} изображения(й)")
             except Exception as agent_error:
                 st.error(f"❌ Ошибка при работе с агентом: {agent_error}")
                 import traceback
@@ -1313,19 +857,28 @@ def edit_images_with_agent(image_inputs, prompt, input_type, width=1024, height=
             status_placeholder = st.empty()
             progress_placeholder = st.empty()
             
+            timed_out = True
             while time.time() - start_time < max_wait_seconds:
                 status = manager.get_agent_status(run_id)
                 elapsed = int(time.time() - start_time)
                 progress_placeholder.progress(min(elapsed / max_wait_seconds, 0.95))
-                
+
                 if status and getattr(status, 'status', '') in ("completed", "failed"):
+                    timed_out = False
                     break
                 status_placeholder.info(f"⏳ Агент редактирует {images_count} изображение(й)... ({elapsed}с)")
                 time.sleep(2)
-                
+
             status_placeholder.empty()
             progress_placeholder.empty()
-            
+
+            agent_status_val = getattr(status, 'status', '') if status else ''
+
+            if timed_out:
+                st.error(f"⏰ Агент не завершил работу за {max_wait_seconds}с (таймаут)")
+            elif agent_status_val == "failed":
+                st.error("❌ Агент завершился с ошибкой")
+
             # Получаем результат
             result_obj = manager.get_agent_result(run_id)
             final_output = getattr(result_obj, 'final_output', None) if result_obj else None
@@ -1497,269 +1050,6 @@ def edit_images_with_agent(image_inputs, prompt, input_type, width=1024, height=
         with st.expander("🔍 Детали ошибки", expanded=False):
             st.code(traceback.format_exc())
 
-def edit_image_with_agent(image_input, prompt, input_type, width=1024, height=1024):
-    """Редактирование изображения через агента по свободному промпту"""
-    
-    st.markdown("### ✏️ Результат редактирования")
-    
-    try:
-        import uuid
-        import os
-        import tempfile
-        from datetime import datetime
-        from agent_streamlit_api import AgentManager
-        import time
-        
-        session_id = f"run-{uuid.uuid4().hex[:16]}"
-        temp_image_path = None
-        original_caption = ""
-        
-        # Готовим локальный файл для агента
-        if input_type == "file":
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
-                tmp_file.write(image_input.read())
-                temp_image_path = tmp_file.name
-            original_caption = getattr(image_input, 'name', 'uploaded_image')
-        else:
-            import requests
-            try:
-                resp = requests.get(image_input, timeout=30)
-                resp.raise_for_status()
-            except Exception as dl_err:
-                st.error(f"❌ Не удалось скачать изображение по URL: {dl_err}")
-                return
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp_file:
-                tmp_file.write(resp.content)
-                temp_image_path = tmp_file.name
-            original_caption = image_input
-
-        # Создаем временное ожидаемое имя результата (агент может вернуть относительный путь)
-        edited_filename = f"./edited_image_{session_id}.png"
-        
-        with st.spinner("🎨 Применение редактирования через агента..."):
-            # Формируем задачу для artist_agent
-            task = (
-                f"Отредактируй изображение по локальному пути '{temp_image_path}'.\n"
-                f"Применить изменения по пользовательскому промпту, предварительно переведя его на английский: {prompt}.\n\n"
-                f"Если необходимо, добавь негативный промпт, чтобы избежать ошибок в генерации.\n"
-                f"Сохранить отредактированное изображение в ./edited_image_{session_id}.png\n"
-                f"Верни ТОЛЬКО путь к созданному файлу."
-            )
-            
-            # Запускаем агента с детальной диагностикой ошибок
-            try:
-                st.info("🔧 Создание AgentManager...")
-                
-                # Альтернативный подход: используем кэшированный singleton AgentManager
-                @st.cache_resource
-                def get_agent_manager():
-                    try:
-                        from agent_streamlit_api import AgentManager
-                        return AgentManager()
-                    except Exception as e:
-                        st.error(f"Ошибка при создании кэшированного AgentManager: {e}")
-                        raise
-                
-                try:
-                    manager = get_agent_manager()
-                    st.success("✅ AgentManager создан успешно (кэшированный)")
-                except Exception as cache_error:
-                    st.warning(f"⚠️ Кэшированный AgentManager не работает: {cache_error}")
-                    st.info("🔄 Пробуем создать AgentManager напрямую...")
-                    
-                    # Fallback: создаём напрямую без кэша
-                    from agent_streamlit_api import AgentManager
-                    manager = AgentManager()
-                    st.success("✅ AgentManager создан успешно (прямое создание)")
-                
-                st.info("🚀 Запуск агента artist_agent...")
-                run_id = manager.run_agent(
-                    agent_id_or_profile="artist_agent",
-                    task=task,
-                    session_id=session_id
-                )
-                st.success("✅ Агент запущен успешно")
-            except Exception as agent_error:
-                st.error(f"❌ Ошибка при работе с агентом: {agent_error}")
-                import traceback
-                st.code(traceback.format_exc())
-                return
-            
-            # Ожидаем завершения
-            max_wait_seconds = 180
-            start_time = time.time()
-            #edited_filename = None
-            status_placeholder = st.empty()
-            while time.time() - start_time < max_wait_seconds:
-                status = manager.get_agent_status(run_id)
-                if status and getattr(status, 'status', '') in ("completed", "failed"):
-                    break
-                status_placeholder.info("⏳ Агент редактирует изображение...")
-                time.sleep(1)
-            status_placeholder.empty()
-            
-            # Получаем результат
-            result_obj = manager.get_agent_result(run_id)
-            final_output = getattr(result_obj, 'final_output', None) if result_obj else None
-            
-            # Если final_output пустой, пытаемся извлечь ответ из трассы
-            if not final_output:
-                try:
-                    # Используем обновленную функцию из страницы логов
-                    import sys
-                    import os
-                    sys.path.append(os.path.dirname(__file__))
-                    
-                    import importlib.util
-                    spec = importlib.util.spec_from_file_location("logs_traces", os.path.join(os.path.dirname(__file__), "08_Logs_Traces.py"))
-                    logs_module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(logs_module)
-                    
-                    _get_final_answer_for_run = logs_module._get_final_answer_for_run
-                    
-                    from telemetry import get_telemetry_manager
-                    telemetry_manager = get_telemetry_manager()
-                    
-                    trace_answer = _get_final_answer_for_run(telemetry_manager, run_id)
-                    if trace_answer:
-                        final_output = trace_answer
-                
-                except Exception as e:
-                    st.error(f"❌ Ошибка при получении результата: {e}")
-            
-            # Извлекаем путь к файлу из ответа агента
-            edited_filename = None
-            if isinstance(final_output, str):
-                text = final_output.strip()
-                
-                # Убираем префикс "Final answer:" если есть
-                if text.lower().startswith("final answer:"):
-                    text = text.split(":", 1)[1].strip()
-                
-                # Очищаем от кавычек и пробелов
-                text = text.strip().strip('"').strip("'")
-                
-                # Ищем пути к файлам в тексте ответа с помощью регексов
-                import re
-                # Паттерны для поиска путей к PNG файлам
-                path_patterns = [
-                    r'(/[^\s<>"\']+\.png)',  # абсолютный путь
-                    r'(\./[^\s<>"\']+\.png)',  # относительный путь ./
-                    r'([^\s<>"\']*edited_image[^\s<>"\']*\.png)',  # файлы содержащие edited_image
-                ]
-                
-                found_paths = []
-                for pattern in path_patterns:
-                    matches = re.findall(pattern, text, re.IGNORECASE)
-                    found_paths.extend(matches)
-                
-                # Проверяем каждый найденный путь
-                for potential_path in found_paths:
-                    if os.path.exists(potential_path):
-                        edited_filename = potential_path
-                        break
-                
-                # Если ничего не найдено регексами, проверяем исходный текст как есть
-                if not edited_filename and text:
-                    if os.path.exists(text):
-                        edited_filename = text
-                    else:
-                        # Попробуем найти файл по частичному пути или имени
-                        import glob
-                        filename_only = os.path.basename(text)
-                        possible_paths = glob.glob(f"**/{filename_only}", recursive=True)
-                        
-                        if possible_paths:
-                            edited_filename = possible_paths[0]
-                        else:
-                            # Финальная попытка - ищем любые файлы edited_image в plots
-                            plots_dir = "./plots"
-                            if os.path.exists(plots_dir):
-                                edited_files = glob.glob(f"{plots_dir}/edited_image*.png")
-                                if edited_files:
-                                    # Берем самый новый файл
-                                    edited_filename = max(edited_files, key=os.path.getmtime)
-            
-            # Если не нашли файл через парсинг, попробуем найти новый отредактированный файл
-            if not edited_filename:
-                import glob
-                import time
-                plots_dir = "./plots"
-                if os.path.exists(plots_dir):
-                    # Находим все файлы edited_image
-                    edited_files = glob.glob(f"{plots_dir}/edited_image*.png")
-                    if edited_files:
-                        # Берем самый новый файл (созданный последним)
-                        newest_file = max(edited_files, key=os.path.getmtime)
-                        file_age = time.time() - os.path.getmtime(newest_file)
-                        
-                        # Если файл создан недавно (в течение последних 5 минут)
-                        if file_age < 300:  # 5 минут
-                            edited_filename = newest_file
-                    
-            if isinstance(edited_filename, str) and os.path.exists(edited_filename):
-                st.success("✅ Изображение успешно отредактировано")
-                
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.markdown("#### 📷 Оригинал")
-                    if input_type == "url":
-                        st.image(temp_image_path, caption=original_caption)
-                    else:
-                        st.image(temp_image_path, caption=original_caption)
-                    try:
-                        orig_size = os.path.getsize(temp_image_path) / 1024
-                        st.caption(f"📁 {os.path.basename(temp_image_path)} ({orig_size:.1f} KB)")
-                    except Exception:
-                        pass
-                
-                with col2:
-                    st.markdown("#### 🎨 Результат")
-                    st.image(edited_filename, caption="Отредактированное изображение")
-                    try:
-                        edited_size = os.path.getsize(edited_filename) / 1024
-                        st.caption(f"📁 {os.path.basename(edited_filename)} ({edited_size:.1f} KB)")
-                    except Exception:
-                        pass
-                
-                with st.expander("ℹ️ Детали редактирования", expanded=False):
-                    st.markdown(f"**🎯 Промпт:** {prompt}")
-                    st.markdown(f"**⏰ Время:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                    st.markdown(f"**🆔 Session ID:** {session_id}")
-                    st.markdown(f"**📂 Результат:** {os.path.basename(edited_filename)}")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    with open(edited_filename, "rb") as file:
-                        st.download_button(
-                            label="💾 Скачать результат",
-                            data=file.read(),
-                            file_name=os.path.basename(edited_filename),
-                            mime="image/png",
-                            key=f"download_edited_{session_id}"
-                        )
-                with col2:
-                    st.info("🔁 Для нового редактирования измените промпт и повторите")
-            else:
-                st.error("❌ Агент не вернул путь к отредактированному файлу")
-                if isinstance(final_output, str):
-                    with st.expander("Ответ агента", expanded=False):
-                        st.code(final_output)
-        
-        # Удаляем временный файл
-        try:
-            if temp_image_path and os.path.exists(temp_image_path):
-                os.unlink(temp_image_path)
-        except Exception:
-            pass
-    
-    except Exception as e:
-        st.error(f"❌ Общая ошибка редактирования: {e}")
-        import traceback
-        with st.expander("🔍 Детали ошибки", expanded=False):
-            st.code(traceback.format_exc())
-
 def show_image_analysis():
     """Анализ изображений"""
     
@@ -1801,10 +1091,10 @@ def show_image_analysis():
                 st.error(f"Не удалось загрузить изображение по URL: {e}")
                 image_url = None
     
-    if uploaded_file is not None or image_url:
+    if image_file is not None or image_url:
         # Отображаем изображение (только для загруженного файла, для URL уже показали выше)
-        if uploaded_file is not None:
-            st.image(uploaded_file, caption="Изображение для анализа", use_container_width=True)
+        if image_file is not None:
+            st.image(image_file, caption="Изображение для анализа", use_container_width=True)
         
         # Типы анализа
         col1, col2 = st.columns(2)
@@ -1840,7 +1130,7 @@ def show_image_analysis():
         
         # Кнопка анализа
         if st.button("🔍 Анализировать изображение", type="primary"):
-            if uploaded_file is not None:
+            if image_file is not None:
                 import os, uuid
                 session_id = f"run-{uuid.uuid4().hex[:16]}"
                 os.environ["RUN_ID"] = session_id  # Используем session_id как run_id
@@ -1853,7 +1143,7 @@ def show_image_analysis():
                 # Используем централизованный ToolManager для телеметрии
                 from tool_manager import get_tool_manager
                 tool_manager = get_tool_manager()
-                
+
                 with tool_manager.tool_context(
                     tool_name="image_analysis",
                     task_description=f"Analyze image with {len(analysis_types)} analysis types",
@@ -1862,7 +1152,7 @@ def show_image_analysis():
                     input_type="file",
                     detailed=detailed_analysis
                 ) as ctx:
-                    analyze_image_with_agent(uploaded_file, analysis_types, confidence_threshold, detailed_analysis, input_type="file")
+                    analyze_image_with_agent(image_file, analysis_types, confidence_threshold, detailed_analysis, input_type="file")
                     ctx.add_metadata("analysis_types_count", len(analysis_types))
                     
             elif image_url:
@@ -2305,7 +1595,7 @@ def show_text_utilities():
             
             st.markdown("**SHA512:**")
             sha512_hash = hashlib.sha512(hash_input.encode()).hexdigest()
-            st.code(sha512_hash[:64] + "...")  # Укорачиваем для отображения
+            st.code(sha512_hash)
 
 def show_time_utilities():
     """Утилиты для работы со временем"""
@@ -2346,10 +1636,18 @@ def show_time_utilities():
     
     with col2:
         timezones = ["UTC", "Europe/Moscow", "Europe/London", "America/New_York", "Asia/Tokyo"]
-        selected_tz = st.selectbox("Целевая временная зона", timezones)
-        
+        source_tz = st.selectbox("Исходная временная зона", timezones, index=0, key="source_tz")
+        selected_tz = st.selectbox("Целевая временная зона", timezones, index=1, key="target_tz")
+
         if st.button("🔄 Конвертировать"):
-            st.info(f"Конвертация в {selected_tz}: {time_input} (заглушка)")
+            try:
+                from zoneinfo import ZoneInfo
+                src_dt = datetime.combine(date_input, time_input)
+                src_dt_aware = src_dt.replace(tzinfo=ZoneInfo(source_tz))
+                dst_dt = src_dt_aware.astimezone(ZoneInfo(selected_tz))
+                st.success(f"{source_tz} {src_dt.strftime('%Y-%m-%d %H:%M:%S')} → {selected_tz}: **{dst_dt.strftime('%Y-%m-%d %H:%M:%S %Z')}**")
+            except Exception as tz_err:
+                st.error(f"❌ Ошибка конвертации: {tz_err}")
     
     # Калькулятор времени
     st.markdown("#### 🧮 Калькулятор времени")
@@ -2449,13 +1747,27 @@ def show_converters():
         st.code(f"HEX: {color_picker}")
         st.code(f"RGB: rgb({rgb[0]}, {rgb[1]}, {rgb[2]})")
         
-        # HSL приблизительно
+        # HSL conversion
         r, g, b = [x/255.0 for x in rgb]
         max_val = max(r, g, b)
         min_val = min(r, g, b)
-        h = s = l = (max_val + min_val) / 2
-        
-        st.code(f"HSL: приблизительно hsl({int(h*360)}, {int(s*100)}%, {int(l*100)}%)")
+        l = (max_val + min_val) / 2
+        delta = max_val - min_val
+        if delta == 0:
+            h = 0.0
+            s = 0.0
+        else:
+            denom = 1 - abs(2 * l - 1)
+            s = min(1.0, delta / denom) if denom > 1e-10 else 0.0
+            if max_val == r:
+                h = ((g - b) / delta) % 6
+            elif max_val == g:
+                h = (b - r) / delta + 2
+            else:
+                h = (r - g) / delta + 4
+            h = h / 6
+
+        st.code(f"HSL: hsl({int(h*360)}, {int(s*100)}%, {int(l*100)}%)")
     
     with col2:
         st.markdown("**🔢 RGB в HEX:**")
@@ -2762,11 +2074,13 @@ def show_agent_constructor_tab():
                 start_time = time.time()
                 status_placeholder = st.empty()
                 progress_placeholder = st.empty()
+                timed_out = True
                 while time.time() - start_time < max_wait_seconds:
                     status = manager.get_agent_status(run_id)
                     elapsed = int(time.time() - start_time)
                     progress_placeholder.progress(min(elapsed / max_wait_seconds, 0.95))
                     if status and getattr(status, 'status', '') in ("completed", "failed"):
+                        timed_out = False
                         break
                     status_placeholder.info(f"⏳ Агент создаёт профиль... ({elapsed}с)")
                     time.sleep(1)
@@ -2774,17 +2088,24 @@ def show_agent_constructor_tab():
                 status_placeholder.empty()
                 progress_placeholder.empty()
 
+                agent_status_val = getattr(status, 'status', '') if status else ''
+
                 result_obj = manager.get_agent_result(run_id)
                 final_output = getattr(result_obj, 'final_output', None) if result_obj else None
             except Exception as e:
                 st.error(f"❌ Ошибка при запуске агента: {e}")
                 return
 
+        if timed_out:
+            st.error(f"⏰ Агент не завершил работу за {max_wait_seconds}с (таймаут)")
+        elif agent_status_val == "failed":
+            st.error("❌ Агент завершился с ошибкой")
+
         if final_output:
             st.success("✅ Агент завершил работу")
             st.markdown("**Итог:**")
             st.text(final_output)
-        else:
+        elif not timed_out and agent_status_val != "failed":
             st.error("❌ Агент не вернул результирующий ответ")
 
 if __name__ == "__main__":

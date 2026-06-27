@@ -669,6 +669,364 @@ class MemoryRAGManager:
                 "error": str(e)
             }
 
+    def clear_agent_memory_all_sessions(self, agent_name: str) -> Dict[str, Any]:
+        """
+        Очистить всю память конкретного агента во всех сессиях.
+
+        Args:
+            agent_name: Имя агента
+
+        Returns:
+            dict с ключами success, deleted_sqlite, deleted_chroma, sessions_cleared, error
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+
+            db_path = self.memory_manager.db_handler.db_path
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+
+                cursor.execute(
+                    "SELECT DISTINCT session_id FROM agent_memory WHERE agent_name = ?",
+                    (agent_name,),
+                )
+                sessions = [row[0] for row in cursor.fetchall()]
+
+            total_sqlite = 0
+            total_chroma = 0
+            for sid in sessions:
+                res = self.clear_agent_memory(agent_name, sid, confirm=True)
+                if res.get("success"):
+                    total_sqlite += res.get("deleted_count", 0)
+                    total_chroma += res.get("chromadb_deleted", 0)
+
+            logger.info(
+                "Очищена память агента %s: %d сессий, %d SQLite, %d ChromaDB",
+                agent_name, len(sessions), total_sqlite, total_chroma,
+            )
+            return {
+                "success": True,
+                "sessions_cleared": len(sessions),
+                "deleted_sqlite": total_sqlite,
+                "deleted_chroma": total_chroma,
+            }
+        except Exception as e:
+            logger.error("Ошибка очистки памяти агента %s: %s", agent_name, e)
+            return {"success": False, "error": str(e)}
+
+    def clear_all_memory(self) -> Dict[str, Any]:
+        """
+        Полная очистка всей памяти системы (все сессии, тактическая + стратегическая).
+
+        Returns:
+            dict с ключами success, sessions_cleared, deleted_sqlite, deleted_chroma, error
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+
+            db_path = self.memory_manager.db_handler.db_path
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT DISTINCT session_id FROM agent_memory"
+                )
+                tactical_sessions = {row[0] for row in cursor.fetchall()}
+                cursor.execute(
+                    "SELECT DISTINCT session_id FROM strategic_memory"
+                )
+                strategic_sessions = {row[0] for row in cursor.fetchall()}
+
+            all_sessions = tactical_sessions | strategic_sessions
+
+            from memory.tools import clear_session_memory
+
+            # Считаем строки до очистки, чтобы не парсить локализованные сообщения
+            with sqlite3.connect(db_path) as _count_conn:
+                _cur = _count_conn.cursor()
+                _cur.execute("SELECT COUNT(*) FROM agent_memory")
+                rows_before = _cur.fetchone()[0]
+                _cur.execute("SELECT COUNT(*) FROM strategic_memory")
+                rows_before += _cur.fetchone()[0]
+
+            errors = []
+            for sid in all_sessions:
+                try:
+                    clear_session_memory(sid, "all")
+                except Exception as e:
+                    errors.append(str(e))
+
+            with sqlite3.connect(db_path) as _count_conn2:
+                _cur2 = _count_conn2.cursor()
+                _cur2.execute("SELECT COUNT(*) FROM agent_memory")
+                rows_after = _cur2.fetchone()[0]
+                _cur2.execute("SELECT COUNT(*) FROM strategic_memory")
+                rows_after += _cur2.fetchone()[0]
+
+            total_sqlite = max(0, rows_before - rows_after)
+
+            self.memory_manager.is_memory_updated = True
+            self.memory_manager.summary = ""
+
+            logger.info(
+                "Полная очистка памяти: %d сессий, %d SQLite записей, %d ошибок",
+                len(all_sessions), total_sqlite, len(errors),
+            )
+            return {
+                "success": len(errors) == 0,
+                "sessions_cleared": len(all_sessions),
+                "deleted_sqlite": total_sqlite,
+                "errors": errors,
+            }
+        except Exception as e:
+            logger.error("Ошибка полной очистки памяти: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def clear_old_memories(self, days_to_keep: int) -> Dict[str, Any]:
+        """
+        Удалить записи тактической памяти старше (now - days_to_keep) дней.
+
+        Args:
+            days_to_keep: Сколько дней хранить (всё старше — удаляется)
+
+        Returns:
+            dict с ключами success, deleted_sqlite, deleted_chroma, cutoff, error
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+            from datetime import timedelta
+
+            cutoff = (datetime.now() - timedelta(days=days_to_keep)).isoformat()
+
+            db_path = self.memory_manager.db_handler.db_path
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+
+                # Получаем ID для ChromaDB перед удалением
+                cursor.execute(
+                    "SELECT session_id, agent_name, step FROM agent_memory WHERE valid_from < ?",
+                    (cutoff,),
+                )
+                rows = cursor.fetchall()
+                chroma_ids = [f"{r[0]}-{r[1]}-{r[2]}" for r in rows]
+
+                cursor.execute(
+                    "DELETE FROM agent_memory WHERE valid_from < ?",
+                    (cutoff,),
+                )
+                deleted_sqlite = cursor.rowcount
+                conn.commit()
+
+            # Очищаем ChromaDB best-effort
+            deleted_chroma = 0
+            if status.chromadb_available and chroma_ids:
+                db_handler = self.memory_manager.db_handler
+                if db_handler.tactical_collection:
+                    try:
+                        existing = db_handler.tactical_collection.get(ids=chroma_ids)
+                        existing_ids = existing.get("ids", [])
+                        if existing_ids:
+                            db_handler.tactical_collection.delete(ids=existing_ids)
+                            deleted_chroma = len(existing_ids)
+                    except Exception as e:
+                        logger.warning("ChromaDB cleanup при old-delete: %s", e)
+
+            self.memory_manager.is_memory_updated = True
+            logger.info(
+                "Удалено старых записей: %d SQLite, %d ChromaDB (cutoff=%s)",
+                deleted_sqlite, deleted_chroma, cutoff,
+            )
+            return {
+                "success": True,
+                "deleted_sqlite": deleted_sqlite,
+                "deleted_chroma": deleted_chroma,
+                "cutoff": cutoff,
+            }
+        except Exception as e:
+            logger.error("Ошибка удаления старых записей: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def vacuum_database(self) -> Dict[str, Any]:
+        """
+        Выполнить VACUUM на SQLite-базе данных памяти.
+
+        Returns:
+            dict с ключами success, size_before_mb, size_after_mb, error
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+            from pathlib import Path
+
+            db_path = self.memory_manager.db_handler.db_path
+            size_before = Path(db_path).stat().st_size / (1024 * 1024)
+
+            conn = sqlite3.connect(db_path)
+            conn.isolation_level = None
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+
+            size_after = Path(db_path).stat().st_size / (1024 * 1024)
+            logger.info(
+                "VACUUM завершён: %.2f MB -> %.2f MB", size_before, size_after
+            )
+            return {
+                "success": True,
+                "size_before_mb": round(size_before, 2),
+                "size_after_mb": round(size_after, 2),
+            }
+        except Exception as e:
+            logger.error("Ошибка VACUUM: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def get_temporal_stats(self, days: Optional[int] = 7) -> Dict[str, Any]:
+        """
+        Агрегаты активности памяти по дням (реальные данные из SQLite).
+
+        Args:
+            days: Количество дней для анализа (None = всё время)
+
+        Returns:
+            dict с ключами success, rows (list of {date, tactical, strategic}), error
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+            from datetime import timedelta
+
+            db_path = self.memory_manager.db_handler.db_path
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+
+                params_t: List[Any] = []
+                where_t = ""
+                if days is not None:
+                    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+                    where_t = "WHERE valid_from >= ?"
+                    params_t = [cutoff]
+
+                cursor.execute(
+                    f"SELECT DATE(valid_from) as d, COUNT(*) FROM agent_memory "
+                    f"{where_t} GROUP BY d ORDER BY d",
+                    params_t,
+                )
+                tactical_by_date = {row[0]: row[1] for row in cursor.fetchall()}
+
+                params_s: List[Any] = []
+                where_s = ""
+                if days is not None:
+                    where_s = "WHERE valid_from >= ?"
+                    params_s = [cutoff]
+
+                cursor.execute(
+                    f"SELECT DATE(valid_from) as d, COUNT(*) FROM strategic_memory "
+                    f"{where_s} GROUP BY d ORDER BY d",
+                    params_s,
+                )
+                strategic_by_date = {row[0]: row[1] for row in cursor.fetchall()}
+
+            all_dates = sorted(set(tactical_by_date) | set(strategic_by_date))
+            rows = [
+                {
+                    "date": d,
+                    "tactical": tactical_by_date.get(d, 0),
+                    "strategic": strategic_by_date.get(d, 0),
+                }
+                for d in all_dates
+            ]
+            return {"success": True, "rows": rows}
+        except Exception as e:
+            logger.error("Ошибка temporal stats: %s", e)
+            return {"success": False, "error": str(e)}
+
+    def import_memory_records(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Импортировать записи тактической памяти из списка dict.
+
+        Ожидает поля: session_id, agent_name, data (dict или str), step (опц.),
+        instance_step (опц.), run_id (опц.), valid_from (опц.).
+
+        Returns:
+            dict с ключами success, imported, skipped, errors
+        """
+        try:
+            status = self.get_memory_status()
+            if not status.sqlite_available:
+                return {"success": False, "error": "SQLite база данных недоступна"}
+
+            import sqlite3
+            import json as _json
+
+            db_path = self.memory_manager.db_handler.db_path
+            imported = 0
+            skipped = 0
+            errors: List[str] = []
+
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                for i, rec in enumerate(records):
+                    sid = rec.get("session_id")
+                    aname = rec.get("agent_name")
+                    data = rec.get("data")
+                    if not sid or not aname or data is None:
+                        skipped += 1
+                        errors.append(f"Запись {i}: пропущена (нет session_id/agent_name/data)")
+                        continue
+                    try:
+                        data_str = (
+                            _json.dumps(data, ensure_ascii=False)
+                            if isinstance(data, dict)
+                            else str(data)
+                        )
+                        ts = rec.get("valid_from") or datetime.now().isoformat()
+                        cursor.execute("""
+                            SELECT MAX(step) FROM agent_memory
+                            WHERE session_id = ? AND agent_name = ?
+                        """, (sid, aname))
+                        max_step = cursor.fetchone()[0]
+                        next_step = rec.get("step") or ((max_step or 0) + 1)
+                        cursor.execute("""
+                            INSERT INTO agent_memory
+                            (session_id, agent_name, step, instance_step, run_id,
+                             data, valid_from, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            sid, aname, next_step,
+                            rec.get("instance_step"), rec.get("run_id"),
+                            data_str, ts, ts, ts,
+                        ))
+                        imported += 1
+                    except Exception as e:
+                        skipped += 1
+                        errors.append(f"Запись {i}: {e}")
+                conn.commit()
+
+            self.memory_manager.is_memory_updated = True
+            logger.info("Импорт завершён: %d импортировано, %d пропущено", imported, skipped)
+            return {"success": True, "imported": imported, "skipped": skipped, "errors": errors}
+        except Exception as e:
+            logger.error("Ошибка импорта: %s", e)
+            return {"success": False, "error": str(e)}
+
     def export_memory(self, agent_name: Optional[str] = None,
                      session_id: Optional[str] = None,
                      format: str = "json") -> Dict[str, Any]:

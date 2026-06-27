@@ -12,6 +12,7 @@ type Props = {
   runServiceAction: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
   isBusy: boolean;
   active: boolean;
+  notify?: (msg: string, type: "error" | "success" | "info") => void;
 };
 
 type RunMeta = {
@@ -31,7 +32,7 @@ type RunMeta = {
   dialect?: string;
 };
 
-export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
+export function TextToSqlSection({ runServiceAction, isBusy, active, notify }: Props) {
   const [tab, setTab] = useState<"generate" | "connections" | "schema" | "history">("generate");
   const [prompt, setPrompt] = useState("");
   const [naturalQuery, setNaturalQuery] = useState("");
@@ -52,6 +53,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
   const [runStatus, setRunStatus] = useState<any | null>(null);
   const [runArtifacts, setRunArtifacts] = useState<any | null>(null);
   const [workflowResult, setWorkflowResult] = useState<any | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [autoRefreshRun, setAutoRefreshRun] = useState(true);
   const [runLogs, setRunLogs] = useState<any[]>([]);
   const [runLogsAutoRefresh, setRunLogsAutoRefresh] = useState(true);
@@ -187,7 +189,9 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
         void loadRunStatus(nextRunId);
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Ошибка генерации SQL");
+      const msg = err instanceof Error ? err.message : "Ошибка генерации SQL";
+      setError(msg);
+      notify?.(msg, "error");
     }
   };
 
@@ -360,6 +364,9 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
         const resultRecord = resultResp as Record<string, unknown> | null;
         const finalOutput = extractFinalOutput(resultRecord?.result);
         const sqlQuery = extractSqlCandidate(resultResp) ?? extractSqlCandidate(artifactsData) ?? undefined;
+        if (!sqlQuery && resultResp && typeof resultResp === "object" && Object.keys(resultResp as object).length > 0) {
+          notify?.("SQL не найден в ответе — возможно неожиданный формат результата", "info");
+        }
         try {
           await runServiceAction("text_to_sql.history.append", {
             entry: {
@@ -658,7 +665,17 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
             </label>
           </div>
           <div className="button-row">
-            <button className="button" type="button" onClick={handleGenerate} disabled={isBusy || !effectiveQuery || !dsn.trim()}>
+            <button
+              className="button"
+              type="button"
+              disabled={isBusy || isSubmitting || !effectiveQuery || !dsn.trim()}
+              onClick={async () => {
+                if (isSubmitting) return;
+                setIsSubmitting(true);
+                try { await handleGenerate(); } finally { setIsSubmitting(false); }
+              }}
+            >
+              {isSubmitting ? <span className="spinner" /> : null}
               Сгенерировать
             </button>
             <button className="button secondary" type="button" onClick={analyzeDsn} disabled={isBusy || !dsn.trim()}>
@@ -1148,6 +1165,7 @@ export function TextToSqlSection({ runServiceAction, isBusy, active }: Props) {
                     <iframe
                       title={`report-${resultModal.runId}`}
                       src={reportPreviewUrl}
+                      sandbox="allow-scripts allow-same-origin"
                       style={{ width: "100%", height: 520, border: "1px solid var(--line-muted)", borderRadius: 12 }}
                     />
                   </div>

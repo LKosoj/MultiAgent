@@ -14,6 +14,15 @@ import os
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
+def _safe_index(options: list, value, label: str = "") -> int:
+    """Безопасный index для selectbox: если значение отсутствует — возвращает 0 и показывает warning."""
+    if value in options:
+        return options.index(value)
+    if label:
+        st.warning(f"⚠️ Неизвестное значение '{value}' для поля «{label}». Установлено первое доступное.")
+    return 0
+
+
 def main():
     st.set_page_config(
         page_title="Settings - MultiAgent System",
@@ -159,17 +168,28 @@ def show_llm_settings():
             else:
                 # Для внешних провайдеров показываем настройки
                 api_key_placeholder = "sk-..." if selected_provider == "openai" else "API ключ"
-                
+
                 current_api_key = config.llm.api_key
-                api_key_display = current_api_key[:10] + "..." if current_api_key and len(current_api_key) > 10 else ""
-                
-                new_api_key = st.text_input(
-                    "🔑 API Ключ",
-                    value=api_key_display,
-                    type="password",
-                    placeholder=api_key_placeholder,
-                    help="API ключ для доступа к модели"
+                has_key = bool(current_api_key)
+
+                change_key = st.checkbox(
+                    "🔑 Изменить API ключ",
+                    value=False,
+                    key="_change_api_key",
+                    help="Отметьте, чтобы ввести новый API ключ"
                 )
+
+                if has_key and not change_key:
+                    st.info("🔑 API ключ установлен (скрыт). Отметьте галку выше для изменения.")
+                    new_api_key = None  # сигнал: не менять
+                else:
+                    new_api_key = st.text_input(
+                        "🔑 Новый API ключ",
+                        value="",
+                        type="password",
+                        placeholder=api_key_placeholder,
+                        help="Введите новый API ключ"
+                    )
                 
                 # Базовый URL (для кастомных провайдеров)
                 base_url = st.text_input(
@@ -264,33 +284,44 @@ def show_llm_settings():
 
 def test_llm_connection(config_manager, provider, model, api_key, base_url):
     """Тестирование соединения с LLM"""
-    
+
     with st.spinner("Тестирование соединения с LLM..."):
         try:
-            # Обновляем API ключ если он изменился
             temp_config = {
                 "provider": provider,
                 "model": model,
-                "api_key": api_key if api_key and not api_key.endswith("...") else None,
+                "api_key": api_key if api_key else None,
                 "base_url": base_url if base_url else None
             }
-            
+
             result = config_manager.test_llm_connection(provider, model, temp_config)
-            
-            if result["success"]:
-                st.success(f"✅ Соединение успешно! Время ответа: {result['response_time_ms']}ms")
-                
-                if "test_response" in result:
-                    with st.expander("📝 Тестовый ответ"):
-                        st.markdown(result["test_response"])
+
+            ok = result.get("ok", result.get("success", False))
+            simulated = result.get("simulated", False)
+            message = result.get("message") or result.get("test_response", "")
+            elapsed = result.get("response_time_ms", 0)
+
+            if ok and not simulated:
+                st.success(f"✅ Соединение успешно! Время ответа: {elapsed:.0f}ms")
+                if message:
+                    with st.expander("📝 Детали"):
+                        st.markdown(message)
+            elif ok and simulated:
+                st.warning(
+                    "⚠️ Проверка симулирована, реальное соединение не выполнено. "
+                    f"Время: {elapsed:.0f}ms"
+                )
+                if message:
+                    with st.expander("📝 Детали"):
+                        st.markdown(message)
             else:
-                st.error(f"❌ Ошибка соединения: {result['error_message']}")
-                
-                if "suggestions" in result:
+                st.error(f"❌ Ошибка соединения: {result.get('error_message') or message}")
+                suggestions = result.get("suggestions", [])
+                if suggestions:
                     st.markdown("**💡 Предложения:**")
-                    for suggestion in result["suggestions"]:
+                    for suggestion in suggestions:
                         st.info(f"• {suggestion}")
-        
+
         except Exception as e:
             st.error(f"❌ Ошибка тестирования: {e}")
 
@@ -304,8 +335,8 @@ def save_llm_settings(config_manager, config, provider, model, api_key, base_url
         new_config.llm.provider = provider
         new_config.llm.model = model
         
-        # Обновляем API ключ только если он изменился
-        if api_key and not api_key.endswith("..."):
+        # Обновляем API ключ только если передан новый (None = не менять)
+        if api_key is not None and api_key != "":
             new_config.llm.api_key = api_key
         
         new_config.llm.base_url = base_url if base_url else None
@@ -489,7 +520,7 @@ def show_telemetry_settings():
             export_format = st.selectbox(
                 "📋 Формат экспорта",
                 ["jsonl", "json", "otlp"],
-                index=["jsonl", "json", "otlp"].index(config.telemetry.export_format),
+                index=_safe_index(["jsonl", "json", "otlp"], config.telemetry.export_format, "Формат экспорта"),
                 help="Формат файлов трасс"
             )
             
@@ -638,7 +669,7 @@ def show_security_settings():
             safety_level = st.selectbox(
                 "🔒 Уровень безопасности",
                 ["strict", "moderate", "permissive"],
-                index=["strict", "moderate", "permissive"].index(config.security.safety_level),
+                index=_safe_index(["strict", "moderate", "permissive"], config.security.safety_level, "Уровень безопасности"),
                 help="Общий уровень проверок безопасности"
             )
             
@@ -695,6 +726,12 @@ def show_security_settings():
         
         # Дополнительные ограничения
         st.markdown("### 🚫 Дополнительные ограничения")
+        st.warning(
+            "⚠️ Поля ниже (разрешённые/блокируемые операции SQL, ключевые слова, "
+            "списки таблиц, схемы) в текущей конфигурации (USE_SQLGLOT=1) **не применяются** "
+            "при выполнении SQL и не создают реальной защиты. Они сохраняются в конфиге, "
+            "но enforcement отсутствует."
+        )
         
         col1, col2 = st.columns(2)
         
@@ -726,7 +763,7 @@ def show_security_settings():
             pii_action = st.selectbox(
                 "🎭 Действие при обнаружении PII",
                 ["block", "mask", "warn"],
-                index=["block", "mask", "warn"].index(config.security.pii_action),
+                index=_safe_index(["block", "mask", "warn"], config.security.pii_action, "Действие при PII"),
                 help="Что делать при обнаружении персональных данных"
             )
             
@@ -745,6 +782,10 @@ def show_security_settings():
         
         # Whitelist/Blacklist
         st.markdown("### 📋 Списки доступа")
+        st.info(
+            "ℹ️ Whitelist/Blacklist таблиц и разрешённые схемы сохраняются в конфиге, "
+            "но при USE_SQLGLOT=1 не проверяются во время выполнения SQL."
+        )
         
         col1, col2 = st.columns(2)
         
@@ -831,37 +872,28 @@ def save_security_settings(config_manager, config, sql_enabled, safety_level, ma
         st.error(f"❌ Ошибка сохранения: {e}")
 
 def show_security_warnings(security_config):
-    """Отображение предупреждений безопасности"""
-    
+    """Отображение предупреждений безопасности (только по реально применяемым настройкам)."""
+
     st.markdown("### ⚠️ Анализ безопасности")
-    
+
     warnings = []
-    
-    # Проверяем различные настройки
+
+    # Только реально проверяемые флаги (не зависящие от deny-list)
     if security_config.sql_execution_enabled:
         warnings.append("🚨 Выполнение SQL включено")
-    
-    if "INSERT" in security_config.allowed_sql_operations:
-        warnings.append("🚨 Разрешены INSERT операции")
-    
-    if "UPDATE" in security_config.allowed_sql_operations:
-        warnings.append("🚨 Разрешены UPDATE операции")
-    
-    if "DELETE" in security_config.allowed_sql_operations:
-        warnings.append("🚨 Разрешены DELETE операции")
-    
+
     if security_config.safety_level == "permissive":
         warnings.append("⚠️ Уровень безопасности: Permissive")
-    
+
     if security_config.max_sql_rows > 10000:
         warnings.append("⚠️ Высокий лимит строк SQL")
-    
+
     if not security_config.enable_pii_detection:
         warnings.append("⚠️ Обнаружение PII отключено")
-    
+
     if not security_config.log_security_events:
         warnings.append("ℹ️ Логирование событий безопасности отключено")
-    
+
     # Отображаем предупреждения
     if warnings:
         for warning in warnings:
@@ -873,7 +905,13 @@ def show_security_warnings(security_config):
                 st.info(warning)
     else:
         st.success("✅ Конфигурация безопасности выглядит хорошо")
-    
+
+    st.caption(
+        "ℹ️ Предупреждения выше основаны только на реально применяемых параметрах. "
+        "Поля deny-list (операции SQL, ключевые слова, списки таблиц) при USE_SQLGLOT=1 "
+        "не проверяются в runtime и здесь не отображаются."
+    )
+
     # Рекомендации
     st.markdown("**💡 Рекомендации для безопасности:**")
     recommendations = [
@@ -884,7 +922,7 @@ def show_security_warnings(security_config):
         "Регулярно проверяйте аудит-логи",
         "Ограничьте доступ к чувствительным таблицам"
     ]
-    
+
     for rec in recommendations:
         st.markdown(f"• {rec}")
 
@@ -918,7 +956,7 @@ def show_memory_settings():
             memory_type = st.selectbox(
                 "📋 Тип памяти",
                 ["chromadb", "sqlite"],
-                index=["chromadb", "sqlite"].index(config.memory.memory_type) if config.memory.memory_type in ["chromadb", "sqlite"] else 0,
+                index=_safe_index(["chromadb", "sqlite"], config.memory.memory_type, "Тип памяти"),
                 help="Тип системы памяти (chromadb - с векторным поиском, sqlite - только SQL)"
             )
             
@@ -1192,7 +1230,7 @@ def show_system_settings():
             log_level = st.selectbox(
                 "📝 Уровень логирования",
                 ["DEBUG", "INFO", "WARNING", "ERROR"],
-                index=["DEBUG", "INFO", "WARNING", "ERROR"].index(config.logging.level),
+                index=_safe_index(["DEBUG", "INFO", "WARNING", "ERROR"], config.logging.level, "Уровень логирования"),
                 help="Уровень детализации логов"
             )
             
@@ -1200,7 +1238,7 @@ def show_system_settings():
             log_format = st.selectbox(
                 "📋 Формат логов",
                 ["detailed", "simple", "json"],
-                index=["detailed", "simple", "json"].index(config.logging.format),
+                index=_safe_index(["detailed", "simple", "json"], config.logging.format, "Формат логов"),
                 help="Формат записи логов"
             )
             
@@ -1232,7 +1270,7 @@ def show_system_settings():
             system_language = st.selectbox(
                 "🌐 Язык системы",
                 ["ru", "en", "auto"],
-                index=["ru", "en", "auto"].index(config.system.language),
+                index=_safe_index(["ru", "en", "auto"], config.system.language, "Язык системы"),
                 help="Язык интерфейса и сообщений"
             )
         
@@ -1393,7 +1431,7 @@ def show_system_settings():
         
         with col3:
             if st.button("📋 Экспорт конфигурации"):
-                export_configuration(config)
+                export_configuration(config_manager)
         
         # Системная информация
         show_system_info()
@@ -1448,36 +1486,45 @@ def save_system_settings(config_manager, config, log_level, log_format, log_rota
         st.error(f"❌ Ошибка сохранения: {e}")
 
 def reset_to_defaults(config_manager):
-    """Сброс к настройкам по умолчанию"""
-    
-    if st.button("⚠️ Подтвердить сброс к умолчаниям"):
-        try:
-            config_manager.reset_to_defaults()
-            st.success("✅ Настройки сброшены к умолчаниям")
-            st.rerun()
-        except Exception as e:
-            st.error(f"❌ Ошибка сброса: {e}")
+    """Сброс к настройкам по умолчанию (двухшаговое подтверждение)."""
 
-def export_configuration(config):
-    """Экспорт конфигурации"""
-    
+    confirm_key = "_reset_confirm_pending"
+
+    if not st.session_state.get(confirm_key, False):
+        if st.button("⚠️ Подтвердить сброс к умолчаниям"):
+            st.session_state[confirm_key] = True
+            st.rerun()
+    else:
+        st.warning("Вы уверены? Все настройки будут сброшены к значениям по умолчанию.")
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ Да, сбросить", type="primary"):
+                st.session_state[confirm_key] = False
+                try:
+                    config_manager.reset_to_defaults()
+                    st.success("✅ Настройки сброшены к умолчаниям")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"❌ Ошибка сброса: {e}")
+        with col_no:
+            if st.button("❌ Отмена"):
+                st.session_state[confirm_key] = False
+                st.rerun()
+
+def export_configuration(config_manager):
+    """Экспорт конфигурации через backend (API-ключи не включаются)."""
+
     try:
-        # Преобразуем конфигурацию в JSON
-        config_dict = config.__dict__ if hasattr(config, '__dict__') else {}
-        
-        # Маскируем чувствительные данные
-        if 'llm' in config_dict and 'api_key' in config_dict['llm']:
-            config_dict['llm']['api_key'] = "***MASKED***"
-        
-        config_json = json.dumps(config_dict, indent=2, default=str, ensure_ascii=False)
-        
+        exported = config_manager.export_config(include_secrets=False)
+        config_json = json.dumps(exported, indent=2, default=str, ensure_ascii=False)
+
         st.download_button(
             label="💾 Скачать конфигурацию",
             data=config_json,
             file_name=f"multiagent_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
             mime="application/json"
         )
-        
+
         st.success("✅ Конфигурация готова для скачивания")
     
     except Exception as e:
@@ -1518,8 +1565,8 @@ def show_system_info():
         with col3:
             st.markdown("**💻 Ресурсы:**")
             
-            # CPU
-            cpu_percent = psutil.cpu_percent(interval=1)
+            # CPU (interval=None — неблокирующий, возвращает значение с момента последнего вызова)
+            cpu_percent = psutil.cpu_percent(interval=None)
             st.metric("CPU", f"{cpu_percent:.1f}%")
             
             # Память

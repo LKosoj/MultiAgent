@@ -3,6 +3,7 @@
 =====================================
 """
 
+import logging
 import streamlit as st
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ import json
 from datetime import datetime
 import time
 import uuid
+
+_logger = logging.getLogger(__name__)
 
 # Добавляем корневую директорию проекта в путь
 project_root = Path(__file__).parent.parent.parent
@@ -53,6 +56,10 @@ def init_session_state():
         st.session_state.agent_runs = {}
     if "auto_refresh_agents" not in st.session_state:
         st.session_state.auto_refresh_agents = False
+    if "test_run_id" not in st.session_state:
+        st.session_state.test_run_id = None
+    if "test_run_profile" not in st.session_state:
+        st.session_state.test_run_profile = None
 
 def show_agent_profiles():
     """Отображение профилей агентов"""
@@ -157,8 +164,8 @@ def show_agent_profiles():
         st.error(f"❌ Ошибка загрузки профилей: {e}")
 
 def run_test_agent(agent_manager, profile):
-    """Запуск тестового агента"""
-    
+    """Запускает тестового агента (неблокирующий, с поллингом через session_state)."""
+
     test_tasks = {
         "researcher": "Найди информацию о последних достижениях в области ИИ",
         "analyst": "Проанализируй текущие тренды на рынке технологий",
@@ -167,37 +174,29 @@ def run_test_agent(agent_manager, profile):
         "validator": "Проверь корректность данного JSON: {'test': 'value'}",
         "visualizer": "Создай диаграмму процесса разработки ПО"
     }
-    
-    # Подбираем тестовую задачу
     test_task = test_tasks.get(profile.name, "Выполни простую тестовую задачу")
-    
-    with st.spinner(f"Тестовый запуск агента {profile.name}..."):
+
+    # Запрошен тест ДРУГОГО агента — отменяем незавершённый прежний прогон и сбрасываем
+    # (закрывает утечку при переключении профиля). Для ТОГО ЖЕ профиля прежний run
+    # сохраняем: повторный клик = поллинг статуса, а сброс по завершении делает блок
+    # отображения статуса ниже (иначе поллинг был бы невозможен).
+    if (st.session_state.test_run_id is not None
+            and st.session_state.test_run_profile != profile.name):
+        prev_status = agent_manager.get_agent_status(st.session_state.test_run_id)
+        if prev_status is not None and prev_status.status == "running":
+            agent_manager.cancel_agent_run(st.session_state.test_run_id)
+        st.session_state.test_run_id = None
+        st.session_state.test_run_profile = None
+
+    # Если тест ещё не запущен — запускаем и сохраняем run_id
+    if st.session_state.test_run_id is None:
         try:
             session_id = f"run-{uuid.uuid4().hex[:16]}"
-            
-            # Callback для отслеживания прогресса
-            progress_container = st.container()
-            
-            def test_callback(run_id, event_type, data):
-                with progress_container:
-                    if event_type == "started":
-                        st.info(f"🚀 Запуск тестового агента")
-                    elif event_type == "completed":
-                        st.success(f"✅ Тест завершен")
-                        if data.get("result"):
-                            st.markdown("**Результат:**")
-                            st.text(str(data["result"])[:500] + "..." if len(str(data["result"])) > 500 else str(data["result"]))
-                    elif event_type == "failed":
-                        st.error(f"❌ Тест не удался: {data.get('error', 'Unknown')}")
-            
-            # Не генерируем run_id — используем тот, что вернет менеджер
             run_id = agent_manager.run_agent(
                 agent_id_or_profile=profile.name,
                 task=test_task,
                 session_id=session_id,
-                callback=test_callback
             )
-            # Пробрасываем run_id локально через контекст и логируем старт
             try:
                 from unified_logging import get_run_logger, run_id_context
                 with run_id_context(run_id):
@@ -205,26 +204,54 @@ def run_test_agent(agent_manager, profile):
                     _rlog.info(f"Старт тестового агента: {profile.name}")
             except Exception:
                 pass
-            
-            # Ждем завершения (упрощенно)
-            max_wait = 30  # 30 секунд
-            waited = 0
-            
-            while waited < max_wait:
-                status = agent_manager.get_agent_status(run_id)
-                if status and status.status in ["completed", "failed", "cancelled"]:
-                    break
-                time.sleep(1)
-                waited += 1
-            
-            # Показываем финальный результат
-            result = agent_manager.get_agent_result(run_id)
-            if result and result.final_output:
-                st.markdown("**💡 Результат тестового запуска:**")
-                st.info(str(result.final_output)[:1000] + "..." if len(str(result.final_output)) > 1000 else str(result.final_output))
-        
+            st.session_state.test_run_id = run_id
+            st.session_state.test_run_profile = profile.name
+            st.rerun()
         except Exception as e:
             st.error(f"❌ Ошибка тестового запуска: {e}")
+            return
+
+    # Поллинг статуса (каждый рендер — проверяем статус)
+    run_id = st.session_state.test_run_id
+    status = agent_manager.get_agent_status(run_id)
+
+    if status is None:
+        st.warning("⚠️ Статус недоступен")
+        return
+
+    col_status, col_cancel = st.columns([3, 1])
+    with col_status:
+        if status.status == "running":
+            st.info(f"⏳ Тестовый агент выполняется... (шаг {getattr(status, 'step_count', '?')})")
+        elif status.status == "completed":
+            st.success("✅ Тест завершён")
+        elif status.status == "failed":
+            st.error(f"❌ Тест не удался: {status.error_message or 'Unknown'}")
+        elif status.status == "cancelled":
+            st.warning("⚠️ Тест отменён")
+
+    with col_cancel:
+        if status.status == "running":
+            if st.button("⏹️ Отменить", key=f"cancel_test_{run_id}"):
+                agent_manager.cancel_agent_run(run_id)
+                st.session_state.test_run_id = None
+                st.session_state.test_run_profile = None
+                st.rerun()
+
+    if status.status == "running":
+        # Инициируем повторный рендер через небольшую задержку (без sleep в основном потоке)
+        st.caption("🔄 Обновите страницу для проверки результата или включите автообновление.")
+    elif status.status in ("completed", "failed", "cancelled"):
+        # Сбрасываем состояние, чтобы следующий клик запустил новый тест
+        st.session_state.test_run_id = None
+        st.session_state.test_run_profile = None
+
+    if status.status == "completed":
+        result = agent_manager.get_agent_result(run_id)
+        if result and result.final_output:
+            output_str = str(result.final_output)
+            st.markdown("**💡 Результат тестового запуска:**")
+            st.info(output_str[:1000] + "..." if len(output_str) > 1000 else output_str)
 
 def show_agent_execution():
     """Отображение интерфейса запуска агента"""
@@ -380,8 +407,8 @@ def show_agent_execution():
                 st.rerun()
             
             except Exception as e:
+                _logger.exception("Ошибка запуска агента")
                 st.error(f"❌ Ошибка запуска агента: {e}")
-                st.exception(e)
         
         elif submitted and not task:
             st.error("❌ Пожалуйста, введите задачу для агента")
@@ -395,7 +422,7 @@ def show_agent_execution():
                 try:
                     st.query_params["run_id"] = last_run_id
                 except Exception:
-                    pass
+                    _logger.warning("Не удалось установить query_params[run_id]", exc_info=True)
                 st.switch_page("pages/08_Logs_Traces.py")
 
 def show_agent_monitoring():
@@ -514,6 +541,10 @@ def show_agent_monitoring():
                         
                         with action_col3:
                             if st.button(f"🔍 Трассы", key=f"traces_agent_{run_id}"):
+                                try:
+                                    st.query_params["run_id"] = run_id
+                                except Exception:
+                                    pass
                                 st.switch_page("pages/08_Logs_Traces.py")
                     
                     else:

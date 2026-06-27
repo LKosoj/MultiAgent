@@ -109,12 +109,17 @@ class TestProgressBarUpdate(unittest.TestCase):
         self.assertIn("* 100", body)
 
     def test_callback_sends_progress_to_update_progress(self):
-        """progress_callback в generation_panel вызывает update_progress"""
+        """progress_callback в generation_panel вызывает update_progress
+
+        Прогресс из потока пробрасывается в update_progress thread-safe способом
+        через self.after(...), поэтому проверяем оба звена цепочки.
+        """
         source = PANEL_PATH.read_text(encoding="utf-8")
         start = source.index("def _run_full_pipeline_thread(self")
         next_def = source.index("\n    def ", start + 1)
         body = source[start:next_def]
-        self.assertIn("self.update_progress(progress", body)
+        self.assertIn("_progress(progress", body)
+        self.assertIn("self.update_progress(", body)
 
     def test_update_progress_sets_bar_value(self):
         """update_progress устанавливает progress_bar['value']"""

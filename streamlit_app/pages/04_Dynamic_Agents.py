@@ -3,6 +3,7 @@
 =========================================
 """
 
+import logging
 import streamlit as st
 import sys
 from pathlib import Path
@@ -10,6 +11,8 @@ import json
 from datetime import datetime
 import yaml
 import uuid
+
+_logger = logging.getLogger(__name__)
 
 # Добавляем корневую директорию проекта в путь
 project_root = Path(__file__).parent.parent.parent
@@ -59,6 +62,10 @@ def init_session_state():
         st.session_state.team_composition = []
     if "saved_definitions" not in st.session_state:
         st.session_state.saved_definitions = {}
+    if "confirm_delete_dynamic" not in st.session_state:
+        st.session_state.confirm_delete_dynamic = None
+    if "last_created_dynamic_agent_id" not in st.session_state:
+        st.session_state.last_created_dynamic_agent_id = None
 
 def show_agent_constructor():
     """Конструктор динамического агента"""
@@ -210,6 +217,31 @@ def show_agent_constructor():
                               planning_interval, instructions, selected_tools,
                               enable_memory, provide_run_summary, max_tool_threads)
 
+    # Кнопка тестового запуска — вне формы, доступна после создания агента
+    if st.session_state.last_created_dynamic_agent_id:
+        agent_id = st.session_state.last_created_dynamic_agent_id
+        if st.button("🧪 Запустить тестовую задачу", key="test_dynamic_agent"):
+            try:
+                agent_manager = get_agent_manager()
+                test_task = "Представься и расскажи о своих возможностях"
+                session_id = f"run-{uuid.uuid4().hex[:16]}"
+                run_id = agent_manager.run_agent(
+                    agent_id_or_profile=agent_id,
+                    task=test_task,
+                    session_id=session_id,
+                )
+                try:
+                    from unified_logging import get_run_logger, run_id_context
+                    with run_id_context(run_id):
+                        _rlog = get_run_logger(run_id, __name__)
+                        _rlog.info(f"Старт тестового динамического агента: {agent_id}")
+                except Exception:
+                    pass
+                st.info(f"🚀 Тестовая задача запущена с ID: `{run_id}`")
+            except Exception as e:
+                _logger.exception("Ошибка тестового запуска динамического агента")
+                st.error(f"❌ Ошибка тестового запуска: {e}")
+
 def get_available_tools():
     """Получение списка доступных инструментов"""
     try:
@@ -332,43 +364,19 @@ def create_dynamic_agent(name, agent_type, description, model, max_steps,
             # Создаем экземпляр агента
             session_id = f"run-{uuid.uuid4().hex[:16]}"
             agent_id = agent_manager.create_dynamic_agent(agent_definition, session_id)
-            
+
             st.success(f"✅ Динамический агент '{name}' создан успешно!")
             st.info(f"🆔 ID агента: `{agent_id}`")
             st.info(f"🆔 Session ID: `{session_id}`")
-            
-            # Предлагаем тестовый запуск
-            if st.button("🧪 Запустить тестовую задачу"):
-                test_task = "Представься и расскажи о своих возможностях"
-                
-                def test_callback(run_id, event_type, data):
-                    if event_type == "completed":
-                        st.markdown("**💡 Результат тестового запуска:**")
-                        st.info(str(data.get("result", "Нет результата")))
-                
-                # Не генерируем run_id заранее — используем возвращенный менеджером
-                run_id = agent_manager.run_agent(
-                    agent_id_or_profile=agent_id,
-                    task=test_task,
-                    session_id=session_id,
-                    callback=test_callback
-                )
-                # Пробрасываем локально и логируем (без утечки RUN_ID)
-                try:
-                    from unified_logging import get_run_logger, run_id_context
-                    with run_id_context(run_id):
-                        _rlog = get_run_logger(run_id, __name__)
-                        _rlog.info(f"Старт тестового динамического агента: {agent_id}")
-                except Exception:
-                    pass
-                
-                st.info(f"🚀 Тестовая задача запущена с ID: `{run_id}`")
+
+            # Сохраняем agent_id для кнопки тестового запуска вне формы
+            st.session_state.last_created_dynamic_agent_id = agent_id
         else:
             st.error("❌ Не удалось создать динамический агент")
     
     except Exception as e:
+        _logger.exception("Ошибка создания динамического агента")
         st.error(f"❌ Ошибка создания агента: {e}")
-        st.exception(e)
 
 def save_agent_template(name, agent_type, description, model, max_steps,
                        planning_interval, instructions, tools, enable_memory,
@@ -469,18 +477,20 @@ def show_manager_team_builder():
         st.markdown("### 👥 Состав команды")
         
         if st.session_state.team_composition:
-            for i, agent in enumerate(st.session_state.team_composition):
+            for agent in list(st.session_state.team_composition):
                 with st.container():
                     col_info, col_remove = st.columns([4, 1])
-                    
+
                     with col_info:
                         type_icon = {"standard": "📋", "dynamic": "🔧", "template": "💾"}
                         st.markdown(f"**{type_icon.get(agent['type'], '🤖')} {agent['name']}**")
                         st.caption(f"Тип: {agent['role']} | {agent['description'][:50]}...")
-                    
+
                     with col_remove:
-                        if st.button("❌", key=f"remove_{i}", help="Удалить из команды"):
-                            st.session_state.team_composition.pop(i)
+                        if st.button("❌", key=f"remove_{agent['name']}", help="Удалить из команды"):
+                            st.session_state.team_composition = [
+                                a for a in st.session_state.team_composition if a["name"] != agent["name"]
+                            ]
                             st.rerun()
             
             st.markdown("---")
@@ -574,9 +584,9 @@ def show_manager_team_builder():
                         st.info(f"👥 Состав команды: {', '.join(team_names)}")
                     
                     except Exception as e:
+                        _logger.exception("Ошибка запуска команды менеджера")
                         st.error(f"❌ Ошибка запуска команды: {e}")
-                        st.exception(e)
-                
+
                 elif submitted and not team_task:
                     st.error("❌ Пожалуйста, введите задачу для команды")
             
@@ -667,8 +677,8 @@ def show_manager_team_builder():
                         st.info("🤝 Команда будет подобрана менеджером автоматически")
 
                     except Exception as e:
+                        _logger.exception("Ошибка запуска менеджера без команды")
                         st.error(f"❌ Ошибка запуска: {e}")
-                        st.exception(e)
 
                 elif submitted and not team_task:
                     st.error("❌ Пожалуйста, введите задачу")
@@ -688,6 +698,8 @@ def show_dynamic_agent_management():
         agent_manager = get_agent_manager()
         dynamic_profiles = agent_manager.list_dynamic_profiles()
         
+        st.caption("ℹ️ Динамические профили действуют до перезапуска сервера и не сохраняются на диск.")
+
         if dynamic_profiles:
             st.markdown("### 🔧 Зарегистрированные динамические профили")
             
@@ -715,9 +727,26 @@ def show_dynamic_agent_management():
                             profile_dict = profile.to_profile_dict()
                             st.json(profile_dict)
                         
-                        if st.button(f"🗑️ Удалить", key=f"delete_dynamic_{profile.name}"):
-                            # Здесь можно добавить логику удаления
-                            st.warning("Функция удаления будет реализована")
+                        if st.session_state.confirm_delete_dynamic == profile.name:
+                            st.warning(f"Удалить профиль «{profile.name}»?")
+                            col_yes, col_no = st.columns(2)
+                            with col_yes:
+                                if st.button("✅ Да", key=f"confirm_yes_{profile.name}"):
+                                    deleted = agent_manager.delete_dynamic_profile(profile.name)
+                                    st.session_state.confirm_delete_dynamic = None
+                                    if deleted:
+                                        st.success(f"✅ Профиль «{profile.name}» удалён")
+                                    else:
+                                        st.error("❌ Профиль не найден")
+                                    st.rerun()
+                            with col_no:
+                                if st.button("❌ Нет", key=f"confirm_no_{profile.name}"):
+                                    st.session_state.confirm_delete_dynamic = None
+                                    st.rerun()
+                        else:
+                            if st.button(f"🗑️ Удалить", key=f"delete_dynamic_{profile.name}"):
+                                st.session_state.confirm_delete_dynamic = profile.name
+                                st.rerun()
         else:
             st.info("📭 Нет зарегистрированных динамических профилей")
         
@@ -1074,8 +1103,8 @@ def show_active_runs_monitoring():
                 st.info("ℹ️ Нет завершенных запусков для очистки")
     
     except Exception as e:
+        _logger.exception("Ошибка мониторинга активных запусков")
         st.error(f"❌ Ошибка мониторинга: {e}")
-        st.exception(e)
 
 if __name__ == "__main__":
     main()

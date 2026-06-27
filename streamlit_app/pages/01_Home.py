@@ -14,6 +14,20 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 from telemetry.helpers import is_trace_completed
 
+# Добавляем папку streamlit_app в путь, чтобы импортировать _dashboard_common
+_streamlit_app_dir = Path(__file__).parent.parent
+if str(_streamlit_app_dir) not in sys.path:
+    sys.path.insert(0, str(_streamlit_app_dir))
+from _dashboard_common import show_recent_activities_common
+
+
+@st.cache_data(ttl=5)
+def _load_trace_cached_home(run_id: str):
+    """Загрузка trace-файла с кэшированием (снижает N+1 disk I/O при рендере)."""
+    from telemetry import get_telemetry_manager
+    tm = get_telemetry_manager()
+    return tm.load_trace_file(run_id)
+
 def get_agent_manager():
     """Получить AgentManager с глобальным состоянием"""
     from agent_streamlit_api import AgentManager
@@ -202,222 +216,19 @@ def show_quick_actions():
 
 def show_recent_activities():
     """Последние активности"""
-    
+
     st.markdown("## 📝 Последние активности")
-    
+
     try:
-        # Получаем последние запуски
-        from workflow.streamlit_api import WorkflowManager
-        from agent_streamlit_api import AgentManager
-        
         wf_manager = get_workflow_manager()
         agent_manager = get_agent_manager()
-        
-        # Объединяем активности из разных источников
-        activities = []
-        
-        # Активности пайплайнов
-        for run_id, run_data in list(wf_manager.active_runs.items())[-5:]:
-            # Проверяем реальный статус из телеметрии
-            real_status = run_data.get("status", "unknown")
-            try:
-                from telemetry import get_telemetry_manager
-                tm = get_telemetry_manager()
-                trace_data = tm.load_trace_file(run_id)
-                spans = trace_data.get("spans", [])
-                if spans:
-                    has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
-                    if has_errors:
-                        real_status = "failed"
-                    elif is_trace_completed(spans):
-                        real_status = "completed"
-                    else:
-                        real_status = "running"
-            except Exception:
-                pass
-            # Приоритет: если менеджер пометил как отменённый — показываем cancelled
-            try:
-                mgr_status = wf_manager.get_workflow_status(run_id)
-                if mgr_status and mgr_status.status == "cancelled":
-                    real_status = "cancelled"
-            except Exception:
-                pass
-                
-            activities.append({
-                "time": run_data.get("start_time", datetime.now()),
-                "type": "workflow",
-                "icon": "🔄",
-                "title": f"Пайплайн: {run_data.get('workflow_name', 'Unknown')}",
-                "status": real_status,
-                "run_id": run_id
-            })
-        
-        # Активности агентов
-        for run_id, run_data in list(agent_manager.active_runs.items())[-5:]:
-            # Проверяем реальный статус из телеметрии
-            real_status = run_data.get("status", "unknown")
-            try:
-                from telemetry import get_telemetry_manager
-                tm = get_telemetry_manager()
-                trace_data = tm.load_trace_file(run_id)
-                spans = trace_data.get("spans", [])
-                if spans:
-                    has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
-                    if has_errors:
-                        real_status = "failed"
-                    elif is_trace_completed(spans):
-                        real_status = "completed"
-                    else:
-                        real_status = "running"
-            except Exception:
-                pass
-            # Приоритет статуса менеджера
-            try:
-                mgr_status = agent_manager.get_agent_status(run_id)
-                if mgr_status and mgr_status.status == "cancelled":
-                    real_status = "cancelled"
-            except Exception:
-                pass
-                
-            activities.append({
-                "time": run_data.get("start_time", datetime.now()),
-                "type": "agent",
-                "icon": "🤖",
-                "title": f"Агент: {run_data.get('profile_name', 'Unknown')}",
-                "status": real_status,
-                "run_id": run_id
-            })
-        
-        # Fallback: если активностей нет, пробуем из session_state
-        if not activities:
-            try:
-                for rid, info in (st.session_state.get("workflow_runs") or {}).items():
-                    activities.append({
-                        "time": info.get("start_time", datetime.now()),
-                        "type": "workflow",
-                        "icon": "🔄",
-                        "title": f"Пайплайн: {info.get('workflow_name', 'Unknown')}",
-                        "status": "unknown",
-                        "run_id": rid
-                    })
-                for rid, info in (st.session_state.get("agent_runs") or {}).items():
-                    activities.append({
-                        "time": info.get("start_time", datetime.now()),
-                        "type": "agent",
-                        "icon": "🤖",
-                        "title": f"Агент: {info.get('profile_name', 'Unknown')}",
-                        "status": "unknown",
-                        "run_id": rid
-                    })
-            except Exception:
-                pass
-
-        # Если пусто — попробуем подхватить из телеметрии
-        if not activities:
-            try:
-                from telemetry import get_telemetry_manager
-                tm = get_telemetry_manager()
-                trace_files = tm.get_trace_files()
-                # Исключаем служебную трассу unknown
-                trace_files = [tf for tf in trace_files if tf.get("run_id") != "unknown"]
-                for tf in trace_files[:10]:
-                    run_id = tf.get("run_id")
-                    modified = tf.get("modified_time")
-                    title = f"Запуск: {run_id[:12]}..."
-                    icon = "📄"
-                    atype = "run"
-                    try:
-                        trace_data = tm.load_trace_file(run_id)
-                        for sp in trace_data.get("spans", []):
-                            attrs = sp.get("attributes", {}) or {}
-                            if attrs.get("pipeline_name"):
-                                title = f"Пайплайн: {attrs.get('pipeline_name')}"
-                                icon = "🔄"
-                                atype = "workflow"
-                                break
-                            if attrs.get("agent_name"):
-                                title = f"Агент: {attrs.get('agent_name')}"
-                                icon = "🤖"
-                                atype = "agent"
-                                break
-                    except Exception:
-                        pass
-                    # Определяем статус из телеметрии
-                    status = "unknown"
-                    try:
-                        trace_data = tm.load_trace_file(run_id)
-                        spans = trace_data.get("spans", [])
-                        if spans:
-                            # Проверяем статус
-                            has_errors = any(s.get("status", {}).get("status_code") == "ERROR" for s in spans)
-                            if has_errors:
-                                status = "failed"
-                            elif is_trace_completed(spans):
-                                status = "completed"
-                            else:
-                                status = "running"
-                    except Exception:
-                        pass
-                    
-                    activities.append({
-                        "time": modified,
-                        "type": atype,
-                        "icon": icon,
-                        "title": title,
-                        "status": status,
-                        "run_id": run_id
-                    })
-            except Exception:
-                pass
-
-        # Сортируем по времени
-        activities.sort(key=lambda x: x["time"], reverse=True)
-        
-        if activities:
-            for activity in activities[:10]:  # Показываем последние 10
-                col1, col2, col3, col4, col5 = st.columns([1, 3, 2, 1, 1])
-                
-                with col1:
-                    st.write(activity["icon"])
-                
-                with col2:
-                    st.write(activity["title"])
-                
-                with col3:
-                    status_color = {
-                        "running": "🟡 Выполняется",
-                        "completed": "🟢 Завершено",
-                        "failed": "🔴 Ошибка",
-                        "cancelled": "⚫ Отменено"
-                    }
-                    st.write(status_color.get(activity["status"], "⚪ Неизвестно"))
-                
-                with col4:
-                    time_str = activity["time"].strftime("%H:%M") if isinstance(activity["time"], datetime) else "N/A"
-                    st.write(time_str)
-
-                with col5:
-                    try:
-                        if activity["status"] == "running":
-                            if activity["type"] == "workflow":
-                                from workflow.streamlit_api import WorkflowManager
-                                wf_manager = get_workflow_manager()
-                                if st.button("⏹️", key=f"home_cancel_wf_{activity['run_id']}", help="Отменить"):
-                                    if wf_manager.cancel_workflow(activity["run_id"]):
-                                        st.success("✅ Отменено")
-                                        st.rerun()
-                            elif activity["type"] == "agent":
-                                from agent_streamlit_api import AgentManager
-                                agent_manager = get_agent_manager()
-                                if st.button("⏹️", key=f"home_cancel_ag_{activity['run_id']}", help="Отменить"):
-                                    if agent_manager.cancel_agent_run(activity["run_id"]):
-                                        st.success("✅ Отменено")
-                                        st.rerun()
-                    except Exception:
-                        pass
-        else:
-            st.info("Нет недавних активностей")
-    
+        show_recent_activities_common(
+            wf_manager=wf_manager,
+            agent_manager=agent_manager,
+            load_trace_fn=_load_trace_cached_home,
+            is_trace_completed_fn=is_trace_completed,
+            key_prefix="home",
+        )
     except Exception as e:
         st.error(f"❌ Ошибка загрузки активностей: {e}")
 
@@ -456,11 +267,15 @@ def show_configuration_status():
             if st.button("🧪 Тест соединения LLM"):
                 with st.spinner("Тестирование..."):
                     result = config_manager.test_llm_connection()
-                
-                if result["success"]:
-                    st.success(f"✅ Соединение успешно ({result['response_time_ms']}ms)")
+
+                ok = result.get("ok", result.get("success", False))
+                simulated = result.get("simulated", False)
+                if ok and not simulated:
+                    st.success(f"✅ Соединение успешно ({result.get('response_time_ms', '?')}ms)")
+                elif ok and simulated:
+                    st.warning(f"⚠️ Симуляция: {result.get('message', 'Реальный LLM недоступен')} ({result.get('response_time_ms', '?')}ms)")
                 else:
-                    st.error(f"❌ Ошибка: {result['error_message']}")
+                    st.error(f"❌ Ошибка: {result.get('error_message', result.get('message', 'Неизвестная ошибка'))}")
         
         with col2:
             st.markdown("**🔒 Безопасность**")

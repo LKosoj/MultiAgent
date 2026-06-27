@@ -3,6 +3,7 @@
 import React from "react";
 import { createPortal } from "react-dom";
 import { KeyValueList } from "../shared/KeyValueList";
+import { decodeGzipBase64, openReportFromPayload } from "../../utils/report";
 
 type AgentProfile = {
   name: string;
@@ -45,20 +46,6 @@ type AgentRunForm = {
   enableMemory: boolean;
 };
 
-const decodeGzipBase64 = async (b64: string) => {
-  const binary = atob(b64);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  if (!("DecompressionStream" in window)) {
-    throw new Error("Браузер не поддерживает распаковку gzip");
-  }
-  const stream = new DecompressionStream("gzip");
-  const body = new Response(bytes).body;
-  if (!body) {
-    throw new Error("Не удалось распаковать отчёт");
-  }
-  const decompressed = body.pipeThrough(stream);
-  return new Response(decompressed).text();
-};
 
 type Props = {
   isBusy: boolean;
@@ -197,27 +184,7 @@ export function AgentsSection({
   }, [currentAgentRunLogs]);
 
   const openReport = React.useCallback(async (runId: string, report: any) => {
-    const payload =
-      report?.base64_gzip ??
-      report?.content_b64_gzip ??
-      report?.report_b64_gzip ??
-      report?.base64;
-    if (!payload) {
-      throw new Error("Пустой отчёт");
-    }
-    const html = await decodeGzipBase64(payload);
-    const mimeType = report?.mime_type ?? "text/html";
-    const filename = report?.filename ?? `report_${runId}.html`;
-    const blob = new Blob([html], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      link.click();
-    }
-    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
+    await openReportFromPayload(runId, report);
   }, []);
 
   // Автооткрытие отключено — отчёт открывается только по клику.
@@ -929,6 +896,7 @@ export function AgentsSection({
                     <iframe
                       title={`report-${resultModal.runId}`}
                       src={reportPreviewUrl}
+                      sandbox="allow-scripts allow-same-origin"
                       style={{ width: "100%", height: 520, border: "1px solid var(--line-muted)", borderRadius: 12 }}
                     />
                   </div>

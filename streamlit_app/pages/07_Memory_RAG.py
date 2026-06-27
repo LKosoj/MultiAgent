@@ -166,29 +166,12 @@ def show_memory_status():
                 st.rerun()
         
         with col2:
-            auto_refresh = st.checkbox("🔄 Автообновление (30с)")
-            
-            # Правильная реализация автообновления
-            if auto_refresh:
-                import time
-                # Инициализируем время последнего обновления
-                if "last_refresh_time_memory" not in st.session_state:
-                    st.session_state.last_refresh_time_memory = time.time()
-                
-                # Проверяем, прошло ли 30 секунд
-                current_time = time.time()
-                if current_time - st.session_state.last_refresh_time_memory >= 30:
-                    st.session_state.last_refresh_time_memory = current_time
-                    st.rerun()
-                
-                # Показываем индикатор автообновления
-                next_refresh = 30 - (current_time - st.session_state.last_refresh_time_memory)
-                if next_refresh > 0:
-                    st.caption(f"⏱️ Обновление через {next_refresh:.0f}с")
+            st.caption("Нажмите «Обновить статус» для получения актуальных данных.")
     
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка получения статуса памяти")
         st.error(f"❌ Ошибка получения статуса памяти: {e}")
-        st.exception(e)
 
 def test_embedding_model(memory_manager):
     """Тестирование модели embeddings"""
@@ -358,14 +341,33 @@ def perform_memory_search(memory_manager, search_query, session_filter, agent_fi
                         result["memory_type"] = memory_type
                     all_results.extend(type_results.results)
         
+        # Применяем клиентские фильтры
+        filtered_results = all_results
+        if min_relevance > 0.0:
+            filtered_results = [
+                r for r in filtered_results
+                if r.get("relevance_score", 0.0) >= min_relevance
+            ]
+        if date_filter:
+            from datetime import date as _date
+            cutoff_iso = date_filter.isoformat()
+            def _get_date_str(r):
+                meta = r.get("metadata", {})
+                raw = meta.get("created_at") or meta.get("timestamp") or ""
+                return str(raw)[:10] if raw else ""
+            filtered_results = [
+                r for r in filtered_results
+                if _get_date_str(r) >= cutoff_iso
+            ]
+
         # Создаем объединенный результат
         class CombinedSearchResult:
             def __init__(self, results):
                 self.results = sorted(results, key=lambda x: x.get('relevance_score', 0), reverse=True)[:top_k]
                 self.search_time_ms = 0.0  # Общее время не замеряем для упрощения
                 self.error_message = None
-                
-        search_results = CombinedSearchResult(all_results)
+
+        search_results = CombinedSearchResult(filtered_results)
         
         # Проверяем успешность по наличию результатов
         if search_results.results:
@@ -425,8 +427,9 @@ def perform_memory_search(memory_manager, search_query, session_filter, agent_fi
             st.warning("🔍 Результаты не найдены. Попробуйте изменить параметры поиска.")
     
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка выполнения поиска")
         st.error(f"❌ Ошибка выполнения поиска: {e}")
-        st.exception(e)
 
 def export_search_results(results, search_query):
     """Экспорт результатов поиска"""
@@ -615,99 +618,53 @@ def show_memory_analytics():
 
 def show_temporal_analytics(memory_manager, time_period):
     """Временная аналитика"""
-    
+
     st.markdown("#### 📅 Активность по времени")
-    
-    # Определяем временной диапазон
-    period_mapping = {
-        "Последние 24 часа": timedelta(hours=24),
-        "Последние 7 дней": timedelta(days=7),
-        "Последние 30 дней": timedelta(days=30),
-        "Все время": None
+
+    period_days = {
+        "Последние 24 часа": 1,
+        "Последние 7 дней": 7,
+        "Последние 30 дней": 30,
+        "Все время": None,
     }
-    
-    time_delta = period_mapping.get(time_period)
-    
+    days = period_days.get(time_period)
+
     try:
-        # Здесь можно добавить логику получения временной статистики
-        # Пока отображаем заглушку
-        st.info(f"Анализ активности за период: {time_period}")
-        
-        # Пример данных для демонстрации
-        sample_dates = pd.date_range(
-            start=datetime.now() - timedelta(days=7),
-            end=datetime.now(),
-            freq='D'
+        stats = memory_manager.get_temporal_stats(days=days)
+        if not stats.get("success"):
+            st.error(f"❌ {stats.get('error', 'Неизвестная ошибка')}")
+            return
+
+        rows = stats.get("rows", [])
+        if not rows:
+            st.info("Нет данных за выбранный период.")
+            return
+
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").rename(
+            columns={"tactical": "Тактические записи", "strategic": "Стратегические записи"}
         )
-        
-        sample_data = pd.DataFrame({
-            'Дата': sample_dates,
-            'Тактические записи': [5, 8, 12, 6, 9, 15, 11, 7],
-            'Стратегические записи': [2, 3, 1, 4, 2, 5, 3, 2]
-        })
-        
-        sample_data = sample_data.set_index('Дата')
-        st.line_chart(sample_data)
-        
+        st.line_chart(df)
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка построения временного графика")
         st.error(f"❌ Ошибка построения временного графика: {e}")
 
 def show_keyword_analysis(memory_manager):
     """Анализ ключевых слов"""
-    
+
     st.markdown("#### 🔤 Ключевые слова в памяти")
-    
-    try:
-        # Здесь можно добавить логику анализа ключевых слов
-        # Пока отображаем заглушку
-        st.info("Анализ наиболее частых ключевых слов в записях памяти")
-        
-        # Пример данных
-        sample_keywords = [
-            ("задача", 45),
-            ("выполнение", 38),
-            ("результат", 32),
-            ("ошибка", 28),
-            ("анализ", 25),
-            ("данные", 22),
-            ("процесс", 19),
-            ("система", 17),
-            ("пользователь", 15),
-            ("решение", 13)
-        ]
-        
-        for i, (keyword, count) in enumerate(sample_keywords):
-            st.markdown(f"{i+1}. **{keyword}** - {count} упоминаний")
-        
-    except Exception as e:
-        st.error(f"❌ Ошибка анализа ключевых слов: {e}")
+    st.info("Анализ ключевых слов недоступен без выбора конкретной сессии. "
+            "Используйте инструмент 'Поиск' для семантического поиска по памяти.")
 
 def show_topic_analysis(memory_manager):
     """Анализ тематик"""
-    
+
     st.markdown("#### 📊 Тематический анализ")
-    
-    try:
-        # Здесь можно добавить логику тематического анализа
-        # Пока отображаем заглушку
-        st.info("Анализ основных тематик в записях памяти")
-        
-        # Пример данных
-        sample_topics = [
-            ("Выполнение задач", 35),
-            ("Обработка данных", 28),
-            ("Взаимодействие с пользователем", 22),
-            ("Техническая диагностика", 18),
-            ("Планирование", 15),
-            ("Ошибки и исключения", 12)
-        ]
-        
-        for i, (topic, percentage) in enumerate(sample_topics):
-            st.progress(percentage / 100)
-            st.markdown(f"**{topic}** - {percentage}%")
-        
-    except Exception as e:
-        st.error(f"❌ Ошибка тематического анализа: {e}")
+    st.info("Тематический анализ (LDA/кластеризация) не реализован. "
+            "Для поиска по тематике используйте семантический поиск на вкладке «Поиск».")
 
 def show_memory_management():
     """Управление памятью"""
@@ -726,58 +683,56 @@ def show_memory_management():
         
         with col1:
             st.markdown("**🔄 Перестройка индекса:**")
-            
-            if st.button("🔄 Перестроить ChromaDB из SQLite", type="primary"):
-                import os, uuid
-                run_id = f"run-{uuid.uuid4().hex[:16]}"
-                os.environ["RUN_ID"] = run_id
-                try:
-                    from unified_logging import get_run_logger
-                    _rlog = get_run_logger(run_id, __name__)
-                    _rlog.info("Старт перестройки ChromaDB из SQLite")
-                except Exception:
-                    pass
-                rebuild_chromadb_index(memory_manager)
-            
+
+            if "confirm_rebuild_chroma" not in st.session_state:
+                st.session_state.confirm_rebuild_chroma = False
+
+            if not st.session_state.confirm_rebuild_chroma:
+                if st.button("🔄 Перестроить ChromaDB из SQLite", type="primary"):
+                    st.session_state.confirm_rebuild_chroma = True
+                    st.rerun()
+            else:
+                st.warning(
+                    "Перестройка удалит текущие векторные индексы и пересоздаст их из SQLite. "
+                    "Операция необратима. Подтвердить?"
+                )
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("✅ Да, перестроить", type="primary"):
+                        st.session_state.confirm_rebuild_chroma = False
+                        import os, uuid
+                        run_id = f"run-{uuid.uuid4().hex[:16]}"
+                        os.environ["RUN_ID"] = run_id
+                        try:
+                            from unified_logging import get_run_logger
+                            _rlog = get_run_logger(run_id, __name__)
+                            _rlog.info("Старт перестройки ChromaDB из SQLite")
+                        except Exception:
+                            pass
+                        rebuild_chromadb_index(memory_manager)
+                with c2:
+                    if st.button("❌ Отмена"):
+                        st.session_state.confirm_rebuild_chroma = False
+                        st.rerun()
+
             st.caption("Восстанавливает векторные индексы из данных SQLite")
             
-            if st.button("🧹 Очистить пустые коллекции"):
-                import os, uuid
-                run_id = f"run-{uuid.uuid4().hex[:16]}"
-                os.environ["RUN_ID"] = run_id
-                try:
-                    from unified_logging import get_run_logger
-                    _rlog = get_run_logger(run_id, __name__)
-                    _rlog.info("Старт очистки пустых коллекций")
-                except Exception:
-                    pass
-                cleanup_empty_collections(memory_manager)
+            st.button(
+                "🧹 Очистить пустые коллекции",
+                disabled=True,
+                help="Не реализовано: ChromaDB не предоставляет API перечисления пустых коллекций",
+            )
         
         with col2:
             st.markdown("**📊 Оптимизация:**")
-            
-            if st.button("⚡ Оптимизировать индексы"):
-                import os, uuid
-                run_id = f"run-{uuid.uuid4().hex[:16]}"
-                os.environ["RUN_ID"] = run_id
-                try:
-                    from unified_logging import get_run_logger
-                    _rlog = get_run_logger(run_id, __name__)
-                    _rlog.info("Старт оптимизации индексов памяти")
-                except Exception:
-                    pass
-                optimize_indexes(memory_manager)
-            
+
+            st.button(
+                "⚡ Оптимизировать индексы",
+                disabled=True,
+                help="Не реализовано: ChromaDB управляет индексами автоматически",
+            )
+
             if st.button("🗜️ Сжать базу данных"):
-                import os, uuid
-                run_id = f"run-{uuid.uuid4().hex[:16]}"
-                os.environ["RUN_ID"] = run_id
-                try:
-                    from unified_logging import get_run_logger
-                    _rlog = get_run_logger(run_id, __name__)
-                    _rlog.info("Старт сжатия базы памяти")
-                except Exception:
-                    pass
                 compress_database(memory_manager)
         
         # Операции экспорта/импорта
@@ -790,7 +745,7 @@ def show_memory_management():
             
             export_format = st.selectbox(
                 "Формат экспорта",
-                ["JSON", "CSV", "SQLite Dump"]
+                ["JSON", "CSV"]
             )
             
             session_id_filter = st.text_input(
@@ -813,9 +768,9 @@ def show_memory_management():
             st.markdown("**📥 Импорт данных:**")
             
             uploaded_file = st.file_uploader(
-                "Загрузить файл экспорта",
-                type=['json', 'csv'],
-                help="Файл с экспортированными данными памяти"
+                "Загрузить файл экспорта (JSON)",
+                type=['json'],
+                help="JSON-файл с экспортированными данными памяти (CSV не поддерживается)"
             )
             
             if uploaded_file is not None:
@@ -842,19 +797,39 @@ def show_memory_management():
         
         with col2:
             st.markdown("**🤖 Очистка по агенту:**")
-            
-            # Получаем список агентов
+
             active_agents = memory_manager.get_active_agents()
             agent_names = [agent.get("agent_name") for agent in active_agents if agent.get("agent_name")]
-            
+
             if agent_names:
-                agent_to_cleanup = st.selectbox(
-                    "Выберите агента",
-                    agent_names
-                )
-                
-                if st.button("🗑️ Очистить память агента"):
-                    cleanup_agent_memory(memory_manager, agent_to_cleanup)
+                agent_to_cleanup = st.selectbox("Выберите агента", sorted(agent_names))
+
+                # Сброс confirm-флагов других агентов при смене выбора
+                prev_agent_key = "_cleanup_agent_prev_selection"
+                if st.session_state.get(prev_agent_key) != agent_to_cleanup:
+                    for name in agent_names:
+                        st.session_state.pop(f"confirm_cleanup_agent_{name}", None)
+                    st.session_state[prev_agent_key] = agent_to_cleanup
+
+                confirm_agent_key = f"confirm_cleanup_agent_{agent_to_cleanup}"
+                if confirm_agent_key not in st.session_state:
+                    st.session_state[confirm_agent_key] = False
+
+                if not st.session_state[confirm_agent_key]:
+                    if st.button("🗑️ Очистить память агента"):
+                        st.session_state[confirm_agent_key] = True
+                        st.rerun()
+                else:
+                    st.warning(f"Удалить всю память агента «{agent_to_cleanup}» во всех сессиях?")
+                    ca1, ca2 = st.columns(2)
+                    with ca1:
+                        if st.button("✅ Да, удалить", key=f"confirm_agent_yes_{agent_to_cleanup}"):
+                            st.session_state[confirm_agent_key] = False
+                            cleanup_agent_memory(memory_manager, agent_to_cleanup)
+                    with ca2:
+                        if st.button("❌ Отмена", key=f"confirm_agent_no_{agent_to_cleanup}"):
+                            st.session_state[confirm_agent_key] = False
+                            st.rerun()
             else:
                 st.info("Нет агентов для очистки")
         
@@ -891,39 +866,31 @@ def rebuild_chromadb_index(memory_manager):
         except Exception as e:
             st.error(f"❌ Ошибка перестройки: {e}")
 
-def cleanup_empty_collections(memory_manager):
-    """Очистка пустых коллекций"""
-    
-    with st.spinner("Очистка пустых коллекций..."):
-        try:
-            # Здесь должна быть логика очистки
-            st.success("✅ Пустые коллекции очищены")
-        except Exception as e:
-            st.error(f"❌ Ошибка очистки: {e}")
-
-def optimize_indexes(memory_manager):
-    """Оптимизация индексов"""
-    
-    with st.spinner("Оптимизация индексов..."):
-        try:
-            # Здесь должна быть логика оптимизации
-            st.success("✅ Индексы оптимизированы")
-        except Exception as e:
-            st.error(f"❌ Ошибка оптимизации: {e}")
-
 def compress_database(memory_manager):
-    """Сжатие базы данных"""
-    
-    with st.spinner("Сжатие базы данных..."):
-        try:
-            # Здесь должна быть логика сжатия
-            st.success("✅ База данных сжата")
-        except Exception as e:
-            st.error(f"❌ Ошибка сжатия: {e}")
+    """Сжатие базы данных (SQLite VACUUM)"""
+
+    try:
+        with st.spinner("Сжатие базы данных (VACUUM)..."):
+            result = memory_manager.vacuum_database()
+
+        if result.get("success"):
+            saved = result["size_before_mb"] - result["size_after_mb"]
+            st.success(
+                f"✅ База данных сжата: "
+                f"{result['size_before_mb']:.2f} MB → {result['size_after_mb']:.2f} MB "
+                f"(сэкономлено {saved:.2f} MB)"
+            )
+        else:
+            st.error(f"❌ Ошибка сжатия: {result.get('error', 'Неизвестная ошибка')}")
+
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка сжатия базы данных")
+        st.error(f"❌ Ошибка сжатия: {e}")
 
 def export_memory_data(memory_manager, export_format, session_id_filter, agent_name_filter):
     """Экспорт данных памяти"""
-    
+
     try:
         with st.spinner("Экспорт данных..."):
             export_result = memory_manager.export_memory(
@@ -931,27 +898,37 @@ def export_memory_data(memory_manager, export_format, session_id_filter, agent_n
                 agent_name=agent_name_filter if agent_name_filter else None,
                 format=export_format.lower()
             )
-        
+
         if export_result.get("success"):
-            st.success(f"✅ Экспортировано {export_result.get('count', 0)} записей")
-            
-            # Создаем файл для скачивания
+            rows = export_result.get("data", [])
+            st.success(f"✅ Экспортировано {len(rows)} записей")
+
             filename = f"memory_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            
+
             if export_format == "JSON":
                 filename += ".json"
                 mime_type = "application/json"
-                data_to_export = json.dumps(export_result.get("data", []), indent=2, ensure_ascii=False)
-            elif export_format == "CSV":
+                data_to_export = json.dumps(rows, indent=2, ensure_ascii=False)
+            else:  # CSV
+                import io
+                import csv
                 filename += ".csv"
                 mime_type = "text/csv"
-                # Для CSV нужно конвертировать данные
-                data_to_export = export_result.get("data", [])
-            else:
-                filename += ".sql"
-                mime_type = "text/sql"
-                data_to_export = export_result.get("data", [])
-            
+                buf = io.StringIO()
+                if rows:
+                    writer = csv.DictWriter(
+                        buf, fieldnames=list(rows[0].keys()), extrasaction="ignore"
+                    )
+                    writer.writeheader()
+                    for row in rows:
+                        # Serialize nested objects to string
+                        flat = {
+                            k: (json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v)
+                            for k, v in row.items()
+                        }
+                        writer.writerow(flat)
+                data_to_export = buf.getvalue()
+
             st.download_button(
                 label=f"💾 Скачать {export_format}",
                 data=data_to_export,
@@ -960,62 +937,123 @@ def export_memory_data(memory_manager, export_format, session_id_filter, agent_n
             )
         else:
             st.error(f"❌ Ошибка экспорта: {export_result.get('error', 'Неизвестная ошибка')}")
-    
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка экспорта")
         st.error(f"❌ Ошибка экспорта: {e}")
 
 def import_memory_data(memory_manager, uploaded_file):
     """Импорт данных памяти"""
-    
+
     try:
         with st.spinner("Импорт данных..."):
             file_content = uploaded_file.read()
-            
-            if uploaded_file.name.endswith('.json'):
-                data = json.loads(file_content.decode('utf-8'))
-            else:
-                # Для CSV нужна дополнительная логика
-                st.error("❌ CSV импорт пока не поддерживается")
+
+            if not uploaded_file.name.endswith('.json'):
+                st.error("❌ CSV-импорт не поддерживается: формат CSV не содержит типовую информацию. "
+                         "Загрузите файл JSON, экспортированный из этого интерфейса.")
                 return
-            
-            # Здесь должна быть логика импорта
-            st.success("✅ Данные импортированы")
-    
+
+            raw = json.loads(file_content.decode('utf-8'))
+            # Поддерживаем как list[dict], так и {data: list[dict]}
+            if isinstance(raw, list):
+                records = raw
+            elif isinstance(raw, dict) and "data" in raw:
+                records = raw["data"]
+            else:
+                st.error("❌ Неизвестный формат JSON. Ожидается list[dict] или {data: list[dict]}.")
+                return
+
+            result = memory_manager.import_memory_records(records)
+
+        if result.get("success"):
+            st.success(
+                f"✅ Импортировано {result['imported']} записей, "
+                f"пропущено {result['skipped']}."
+            )
+            if result.get("errors"):
+                with st.expander("Предупреждения"):
+                    for msg in result["errors"]:
+                        st.warning(msg)
+        else:
+            st.error(f"❌ Ошибка импорта: {result.get('error', 'Неизвестная ошибка')}")
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка импорта")
         st.error(f"❌ Ошибка импорта: {e}")
 
 def cleanup_old_memories(memory_manager, days_to_keep):
     """Очистка старых записей"""
-    
+
     try:
         with st.spinner(f"Очистка записей старше {days_to_keep} дней..."):
-            # Здесь должна быть логика очистки
-            st.success(f"✅ Записи старше {days_to_keep} дней очищены")
-    
+            result = memory_manager.clear_old_memories(days_to_keep)
+
+        if result.get("success"):
+            st.success(
+                f"✅ Удалено {result['deleted_sqlite']} SQLite-записей "
+                f"и {result['deleted_chroma']} ChromaDB-записей "
+                f"(cutoff: {result['cutoff'][:10]})"
+            )
+        else:
+            st.error(f"❌ Ошибка очистки: {result.get('error', 'Неизвестная ошибка')}")
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка очистки старых записей")
         st.error(f"❌ Ошибка очистки: {e}")
 
 def cleanup_agent_memory(memory_manager, agent_name):
     """Очистка памяти конкретного агента"""
-    
+
     try:
         with st.spinner(f"Очистка памяти агента {agent_name}..."):
-            # Здесь должна быть логика очистки памяти агента
-            st.success(f"✅ Память агента {agent_name} очищена")
-    
+            result = memory_manager.clear_agent_memory_all_sessions(agent_name)
+
+        if result.get("success"):
+            st.success(
+                f"✅ Память агента «{agent_name}» очищена: "
+                f"{result['deleted_sqlite']} SQLite-записей, "
+                f"{result['deleted_chroma']} ChromaDB-записей "
+                f"в {result['sessions_cleared']} сессиях"
+            )
+        else:
+            st.error(f"❌ Ошибка очистки: {result.get('error', 'Неизвестная ошибка')}")
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка очистки памяти агента")
         st.error(f"❌ Ошибка очистки памяти агента: {e}")
 
 def full_memory_cleanup(memory_manager):
     """Полная очистка памяти"""
-    
+
     try:
         with st.spinner("Полная очистка памяти..."):
-            # Здесь должна быть логика полной очистки
-            st.success("✅ Вся память очищена")
-            st.warning("⚠️ Все данные удалены!")
-    
+            result = memory_manager.clear_all_memory()
+
+        if result.get("success"):
+            msg = (
+                f"✅ Полная очистка завершена: "
+                f"{result['sessions_cleared']} сессий, "
+                f"{result['deleted_sqlite']} SQLite-записей удалено."
+            )
+            errors = result.get("errors", [])
+            if errors:
+                msg += f" (ошибок: {len(errors)})"
+            st.success(msg)
+            if errors:
+                with st.expander("Ошибки при очистке"):
+                    for e in errors:
+                        st.warning(e)
+        else:
+            st.error(f"❌ Ошибка полной очистки: {result.get('error', 'Неизвестная ошибка')}")
+
     except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).exception("Ошибка полной очистки памяти")
         st.error(f"❌ Ошибка полной очистки: {e}")
 
 def show_storage_statistics(memory_manager):

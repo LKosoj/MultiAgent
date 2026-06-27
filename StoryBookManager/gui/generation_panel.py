@@ -26,10 +26,12 @@ logger = logging.getLogger(__name__)
 class GenerationPanel(ttk.Frame):
     """Панель управления генерацией"""
     
-    def __init__(self, parent, on_generation_started: Callable):
+    def __init__(self, parent, on_generation_started: Callable,
+                 on_generation_complete: Optional[Callable] = None):
         super().__init__(parent)
-        
+
         self.on_generation_started = on_generation_started
+        self.on_generation_complete = on_generation_complete
         self.current_project: Optional[Project] = None
         self.pipeline_runner = PipelineRunner()
         self.generation_thread: Optional[threading.Thread] = None
@@ -532,8 +534,8 @@ class GenerationPanel(ttk.Frame):
         page_spin = ttk.Spinbox(page_frame, from_=1, to=50, textvariable=self.page_var, width=10)
         page_spin.pack(side="left")
         
-        ttk.Button(page_frame, text="🎨 Регенерировать изображение", 
-                  command=self.regenerate_image).pack(side="right")
+        ttk.Button(page_frame, text="🎨 Регенерировать изображение",
+                  command=self.regenerate_image, state="disabled").pack(side="right")
         
         # Регенерация видео
         ttk.Label(regen_frame, text="Кадр для регенерации:").pack(anchor="w")
@@ -548,8 +550,8 @@ class GenerationPanel(ttk.Frame):
         self.shot_var = tk.StringVar()
         ttk.Spinbox(shot_frame, from_=1, to=10, textvariable=self.shot_var, width=5).pack(side="left", padx=5)
         
-        ttk.Button(regen_frame, text="🎬 Регенерировать видео", 
-                  command=self.regenerate_video).pack(fill="x", pady=(10, 0))
+        ttk.Button(regen_frame, text="🎬 Регенерировать видео",
+                  command=self.regenerate_video, state="disabled").pack(fill="x", pady=(10, 0))
         
         # Валидация проекта
         validation_frame = ttk.LabelFrame(parent, text="Валидация", padding=10)
@@ -559,8 +561,8 @@ class GenerationPanel(ttk.Frame):
                   command=self.validate_project).pack(fill="x", pady=2)
         ttk.Button(validation_frame, text="🎚 Проверить video/music providers",
                   command=self.check_provider_readiness).pack(fill="x", pady=2)
-        ttk.Button(validation_frame, text="🔧 Исправить ошибки", 
-                  command=self.fix_project_errors).pack(fill="x", pady=2)
+        ttk.Button(validation_frame, text="🔧 Исправить ошибки",
+                  command=self.fix_project_errors, state="disabled").pack(fill="x", pady=2)
     
     def create_execution_panel(self, parent):
         """Создание панели выполнения"""
@@ -776,57 +778,85 @@ class GenerationPanel(ttk.Frame):
             messagebox.showerror("Ошибка параметров pipeline", str(e))
             return
 
-        try:
-            # Валидация проекта перед запуском
-            validation_result = self.pipeline_runner.validate_project_for_pipeline(self.current_project.project_id)
-            if not validation_result.get("valid", False):
-                result = messagebox.askyesno(
-                    "Ошибки валидации",
-                    f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
-                )
-                if not result:
-                    # Отмена ДО start_generation: снимаем guard-флаг и явно
-                    # возвращаем кнопки в disabled (идемпотентно — они и так
-                    # disabled, но защищает от будущих правок порядка вызовов).
+        project_id = self.current_project.project_id
+        generation_params = {
+            "project_id": project_id,
+            "task": task,
+            **pipeline_inputs,
+        }
+
+        # Показываем лёгкий статус без перевода UI в режим генерации
+        self.after(0, lambda: self.add_log("Проверка проекта...", "info"))
+
+        def _validate_then_run():
+            try:
+                validation_result = self.pipeline_runner.validate_project_for_pipeline(project_id)
+                if not validation_result.get("valid", False):
+                    msg = validation_result.get("message", "")
+
+                    proceed = threading.Event()
+                    user_said_yes = [False]
+
+                    def _ask():
+                        user_said_yes[0] = messagebox.askyesno(
+                            "Ошибки валидации",
+                            f"Проект содержит ошибки:\n{msg}\n\nВсе равно запустить?"
+                        )
+                        proceed.set()
+
+                    self.after(0, _ask)
+                    proceed.wait()
+
+                    if not user_said_yes[0]:
+                        with self._generation_lock:
+                            self.is_generating = False
+                        return
+
+                # Валидация прошла — старт UI-состояния и потока в одном Tk-колбэке,
+                # чтобы гарантировать: start_generation (сброс cancel-event, кнопки)
+                # выполняется ДО thread.start(), а self.generation_thread пишется
+                # только в Tk-потоке (нет гонки атрибута).
+                def _begin(pid=project_id, t=task, pi=pipeline_inputs, gp=generation_params):
+                    self.start_generation("Полный pipeline", gp)
+                    self.generation_thread = threading.Thread(
+                        target=self._run_full_pipeline_thread,
+                        args=(pid, t, pi),
+                        daemon=True,
+                    )
+                    self.generation_thread.start()
+                self.after(0, _begin)
+            except Exception as exc:
+                logger.error(f"Ошибка предстартовой валидации: {exc}")
+                self.after(0, lambda e=exc: self.add_log(f"❌ Ошибка валидации: {e}", "error"))
+                self.after(0, self.finish_generation)
+                with self._generation_lock:
                     self.is_generating = False
-                    self.stop_button.config(state="disabled")
-                    self.pause_button.config(state="disabled", text="⏸ Пауза")
-                    return
 
-            # Запуск в отдельном потоке
-            self.start_generation("Полный pipeline", {
-                "project_id": self.current_project.project_id,
-                "task": task,
-                **pipeline_inputs,
-            })
-
-            # Запускаем pipeline
-            self.generation_thread = threading.Thread(
-                target=self._run_full_pipeline_thread,
-                args=(self.current_project.project_id, task, pipeline_inputs),
-                daemon=True
-            )
-            self.generation_thread.start()
-        except Exception:
-            self.is_generating = False
-            raise
+        threading.Thread(target=_validate_then_run, daemon=True).start()
     
     def _run_full_pipeline_thread(self, project_id: str, task: str,
                                   pipeline_inputs: Dict[str, Any]):
         """Запуск полного pipeline в отдельном потоке"""
+        def _log(msg, level="info"):
+            self.after(0, lambda m=msg, l=level: self.add_log(m, l))
+
+        def _progress(value, msg):
+            self.after(0, lambda v=value, m=msg: self.update_progress(v, m))
+
         try:
-            self.add_log(f"Запуск полного pipeline для проекта {project_id}", "info")
-            self.add_log(f"Задача: {task}", "info")
+            _log(f"Запуск полного pipeline для проекта {project_id}")
+            _log(f"Задача: {task}")
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
                                    step_duration: float = None):
                 level = "error" if step_status == "failed" else "info"
-                self.add_log(message, level)
+                _log(message, level)
                 if progress is not None:
-                    self.update_progress(progress, message)
+                    _progress(progress, message)
                 if step_id and step_status:
-                    self.step_tracker.update_step(step_id, step_status, step_duration)
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
+                               self.step_tracker.update_step(si, ss, sd))
 
             result = run_pipeline_sync(
                 self.pipeline_runner,
@@ -837,38 +867,45 @@ class GenerationPanel(ttk.Frame):
             )
 
             if result.get("status") == "cancelled":
-                self.add_log("⏹ Pipeline отменён после завершения активных шагов", "warning")
+                _log("⏹ Pipeline отменён после завершения активных шагов", "warning")
             elif result.get("status") == "success":
-                self.add_log("✅ Pipeline завершен успешно!", "success")
-                self.update_progress(100, "Завершено")
+                _log("✅ Pipeline завершен успешно!", "success")
+                _progress(100, "Завершено")
             else:
                 error_msg = result.get("message", "Неизвестная ошибка")
-                self.add_log(f"❌ Pipeline завершен с ошибкой: {error_msg}", "error")
-                self.update_progress(0, "Ошибка")
+                _log(f"❌ Pipeline завершен с ошибкой: {error_msg}", "error")
+                _progress(0, "Ошибка")
             self._append_video_artifact_summary(project_id)
 
         except Exception as e:
             logger.error(f"Ошибка выполнения pipeline: {e}")
-            self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            _log(f"❌ Критическая ошибка: {e}", "error")
             self._append_video_artifact_summary(project_id)
         finally:
-            self.finish_generation()
+            self.after(0, self.finish_generation)
     
     def _run_from_step_thread(self, project_id: str, step_id: str,
                               task: Optional[str], pipeline_inputs: Dict[str, Any]):
         """Запуск pipeline с определенного шага в отдельном потоке"""
+        def _log(msg, level="info"):
+            self.after(0, lambda m=msg, l=level: self.add_log(m, l))
+
+        def _progress(value, msg):
+            self.after(0, lambda v=value, m=msg: self.update_progress(v, m))
+
         try:
-            self.add_log(f"Запуск частичного pipeline для проекта {project_id} с шага {step_id}", "info")
-            
+            _log(f"Запуск частичного pipeline для проекта {project_id} с шага {step_id}")
+
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
                                    step_duration: float = None):
                 level = "error" if step_status == "failed" else "info"
-                self.add_log(message, level)
+                _log(message, level)
                 if progress is not None:
-                    self.update_progress(progress, message)
+                    _progress(progress, message)
                 if step_id and step_status:
-                    self.step_tracker.update_step(step_id, step_status, step_duration)
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
+                               self.step_tracker.update_step(si, ss, sd))
 
             loop = asyncio.new_event_loop()
             try:
@@ -883,44 +920,48 @@ class GenerationPanel(ttk.Frame):
                 )
             finally:
                 loop.close()
-            
+
             # Обрабатываем результат
             if result.get("status") == "cancelled":
-                self.add_log("⏹ Частичный pipeline отменён после завершения активных шагов", "warning")
+                _log("⏹ Частичный pipeline отменён после завершения активных шагов", "warning")
             elif result.get("status") == "success":
                 skipped_steps = result.get("skipped_steps", 0)
-                self.add_log(f"✅ Частичный pipeline завершен успешно! Пропущено шагов: {skipped_steps}", "success")
-                self.update_progress(100, "Завершено")
+                _log(f"✅ Частичный pipeline завершен успешно! Пропущено шагов: {skipped_steps}", "success")
+                _progress(100, "Завершено")
             else:
                 error_msg = result.get("message", "Неизвестная ошибка")
-                self.add_log(f"❌ Частичный pipeline завершен с ошибкой: {error_msg}", "error")
-                self.update_progress(0, "Ошибка")
+                _log(f"❌ Частичный pipeline завершен с ошибкой: {error_msg}", "error")
+                _progress(0, "Ошибка")
             self._append_video_artifact_summary(project_id)
-            
+
         except Exception as e:
             logger.error(f"Ошибка выполнения частичного pipeline: {e}")
-            self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            _log(f"❌ Критическая ошибка: {e}", "error")
             self._append_video_artifact_summary(project_id)
         finally:
-            self.finish_generation()
+            self.after(0, self.finish_generation)
 
     def _run_resume_pipeline_thread(self, workflow_id: str, completed_steps: List[str]):
         """Возобновляет workflow из checkpoint в отдельном потоке."""
+        def _log(msg, level="info"):
+            self.after(0, lambda m=msg, l=level: self.add_log(m, l))
+
+        def _progress(value, msg):
+            self.after(0, lambda v=value, m=msg: self.update_progress(v, m))
+
         try:
-            self.add_log(
-                f"Возобновление pipeline из checkpoint {workflow_id}",
-                "info",
-            )
+            _log(f"Возобновление pipeline из checkpoint {workflow_id}")
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
                                    step_duration: float = None):
                 level = "error" if step_status == "failed" else "info"
-                self.add_log(message, level)
+                _log(message, level)
                 if progress is not None:
-                    self.update_progress(progress, message)
+                    _progress(progress, message)
                 if step_id and step_status:
-                    self.step_tracker.update_step(step_id, step_status, step_duration)
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
+                               self.step_tracker.update_step(si, ss, sd))
 
             loop = asyncio.new_event_loop()
             try:
@@ -934,42 +975,46 @@ class GenerationPanel(ttk.Frame):
                 loop.close()
 
             if result.get("status") == "cancelled":
-                self.add_log("⏹ Восстановленный pipeline отменён", "warning")
+                _log("⏹ Восстановленный pipeline отменён", "warning")
             elif result.get("status") == "success":
-                self.add_log("✅ Pipeline успешно восстановлен из checkpoint", "success")
-                self.update_progress(100, "Завершено")
+                _log("✅ Pipeline успешно восстановлен из checkpoint", "success")
+                _progress(100, "Завершено")
             else:
                 error_msg = result.get("message", "Неизвестная ошибка")
-                self.add_log(f"❌ Ошибка восстановления pipeline: {error_msg}", "error")
-                self.update_progress(0, "Ошибка")
+                _log(f"❌ Ошибка восстановления pipeline: {error_msg}", "error")
+                _progress(0, "Ошибка")
             if self.current_project:
                 self._append_video_artifact_summary(self.current_project.project_id)
         except Exception as e:
             logger.error(f"Ошибка восстановления workflow {workflow_id}: {e}")
-            self.add_log(f"❌ Критическая ошибка восстановления: {e}", "error")
+            _log(f"❌ Критическая ошибка восстановления: {e}", "error")
             if self.current_project:
                 self._append_video_artifact_summary(self.current_project.project_id)
         finally:
-            self.finish_generation()
+            self.after(0, self.finish_generation)
 
     def _run_single_step_thread(self, project_id: str, step_id: str,
                                 task: Optional[str], pipeline_inputs: Dict[str, Any]):
         """Перезапускает только один шаг pipeline в отдельном потоке."""
+        def _log(msg, level="info"):
+            self.after(0, lambda m=msg, l=level: self.add_log(m, l))
+
+        def _progress(value, msg):
+            self.after(0, lambda v=value, m=msg: self.update_progress(v, m))
+
         try:
-            self.add_log(
-                f"Перезапуск одного шага для проекта {project_id}: {step_id}",
-                "info",
-            )
+            _log(f"Перезапуск одного шага для проекта {project_id}: {step_id}")
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
                                    step_duration: float = None):
                 level = "error" if step_status == "failed" else "info"
-                self.add_log(message, level)
+                _log(message, level)
                 if progress is not None:
-                    self.update_progress(progress, message)
+                    _progress(progress, message)
                 if step_id and step_status:
-                    self.step_tracker.update_step(step_id, step_status, step_duration)
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
+                               self.step_tracker.update_step(si, ss, sd))
 
             loop = asyncio.new_event_loop()
             try:
@@ -986,26 +1031,26 @@ class GenerationPanel(ttk.Frame):
                 loop.close()
 
             if result.get("status") == "success":
-                self.add_log(
+                _log(
                     f"✅ Шаг '{step_id}' перезапущен успешно без повтора остальных шагов",
                     "success",
                 )
-                self.update_progress(100, "Завершено")
+                _progress(100, "Завершено")
             else:
                 error_msg = result.get("message", "Неизвестная ошибка")
-                self.add_log(
+                _log(
                     f"❌ Перезапуск шага '{step_id}' завершился с ошибкой: {error_msg}",
                     "error",
                 )
-                self.update_progress(0, "Ошибка")
+                _progress(0, "Ошибка")
             self._append_video_artifact_summary(project_id)
 
         except Exception as e:
             logger.error(f"Ошибка single-step rerun для шага {step_id}: {e}")
-            self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            _log(f"❌ Критическая ошибка: {e}", "error")
             self._append_video_artifact_summary(project_id)
         finally:
-            self.finish_generation()
+            self.after(0, self.finish_generation)
     
     def run_from_step(self):
         """Запуск pipeline с определенного шага"""
@@ -1044,45 +1089,53 @@ class GenerationPanel(ttk.Frame):
             return
 
         task = self.task_text.get("1.0", tk.END).strip() or None
+        project_id = self.current_project.project_id
 
-        try:
-            # Валидация проекта перед запуском
-            validation_result = self.pipeline_runner.validate_project_for_pipeline(
-                self.current_project.project_id,
-                start_step=step_id,
-            )
-            if not validation_result.get("valid", False):
-                result = messagebox.askyesno(
-                    "Ошибки валидации",
-                    f"Проект содержит ошибки:\n{validation_result.get('message', '')}\n\nВсе равно запустить?"
+        self.start_generation(f"Частичный pipeline с {step_id}", {
+            "project_id": project_id,
+            "start_step": step_id,
+            **pipeline_inputs,
+            **({"task": task} if task else {}),
+        })
+
+        def _validate_then_run():
+            try:
+                self.after(0, lambda: self.add_log("Валидация проекта...", "info"))
+                validation_result = self.pipeline_runner.validate_project_for_pipeline(
+                    project_id, start_step=step_id
                 )
-                if not result:
-                    # Отмена ДО start_generation: снимаем guard-флаг и явно
-                    # возвращаем кнопки в disabled (идемпотентно — они и так
-                    # disabled, но защищает от будущих правок порядка вызовов).
-                    self.is_generating = False
-                    self.stop_button.config(state="disabled")
-                    self.pause_button.config(state="disabled", text="⏸ Пауза")
-                    return
+                if not validation_result.get("valid", False):
+                    msg = validation_result.get("message", "")
 
-            # Запуск в отдельном потоке
-            self.start_generation(f"Частичный pipeline с {step_id}", {
-                "project_id": self.current_project.project_id,
-                "start_step": step_id,
-                **pipeline_inputs,
-                **({"task": task} if task else {}),
-            })
+                    proceed = threading.Event()
+                    user_said_yes = [False]
 
-            # Запускаем pipeline
-            self.generation_thread = threading.Thread(
-                target=self._run_from_step_thread,
-                args=(self.current_project.project_id, step_id, task, pipeline_inputs),
-                daemon=True
-            )
-            self.generation_thread.start()
-        except Exception:
-            self.is_generating = False
-            raise
+                    def _ask():
+                        user_said_yes[0] = messagebox.askyesno(
+                            "Ошибки валидации",
+                            f"Проект содержит ошибки:\n{msg}\n\nВсе равно запустить?"
+                        )
+                        proceed.set()
+
+                    self.after(0, _ask)
+                    proceed.wait()
+
+                    if not user_said_yes[0]:
+                        self.after(0, self.finish_generation)
+                        return
+
+                self.generation_thread = threading.Thread(
+                    target=self._run_from_step_thread,
+                    args=(project_id, step_id, task, pipeline_inputs),
+                    daemon=True,
+                )
+                self.generation_thread.start()
+            except Exception as exc:
+                logger.error(f"Ошибка предстартовой валидации: {exc}")
+                self.after(0, lambda m=str(exc): self.add_log(f"❌ Ошибка валидации: {m}", "error"))
+                self.after(0, self.finish_generation)
+
+        threading.Thread(target=_validate_then_run, daemon=True).start()
 
     def _restart_pipeline_step_from_tracker(self, step_id: str):
         """Перезапускает шаг из контекстного меню StepTracker."""
@@ -1136,85 +1189,60 @@ class GenerationPanel(ttk.Frame):
             raise
 
     def regenerate_image(self):
-        """Регенерация изображения"""
-        if not self.current_project:
-            messagebox.showwarning("Предупреждение", "Выберите проект")
-            return
-        
-        try:
-            page_num = int(self.page_var.get() or "1")
-        except ValueError:
-            messagebox.showerror("Ошибка", "Неверный номер страницы")
-            return
-        
-        if self.is_generating:
-            messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
-            return
-        
-        # TODO: Реализовать регенерацию изображения
-        self.add_log(f"Запуск регенерации изображения для страницы {page_num}", "info")
-        messagebox.showinfo("Информация", "Функция регенерации изображений будет реализована позже")
-    
+        """Регенерация изображения — не реализовано"""
+        messagebox.showinfo("Не реализовано", "Регенерация изображения не реализована")
+
     def regenerate_video(self):
-        """Регенерация видео"""
-        if not self.current_project:
-            messagebox.showwarning("Предупреждение", "Выберите проект")
-            return
-        
-        try:
-            scene_num = int(self.scene_var.get() or "1")
-            shot_num = int(self.shot_var.get() or "1")
-        except ValueError:
-            messagebox.showerror("Ошибка", "Неверные номера сцены или кадра")
-            return
-        
-        if self.is_generating:
-            messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
-            return
-        
-        # TODO: Реализовать регенерацию видео
-        self.add_log(f"Запуск регенерации видео для сцены {scene_num}, кадр {shot_num}", "info")
-        messagebox.showinfo("Информация", "Функция регенерации видео будет реализована позже")
+        """Регенерация видео — не реализовано"""
+        messagebox.showinfo("Не реализовано", "Регенерация видео не реализована")
     
     def validate_project(self):
-        """Валидация проекта"""
+        """Валидация проекта (в фоновом потоке)"""
         if not self.current_project:
             messagebox.showwarning("Предупреждение", "Выберите проект")
             return
-        
-        try:
-            self.add_log("Запуск валидации проекта...", "info")
-            
-            result = self.pipeline_runner.validate_project_for_pipeline(self.current_project.project_id)
-            
-            if result.get("valid", False):
-                self.add_log("✅ Проект прошел валидацию", "success")
-            else:
-                message = result.get("message", "Неизвестная ошибка")
-                self.add_log(f"❌ Ошибки валидации: {message}", "error")
-            
-        except Exception as e:
-            logger.error(f"Ошибка валидации проекта: {e}")
-            self.add_log(f"❌ Ошибка валидации: {e}", "error")
+
+        project_id = self.current_project.project_id
+        self.add_log("Запуск валидации проекта...", "info")
+
+        def _run():
+            try:
+                result = self.pipeline_runner.validate_project_for_pipeline(project_id)
+                if result.get("valid", False):
+                    self.after(0, lambda: self.add_log("✅ Проект прошел валидацию", "success"))
+                else:
+                    message = result.get("message", "Неизвестная ошибка")
+                    self.after(0, lambda: self.add_log(f"❌ Ошибки валидации: {message}", "error"))
+            except Exception as e:
+                logger.error(f"Ошибка валидации проекта: {e}")
+                self.after(0, lambda: self.add_log(f"❌ Ошибка валидации: {e}", "error"))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def check_provider_readiness(self):
-        """Показывает pre-run сводку доступности video/music провайдеров."""
+        """Показывает pre-run сводку доступности video/music провайдеров (в фоновом потоке)."""
         if not self.current_project:
             messagebox.showwarning("Предупреждение", "Выберите проект")
             return
 
-        try:
-            readiness = self._load_provider_readiness(self.current_project.project_id)
-            for message, level in self._format_provider_readiness_summary(readiness):
-                self.add_log(message, level)
-        except Exception as e:
-            logger.error(f"Ошибка проверки video/music providers: {e}")
-            self.add_log(f"❌ Ошибка проверки video/music providers: {e}", "error")
+        project_id = self.current_project.project_id
+        self.add_log("Проверка готовности провайдеров...", "info")
+
+        def _run():
+            try:
+                readiness = self._load_provider_readiness(project_id)
+                lines = self._format_provider_readiness_summary(readiness)
+                for message, level in lines:
+                    self.after(0, lambda m=message, lv=level: self.add_log(m, lv))
+            except Exception as e:
+                logger.error(f"Ошибка проверки video/music providers: {e}")
+                self.after(0, lambda: self.add_log(f"❌ Ошибка проверки video/music providers: {e}", "error"))
+
+        threading.Thread(target=_run, daemon=True).start()
     
     def fix_project_errors(self):
-        """Исправление ошибок проекта"""
-        # TODO: Реализовать автоматическое исправление ошибок
-        messagebox.showinfo("Информация", "Функция автоматического исправления ошибок будет реализована позже")
+        """Исправление ошибок проекта — не реализовано"""
+        messagebox.showinfo("Не реализовано", "Автоматическое исправление ошибок не реализовано")
 
     def _resolve_project_path(self, project_id: str) -> Path:
         """Возвращает путь проекта для чтения артефактов video pipeline."""
@@ -1552,9 +1580,12 @@ class GenerationPanel(ttk.Frame):
         return messages
 
     def _append_video_artifact_summary(self, project_id: str):
-        """Пишет сводку video artifacts в UI-лог после выполнения pipeline."""
+        """Пишет сводку video artifacts в UI-лог после выполнения pipeline.
+
+        Метод thread-safe: может вызываться из фонового потока.
+        """
         for message, level in self._build_video_artifact_summary(project_id):
-            self.add_log(message, level)
+            self.after(0, lambda m=message, l=level: self.add_log(m, l))
 
     def start_generation(self, generation_type: str, params: Dict[str, Any]):
         """Начало генерации.
@@ -1598,6 +1629,11 @@ class GenerationPanel(ttk.Frame):
             self.pause_button.config(state="disabled", text="⏸ Пауза")
             self.status_label.config(text=f"Завершено за {elapsed_str}")
             self.generation_thread = None
+            if self.on_generation_complete:
+                try:
+                    self.on_generation_complete()
+                except Exception as _e:
+                    logger.warning(f"on_generation_complete callback error: {_e}")
 
         self.after(0, _update_ui)
     

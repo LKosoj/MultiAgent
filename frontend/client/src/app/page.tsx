@@ -17,6 +17,8 @@ import {
   ToolsSection,
   SystemSection,
 } from "./components/sections/ActionCardSections";
+import { CustomSection } from "./components/sections/CustomSection";
+import { Toast, useToast } from "./components/shared/Toast";
 import { KeyValueList } from "./components/shared/KeyValueList";
 import {
   buildWorkflowParameters,
@@ -163,6 +165,7 @@ const getModelKey = (model: unknown) => {
 function AguiStudio() {
   const { agent } = useAgent({ agentId: "default" });
   const { copilotkit } = useCopilotKit();
+  const { toasts, dismiss: dismissToast, notify } = useToast();
 
   const [results, setResults] = useState<ServiceResult[]>([]);
   const [, setPendingTick] = useState(0);
@@ -400,6 +403,7 @@ function AguiStudio() {
     { id: "config", label: "Конфигурация" },
     { id: "telemetry", label: "Телеметрия" },
     { id: "system", label: "Система" },
+    { id: "custom", label: "Произвольные действия" },
   ];
 
   const appendResult = useCallback((entry: ServiceResult) => {
@@ -1332,6 +1336,9 @@ function AguiStudio() {
           <div className="app-title">MultiAgent Studio</div>
           <div className="app-subtitle">Центр управления запусками, сервисными функциями и мониторинга</div>
         </div>
+        <span className={`status-pill ${serviceReady ? "status-pill--online" : "status-pill--offline"}`}>
+          {serviceReady ? "Online" : "Offline"}
+        </span>
       </header>
 
       <main className="app-grid">
@@ -1408,12 +1415,13 @@ function AguiStudio() {
             />
           ) : null}
 
-          {activeSection === "dynamic-agents" ? <DynamicAgentsSection runServiceAction={runServiceAction} isBusy={isBusy} /> : null}
+          {activeSection === "dynamic-agents" ? <DynamicAgentsSection runServiceAction={runServiceAction} isBusy={isBusy} notify={notify} /> : null}
 
           {activeSection === "workflows" ? (
             <WorkflowsSection
               isBusy={isBusy}
               runServiceAction={runServiceAction}
+              notify={notify}
               workflowTab={workflowTab}
               setWorkflowTab={setWorkflowTab}
               workflows={workflows}
@@ -1482,6 +1490,7 @@ function AguiStudio() {
               runServiceAction={runServiceAction}
               isBusy={isBusy}
               active={activeSection === "text-to-sql"}
+              notify={notify}
             />
           </div>
 
@@ -1551,6 +1560,10 @@ function AguiStudio() {
 
           {activeSection === "system" ? (
             <SystemSection runServiceAction={runServiceAction} isBusy={isBusy} progressResults={results} clearProgressResults={clearProgressResults} />
+          ) : null}
+
+          {activeSection === "custom" ? (
+            <CustomSection runServiceAction={runServiceAction} isBusy={isBusy} results={results} clearResults={clearProgressResults} />
           ) : null}
 
         </section>
@@ -1770,6 +1783,7 @@ function AguiStudio() {
           </div>
         </div>
       ) : null}
+      <Toast toasts={toasts} dismiss={dismissToast} />
     </div>
   );
 }

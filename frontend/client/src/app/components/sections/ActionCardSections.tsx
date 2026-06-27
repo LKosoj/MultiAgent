@@ -99,6 +99,7 @@ export function ConfigSection({ runServiceAction, isBusy }: ActionCardProps) {
   const [resourceLimitsForm, setResourceLimitsForm] = useState<any>({});
   const [performanceForm, setPerformanceForm] = useState<any>({});
   const [networkForm, setNetworkForm] = useState<any>({});
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -292,10 +293,30 @@ export function ConfigSection({ runServiceAction, isBusy }: ActionCardProps) {
             </label>
           </div>
           <div className="button-row">
-            <button className="button" type="button" onClick={() => updateSection("llm", llmForm)} disabled={isBusy}>
+            <button
+              className="button"
+              type="button"
+              disabled={isBusy || isSubmitting}
+              onClick={async () => {
+                if (isSubmitting) return;
+                setIsSubmitting(true);
+                try { await updateSection("llm", llmForm); } finally { setIsSubmitting(false); }
+              }}
+            >
+              {isSubmitting ? <span className="spinner" /> : null}
               Сохранить
             </button>
-            <button className="button secondary" type="button" onClick={handleLlmTest} disabled={isBusy}>
+            <button
+              className="button secondary"
+              type="button"
+              disabled={isBusy || isSubmitting}
+              onClick={async () => {
+                if (isSubmitting) return;
+                setIsSubmitting(true);
+                try { await handleLlmTest(); } finally { setIsSubmitting(false); }
+              }}
+            >
+              {isSubmitting ? <span className="spinner" /> : null}
               Тест соединения
             </button>
           </div>

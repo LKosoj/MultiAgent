@@ -3074,7 +3074,7 @@ def test_streamlit_structured_sql_extractor_reads_step_result_outputs():
 def _extract_generate_sql_query_slice(source: str) -> str:
     """Возвращает срез исходника, относящийся к функции generate_sql_query."""
     start = source.index("def generate_sql_query")
-    end = source.index("\ndef execute_sql_query", start)
+    end = source.index("\ndef explain_natural_query", start)
     return source[start:end]
 
 

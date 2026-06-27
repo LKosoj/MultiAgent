@@ -184,7 +184,10 @@ export function DashboardSection({ runServiceAction, isBusy, onNavigate, service
   }, [autoTick, serviceReady, loadMetrics]);
 
   useEffect(() => {
-    const id = window.setInterval(() => setAutoTick((t) => t + 1), 5000);
+    const tick = () => {
+      if (!document.hidden) setAutoTick((t) => t + 1);
+    };
+    const id = window.setInterval(tick, 5000);
     return () => window.clearInterval(id);
   }, []);
 

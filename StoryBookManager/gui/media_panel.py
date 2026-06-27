@@ -70,7 +70,15 @@ class MediaPanel(ttk.Frame):
         self.is_paused = False
         self.video_thread = None
         self.fps = 30  # По умолчанию
-        
+        self._stop_playback = threading.Event()
+
+        # Фоновое сканирование медиа
+        self._refresh_in_progress = False
+        self._media_items: List[Dict[str, Any]] = []  # кэш всех элементов для фильтрации
+
+        # Для зума панели просмотра
+        self._zoom_image_path: Optional[str] = None
+
         self.create_ui()
     
     def create_ui(self):
@@ -262,30 +270,82 @@ class MediaPanel(ttk.Frame):
             messagebox.showerror("Ошибка", f"Не удалось загрузить проект:\n{e}")
     
     def refresh_media(self):
-        """Обновление списка медиа файлов"""
+        """Обновление списка медиа файлов (сканирование в фоне, вставка порциями)"""
         if not self.media_processor:
             return
-        
+
+        if self._refresh_in_progress:
+            return
+
+        self._refresh_in_progress = True
+
+        # Очищаем дерево и показываем статус
+        for item in self.media_tree.get_children():
+            self.media_tree.delete(item)
+        self._media_items = []
+        self._status_item = self.media_tree.insert(
+            "", "end", text="Обновление...", values=("", "", "", "")
+        )
+
+        def _scan():
+            try:
+                images = self.media_processor.get_project_images()
+                videos = self.media_processor.get_project_videos()
+                all_items = [(img, "image") for img in images] + [(vid, "video") for vid in videos]
+            except Exception as exc:
+                self.after(0, lambda e=exc: self._refresh_error(e))
+                return
+            self.after(0, lambda items=all_items: self._refresh_deliver(items))
+
+        threading.Thread(target=_scan, daemon=True).start()
+
+    def _refresh_error(self, exc: Exception):
+        """Показывает ошибку сканирования в главном потоке"""
+        self._refresh_in_progress = False
+        if hasattr(self, '_status_item'):
+            try:
+                self.media_tree.delete(self._status_item)
+            except Exception:
+                pass
+        logger.error(f"Ошибка обновления медиа файлов: {exc}")
+        messagebox.showerror("Ошибка", f"Не удалось обновить медиа файлы:\n{exc}")
+
+    def _refresh_deliver(self, items: List[tuple], offset: int = 0, batch: int = 20):
+        """Вставляет items в Treeview порциями, вызывается в главном потоке"""
+        next_offset = offset + batch
         try:
-            # Очищаем дерево
-            for item in self.media_tree.get_children():
-                self.media_tree.delete(item)
-            
-            # Загружаем изображения
-            images = self.media_processor.get_project_images()
-            for image in images:
-                self.add_media_item(image, "image")
-            
-            # Загружаем видео
-            videos = self.media_processor.get_project_videos()
-            for video in videos:
-                self.add_media_item(video, "video")
-            
-            logger.info(f"Загружено {len(images)} изображений и {len(videos)} видео")
-            
-        except Exception as e:
-            logger.error(f"Ошибка обновления медиа файлов: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось обновить медиа файлы:\n{e}")
+            # Удаляем статус-запись при первой порции
+            if offset == 0:
+                try:
+                    self.media_tree.delete(self._status_item)
+                except Exception:
+                    pass
+
+            chunk = items[offset:offset + batch]
+            for media_info, media_type in chunk:
+                self._media_items.append((media_info, media_type))
+                self._apply_filter_item(media_info, media_type)
+
+            if next_offset < len(items):
+                self.after(0, lambda: self._refresh_deliver(items, next_offset, batch))
+            else:
+                self._refresh_in_progress = False
+                logger.info(f"Загружено {len(items)} медиа файлов")
+        except Exception as exc:
+            # Исключение из after-callback Tkinter молча проглатывает, поэтому логируем явно
+            self._refresh_in_progress = False
+            logger.error(f"Ошибка доставки медиа в дерево: {exc}")
+
+    def _apply_filter_item(self, media_info: Dict[str, Any], media_type: str):
+        """Добавляет элемент в дерево, если он соответствует текущему фильтру"""
+        fval = self.media_filter.get() if hasattr(self, 'media_filter') else "all"
+        item_type = media_info.get("type", media_type)
+        if fval == "all":
+            self.add_media_item(media_info, media_type)
+        elif fval == "videos" and media_type == "video":
+            self.add_media_item(media_info, media_type)
+        elif fval == item_type or fval == media_info.get("category", ""):
+            self.add_media_item(media_info, media_type)
     
     def add_media_item(self, media_info: Dict[str, Any], media_type: str):
         """Добавление медиа элемента в дерево"""
@@ -330,9 +390,15 @@ class MediaPanel(ttk.Frame):
         return f"{size_bytes:.1f} TB"
     
     def on_filter_changed(self, *args):
-        """Обработчик изменения фильтра"""
-        # TODO: Реализовать фильтрацию медиа файлов
-        pass
+        """Перефильтровывает дерево по кэшу без повторного сканирования файловой системы"""
+        if self._refresh_in_progress:
+            return
+
+        for item in self.media_tree.get_children():
+            self.media_tree.delete(item)
+
+        for media_info, media_type in self._media_items:
+            self._apply_filter_item(media_info, media_type)
     
     def on_media_select(self, event):
         """Обработчик выбора медиа файла"""
@@ -365,25 +431,28 @@ class MediaPanel(ttk.Frame):
     
     def update_file_info(self, file_path: str):
         """Обновление информации о файле"""
+        self.file_info_text.delete("1.0", tk.END)
         try:
             file_path_obj = Path(file_path)
-            
-            # Очищаем текущую информацию
-            self.file_info_text.delete("1.0", tk.END)
-            
+
             if not file_path_obj.exists():
-                self.file_info_text.insert("1.0", "Файл не найден")
+                self.file_info_text.insert("1.0", f"Файл не найден:\n{file_path_obj.name}")
                 return
-            
+
             # Базовая информация
-            stat = file_path_obj.stat()
+            try:
+                stat = file_path_obj.stat()
+            except PermissionError:
+                self.file_info_text.insert("1.0", f"Нет доступа к файлу:\n{file_path_obj.name}")
+                return
+
             info_lines = [
                 f"Файл: {file_path_obj.name}",
                 f"Путь: {file_path_obj.parent}",
                 f"Размер: {self.format_file_size(stat.st_size)}",
                 f"Изменен: {self.format_timestamp(stat.st_mtime)}"
             ]
-            
+
             # Дополнительная информация для изображений
             if self.media_processor and file_path_obj.suffix.lower() in ['.png', '.jpg', '.jpeg', '.gif', '.bmp']:
                 image_info = self.media_processor.get_image_info(file_path)
@@ -392,13 +461,16 @@ class MediaPanel(ttk.Frame):
                     info_lines.append(f"Размеры: {width} × {height}")
                 if image_info.get("format"):
                     info_lines.append(f"Формат: {image_info['format']}")
-            
-            # Выводим информацию
+
             self.file_info_text.insert("1.0", "\n".join(info_lines))
-            
+
+        except FileNotFoundError:
+            self.file_info_text.insert("1.0", f"Файл не найден:\n{Path(file_path).name}")
+        except PermissionError:
+            self.file_info_text.insert("1.0", f"Нет доступа к файлу:\n{Path(file_path).name}")
         except Exception as e:
             logger.error(f"Ошибка получения информации о файле: {e}")
-            self.file_info_text.insert("1.0", f"Ошибка: {e}")
+            self.file_info_text.insert("1.0", f"Ошибка чтения метаданных:\n{e}")
     
     def format_timestamp(self, timestamp: float) -> str:
         """Форматирование временной метки"""
@@ -406,90 +478,134 @@ class MediaPanel(ttk.Frame):
         return datetime.datetime.fromtimestamp(timestamp).strftime("%d.%m.%Y %H:%M:%S")
     
     def display_image(self, image_path: str):
-        """Отображение изображения"""
+        """Отображение изображения (декодирование в фоновом потоке)"""
         if not self.media_processor:
             return
-        
+
+        # Скрываем метку пустого состояния
         try:
-            # Скрываем метку пустого состояния
             self.empty_label.pack_forget()
-            
-            # Показываем кнопку редактирования изображений
-            self.edit_image_btn.pack(side="left", padx=5)
-            
-            # Скрываем кнопки управления видео (если показаны)
-            self.play_video_btn.pack_forget()
-            self.pause_video_btn.pack_forget()
-            self.stop_video_btn.pack_forget()
-            
-            # Останавливаем видео если воспроизводится
-            self.stop_video()
-            
-            # Загружаем изображение для отображения
-            photo = self.media_processor.load_image_for_display(image_path)
-            
-            if photo:
-                self.current_photo = photo
-                
-                # Очищаем canvas
-                self.image_canvas.delete("all")
-                
-                # Центрируем изображение
-                canvas_width = self.image_canvas.winfo_width()
-                canvas_height = self.image_canvas.winfo_height()
-                
-                x = canvas_width // 2
-                y = canvas_height // 2
-                
-                # Отображаем изображение
-                self.image_canvas.create_image(x, y, image=photo, anchor="center", tags="image")
-                
-                # Настраиваем область прокрутки
-                self.image_canvas.configure(scrollregion=self.image_canvas.bbox("all"))
-                
-            else:
-                self.show_error_message("Не удалось загрузить изображение")
-            
-        except Exception as e:
-            logger.error(f"Ошибка отображения изображения {image_path}: {e}")
-            self.show_error_message(f"Ошибка отображения изображения:\n{e}")
+        except Exception:
+            pass
+
+        # Показываем кнопку редактирования изображений
+        self.edit_image_btn.pack(side="left", padx=5)
+
+        # Скрываем кнопки управления видео (если показаны)
+        self.play_video_btn.pack_forget()
+        self.pause_video_btn.pack_forget()
+        self.stop_video_btn.pack_forget()
+
+        # Останавливаем видео если воспроизводится
+        self.stop_video()
+
+        # Сохраняем путь для зума
+        self._zoom_image_path = image_path
+
+        # Показываем плейсхолдер загрузки
+        self.image_canvas.delete("all")
+        self.image_canvas.create_text(
+            self.image_canvas.winfo_width() // 2 or 200,
+            self.image_canvas.winfo_height() // 2 or 150,
+            text="Загрузка...",
+            font=("Arial", 12),
+            fill="gray",
+            tags="loading_placeholder"
+        )
+
+        def _load():
+            try:
+                p = Path(image_path)
+                if not p.exists():
+                    self.after(0, lambda: self.show_error_message(
+                        f"Файл не найден:\n{p.name}"
+                    ))
+                    return
+                photo = self.media_processor.load_image_for_display(image_path)
+                if photo:
+                    self.after(0, lambda ph=photo: self._on_image_loaded(ph, image_path))
+                else:
+                    self.after(0, lambda: self.show_error_message("Не удалось загрузить изображение"))
+            except PermissionError:
+                self.after(0, lambda: self.show_error_message(f"Нет доступа к файлу:\n{Path(image_path).name}"))
+            except Exception as exc:
+                logger.error(f"Ошибка декодирования изображения {image_path}: {exc}")
+                self.after(0, lambda e=exc: self.show_error_message(f"Ошибка загрузки:\n{e}"))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _on_image_loaded(self, photo, image_path: str):
+        """Отображает загруженное изображение в главном потоке"""
+        # Игнорируем результат если пользователь уже переключился на другой файл
+        if self._zoom_image_path != image_path:
+            return
+        self.current_photo = photo
+        self.image_canvas.delete("all")
+        canvas_width = self.image_canvas.winfo_width()
+        canvas_height = self.image_canvas.winfo_height()
+        x = canvas_width // 2 or 200
+        y = canvas_height // 2 or 150
+        self.image_canvas.create_image(x, y, image=photo, anchor="center", tags="image")
+        self.image_canvas.configure(scrollregion=self.image_canvas.bbox("all"))
     
     def display_video_thumbnail(self, video_path: str):
-        """Отображение превью видео"""
+        """Отображение превью видео (извлечение кадра в фоновом потоке)"""
         if not self.media_processor:
             return
-        
+
+        self.current_video_path = video_path
+
+        # Показываем плейсхолдер
+        self.image_canvas.delete("all")
         try:
-            self.current_video_path = video_path
-            
-            # Создаем превью кадр
-            thumbnail_path = self.media_processor.get_video_thumbnail(video_path)
-            
-            if thumbnail_path:
-                self.display_image(thumbnail_path)
-                
-                # Добавляем индикатор видео
-                self.image_canvas.create_text(
-                    50, 50, 
-                    text="🎬 ВИДЕО", 
-                    font=("Arial", 14, "bold"), 
-                    fill="white",
-                    tags="video_indicator"
-                )
-                
-                # Скрываем кнопку редактирования изображений для видео
-                self.edit_image_btn.pack_forget()
-                
-                # Показываем кнопки управления видео
-                self.play_video_btn.pack(side="left", padx=5)
-                self.pause_video_btn.pack(side="left", padx=2)
-                self.stop_video_btn.pack(side="left", padx=2)
-            else:
-                self.show_error_message("Не удалось создать превью видео")
-            
-        except Exception as e:
-            logger.error(f"Ошибка отображения превью видео {video_path}: {e}")
-            self.show_error_message(f"Ошибка отображения видео:\n{e}")
+            self.empty_label.pack_forget()
+        except Exception:
+            pass
+        self.image_canvas.create_text(
+            self.image_canvas.winfo_width() // 2 or 200,
+            self.image_canvas.winfo_height() // 2 or 150,
+            text="Загрузка превью...",
+            font=("Arial", 12),
+            fill="gray",
+            tags="loading_placeholder"
+        )
+
+        def _get_thumb():
+            try:
+                p = Path(video_path)
+                if not p.exists():
+                    self.after(0, lambda: self.show_error_message(f"Видео файл не найден:\n{p.name}"))
+                    return
+                thumbnail_path = self.media_processor.get_video_thumbnail(video_path)
+                if thumbnail_path:
+                    self.after(0, lambda tp=thumbnail_path: self._on_video_thumb_ready(tp))
+                else:
+                    self.after(0, lambda: self.show_error_message("Не удалось создать превью видео"))
+            except Exception as exc:
+                logger.error(f"Ошибка получения превью видео {video_path}: {exc}")
+                self.after(0, lambda e=exc: self.show_error_message(f"Ошибка превью видео:\n{e}"))
+
+        threading.Thread(target=_get_thumb, daemon=True).start()
+
+    def _on_video_thumb_ready(self, thumbnail_path: str):
+        """Показывает превью видео в главном потоке после фонового извлечения кадра"""
+        self.display_image(thumbnail_path)
+        # Добавляем индикатор видео (after display_image запускает свой поток, индикатор добавим после)
+        self.after(50, self._add_video_controls)
+
+    def _add_video_controls(self):
+        """Добавляет оверлей и кнопки управления видео"""
+        self.image_canvas.create_text(
+            50, 50,
+            text="🎬 ВИДЕО",
+            font=("Arial", 14, "bold"),
+            fill="white",
+            tags="video_indicator"
+        )
+        self.edit_image_btn.pack_forget()
+        self.play_video_btn.pack(side="left", padx=5)
+        self.pause_video_btn.pack(side="left", padx=2)
+        self.stop_video_btn.pack(side="left", padx=2)
     
     def show_unsupported_file(self):
         """Показ сообщения о неподдерживаемом файле"""
@@ -529,18 +645,60 @@ class MediaPanel(ttk.Frame):
     
     def zoom_in(self):
         """Увеличение изображения"""
-        # TODO: Реализовать зум
-        messagebox.showinfo("Информация", "Функция зума будет реализована позже")
-    
+        self.zoom_factor = min(self.zoom_factor * 1.25, 8.0)
+        self._apply_zoom()
+
     def zoom_out(self):
         """Уменьшение изображения"""
-        # TODO: Реализовать зум
-        messagebox.showinfo("Информация", "Функция зума будет реализована позже")
-    
+        self.zoom_factor = max(self.zoom_factor / 1.25, 0.1)
+        self._apply_zoom()
+
     def fit_to_window(self):
         """Подгонка изображения под размер окна"""
-        # TODO: Реализовать подгонку размера
-        messagebox.showinfo("Информация", "Функция подгонки размера будет реализована позже")
+        self.zoom_factor = 1.0
+        self._apply_zoom()
+
+    def _apply_zoom(self):
+        """Перемасштабирует текущее изображение и обновляет canvas"""
+        if not self._zoom_image_path or not HAS_PIL:
+            return
+
+        path = Path(self._zoom_image_path)
+        if not path.exists():
+            return
+
+        zoom = self.zoom_factor
+        target_path = self._zoom_image_path
+
+        def _resize():
+            try:
+                with Image.open(str(path)) as img:
+                    # Конвертируем режим как в load_image_for_display
+                    if img.mode in ('RGBA', 'LA', 'P'):
+                        bg = Image.new('RGB', img.size, (255, 255, 255))
+                        if img.mode == 'P':
+                            img = img.convert('RGBA')
+                        bg.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                        img = bg
+                    canvas_w = self.image_canvas.winfo_width() or 400
+                    canvas_h = self.image_canvas.winfo_height() or 300
+                    # При zoom==1 подгоняем по окну, иначе масштабируем от оригинала
+                    if zoom == 1.0:
+                        img.thumbnail((canvas_w, canvas_h), Image.Resampling.LANCZOS)
+                    else:
+                        new_w = max(1, int(img.width * zoom))
+                        new_h = max(1, int(img.height * zoom))
+                        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    # Копируем PIL.Image ДО закрытия контекстного менеджера,
+                    # чтобы ImageTk.PhotoImage можно было создать в главном потоке
+                    pil_img = img.copy()
+                self.after(0, lambda pi=pil_img, p=target_path: self._on_image_loaded(
+                    ImageTk.PhotoImage(pi), p
+                ))
+            except Exception as exc:
+                logger.error(f"Ошибка зума: {exc}")
+
+        threading.Thread(target=_resize, daemon=True).start()
     
     def play_video_external(self):
         """Воспроизведение видео в системном плеере"""
@@ -553,17 +711,17 @@ class MediaPanel(ttk.Frame):
             if not video_path.exists():
                 messagebox.showerror("Ошибка", "Видео файл не найден")
                 return
-            
+
             import subprocess
-            import sys
-            
+
             if sys.platform == "win32":
-                subprocess.run(["start", video_path], shell=True)
+                import os as _os
+                _os.startfile(str(video_path))
             elif sys.platform == "darwin":  # macOS
-                subprocess.run(["open", video_path])
+                subprocess.run(["open", str(video_path)])
             else:  # Linux
-                subprocess.run(["xdg-open", video_path])
-                
+                subprocess.run(["xdg-open", str(video_path)])
+
             logger.info(f"Открыто видео для воспроизведения: {video_path}")
                 
         except Exception as e:
@@ -631,21 +789,27 @@ class MediaPanel(ttk.Frame):
         if self.is_playing:
             self.is_playing = False
             self.is_paused = False
-            
+            self._stop_playback.set()
+
+            if self.video_thread and self.video_thread.is_alive():
+                self.video_thread.join(timeout=1.0)
+
+            self._stop_playback.clear()
+
             if self.video_capture:
                 self.video_capture.release()
                 self.video_capture = None
-            
+
             # Сбрасываем текст кнопки
             self.pause_video_btn.config(text="⏸️ Пауза")
-            
+
             logger.info("Воспроизведение видео остановлено")
     
     def _video_playback_loop(self):
         """Основной цикл воспроизведения видео"""
         frame_delay = 1.0 / self.fps
-        
-        while self.is_playing and self.video_capture:
+
+        while self.is_playing and self.video_capture and not self._stop_playback.is_set():
             if not self.is_paused:
                 ret, frame = self.video_capture.read()
                 
@@ -678,12 +842,11 @@ class MediaPanel(ttk.Frame):
                         # Конвертируем BGR в RGB
                         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                         
-                        # Конвертируем в PIL Image и затем в PhotoImage
+                        # Конвертируем в PIL Image и передаём в главный поток
                         pil_image = Image.fromarray(frame_rgb)
-                        photo = ImageTk.PhotoImage(pil_image)
-                        
-                        # Обновляем canvas в главном потоке
-                        self.image_canvas.after(0, self._update_video_frame, photo)
+
+                        # Обновляем canvas в главном потоке (PhotoImage создаётся там)
+                        self.image_canvas.after(0, self._update_video_frame, pil_image)
                         
                 except Exception as e:
                     logger.error(f"Ошибка обработки кадра видео: {e}")
@@ -691,14 +854,16 @@ class MediaPanel(ttk.Frame):
             
             time.sleep(frame_delay)
         
-        # Освобождаем ресурсы
-        if self.video_capture:
+        # Освобождаем ресурсы только если stop_video не сделал это сам
+        if self.video_capture and not self._stop_playback.is_set():
             self.video_capture.release()
             self.video_capture = None
     
-    def _update_video_frame(self, photo):
+    def _update_video_frame(self, pil_image):
         """Обновление кадра видео в canvas (вызывается в главном потоке)"""
         try:
+            # PhotoImage создаём здесь — в главном Tk-потоке (thread-safe)
+            photo = ImageTk.PhotoImage(pil_image)
             # Сохраняем ссылку на фото чтобы оно не удалилось сборщиком мусора
             self.current_photo = photo
             
@@ -723,15 +888,15 @@ class MediaPanel(ttk.Frame):
         if current_path:
             try:
                 import subprocess
-                import sys
-                
+
                 if sys.platform == "win32":
-                    subprocess.run(["start", current_path], shell=True)
+                    import os as _os
+                    _os.startfile(str(current_path))
                 elif sys.platform == "darwin":
-                    subprocess.run(["open", current_path])
+                    subprocess.run(["open", str(current_path)])
                 else:
-                    subprocess.run(["xdg-open", current_path])
-                    
+                    subprocess.run(["xdg-open", str(current_path)])
+
             except Exception as e:
                 logger.error(f"Ошибка открытия файла в системе: {e}")
                 messagebox.showerror("Ошибка", f"Не удалось открыть файл:\n{e}")
@@ -754,7 +919,7 @@ class MediaPanel(ttk.Frame):
             context_menu.add_command(label="Открыть в системе", command=self.open_in_system)
             context_menu.add_command(label="Показать в папке", command=self.show_in_folder)
             context_menu.add_separator()
-            context_menu.add_command(label="Регенерировать", command=self.regenerate_media)
+            context_menu.add_command(label="Регенерировать (недоступно)", state="disabled")
             context_menu.add_command(label="Копировать путь", command=self.copy_path)
             
             # Показываем меню
@@ -769,8 +934,7 @@ class MediaPanel(ttk.Frame):
         if current_path:
             try:
                 import subprocess
-                import sys
-                
+
                 folder_path = str(Path(current_path).parent)
                 
                 if sys.platform == "win32":
@@ -823,6 +987,11 @@ class MediaPanel(ttk.Frame):
     def clear_cache(self):
         """Очистка кэша медиа файлов"""
         if self.media_processor:
+            if not messagebox.askyesno(
+                "Подтверждение",
+                "Очистить кэш медиа файлов?\nМиниатюры будут пересозданы при следующем открытии."
+            ):
+                return
             try:
                 self.media_processor.cleanup_cache()
                 messagebox.showinfo("Успех", "Кэш медиа файлов очищен")
@@ -1350,49 +1519,73 @@ class ImageEditDialog:
         self.update_mini_previews()
     
     def show_preview_image(self, image_path: str, description: str = ""):
-        """Отображение изображения в панели предпросмотра"""
-        try:
-            if not HAS_PIL:
-                self.preview_info_label.config(text="PIL не установлен")
-                return
-            
-            # Очищаем canvas
-            self.preview_canvas.delete("all")
-            
-            # Загружаем и масштабируем изображение
-            with Image.open(image_path) as img:
-                # Масштабируем изображение, сохраняя пропорции
-                img.thumbnail((290, 310), Image.Resampling.LANCZOS)
-                
-                # Конвертируем для Tkinter
-                self.preview_photo = ImageTk.PhotoImage(img)
-                
-                # Центрируем изображение на canvas
-                canvas_width = self.preview_canvas.winfo_reqwidth()
-                canvas_height = self.preview_canvas.winfo_reqheight()
-                x = canvas_width // 2
-                y = canvas_height // 2
-                
-                self.preview_canvas.create_image(x, y, image=self.preview_photo, anchor="center")
-                
-                # Обновляем информацию
-                file_name = Path(image_path).name
-                img_size = f"{img.width}×{img.height}"
-                info_text = f"{description}\n{file_name}\n{img_size}"
-                self.preview_info_label.config(text=info_text)
-                
-                # Обновляем путь к текущему изображению
-                self.current_preview_path = image_path
-                
-        except Exception as e:
-            self.preview_canvas.create_text(
-                150, 160,
-                text=f"Ошибка загрузки:\n{str(e)}",
-                font=("Arial", 10),
-                justify="center",
-                fill="red"
-            )
-            self.preview_info_label.config(text=f"Ошибка: {Path(image_path).name}")
+        """Отображение изображения в панели предпросмотра (декодирование в фоне)"""
+        if not HAS_PIL:
+            self.preview_info_label.config(text="PIL не установлен")
+            return
+
+        # Плейсхолдер
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(
+            self.preview_canvas.winfo_reqwidth() // 2 or 150,
+            self.preview_canvas.winfo_reqheight() // 2 or 160,
+            text="Загрузка...",
+            font=("Arial", 10),
+            fill="gray",
+            tags="loading"
+        )
+        self.current_preview_path = image_path
+
+        def _load():
+            try:
+                p = Path(image_path)
+                if not p.exists():
+                    self.preview_canvas.after(0, lambda: (
+                        self.preview_canvas.delete("all"),
+                        self.preview_canvas.create_text(
+                            150, 160, text=f"Файл не найден:\n{p.name}",
+                            font=("Arial", 10), fill="red", justify="center"
+                        )
+                    ))
+                    return
+                with Image.open(str(p)) as img:
+                    img.thumbnail((290, 310), Image.Resampling.LANCZOS)
+                    # Сохраняем размеры и копию до закрытия контекстного менеджера;
+                    # ImageTk.PhotoImage создаётся в главном потоке через after(0,...)
+                    w, h = img.width, img.height
+                    pil_img = img.copy()
+                info_text = f"{description}\n{p.name}\n{w}×{h}"
+                self.preview_canvas.after(
+                    0,
+                    lambda pi=pil_img, txt=info_text: self._set_preview_photo(
+                        ImageTk.PhotoImage(pi), txt, image_path
+                    )
+                )
+            except Exception as exc:
+                self.preview_canvas.after(0, lambda e=exc: (
+                    self.preview_canvas.delete("all"),
+                    self.preview_canvas.create_text(
+                        150, 160, text=f"Ошибка загрузки:\n{e}",
+                        font=("Arial", 10), fill="red", justify="center"
+                    ),
+                    self.preview_info_label.config(text=f"Ошибка: {Path(image_path).name}")
+                ))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _set_preview_photo(self, photo, info_text: str, image_path: str):
+        """Устанавливает загруженное фото в preview canvas (главный поток)"""
+        # Игнорируем устаревший результат
+        if self.current_preview_path != image_path:
+            return
+        self.preview_photo = photo
+        self.preview_canvas.delete("all")
+        canvas_width = self.preview_canvas.winfo_reqwidth()
+        canvas_height = self.preview_canvas.winfo_reqheight()
+        x = canvas_width // 2 or 150
+        y = canvas_height // 2 or 160
+        self.preview_canvas.create_image(x, y, image=photo, anchor="center")
+        self.preview_info_label.config(text=info_text)
     
     def update_mini_previews(self):
         """Обновление мини-превью выбранных референсов"""
@@ -1413,63 +1606,63 @@ class ImageEditDialog:
         self.mini_canvas.configure(scrollregion=self.mini_canvas.bbox("all"))
     
     def create_mini_preview(self, image_path: str, label: str, index: int, is_original: bool = False):
-        """Создание одного мини-превью"""
-        try:
-            if not HAS_PIL:
-                return
-            
-            # Контейнер для мини-превью
-            mini_frame = ttk.Frame(self.mini_scrollable_frame)
-            mini_frame.pack(side="left", padx=2, pady=2)
-            
-            # Загружаем и уменьшаем изображение
-            with Image.open(image_path) as img:
-                # Создаем миниатюру 70x70
-                img.thumbnail((70, 70), Image.Resampling.LANCZOS)
-                mini_photo = ImageTk.PhotoImage(img)
-                
-                # Canvas для мини-изображения
-                mini_canvas = tk.Canvas(mini_frame, width=75, height=75, 
-                                      bg="lightblue" if is_original else "lightgray",
-                                      highlightthickness=2,
-                                      highlightcolor="blue" if is_original else "gray")
-                mini_canvas.pack()
-                
-                # Отображаем изображение
-                mini_canvas.create_image(37, 37, image=mini_photo, anchor="center")
-                
-                # Подпись
-                label_widget = ttk.Label(mini_frame, text=label, font=("TkDefaultFont", 8))
-                label_widget.pack()
-                
-                # Сохраняем ссылки на объекты
-                self.mini_previews.append({
-                    'frame': mini_frame,
-                    'canvas': mini_canvas,
-                    'photo': mini_photo,
-                    'label': label_widget,
-                    'path': image_path
-                })
-                
-                # Привязываем клик для увеличения в основном превью
-                def on_click(event, path=image_path, desc=label):
-                    if is_original:
-                        self.show_preview_image(path, "Исходное изображение")
-                    else:
-                        self.show_preview_image(path, f"Референс: {Path(path).name}")
-                
-                mini_canvas.bind("<Button-1>", on_click)
-                
-        except Exception as e:
-            # Создаем заглушку при ошибке
-            mini_frame = ttk.Frame(self.mini_scrollable_frame)
-            mini_frame.pack(side="left", padx=2, pady=2)
-            
-            error_canvas = tk.Canvas(mini_frame, width=75, height=75, bg="red")
-            error_canvas.pack()
-            error_canvas.create_text(37, 37, text="❌", font=("Arial", 20), fill="white")
-            
-            ttk.Label(mini_frame, text="Ошибка", font=("TkDefaultFont", 8)).pack()
+        """Создание одного мини-превью (декодирование в фоне)"""
+        if not HAS_PIL:
+            return
+
+        # Контейнер + canvas создаём сразу (в главном потоке)
+        mini_frame = ttk.Frame(self.mini_scrollable_frame)
+        mini_frame.pack(side="left", padx=2, pady=2)
+
+        mini_canvas = tk.Canvas(
+            mini_frame, width=75, height=75,
+            bg="lightblue" if is_original else "lightgray",
+            highlightthickness=2,
+            highlightcolor="blue" if is_original else "gray"
+        )
+        mini_canvas.pack()
+        mini_canvas.create_text(37, 37, text="...", font=("Arial", 9), fill="gray", tags="ph")
+
+        label_widget = ttk.Label(mini_frame, text=label, font=("TkDefaultFont", 8))
+        label_widget.pack()
+
+        entry = {
+            'frame': mini_frame,
+            'canvas': mini_canvas,
+            'photo': None,
+            'label': label_widget,
+            'path': image_path
+        }
+        self.mini_previews.append(entry)
+
+        def on_click(event, path=image_path):
+            if is_original:
+                self.show_preview_image(path, "Исходное изображение")
+            else:
+                self.show_preview_image(path, f"Референс: {Path(path).name}")
+
+        mini_canvas.bind("<Button-1>", on_click)
+
+        def _load():
+            try:
+                with Image.open(image_path) as img:
+                    img.thumbnail((70, 70), Image.Resampling.LANCZOS)
+                    # Копируем PIL.Image до закрытия контекстного менеджера;
+                    # ImageTk.PhotoImage создаётся в главном потоке через after(0,...)
+                    pil_img = img.copy()
+                mini_canvas.after(0, lambda pi=pil_img: _set(ImageTk.PhotoImage(pi)))
+            except Exception:
+                mini_canvas.after(0, lambda: (
+                    mini_canvas.delete("all"),
+                    mini_canvas.create_text(37, 37, text="❌", font=("Arial", 20), fill="red")
+                ))
+
+        def _set(photo):
+            entry['photo'] = photo
+            mini_canvas.delete("ph")
+            mini_canvas.create_image(37, 37, image=photo, anchor="center")
+
+        threading.Thread(target=_load, daemon=True).start()
     
     def on_preview_click(self, event):
         """Обработка клика по предпросмотру для открытия полноразмерного просмотра"""
@@ -1555,30 +1748,64 @@ class FullSizeImageViewer:
         self.canvas.configure(xscrollcommand=self.h_scrollbar.set, yscrollcommand=self.v_scrollbar.set)
     
     def load_and_display_image(self):
-        """Загрузка и отображение изображения"""
-        try:
-            if not HAS_PIL:
-                self.info_label.config(text="PIL не установлен")
-                return
-            
-            # Загружаем изображение
-            self.original_image = Image.open(self.image_path)
-            self.display_image()
-            
-            # Обновляем информацию
-            file_size = Path(self.image_path).stat().st_size
-            size_str = self.format_file_size(file_size)
-            info_text = f"{self.title} | {self.original_image.width}×{self.original_image.height} | {size_str}"
-            self.info_label.config(text=info_text)
-            
-        except Exception as e:
-            self.canvas.create_text(
-                200, 200,
-                text=f"Ошибка загрузки изображения:\n{str(e)}",
-                fill="red",
-                font=("Arial", 14),
-                justify="center"
-            )
+        """Загрузка и отображение изображения (декодирование в фоне)"""
+        if not HAS_PIL:
+            self.info_label.config(text="PIL не установлен")
+            return
+
+        # Плейсхолдер
+        self.canvas.create_text(
+            400, 300,
+            text="Загрузка...",
+            fill="gray",
+            font=("Arial", 16),
+            justify="center",
+            tags="loading_placeholder"
+        )
+
+        def _load():
+            try:
+                p = Path(self.image_path)
+                if not p.exists():
+                    self.canvas.after(0, lambda: (
+                        self.canvas.delete("all"),
+                        self.canvas.create_text(
+                            200, 200, text=f"Файл не найден:\n{p.name}",
+                            fill="red", font=("Arial", 14), justify="center"
+                        )
+                    ))
+                    return
+                img = Image.open(str(p))
+                orig_w, orig_h = img.width, img.height
+                file_size = p.stat().st_size
+                self.canvas.after(0, lambda i=img, w=orig_w, h=orig_h, s=file_size: self._on_img_ready(i, w, h, s))
+            except PermissionError:
+                self.canvas.after(0, lambda: (
+                    self.canvas.delete("all"),
+                    self.canvas.create_text(
+                        200, 200, text=f"Нет доступа к файлу:\n{Path(self.image_path).name}",
+                        fill="red", font=("Arial", 14), justify="center"
+                    )
+                ))
+            except Exception as exc:
+                self.canvas.after(0, lambda e=exc: (
+                    self.canvas.delete("all"),
+                    self.canvas.create_text(
+                        200, 200, text=f"Ошибка загрузки:\n{e}",
+                        fill="red", font=("Arial", 14), justify="center"
+                    )
+                ))
+
+        threading.Thread(target=_load, daemon=True).start()
+
+    def _on_img_ready(self, img, orig_w: int, orig_h: int, file_size: int):
+        """Вызывается в главном потоке после загрузки файла"""
+        self.original_image = img
+        self.canvas.delete("loading_placeholder")
+        self.display_image()
+        size_str = self.format_file_size(file_size)
+        info_text = f"{self.title} | {orig_w}×{orig_h} | {size_str}"
+        self.info_label.config(text=info_text)
     
     def display_image(self):
         """Отображение изображения с текущим масштабом"""

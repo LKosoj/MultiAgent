@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import { KeyValueList } from "../shared/KeyValueList";
 import { WorkflowResultView } from "../shared/WorkflowResultView";
+import { decodeGzipBase64, openReportFromPayload } from "../../utils/report";
 import {
   inferWorkflowInputKind,
   isWorkflowInputOptionalBlank,
@@ -20,21 +21,6 @@ import {
   type StorybookReadinessSummary,
   type StorybookWorkflowActionsSummary,
 } from "../../utils/storybookReadiness";
-
-const decodeGzipBase64 = async (b64: string) => {
-  const binary = atob(b64);
-  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
-  if (!("DecompressionStream" in window)) {
-    throw new Error("Браузер не поддерживает распаковку gzip");
-  }
-  const stream = new DecompressionStream("gzip");
-  const body = new Response(bytes).body;
-  if (!body) {
-    throw new Error("Не удалось распаковать отчёт");
-  }
-  const decompressed = body.pipeThrough(stream);
-  return new Response(decompressed).text();
-};
 
 const extractFinalOutput = (payload: unknown) => {
   if (!payload) return null;
@@ -78,6 +64,7 @@ type WorkflowRunHistoryEntry = {
 type Props = {
   isBusy: boolean;
   runServiceAction: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
+  notify?: (msg: string, type: "error" | "success" | "info") => void;
   workflowTab: "list" | "run" | "monitor" | "builder";
   setWorkflowTab: (tab: Props["workflowTab"]) => void;
   workflows: WorkflowInfo[];
@@ -129,7 +116,7 @@ type Props = {
   loadWorkflowInputs: (name: string) => void;
   setWorkflowOptions: React.Dispatch<React.SetStateAction<{ useEnhanced: boolean; enableTelemetry: boolean }>>;
   setWorkflowParams: React.Dispatch<React.SetStateAction<WorkflowParams>>;
-  handleRunWorkflow: () => void;
+  handleRunWorkflow: () => void | Promise<void>;
   handleFetchStorybookReadiness: (sourceParams?: Record<string, unknown>) => void;
   handleFetchWorkflowStatus: (id: string) => void;
   handleFetchWorkflowArtifacts: (id: string) => void;
@@ -154,13 +141,14 @@ type Props = {
   setBuilderSteps: React.Dispatch<React.SetStateAction<string>>;
   setBuilderYaml: React.Dispatch<React.SetStateAction<string>>;
   setBuilderSaveName: React.Dispatch<React.SetStateAction<string>>;
-  handleGenerateYaml: () => void;
-  handleSaveYaml: () => void;
+  handleGenerateYaml: () => void | Promise<void>;
+  handleSaveYaml: () => void | Promise<void>;
 };
 
 export function WorkflowsSection({
   isBusy,
   runServiceAction,
+  notify,
   workflowTab,
   setWorkflowTab,
   workflows,
@@ -234,6 +222,8 @@ export function WorkflowsSection({
   const resultModalOutputRunIdRef = React.useRef<string | null>(null);
   const resultModalRunIdRef = React.useRef<string | null>(null);
   const [isMounted, setIsMounted] = useState(false);
+  const [isSubmittingRun, setIsSubmittingRun] = useState(false);
+  const [isSubmittingYaml, setIsSubmittingYaml] = useState(false);
   const [logsModalAutoRefresh, setLogsModalAutoRefresh] = useState(true);
   const [runLogsAutoRefresh, setRunLogsAutoRefresh] = useState(true);
   const [storybookValidation, setStorybookValidation] = useState<unknown>(null);
@@ -344,30 +334,6 @@ export function WorkflowsSection({
     setStorybookProjectInventoryError(null);
   }, [selectedWorkflow?.name, workflowParams]);
 
-  const openReport = async (runId: string, report: any) => {
-    const payload =
-      report?.base64_gzip ??
-      report?.content_b64_gzip ??
-      report?.report_b64_gzip ??
-      report?.base64;
-    if (!payload) {
-      throw new Error("Пустой отчёт");
-    }
-    const html = await decodeGzipBase64(payload);
-    const mimeType = report?.mime_type ?? "text/html";
-    const filename = report?.filename ?? `report_${runId}.html`;
-    const blob = new Blob([html], { type: mimeType });
-    const url = URL.createObjectURL(blob);
-    const opened = window.open(url, "_blank", "noopener,noreferrer");
-    if (!opened) {
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      link.click();
-    }
-    window.setTimeout(() => URL.revokeObjectURL(url), 10000);
-  };
-
   const handleGenerateReport = async (runId: string) => {
     setReportError(null);
     try {
@@ -378,9 +344,11 @@ export function WorkflowsSection({
         resp = await runServiceAction("telemetry.generate_report", { run_id: runId, persist: false });
       }
       const report = (resp as any)?.report ?? resp;
-      await openReport(runId, report);
+      await openReportFromPayload(runId, report);
     } catch (err) {
-      setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
+      const msg = err instanceof Error ? err.message : "Не удалось открыть отчёт";
+      setReportError(msg);
+      notify?.(msg, "error");
     }
   };
 
@@ -832,7 +800,17 @@ export function WorkflowsSection({
                     </button>
                   </>
                 ) : null}
-                <button className="button" type="button" onClick={handleRunWorkflow} disabled={isBusy}>
+                <button
+                  className="button"
+                  type="button"
+                  disabled={isBusy || isSubmittingRun}
+                  onClick={async () => {
+                    if (isSubmittingRun) return;
+                    setIsSubmittingRun(true);
+                    try { await handleRunWorkflow(); } finally { setIsSubmittingRun(false); }
+                  }}
+                >
+                  {isSubmittingRun ? <span className="spinner" /> : null}
                   Запустить
                 </button>
                 <button className="button secondary" type="button" onClick={() => loadWorkflowInputs(selectedWorkflow.name)} disabled={isBusy}>
@@ -1029,7 +1007,7 @@ export function WorkflowsSection({
                                 onClick={async () => {
                                   setReportError(null);
                                   try {
-                                    await openReport(runId, report);
+                                    await openReportFromPayload(runId, report);
                                   } catch (err) {
                                     setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
                                   }
@@ -1161,7 +1139,7 @@ export function WorkflowsSection({
                                     onClick={async () => {
                                       setReportError(null);
                                       try {
-                                        await openReport(runId, report);
+                                        await openReportFromPayload(runId, report);
                                       } catch (err) {
                                         setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
                                       }
@@ -1304,7 +1282,17 @@ export function WorkflowsSection({
               />
             </div>
             <div className="button-row">
-              <button className="button" type="button" onClick={handleGenerateYaml} disabled={isBusy}>
+              <button
+                className="button"
+                type="button"
+                disabled={isBusy || isSubmittingYaml}
+                onClick={async () => {
+                  if (isSubmittingYaml) return;
+                  setIsSubmittingYaml(true);
+                  try { await handleGenerateYaml(); } finally { setIsSubmittingYaml(false); }
+                }}
+              >
+                {isSubmittingYaml ? <span className="spinner" /> : null}
                 Сгенерировать YAML
               </button>
               <button className="button secondary" type="button" onClick={() => setBuilderYaml("")} disabled={isBusy}>
@@ -1325,7 +1313,20 @@ export function WorkflowsSection({
               </label>
             </div>
             <div className="button-row">
-              <button className="button" type="button" onClick={handleSaveYaml} disabled={isBusy || !builderSaveName.trim() || !builderYaml.trim()}>
+              <button
+                className="button"
+                type="button"
+                onClick={async () => {
+                  if (isSubmittingYaml) return;
+                  setIsSubmittingYaml(true);
+                  try {
+                    await handleSaveYaml();
+                  } finally {
+                    setIsSubmittingYaml(false);
+                  }
+                }}
+                disabled={isBusy || isSubmittingYaml || !builderSaveName.trim() || !builderYaml.trim()}
+              >
                 Сохранить
               </button>
             </div>
@@ -1385,7 +1386,7 @@ export function WorkflowsSection({
                           if (report) {
                             setReportError(null);
                             try {
-                              await openReport(runId, report);
+                              await openReportFromPayload(runId, report);
                             } catch (err) {
                               setReportError(err instanceof Error ? err.message : "Не удалось открыть отчёт");
                             }
@@ -1417,6 +1418,7 @@ export function WorkflowsSection({
                     <iframe
                       title={`report-${resultModal.runId}`}
                       src={reportPreviewUrl}
+                      sandbox="allow-scripts allow-same-origin"
                       style={{ width: "100%", height: 520, border: "1px solid var(--line-muted)", borderRadius: 12 }}
                     />
                   </div>

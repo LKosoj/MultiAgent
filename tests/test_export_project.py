@@ -120,13 +120,24 @@ class TestExportProject(unittest.TestCase):
             mock_project = MagicMock()
             mock_project.project_id = self.project_id
             panel.selected_project = mock_project
-            
+
+            # Экспорт теперь выполняется в фоновом потоке и планирует
+            # UI-колбэки через self.after(); в тесте выполняем их синхронно.
+            panel.after = lambda ms, cb=None, *a: (cb(*a) if callable(cb) else None)
+
             output_zip = str(project_root / "tests" / f"{self.project_id}_ui.zip")
             mock_asksaveasfilename.return_value = output_zip
-            
-            # Call export
+
+            # Call export (runs in a daemon thread)
             panel.export_selected_project()
-            
+
+            # Дожидаемся, пока фоновый поток допишет ZIP-архив
+            import time
+            for _ in range(50):
+                if Path(output_zip).exists():
+                    break
+                time.sleep(0.1)
+
             # Verify file was created
             self.assertTrue(Path(output_zip).exists())
             

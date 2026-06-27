@@ -434,6 +434,7 @@ _GLOBAL_ACTIVE_RUNS = {}
 _GLOBAL_RUN_CALLBACKS = {}
 _GLOBAL_AGENT_PROCESSES = {}
 _GLOBAL_AGENT_RESULT_QUEUES = {}
+_GLOBAL_DYNAMIC_PROFILES: Dict[str, "DynamicAgentDefinition"] = {}
 # Блокировки для потокобезопасного доступа к глобальным реестрам
 _GLOBAL_RUNS_LOCK = threading.RLock()
 _GLOBAL_PROCESSES_LOCK = threading.RLock()
@@ -567,12 +568,10 @@ class AgentManager:
         self.agent_system = DynamicAgentSystem()
         
         # Используем глобальные переменные для разделения состояния между экземплярами
-        global _GLOBAL_ACTIVE_RUNS, _GLOBAL_RUN_CALLBACKS
+        global _GLOBAL_ACTIVE_RUNS, _GLOBAL_RUN_CALLBACKS, _GLOBAL_DYNAMIC_PROFILES
         self.active_runs = _GLOBAL_ACTIVE_RUNS
         self.run_callbacks = _GLOBAL_RUN_CALLBACKS
-        
-        # Реестр динамических профилей (в памяти)
-        self.dynamic_profiles: Dict[str, DynamicAgentDefinition] = {}
+        self.dynamic_profiles = _GLOBAL_DYNAMIC_PROFILES
         
         logger.info("🤖 AgentManager инициализирован с глобальным состоянием")
 
@@ -1088,11 +1087,28 @@ class AgentManager:
     def list_dynamic_profiles(self) -> List[DynamicAgentDefinition]:
         """
         Получить список динамических профилей
-        
+
         Returns:
             Список объектов DynamicAgentDefinition
         """
         return list(self.dynamic_profiles.values())
+
+    def delete_dynamic_profile(self, name: str) -> bool:
+        """
+        Удалить динамический профиль агента
+
+        Args:
+            name: Имя профиля для удаления
+
+        Returns:
+            True если профиль найден и удалён, False если не существует
+        """
+        if name not in self.dynamic_profiles:
+            logger.warning(f"⚠️ Динамический профиль не найден: {name}")
+            return False
+        del self.dynamic_profiles[name]
+        logger.info(f"🗑️ Удалён динамический профиль: {name}")
+        return True
 
     def create_dynamic_agent(self, 
                            definition: DynamicAgentDefinition,
