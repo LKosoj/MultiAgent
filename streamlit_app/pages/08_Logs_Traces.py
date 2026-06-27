@@ -66,6 +66,10 @@ import pandas as pd
 # Добавляем корневую директорию проекта в путь
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+_streamlit_app_dir = Path(__file__).parent.parent
+if str(_streamlit_app_dir) not in sys.path:
+    sys.path.insert(0, str(_streamlit_app_dir))
+from _theme import inject_theme
 
 # Импортируем функцию отображения артефактов workflow
 try:
@@ -120,7 +124,8 @@ def main():
         page_icon="🔍",
         layout="wide"
     )
-    
+    inject_theme()
+
     st.title("🔍 Логи и трассы телеметрии")
     st.markdown("---")
     

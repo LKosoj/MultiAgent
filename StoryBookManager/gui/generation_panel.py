@@ -498,8 +498,9 @@ class GenerationPanel(ttk.Frame):
         self.generate_music_checkbutton.pack(anchor="w", pady=(2, 0))
         self._sync_sample_shot_key_state()
 
-        ttk.Button(pipeline_frame, text="🚀 Запустить полный pipeline", 
-                  command=self.run_full_pipeline).pack(fill="x")
+        ttk.Button(pipeline_frame, text="🚀 Запустить полный pipeline",
+                  command=self.run_full_pipeline,
+                  style="Accent.TButton").pack(fill="x")
         
         # Частичная генерация
         partial_frame = ttk.LabelFrame(parent, text="Частичная генерация", padding=10)
@@ -602,11 +603,11 @@ class GenerationPanel(ttk.Frame):
         )
         self.logs_text.pack(fill="both", expand=True)
         
-        # Настройка тегов для раскраски логов
-        self.logs_text.tag_configure("info", foreground="#0000FF")
-        self.logs_text.tag_configure("success", foreground="#008000")
-        self.logs_text.tag_configure("warning", foreground="#FF8000")
-        self.logs_text.tag_configure("error", foreground="#FF0000")
+        # Настройка тегов для раскраски логов (тёплая палитра)
+        self.logs_text.tag_configure("info", foreground="#2B5797")
+        self.logs_text.tag_configure("success", foreground="#4A7C59")
+        self.logs_text.tag_configure("warning", foreground="#8B6914")
+        self.logs_text.tag_configure("error", foreground="#9B2335")
         
         # Кнопки управления логами
         logs_buttons = ttk.Frame(logs_frame)

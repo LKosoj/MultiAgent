@@ -182,18 +182,25 @@ class TestStepTrackerStyling(unittest.TestCase):
         self.assertIn("FONT_NORMAL", body)
         self.assertIn("font=font", body)
 
+    def _get_status_colors(self):
+        """Извлекает словарь STATUS_COLORS из исходника через AST"""
+        tree = ast.parse(TRACKER_PATH.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "STATUS_COLORS":
+                        return ast.literal_eval(node.value)
+        self.fail("STATUS_COLORS не найден")
+
     def test_running_status_distinguishable(self):
         """running использует отличный от pending цвет"""
-        source = TRACKER_PATH.read_text(encoding="utf-8")
-        # Оба определены в STATUS_COLORS с разными значениями
-        self.assertIn('"running"', source)
-        self.assertIn('"pending"', source)
+        colors = self._get_status_colors()
+        # Оба статуса определены с валидными hex-значениями
+        for status in ("running", "pending"):
+            self.assertIn(status, colors)
+            self.assertRegex(colors[status], r"^#[0-9A-Fa-f]{6}$")
         # running и pending не могут иметь одинаковый цвет
-        start = source.index("STATUS_COLORS")
-        end = source.index("}", start) + 1
-        colors_block = source[start:end]
-        self.assertIn("#0066CC", colors_block)  # running color
-        self.assertIn("#666666", colors_block)  # pending color
+        self.assertNotEqual(colors["running"], colors["pending"])
 
 
 class TestStepTrackerDuration(unittest.TestCase):

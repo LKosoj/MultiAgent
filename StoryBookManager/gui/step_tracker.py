@@ -22,12 +22,12 @@ STATUS_ICONS = {
 }
 
 STATUS_COLORS = {
-    "pending": "#666666",
-    "running": "#0066CC",
-    "completed": "#008000",
-    "failed": "#CC0000",
-    "skipped": "#999999",
-    "cancelled": "#CC6600",
+    "pending":   "#7A6A5A",  # text_muted
+    "running":   "#1A5276",  # running
+    "completed": "#4A7C59",  # success
+    "failed":    "#9B2335",  # error
+    "skipped":   "#7A6A5A",  # text_muted
+    "cancelled": "#8B6914",  # warning
 }
 
 FONT_NORMAL = ("Arial", 9)

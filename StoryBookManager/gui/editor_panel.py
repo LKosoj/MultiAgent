@@ -170,7 +170,7 @@ class EditorPanel(ttk.Frame):
         )
         self.raw_text.pack(fill="both", expand=True)
         
-        # Простая подсветка JSON синтаксиса
+        # Подсветка JSON синтаксиса (тёплая палитра)
         self.setup_json_highlighting()
         
         # Создание контекстного меню для копирования/вставки
@@ -182,12 +182,11 @@ class EditorPanel(ttk.Frame):
         self.raw_text.bind("<Button-3>", self.show_context_menu)
     
     def setup_json_highlighting(self):
-        """Настройка подсветки JSON синтаксиса"""
-        # Определяем теги для раскраски
-        self.raw_text.tag_configure("string", foreground="#008000")  # Зеленый
-        self.raw_text.tag_configure("number", foreground="#0000FF")  # Синий
-        self.raw_text.tag_configure("keyword", foreground="#800080") # Пурпурный
-        self.raw_text.tag_configure("bracket", foreground="#FF0000") # Красный
+        """Настройка подсветки JSON синтаксиса (тёплая палитра)"""
+        self.raw_text.tag_configure("string",  foreground="#4A7C59")  # success
+        self.raw_text.tag_configure("number",  foreground="#1A5276")  # running
+        self.raw_text.tag_configure("keyword", foreground="#7A6A5A")  # text_muted
+        self.raw_text.tag_configure("bracket", foreground="#9B2335")  # error
     
     def create_context_menu(self):
         """Создание контекстного меню для raw редактора"""
@@ -326,11 +325,11 @@ class EditorPanel(ttk.Frame):
         # Добавляем поддержку прокрутки колесом мыши для области валидации
         bind_mousewheel_to_text_with_scrollbar(self.validation_text, validation_scrollbar)
         
-        # Теги для раскраски сообщений
-        self.validation_text.tag_configure("error", foreground="#FF0000")
-        self.validation_text.tag_configure("warning", foreground="#FF8000")
-        self.validation_text.tag_configure("success", foreground="#008000")
-        self.validation_text.tag_configure("info", foreground="#0000FF")
+        # Теги для раскраски сообщений валидации (тёплая палитра)
+        self.validation_text.tag_configure("error",   foreground="#9B2335")
+        self.validation_text.tag_configure("warning", foreground="#8B6914")
+        self.validation_text.tag_configure("success", foreground="#4A7C59")
+        self.validation_text.tag_configure("info",    foreground="#2B5797")
     
     def load_project(self, project: Project):
         """Загрузка проекта"""

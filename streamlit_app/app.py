@@ -20,6 +20,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 from telemetry.helpers import is_trace_completed
 from _dashboard_common import show_recent_activities_common
+from _theme import inject_theme
 
 def get_agent_manager():
     """Получить AgentManager с глобальным состоянием"""
@@ -48,7 +49,8 @@ def main():
         layout="wide",
         initial_sidebar_state="expanded"
     )
-    
+    inject_theme()
+
     # Проверяем состояние инициализации
     if "app_initialized" not in st.session_state:
         show_initialization_screen()

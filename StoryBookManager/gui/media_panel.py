@@ -509,7 +509,7 @@ class MediaPanel(ttk.Frame):
             self.image_canvas.winfo_height() // 2 or 150,
             text="Загрузка...",
             font=("Arial", 12),
-            fill="gray",
+            fill="#7A6A5A",
             tags="loading_placeholder"
         )
 
@@ -566,7 +566,7 @@ class MediaPanel(ttk.Frame):
             self.image_canvas.winfo_height() // 2 or 150,
             text="Загрузка превью...",
             font=("Arial", 12),
-            fill="gray",
+            fill="#7A6A5A",
             tags="loading_placeholder"
         )
 
@@ -1301,7 +1301,7 @@ class ImageEditDialog:
         self.edit_button.pack(side="right")
         
         # Статус
-        self.status_label = ttk.Label(button_frame, text="Введите описание изменений", foreground="orange")
+        self.status_label = ttk.Label(button_frame, text="Введите описание изменений", foreground="#8B6914")
         self.status_label.pack(side="left")
         
         # Основной контейнер для содержимого - разделим на левую и правую части
@@ -1340,8 +1340,8 @@ class ImageEditDialog:
         info_frame.pack(fill="x", pady=(0, 10))
         
         ttk.Label(info_frame, text="Редактируемое изображение:", font=("TkDefaultFont", 9, "bold")).pack(anchor="w")
-        ttk.Label(info_frame, text=f"📷 {Path(self.image_path).name} (всегда первое в списке)", 
-                 foreground="blue").pack(anchor="w")
+        ttk.Label(info_frame, text=f"📷 {Path(self.image_path).name} (всегда первое в списке)",
+                 foreground="#2B5797").pack(anchor="w")
         
         # Счетчик выбранных референсов
         self.counter_label = ttk.Label(info_frame, text="Выбрано: 0/3 дополнительных", foreground="gray")
@@ -1449,10 +1449,10 @@ class ImageEditDialog:
         
         if len(prompt) >= 5:
             self.edit_button.config(state="normal")
-            self.status_label.config(text="Готово к редактированию ✅", foreground="green")
+            self.status_label.config(text="Готово к редактированию ✅", foreground="#4A7C59")
         else:
             self.edit_button.config(state="disabled")
-            self.status_label.config(text="Введите описание изменений (минимум 5 символов)", foreground="orange")
+            self.status_label.config(text="Введите описание изменений (минимум 5 символов)", foreground="#8B6914")
     
     def start_edit(self):
         """Запуск редактирования"""

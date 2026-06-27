@@ -74,18 +74,9 @@ class MainWindow:
         self.setup_styles()
     
     def setup_styles(self):
-        """Настройка стилей ttk"""
-        style = ttk.Style()
-        
-        # Используем стандартную тему
-        available_themes = style.theme_names()
-        if "clam" in available_themes:
-            style.theme_use("clam")
-        
-        # Кастомные стили
-        style.configure("Title.TLabel", font=("Arial", 12, "bold"))
-        style.configure("Subtitle.TLabel", font=("Arial", 10, "bold"))
-        style.configure("Header.TFrame", relief="raised", borderwidth=1)
+        """Настройка стилей ttk — применяем тёплую издательскую тему."""
+        from StoryBookManager.gui.theme import apply_theme
+        apply_theme(self.root)
     
     def create_menu(self):
         """Создание главного меню"""

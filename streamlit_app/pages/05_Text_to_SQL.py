@@ -129,6 +129,10 @@ def _redact_payload(value: Any) -> Any:
 # Добавляем корневую директорию проекта в путь
 project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
+_streamlit_app_dir = Path(__file__).parent.parent
+if str(_streamlit_app_dir) not in sys.path:
+    sys.path.insert(0, str(_streamlit_app_dir))
+from _theme import inject_theme
 
 # Реестр фоновых задач (персистентный между перезапусками скрипта)
 @st.cache_resource(show_spinner=False)
@@ -181,7 +185,8 @@ def main():
         page_icon="🔍",
         layout="wide"
     )
-    
+    inject_theme()
+
     st.title("🔍 Text-to-SQL генерация и выполнение")
     st.markdown("---")
     

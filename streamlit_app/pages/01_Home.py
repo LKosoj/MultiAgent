@@ -19,6 +19,7 @@ _streamlit_app_dir = Path(__file__).parent.parent
 if str(_streamlit_app_dir) not in sys.path:
     sys.path.insert(0, str(_streamlit_app_dir))
 from _dashboard_common import show_recent_activities_common
+from _theme import inject_theme
 
 
 @st.cache_data(ttl=5)
@@ -44,7 +45,8 @@ def main():
         page_icon="📊",
         layout="wide"
     )
-    
+    inject_theme()
+
     st.title("📊 Дашборд системы")
     st.markdown("---")
     

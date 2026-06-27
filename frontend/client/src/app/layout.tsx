@@ -1,16 +1,17 @@
 import type { Metadata } from "next";
-import { Fraunces, Space_Grotesk, JetBrains_Mono } from "next/font/google";
+import { Bricolage_Grotesque, IBM_Plex_Sans, JetBrains_Mono } from "next/font/google";
 import "./globals.css";
 import "@copilotkitnext/react/styles.css";
 
-const fontDisplay = Fraunces({
+const fontDisplay = Bricolage_Grotesque({
   subsets: ["latin"],
   variable: "--font-display",
   display: "swap",
 });
 
-const fontBody = Space_Grotesk({
+const fontBody = IBM_Plex_Sans({
   subsets: ["latin"],
+  weight: ["400", "500", "600"],
   variable: "--font-body",
   display: "swap",
 });
