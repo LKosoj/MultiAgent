@@ -109,6 +109,11 @@ class WorkflowEngine(DynamicAgentSystem):
         
         # Используем переданный WorkflowDefinition напрямую
         workflow_def = workflow_definition
+        if workflow_def.requires_enhanced_engine and self.__class__.__name__ != "EnhancedWorkflowEngine":
+            raise WorkflowExecutionError(
+                f"Pipeline '{workflow_def.name}' requires EnhancedWorkflowEngine; "
+                "base WorkflowEngine execution is not allowed"
+            )
         
         # Создаем контекст если не передан
         if context is None:

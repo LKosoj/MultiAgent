@@ -4,6 +4,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createPortal } from "react-dom";
 import { KeyValueList } from "../shared/KeyValueList";
 import { WorkflowResultView } from "../shared/WorkflowResultView";
+import {
+  inferWorkflowInputKind,
+  isWorkflowInputOptionalBlank,
+  requiresWorkflowUserInput,
+  stringifyWorkflowValue,
+  workflowNumberMin,
+  type WorkflowParams,
+} from "../../utils/workflowParams";
 
 const decodeGzipBase64 = async (b64: string) => {
   const binary = atob(b64);
@@ -74,7 +82,7 @@ type Props = {
   filteredWorkflows: WorkflowInfo[];
   selectedWorkflow: WorkflowInfo | null;
   workflowInputs: Record<string, unknown>;
-  workflowParams: Record<string, string>;
+  workflowParams: WorkflowParams;
   workflowOptions: { useEnhanced: boolean; enableTelemetry: boolean };
   workflowRuns: WorkflowRunInfo[];
   workflowRunsLoading: boolean;
@@ -108,7 +116,7 @@ type Props = {
   handleViewWorkflowYaml: (wf: WorkflowInfo) => void;
   loadWorkflowInputs: (name: string) => void;
   setWorkflowOptions: React.Dispatch<React.SetStateAction<{ useEnhanced: boolean; enableTelemetry: boolean }>>;
-  setWorkflowParams: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  setWorkflowParams: React.Dispatch<React.SetStateAction<WorkflowParams>>;
   handleRunWorkflow: () => void;
   handleFetchWorkflowStatus: (id: string) => void;
   handleFetchWorkflowArtifacts: (id: string) => void;
@@ -636,16 +644,40 @@ export function WorkflowsSection({
                 {Object.keys(workflowInputs).length === 0 ? (
                   <div className="card-description">Этот workflow не содержит inputs — проверьте YAML.</div>
                 ) : (
-                  Object.entries(workflowInputs).map(([key, defaultValue]) => (
-                    <label className="field" key={key}>
-                      <span className="label">{key}</span>
-                      <input
-                        value={workflowParams[key] ?? ""}
-                        placeholder={defaultValue ? String(defaultValue) : "обязательный"}
-                        onChange={(event) => setWorkflowParams((prev) => ({ ...prev, [key]: event.target.value }))}
-                      />
-                    </label>
-                  ))
+                  Object.entries(workflowInputs).map(([key, defaultValue]) => {
+                    const kind = inferWorkflowInputKind(defaultValue);
+                    const currentValue = workflowParams[key];
+                    if (kind === "boolean") {
+                      return (
+                        <label className="toggle" key={key}>
+                          <input
+                            type="checkbox"
+                            checked={Boolean(currentValue)}
+                            onChange={(event) => setWorkflowParams((prev) => ({ ...prev, [key]: event.target.checked }))}
+                          />
+                          <span>{key}</span>
+                        </label>
+                      );
+                    }
+                    return (
+                      <label className="field" key={key}>
+                        <span className="label">{key}</span>
+                        <input
+                          type={kind === "number" ? "number" : "text"}
+                          min={kind === "number" ? workflowNumberMin(selectedWorkflow.name, key) : undefined}
+                          value={stringifyWorkflowValue(currentValue)}
+                          placeholder={
+                            isWorkflowInputOptionalBlank(selectedWorkflow.name, key)
+                              ? "необязательно"
+                              : requiresWorkflowUserInput(selectedWorkflow.name, key, defaultValue)
+                                ? "обязательный"
+                                : stringifyWorkflowValue(defaultValue)
+                          }
+                          onChange={(event) => setWorkflowParams((prev) => ({ ...prev, [key]: event.target.value }))}
+                        />
+                      </label>
+                    );
+                  })
                 )}
               </div>
               <div className="button-row">
@@ -715,6 +747,7 @@ export function WorkflowsSection({
               const runId = run.run_id ?? `workflow-${index + 1}`;
               const status = run.status ?? "unknown";
               const statusInfo = workflowArtifacts[`status:${runId}`];
+              const artifactsPayload = workflowArtifacts[runId];
               const resultPayload = workflowResults[runId] as any;
               const finalOutput = extractFinalOutput(resultPayload?.result);
               const report = resultPayload?.report;
@@ -795,6 +828,12 @@ export function WorkflowsSection({
                       <KeyValueList data={statusInfo} />
                     </div>
                   ) : null}
+                  {artifactsPayload ? (
+                    <div className="run-result">
+                      <div className="label">Артефакты</div>
+                      <KeyValueList data={artifactsPayload} />
+                    </div>
+                  ) : null}
                   {resultPayload ? (
                     <div className="run-result">
                       <div className="label">Результат</div>
@@ -850,6 +889,7 @@ export function WorkflowsSection({
                 {workflowRunHistory.slice(0, 20).map((entry) => {
                   const runId = entry.run_id;
                   const statusInfo = workflowArtifacts[`status:${runId}`];
+                  const artifactsPayload = workflowArtifacts[runId];
                   const resultPayload = workflowResults[runId] as any;
                   const finalOutput = extractFinalOutput(resultPayload?.result);
                   const report = resultPayload?.report;
@@ -908,6 +948,12 @@ export function WorkflowsSection({
                         <div className="run-result">
                           <div className="label">Статус</div>
                           <KeyValueList data={statusInfo} />
+                        </div>
+                      ) : null}
+                      {artifactsPayload ? (
+                        <div className="run-result">
+                          <div className="label">Артефакты</div>
+                          <KeyValueList data={artifactsPayload} />
                         </div>
                       ) : null}
                       {resultPayload ? (

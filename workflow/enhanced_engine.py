@@ -226,6 +226,11 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         # НЕ применяются — перезапускаемые шаги исполняются базовой логикой. Это
         # осознанный компромисс: восстановление прогресса важнее enhanced-семантики.
         if skip_steps is not None:
+            if workflow_definition.requires_enhanced_engine:
+                raise WorkflowExecutionError(
+                    f"Workflow '{workflow_definition.name}' requires enhanced engine "
+                    "(pipeline.requires_enhanced_engine=true), but generic resume uses legacy execution"
+                )
             return await super().execute_workflow(
                 workflow_definition, context, client_id,
                 skip_steps=skip_steps,
@@ -251,6 +256,11 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             
             # Fallback к legacy если включен
             if self._should_fallback_to_legacy(workflow_definition, context):
+                if workflow_definition.requires_enhanced_engine:
+                    raise WorkflowExecutionError(
+                        f"Workflow '{workflow_definition.name}' requires enhanced engine "
+                        "(pipeline.requires_enhanced_engine=true), legacy fallback is not allowed"
+                    ) from e
                 logger.info("🔄 Falling back to legacy execution")
                 return await super().execute_workflow(workflow_definition, context, client_id)
             else:
@@ -1040,6 +1050,8 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         if isinstance(result, dict):
             if 'error' in result or 'exception' in result:
                 return True
+            if str(result.get('status', '')).strip().lower() == 'error':
+                return True
                 
         return False
     
@@ -1048,6 +1060,6 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         if isinstance(result, str):
             return result
         elif isinstance(result, dict):
-            return result.get('error', result.get('exception', str(result)))
+            return result.get('error', result.get('exception', result.get('message', str(result))))
         else:
             return str(result)

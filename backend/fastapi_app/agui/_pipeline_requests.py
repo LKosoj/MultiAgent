@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class _BasePipelineRequest(BaseModel):
@@ -269,6 +269,18 @@ class StorybookPipelineRequest(_BasePipelineRequest):
         default_factory=lambda: _storybook_default_bool("skip_prompt_enhancement"),
         validate_default=True,
     )
+    sample_before_batch: bool = Field(
+        default_factory=lambda: _storybook_default_bool("sample_before_batch"),
+        validate_default=True,
+    )
+    sample_shot_key: str = Field(
+        default_factory=lambda: _storybook_default_str("sample_shot_key", allow_empty=True),
+        validate_default=True,
+    )
+    final_allow_missing_audio: bool = Field(
+        default_factory=lambda: _storybook_default_bool("final_allow_missing_audio"),
+        validate_default=True,
+    )
 
     @field_validator("task", mode="before")
     @classmethod
@@ -288,6 +300,45 @@ class StorybookPipelineRequest(_BasePipelineRequest):
                 raise ValueError("pages_min/pages_max must be an integer")
             return int(stripped)
         raise ValueError("pages_min/pages_max must be an integer")
+
+    @field_validator("words_per_page_min", "words_per_page_max", "screenplay_time", mode="before")
+    @classmethod
+    def _v_positive_ints(cls, v: Any) -> int:
+        if isinstance(v, bool):
+            raise ValueError("value must be an integer")
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            stripped = v.strip()
+            if not stripped.isdigit():
+                raise ValueError("value must be an integer")
+            return int(stripped)
+        raise ValueError("value must be an integer")
+
+    @field_validator("sample_shot_key", mode="before")
+    @classmethod
+    def _v_sample_shot_key(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        if not isinstance(v, str):
+            raise ValueError("sample_shot_key must be a string")
+        stripped = v.strip()
+        if not stripped:
+            return ""
+        parts = stripped.split("-", 1)
+        if len(parts) != 2 or not all(part.isdigit() and int(part) > 0 for part in parts):
+            raise ValueError("sample_shot_key must use scene-shot format, for example 1-2")
+        return stripped
+
+    @model_validator(mode="after")
+    def _v_storybook_ranges(self) -> "StorybookPipelineRequest":
+        if self.pages_max < self.pages_min:
+            raise ValueError("pages_max must be greater than or equal to pages_min")
+        if self.words_per_page_max < self.words_per_page_min:
+            raise ValueError(
+                "words_per_page_max must be greater than or equal to words_per_page_min"
+            )
+        return self
 
 
 class ToolDemoRequest(_BasePipelineRequest):

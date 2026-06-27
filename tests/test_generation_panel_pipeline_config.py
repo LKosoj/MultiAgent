@@ -11,7 +11,9 @@
 
 import asyncio
 import importlib
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -141,8 +143,14 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
             "words_per_page_min": 100,
             "words_per_page_max": 300,
             "language": "ru",
+            "screenplay_time": 120,
             "generate_screenplay": True,
+            "generate_end_shots": True,
             "force_update_prompts": False,
+            "skip_prompt_enhancement": True,
+            "sample_before_batch": False,
+            "sample_shot_key": "",
+            "final_allow_missing_audio": False,
         }
         panel.supported_languages = ["ru", "en", "es"]
         panel.run_full_pipeline = MagicMock()
@@ -175,9 +183,60 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         self.assertEqual(panel.pipeline_pages_max_var.get(), "16")
         self.assertEqual(panel.pipeline_words_per_page_min_var.get(), "100")
         self.assertEqual(panel.pipeline_words_per_page_max_var.get(), "300")
+        self.assertEqual(panel.screenplay_time_var.get(), "120")
         self.assertEqual(panel.pipeline_language_combo["values"], ("ru", "en", "es"))
         self.assertTrue(hasattr(panel, "generate_screenplay_checkbutton"))
+        self.assertTrue(hasattr(panel, "generate_end_shots_checkbutton"))
         self.assertTrue(hasattr(panel, "force_update_prompts_checkbutton"))
+        self.assertTrue(hasattr(panel, "skip_prompt_enhancement_checkbutton"))
+        self.assertTrue(hasattr(panel, "sample_before_batch_checkbutton"))
+        self.assertEqual(panel.sample_shot_key_combo.options["state"], "disabled")
+        self.assertTrue(hasattr(panel, "final_allow_missing_audio_checkbutton"))
+
+    def test_apply_project_settings_syncs_sample_shot_key_state(self):
+        module = _import_generation_panel()
+        GenerationPanel = module.GenerationPanel
+
+        panel = GenerationPanel.__new__(GenerationPanel)
+        panel.pipeline_inputs = {
+            "pages_min": 1,
+            "pages_max": 2,
+            "words_per_page_min": 100,
+            "words_per_page_max": 200,
+            "language": "ru",
+            "screenplay_time": 120,
+            "generate_screenplay": True,
+            "generate_end_shots": True,
+            "force_update_prompts": False,
+            "skip_prompt_enhancement": False,
+            "sample_before_batch": False,
+            "sample_shot_key": "",
+            "final_allow_missing_audio": False,
+        }
+        panel.supported_languages = ["ru", "en"]
+        panel.pipeline_pages_min_var = FakeVar()
+        panel.pipeline_pages_max_var = FakeVar()
+        panel.pipeline_words_per_page_min_var = FakeVar()
+        panel.pipeline_words_per_page_max_var = FakeVar()
+        panel.pipeline_language_var = FakeVar()
+        panel.screenplay_time_var = FakeVar()
+        panel.generate_screenplay_var = FakeVar()
+        panel.generate_end_shots_var = FakeVar()
+        panel.force_update_prompts_var = FakeVar()
+        panel.skip_prompt_enhancement_var = FakeVar()
+        panel.sample_before_batch_var = FakeVar()
+        panel.sample_shot_key_var = FakeVar()
+        panel.final_allow_missing_audio_var = FakeVar()
+        panel.sample_shot_key_combo = FakeWidget()
+
+        GenerationPanel._apply_project_pipeline_settings(
+            panel,
+            {"sample_before_batch": True, "sample_shot_key": "1-2"},
+        )
+
+        self.assertTrue(panel.sample_before_batch_var.get())
+        self.assertEqual(panel.sample_shot_key_var.get(), "1-2")
+        self.assertEqual(panel.sample_shot_key_combo.options["state"], "normal")
 
     def test_collect_pipeline_params_returns_validated_values(self):
         module = _import_generation_panel()
@@ -189,8 +248,14 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.pipeline_words_per_page_min_var = FakeVar("120")
         panel.pipeline_words_per_page_max_var = FakeVar("180")
         panel.pipeline_language_var = FakeVar("en")
+        panel.screenplay_time_var = FakeVar("240")
         panel.generate_screenplay_var = FakeVar(True)
+        panel.generate_end_shots_var = FakeVar(False)
         panel.force_update_prompts_var = FakeVar(False)
+        panel.skip_prompt_enhancement_var = FakeVar(True)
+        panel.sample_before_batch_var = FakeVar(True)
+        panel.sample_shot_key_var = FakeVar(" 1-2 ")
+        panel.final_allow_missing_audio_var = FakeVar(False)
 
         params = GenerationPanel._collect_pipeline_params(panel)
 
@@ -202,8 +267,14 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
                 "words_per_page_min": 120,
                 "words_per_page_max": 180,
                 "language": "en",
+                "screenplay_time": 240,
                 "generate_screenplay": True,
+                "generate_end_shots": False,
                 "force_update_prompts": False,
+                "skip_prompt_enhancement": True,
+                "sample_before_batch": True,
+                "sample_shot_key": "1-2",
+                "final_allow_missing_audio": False,
             },
         )
 
@@ -217,11 +288,94 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.pipeline_words_per_page_min_var = FakeVar("120")
         panel.pipeline_words_per_page_max_var = FakeVar("180")
         panel.pipeline_language_var = FakeVar("ru")
+        panel.screenplay_time_var = FakeVar("120")
         panel.generate_screenplay_var = FakeVar(True)
+        panel.generate_end_shots_var = FakeVar(True)
         panel.force_update_prompts_var = FakeVar(False)
+        panel.skip_prompt_enhancement_var = FakeVar(True)
+        panel.sample_before_batch_var = FakeVar(False)
+        panel.sample_shot_key_var = FakeVar("")
+        panel.final_allow_missing_audio_var = FakeVar(False)
 
         with self.assertRaisesRegex(ValueError, "не может быть меньше"):
             GenerationPanel._collect_pipeline_params(panel)
+
+    def test_collect_pipeline_params_rejects_invalid_video_values(self):
+        module = _import_generation_panel()
+        GenerationPanel = module.GenerationPanel
+
+        panel = GenerationPanel.__new__(GenerationPanel)
+        panel.pipeline_pages_min_var = FakeVar("1")
+        panel.pipeline_pages_max_var = FakeVar("2")
+        panel.pipeline_words_per_page_min_var = FakeVar("120")
+        panel.pipeline_words_per_page_max_var = FakeVar("180")
+        panel.pipeline_language_var = FakeVar("ru")
+        panel.screenplay_time_var = FakeVar("0")
+        panel.generate_screenplay_var = FakeVar(True)
+        panel.generate_end_shots_var = FakeVar(True)
+        panel.force_update_prompts_var = FakeVar(False)
+        panel.skip_prompt_enhancement_var = FakeVar(True)
+        panel.sample_before_batch_var = FakeVar(False)
+        panel.sample_shot_key_var = FakeVar("")
+        panel.final_allow_missing_audio_var = FakeVar(False)
+
+        with self.assertRaisesRegex(ValueError, "Длительность screenplay"):
+            GenerationPanel._collect_pipeline_params(panel)
+
+        panel.screenplay_time_var = FakeVar("120")
+        panel.sample_before_batch_var = FakeVar(True)
+        panel.sample_shot_key_var = FakeVar("bad")
+        with self.assertRaisesRegex(ValueError, "Sample shot"):
+            GenerationPanel._collect_pipeline_params(panel)
+
+    def test_video_artifact_summary_reports_final_review(self):
+        module = _import_generation_panel()
+        GenerationPanel = module.GenerationPanel
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_path = Path(tmp_dir) / "project-1"
+            (project_path / "96_video_contract").mkdir(parents=True)
+            (project_path / "97_shots").mkdir()
+            (project_path / "98_audio").mkdir()
+            (project_path / "99_final").mkdir()
+
+            (project_path / "96_video_contract" / "provider_menu_summary.json").write_text(
+                json.dumps(
+                    {
+                        "provider": "aitunnel",
+                        "capabilities": {"image": True, "video": True, "audio": False, "render": True},
+                        "expected_video_count": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (project_path / "97_shots" / "provider_jobs.json").write_text(
+                json.dumps({"jobs": [{"status": "downloaded", "cost_rub": 1.5}]}),
+                encoding="utf-8",
+            )
+            (project_path / "98_audio" / "audio_manifest.json").write_text(
+                json.dumps({"tts_status": "unavailable", "audio_tracks": []}),
+                encoding="utf-8",
+            )
+            (project_path / "98_audio" / "subtitles.srt").write_text("1\n", encoding="utf-8")
+            (project_path / "99_final" / "final_review.json").write_text(
+                json.dumps({"passed": False, "checks": {"audio": {"passed": False}}, "errors": ["audio"]}),
+                encoding="utf-8",
+            )
+            (project_path / "99_final" / "manifest.json").write_text("{}", encoding="utf-8")
+
+            panel = GenerationPanel.__new__(GenerationPanel)
+            panel.current_project = types.SimpleNamespace(
+                project_id="project-1",
+                project_path=project_path,
+            )
+
+            messages = GenerationPanel._build_video_artifact_summary(panel, "project-1")
+
+        rendered = "\n".join(message for message, _level in messages)
+        self.assertIn("Video preflight", rendered)
+        self.assertIn("Provider jobs: jobs=1", rendered)
+        self.assertIn("Final review: passed=False", rendered)
 
 
 class TestPipelineRunnerPipelineConfig(unittest.TestCase):
@@ -248,8 +402,14 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
             "words_per_page_min": 130,
             "words_per_page_max": 220,
             "language": "en",
+            "screenplay_time": 180,
             "generate_screenplay": False,
+            "generate_end_shots": False,
             "force_update_prompts": True,
+            "skip_prompt_enhancement": False,
+            "sample_before_batch": True,
+            "sample_shot_key": "1-2",
+            "final_allow_missing_audio": True,
         }
         mock_ctx_cls = MagicMock(return_value=MagicMock())
 
@@ -271,8 +431,14 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
         self.assertEqual(call_kwargs["words_per_page_min"], 130)
         self.assertEqual(call_kwargs["words_per_page_max"], 220)
         self.assertEqual(call_kwargs["language"], "en")
+        self.assertEqual(call_kwargs["screenplay_time"], 180)
         self.assertFalse(call_kwargs["generate_screenplay"])
+        self.assertFalse(call_kwargs["generate_end_shots"])
         self.assertTrue(call_kwargs["force_update_prompts"])
+        self.assertFalse(call_kwargs["skip_prompt_enhancement"])
+        self.assertTrue(call_kwargs["sample_before_batch"])
+        self.assertEqual(call_kwargs["sample_shot_key"], "1-2")
+        self.assertTrue(call_kwargs["final_allow_missing_audio"])
 
     @patch("StoryBookManager.core.pipeline_runner.project_root", new=project_root)
     def test_run_from_step_merges_yaml_inputs_with_ui_overrides(self):
@@ -295,8 +461,14 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
             "words_per_page_min": 100,
             "words_per_page_max": 200,
             "language": "ru",
+            "screenplay_time": 120,
             "generate_screenplay": True,
+            "generate_end_shots": True,
             "force_update_prompts": False,
+            "skip_prompt_enhancement": True,
+            "sample_before_batch": False,
+            "sample_shot_key": "",
+            "final_allow_missing_audio": False,
         }
 
         mock_ctx = MagicMock()
@@ -321,7 +493,12 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
                         "pages_min": 7,
                         "words_per_page_max": 260,
                         "language": "de",
+                        "screenplay_time": 240,
                         "force_update_prompts": True,
+                        "skip_prompt_enhancement": False,
+                        "sample_before_batch": True,
+                        "sample_shot_key": "1-2",
+                        "final_allow_missing_audio": True,
                     },
                 )
             )
@@ -335,7 +512,12 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
         self.assertEqual(variables["words_per_page_min"], 100)
         self.assertEqual(variables["words_per_page_max"], 260)
         self.assertEqual(variables["language"], "de")
+        self.assertEqual(variables["screenplay_time"], 240)
         self.assertTrue(variables["force_update_prompts"])
+        self.assertFalse(variables["skip_prompt_enhancement"])
+        self.assertTrue(variables["sample_before_batch"])
+        self.assertEqual(variables["sample_shot_key"], "1-2")
+        self.assertTrue(variables["final_allow_missing_audio"])
 
 
 if __name__ == "__main__":

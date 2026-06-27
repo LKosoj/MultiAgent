@@ -1,7 +1,7 @@
 """
 End-to-end regression test for text_to_sql_pipeline.yaml.
 
-Tool- и agent-шаги мокаем на уровне `WorkflowEngine._execute_tool_step` /
+Tool- и agent-шаги мокаем на уровне `EnhancedWorkflowEngine._execute_tool_step` /
 `_execute_manager_with_preloaded_agents`, поэтому проверяется:
 - успешная загрузка YAML;
 - разрешение зависимостей между шагами (DAG);
@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from workflow.engine import WorkflowEngine
+from workflow.enhanced_engine import EnhancedWorkflowEngine
 from workflow.models import StepStatus, WorkflowStatus
 
 
@@ -96,7 +96,7 @@ _AGENT_OUTPUTS: dict[str, dict[str, Any]] = {
 def engine_with_stubs(monkeypatch):
     """Engine с мокированными tool/agent шагами и in-memory state."""
 
-    engine = WorkflowEngine()
+    engine = EnhancedWorkflowEngine()
 
     async def _fake_tool_step(step, context, task):
         if step.id not in _TOOL_OUTPUTS:
@@ -110,6 +110,12 @@ def engine_with_stubs(monkeypatch):
 
     monkeypatch.setattr(engine, "_execute_tool_step", _fake_tool_step)
     monkeypatch.setattr(engine, "_execute_agent_step", _fake_agent_step)
+
+    async def _fake_enhanced_agent_step(step, context, task, plan=None, budget=None):
+        del plan, budget
+        return await _fake_agent_step(step, context, task)
+
+    monkeypatch.setattr(engine, "_execute_enhanced_agent_step", _fake_enhanced_agent_step)
 
     async def _noop_checkpoint(*args, **kwargs):
         return None

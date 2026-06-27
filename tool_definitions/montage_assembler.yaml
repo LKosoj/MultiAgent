@@ -1,0 +1,26 @@
+name: montage_assembler_tool
+description: "Assembles storybook video clips into the final montage and writes final QA/manifests"
+category: "storybook"
+source_type: custom_function
+implementation_source: custom_tools.storybook.montage_assembler.montage_assembler_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Execution trace/session identifier"
+    required: true
+  - name: project_id
+    type: str
+    description: "Storybook project identifier"
+    required: true
+  - name: language
+    type: str
+    description: "Language code for manifest metadata"
+    required: false
+  - name: enable
+    type: bool
+    description: "If true, runs assembly; if false, skips execution"
+    required: false
+  - name: allow_missing_audio
+    type: bool
+    description: "If true, allows a video-only montage when no audio track exists"
+    required: false

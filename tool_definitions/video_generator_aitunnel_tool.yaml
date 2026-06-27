@@ -41,3 +41,12 @@ parameters:
     description: "Если True, пропускает улучшение промпта LLM (только перевод, без добавления деталей и без галлюцинаций). По умолчанию False"
     default: false
     required: false
+  - name: "sample_before_batch"
+    type: "bool"
+    description: "Если True, обрабатывает только один выбранный или первый ожидающий шот перед пакетной генерацией"
+    default: false
+    required: false
+  - name: "sample_shot_key"
+    type: "str"
+    description: "Ключ шота в формате scene-shot для sample_before_batch; если не задан, берется первый ожидающий шот"
+    required: false

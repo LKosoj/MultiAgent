@@ -24,6 +24,69 @@ def get_workflow_manager(use_enhanced: bool = True):
     from workflow.streamlit_api import WorkflowManager
     return WorkflowManager(use_enhanced=use_enhanced)
 
+
+OPTIONAL_BLANK_INPUTS = {
+    "storybook_pipeline": {"sample_shot_key"},
+}
+
+REQUIRED_USER_INPUTS = {
+    "storybook_pipeline": {"task"},
+}
+
+POSITIVE_INT_INPUTS = {
+    "storybook_pipeline": {
+        "pages_min",
+        "pages_max",
+        "words_per_page_min",
+        "words_per_page_max",
+        "screenplay_time",
+    },
+}
+
+
+def _is_blank_workflow_input(value):
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _workflow_input_required(workflow_name, param_name, default_value):
+    if param_name in REQUIRED_USER_INPUTS.get(workflow_name, set()):
+        return True
+    if param_name in OPTIONAL_BLANK_INPUTS.get(workflow_name, set()):
+        return False
+    return _is_blank_workflow_input(default_value)
+
+
+def _workflow_number_min(workflow_name, param_name):
+    return 1 if param_name in POSITIVE_INT_INPUTS.get(workflow_name, set()) else 0
+
+
+def _render_workflow_input(workflow_name, param_name, default_value, param_help, param_placeholder):
+    label = f"📋 {param_name}"
+    input_key = f"param_{workflow_name}_{param_name}"
+
+    if isinstance(default_value, bool):
+        return st.checkbox(label, value=default_value, help=param_help, key=input_key)
+    if isinstance(default_value, int) and not isinstance(default_value, bool):
+        return st.number_input(
+            label,
+            min_value=_workflow_number_min(workflow_name, param_name),
+            value=default_value,
+            step=1,
+            help=param_help,
+            key=input_key,
+        )
+
+    default_text = ""
+    if not _workflow_input_required(workflow_name, param_name, default_value):
+        default_text = str(default_value) if default_value is not None else ""
+    return st.text_input(
+        label,
+        value=default_text,
+        placeholder=param_placeholder,
+        help=param_help,
+        key=input_key,
+    )
+
 def show_workflow_artifacts(final_output, run_id):
     """Отобразить артефакты workflow в структурированном виде"""
     if not final_output:
@@ -406,24 +469,31 @@ def show_workflow_execution():
                     param_help = "Идентификатор проекта"
                     param_placeholder = "my_project"
                 
-                # Отображаем поле ввода
-                param_value = st.text_input(
-                    f"📋 {param_name}",
-                    value=str(default_value) if default_value else "",
-                    placeholder=param_placeholder,
-                    help=param_help,
-                    key=f"param_{param_name}"
+                param_value = _render_workflow_input(
+                    workflow.name,
+                    param_name,
+                    default_value,
+                    param_help,
+                    param_placeholder,
                 )
                 
                 # Добавляем в параметры, если значение введено или есть дефолт
-                if param_value.strip():
+                if isinstance(param_value, bool):
+                    pipeline_params[param_name] = param_value
+                elif isinstance(param_value, int) and not isinstance(param_value, bool):
+                    pipeline_params[param_name] = param_value
+                elif isinstance(param_value, str) and param_value.strip():
                     # Для некоторых параметров конвертируем тип
                     if param_name in ["end_date"] and param_value.strip() == "today":
                         from datetime import datetime
                         pipeline_params[param_name] = datetime.now().strftime("%d/%m/%Y")
                     else:
                         pipeline_params[param_name] = param_value.strip()
-                elif default_value and str(default_value).strip():
+                elif (
+                    not _workflow_input_required(workflow.name, param_name, default_value)
+                    and default_value is not None
+                    and str(default_value).strip()
+                ):
                     # Если ничего не введено, но есть дефолт - используем его
                     pipeline_params[param_name] = str(default_value).strip()
         else:
@@ -440,7 +510,10 @@ def show_workflow_execution():
             if pipeline_inputs:
                 for param_name, default_value in pipeline_inputs.items():
                     # Параметры с пустыми дефолтами считаются обязательными
-                    if not default_value and param_name not in pipeline_params:
+                    if (
+                        _workflow_input_required(workflow.name, param_name, default_value)
+                        and param_name not in pipeline_params
+                    ):
                         missing_params.append(param_name)
             # Если нет inputs - это ошибка, не можем проверить параметры
             else:

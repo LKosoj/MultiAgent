@@ -153,8 +153,14 @@ class GenerationPanel(ttk.Frame):
         self.pipeline_words_per_page_min_var = tk.StringVar()
         self.pipeline_words_per_page_max_var = tk.StringVar()
         self.pipeline_language_var = tk.StringVar()
+        self.screenplay_time_var = tk.StringVar()
         self.generate_screenplay_var = tk.BooleanVar()
+        self.generate_end_shots_var = tk.BooleanVar()
         self.force_update_prompts_var = tk.BooleanVar()
+        self.skip_prompt_enhancement_var = tk.BooleanVar()
+        self.sample_before_batch_var = tk.BooleanVar()
+        self.sample_shot_key_var = tk.StringVar()
+        self.final_allow_missing_audio_var = tk.BooleanVar()
         self._reset_pipeline_settings_to_defaults()
 
     def _reset_pipeline_settings_to_defaults(self):
@@ -171,11 +177,25 @@ class GenerationPanel(ttk.Frame):
             str(self.pipeline_inputs.get("words_per_page_max", ""))
         )
         self.pipeline_language_var.set(str(self.pipeline_inputs.get("language", "")))
+        self.screenplay_time_var.set(str(self.pipeline_inputs.get("screenplay_time", "")))
         self.generate_screenplay_var.set(
             self._to_bool(self.pipeline_inputs.get("generate_screenplay", False))
         )
+        self.generate_end_shots_var.set(
+            self._to_bool(self.pipeline_inputs.get("generate_end_shots", False))
+        )
         self.force_update_prompts_var.set(
             self._to_bool(self.pipeline_inputs.get("force_update_prompts", False))
+        )
+        self.skip_prompt_enhancement_var.set(
+            self._to_bool(self.pipeline_inputs.get("skip_prompt_enhancement", False))
+        )
+        self.sample_before_batch_var.set(
+            self._to_bool(self.pipeline_inputs.get("sample_before_batch", False))
+        )
+        self.sample_shot_key_var.set(str(self.pipeline_inputs.get("sample_shot_key", "")))
+        self.final_allow_missing_audio_var.set(
+            self._to_bool(self.pipeline_inputs.get("final_allow_missing_audio", False))
         )
 
     def _apply_project_pipeline_settings(self, brief_data: Dict[str, Any]):
@@ -204,8 +224,25 @@ class GenerationPanel(ttk.Frame):
 
         if "generate_screenplay" in brief_data:
             self.generate_screenplay_var.set(self._to_bool(brief_data.get("generate_screenplay")))
+        if "generate_end_shots" in brief_data:
+            self.generate_end_shots_var.set(self._to_bool(brief_data.get("generate_end_shots")))
+        if "screenplay_time" in brief_data and brief_data.get("screenplay_time") not in (None, ""):
+            self.screenplay_time_var.set(str(brief_data.get("screenplay_time")))
         if "force_update_prompts" in brief_data:
             self.force_update_prompts_var.set(self._to_bool(brief_data.get("force_update_prompts")))
+        if "skip_prompt_enhancement" in brief_data:
+            self.skip_prompt_enhancement_var.set(
+                self._to_bool(brief_data.get("skip_prompt_enhancement"))
+            )
+        if "sample_before_batch" in brief_data:
+            self.sample_before_batch_var.set(self._to_bool(brief_data.get("sample_before_batch")))
+        if "sample_shot_key" in brief_data:
+            self.sample_shot_key_var.set(str(brief_data.get("sample_shot_key") or "").strip())
+        if "final_allow_missing_audio" in brief_data:
+            self.final_allow_missing_audio_var.set(
+                self._to_bool(brief_data.get("final_allow_missing_audio"))
+            )
+        self._sync_sample_shot_key_state()
 
     def _collect_pipeline_params(self) -> Dict[str, Any]:
         """Собирает и валидирует параметры pipeline из UI."""
@@ -214,8 +251,9 @@ class GenerationPanel(ttk.Frame):
             pages_max = int(self.pipeline_pages_max_var.get())
             words_per_page_min = int(self.pipeline_words_per_page_min_var.get())
             words_per_page_max = int(self.pipeline_words_per_page_max_var.get())
+            screenplay_time = int(self.screenplay_time_var.get())
         except ValueError as e:
-            raise ValueError("Параметры страниц и слов должны быть целыми числами") from e
+            raise ValueError("Параметры страниц, слов и времени должны быть целыми числами") from e
 
         if pages_min < 1:
             raise ValueError("Минимальное количество страниц должно быть не меньше 1")
@@ -225,10 +263,19 @@ class GenerationPanel(ttk.Frame):
             raise ValueError("Минимальное количество слов на страницу должно быть не меньше 1")
         if words_per_page_max < words_per_page_min:
             raise ValueError("Максимальное количество слов на страницу не может быть меньше минимального")
+        if screenplay_time < 1:
+            raise ValueError("Длительность screenplay должна быть не меньше 1 секунды")
 
         language = self.pipeline_language_var.get().strip()
         if not language:
             raise ValueError("Выберите язык pipeline")
+
+        sample_before_batch = bool(self.sample_before_batch_var.get())
+        sample_shot_key = self.sample_shot_key_var.get().strip() if sample_before_batch else ""
+        if sample_shot_key:
+            sample_parts = sample_shot_key.split("-", 1)
+            if len(sample_parts) != 2 or not all(part.isdigit() and int(part) > 0 for part in sample_parts):
+                raise ValueError("Sample shot должен быть в формате scene-shot, например 1-2")
 
         return {
             "pages_min": pages_min,
@@ -236,9 +283,22 @@ class GenerationPanel(ttk.Frame):
             "words_per_page_min": words_per_page_min,
             "words_per_page_max": words_per_page_max,
             "language": language,
+            "screenplay_time": screenplay_time,
             "generate_screenplay": bool(self.generate_screenplay_var.get()),
+            "generate_end_shots": bool(self.generate_end_shots_var.get()),
             "force_update_prompts": bool(self.force_update_prompts_var.get()),
+            "skip_prompt_enhancement": bool(self.skip_prompt_enhancement_var.get()),
+            "sample_before_batch": sample_before_batch,
+            "sample_shot_key": sample_shot_key,
+            "final_allow_missing_audio": bool(self.final_allow_missing_audio_var.get()),
         }
+
+    def _sync_sample_shot_key_state(self):
+        """Включает поле sample-shot только для sample-before-batch режима."""
+        if not hasattr(self, "sample_shot_key_combo"):
+            return
+        state = "normal" if bool(self.sample_before_batch_var.get()) else "disabled"
+        self.sample_shot_key_combo.config(state=state)
     
     def create_ui(self):
         """Создание пользовательского интерфейса"""
@@ -356,6 +416,18 @@ class GenerationPanel(ttk.Frame):
         self.pipeline_language_combo['values'] = tuple(self.supported_languages)
         self.pipeline_language_combo.pack(side="left", padx=(5, 0))
 
+        screenplay_time_frame = ttk.Frame(pipeline_settings_frame)
+        screenplay_time_frame.pack(fill="x", pady=6)
+        ttk.Label(screenplay_time_frame, text="Длительность видео, сек.:").pack(side="left")
+        self.screenplay_time_spinbox = ttk.Spinbox(
+            screenplay_time_frame,
+            from_=1,
+            to=sys.maxsize,
+            textvariable=self.screenplay_time_var,
+            width=8
+        )
+        self.screenplay_time_spinbox.pack(side="left", padx=(5, 0))
+
         options_frame = ttk.Frame(pipeline_settings_frame)
         options_frame.pack(fill="x", pady=(6, 0))
         self.generate_screenplay_checkbutton = ttk.Checkbutton(
@@ -364,12 +436,52 @@ class GenerationPanel(ttk.Frame):
             variable=self.generate_screenplay_var
         )
         self.generate_screenplay_checkbutton.pack(anchor="w")
+        self.generate_end_shots_checkbutton = ttk.Checkbutton(
+            options_frame,
+            text="Генерировать финальные кадры shots",
+            variable=self.generate_end_shots_var
+        )
+        self.generate_end_shots_checkbutton.pack(anchor="w", pady=(2, 0))
         self.force_update_prompts_checkbutton = ttk.Checkbutton(
             options_frame,
             text="Принудительно обновлять промпты видео",
             variable=self.force_update_prompts_var
         )
         self.force_update_prompts_checkbutton.pack(anchor="w", pady=(2, 0))
+        self.skip_prompt_enhancement_checkbutton = ttk.Checkbutton(
+            options_frame,
+            text="Не улучшать video-промпты LLM",
+            variable=self.skip_prompt_enhancement_var
+        )
+        self.skip_prompt_enhancement_checkbutton.pack(anchor="w", pady=(2, 0))
+        self.sample_before_batch_checkbutton = ttk.Checkbutton(
+            options_frame,
+            text="Сначала sample-shot перед batch",
+            variable=self.sample_before_batch_var,
+            command=self._sync_sample_shot_key_state
+        )
+        self.sample_before_batch_checkbutton.pack(anchor="w", pady=(2, 0))
+
+        sample_frame = ttk.Frame(pipeline_settings_frame)
+        sample_frame.pack(fill="x", pady=(6, 0))
+        ttk.Label(sample_frame, text="Sample shot:").pack(side="left")
+        self.sample_shot_key_combo = ttk.Combobox(
+            sample_frame,
+            textvariable=self.sample_shot_key_var,
+            width=10
+        )
+        self.sample_shot_key_combo.pack(side="left", padx=(5, 0))
+        ttk.Label(sample_frame, text="формат 1-2").pack(side="left", padx=(5, 0))
+
+        final_frame = ttk.Frame(pipeline_settings_frame)
+        final_frame.pack(fill="x", pady=(6, 0))
+        self.final_allow_missing_audio_checkbutton = ttk.Checkbutton(
+            final_frame,
+            text="Разрешить финальную сборку без audio",
+            variable=self.final_allow_missing_audio_var
+        )
+        self.final_allow_missing_audio_checkbutton.pack(anchor="w")
+        self._sync_sample_shot_key_state()
 
         ttk.Button(pipeline_frame, text="🚀 Запустить полный pipeline", 
                   command=self.run_full_pipeline).pack(fill="x")
@@ -718,10 +830,12 @@ class GenerationPanel(ttk.Frame):
                 error_msg = result.get("message", "Неизвестная ошибка")
                 self.add_log(f"❌ Pipeline завершен с ошибкой: {error_msg}", "error")
                 self.update_progress(0, "Ошибка")
+            self._append_video_artifact_summary(project_id)
 
         except Exception as e:
             logger.error(f"Ошибка выполнения pipeline: {e}")
             self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            self._append_video_artifact_summary(project_id)
         finally:
             self.finish_generation()
     
@@ -766,10 +880,12 @@ class GenerationPanel(ttk.Frame):
                 error_msg = result.get("message", "Неизвестная ошибка")
                 self.add_log(f"❌ Частичный pipeline завершен с ошибкой: {error_msg}", "error")
                 self.update_progress(0, "Ошибка")
+            self._append_video_artifact_summary(project_id)
             
         except Exception as e:
             logger.error(f"Ошибка выполнения частичного pipeline: {e}")
             self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            self._append_video_artifact_summary(project_id)
         finally:
             self.finish_generation()
 
@@ -811,9 +927,13 @@ class GenerationPanel(ttk.Frame):
                 error_msg = result.get("message", "Неизвестная ошибка")
                 self.add_log(f"❌ Ошибка восстановления pipeline: {error_msg}", "error")
                 self.update_progress(0, "Ошибка")
+            if self.current_project:
+                self._append_video_artifact_summary(self.current_project.project_id)
         except Exception as e:
             logger.error(f"Ошибка восстановления workflow {workflow_id}: {e}")
             self.add_log(f"❌ Критическая ошибка восстановления: {e}", "error")
+            if self.current_project:
+                self._append_video_artifact_summary(self.current_project.project_id)
         finally:
             self.finish_generation()
 
@@ -863,10 +983,12 @@ class GenerationPanel(ttk.Frame):
                     "error",
                 )
                 self.update_progress(0, "Ошибка")
+            self._append_video_artifact_summary(project_id)
 
         except Exception as e:
             logger.error(f"Ошибка single-step rerun для шага {step_id}: {e}")
             self.add_log(f"❌ Критическая ошибка: {e}", "error")
+            self._append_video_artifact_summary(project_id)
         finally:
             self.finish_generation()
     
@@ -1064,7 +1186,184 @@ class GenerationPanel(ttk.Frame):
         """Исправление ошибок проекта"""
         # TODO: Реализовать автоматическое исправление ошибок
         messagebox.showinfo("Информация", "Функция автоматического исправления ошибок будет реализована позже")
-    
+
+    def _resolve_project_path(self, project_id: str) -> Path:
+        """Возвращает путь проекта для чтения артефактов video pipeline."""
+        if (
+            self.current_project
+            and self.current_project.project_id == project_id
+            and getattr(self.current_project, "project_path", None)
+        ):
+            project_path = Path(self.current_project.project_path)
+            if project_path.exists():
+                return project_path
+
+        return Path(__file__).parent.parent.parent / "plots" / "storybooks" / project_id
+
+    @staticmethod
+    def _read_json_artifact(project_path: Path, relative_path: str) -> Optional[Dict[str, Any]]:
+        artifact_path = project_path / relative_path
+        if not artifact_path.exists():
+            return None
+        try:
+            with open(artifact_path, "r", encoding="utf-8") as file_obj:
+                data = json.load(file_obj)
+        except Exception as e:
+            logger.warning("Не удалось прочитать artifact %s: %s", artifact_path, e)
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _format_capabilities(capabilities: Dict[str, Any]) -> str:
+        if not isinstance(capabilities, dict) or not capabilities:
+            return "неизвестно"
+        parts = []
+        for key in ("image", "video", "audio", "render"):
+            if key in capabilities:
+                parts.append(f"{key}={'yes' if capabilities.get(key) else 'no'}")
+        return ", ".join(parts) if parts else "неизвестно"
+
+    @staticmethod
+    def _failed_review_checks(final_review: Dict[str, Any]) -> List[str]:
+        checks = final_review.get("checks")
+        if not isinstance(checks, dict):
+            return []
+        return [
+            check_name
+            for check_name, check_data in checks.items()
+            if isinstance(check_data, dict) and not check_data.get("passed", False)
+        ]
+
+    @staticmethod
+    def _provider_job_summary(provider_jobs: Dict[str, Any]) -> str:
+        jobs = provider_jobs.get("jobs")
+        if not isinstance(jobs, list):
+            return "jobs=0"
+
+        status_counts: Dict[str, int] = {}
+        total_cost = 0.0
+        cost_seen = False
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            status = str(job.get("status") or "unknown")
+            status_counts[status] = status_counts.get(status, 0) + 1
+            cost = job.get("cost_rub", job.get("cost"))
+            if isinstance(cost, (int, float)):
+                total_cost += float(cost)
+                cost_seen = True
+
+        parts = [f"jobs={len(jobs)}"]
+        parts.extend(f"{status}={count}" for status, count in sorted(status_counts.items()))
+        if cost_seen:
+            parts.append(f"cost={total_cost:.2f}")
+        return ", ".join(parts)
+
+    def _build_video_artifact_summary(self, project_id: str) -> List[tuple[str, str]]:
+        """Собирает краткую сводку video pipeline артефактов для UI-логов."""
+        project_path = self._resolve_project_path(project_id)
+        messages: List[tuple[str, str]] = []
+
+        if not project_path.exists():
+            return [(
+                f"Видео-артефакты недоступны: проект не найден ({project_path})",
+                "warning",
+            )]
+
+        preflight = self._read_json_artifact(
+            project_path,
+            "96_video_contract/provider_menu_summary.json",
+        )
+        if preflight:
+            messages.append((
+                "Video preflight: "
+                f"provider={preflight.get('provider', 'unknown')}, "
+                f"capabilities={self._format_capabilities(preflight.get('capabilities') or {})}, "
+                f"expected_clips={preflight.get('expected_video_count', 0)}",
+                "success" if preflight.get("capabilities", {}).get("video") else "warning",
+            ))
+
+        delivery = self._read_json_artifact(
+            project_path,
+            "96_video_contract/delivery_promise.json",
+        )
+        if delivery:
+            blockers = delivery.get("blocking_reasons") or []
+            level = "success" if delivery.get("will_generate_video") else "warning"
+            if delivery.get("status") == "error":
+                level = "error"
+            blocker_text = ", ".join(str(item) for item in blockers) if blockers else "нет"
+            messages.append((
+                "Delivery promise: "
+                f"will_generate_video={delivery.get('will_generate_video')}, "
+                f"expected_outputs={delivery.get('expected_video_count', 0)}, "
+                f"blockers={blocker_text}",
+                level,
+            ))
+
+        provider_jobs = self._read_json_artifact(project_path, "97_shots/provider_jobs.json")
+        if provider_jobs:
+            jobs = provider_jobs.get("jobs")
+            jobs_list = jobs if isinstance(jobs, list) else []
+            has_failed = any(
+                isinstance(job, dict) and job.get("status") in {"failed", "download_failed"}
+                for job in jobs_list
+            )
+            messages.append((
+                f"Provider jobs: {self._provider_job_summary(provider_jobs)}",
+                "error" if has_failed else "success",
+            ))
+
+        audio_manifest = self._read_json_artifact(project_path, "98_audio/audio_manifest.json")
+        subtitles_path = project_path / "98_audio" / "subtitles.srt"
+        if audio_manifest or subtitles_path.exists():
+            tts_status = audio_manifest.get("tts_status", "unknown") if audio_manifest else "missing"
+            tracks = audio_manifest.get("audio_tracks") if audio_manifest else []
+            track_count = len(tracks) if isinstance(tracks, list) else 0
+            messages.append((
+                "Audio/subtitles: "
+                f"tts_status={tts_status}, tracks={track_count}, subtitles={subtitles_path.exists()}",
+                "success" if subtitles_path.exists() else "warning",
+            ))
+
+        final_dir = project_path / "99_final"
+        final_video_path = final_dir / "final_video.mp4"
+        final_review = self._read_json_artifact(project_path, "99_final/final_review.json")
+        if final_review:
+            failed_checks = self._failed_review_checks(final_review)
+            errors = final_review.get("errors")
+            error_count = len(errors) if isinstance(errors, list) else 0
+            messages.append((
+                "Final review: "
+                f"passed={final_review.get('passed')}, "
+                f"failed_checks={', '.join(failed_checks) if failed_checks else 'нет'}, "
+                f"errors={error_count}",
+                "success" if final_review.get("passed") else "error",
+            ))
+
+        if final_dir.exists():
+            expected = [
+                "final_video.mp4",
+                "timeline.fcpxml",
+                "subtitles.srt",
+                "manifest.json",
+                "final_review.json",
+            ]
+            present = [name for name in expected if (final_dir / name).exists()]
+            messages.append((
+                f"Final artifacts: {', '.join(present) if present else 'нет'} ({final_dir})",
+                "success" if final_video_path.exists() else "warning",
+            ))
+
+        if not messages:
+            messages.append(("Видео-артефакты пока не найдены", "warning"))
+        return messages
+
+    def _append_video_artifact_summary(self, project_id: str):
+        """Пишет сводку video artifacts в UI-лог после выполнения pipeline."""
+        for message, level in self._build_video_artifact_summary(project_id):
+            self.add_log(message, level)
+
     def start_generation(self, generation_type: str, params: Dict[str, Any]):
         """Начало генерации.
 

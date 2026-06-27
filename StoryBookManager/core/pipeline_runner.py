@@ -191,6 +191,22 @@ class PipelineRunner:
             "screenplay_shots_generator": ["97_shots/shots.json"],
             "shots_prompt_qa": ["97_shots/shots.json"],
             "artist_batch_shots": ["97_shots"],
+            "storybook_video_preflight": ["96_video_contract/provider_menu_summary.json"],
+            "storybook_video_delivery_promise": ["96_video_contract/delivery_promise.json"],
+            "video_generator": ["97_shots"],
+            "storybook_audio_subtitle": [
+                "98_audio/subtitles.srt",
+                "98_audio/audio_manifest.json",
+                "98_audio/cue_sheet.json",
+            ],
+            "montage_assembler": [
+                "99_final/final_video.mp4",
+                "99_final/timeline.fcpxml",
+                "99_final/subtitles.srt",
+                "99_final/manifest.json",
+                "99_final/final_review.json",
+            ],
+            "storybook_video_decision_log": ["96_video_contract/decision_log.json"],
         }
 
     @classmethod
@@ -367,6 +383,8 @@ class PipelineRunner:
                 logger.info(f"⏭️ Шаг '{skipped_step.id}' будет пропущен (выполнение с {step_id})")
 
             workflow_def.steps = workflow_def.steps[start_index:]
+            if progress_callback:
+                self._install_step_hook(progress_callback, len(workflow_def.steps))
 
             workflow_inputs = workflow_def.inputs if isinstance(workflow_def.inputs, dict) else {}
             context_variables = workflow_inputs.copy()
@@ -400,6 +418,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка выполнения pipeline с шага {step_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            self._uninstall_step_hook()
             self.current_workflow_id = None
 
     async def _get_latest_workflow_checkpoint(self, workflow_id: str):

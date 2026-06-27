@@ -121,6 +121,14 @@ def _verification_output(status: str, recommendations: list[str] | None = None) 
     }
 
 
+def test_enhanced_engine_treats_status_error_dict_as_tool_error():
+    engine = _enhanced_engine_instance()
+    result = {"status": "error", "message": "provider unavailable"}
+
+    assert engine._is_tool_error_result(result) is True
+    assert engine._extract_error_from_result(result) == "provider unavailable"
+
+
 # ===========================================================================
 # 6.1: _substitute_variables_in_metadata
 # ===========================================================================
@@ -1382,3 +1390,67 @@ def test_enhanced_engine_disabled_fails_for_required_enhanced_workflow():
 
     with pytest.raises(WorkflowExecutionError, match="requires enhanced engine"):
         asyncio.run(engine.execute_workflow(workflow, context))
+
+
+def test_base_engine_rejects_required_enhanced_workflow():
+    engine = _engine_instance()
+    models = _workflow_models()
+    WorkflowDefinition = models.WorkflowDefinition
+    WorkflowContext = models.WorkflowContext
+    WorkflowExecutionError = models.WorkflowExecutionError
+
+    workflow = WorkflowDefinition(
+        name="requires-enhanced",
+        steps=[],
+        requires_enhanced_engine=True,
+    )
+    context = WorkflowContext(workflow_id="wf-base", session_id="sess-base")
+
+    with pytest.raises(WorkflowExecutionError, match="requires EnhancedWorkflowEngine"):
+        asyncio.run(engine.execute_workflow(workflow, context))
+
+
+def test_enhanced_engine_required_workflow_disallows_legacy_fallback(monkeypatch):
+    engine = _enhanced_engine_instance()
+    models = _workflow_models()
+    WorkflowDefinition = models.WorkflowDefinition
+    WorkflowContext = models.WorkflowContext
+    WorkflowExecutionError = models.WorkflowExecutionError
+
+    engine.feature_manager = types.SimpleNamespace(
+        is_enhanced_enabled=lambda workflow_id=None: True,
+        global_config={"enhanced_workflow": {"fallback_to_legacy": True}},
+        workflow_overrides={},
+    )
+    workflow = WorkflowDefinition(
+        name="requires-enhanced",
+        steps=[],
+        requires_enhanced_engine=True,
+    )
+    context = WorkflowContext(workflow_id="wf-fallback", session_id="sess-fallback")
+
+    async def fail_enhanced(*_args, **_kwargs):
+        raise RuntimeError("enhanced failed")
+
+    monkeypatch.setattr(engine, "_execute_enhanced_workflow", fail_enhanced)
+
+    with pytest.raises(WorkflowExecutionError, match="legacy fallback is not allowed"):
+        asyncio.run(engine.execute_workflow(workflow, context))
+
+
+def test_enhanced_engine_required_workflow_disallows_generic_legacy_resume():
+    engine = _enhanced_engine_instance()
+    models = _workflow_models()
+    WorkflowDefinition = models.WorkflowDefinition
+    WorkflowContext = models.WorkflowContext
+    WorkflowExecutionError = models.WorkflowExecutionError
+
+    workflow = WorkflowDefinition(
+        name="requires-enhanced",
+        steps=[],
+        requires_enhanced_engine=True,
+    )
+    context = WorkflowContext(workflow_id="wf-resume", session_id="sess-resume")
+
+    with pytest.raises(WorkflowExecutionError, match="generic resume uses legacy execution"):
+        asyncio.run(engine.execute_workflow(workflow, context, skip_steps=set()))

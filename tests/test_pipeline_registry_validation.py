@@ -69,6 +69,9 @@ _BAD_PAYLOADS: list[tuple[str, dict, str]] = [
     ("storybook_pipeline", {}, "task"),
     ("storybook_pipeline", {"task": ""}, "task"),
     ("storybook_pipeline", {"task": "ok", "pages_min": "not_a_number"}, "pages"),
+    ("storybook_pipeline", {"task": "ok", "words_per_page_min": "not_a_number"}, "integer"),
+    ("storybook_pipeline", {"task": "ok", "screenplay_time": 0}, "screenplay_time"),
+    ("storybook_pipeline", {"task": "ok", "sample_shot_key": "bad"}, "sample_shot_key"),
     ("tool_demo", {}, "image_prompt"),
     ("tool_demo", {"image_prompt": "p"}, "research_topic"),
     # text_to_sql_pipeline: query/dsn обязательны (контракт не сломан).
@@ -169,6 +172,32 @@ def test_storybook_validator_requires_task_but_uses_yaml_defaults_for_other_inpu
             assert dumped[key] == value
 
 
+def test_storybook_validator_normalizes_sample_shot_key() -> None:
+    model = PIPELINE_VALIDATORS["storybook_pipeline"]
+
+    blank = model.model_validate({"task": "Сказка", "sample_shot_key": "   "})
+    selected = model.model_validate({"task": "Сказка", "sample_shot_key": " 1-2 "})
+
+    assert blank.sample_shot_key == ""
+    assert selected.sample_shot_key == "1-2"
+
+
+def test_storybook_validator_rejects_inverted_ranges() -> None:
+    model = PIPELINE_VALIDATORS["storybook_pipeline"]
+
+    with pytest.raises(ValidationError, match="pages_max"):
+        model.model_validate({"task": "Сказка", "pages_min": 5, "pages_max": 4})
+
+    with pytest.raises(ValidationError, match="words_per_page_max"):
+        model.model_validate(
+            {
+                "task": "Сказка",
+                "words_per_page_min": 300,
+                "words_per_page_max": 100,
+            }
+        )
+
+
 def test_storybook_validator_reads_yaml_defaults_after_file_change(tmp_path, monkeypatch) -> None:
     import backend.fastapi_app.agui._pipeline_requests as pipeline_requests
 
@@ -188,7 +217,7 @@ def test_storybook_validator_reads_yaml_defaults_after_file_change(tmp_path, mon
                 "  task: demo",
                 "  project_id: storybook_project",
                 f"  pages_min: {pages_min}",
-                "  pages_max: 2",
+                "  pages_max: 4",
                 "  words_per_page_min: 200",
                 "  words_per_page_max: 300",
                 "  generate_screenplay: true",
@@ -197,6 +226,9 @@ def test_storybook_validator_reads_yaml_defaults_after_file_change(tmp_path, mon
                 "  screenplay_time: 120",
                 "  force_update_prompts: false",
                 "  skip_prompt_enhancement: true",
+                "  sample_before_batch: false",
+                "  sample_shot_key: ''",
+                "  final_allow_missing_audio: false",
             ]),
             encoding="utf-8",
         )

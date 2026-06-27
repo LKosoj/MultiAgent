@@ -3,6 +3,8 @@ version: '0.1'
 description: 'Универсальный пайплайн детской сказки: от брифа до PDF'
 parallel_execution: true
 max_parallel_steps: 5
+pipeline:
+  requires_enhanced_engine: true
 inputs:
   task: 'Книга о храбром коте-рыцаре в сияющих доспехах, который защищает своё королевство от злого волшебника. Дружелюбная сказка с приключениями для детей 6-8 лет. Главные герои: кот-рыцарь и принцесса. Антогонисты: злой волшебник.'
   project_id: storybook_project
@@ -16,6 +18,9 @@ inputs:
   screenplay_time: 120
   force_update_prompts: false
   skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
+  sample_before_batch: false
+  sample_shot_key: ''
+  final_allow_missing_audio: false
 global_retry_policy:
   max_retries: 2
   backoff_strategy: exponential
@@ -96,7 +101,7 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
   depends_on:
-  - story_editor
+  - style_keeper
 - id: story_editor
   step_type: tool
   task: Edit and improve story text if it was regenerated
@@ -118,7 +123,7 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
   depends_on:
-  - style_keeper
+  - story_editor
 - id: items_builder
   step_type: tool
   task: Prepare batch items for artist agent
@@ -227,6 +232,48 @@ steps:
   depends_on:
   - shots_prompt_qa
   - artist_batch
+- id: storybook_video_preflight
+  step_type: tool
+  task: Preflight storybook video/audio/render provider capabilities
+  timeout: 120
+  tool_name: storybook_video_preflight_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - provider
+    - generation_enabled
+    - items_total
+    - artifact_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - shots_prompt_qa
+- id: storybook_video_delivery_promise
+  step_type: tool
+  task: Lock delivery promise for storybook motion-led video
+  timeout: 120
+  tool_name: storybook_video_delivery_promise_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - will_generate_video
+    - expected_video_count
+    - expected_outputs
+    - blocking_reasons
+    - artifact_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - storybook_video_preflight
+  - artist_batch_shots
 - id: video_generator
   step_type: tool
   task: Generate video from shots
@@ -240,9 +287,72 @@ steps:
     language: '{language}'
     force_update_prompts: '{force_update_prompts}'
     skip_prompt_enhancement: '{skip_prompt_enhancement}'
+    sample_before_batch: '{sample_before_batch}'
+    sample_shot_key: '{sample_shot_key}'
     enable: '{generate_screenplay}'
   depends_on:
+  - storybook_video_delivery_promise
   - artist_batch_shots
+- id: storybook_audio_subtitle
+  step_type: tool
+  task: Prepare first-class audio manifest and subtitles for final montage
+  timeout: 180
+  tool_name: storybook_audio_subtitle_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - subtitles_path
+    - audio_manifest_path
+    - cue_sheet_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - video_generator
+- id: montage_assembler
+  step_type: tool
+  task: Assemble final video, timeline, subtitles, manifest and final review
+  timeout: 1200
+  tool_name: montage_assembler_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - final_video_path
+    - timeline_path
+    - subtitles_path
+    - manifest_path
+    - final_review_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+    allow_missing_audio: '{final_allow_missing_audio}'
+  depends_on:
+  - storybook_audio_subtitle
+- id: storybook_video_decision_log
+  step_type: tool
+  task: Persist storybook video provider/model/runtime decisions and final status
+  timeout: 120
+  tool_name: storybook_video_decision_log_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - decisions
+    - final_video_status
+    - artifact_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    approved: false
+  depends_on:
+  - montage_assembler
 error_handling:
   on_failure: stop
   auto_retry_transient: true

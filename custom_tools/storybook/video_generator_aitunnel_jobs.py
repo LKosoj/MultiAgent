@@ -1,0 +1,333 @@
+"""Durable provider job ledger for AITunnel storybook video generation."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+
+_PROVIDER_NAME = "aitunnel"
+_PROVIDER_JOBS_VERSION = 1
+_PROVIDER_JOBS_THREAD_LOCKS: Dict[str, threading.RLock] = {}
+_PROVIDER_JOBS_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+class _ProviderJobStore:
+    def __init__(self, path: str):
+        self.path = Path(path)
+        self._lock = threading.RLock()
+        self._data = self._load()
+
+    def _lock_path(self) -> Path:
+        return self.path.with_name(f"{self.path.name}.lock")
+
+    def _acquire_file_lock(self):
+        return _ProviderJobsFileLock(self._lock_path())
+
+    def _load(self) -> Dict[str, Any]:
+        if not self.path.exists():
+            return {"version": _PROVIDER_JOBS_VERSION, "jobs": []}
+
+        with self.path.open("r", encoding="utf-8") as jobs_file:
+            payload = json.load(jobs_file)
+
+        if isinstance(payload, list):
+            return {"version": _PROVIDER_JOBS_VERSION, "jobs": payload}
+        if isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
+            return {
+                "version": payload.get("version", _PROVIDER_JOBS_VERSION),
+                "jobs": payload["jobs"],
+            }
+        raise ValueError(f"Неверная структура provider_jobs.json: {self.path}")
+
+    def mark_stale_for_changed_input(self, shot_key: str, input_hash: str) -> None:
+        now = _utc_now_iso()
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            changed = False
+            for job in self._data["jobs"]:
+                if job.get("provider") != _PROVIDER_NAME:
+                    continue
+                if job.get("shot_key") != shot_key:
+                    continue
+                if job.get("input_hash") == input_hash or job.get("status") == "stale":
+                    continue
+                job["status"] = "stale"
+                job["error"] = "Input hash changed"
+                _touch_job(job, now, "stale_at")
+                changed = True
+            if changed:
+                self._save_locked()
+
+    def ensure_job(self, job_data: Dict[str, Any]) -> Dict[str, Any]:
+        now = _utc_now_iso()
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            job = self._find_latest_locked(job_data["shot_key"], job_data["input_hash"])
+            if job is not None and job.get("status") == "failed":
+                job = None
+            if job is None:
+                job = job_data.copy()
+                job["timestamps"] = dict(job_data.get("timestamps") or {})
+                job["timestamps"].setdefault("created_at", now)
+                job["timestamps"]["updated_at"] = now
+                self._data["jobs"].append(job)
+            else:
+                for key, value in job_data.items():
+                    if key == "timestamps":
+                        continue
+                    job.setdefault(key, value)
+                _touch_job(job, now)
+            self._save_locked()
+            return _copy_job(job)
+
+    def find_current_job(self, shot_key: str, input_hash: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            job = self._find_latest_locked(shot_key, input_hash)
+            return _copy_job(job) if job else None
+
+    def find_resumable_job(self, shot_key: str, input_hash: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            for job in reversed(self._data["jobs"]):
+                if job.get("provider") != _PROVIDER_NAME:
+                    continue
+                if job.get("shot_key") != shot_key or job.get("input_hash") != input_hash:
+                    continue
+                if job.get("status") in {"stale", "failed", "prepared"}:
+                    continue
+                return _copy_job(job)
+            return None
+
+    def find_latest_output_job_for_shot(self, shot_key: str, output_path: str) -> Optional[Dict[str, Any]]:
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            for job in reversed(self._data["jobs"]):
+                if job.get("provider") != _PROVIDER_NAME:
+                    continue
+                if job.get("shot_key") != shot_key:
+                    continue
+                if job.get("output_path") != output_path:
+                    continue
+                if job.get("status") in {"stale", "failed"}:
+                    continue
+                return _copy_job(job)
+            return None
+
+    def has_job_for_shot(self, shot_key: str) -> bool:
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            return any(
+                job.get("provider") == _PROVIDER_NAME and job.get("shot_key") == shot_key
+                for job in self._data["jobs"]
+            )
+
+    def update_job(
+        self,
+        shot_key: str,
+        input_hash: str,
+        updates: Dict[str, Any],
+        timestamp_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        now = _utc_now_iso()
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            job = self._find_latest_locked(shot_key, input_hash)
+            if job is None:
+                job = _new_provider_job(
+                    shot_key=shot_key,
+                    model=str(updates.get("model") or ""),
+                    prompt_hash=str(updates.get("prompt_hash") or ""),
+                    source_image_hashes=updates.get("source_image_hashes") or {},
+                    input_hash=input_hash,
+                    output_path=str(updates.get("output_path") or ""),
+                )
+                self._data["jobs"].append(job)
+
+            job.update(updates)
+            _touch_job(job, now, timestamp_key)
+            self._save_locked()
+            return _copy_job(job)
+
+    def _find_latest_locked(self, shot_key: str, input_hash: str) -> Optional[Dict[str, Any]]:
+        for job in reversed(self._data["jobs"]):
+            if job.get("provider") != _PROVIDER_NAME:
+                continue
+            if job.get("shot_key") != shot_key:
+                continue
+            if job.get("input_hash") != input_hash:
+                continue
+            if job.get("status") == "stale":
+                continue
+            return job
+        return None
+
+    def _save_locked(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write_json(self.path, self._data)
+
+
+def _copy_job(job: Dict[str, Any]) -> Dict[str, Any]:
+    return json.loads(json.dumps(job))
+
+
+class _ProviderJobsFileLock:
+    def __init__(self, path: Path):
+        self.path = path
+        self._handle = None
+        self._thread_lock = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread_lock = _provider_jobs_thread_lock(self.path)
+        self._thread_lock.acquire()
+        self._handle = self.path.open("a+", encoding="utf-8")
+        try:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+        except ImportError:
+            pass
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            if self._handle is not None:
+                try:
+                    import fcntl
+
+                    fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
+                except ImportError:
+                    pass
+                self._handle.close()
+        finally:
+            self._handle = None
+            if self._thread_lock is not None:
+                self._thread_lock.release()
+                self._thread_lock = None
+
+
+def _provider_jobs_thread_lock(path: Path) -> threading.RLock:
+    key = str(path.resolve())
+    with _PROVIDER_JOBS_THREAD_LOCKS_GUARD:
+        lock = _PROVIDER_JOBS_THREAD_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PROVIDER_JOBS_THREAD_LOCKS[key] = lock
+        return lock
+
+
+def _new_provider_job(
+    shot_key: str,
+    model: str,
+    prompt_hash: str,
+    source_image_hashes: Dict[str, Optional[str]],
+    input_hash: str,
+    output_path: str,
+) -> Dict[str, Any]:
+    return {
+        "shot_key": shot_key,
+        "provider": _PROVIDER_NAME,
+        "model": model,
+        "prompt_hash": prompt_hash,
+        "source_image_hashes": source_image_hashes,
+        "input_hash": input_hash,
+        "task_id": None,
+        "status": "prepared",
+        "cost": None,
+        "currency": None,
+        "output_path": output_path,
+        "video_url": None,
+        "video_url_requires_auth": None,
+        "error": None,
+        "timestamps": {},
+    }
+
+
+def _touch_job(job: Dict[str, Any], now: str, timestamp_key: Optional[str] = None) -> None:
+    timestamps = job.setdefault("timestamps", {})
+    timestamps["updated_at"] = now
+    if timestamp_key:
+        timestamps[timestamp_key] = now
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as tmp_file:
+            json.dump(payload, tmp_file, ensure_ascii=False, indent=2, sort_keys=True)
+            tmp_file.write("\n")
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _hash_json(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return _hash_text(encoded)
+
+
+def _hash_source_image(image_ref: Optional[str]) -> Optional[str]:
+    if not image_ref:
+        return None
+    if _is_url_or_data_url(image_ref):
+        return _hash_text(image_ref)
+
+    path = Path(image_ref)
+    if not path.exists():
+        return None
+
+    digest = hashlib.sha256()
+    with path.open("rb") as image_file:
+        for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _build_input_hash(
+    model_name: str,
+    prompt_hash: str,
+    source_image_hashes: Dict[str, Optional[str]],
+    duration: int,
+    size_params: Dict[str, str],
+    seed: Optional[int],
+    frame_types: list[str],
+) -> str:
+    return _hash_json(
+        {
+            "provider": _PROVIDER_NAME,
+            "model": model_name,
+            "prompt_hash": prompt_hash,
+            "source_image_hashes": source_image_hashes,
+            "duration": duration,
+            "size_params": size_params,
+            "seed": seed,
+            "generate_audio": False,
+            "frame_types": frame_types,
+        }
+    )
+
+
+def _is_url_or_data_url(value: str) -> bool:
+    return value.startswith("http://") or value.startswith("https://") or value.startswith("data:")

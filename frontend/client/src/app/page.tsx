@@ -18,6 +18,11 @@ import {
   SystemSection,
 } from "./components/sections/ActionCardSections";
 import { KeyValueList } from "./components/shared/KeyValueList";
+import {
+  buildWorkflowParameters,
+  initialWorkflowParams,
+  type WorkflowParams,
+} from "./utils/workflowParams";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000/agent";
 
@@ -194,7 +199,7 @@ function AguiStudio() {
   const [workflowSearch, setWorkflowSearch] = useState("");
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowInfo | null>(null);
   const [workflowInputs, setWorkflowInputs] = useState<Record<string, unknown>>({});
-  const [workflowParams, setWorkflowParams] = useState<Record<string, string>>({});
+  const [workflowParams, setWorkflowParams] = useState<WorkflowParams>({});
   const [workflowOptions, setWorkflowOptions] = useState({ useEnhanced: true, enableTelemetry: true });
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRunInfo[]>([]);
   const [workflowRunsLoading, setWorkflowRunsLoading] = useState(false);
@@ -834,11 +839,7 @@ function AguiStudio() {
       };
       const inputs = result?.pipeline_info?.inputs ?? {};
       setWorkflowInputs(inputs);
-      const defaults: Record<string, string> = {};
-      Object.entries(inputs).forEach(([key, value]) => {
-        defaults[key] = value === null || value === undefined ? "" : String(value);
-      });
-      setWorkflowParams(defaults);
+      setWorkflowParams(initialWorkflowParams(workflowName, inputs));
     },
     [runServiceAction],
   );
@@ -907,21 +908,17 @@ function AguiStudio() {
   const handleRunWorkflow = useCallback(async () => {
     if (!selectedWorkflow) return;
     setWorkflowRunError(null);
-    const parameters: Record<string, string> = {};
-    Object.entries(workflowInputs).forEach(([key, defaultValue]) => {
-      const raw = (workflowParams[key] ?? "").trim();
-      if (raw) {
-        parameters[key] = raw;
-      } else if (defaultValue !== null && defaultValue !== undefined && String(defaultValue).trim()) {
-        parameters[key] = String(defaultValue).trim();
-      }
-    });
-    const missing = Object.entries(workflowInputs)
-      .filter(([, value]) => value === null || value === undefined || String(value).trim() === "")
-      .map(([key]) => key)
-      .filter((key) => !parameters[key]);
+    const { parameters, missing, errors } = buildWorkflowParameters(
+      selectedWorkflow.name,
+      workflowInputs,
+      workflowParams,
+    );
     if (missing.length) {
       setWorkflowRunError(`Заполните обязательные параметры: ${missing.join(", ")}`);
+      return;
+    }
+    if (errors.length) {
+      setWorkflowRunError(errors.join("; "));
       return;
     }
 
