@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -68,3 +69,17 @@ def _clear_text_to_sql_llm_safety_cache():
         yield
     finally:
         _clear_llm_safety_cache()
+
+
+@pytest.fixture(autouse=True)
+def _storybook_tool_projects_dir(request, monkeypatch):
+    storybook_tool_tests = {
+        "test_montage_assembler_tool.py",
+        "test_storybook_audio_subtitle_tool.py",
+        "test_storybook_music_generator_tool.py",
+        "test_storybook_video_contract_tools.py",
+    }
+    if Path(str(request.node.path)).name in storybook_tool_tests:
+        tmp_path = request.getfixturevalue("tmp_path")
+        monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path / "plots" / "storybooks"))
+    yield

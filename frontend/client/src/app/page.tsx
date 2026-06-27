@@ -23,6 +23,10 @@ import {
   initialWorkflowParams,
   type WorkflowParams,
 } from "./utils/workflowParams";
+import {
+  buildStorybookReadinessPayload,
+  extractStorybookReadiness,
+} from "./utils/storybookReadiness";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000/agent";
 
@@ -76,6 +80,14 @@ type WorkflowRunInfo = {
   progress_percentage?: number;
   duration_seconds?: number;
   error_message?: string;
+};
+
+type WorkflowRunHistoryEntry = {
+  run_id: string;
+  workflow_name?: string;
+  status?: string;
+  start_time?: string;
+  parameters?: Record<string, unknown>;
 };
 
 type DbPlugin = {
@@ -210,9 +222,7 @@ function AguiStudio() {
   const [currentWorkflowRunLogs, setCurrentWorkflowRunLogs] = useState<unknown[]>([]);
   const [workflowResults, setWorkflowResults] = useState<Record<string, unknown>>({});
   const requestedWorkflowResultsRef = useRef<Set<string>>(new Set());
-  const [workflowRunHistory, setWorkflowRunHistory] = useState<
-    { run_id: string; workflow_name?: string; status?: string; start_time?: string }[]
-  >([]);
+  const [workflowRunHistory, setWorkflowRunHistory] = useState<WorkflowRunHistoryEntry[]>([]);
   const [workflowArtifacts, setWorkflowArtifacts] = useState<Record<string, unknown>>({});
   const [builderInfo, setBuilderInfo] = useState({
     name: "my_pipeline",
@@ -228,6 +238,9 @@ function AguiStudio() {
   const [builderYaml, setBuilderYaml] = useState("");
   const [builderSaveName, setBuilderSaveName] = useState("");
   const [workflowRunError, setWorkflowRunError] = useState<string | null>(null);
+  const [storybookReadiness, setStorybookReadiness] = useState<unknown>(null);
+  const [storybookReadinessLoading, setStorybookReadinessLoading] = useState(false);
+  const [storybookReadinessError, setStorybookReadinessError] = useState<string | null>(null);
   const [builderError, setBuilderError] = useState<string | null>(null);
   const [workflowYamlModal, setWorkflowYamlModal] = useState<{
     open: boolean;
@@ -834,6 +847,8 @@ function AguiStudio() {
 
   const loadWorkflowInputs = useCallback(
     async (workflowName: string) => {
+      setStorybookReadiness(null);
+      setStorybookReadinessError(null);
       const result = (await runServiceAction("workflows.parse_yaml", { workflow_name: workflowName })) as {
         pipeline_info?: { inputs?: Record<string, unknown> };
       };
@@ -847,11 +862,18 @@ function AguiStudio() {
   const handleSelectWorkflow = useCallback(
     async (workflow: WorkflowInfo) => {
       setSelectedWorkflow(workflow);
+      setStorybookReadiness(null);
+      setStorybookReadinessError(null);
       setWorkflowTab("run");
       await loadWorkflowInputs(workflow.name);
     },
     [loadWorkflowInputs],
   );
+
+  useEffect(() => {
+    setStorybookReadiness(null);
+    setStorybookReadinessError(null);
+  }, [selectedWorkflow?.name, workflowParams]);
 
   const handleViewWorkflowYaml = useCallback(
     async (workflow: WorkflowInfo) => {
@@ -940,6 +962,7 @@ function AguiStudio() {
             workflow_name: selectedWorkflow.name,
             status: "running",
             start_time: new Date().toLocaleTimeString("ru-RU"),
+            parameters,
           },
           ...prev,
         ]);
@@ -950,6 +973,29 @@ function AguiStudio() {
       setWorkflowRunError(err instanceof Error ? err.message : "Не удалось запустить workflow");
     }
   }, [refreshWorkflowRuns, runServiceAction, selectedWorkflow, workflowInputs, workflowOptions, workflowParams]);
+
+  const handleFetchStorybookReadiness = useCallback(
+    async (sourceParams?: Record<string, unknown>) => {
+      setStorybookReadinessLoading(true);
+      setStorybookReadinessError(null);
+      setStorybookReadiness(null);
+      try {
+        const payload = buildStorybookReadinessPayload(
+          workflowInputs,
+          (sourceParams ?? workflowParams) as WorkflowParams,
+        );
+        const response = await runServiceAction("workflows.storybook_readiness", payload, {
+          timeoutMs: 30000,
+        });
+        setStorybookReadiness(extractStorybookReadiness(response));
+      } catch (err) {
+        setStorybookReadinessError(err instanceof Error ? err.message : "Не удалось проверить video/music readiness");
+      } finally {
+        setStorybookReadinessLoading(false);
+      }
+    },
+    [runServiceAction, workflowInputs, workflowParams],
+  );
 
   const handleCancelWorkflow = useCallback(
     async (runId: string) => {
@@ -1392,6 +1438,9 @@ function AguiStudio() {
               workflowResults={workflowResults}
               workflowRunHistory={workflowRunHistory}
               workflowArtifacts={workflowArtifacts}
+              storybookReadiness={storybookReadiness}
+              storybookReadinessLoading={storybookReadinessLoading}
+              storybookReadinessError={storybookReadinessError}
               builderInfo={builderInfo}
               builderInputs={builderInputs}
               builderSteps={builderSteps}
@@ -1409,6 +1458,7 @@ function AguiStudio() {
               setWorkflowOptions={setWorkflowOptions}
               setWorkflowParams={setWorkflowParams}
               handleRunWorkflow={handleRunWorkflow}
+              handleFetchStorybookReadiness={handleFetchStorybookReadiness}
               handleFetchWorkflowStatus={handleFetchWorkflowStatus}
               handleFetchWorkflowArtifacts={handleFetchWorkflowArtifacts}
               handleFetchWorkflowResult={handleFetchWorkflowResult}

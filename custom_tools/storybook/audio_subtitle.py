@@ -3,6 +3,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
 
 def storybook_audio_subtitle_tool(
     session_id: str,
@@ -444,19 +446,7 @@ def _format_srt_timestamp(seconds: float) -> str:
 
 
 def _safe_project_dir(project_id: str) -> Path:
-    value = str(project_id or "").strip()
-    if not value:
-        raise ValueError("project_id is required")
-
-    root = (Path("plots") / "storybooks").resolve()
-    candidate = (root / value).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"project_id escapes storybook root: {project_id}") from exc
-    if candidate == root:
-        raise ValueError("project_id must identify a project directory")
-    return candidate
+    return safe_storybook_project_dir(project_id)
 
 
 def _as_bool(value: Any) -> bool:

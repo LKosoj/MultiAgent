@@ -3,8 +3,248 @@ import os
 import shutil
 from pathlib import Path
 
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
 
 CONTRACT_VERSION = 1
+STORYBOOK_WORKFLOW_NAME = "storybook_pipeline"
+
+
+STORYBOOK_WORKFLOW_ACTIONS = (
+    {
+        "id": "project_inventory",
+        "label": "List storybook projects and selected project inventory",
+        "category": "project_lifecycle",
+        "status": "available",
+        "service_action": "workflows.storybook_project_inventory",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "artifact_inventory",
+        "label": "Inspect storybook JSON artifact status",
+        "category": "artifact_editor",
+        "status": "available",
+        "service_action": "workflows.storybook_project_inventory",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "media_inventory",
+        "label": "Inspect storybook media inventory",
+        "category": "media_manager",
+        "status": "available",
+        "service_action": "workflows.storybook_project_inventory",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "artifact_edit",
+        "label": "Edit storybook JSON artifacts",
+        "category": "artifact_editor",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Web artifact editing needs explicit write/backup UX before enabling.",
+    },
+    {
+        "id": "media_edit",
+        "label": "Edit/overwrite storybook media with backup",
+        "category": "media_manager",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Web media overwrite needs explicit backup and preview flow.",
+    },
+    {
+        "id": "project_create_backup_export_delete",
+        "label": "Create, backup, export, delete storybook projects",
+        "category": "project_lifecycle",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Destructive project operations need dedicated web confirmations.",
+    },
+    {
+        "id": "full_pipeline",
+        "label": "Run full pipeline",
+        "category": "execution",
+        "status": "available",
+        "service_action": "workflows.start",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "video_music_readiness",
+        "label": "Video/music readiness",
+        "category": "preflight",
+        "status": "available",
+        "service_action": "workflows.storybook_readiness",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "validate_project",
+        "label": "Validate project",
+        "category": "preflight",
+        "status": "available",
+        "service_action": "workflows.storybook_validate",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "monitor_run",
+        "label": "Monitor status, artifacts, result, logs",
+        "category": "monitoring",
+        "status": "available",
+        "service_action": "workflows.status/workflows.artifacts/workflows.result/logs.run_logs",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "cancel_run",
+        "label": "Cancel running pipeline",
+        "category": "execution",
+        "status": "available",
+        "service_action": "workflows.cancel",
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+    {
+        "id": "run_from_step",
+        "label": "Run from selected step",
+        "category": "execution",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Web WorkflowManager currently starts whole YAML pipelines only.",
+    },
+    {
+        "id": "rerun_single_step",
+        "label": "Rerun one pipeline step from checkpoint",
+        "category": "execution",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Requires latest StoryBookManager project checkpoint context.",
+    },
+    {
+        "id": "pause_resume",
+        "label": "Pause/resume between steps",
+        "category": "execution",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "available",
+            "react": "unsupported",
+            "streamlit": "unsupported",
+        },
+        "reason": "Pause/resume is bound to the local PipelineRunner instance.",
+    },
+    {
+        "id": "regenerate_image",
+        "label": "Regenerate one image",
+        "category": "selective_regeneration",
+        "status": "not_implemented",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "not_implemented",
+            "react": "not_implemented",
+            "streamlit": "not_implemented",
+        },
+    },
+    {
+        "id": "regenerate_video",
+        "label": "Regenerate one video shot",
+        "category": "selective_regeneration",
+        "status": "not_implemented",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "not_implemented",
+            "react": "not_implemented",
+            "streamlit": "not_implemented",
+        },
+    },
+    {
+        "id": "fix_project_errors",
+        "label": "Auto-fix project errors",
+        "category": "maintenance",
+        "status": "not_implemented",
+        "service_action": None,
+        "surfaces": {
+            "storybook_manager": "not_implemented",
+            "react": "not_implemented",
+            "streamlit": "not_implemented",
+        },
+    },
+    {
+        "id": "yaml_builder",
+        "label": "View/edit/build workflow YAML",
+        "category": "workflow_authoring",
+        "status": "web_only",
+        "service_action": "workflows.parse_yaml/workflows.get_yaml/workflows.generate_yaml/workflows.save_yaml",
+        "surfaces": {
+            "storybook_manager": "unsupported",
+            "react": "available",
+            "streamlit": "available",
+        },
+    },
+)
+
+
+def storybook_workflow_actions(project_id: str | None = None) -> dict:
+    """Return the shared UI action contract for storybook workflows."""
+    return {
+        "version": CONTRACT_VERSION,
+        "status": "success",
+        "workflow_name": STORYBOOK_WORKFLOW_NAME,
+        "project_id": str(project_id).strip() if project_id else None,
+        "actions": [dict(action) for action in STORYBOOK_WORKFLOW_ACTIONS],
+    }
 
 
 def _load_env_file() -> None:
@@ -140,6 +380,140 @@ def storybook_video_decision_log_tool(
     return payload
 
 
+def storybook_video_music_readiness(
+    project_id: str,
+    session_id: str = "ui-readiness",
+    language: str = "ru",
+    enable: bool = True,
+    generate_music: bool = True,
+) -> dict:
+    """Return a UI-safe readiness summary for storybook video, music, and render.
+
+    The summary contains booleans, provider names, paths, and artifact statuses only.
+    It intentionally never returns raw API keys or other secret values.
+    """
+    base = _project_dir(project_id)
+    summary = _provider_summary(session_id, project_id, language, enable)
+    contract_dir = base / "96_video_contract"
+    shots_dir = base / "97_shots"
+    audio_dir = base / "98_audio"
+    final_dir = base / "99_final"
+    delivery_path = contract_dir / "delivery_promise.json"
+    provider_jobs_path = shots_dir / "provider_jobs.json"
+    audio_manifest_path = audio_dir / "audio_manifest.json"
+    music_manifest_path = audio_dir / "music_manifest.json"
+    final_review_path = final_dir / "final_review.json"
+
+    music_manifest, music_manifest_error = _read_json_artifact(music_manifest_path)
+    audio_manifest, audio_manifest_error = _read_json_artifact(audio_manifest_path)
+    provider_jobs, provider_jobs_error = _read_json_artifact(provider_jobs_path)
+    delivery, delivery_error = _read_json_artifact(delivery_path)
+    final_review, final_review_error = _read_json_artifact(final_review_path)
+    music_manifest = music_manifest or {}
+    audio_manifest = audio_manifest or {}
+    provider_jobs = provider_jobs or {}
+    delivery = delivery or {}
+    final_review = final_review or {}
+    artifact_errors = [
+        error
+        for error in (
+            music_manifest_error,
+            audio_manifest_error,
+            provider_jobs_error,
+            delivery_error,
+            final_review_error,
+        )
+        if error
+    ]
+
+    music_path = audio_dir / "music.mp3"
+    final_video_path = final_dir / "final_video.mp4"
+    subtitles_path = audio_dir / "subtitles.srt"
+    capabilities = dict(summary["capabilities"])
+    capabilities["music"] = _has_env("SUNO_API_KEY")
+    music_enabled = _as_bool(generate_music)
+    music_configured = _has_env("SUNO_API_KEY")
+    music_exists = music_path.exists()
+    generation_enabled = _as_bool(enable)
+    blocking_reasons = _readiness_blockers(summary, capabilities)
+    warnings = _readiness_warnings(summary, music_enabled, music_configured, music_exists)
+    errors = _readiness_errors(
+        provider_jobs,
+        final_review,
+        music_manifest,
+        artifact_errors,
+        provider_jobs_path=provider_jobs_path,
+    )
+
+    payload = {
+        "version": CONTRACT_VERSION,
+        "status": "success",
+        "ready": not blocking_reasons and not errors,
+        "project_id": str(project_id),
+        "project_path": str(base),
+        "generation_enabled": generation_enabled,
+        "generation": {
+            "video_enabled": generation_enabled,
+            "music_enabled": music_enabled,
+            "language": language,
+        },
+        "capabilities": capabilities,
+        "video": {
+            "provider": summary["provider"],
+            "providers_considered": summary["capability_details"].get("providers_considered", []),
+            "expected_clip_count": summary["expected_video_count"],
+            "items_total": summary["items_total"],
+            "shots_path": summary["shots_path"],
+            "shots_exists": summary["shots_exists"],
+            "shots_error": summary["shots_error"],
+        },
+        "music": {
+            "enabled": music_enabled,
+            "provider": "suno",
+            "configured": music_configured,
+            "api_base_url": (os.getenv("SUNO_API_BASE_URL") or "https://api.sunoapi.org").strip(),
+            "model": (os.getenv("SUNO_MODEL") or "V4_5").strip(),
+            "callback_configured": _has_env("SUNO_CALLBACK_URL"),
+            "status": "disabled" if not music_enabled else music_manifest.get("status") or audio_manifest.get("music_status") or "not_generated",
+            "task_id": music_manifest.get("task_id"),
+            "music_path": str(music_path),
+            "music_exists": music_exists,
+            "manifest_path": str(base / "98_audio" / "music_manifest.json"),
+            "manifest_exists": bool(music_manifest),
+        },
+        "render": {
+            "ffmpeg_path": summary["capability_details"].get("ffmpeg_path"),
+            "ffprobe_path": summary["capability_details"].get("ffprobe_path"),
+            "configured": bool(summary["capabilities"].get("render")),
+        },
+        "artifacts": {
+            "provider_menu_summary": _artifact_status(contract_dir / "provider_menu_summary.json"),
+            "delivery_promise": _artifact_status(delivery_path, _invalid_or_status(delivery_error, delivery.get("status"))),
+            "decision_log": _artifact_status(contract_dir / "decision_log.json"),
+            "provider_jobs": _provider_jobs_status(provider_jobs_path, provider_jobs, provider_jobs_error),
+            "audio_manifest": _artifact_status(audio_manifest_path, _invalid_or_status(audio_manifest_error, audio_manifest.get("tts_status"))),
+            "cue_sheet": _artifact_status(audio_dir / "cue_sheet.json"),
+            "subtitles": _artifact_status(subtitles_path),
+            "music_manifest": _artifact_status(music_manifest_path, _invalid_or_status(music_manifest_error, music_manifest.get("status"))),
+            "music": _artifact_status(music_path, music_manifest.get("status") if music_path.exists() and not music_manifest_error else None),
+            "final_video": _artifact_status(final_video_path),
+            "timeline": _artifact_status(final_dir / "timeline.fcpxml"),
+            "final_subtitles": _artifact_status(final_dir / "subtitles.srt"),
+            "manifest": _artifact_status(final_dir / "manifest.json"),
+            "asset_manifest": _artifact_status(final_dir / "asset_manifest.json"),
+            "edit_decisions": _artifact_status(final_dir / "edit_decisions.json"),
+            "render_report": _artifact_status(final_dir / "render_report.json"),
+            "final_review": _artifact_status(final_review_path, _invalid_or_status(final_review_error, _final_review_status(final_review))),
+        },
+        "final_review": _final_review_summary(final_review),
+        "workflow_actions": storybook_workflow_actions(project_id),
+        "blocking_reasons": blocking_reasons,
+        "warnings": warnings,
+        "errors": errors,
+    }
+    return payload
+
+
 def _provider_summary(session_id, project_id, language, enable):
     enabled = _as_bool(enable)
     shots_path, items, shots_error = _load_shots(project_id)
@@ -192,20 +566,113 @@ def _provider_summary(session_id, project_id, language, enable):
     return summary
 
 
-def _project_dir(project_id):
-    value = str(project_id or "").strip()
-    if not value:
-        raise ValueError("project_id is required")
+def _readiness_blockers(summary, capabilities):
+    blockers = []
+    if not summary.get("generation_enabled"):
+        return blockers
+    if summary.get("shots_error"):
+        blockers.append("shots_json_invalid")
+    if not capabilities.get("video"):
+        blockers.append("video_provider_unavailable")
+    if not capabilities.get("render"):
+        blockers.append("render_capability_unavailable")
+    if summary.get("shots_exists") and summary.get("expected_video_count", 0) == 0:
+        blockers.append("no_expected_video_clips")
+    return blockers
 
-    root = (Path("plots") / "storybooks").resolve()
-    candidate = (root / value).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"project_id escapes storybook root: {project_id}") from exc
-    if candidate == root:
-        raise ValueError("project_id must identify a project directory")
-    return candidate
+
+def _readiness_warnings(summary, music_enabled, music_configured, music_exists):
+    warnings = []
+    if music_enabled and not music_configured and not music_exists:
+        warnings.append("music_provider_unavailable")
+    if not summary.get("shots_exists"):
+        warnings.append("shots_json_missing_before_run")
+    return warnings
+
+
+def _readiness_errors(provider_jobs, final_review, music_manifest, artifact_errors=None, provider_jobs_path=None):
+    errors = list(artifact_errors or [])
+    jobs = provider_jobs.get("jobs") if isinstance(provider_jobs, dict) else None
+    if isinstance(jobs, list):
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if str(job.get("status")) in {"failed", "download_failed"}:
+                shot_key = job.get("shot_key") or job.get("output_path") or "unknown"
+                errors.append(f"provider_job_failed:{shot_key}")
+    elif provider_jobs:
+        name = provider_jobs_path.name if provider_jobs_path else "provider_jobs.json"
+        errors.append(f"invalid_json_shape:{name}")
+
+    music_status = str(music_manifest.get("status") or "").lower() if isinstance(music_manifest, dict) else ""
+    if music_status in {"error", "failed"}:
+        errors.append("music_generation_failed")
+
+    if isinstance(final_review, dict) and final_review:
+        if final_review.get("passed") is False:
+            errors.append("final_review_failed")
+        review_errors = final_review.get("errors")
+        if isinstance(review_errors, list):
+            errors.extend(str(error) for error in review_errors if error)
+
+    return errors
+
+
+def _artifact_status(path, status=None):
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "status": status or ("present" if path.exists() else "missing"),
+    }
+
+
+def _invalid_or_status(error, status):
+    return "invalid" if error else status
+
+
+def _provider_jobs_status(path, provider_jobs, error=None):
+    status = "missing"
+    if error:
+        status = "invalid"
+    elif provider_jobs:
+        jobs = provider_jobs.get("jobs") if isinstance(provider_jobs, dict) else None
+        if isinstance(jobs, list):
+            failed = any(isinstance(job, dict) and str(job.get("status")) in {"failed", "download_failed"} for job in jobs)
+            status = "failed" if failed else "present"
+        else:
+            status = "invalid"
+    payload = _artifact_status(path, status)
+    jobs = provider_jobs.get("jobs") if isinstance(provider_jobs, dict) else None
+    payload["job_count"] = len(jobs) if isinstance(jobs, list) else 0
+    return payload
+
+
+def _final_review_status(final_review):
+    if not final_review:
+        return None
+    return "passed" if final_review.get("passed") else "failed"
+
+
+def _final_review_summary(final_review):
+    if not final_review:
+        return {"exists": False, "passed": None, "failed_checks": [], "errors": []}
+    checks = final_review.get("checks")
+    failed_checks = [
+        name
+        for name, value in checks.items()
+        if isinstance(value, dict) and not value.get("passed", False)
+    ] if isinstance(checks, dict) else []
+    errors = final_review.get("errors")
+    return {
+        "exists": True,
+        "passed": final_review.get("passed"),
+        "failed_checks": failed_checks,
+        "errors": errors if isinstance(errors, list) else [],
+    }
+
+
+def _project_dir(project_id):
+    return safe_storybook_project_dir(project_id)
 
 
 def _contract_dir(project_id):
@@ -370,6 +837,20 @@ def _read_json(path):
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def _read_json_artifact(path):
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return None, f"invalid_json:{path.name}:line_{exc.lineno}_column_{exc.colno}"
+    except OSError as exc:
+        return None, f"unreadable_json:{path.name}:{exc.__class__.__name__}"
+    if not isinstance(data, dict):
+        return None, f"invalid_json_shape:{path.name}"
+    return data, None
 
 
 def _has_env(name):

@@ -32,6 +32,8 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from custom_tools.storybook.project_paths import require_safe_storybook_project_id
+
 
 class _BasePipelineRequest(BaseModel):
     """Базовая модель для pipeline-валидаторов.
@@ -277,6 +279,10 @@ class StorybookPipelineRequest(_BasePipelineRequest):
         default_factory=lambda: _storybook_default_str("sample_shot_key", allow_empty=True),
         validate_default=True,
     )
+    generate_music: bool = Field(
+        default_factory=lambda: _storybook_default_bool("generate_music"),
+        validate_default=True,
+    )
     final_allow_missing_audio: bool = Field(
         default_factory=lambda: _storybook_default_bool("final_allow_missing_audio"),
         validate_default=True,
@@ -286,6 +292,11 @@ class StorybookPipelineRequest(_BasePipelineRequest):
     @classmethod
     def _v_task(cls, v: Any) -> str:
         return _require_non_empty_string(v, "task")
+
+    @field_validator("project_id", mode="before")
+    @classmethod
+    def _v_project_id(cls, v: Any) -> str:
+        return require_safe_storybook_project_id(v)
 
     @field_validator("pages_min", "pages_max", mode="before")
     @classmethod

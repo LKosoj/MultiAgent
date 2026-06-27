@@ -628,6 +628,21 @@ def _coerce_strict_bool(value: Any, *, default: bool = False, field_name: str = 
     raise ValueError(f"{field_name} must be boolean")
 
 
+def _storybook_project_id_from_payload(payload: Dict[str, Any], *, required: bool) -> str | None:
+    value = payload.get("project_id")
+    parameters = payload.get("parameters")
+    if not value and isinstance(parameters, dict):
+        value = parameters.get("project_id")
+    if not value:
+        if required:
+            raise ValueError("project_id is required")
+        return None
+
+    from custom_tools.storybook.project_paths import require_safe_storybook_project_id
+
+    return require_safe_storybook_project_id(value)
+
+
 def _validate_text_to_sql_max_rows(value: Any) -> int:
     if isinstance(value, bool):
         raise ValueError("max_rows must be an integer")
@@ -3088,6 +3103,61 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
             stored = _workflow_result_from_store(run_id) or {}
             artifacts = stored.get("artifacts") if isinstance(stored.get("artifacts"), dict) else None
         return _redact_payload({"artifacts": _serialize(artifacts)})
+    if action == "workflows.storybook_readiness":
+        parameters = payload.get("parameters")
+        project_id = _storybook_project_id_from_payload(payload, required=True)
+        parameters = parameters if isinstance(parameters, dict) else {}
+        language = payload.get("language")
+        if language is None:
+            language = parameters.get("language")
+        enable = payload.get("enable")
+        if enable is None:
+            enable = parameters.get("generate_screenplay")
+        generate_music = payload.get("generate_music")
+        if generate_music is None:
+            generate_music = parameters.get("generate_music")
+        from custom_tools.storybook.video_contract import storybook_video_music_readiness
+
+        readiness = storybook_video_music_readiness(
+            project_id=str(project_id),
+            session_id=str(payload.get("session_id") or "agui-readiness"),
+            language=str(language or "ru"),
+            enable=_coerce_strict_bool(enable, default=True, field_name="enable"),
+            generate_music=_coerce_strict_bool(generate_music, default=True, field_name="generate_music"),
+        )
+        return _redact_payload({"readiness": _serialize(readiness)})
+    if action == "workflows.storybook_actions":
+        project_id = _storybook_project_id_from_payload(payload, required=False)
+
+        from custom_tools.storybook.video_contract import storybook_workflow_actions
+
+        return _redact_payload({"actions": _serialize(storybook_workflow_actions(project_id))})
+    if action == "workflows.storybook_validate":
+        parameters = payload.get("parameters")
+        project_id = _storybook_project_id_from_payload(payload, required=True)
+        start_step = payload.get("start_step")
+        if start_step is None and isinstance(parameters, dict):
+            start_step = parameters.get("start_step")
+
+        from StoryBookManager.core.pipeline_runner import PipelineRunner
+
+        runner = PipelineRunner.__new__(PipelineRunner)
+        validation = runner.validate_project_for_pipeline(
+            project_id,
+            start_step=str(start_step) if start_step else None,
+        )
+        return _redact_payload({"validation": _serialize(validation)})
+    if action == "workflows.storybook_project_inventory":
+        project_id = _storybook_project_id_from_payload(payload, required=False)
+        max_items = int(payload.get("max_items") or 20)
+
+        from custom_tools.storybook.storybook_surface import storybook_project_inventory
+
+        inventory = storybook_project_inventory(
+            project_id=project_id,
+            max_items=max(1, min(max_items, 100)),
+        )
+        return _redact_payload({"inventory": _serialize(inventory)})
     if action == "workflows.generate_report":
         run_id = payload.get("run_id")
         if not run_id:

@@ -336,7 +336,7 @@ def test_montage_assembler_rejects_project_id_path_traversal(tmp_path, monkeypat
     result = montage_assembler.montage_assembler_tool("sess", "../outside")
 
     assert result["status"] == "error"
-    assert "escapes storybook root" in result["message"]
+    assert "project_id must be a safe path segment" in result["message"]
 
 
 def test_montage_assembler_failed_blackdetect_fails_final_review(tmp_path, monkeypatch):

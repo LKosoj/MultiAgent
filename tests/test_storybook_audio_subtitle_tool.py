@@ -97,4 +97,4 @@ def test_storybook_audio_subtitle_rejects_project_id_path_traversal(tmp_path, mo
     result = storybook_audio_subtitle_tool("sess", "../outside")
 
     assert result["status"] == "error"
-    assert "escapes storybook root" in result["message"]
+    assert "project_id must be a safe path segment" in result["message"]

@@ -48,6 +48,10 @@ const isBlank = (value: unknown) => {
   return value === null || value === undefined || (typeof value === "string" && value.trim() === "");
 };
 
+const isPositiveIntPair = (value: string) => {
+  return /^[1-9]\d*-[1-9]\d*$/.test(value);
+};
+
 export const isWorkflowInputOptionalBlank = (workflowName: string, key: string) => {
   return OPTIONAL_BLANK_INPUTS[workflowName]?.has(key) ?? false;
 };
@@ -144,6 +148,12 @@ export const buildWorkflowParameters = (
     const wordsMax = parameters.words_per_page_max;
     if (typeof wordsMin === "number" && typeof wordsMax === "number" && wordsMax < wordsMin) {
       errors.push("words_per_page_max должен быть не меньше words_per_page_min");
+    }
+    const sampleShotKey = parameters.sample_shot_key;
+    if (sampleShotKey !== undefined) {
+      if (typeof sampleShotKey !== "string" || !isPositiveIntPair(sampleShotKey)) {
+        errors.push("sample_shot_key должен быть в формате positive-int-positive-int");
+      }
     }
   }
 

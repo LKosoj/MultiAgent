@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-import sys
 
 from tests.workflow_test_utils import load_light_workflow_models
 
@@ -40,20 +39,7 @@ class TestProjectValidationDependencies(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            config_package = types.ModuleType("config")
-            config_settings_module = types.ModuleType("config.settings")
-            config_settings_module.app_settings = types.SimpleNamespace(
-                get_projects_directory=lambda: projects_root
-            )
-            config_package.settings = config_settings_module
-
-            with patch.dict(
-                sys.modules,
-                {
-                    "config": config_package,
-                    "config.settings": config_settings_module,
-                },
-            ):
+            with patch.dict(os.environ, {"STORYBOOK_PROJECTS_DIR": str(projects_root.resolve())}):
                 result = runner.validate_project_for_pipeline(
                     "proj_validation",
                     start_step="prompt_engineer",

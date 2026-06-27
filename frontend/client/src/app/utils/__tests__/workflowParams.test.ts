@@ -7,6 +7,7 @@ describe("workflow parameter helpers", () => {
       task: "demo prompt from yaml",
       sample_before_batch: false,
       sample_shot_key: "",
+      generate_music: true,
       final_allow_missing_audio: false,
       screenplay_time: 120,
     };
@@ -27,6 +28,7 @@ describe("workflow parameter helpers", () => {
     expect(ready.parameters).toEqual({
       task: "custom story",
       sample_before_batch: false,
+      generate_music: true,
       final_allow_missing_audio: false,
       screenplay_time: 120,
     });
@@ -38,12 +40,14 @@ describe("workflow parameter helpers", () => {
       {
         task: "demo",
         sample_before_batch: false,
+        generate_music: true,
         final_allow_missing_audio: false,
         screenplay_time: 120,
       },
       {
         task: "custom",
         sample_before_batch: "true",
+        generate_music: "false",
         final_allow_missing_audio: "false",
         screenplay_time: "240",
       },
@@ -51,6 +55,7 @@ describe("workflow parameter helpers", () => {
 
     expect(result.errors).toEqual([]);
     expect(result.parameters.sample_before_batch).toBe(true);
+    expect(result.parameters.generate_music).toBe(false);
     expect(result.parameters.final_allow_missing_audio).toBe(false);
     expect(result.parameters.screenplay_time).toBe(240);
   });
@@ -79,5 +84,36 @@ describe("workflow parameter helpers", () => {
     expect(result.errors).toContain("screenplay_time должен быть не меньше 1");
     expect(result.errors).toContain("pages_max должен быть не меньше pages_min");
     expect(result.errors).toContain("words_per_page_max должен быть не меньше words_per_page_min");
+  });
+
+  it("rejects malformed nonblank storybook sample_shot_key", () => {
+    const invalid = buildWorkflowParameters(
+      "storybook_pipeline",
+      {
+        task: "demo",
+        sample_shot_key: "",
+      },
+      {
+        task: "custom",
+        sample_shot_key: "1-0",
+      },
+    );
+
+    expect(invalid.errors).toContain("sample_shot_key должен быть в формате positive-int-positive-int");
+
+    const valid = buildWorkflowParameters(
+      "storybook_pipeline",
+      {
+        task: "demo",
+        sample_shot_key: "",
+      },
+      {
+        task: "custom",
+        sample_shot_key: "12-3",
+      },
+    );
+
+    expect(valid.errors).toEqual([]);
+    expect(valid.parameters.sample_shot_key).toBe("12-3");
   });
 });

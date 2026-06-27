@@ -199,6 +199,10 @@ class PipelineRunner:
                 "98_audio/audio_manifest.json",
                 "98_audio/cue_sheet.json",
             ],
+            "storybook_music_generator": [
+                "98_audio/audio_manifest.json",
+                "98_audio/music_manifest.json",
+            ],
             "montage_assembler": [
                 "99_final/final_video.mp4",
                 "99_final/timeline.fcpxml",
@@ -876,10 +880,19 @@ class PipelineRunner:
         Валидирует наличие 00_brief.json, синтаксис JSON и зависимости частичного запуска.
         """
         try:
-            from config.settings import app_settings
+            from custom_tools.storybook.project_paths import (
+                safe_storybook_project_dir,
+            )
 
-            projects_dir = app_settings.get_projects_directory()
-            project_path = projects_dir / project_id
+            try:
+                project_path = safe_storybook_project_dir(project_id)
+            except ValueError as exc:
+                return {
+                    "valid": False,
+                    "message": str(exc),
+                    "errors": [str(exc)],
+                    "warnings": [],
+                }
 
             if not project_path.exists():
                 return {

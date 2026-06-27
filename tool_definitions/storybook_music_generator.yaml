@@ -1,0 +1,50 @@
+name: storybook_music_generator_tool
+description: "Generates or reuses a storybook background music track and registers it in audio_manifest.json"
+category: "storybook"
+source_type: custom_function
+implementation_source: custom_tools.storybook.music_generator.storybook_music_generator_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Execution trace/session identifier"
+    required: true
+  - name: project_id
+    type: str
+    description: "Storybook project identifier"
+    required: true
+  - name: language
+    type: str
+    description: "Music prompt language/context code"
+    required: false
+  - name: enable
+    type: bool
+    description: "If true, generates or reuses music; if false, writes a skipped manifest"
+    required: false
+  - name: provider
+    type: str
+    description: "Music provider name; currently suno"
+    required: false
+  - name: prompt
+    type: str
+    description: "Optional explicit music prompt; otherwise derived from screenplay concept and scene sound"
+    required: false
+  - name: instrumental
+    type: bool
+    description: "Request instrumental music"
+    required: false
+  - name: wait_for_completion
+    type: bool
+    description: "Poll provider job until audio is ready and downloaded"
+    required: false
+  - name: poll_interval_seconds
+    type: int
+    description: "Provider polling interval"
+    required: false
+  - name: timeout_seconds
+    type: int
+    description: "Max provider polling time"
+    required: false
+  - name: force_regenerate
+    type: bool
+    description: "If true, ignore existing 98_audio/music.mp3 and submit a new provider job"
+    required: false

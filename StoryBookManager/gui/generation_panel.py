@@ -160,6 +160,7 @@ class GenerationPanel(ttk.Frame):
         self.skip_prompt_enhancement_var = tk.BooleanVar()
         self.sample_before_batch_var = tk.BooleanVar()
         self.sample_shot_key_var = tk.StringVar()
+        self.generate_music_var = tk.BooleanVar()
         self.final_allow_missing_audio_var = tk.BooleanVar()
         self._reset_pipeline_settings_to_defaults()
 
@@ -194,6 +195,9 @@ class GenerationPanel(ttk.Frame):
             self._to_bool(self.pipeline_inputs.get("sample_before_batch", False))
         )
         self.sample_shot_key_var.set(str(self.pipeline_inputs.get("sample_shot_key", "")))
+        self.generate_music_var.set(
+            self._to_bool(self.pipeline_inputs.get("generate_music", False))
+        )
         self.final_allow_missing_audio_var.set(
             self._to_bool(self.pipeline_inputs.get("final_allow_missing_audio", False))
         )
@@ -238,6 +242,8 @@ class GenerationPanel(ttk.Frame):
             self.sample_before_batch_var.set(self._to_bool(brief_data.get("sample_before_batch")))
         if "sample_shot_key" in brief_data:
             self.sample_shot_key_var.set(str(brief_data.get("sample_shot_key") or "").strip())
+        if "generate_music" in brief_data:
+            self.generate_music_var.set(self._to_bool(brief_data.get("generate_music")))
         if "final_allow_missing_audio" in brief_data:
             self.final_allow_missing_audio_var.set(
                 self._to_bool(brief_data.get("final_allow_missing_audio"))
@@ -290,6 +296,7 @@ class GenerationPanel(ttk.Frame):
             "skip_prompt_enhancement": bool(self.skip_prompt_enhancement_var.get()),
             "sample_before_batch": sample_before_batch,
             "sample_shot_key": sample_shot_key,
+            "generate_music": bool(self.generate_music_var.get()),
             "final_allow_missing_audio": bool(self.final_allow_missing_audio_var.get()),
         }
 
@@ -481,6 +488,12 @@ class GenerationPanel(ttk.Frame):
             variable=self.final_allow_missing_audio_var
         )
         self.final_allow_missing_audio_checkbutton.pack(anchor="w")
+        self.generate_music_checkbutton = ttk.Checkbutton(
+            final_frame,
+            text="Генерировать музыку Suno",
+            variable=self.generate_music_var
+        )
+        self.generate_music_checkbutton.pack(anchor="w", pady=(2, 0))
         self._sync_sample_shot_key_state()
 
         ttk.Button(pipeline_frame, text="🚀 Запустить полный pipeline", 
@@ -544,6 +557,8 @@ class GenerationPanel(ttk.Frame):
         
         ttk.Button(validation_frame, text="✓ Проверить проект", 
                   command=self.validate_project).pack(fill="x", pady=2)
+        ttk.Button(validation_frame, text="🎚 Проверить video/music providers",
+                  command=self.check_provider_readiness).pack(fill="x", pady=2)
         ttk.Button(validation_frame, text="🔧 Исправить ошибки", 
                   command=self.fix_project_errors).pack(fill="x", pady=2)
     
@@ -1181,6 +1196,20 @@ class GenerationPanel(ttk.Frame):
         except Exception as e:
             logger.error(f"Ошибка валидации проекта: {e}")
             self.add_log(f"❌ Ошибка валидации: {e}", "error")
+
+    def check_provider_readiness(self):
+        """Показывает pre-run сводку доступности video/music провайдеров."""
+        if not self.current_project:
+            messagebox.showwarning("Предупреждение", "Выберите проект")
+            return
+
+        try:
+            readiness = self._load_provider_readiness(self.current_project.project_id)
+            for message, level in self._format_provider_readiness_summary(readiness):
+                self.add_log(message, level)
+        except Exception as e:
+            logger.error(f"Ошибка проверки video/music providers: {e}")
+            self.add_log(f"❌ Ошибка проверки video/music providers: {e}", "error")
     
     def fix_project_errors(self):
         """Исправление ошибок проекта"""
@@ -1218,10 +1247,157 @@ class GenerationPanel(ttk.Frame):
         if not isinstance(capabilities, dict) or not capabilities:
             return "неизвестно"
         parts = []
-        for key in ("image", "video", "audio", "render"):
+        for key in ("image", "video", "audio", "music", "render"):
             if key in capabilities:
                 parts.append(f"{key}={'yes' if capabilities.get(key) else 'no'}")
         return ", ".join(parts) if parts else "неизвестно"
+
+    @staticmethod
+    def _format_workflow_actions(actions_contract: Dict[str, Any]) -> str:
+        actions = actions_contract.get("actions") if isinstance(actions_contract, dict) else None
+        if not isinstance(actions, list):
+            return "неизвестно"
+        interesting_ids = {
+            "project_inventory",
+            "artifact_inventory",
+            "media_inventory",
+            "artifact_edit",
+            "media_edit",
+            "project_create_backup_export_delete",
+            "full_pipeline",
+            "validate_project",
+            "video_music_readiness",
+            "run_from_step",
+            "rerun_single_step",
+            "pause_resume",
+            "regenerate_image",
+            "regenerate_video",
+            "yaml_builder",
+        }
+        parts = []
+        for action in actions:
+            if not isinstance(action, dict) or action.get("id") not in interesting_ids:
+                continue
+            parts.append(f"{action.get('id')}={action.get('status', 'unknown')}")
+        return ", ".join(parts) if parts else "неизвестно"
+
+    def _load_provider_readiness(self, project_id: str) -> Dict[str, Any]:
+        """Загружает единый readiness-контракт для UI без запуска pipeline."""
+        from custom_tools.storybook.video_contract import storybook_video_music_readiness
+
+        language = self.pipeline_language_var.get().strip() if hasattr(self, "pipeline_language_var") else "ru"
+        return storybook_video_music_readiness(
+            project_id=project_id,
+            session_id="storybook-manager-readiness",
+            language=language or "ru",
+            enable=bool(self.generate_screenplay_var.get()) if hasattr(self, "generate_screenplay_var") else True,
+            generate_music=bool(self.generate_music_var.get()) if hasattr(self, "generate_music_var") else True,
+        )
+
+    def _format_provider_readiness_summary(self, readiness: Dict[str, Any]) -> List[tuple[str, str]]:
+        """Форматирует readiness-контракт в короткие UI-строки."""
+        capabilities = readiness.get("capabilities") if isinstance(readiness, dict) else {}
+        video = readiness.get("video") if isinstance(readiness, dict) else {}
+        music = readiness.get("music") if isinstance(readiness, dict) else {}
+        render = readiness.get("render") if isinstance(readiness, dict) else {}
+        artifacts = readiness.get("artifacts") if isinstance(readiness, dict) else {}
+        final_review = readiness.get("final_review") if isinstance(readiness, dict) else {}
+        workflow_actions = readiness.get("workflow_actions") if isinstance(readiness, dict) else {}
+        blockers = readiness.get("blocking_reasons") if isinstance(readiness, dict) else []
+        warnings = readiness.get("warnings") if isinstance(readiness, dict) else []
+        errors = readiness.get("errors") if isinstance(readiness, dict) else []
+        ready = readiness.get("ready") if isinstance(readiness, dict) else False
+
+        messages: List[tuple[str, str]] = []
+        messages.append((
+            "Provider readiness: "
+            f"ready={ready}, "
+            f"capabilities={self._format_capabilities(capabilities or {})}, "
+            f"blockers={', '.join(blockers) if blockers else 'нет'}, "
+            f"warnings={', '.join(warnings) if warnings else 'нет'}, "
+            f"errors={', '.join(errors) if errors else 'нет'}",
+            "error" if blockers or errors else ("warning" if warnings else "success"),
+        ))
+        messages.append((
+            "Video provider: "
+            f"provider={video.get('provider', 'unknown')}, "
+            f"expected_clips={video.get('expected_clip_count', 0)}, "
+            f"shots_exists={video.get('shots_exists')}",
+            "success" if capabilities.get("video") else "warning",
+        ))
+        messages.append((
+            "Music provider: "
+            f"provider={music.get('provider', 'unknown')}, "
+            f"enabled={music.get('enabled')}, "
+            f"configured={music.get('configured')}, "
+            f"model={music.get('model', 'unknown')}, "
+            f"callback={music.get('callback_configured')}, "
+            f"status={music.get('status', 'unknown')}, "
+            f"music_exists={music.get('music_exists')}",
+            self._music_readiness_level(music, errors),
+        ))
+        messages.append((
+            "Render runtime: "
+            f"ffmpeg={render.get('ffmpeg_path') or 'missing'}, "
+            f"ffprobe={render.get('ffprobe_path') or 'missing'}",
+            "success" if render.get("configured") else "warning",
+        ))
+        messages.append((
+            "Workflow actions: "
+            f"{self._format_workflow_actions(workflow_actions or {})}",
+            "info",
+        ))
+        if isinstance(artifacts, dict):
+            artifact_bits = []
+            for key in (
+                "cue_sheet",
+                "subtitles",
+                "music_manifest",
+                "music",
+                "final_video",
+                "timeline",
+                "manifest",
+                "asset_manifest",
+                "edit_decisions",
+                "render_report",
+                "final_review",
+            ):
+                item = artifacts.get(key)
+                if isinstance(item, dict):
+                    artifact_bits.append(f"{key}={item.get('status')}")
+            if artifact_bits:
+                messages.append(("Artifacts: " + ", ".join(artifact_bits), "info"))
+        if isinstance(final_review, dict) and final_review.get("exists"):
+            failed = final_review.get("failed_checks") or []
+            messages.append((
+                "Final review readiness: "
+                f"passed={final_review.get('passed')}, "
+                f"failed_checks={', '.join(failed) if failed else 'нет'}",
+                "success" if final_review.get("passed") else "error",
+            ))
+        return messages
+
+    @staticmethod
+    def _music_readiness_level(music: Dict[str, Any], errors: List[str]) -> str:
+        status = str(music.get("status") or "").lower()
+        if status in {"error", "failed"} or "music_generation_failed" in errors:
+            return "error"
+        if music.get("enabled") is False or status in {"disabled", "skipped"}:
+            return "info"
+        if music.get("configured") or music.get("music_exists"):
+            return "success"
+        return "warning"
+
+    @staticmethod
+    def _music_artifact_level(music_manifest: Optional[Dict[str, Any]], music_exists: bool) -> str:
+        status = str((music_manifest or {}).get("status") or "").lower()
+        if status in {"error", "failed"}:
+            return "error"
+        if status in {"disabled", "skipped"}:
+            return "info"
+        if status == "success":
+            return "success" if music_exists else "warning"
+        return "success" if music_exists and not music_manifest else "warning"
 
     @staticmethod
     def _failed_review_checks(final_review: Dict[str, Any]) -> List[str]:
@@ -1318,12 +1494,25 @@ class GenerationPanel(ttk.Frame):
         subtitles_path = project_path / "98_audio" / "subtitles.srt"
         if audio_manifest or subtitles_path.exists():
             tts_status = audio_manifest.get("tts_status", "unknown") if audio_manifest else "missing"
+            music_status = audio_manifest.get("music_status", "unknown") if audio_manifest else "missing"
             tracks = audio_manifest.get("audio_tracks") if audio_manifest else []
             track_count = len(tracks) if isinstance(tracks, list) else 0
             messages.append((
                 "Audio/subtitles: "
-                f"tts_status={tts_status}, tracks={track_count}, subtitles={subtitles_path.exists()}",
+                f"tts_status={tts_status}, music_status={music_status}, "
+                f"tracks={track_count}, subtitles={subtitles_path.exists()}",
                 "success" if subtitles_path.exists() else "warning",
+            ))
+
+        music_manifest = self._read_json_artifact(project_path, "98_audio/music_manifest.json")
+        music_path = project_path / "98_audio" / "music.mp3"
+        if music_manifest or music_path.exists():
+            messages.append((
+                "Music artifact: "
+                f"status={(music_manifest or {}).get('status', 'present')}, "
+                f"task_id={(music_manifest or {}).get('task_id') or 'none'}, "
+                f"music_exists={music_path.exists()}",
+                self._music_artifact_level(music_manifest, music_path.exists()),
             ))
 
         final_dir = project_path / "99_final"
@@ -1347,6 +1536,9 @@ class GenerationPanel(ttk.Frame):
                 "timeline.fcpxml",
                 "subtitles.srt",
                 "manifest.json",
+                "asset_manifest.json",
+                "edit_decisions.json",
+                "render_report.json",
                 "final_review.json",
             ]
             present = [name for name in expected if (final_dir / name).exists()]

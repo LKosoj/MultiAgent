@@ -11,6 +11,7 @@ from custom_tools.storybook.audio_subtitle import (
     _format_srt_timestamp,
     _parse_timing_range,
 )
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
 
 
 def montage_assembler_tool(
@@ -753,19 +754,7 @@ def _static_prompt_ratio(prompts: List[str]) -> float:
 
 
 def _safe_project_dir(project_id: str) -> Path:
-    value = str(project_id or "").strip()
-    if not value:
-        raise ValueError("project_id is required")
-
-    root = (Path("plots") / "storybooks").resolve()
-    candidate = (root / value).resolve()
-    try:
-        candidate.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"project_id escapes storybook root: {project_id}") from exc
-    if candidate == root:
-        raise ValueError("project_id must identify a project directory")
-    return candidate
+    return safe_storybook_project_dir(project_id)
 
 
 def _resolve_project_media_path(raw_path: str, project_dir: Path) -> tuple[Path, bool]:

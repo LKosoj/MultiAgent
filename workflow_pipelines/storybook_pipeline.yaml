@@ -20,6 +20,7 @@ inputs:
   skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
   sample_before_batch: false
   sample_shot_key: ''
+  generate_music: true
   final_allow_missing_audio: false
 global_retry_policy:
   max_retries: 2
@@ -312,6 +313,28 @@ steps:
     enable: '{generate_screenplay}'
   depends_on:
   - video_generator
+- id: storybook_music_generator
+  step_type: tool
+  task: Generate or reuse background music and register it in audio manifest
+  timeout: 900
+  tool_name: storybook_music_generator_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - music_manifest_path
+    - music_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_music}'
+    provider: suno
+    instrumental: true
+    wait_for_completion: true
+  depends_on:
+  - storybook_audio_subtitle
+  condition: '{generate_screenplay}'
 - id: montage_assembler
   step_type: tool
   task: Assemble final video, timeline, subtitles, manifest and final review
@@ -333,7 +356,7 @@ steps:
     enable: '{generate_screenplay}'
     allow_missing_audio: '{final_allow_missing_audio}'
   depends_on:
-  - storybook_audio_subtitle
+  - storybook_music_generator
 - id: storybook_video_decision_log
   step_type: tool
   task: Persist storybook video provider/model/runtime decisions and final status

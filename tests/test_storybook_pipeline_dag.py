@@ -61,12 +61,15 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertIn("storybook_video_delivery_promise", steps)
         self.assertIn("video_generator", steps)
         self.assertIn("storybook_audio_subtitle", steps)
+        self.assertIn("storybook_music_generator", steps)
         self.assertIn("montage_assembler", steps)
         self.assertIn("storybook_video_decision_log", steps)
         self.assertIn("storybook_video_preflight", steps["storybook_video_delivery_promise"].depends_on)
         self.assertIn("storybook_video_delivery_promise", steps["video_generator"].depends_on)
         self.assertEqual(steps["storybook_audio_subtitle"].depends_on, ["video_generator"])
-        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_audio_subtitle"])
+        self.assertEqual(steps["storybook_music_generator"].depends_on, ["storybook_audio_subtitle"])
+        self.assertEqual(steps["storybook_music_generator"].condition, "{generate_screenplay}")
+        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_music_generator"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
 
     def test_pipeline_runner_knows_video_tail_artifacts(self):
@@ -77,6 +80,7 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertIn("96_video_contract/provider_menu_summary.json", artifacts["storybook_video_preflight"])
         self.assertIn("96_video_contract/delivery_promise.json", artifacts["storybook_video_delivery_promise"])
         self.assertIn("98_audio/subtitles.srt", artifacts["storybook_audio_subtitle"])
+        self.assertIn("98_audio/music_manifest.json", artifacts["storybook_music_generator"])
         self.assertIn("99_final/final_video.mp4", artifacts["montage_assembler"])
         self.assertIn("96_video_contract/decision_log.json", artifacts["storybook_video_decision_log"])
 
@@ -86,6 +90,7 @@ class TestStorybookPipelineDag(unittest.TestCase):
             "storybook_video_preflight",
             "storybook_video_delivery_promise",
             "storybook_audio_subtitle",
+            "storybook_music_generator",
             "montage_assembler",
             "storybook_video_decision_log",
         }

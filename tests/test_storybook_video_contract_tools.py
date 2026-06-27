@@ -47,6 +47,31 @@ def test_preflight_writes_provider_menu_summary(tmp_path, monkeypatch):
     assert saved["capabilities"]["render"] is True
 
 
+def test_preflight_keeps_suno_separate_from_audio_capability(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.setenv("SUNO_API_KEY", "sk-suno")
+
+    result = video_contract.storybook_video_preflight_tool(
+        session_id="session-1",
+        project_id="project-1",
+        language="ru",
+        enable="true",
+    )
+
+    artifact = tmp_path / result["artifact_path"]
+    saved = json.loads(artifact.read_text(encoding="utf-8"))
+    assert saved["capabilities"]["audio"] is False
+    assert "SUNO_API_KEY" not in saved["capability_details"]["audio_env"]
+
+    readiness = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+    )
+    assert readiness["capabilities"]["music"] is True
+    assert readiness["music"]["configured"] is True
+
+
 def test_delivery_promise_blocks_enabled_run_without_capabilities_or_clips(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     for name in [
@@ -112,7 +137,7 @@ def test_preflight_rejects_project_id_path_escape(tmp_path, monkeypatch):
             project_id="../outside",
         )
     except ValueError as exc:
-        assert "escapes storybook root" in str(exc)
+        assert "project_id must be a safe path segment" in str(exc)
     else:
         raise AssertionError("project_id path traversal must be rejected")
 
@@ -179,3 +204,137 @@ def test_decision_log_defaults_to_unapproved_and_can_be_approved(tmp_path, monke
     assert approved["approved"] is True
     assert all(decision["approved"] is True for decision in approved["decisions"])
     assert result["final_video_status"] == "missing"
+
+
+def test_video_music_readiness_treats_missing_shots_as_pre_run_warning(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+        generate_music=False,
+    )
+
+    assert result["ready"] is True
+    assert result["generation"] == {
+        "video_enabled": True,
+        "music_enabled": False,
+        "language": "ru",
+    }
+    assert result["blocking_reasons"] == []
+    assert "shots_json_missing_before_run" in result["warnings"]
+    assert result["music"]["status"] == "disabled"
+    action_ids = [action["id"] for action in result["workflow_actions"]["actions"]]
+    assert "project_inventory" in action_ids
+    assert "artifact_edit" in action_ids
+    assert "media_edit" in action_ids
+    assert "video_music_readiness" in action_ids
+
+
+def test_video_music_readiness_reports_music_final_artifacts_and_errors(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.setenv("SUNO_API_KEY", "sk-suno")
+    base = tmp_path / "plots" / "storybooks" / "project-1"
+    _write_shots(
+        tmp_path,
+        "project-1",
+        [{"scene_number": 1, "shot_number": 1, "video_prompt": "pan", "video_path": "97_shots/1-1.mp4"}],
+    )
+    (base / "97_shots" / "provider_jobs.json").write_text(
+        json.dumps({"jobs": [{"shot_key": "1-1", "status": "failed", "cost_rub": 2.5}]}),
+        encoding="utf-8",
+    )
+    (base / "98_audio").mkdir(parents=True, exist_ok=True)
+    (base / "98_audio" / "music.mp3").write_bytes(b"mp3")
+    (base / "98_audio" / "music_manifest.json").write_text(
+        json.dumps({"status": "success", "task_id": "suno-task-1"}),
+        encoding="utf-8",
+    )
+    (base / "98_audio" / "cue_sheet.json").write_text("{}", encoding="utf-8")
+    (base / "99_final").mkdir(parents=True, exist_ok=True)
+    for name in [
+        "final_video.mp4",
+        "timeline.fcpxml",
+        "subtitles.srt",
+        "manifest.json",
+        "asset_manifest.json",
+        "edit_decisions.json",
+        "render_report.json",
+    ]:
+        (base / "99_final" / name).write_text("x", encoding="utf-8")
+    (base / "99_final" / "final_review.json").write_text(
+        json.dumps(
+            {
+                "passed": False,
+                "checks": {"audio": {"passed": False}},
+                "errors": ["Audio track missing"],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+    )
+
+    assert result["ready"] is False
+    assert result["capabilities"]["music"] is True
+    assert result["music"]["configured"] is True
+    assert result["music"]["music_exists"] is True
+    assert result["artifacts"]["cue_sheet"]["exists"] is True
+    assert result["artifacts"]["asset_manifest"]["exists"] is True
+    assert result["artifacts"]["edit_decisions"]["exists"] is True
+    assert result["artifacts"]["render_report"]["exists"] is True
+    assert result["final_review"]["failed_checks"] == ["audio"]
+    assert "provider_job_failed:1-1" in result["errors"]
+    assert "final_review_failed" in result["errors"]
+    assert "Audio track missing" in result["errors"]
+
+
+def test_video_music_readiness_reports_invalid_json_artifact(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    base = tmp_path / "plots" / "storybooks" / "project-1"
+    _write_shots(
+        tmp_path,
+        "project-1",
+        [{"scene_number": 1, "shot_number": 1, "video_prompt": "pan", "video_path": "97_shots/1-1.mp4"}],
+    )
+    (base / "99_final").mkdir(parents=True, exist_ok=True)
+    (base / "99_final" / "final_review.json").write_text("{", encoding="utf-8")
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+    )
+
+    assert result["ready"] is False
+    assert result["artifacts"]["final_review"]["status"] == "invalid"
+    assert any(error.startswith("invalid_json:final_review.json") for error in result["errors"])
+
+
+def test_video_music_readiness_reports_invalid_provider_jobs_schema(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    base = tmp_path / "plots" / "storybooks" / "project-1"
+    _write_shots(
+        tmp_path,
+        "project-1",
+        [{"scene_number": 1, "shot_number": 1, "video_prompt": "pan", "video_path": "97_shots/1-1.mp4"}],
+    )
+    (base / "97_shots" / "provider_jobs.json").write_text(
+        json.dumps({"unexpected": []}),
+        encoding="utf-8",
+    )
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+    )
+
+    assert result["ready"] is False
+    assert result["artifacts"]["provider_jobs"]["status"] == "invalid"
+    assert "invalid_json_shape:provider_jobs.json" in result["errors"]

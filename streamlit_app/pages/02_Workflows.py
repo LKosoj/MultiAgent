@@ -43,9 +43,250 @@ POSITIVE_INT_INPUTS = {
     },
 }
 
+STORYBOOK_WORKFLOW_NAME = "storybook_pipeline"
+STORYBOOK_READINESS_DEFAULTS = {
+    "project_id": "storybook_project",
+    "language": "ru",
+    "generate_screenplay": True,
+    "generate_music": True,
+}
+STORYBOOK_READINESS_SESSION_ID = "streamlit-readiness"
+
 
 def _is_blank_workflow_input(value):
     return value is None or (isinstance(value, str) and value.strip() == "")
+
+
+def _is_storybook_workflow(workflow):
+    if isinstance(workflow, dict):
+        workflow_name = workflow.get("workflow_name") or workflow.get("name")
+    else:
+        workflow_name = getattr(workflow, "name", workflow)
+    return str(workflow_name or "").strip() == STORYBOOK_WORKFLOW_NAME
+
+
+def _coerce_storybook_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        if normalized in {"1", "true", "yes", "y", "on", "да"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off", "нет"}:
+            return False
+    return bool(value)
+
+
+def _storybook_readiness_payload_from_params(pipeline_params=None, default_params=None):
+    params = pipeline_params if isinstance(pipeline_params, dict) else {}
+    defaults = default_params if isinstance(default_params, dict) else {}
+
+    def value_for(name):
+        fallback = STORYBOOK_READINESS_DEFAULTS[name]
+        value = params.get(name)
+        if _is_blank_workflow_input(value):
+            value = defaults.get(name, fallback)
+        if _is_blank_workflow_input(value):
+            value = fallback
+        return value
+
+    session_id = params.get("session_id") or defaults.get("session_id") or STORYBOOK_READINESS_SESSION_ID
+    project_id = str(value_for("project_id")).strip() or STORYBOOK_READINESS_DEFAULTS["project_id"]
+    language = str(value_for("language")).strip() or STORYBOOK_READINESS_DEFAULTS["language"]
+
+    return {
+        "project_id": project_id,
+        "session_id": str(session_id).strip() or STORYBOOK_READINESS_SESSION_ID,
+        "language": language,
+        "enable": _coerce_storybook_bool(value_for("generate_screenplay"), True),
+        "generate_music": _coerce_storybook_bool(value_for("generate_music"), True),
+    }
+
+
+def _load_storybook_readiness(pipeline_params=None, default_params=None):
+    from custom_tools.storybook.video_contract import storybook_video_music_readiness
+
+    payload = _storybook_readiness_payload_from_params(pipeline_params, default_params)
+    return storybook_video_music_readiness(**payload)
+
+
+def _load_storybook_validation(pipeline_params=None, default_params=None):
+    from StoryBookManager.core.pipeline_runner import PipelineRunner
+
+    payload = _storybook_readiness_payload_from_params(pipeline_params, default_params)
+    params = pipeline_params if isinstance(pipeline_params, dict) else {}
+    defaults = default_params if isinstance(default_params, dict) else {}
+    start_step = params.get("start_step") or defaults.get("start_step")
+    runner = PipelineRunner.__new__(PipelineRunner)
+    return runner.validate_project_for_pipeline(
+        payload["project_id"],
+        start_step=str(start_step) if start_step else None,
+    )
+
+
+def _load_storybook_project_inventory(pipeline_params=None, default_params=None):
+    from custom_tools.storybook.storybook_surface import storybook_project_inventory
+
+    payload = _storybook_readiness_payload_from_params(pipeline_params, default_params)
+    return storybook_project_inventory(payload["project_id"])
+
+
+def _storybook_music_status_label(music, errors_list):
+    status = str((music or {}).get("status") or "").lower()
+    if status in {"error", "failed"} or "music_generation_failed" in errors_list:
+        return "failed"
+    if not (music or {}).get("enabled") or status in {"disabled", "skipped"}:
+        return "disabled"
+    if (music or {}).get("configured") or (music or {}).get("music_exists"):
+        return "ready"
+    return "missing"
+
+
+def _render_storybook_readiness_summary(readiness):
+    st.markdown("#### 🎬 Video/music summary")
+
+    if not isinstance(readiness, dict):
+        st.warning("Readiness вернул неожиданный формат")
+        st.json(readiness)
+        return
+
+    capabilities = readiness.get("capabilities") or {}
+    video = readiness.get("video") or {}
+    music = readiness.get("music") or {}
+    render = readiness.get("render") or {}
+    artifacts = readiness.get("artifacts") or {}
+    blockers = readiness.get("blocking_reasons") or []
+    warnings_list = readiness.get("warnings") or []
+    errors_list = readiness.get("errors") or []
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Video provider", video.get("provider") or "unknown")
+    with col2:
+        st.metric("Expected clips", video.get("expected_clip_count", 0))
+    with col3:
+        st.metric("Music", _storybook_music_status_label(music, errors_list))
+    with col4:
+        st.metric("Render", "ready" if render.get("configured") else "missing")
+
+    capability_bits = [
+        f"`{name}`={'yes' if capabilities.get(name) else 'no'}"
+        for name in ("image", "video", "audio", "music", "render")
+        if name in capabilities
+    ]
+    if capability_bits:
+        st.markdown("**Capabilities:** " + ", ".join(capability_bits))
+
+    if blockers:
+        st.warning("Blockers: " + ", ".join(str(item) for item in blockers))
+    else:
+        st.success("No readiness blockers")
+
+    if warnings_list:
+        st.warning("Warnings: " + ", ".join(str(item) for item in warnings_list))
+
+    if errors_list:
+        st.error("Errors: " + ", ".join(str(item) for item in errors_list))
+
+    artifact_bits = []
+    for name in (
+        "cue_sheet",
+        "subtitles",
+        "music_manifest",
+        "music",
+        "final_video",
+        "timeline",
+        "manifest",
+        "asset_manifest",
+        "edit_decisions",
+        "render_report",
+        "final_review",
+    ):
+        artifact = artifacts.get(name)
+        if isinstance(artifact, dict):
+            artifact_bits.append(f"`{name}`={artifact.get('status')}")
+    if artifact_bits:
+        st.markdown("**Artifacts:** " + ", ".join(artifact_bits))
+
+    _render_storybook_actions_summary(readiness.get("workflow_actions"))
+
+    st.json(readiness)
+
+
+def _render_storybook_actions_summary(actions_contract):
+    if not isinstance(actions_contract, dict):
+        return
+    actions = actions_contract.get("actions")
+    if not isinstance(actions, list):
+        return
+
+    st.markdown("#### Storybook action contract")
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        surfaces = action.get("surfaces") if isinstance(action.get("surfaces"), dict) else {}
+        value = (
+            f"`{action.get('id')}`={action.get('status')}; "
+            f"manager={surfaces.get('storybook_manager', 'unknown')}, "
+            f"react={surfaces.get('react', 'unknown')}, "
+            f"streamlit={surfaces.get('streamlit', 'unknown')}"
+        )
+        reason = action.get("reason")
+        if reason:
+            value += f"; {reason}"
+        status = str(action.get("status") or "")
+        if status == "available":
+            st.success(value)
+        elif status in {"not_implemented", "manager_only", "web_only"}:
+            st.warning(value)
+        else:
+            st.info(value)
+
+
+def _render_storybook_project_inventory(inventory):
+    st.markdown("#### Storybook project inventory")
+
+    if not isinstance(inventory, dict):
+        st.warning("Inventory вернул неожиданный формат")
+        st.json(inventory)
+        return
+
+    selected = inventory.get("selected_project") if isinstance(inventory.get("selected_project"), dict) else {}
+    preview = selected.get("preview") if isinstance(selected.get("preview"), dict) else {}
+    artifacts = selected.get("artifacts") if isinstance(selected.get("artifacts"), dict) else {}
+    media = selected.get("media") if isinstance(selected.get("media"), dict) else {}
+    media_counts = media.get("counts") if isinstance(media.get("counts"), dict) else {}
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Projects", inventory.get("projects_count", 0))
+    with col2:
+        st.metric("Pages", preview.get("pages_count", 0))
+    with col3:
+        st.metric("Images", media_counts.get("image", 0))
+    with col4:
+        st.metric("Videos", media_counts.get("video", 0))
+
+    invalid = [
+        name
+        for name, artifact in artifacts.items()
+        if isinstance(artifact, dict) and artifact.get("status") == "invalid"
+    ]
+    missing = [
+        name
+        for name, artifact in artifacts.items()
+        if isinstance(artifact, dict) and artifact.get("status") == "missing"
+    ]
+    if invalid:
+        st.error("Invalid JSON artifacts: " + ", ".join(invalid))
+    if missing:
+        st.warning("Missing JSON artifacts: " + ", ".join(missing[:10]))
+
+    st.json(inventory)
 
 
 def _workflow_input_required(workflow_name, param_name, default_value):
@@ -501,8 +742,44 @@ def show_workflow_execution():
             st.error("❌ Этот пайплайн не имеет секции 'inputs'. Пожалуйста, обновите пайплайн.")
             st.info("💡 Добавьте секцию 'inputs' в YAML файл пайплайна или используйте конструктор для обновления.")
         
-        # Кнопка запуска
-        submitted = st.form_submit_button("🚀 Запустить пайплайн", type="primary")
+        # Кнопки проверки и запуска
+        readiness_requested = False
+        validation_requested = False
+        inventory_requested = False
+        if _is_storybook_workflow(workflow):
+            validation_col, readiness_col, inventory_col, launch_col = st.columns(4)
+            with validation_col:
+                validation_requested = st.form_submit_button("✓ Проверить проект")
+            with readiness_col:
+                readiness_requested = st.form_submit_button("🎬 Проверить video/music readiness")
+            with inventory_col:
+                inventory_requested = st.form_submit_button("📚 Project inventory")
+            with launch_col:
+                submitted = st.form_submit_button("🚀 Запустить пайплайн", type="primary")
+        else:
+            submitted = st.form_submit_button("🚀 Запустить пайплайн", type="primary")
+
+        if validation_requested:
+            try:
+                validation = _load_storybook_validation(pipeline_params, pipeline_inputs)
+                st.markdown("#### Project validation")
+                st.json(validation)
+            except Exception as e:
+                st.error(f"❌ Ошибка проверки проекта: {e}")
+
+        if readiness_requested:
+            try:
+                readiness = _load_storybook_readiness(pipeline_params, pipeline_inputs)
+                _render_storybook_readiness_summary(readiness)
+            except Exception as e:
+                st.error(f"❌ Ошибка проверки video/music readiness: {e}")
+
+        if inventory_requested:
+            try:
+                inventory = _load_storybook_project_inventory(pipeline_params, pipeline_inputs)
+                _render_storybook_project_inventory(inventory)
+            except Exception as e:
+                st.error(f"❌ Ошибка загрузки storybook inventory: {e}")
         
         if submitted:
             # Проверяем обязательные параметры
@@ -742,19 +1019,35 @@ def show_workflow_monitoring():
         
         if st.session_state.workflow_runs:
             history_data = []
+            storybook_summary_runs = []
             for run_id, run_info in st.session_state.workflow_runs.items():
                 status = wf_manager.get_workflow_status(run_id)
+                parameters = run_info.get("parameters") if isinstance(run_info.get("parameters"), dict) else {}
+                if _is_storybook_workflow(run_info) and parameters.get("project_id"):
+                    storybook_summary_runs.append((run_id, run_info, parameters))
                 
                 history_data.append({
                     "Run ID": run_id[:8] + "...",
-                    "Пайплайн": run_info["workflow_name"],
+                    "Пайплайн": run_info.get("workflow_name", "Unknown"),
                     "Статус": status.status if status else "Unknown",
                     "Начат": run_info["start_time"].strftime("%H:%M:%S"),
-                    "Session ID": run_info["session_id"]
+                    "Session ID": run_info.get("session_id") or parameters.get("session_id", "")
                 })
             
             if history_data:
                 st.dataframe(history_data, use_container_width=True)
+
+            if storybook_summary_runs:
+                st.markdown("#### 🎬 Video/music summary")
+                for run_id, run_info, parameters in storybook_summary_runs:
+                    workflow_name = run_info.get("workflow_name", STORYBOOK_WORKFLOW_NAME)
+                    button_label = f"Video/music summary: {workflow_name} - {run_id[:8]}"
+                    if st.button(button_label, key=f"storybook_readiness_history_{run_id}"):
+                        try:
+                            readiness = _load_storybook_readiness(parameters)
+                            _render_storybook_readiness_summary(readiness)
+                        except Exception as e:
+                            st.error(f"❌ Ошибка проверки video/music summary: {e}")
         else:
             st.info("📭 История пуста")
         

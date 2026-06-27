@@ -7,6 +7,7 @@
 - Валидные JSON проходят проверку
 """
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -43,11 +44,7 @@ class TestValidateProjectJsonSyntax(unittest.TestCase):
         return proj_dir
 
     def _run_validate(self, runner, tmpdir, project_name="test_project"):
-        mock_settings = MagicMock()
-        mock_settings.get_projects_directory.return_value = Path(tmpdir)
-        mock_module = MagicMock()
-        mock_module.app_settings = mock_settings
-        with patch.dict("sys.modules", {"config.settings": mock_module}):
+        with patch.dict(os.environ, {"STORYBOOK_PROJECTS_DIR": str(Path(tmpdir).resolve())}):
             return runner.validate_project_for_pipeline(project_name)
 
     def test_valid_project_passes(self):

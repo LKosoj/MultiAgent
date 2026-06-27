@@ -150,6 +150,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
             "skip_prompt_enhancement": True,
             "sample_before_batch": False,
             "sample_shot_key": "",
+            "generate_music": True,
             "final_allow_missing_audio": False,
         }
         panel.supported_languages = ["ru", "en", "es"]
@@ -191,6 +192,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         self.assertTrue(hasattr(panel, "skip_prompt_enhancement_checkbutton"))
         self.assertTrue(hasattr(panel, "sample_before_batch_checkbutton"))
         self.assertEqual(panel.sample_shot_key_combo.options["state"], "disabled")
+        self.assertTrue(hasattr(panel, "generate_music_checkbutton"))
         self.assertTrue(hasattr(panel, "final_allow_missing_audio_checkbutton"))
 
     def test_apply_project_settings_syncs_sample_shot_key_state(self):
@@ -211,6 +213,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
             "skip_prompt_enhancement": False,
             "sample_before_batch": False,
             "sample_shot_key": "",
+            "generate_music": True,
             "final_allow_missing_audio": False,
         }
         panel.supported_languages = ["ru", "en"]
@@ -226,6 +229,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.skip_prompt_enhancement_var = FakeVar()
         panel.sample_before_batch_var = FakeVar()
         panel.sample_shot_key_var = FakeVar()
+        panel.generate_music_var = FakeVar()
         panel.final_allow_missing_audio_var = FakeVar()
         panel.sample_shot_key_combo = FakeWidget()
 
@@ -255,6 +259,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.skip_prompt_enhancement_var = FakeVar(True)
         panel.sample_before_batch_var = FakeVar(True)
         panel.sample_shot_key_var = FakeVar(" 1-2 ")
+        panel.generate_music_var = FakeVar(True)
         panel.final_allow_missing_audio_var = FakeVar(False)
 
         params = GenerationPanel._collect_pipeline_params(panel)
@@ -274,6 +279,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
                 "skip_prompt_enhancement": True,
                 "sample_before_batch": True,
                 "sample_shot_key": "1-2",
+                "generate_music": True,
                 "final_allow_missing_audio": False,
             },
         )
@@ -295,6 +301,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.skip_prompt_enhancement_var = FakeVar(True)
         panel.sample_before_batch_var = FakeVar(False)
         panel.sample_shot_key_var = FakeVar("")
+        panel.generate_music_var = FakeVar(True)
         panel.final_allow_missing_audio_var = FakeVar(False)
 
         with self.assertRaisesRegex(ValueError, "не может быть меньше"):
@@ -317,6 +324,7 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         panel.skip_prompt_enhancement_var = FakeVar(True)
         panel.sample_before_batch_var = FakeVar(False)
         panel.sample_shot_key_var = FakeVar("")
+        panel.generate_music_var = FakeVar(True)
         panel.final_allow_missing_audio_var = FakeVar(False)
 
         with self.assertRaisesRegex(ValueError, "Длительность screenplay"):
@@ -357,12 +365,20 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
                 json.dumps({"tts_status": "unavailable", "audio_tracks": []}),
                 encoding="utf-8",
             )
+            (project_path / "98_audio" / "music_manifest.json").write_text(
+                json.dumps({"status": "success", "task_id": "suno-task-1"}),
+                encoding="utf-8",
+            )
+            (project_path / "98_audio" / "music.mp3").write_bytes(b"mp3")
             (project_path / "98_audio" / "subtitles.srt").write_text("1\n", encoding="utf-8")
             (project_path / "99_final" / "final_review.json").write_text(
                 json.dumps({"passed": False, "checks": {"audio": {"passed": False}}, "errors": ["audio"]}),
                 encoding="utf-8",
             )
             (project_path / "99_final" / "manifest.json").write_text("{}", encoding="utf-8")
+            (project_path / "99_final" / "asset_manifest.json").write_text("{}", encoding="utf-8")
+            (project_path / "99_final" / "edit_decisions.json").write_text("{}", encoding="utf-8")
+            (project_path / "99_final" / "render_report.json").write_text("{}", encoding="utf-8")
 
             panel = GenerationPanel.__new__(GenerationPanel)
             panel.current_project = types.SimpleNamespace(
@@ -375,7 +391,93 @@ class TestGenerationPanelPipelineConfigUI(unittest.TestCase):
         rendered = "\n".join(message for message, _level in messages)
         self.assertIn("Video preflight", rendered)
         self.assertIn("Provider jobs: jobs=1", rendered)
+        self.assertIn("Music artifact: status=success", rendered)
         self.assertIn("Final review: passed=False", rendered)
+        self.assertIn("asset_manifest.json", rendered)
+        self.assertIn("edit_decisions.json", rendered)
+        self.assertIn("render_report.json", rendered)
+
+    def test_provider_readiness_summary_reports_music_and_final_artifacts(self):
+        module = _import_generation_panel()
+        GenerationPanel = module.GenerationPanel
+
+        panel = GenerationPanel.__new__(GenerationPanel)
+        readiness = {
+            "ready": True,
+            "capabilities": {"image": True, "video": True, "audio": True, "music": False, "render": True},
+            "video": {"provider": "aitunnel", "expected_clip_count": 2, "shots_exists": True},
+            "music": {
+                "enabled": True,
+                "provider": "suno",
+                "configured": False,
+                "model": "V4_5",
+                "callback_configured": False,
+                "status": "not_generated",
+                "music_exists": False,
+            },
+            "render": {"ffmpeg_path": "/usr/bin/ffmpeg", "ffprobe_path": "/usr/bin/ffprobe", "configured": True},
+            "artifacts": {
+                "cue_sheet": {"status": "present"},
+                "music_manifest": {"status": "missing"},
+                "final_video": {"status": "present"},
+                "asset_manifest": {"status": "present"},
+                "edit_decisions": {"status": "present"},
+                "render_report": {"status": "present"},
+                "final_review": {"status": "failed"},
+            },
+            "final_review": {"exists": True, "passed": False, "failed_checks": ["audio"]},
+            "workflow_actions": {
+                "actions": [
+                    {"id": "full_pipeline", "status": "available"},
+                    {"id": "run_from_step", "status": "manager_only"},
+                    {"id": "regenerate_image", "status": "not_implemented"},
+                ]
+            },
+            "blocking_reasons": [],
+            "warnings": ["music_provider_unavailable"],
+            "errors": ["final_review_failed"],
+        }
+
+        messages = GenerationPanel._format_provider_readiness_summary(panel, readiness)
+
+        rendered = "\n".join(message for message, _level in messages)
+        self.assertIn("ready=True", rendered)
+        self.assertIn("music_provider_unavailable", rendered)
+        self.assertIn("final_review_failed", rendered)
+        self.assertIn("cue_sheet=present", rendered)
+        self.assertIn("asset_manifest=present", rendered)
+        self.assertIn("render_report=present", rendered)
+        self.assertIn("Final review readiness: passed=False", rendered)
+        self.assertIn("Workflow actions: full_pipeline=available", rendered)
+        self.assertIn("run_from_step=manager_only", rendered)
+        self.assertIn("regenerate_image=not_implemented", rendered)
+
+    def test_music_readiness_and_artifact_levels_prioritize_failed_status(self):
+        module = _import_generation_panel()
+        GenerationPanel = module.GenerationPanel
+
+        self.assertEqual(
+            GenerationPanel._music_readiness_level(
+                {"enabled": True, "configured": True, "music_exists": True, "status": "failed"},
+                [],
+            ),
+            "error",
+        )
+        self.assertEqual(
+            GenerationPanel._music_readiness_level(
+                {"enabled": True, "configured": True, "music_exists": True, "status": "success"},
+                ["music_generation_failed"],
+            ),
+            "error",
+        )
+        self.assertEqual(
+            GenerationPanel._music_artifact_level({"status": "failed"}, True),
+            "error",
+        )
+        self.assertEqual(
+            GenerationPanel._music_artifact_level({"status": "skipped"}, True),
+            "info",
+        )
 
 
 class TestPipelineRunnerPipelineConfig(unittest.TestCase):
@@ -409,6 +511,7 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
             "skip_prompt_enhancement": False,
             "sample_before_batch": True,
             "sample_shot_key": "1-2",
+            "generate_music": True,
             "final_allow_missing_audio": True,
         }
         mock_ctx_cls = MagicMock(return_value=MagicMock())
@@ -438,6 +541,7 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
         self.assertFalse(call_kwargs["skip_prompt_enhancement"])
         self.assertTrue(call_kwargs["sample_before_batch"])
         self.assertEqual(call_kwargs["sample_shot_key"], "1-2")
+        self.assertTrue(call_kwargs["generate_music"])
         self.assertTrue(call_kwargs["final_allow_missing_audio"])
 
     @patch("StoryBookManager.core.pipeline_runner.project_root", new=project_root)
@@ -468,6 +572,7 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
             "skip_prompt_enhancement": True,
             "sample_before_batch": False,
             "sample_shot_key": "",
+            "generate_music": True,
             "final_allow_missing_audio": False,
         }
 
@@ -498,6 +603,7 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
                         "skip_prompt_enhancement": False,
                         "sample_before_batch": True,
                         "sample_shot_key": "1-2",
+                        "generate_music": True,
                         "final_allow_missing_audio": True,
                     },
                 )
@@ -517,6 +623,7 @@ class TestPipelineRunnerPipelineConfig(unittest.TestCase):
         self.assertFalse(variables["skip_prompt_enhancement"])
         self.assertTrue(variables["sample_before_batch"])
         self.assertEqual(variables["sample_shot_key"], "1-2")
+        self.assertTrue(variables["generate_music"])
         self.assertTrue(variables["final_allow_missing_audio"])
 
 

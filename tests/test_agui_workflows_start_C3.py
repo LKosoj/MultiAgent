@@ -142,6 +142,232 @@ def test_workflows_start_rejects_text_to_sql_pipeline(monkeypatch):
     assert wf_manager.calls == []
 
 
+def test_workflows_storybook_readiness_delegates_to_video_contract(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    from custom_tools.storybook import video_contract
+
+    calls = []
+
+    def fake_readiness(**kwargs):
+        calls.append(kwargs)
+        return {"status": "success", "project_id": kwargs["project_id"], "ready": True}
+
+    monkeypatch.setattr(video_contract, "storybook_video_music_readiness", fake_readiness)
+
+    result = service.handle_service_action(
+        "workflows.storybook_readiness",
+        {
+            "parameters": {"project_id": "project-1"},
+            "language": "en",
+            "enable": "false",
+            "generate_music": "true",
+        },
+    )
+
+    assert result["readiness"] == {"status": "success", "project_id": "project-1", "ready": True}
+    assert calls == [
+        {
+            "project_id": "project-1",
+            "session_id": "agui-readiness",
+            "language": "en",
+            "enable": False,
+            "generate_music": True,
+        }
+    ]
+
+
+def test_workflows_storybook_readiness_reads_workflow_parameters(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    from custom_tools.storybook import video_contract
+
+    calls = []
+
+    def fake_readiness(**kwargs):
+        calls.append(kwargs)
+        return {"status": "success", "project_id": kwargs["project_id"], "ready": True}
+
+    monkeypatch.setattr(video_contract, "storybook_video_music_readiness", fake_readiness)
+
+    service.handle_service_action(
+        "workflows.storybook_readiness",
+        {
+            "parameters": {
+                "project_id": "project-2",
+                "language": "de",
+                "generate_screenplay": False,
+                "generate_music": False,
+            },
+        },
+    )
+
+    assert calls == [
+        {
+            "project_id": "project-2",
+            "session_id": "agui-readiness",
+            "language": "de",
+            "enable": False,
+            "generate_music": False,
+        }
+    ]
+
+
+def test_workflows_storybook_readiness_rejects_invalid_boolean(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    with pytest.raises(ValueError, match="enable must be boolean"):
+        service.handle_service_action(
+            "workflows.storybook_readiness",
+            {"project_id": "project-1", "enable": "fasle"},
+        )
+
+
+def test_workflows_storybook_readiness_requires_project_id(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    with pytest.raises(ValueError, match="project_id is required"):
+        service.handle_service_action("workflows.storybook_readiness", {})
+
+
+_UNSAFE_STORYBOOK_PROJECT_IDS = [
+    "../outside",
+    "/tmp/outside",
+    ".",
+    "project/..",
+    "a/../b",
+    "a/b",
+    r"a\b",
+]
+
+
+@pytest.mark.parametrize("project_id", _UNSAFE_STORYBOOK_PROJECT_IDS)
+def test_workflows_start_rejects_unsafe_storybook_project_id(monkeypatch, project_id):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    with pytest.raises(ValueError, match="workflows.start parameters invalid"):
+        service.handle_service_action(
+            "workflows.start",
+            {
+                "workflow_name": "storybook_pipeline",
+                "parameters": {"task": "ok", "project_id": project_id},
+            },
+        )
+
+    assert wf_manager.calls == []
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "workflows.storybook_readiness",
+        "workflows.storybook_actions",
+        "workflows.storybook_validate",
+        "workflows.storybook_project_inventory",
+    ],
+)
+@pytest.mark.parametrize("project_id", _UNSAFE_STORYBOOK_PROJECT_IDS)
+def test_workflows_storybook_actions_reject_unsafe_project_id(monkeypatch, action, project_id):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    with pytest.raises(ValueError, match="project_id must be a safe path segment"):
+        service.handle_service_action(action, {"parameters": {"project_id": project_id}})
+
+    assert wf_manager.calls == []
+
+
+def test_workflows_storybook_actions_returns_shared_contract(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    result = service.handle_service_action(
+        "workflows.storybook_actions",
+        {"parameters": {"project_id": "project-1"}},
+    )
+
+    contract = result["actions"]
+    action_ids = [action["id"] for action in contract["actions"]]
+    assert contract["workflow_name"] == "storybook_pipeline"
+    assert contract["project_id"] == "project-1"
+    assert "full_pipeline" in action_ids
+    assert "validate_project" in action_ids
+    assert "run_from_step" in action_ids
+    assert wf_manager.calls == []
+
+
+def test_workflows_storybook_validate_delegates_to_pipeline_runner(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    runner_module = types.ModuleType("StoryBookManager.core.pipeline_runner")
+    calls = []
+
+    class FakePipelineRunner:
+        def validate_project_for_pipeline(self, project_id, start_step=None):
+            calls.append({"project_id": project_id, "start_step": start_step})
+            return {
+                "valid": True,
+                "message": "ok",
+                "errors": [],
+                "warnings": ["warn"],
+            }
+
+    runner_module.PipelineRunner = FakePipelineRunner
+    monkeypatch.setitem(sys.modules, "StoryBookManager.core.pipeline_runner", runner_module)
+
+    result = service.handle_service_action(
+        "workflows.storybook_validate",
+        {"parameters": {"project_id": "project-1", "start_step": "story_writer"}},
+    )
+
+    assert result["validation"] == {
+        "valid": True,
+        "message": "ok",
+        "errors": [],
+        "warnings": ["warn"],
+    }
+    assert calls == [{"project_id": "project-1", "start_step": "story_writer"}]
+    assert wf_manager.calls == []
+
+
+def test_workflows_storybook_validate_requires_project_id(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    with pytest.raises(ValueError, match="project_id is required"):
+        service.handle_service_action("workflows.storybook_validate", {})
+
+
+def test_workflows_storybook_project_inventory_delegates_to_surface_contract(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    from custom_tools.storybook import storybook_surface
+
+    calls = []
+
+    def fake_inventory(project_id=None, max_items=20):
+        calls.append({"project_id": project_id, "max_items": max_items})
+        return {"status": "success", "project_id": project_id, "max_items": max_items}
+
+    monkeypatch.setattr(storybook_surface, "storybook_project_inventory", fake_inventory)
+
+    result = service.handle_service_action(
+        "workflows.storybook_project_inventory",
+        {"parameters": {"project_id": "project-1"}, "max_items": 500},
+    )
+
+    assert result["inventory"] == {
+        "status": "success",
+        "project_id": "project-1",
+        "max_items": 100,
+    }
+    assert calls == [{"project_id": "project-1", "max_items": 100}]
+    assert wf_manager.calls == []
+
+
 def test_workflows_start_rejects_metadata_marked_pipeline(monkeypatch, tmp_path):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
