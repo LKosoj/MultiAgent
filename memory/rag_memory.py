@@ -540,8 +540,10 @@ class RagMemory(AgentMemory):
         
         context_parts = []
         
-        # 1. Собираем 2 последних успешных шага из внутренней памяти smolagents
-        successful_steps = self._get_last_successful_steps(max_steps=2)
+        # 1. Собираем последние успешные шаги из внутренней памяти smolagents
+        successful_steps = self._get_last_successful_steps(
+            max_steps=max(2, self.policy.last_k_steps)
+        )
         for step in successful_steps:
             try:
                 step_text = json.dumps(step, ensure_ascii=False, indent=2)
@@ -559,8 +561,13 @@ class RagMemory(AgentMemory):
                 summary_text = record.get('data', {}).get('summary', '')
                 context_parts.append(("rag_record", f"СУММАРИ: {summary_text}"))
             elif isinstance(record, dict):
-                # Обычная запись
-                record_text = json.dumps(record.get('data', {}), ensure_ascii=False, indent=2)
+                # Обычная запись — приоритет agent_response (результат работы агента)
+                data = record.get('data', {})
+                agent_response = data.get('agent_response') if isinstance(data, dict) else None
+                if agent_response and str(agent_response).strip():
+                    record_text = str(agent_response)
+                else:
+                    record_text = json.dumps(data, ensure_ascii=False, indent=2)
                 context_parts.append(("rag_record", record_text))
             else:
                 # На всякий случай - если record не словарь
@@ -600,49 +607,68 @@ class RagMemory(AgentMemory):
         }
         
     def _get_last_successful_steps(self, max_steps: int = 2) -> List[Dict]:
-        """Получает последние успешные шаги из внутренней памяти smolagents
+        """Получает последние успешные шаги из внутренней памяти smolagents.
         
-        Args:
-            max_steps: Максимальное количество шагов
-            
-        Returns:
-            List последних успешных ActionStep без ошибок
+        Включает ActionStep (вызовы инструментов) и FinalAnswerStep (итоговый ответ).
         """
         if not hasattr(self, 'steps') or not self.steps:
             return []
-            
-        # Фильтруем только ActionStep без ошибок, в обратном порядке
-        successful_steps = []
+
+        successful_steps: List[Dict] = []
         for step in reversed(self.steps):
-            # Проверяем, что это успешный шаг
-            # step может быть объектом smolagents или словарем
+            if len(successful_steps) >= max_steps:
+                break
             try:
-                # Пытаемся работать как с объектом smolagents
-                if (hasattr(step, '__class__') and 
-                    step.__class__.__name__ == 'ActionStep' and 
-                    (not hasattr(step, 'error') or step.error is None) and
-                    len(successful_steps) < max_steps):
-                    # Преобразуем в словарь для совместимости
+                if hasattr(step, '__class__'):
+                    step_type = step.__class__.__name__
+                elif isinstance(step, dict):
+                    step_type = step.get('smol_step_type')
+                else:
+                    continue
+
+                if step_type == 'FinalAnswerStep':
+                    output = (
+                        getattr(step, 'output', None)
+                        if not isinstance(step, dict)
+                        else step.get('output')
+                    )
+                    if output:
+                        successful_steps.append({
+                            'smol_step_type': 'FinalAnswerStep',
+                            'output': output,
+                        })
+                    continue
+
+                if step_type != 'ActionStep':
+                    continue
+
+                error = (
+                    getattr(step, 'error', None)
+                    if not isinstance(step, dict)
+                    else step.get('error')
+                )
+                if error is not None:
+                    continue
+
+                if isinstance(step, dict):
+                    step_dict = dict(step)
+                else:
                     step_dict = {
-                        'smol_step_type': step.__class__.__name__,
+                        'smol_step_type': 'ActionStep',
                         'model_output': getattr(step, 'model_output', None),
                         'action_output': getattr(step, 'action_output', None),
                         'observations': getattr(step, 'observations', None),
                         'code_action': getattr(step, 'code_action', None),
-                        'error': getattr(step, 'error', None)
+                        'error': None,
                     }
+
+                if any(step_dict.get(field) for field in (
+                    'observations', 'action_output', 'model_output', 'code_action'
+                )):
                     successful_steps.append(step_dict)
             except Exception:
-                # Fallback: пытаемся работать как со словарем (старый код)
-                try:
-                    if (step.get('smol_step_type') == 'ActionStep' and 
-                        step.get('error') is None and 
-                        len(successful_steps) < max_steps):
-                        successful_steps.append(step)
-                except Exception:
-                    # Если и это не работает, пропускаем шаг
-                    continue
-                
+                continue
+
         return successful_steps
         
     def _get_run_rag_records(self, max_records: int = 10) -> List[Dict]:
@@ -662,13 +688,14 @@ class RagMemory(AgentMemory):
         
         try:
             # Получаем записи ТОЛЬКО текущего запуска через run_id (источник истины — SQLite)
+            # Для суммаризации читаем свой run без политических фильтров retrieval
             records = get_memory(
                 session_id=self.session_id,
                 agent_name=self.agent_name,
                 query="",  # Пустой запрос = получить все (без семантики)
                 run_id=self.current_run_id,
                 include_historical=False,  # Только активные записи
-                requesting_agent=self.agent_name
+                requesting_agent=None,
             )
             
             filtered_records = [r for r in records if isinstance(r, dict)]
@@ -680,6 +707,21 @@ class RagMemory(AgentMemory):
                 logger.error(f"⚠️ Ошибка при получении RAG-записей для запуска: {e}")
             return []
             
+    def _resolve_summary_model(self, model=None):
+        """Возвращает LLM для суммаризации: аргумент → профиль → глобальная model_summary."""
+        if model is not None:
+            if isinstance(model, str):
+                from agent_command import model_mapping
+                return model_mapping.get(model)
+            return model
+        profile_model = getattr(self, '_summary_model', None)
+        if profile_model:
+            if isinstance(profile_model, str):
+                from agent_command import model_mapping
+                return model_mapping.get(profile_model)
+            return profile_model
+        return model_summary
+
     def generate_run_summary(self, model=None) -> Optional[str]:
         """Генерирует суммари текущего запуска через LLM
         
@@ -716,50 +758,58 @@ class RagMemory(AgentMemory):
                 context_text += f"Запись {i+1}:\n{record}\n\n"
                 
         if context_data["truncated"]:
-            context_text += f"...\n[Контекст обрезан: {context_data['original_chars']} -> {context_data['total_chars']} символов]\n"
+            context_text += (
+                f"...\n[Контекст обрезан: {context_data['original_chars']} -> "
+                f"{context_data['total_chars']} символов]\n"
+            )
+
+        user_prompt = (
+            f"ИСХОДНАЯ ЗАДАЧА АГЕНТА: {self.current_run_context or 'Не указана'}\n\n"
+            f"ДАННЫЕ ДЛЯ АНАЛИЗА:\n{context_text}"
+        )
         
-        system_prompt = f"""Вы - эксперт по анализу работы ИИ-агентов. 
+        system_prompt = f"""Вы - эксперт по анализу работы ИИ-агентов.
 
-ЗАДАЧА: Создайте краткое, структурированное суммари работы агента "{self.agent_name}" на основе ТОЛЬКО предоставленных данных.
-
-ИСХОДНАЯ ЗАДАЧА АГЕНТА: {self.current_run_context or "Не указана"}
+ЗАДАЧА: Создайте краткое, структурированное суммари работы агента "{self.agent_name}" на основе ТОЛЬКО данных из сообщения пользователя.
 
 ТРЕБОВАНИЯ:
-1. Отвечайте строго на основе данных ниже - НЕ добавляйте информацию извне
+1. Отвечайте строго на основе предоставленных данных - НЕ добавляйте информацию извне
 2. Структурируйте ответ: Что сделано / Ключевые результаты / Проблемы (если были)
 3. Будьте лаконичны - максимум 500 слов
 4. Укажите номера шагов/записей при ссылках на конкретные действия
 5. Если данных недостаточно для выводов, прямо об этом скажите
+6. НЕ отвечайте приветствиями и не предлагайте помощь — только суммари работы"""
 
-ДАННЫЕ ДЛЯ АНАЛИЗА:
-"""
-
-        user_prompt = context_text
+        if self.policy.enable_logging:
+            logger.info(
+                f"📊 Суммаризация {self.agent_name}: "
+                f"action_steps={len(context_data['successful_steps'])}, "
+                f"rag_records={len(context_data['rag_records'])}, "
+                f"prompt_chars={len(user_prompt)}"
+            )
+            preview = user_prompt[:1500]
+            logger.debug(
+                f"📊 Превью контекста суммаризации ({len(user_prompt)} симв.):\n{preview}"
+                f"{'...' if len(user_prompt) > 1500 else ''}"
+            )
         
         try:
-            model = None
-            # Используем модель или пытаемся найти в контексте агента
-            if not model_summary:
-                # Пытаемся получить модель из контекста, если доступна
-                model = getattr(self, '_get_default_model', lambda: None)()
-            else:
-                model = model_summary
+            summary_model = self._resolve_summary_model(model)
 
             if len(user_prompt) > 80000:
-                model = model_big
+                summary_model = model_big or summary_model
 
-            if not model:
+            if not summary_model:
                 if self.policy.enable_logging:
                     logger.warning("⚠️ Модель для суммаризации не найдена")
                 return None
                 
-            # Генерируем суммари
             messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
+                ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
+                ChatMessage(role=MessageRole.USER, content=user_prompt),
             ]
             
-            response = model(messages, max_tokens=20000, temperature=0.1)
+            response = summary_model(messages, max_tokens=20000, temperature=0.1)
             
             # Извлекаем текст из ответа модели (может быть ChatMessage или строка)
             if hasattr(response, 'content'):

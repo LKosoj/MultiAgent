@@ -17,6 +17,8 @@ from memory.rag_memory import create_rag_memory
 
 logger = logging.getLogger(__name__)
 
+CODE_EXECUTION_TIMEOUT_SECONDS = 600
+
 def _build_agents_info(agents_list: List) -> str:
     """Создает информацию о доступных агентах для включения в промпт менеджера."""
     if not agents_list:
@@ -319,6 +321,7 @@ class AgentFactory:
                     managed_agents=self._get_managed_agents(profile_type, preload_agents),
                     description=profile.get('description'),
                     additional_authorized_imports='*',
+                    executor_kwargs={"timeout_seconds": CODE_EXECUTION_TIMEOUT_SECONDS},
                     step_callbacks=self._build_step_callbacks(),
                 )
                 

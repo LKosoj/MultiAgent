@@ -353,10 +353,12 @@ researcher --> agent3
 
             if show:
                 path_to_html = html_visualizer.advanced_visualization(report, session_id, show)
-                # Преобразуем относительный путь в абсолютный
-                abs_path = os.path.abspath(path_to_html)
-                webbrowser.open(f"file://{abs_path}")
-                print(f"HTML-визуализация сохранена в файл: {abs_path}")
+                if path_to_html:
+                    abs_path = os.path.abspath(path_to_html)
+                    webbrowser.open(f"file://{abs_path}")
+                    print(f"HTML-визуализация сохранена в файл: {abs_path}")
+                else:
+                    print("HTML-визуализация не создана (см. ошибки выше)")
             
             # Создаем HTML-визуализацию процесса выполнения менеджер-агента
             # print("Создаем HTML-визуализацию процесса выполнения менеджер-агента")
@@ -392,10 +394,12 @@ researcher --> agent3
         result += "\n" + "=" * 50 + "\n"
         print(result)
         path_to_html = html_visualizer.advanced_visualization(result, session_id, show=True)
-        # Преобразуем относительный путь в абсолютный
-        abs_path = os.path.abspath(path_to_html)
-        webbrowser.open(f"file://{abs_path}")
-        print(f"HTML-визуализация сохранена в файл: {abs_path}")
+        if path_to_html:
+            abs_path = os.path.abspath(path_to_html)
+            webbrowser.open(f"file://{abs_path}")
+            print(f"HTML-визуализация сохранена в файл: {abs_path}")
+        else:
+            print("HTML-визуализация не создана (см. ошибки выше)")
 
     async def analyze_task(self, task: str) -> List[str]:
         """Анализ задачи и определение необходимых агентов с помощью LLM."""

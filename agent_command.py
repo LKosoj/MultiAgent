@@ -8,7 +8,7 @@ custom_role_conversions = {"tool-call": "assistant", "tool-response": "user"}
 
 _MODEL_CONFIGS: dict[str, dict] = {
     "model_search": {
-        "model_id": "llmgateway/light_model",
+        "model_id": "llmgateway/qwen3.5",
         "fallback_models": "",
         "max_tokens": 32768,
         "stream": False,

@@ -1,3 +1,9 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import asyncio
 import logging
 import os
@@ -5,7 +11,6 @@ import sys
 import traceback
 import time
 from datetime import datetime
-from pathlib import Path
 from typing import Optional
 
 from agent_system import DynamicAgentSystem

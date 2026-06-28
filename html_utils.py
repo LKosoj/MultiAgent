@@ -786,7 +786,8 @@ class HTMLVisualizer:
         Returns:
             str: Путь к созданному HTML-файлу
         """
-        output_path=f"output/interactive_plots_{session_id}.html"
+        output_path = f"output/interactive_plots_{session_id}.html"
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         try:
             # Если во входном результате приходит JSON (dict или JSON-строка),
             # преобразуем его в человекочитаемый HTML перед дальнейшей обработкой
