@@ -33,7 +33,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="ru" className={`${fontDisplay.variable} ${fontBody.variable} ${fontMono.variable}`}>
+    <html lang="ru" className={`${fontDisplay.variable} ${fontBody.variable} ${fontMono.variable}`} suppressHydrationWarning>
       <body className="antialiased">{children}</body>
     </html>
   );

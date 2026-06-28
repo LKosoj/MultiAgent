@@ -45,6 +45,7 @@ class EditorPanel(ttk.Frame):
         self._file_data_cache: Dict[str, Any] = {}  # file_type -> последние данные формы
         self._pending_load_file_type: Optional[str] = None  # загрузить после save_done
         self._file_var_trace_id: Optional[str] = None  # id trace для безопасного снятия
+        self._load_request_id = 0  # отбрасывает устаревшие callback'и фоновой загрузки
         
         # Универсальный редактор (теперь базовый режим)
         self._ui_config_error: Optional[str] = None
@@ -122,6 +123,38 @@ class EditorPanel(ttk.Frame):
         
         # Панель валидации
         self.create_validation_panel(main_frame)
+
+    def _widget_exists(self, widget) -> bool:
+        """True, если Tk-виджет ещё существует и безопасен для обращения."""
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except (AttributeError, RuntimeError, tk.TclError):
+            return False
+
+    def _safe_after(self, delay_ms: int, callback):
+        """Планирует callback без traceback, если Tk mainloop уже остановлен."""
+        if threading.current_thread() is threading.main_thread() and not self._widget_exists(self):
+            return None
+        try:
+            return self.after(delay_ms, callback)
+        except (RuntimeError, tk.TclError):
+            return None
+
+    def _editor_widgets_ready(self) -> bool:
+        """Проверяет, что ключевые виджеты редактора ещё живы."""
+        return all(
+            self._widget_exists(widget)
+            for widget in (
+                self,
+                getattr(self, "form_frame", None),
+                getattr(self, "raw_text", None),
+                getattr(self, "validation_text", None),
+                getattr(self, "status_label", None),
+            )
+            if widget is not None
+        )
     
     def create_structured_editor(self):
         """Создание структурированного редактора"""
@@ -334,6 +367,8 @@ class EditorPanel(ttk.Frame):
     def load_project(self, project: Project):
         """Загрузка проекта"""
         try:
+            self._load_request_id += 1
+            self._is_loading = False
             self.current_project = project
             self.file_manager = FileManager(project.project_id)
             
@@ -397,6 +432,9 @@ class EditorPanel(ttk.Frame):
             
     def clear_editors(self):
         """Очистка редакторов"""
+        if not self._editor_widgets_ready():
+            return
+
         # Очистка структурированного редактора
         for widget in self.form_frame.winfo_children():
             widget.destroy()
@@ -451,6 +489,9 @@ class EditorPanel(ttk.Frame):
     
     def load_file(self, file_type: str):
         """Загрузка файла (I/O выполняется в фоновом потоке)"""
+        if not self._editor_widgets_ready():
+            return
+
         if self._ui_config_error:
             messagebox.showerror(
                 "Ошибка конфигурации UI",
@@ -463,6 +504,8 @@ class EditorPanel(ttk.Frame):
             return
 
         self._is_loading = True
+        self._load_request_id += 1
+        load_request_id = self._load_request_id
         self.current_file_type = file_type
         self.status_label.config(text="Загрузка…")
         self._save_button.config(state="disabled")
@@ -471,15 +514,21 @@ class EditorPanel(ttk.Frame):
             try:
                 data = self.file_manager.load_json_file(file_type)
             except Exception as exc:
-                self.after(0, lambda: self._on_load_error(file_type, exc))
+                self._safe_after(0, lambda: self._on_load_error(file_type, exc, load_request_id))
                 return
-            self.after(0, lambda: self._on_load_done(file_type, data))
+            self._safe_after(0, lambda: self._on_load_done(file_type, data, load_request_id))
 
         threading.Thread(target=_do_load, daemon=True).start()
 
-    def _on_load_done(self, file_type: str, data):
+    def _on_load_done(self, file_type: str, data, load_request_id: int):
         """Вызывается в Tk-потоке после успешной загрузки файла"""
+        if load_request_id != self._load_request_id:
+            return
+
         self._is_loading = False
+        if not self._editor_widgets_ready():
+            return
+
         self.current_data = data
         self._changes.pop(file_type, None)  # сбрасываем флаг только для этого файла
         if data is not None:
@@ -502,15 +551,24 @@ class EditorPanel(ttk.Frame):
         self._update_save_button_state()
         logger.info(f"Загружен файл {file_type}")
 
-    def _on_load_error(self, file_type: str, exc: Exception):
+    def _on_load_error(self, file_type: str, exc: Exception, load_request_id: int):
         """Вызывается в Tk-потоке при ошибке загрузки"""
+        if load_request_id != self._load_request_id:
+            return
+
         self._is_loading = False
+        if not self._editor_widgets_ready():
+            return
+
         self._update_save_button_state()
         logger.error(f"Ошибка загрузки файла {file_type}: {exc}")
         messagebox.showerror("Ошибка", f"Не удалось загрузить файл:\n{exc}")
     
     def update_structured_editor(self):
         """Обновление структурированного редактора"""
+        if not self._widget_exists(getattr(self, "form_frame", None)):
+            return
+
         # Очищаем текущую форму
         for widget in self.form_frame.winfo_children():
             widget.destroy()
@@ -2371,9 +2429,9 @@ class EditorPanel(ttk.Frame):
                     create_backup=True,
                 )
             except Exception as exc:
-                self.after(0, lambda: self._on_save_error(exc))
+                self._safe_after(0, lambda: self._on_save_error(exc))
                 return
-            self.after(0, lambda: self._on_save_done(file_type, success))
+            self._safe_after(0, lambda: self._on_save_done(file_type, success))
 
         threading.Thread(target=_do_save, daemon=True).start()
 

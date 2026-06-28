@@ -57,6 +57,19 @@ type Props = {
   loadDbBenchmark: () => void;
 };
 
+const toStringList = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).filter(Boolean);
+  }
+  if (typeof value === "string") {
+    return value ? [value] : [];
+  }
+  if (value && typeof value === "object") {
+    return Object.values(value).map((item) => String(item)).filter(Boolean);
+  }
+  return [];
+};
+
 export function DbSection({
   isBusy,
   dbTab,
@@ -90,6 +103,7 @@ export function DbSection({
     value: plugin.scheme ?? "",
   }));
   const activePlugin = dbPlugins.find((plugin) => plugin.scheme === selectedPlugin);
+  const activePluginDsnExamples = toStringList(activePlugin?.dsn_examples);
 
   return (
     <div className="section" id="db">
@@ -135,13 +149,15 @@ export function DbSection({
             <article className="card">
               <div className="card-title">Возможностей</div>
               <div className="hero-number">
-                {dbPlugins.reduce((sum, plugin) => sum + (plugin.supported_features?.length ?? 0), 0)}
+                {dbPlugins.reduce((sum, plugin) => sum + toStringList(plugin.supported_features).length, 0)}
               </div>
             </article>
           </div>
           <div className="cards profile-grid">
             {dbPlugins.map((plugin, index) => {
               const name = plugin.name || `plugin-${index + 1}`;
+              const supportedFeatures = toStringList(plugin.supported_features);
+              const dsnExamples = toStringList(plugin.dsn_examples);
               return (
                 <article key={`${name}-${plugin.scheme ?? index}`} className="card profile-card">
                   <div className="inline">
@@ -158,17 +174,17 @@ export function DbSection({
                     </div>
                     <div>
                       <span className="label">Возможности</span>
-                      <div className="meta-value">{plugin.supported_features?.length ?? 0}</div>
+                      <div className="meta-value">{supportedFeatures.length}</div>
                     </div>
                   </div>
-                  {plugin.supported_features?.length ? (
-                    <div className="card-hint">Фичи: {plugin.supported_features.slice(0, 5).join(", ")}</div>
+                  {supportedFeatures.length ? (
+                    <div className="card-hint">Фичи: {supportedFeatures.slice(0, 5).join(", ")}</div>
                   ) : null}
-                  {plugin.dsn_examples?.length ? (
+                  {dsnExamples.length ? (
                     <details className="details">
                       <summary>Примеры DSN</summary>
                       <div className="kv-list">
-                        {plugin.dsn_examples.map((dsn) => (
+                        {dsnExamples.map((dsn) => (
                           <div key={dsn} className="kv-row">
                             <div className="kv-key">DSN</div>
                             <div className="kv-value" style={{ fontFamily: "var(--font-mono)", wordBreak: "break-all" }}>
@@ -248,11 +264,11 @@ export function DbSection({
               />
             </label>
           </div>
-          {activePlugin?.dsn_examples?.length ? (
+          {activePluginDsnExamples.length ? (
             <details className="details">
               <summary>Примеры DSN</summary>
               <div className="graph-inputs">
-                {activePlugin.dsn_examples.map((dsn) => (
+                {activePluginDsnExamples.map((dsn) => (
                   <div key={dsn} className="graph-input">
                     <div className="meta-value" style={{ wordBreak: "break-all" }}>
                       {dsn}

@@ -45,6 +45,24 @@ class ProjectPanel(ttk.Frame):
 
         self.create_ui()
         self.refresh_projects()
+
+    def _widget_exists(self, widget) -> bool:
+        """True, если Tk-виджет ещё существует и безопасен для обращения."""
+        if widget is None:
+            return False
+        try:
+            return bool(widget.winfo_exists())
+        except (AttributeError, RuntimeError, tk.TclError):
+            return False
+
+    def _safe_after(self, delay_ms: int, callback) -> Optional[str]:
+        """Планирует callback только пока Tk mainloop и виджет панели живы."""
+        if threading.current_thread() is threading.main_thread() and not self._widget_exists(self):
+            return None
+        try:
+            return self.after(delay_ms, callback)
+        except (RuntimeError, tk.TclError):
+            return None
     
     def create_ui(self):
         """Создание пользовательского интерфейса"""
@@ -373,13 +391,16 @@ class ProjectPanel(ttk.Frame):
                 except Exception as e:
                     logger.warning("Ошибка фонового расчёта размера %s: %s", project.project_id, e)
 
-            self.after(0, lambda: self._apply_size_updates(updates))
+            self._safe_after(0, lambda: self._apply_size_updates(updates))
 
         self._size_thread = threading.Thread(target=worker, daemon=True)
         self._size_thread.start()
 
     def _apply_size_updates(self, updates: Dict[str, str]):
         """Обновляет колонку размера в дереве после фоновой загрузки"""
+        if not self._widget_exists(getattr(self, "projects_tree", None)):
+            return
+
         for item_id, project in list(self.project_items.items()):
             size_str = updates.get(project.project_id)
             if size_str is not None:
@@ -504,11 +525,11 @@ class ProjectPanel(ttk.Frame):
                 photo = ImageTk.PhotoImage(img)
             except ImportError:
                 logger.debug("PIL не установлен — thumbnail не отображается")
-                self.after(0, lambda: self.thumbnail_label.config(text="[Изображение]", image=""))
+                self._safe_after(0, lambda: self.thumbnail_label.config(text="[Изображение]", image=""))
                 return
             except Exception as e:
                 logger.warning("Ошибка загрузки thumbnail %s: %s", thumbnail_path, e)
-                self.after(0, lambda: self.thumbnail_label.config(text="Ошибка загрузки", image=""))
+                self._safe_after(0, lambda: self.thumbnail_label.config(text="Ошибка загрузки", image=""))
                 return
 
             def _apply():
@@ -518,7 +539,7 @@ class ProjectPanel(ttk.Frame):
                 self._thumbnail_photo = photo
                 self.thumbnail_label.config(image=self._thumbnail_photo, text="")
 
-            self.after(0, _apply)
+            self._safe_after(0, _apply)
 
         threading.Thread(target=_load, daemon=True).start()
     
@@ -554,8 +575,8 @@ class ProjectPanel(ttk.Frame):
                 backup_path = self.project_manager.backup_project(project_id)
             except Exception as e:
                 logger.error("Ошибка создания backup %s: %s", project_id, e)
-                self.after(0, lambda: (progress_dialog.destroy(),
-                                       messagebox.showerror("Ошибка", f"Ошибка создания backup:\n{e}")))
+                self._safe_after(0, lambda: (progress_dialog.destroy(),
+                                             messagebox.showerror("Ошибка", f"Ошибка создания backup:\n{e}")))
                 return
 
             def on_done():
@@ -565,7 +586,7 @@ class ProjectPanel(ttk.Frame):
                 else:
                     messagebox.showerror("Ошибка", "Не удалось создать backup")
 
-            self.after(0, on_done)
+            self._safe_after(0, on_done)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -604,7 +625,7 @@ class ProjectPanel(ttk.Frame):
         
         def update_progress(current, total):
             if total > 0:
-                self.after(0, lambda: progress_var.set((current / total) * 100))
+                self._safe_after(0, lambda: progress_var.set((current / total) * 100))
 
         def worker():
             try:
@@ -613,8 +634,8 @@ class ProjectPanel(ttk.Frame):
                 )
             except Exception as e:
                 logger.error("Ошибка экспорта %s: %s", project_id, e)
-                self.after(0, lambda: (progress_dialog.destroy(),
-                                       messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{e}")))
+                self._safe_after(0, lambda: (progress_dialog.destroy(),
+                                             messagebox.showerror("Ошибка", f"Ошибка экспорта:\n{e}")))
                 return
 
             def on_done():
@@ -624,7 +645,7 @@ class ProjectPanel(ttk.Frame):
                 else:
                     messagebox.showerror("Ошибка", "Не удалось экспортировать проект")
 
-            self.after(0, on_done)
+            self._safe_after(0, on_done)
 
         threading.Thread(target=worker, daemon=True).start()
     
@@ -772,8 +793,8 @@ class ProjectPanel(ttk.Frame):
                 success = self.project_manager.delete_project(project_id, create_backup=True)
             except Exception as e:
                 logger.error("Ошибка удаления проекта %s: %s", project_id, e)
-                self.after(0, lambda: (progress_dialog.destroy(),
-                                       messagebox.showerror("Ошибка", f"Ошибка удаления проекта:\n{e}")))
+                self._safe_after(0, lambda: (progress_dialog.destroy(),
+                                             messagebox.showerror("Ошибка", f"Ошибка удаления проекта:\n{e}")))
                 return
 
             def on_done():
@@ -786,7 +807,7 @@ class ProjectPanel(ttk.Frame):
                 else:
                     messagebox.showerror("Ошибка", "Не удалось удалить проект")
 
-            self.after(0, on_done)
+            self._safe_after(0, on_done)
 
         threading.Thread(target=worker, daemon=True).start()
     
