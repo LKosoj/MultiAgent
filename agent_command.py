@@ -32,8 +32,7 @@ _MODEL_CONFIGS: dict[str, dict] = {
     "model_hard": {
         "model_id": "llmgateway/high",
         "fallback_models": (
-            "clr.Qwen/Qwen3-235B-A22B-Instruct-2507,"
-            "clr.Qwen/Qwen3-Coder-480B-A35B-Instruct"
+            ""
         ),
         "max_tokens": 32768,
         "stream": False,
@@ -64,7 +63,7 @@ _MODEL_CONFIGS: dict[str, dict] = {
     },
     "model_reranker": {
         "model_id": "llmgateway/light_model",
-        "fallback_models": "vse.amazon/nova-micro-v1",
+        "fallback_models": "",
         "max_tokens": 32768,
         "stream": False,
         "temperature": 0.2,

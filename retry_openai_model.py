@@ -16,6 +16,7 @@ Wrapper для OpenAIServerModel с встроенным механизмом п
     )
 """
 
+import ast
 import time
 import os
 import json
@@ -24,8 +25,10 @@ import logging
 import re
 import copy
 import threading
-from typing import Any, Dict, List, Optional
+import uuid
+from typing import Any, Dict, List, Optional, Tuple
 from smolagents import OpenAIServerModel, ChatMessage, logger
+from smolagents.models import ChatMessageToolCall, ChatMessageToolCallFunction
 import httpx
 from httpx import HTTPStatusError, ReadTimeout, ConnectTimeout, TimeoutException
 from types import SimpleNamespace
@@ -42,6 +45,90 @@ def _compute_backoff_delay(retry_delay_base: float, attempt: int) -> float:
     """
     base = retry_delay_base * (2 ** attempt)
     return base + random.uniform(0.0, base * 0.1)
+
+
+_CALLING_TOOLS_PATTERN = re.compile(r"Calling tools:\s*", re.IGNORECASE)
+
+
+def _parse_embedded_tool_calls_blob(blob: str) -> List[Dict[str, Any]]:
+    """Парсит Python-literal или JSON со списком/словарём tool calls."""
+    blob = blob.strip()
+    if not blob:
+        return []
+
+    for parser in (ast.literal_eval, json.loads):
+        try:
+            parsed = parser(blob)
+        except (ValueError, SyntaxError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return [parsed]
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+
+    list_match = re.search(r"\[.*\]", blob, re.DOTALL)
+    if list_match and list_match.group(0) != blob:
+        return _parse_embedded_tool_calls_blob(list_match.group(0))
+    return []
+
+
+def _normalize_recovered_tool_call(raw: Dict[str, Any]) -> Optional[ChatMessageToolCall]:
+    """Приводит словарь tool call к ChatMessageToolCall."""
+    if not isinstance(raw, dict):
+        return None
+
+    if isinstance(raw.get("function"), dict):
+        fn = raw["function"]
+        name = fn.get("name")
+        if not name:
+            return None
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        return ChatMessageToolCall(
+            id=str(raw.get("id") or uuid.uuid4()),
+            type=str(raw.get("type") or "function"),
+            function=ChatMessageToolCallFunction(name=name, arguments=arguments or {}),
+        )
+
+    name = raw.get("name") or raw.get("tool")
+    if not name:
+        return None
+    arguments = raw.get("arguments") or raw.get("args") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            pass
+    return ChatMessageToolCall(
+        id=str(raw.get("id") or uuid.uuid4()),
+        type="function",
+        function=ChatMessageToolCallFunction(name=name, arguments=arguments or {}),
+    )
+
+
+def recover_tool_calls_from_text(content: str) -> Tuple[Optional[str], List[ChatMessageToolCall]]:
+    """
+    Извлекает tool_calls из текстового ответа модели (формат шлюза: prose + Calling tools: [...]).
+    Возвращает (очищенный content, список tool_calls).
+    """
+    if not content or not isinstance(content, str):
+        return content, []
+
+    marker = _CALLING_TOOLS_PATTERN.search(content)
+    if marker:
+        prefix = content[: marker.start()].strip() or None
+        raw_calls = _parse_embedded_tool_calls_blob(content[marker.end() :])
+        tool_calls = [
+            tc for tc in (_normalize_recovered_tool_call(raw) for raw in raw_calls) if tc is not None
+        ]
+        if tool_calls:
+            return prefix, tool_calls
+
+    return content, []
 
 
 def _parse_retry_after(response) -> Optional[float]:
@@ -1057,31 +1144,54 @@ class RetryOpenAIServerModel:
         """
         Нормализует content в ответе модели к строке.
         Это предотвращает падения вида `list` has no attribute `strip`.
+        Восстанавливает tool_calls, если шлюз вшил их в текст (Calling tools: [...]).
         """
         try:
             if isinstance(response, ChatMessage):
                 normalized_content = self._coerce_content_to_text(getattr(response, "content", None))
                 tool_calls = getattr(response, "tool_calls", None)
+                if not tool_calls and normalized_content:
+                    cleaned_content, recovered = recover_tool_calls_from_text(normalized_content)
+                    if recovered:
+                        logger.info(
+                            f"Восстановлено {len(recovered)} tool call(s) из текстового ответа модели"
+                        )
+                        return ChatMessage(
+                            role=getattr(response, "role", "assistant"),
+                            content=cleaned_content,
+                            tool_calls=recovered,
+                            raw=getattr(response, "raw", None),
+                            token_usage=getattr(response, "token_usage", None),
+                        )
                 if tool_calls:
-                    return ChatMessage(role=getattr(response, "role", "assistant"), content=normalized_content, tool_calls=tool_calls, raw=getattr(response, "raw", None))
-                return ChatMessage(role=getattr(response, "role", "assistant"), content=normalized_content, raw=getattr(response, "raw", None))
+                    return ChatMessage(
+                        role=getattr(response, "role", "assistant"),
+                        content=normalized_content,
+                        tool_calls=tool_calls,
+                        raw=getattr(response, "raw", None),
+                        token_usage=getattr(response, "token_usage", None),
+                    )
+                return ChatMessage(
+                    role=getattr(response, "role", "assistant"),
+                    content=normalized_content,
+                    raw=getattr(response, "raw", None),
+                    token_usage=getattr(response, "token_usage", None),
+                )
 
             if hasattr(response, "choices") and response.choices is not None and len(response.choices) > 0:
-                # Пытаемся исправить in-place, иначе создаем копию
-                try:
-                    message = response.choices[0].message
-                    if message is not None and hasattr(message, "content"):
-                        message.content = self._coerce_content_to_text(message.content)
-                    return response
-                except Exception:
-                    cloned = copy.deepcopy(response)
-                    try:
-                        message = cloned.choices[0].message
-                        if message is not None and hasattr(message, "content"):
-                            message.content = self._coerce_content_to_text(message.content)
-                    except Exception:
-                        pass
-                    return cloned
+                message = response.choices[0].message
+                if message is not None and hasattr(message, "content"):
+                    normalized_content = self._coerce_content_to_text(message.content)
+                    message.content = normalized_content
+                    if not getattr(message, "tool_calls", None) and normalized_content:
+                        cleaned_content, recovered = recover_tool_calls_from_text(normalized_content)
+                        if recovered:
+                            logger.info(
+                                f"Восстановлено {len(recovered)} tool call(s) из текстового ответа API"
+                            )
+                            message.content = cleaned_content
+                            message.tool_calls = recovered
+                return response
         except Exception:
             pass
         return response
