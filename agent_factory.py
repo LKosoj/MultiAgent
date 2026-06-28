@@ -14,6 +14,7 @@ from adaptive_planning import (
 )
 from mcp_tools import mcp_clients, mcp_tools
 from memory.rag_memory import create_rag_memory
+from memory.observation_storage import compact_observation_for_context
 
 logger = logging.getLogger(__name__)
 
@@ -377,6 +378,27 @@ class AgentFactory:
 
     def _build_step_callbacks(self):
         """Создает callbacks для сохранения шагов в RAG-память через RagMemory.add_step."""
+        def _compact_step_observations(memory_step, agent=None):
+            """Сохраняет полный observation в файл и оставляет в контексте индекс + URL/заголовки."""
+            if not isinstance(memory_step, ActionStep):
+                return
+            observations = getattr(memory_step, "observations", None)
+            if not isinstance(observations, str) or not observations.strip():
+                return
+
+            session_id = getattr(getattr(agent, "memory", None), "session_id", None) or "unknown_session"
+            agent_name = getattr(agent, "name", "agent")
+            run_id = getattr(getattr(agent, "memory", None), "current_run_id", None)
+            step_number = getattr(memory_step, "step_number", None)
+
+            memory_step.observations = compact_observation_for_context(
+                observations,
+                session_id=session_id,
+                agent_name=agent_name,
+                step_number=step_number,
+                run_id=run_id,
+            )
+
         def _save_step(memory_step, agent=None):
             try:
                 if not agent or not hasattr(agent, 'memory'):
@@ -466,7 +488,7 @@ class AgentFactory:
                 return None
 
         return {
-            ActionStep: _save_step,
+            ActionStep: [_compact_step_observations, _save_step],
             FinalAnswerStep: _save_step,
         }
 

@@ -4,6 +4,8 @@ from smolagents.models import ChatMessage
 from retry_openai_model import (
     RetryOpenAIServerModel,
     recover_tool_calls_from_text,
+    should_wrap_plain_text_as_final_answer,
+    wrap_plain_text_as_final_answer,
 )
 
 
@@ -40,3 +42,34 @@ def test_leaves_plain_text_without_calling_tools_unchanged():
 
     assert cleaned == text
     assert tool_calls == []
+
+
+def test_should_wrap_long_plain_text_without_json():
+    text = "A" * 500
+    assert should_wrap_plain_text_as_final_answer(text) is True
+
+
+def test_should_not_wrap_short_plain_text():
+    assert should_wrap_plain_text_as_final_answer("ok") is False
+
+
+def test_apply_tool_call_recovery_wraps_plain_text_as_final_answer():
+    model = RetryOpenAIServerModel.__new__(RetryOpenAIServerModel)
+    long_answer = "### 1. Task outcome\n" + ("Найдены статьи. " * 40)
+    response = ChatMessage(role="assistant", content=long_answer)
+
+    recovered = model._apply_tool_call_recovery(
+        response,
+        {"tools_to_call_from": ["web_search"]},
+    )
+
+    assert recovered.tool_calls is not None
+    assert len(recovered.tool_calls) == 1
+    assert recovered.tool_calls[0].function.name == "final_answer"
+    assert "Найдены статьи" in recovered.tool_calls[0].function.arguments["answer"]
+
+
+def test_wrap_plain_text_as_final_answer_shape():
+    tc = wrap_plain_text_as_final_answer("итоговый ответ")
+    assert tc.function.name == "final_answer"
+    assert tc.function.arguments == {"answer": "итоговый ответ"}

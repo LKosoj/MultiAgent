@@ -131,6 +131,37 @@ def recover_tool_calls_from_text(content: str) -> Tuple[Optional[str], List[Chat
     return content, []
 
 
+def should_wrap_plain_text_as_final_answer(content: str, min_chars: int = 200) -> bool:
+    """
+    True, если текст похож на финальный ответ без tool call (нет JSON blob для smolagents).
+    """
+    if not content or not isinstance(content, str):
+        return False
+    text = content.strip()
+    if len(text) < min_chars:
+        return False
+    if _CALLING_TOOLS_PATTERN.search(text):
+        return False
+    try:
+        from smolagents.utils import parse_json_blob
+
+        parse_json_blob(text)
+        return False
+    except ValueError as exc:
+        return "does not contain any JSON blob" in str(exc)
+    except Exception:
+        return True
+
+
+def wrap_plain_text_as_final_answer(content: str) -> ChatMessageToolCall:
+    """Оборачивает plain-text ответ модели в вызов final_answer."""
+    return ChatMessageToolCall(
+        id=str(uuid.uuid4()),
+        type="function",
+        function=ChatMessageToolCallFunction(name="final_answer", arguments={"answer": content}),
+    )
+
+
 def _parse_retry_after(response) -> Optional[float]:
     """Парсит заголовок Retry-After (секунды или HTTP-дата). Возвращает None, если не задан/некорректен."""
     try:
@@ -1196,6 +1227,49 @@ class RetryOpenAIServerModel:
             pass
         return response
 
+    def _apply_tool_call_recovery(self, response: Any, kwargs: Dict[str, Any]) -> Any:
+        """Восстанавливает tool_calls из текста или оборачивает plain-text в final_answer."""
+        if not kwargs.get("tools_to_call_from"):
+            return response
+
+        if isinstance(response, ChatMessage):
+            tool_calls = getattr(response, "tool_calls", None)
+            content = self._coerce_content_to_text(getattr(response, "content", None))
+            if tool_calls:
+                return response
+            if content and should_wrap_plain_text_as_final_answer(content):
+                logger.info(
+                    "Ответ модели без tool_calls интерпретирован как final_answer "
+                    f"({len(content)} симв.)"
+                )
+                return ChatMessage(
+                    role=getattr(response, "role", "assistant"),
+                    content=None,
+                    tool_calls=[wrap_plain_text_as_final_answer(content)],
+                    raw=getattr(response, "raw", None),
+                    token_usage=getattr(response, "token_usage", None),
+                )
+            return response
+
+        if hasattr(response, "choices") and response.choices:
+            message = response.choices[0].message
+            if message is None:
+                return response
+            tool_calls = getattr(message, "tool_calls", None)
+            content = self._coerce_content_to_text(getattr(message, "content", None))
+            if tool_calls:
+                return response
+            if content and should_wrap_plain_text_as_final_answer(content):
+                logger.info(
+                    "Ответ API без tool_calls интерпретирован как final_answer "
+                    f"({len(content)} симв.)"
+                )
+                message.content = None
+                message.tool_calls = [wrap_plain_text_as_final_answer(content)]
+            return response
+
+        return response
+
     def _inject_usage_defaults(self, response: Any) -> Any:
         """
         Гарантирует наличие usage/token_usage в ответе.
@@ -1312,6 +1386,7 @@ class RetryOpenAIServerModel:
                     normalized_messages = self._normalize_messages_for_model(messages)
                     response = self.model(normalized_messages, **kwargs)
                     response = self._normalize_response_content(response)
+                    response = self._apply_tool_call_recovery(response, kwargs)
 
                     # Пишем лог ответа (один файл на ответ)
                     if self.debug_logging:

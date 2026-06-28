@@ -297,19 +297,6 @@ researcher --> agent3
                 for memory_step in agent.memory.steps:
                     memory_step.model_input_messages = None
 
-                # Добавляем лог агента
-                try:
-                    if hasattr(agent, 'memory') and agent.memory.steps and agent.name not in ['researcher']:
-                        report.append("  🔍 Лог агента:")
-                        for step in agent.memory.steps:
-                            # Преобразуем step в читаемый формат
-                            step_str = str(step)
-                            if len(step_str) > 200:
-                                step_str = step_str
-                            report.append(f"    - {step_str}")
-                except Exception as e:
-                    report.append(f"  ❌ Ошибка получения логов: {str(e)}")
-                
                 try:
                     if hasattr(self, 'last_output'):
                         final_result = self.last_output
