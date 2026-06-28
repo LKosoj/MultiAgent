@@ -41,7 +41,7 @@ _MODEL_CONFIGS: dict[str, dict] = {
         "max_retries": 8,
     },
     "model_summary": {
-        "model_id": "llmgateway/big_context",
+        "model_id": "llmgateway/light_model",
         "fallback_models": "",
         "max_tokens": 32768,
         "stream": False,
@@ -56,7 +56,7 @@ _MODEL_CONFIGS: dict[str, dict] = {
         "max_retries": 8,
     },
     "model_vision": {
-        "model_id": "llmgateway/qwen3.5",
+        "model_id": "llmgateway/high",
         "max_tokens": 32768,
         "stream": False,
         "temperature": 0.4,
