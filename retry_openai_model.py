@@ -48,6 +48,61 @@ def _compute_backoff_delay(retry_delay_base: float, attempt: int) -> float:
 
 
 _CALLING_TOOLS_PATTERN = re.compile(r"Calling tools:\s*", re.IGNORECASE)
+_ACTION_PATTERN = re.compile(r"\bAction:\s*", re.IGNORECASE)
+_TOOL_CALL_MARKERS = (_CALLING_TOOLS_PATTERN, _ACTION_PATTERN)
+
+
+def _looks_like_tool_call_dict(raw: Dict[str, Any]) -> bool:
+    if raw.get("name") or raw.get("tool"):
+        return True
+    fn = raw.get("function")
+    return isinstance(fn, dict) and bool(fn.get("name"))
+
+
+def _iter_balanced_dict_objects(text: str) -> List[Dict[str, Any]]:
+    """Извлекает отдельные dict-объекты из текста (JSON или Python literal)."""
+    results: List[Dict[str, Any]] = []
+    idx = 0
+    decoder = json.JSONDecoder()
+    while idx < len(text):
+        start = text.find("{", idx)
+        if start == -1:
+            break
+        parsed = False
+        try:
+            obj, end = decoder.raw_decode(text, start)
+            if isinstance(obj, dict):
+                results.append(obj)
+            idx = end
+            parsed = True
+        except json.JSONDecodeError:
+            pass
+        if not parsed:
+            depth = 0
+            end_idx = None
+            for i in range(start, len(text)):
+                ch = text[i]
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end_idx = i + 1
+                        break
+            if end_idx is None:
+                idx = start + 1
+                continue
+            chunk = text[start:end_idx]
+            for parser in (json.loads, ast.literal_eval):
+                try:
+                    obj = parser(chunk)
+                except (ValueError, SyntaxError, json.JSONDecodeError):
+                    continue
+                if isinstance(obj, dict):
+                    results.append(obj)
+                    break
+            idx = end_idx
+    return results
 
 
 def _parse_embedded_tool_calls_blob(blob: str) -> List[Dict[str, Any]]:
@@ -68,8 +123,13 @@ def _parse_embedded_tool_calls_blob(blob: str) -> List[Dict[str, Any]]:
 
     list_match = re.search(r"\[.*\]", blob, re.DOTALL)
     if list_match and list_match.group(0) != blob:
-        return _parse_embedded_tool_calls_blob(list_match.group(0))
-    return []
+        nested = _parse_embedded_tool_calls_blob(list_match.group(0))
+        if nested:
+            return nested
+
+    dict_objects = _iter_balanced_dict_objects(blob)
+    tool_like = [obj for obj in dict_objects if _looks_like_tool_call_dict(obj)]
+    return tool_like
 
 
 def _normalize_recovered_tool_call(raw: Dict[str, Any]) -> Optional[ChatMessageToolCall]:
@@ -112,14 +172,20 @@ def _normalize_recovered_tool_call(raw: Dict[str, Any]) -> Optional[ChatMessageT
 
 def recover_tool_calls_from_text(content: str) -> Tuple[Optional[str], List[ChatMessageToolCall]]:
     """
-    Извлекает tool_calls из текстового ответа модели (формат шлюза: prose + Calling tools: [...]).
-    Возвращает (очищенный content, список tool_calls).
+    Извлекает tool_calls из текстового ответа модели.
+
+    Поддерживаемые форматы шлюза:
+    - prose + ``Calling tools: [...]``
+    - prose + ``Action:`` + несколько JSON-объектов построчно
+    - несколько JSON tool-call dict подряд без обёртки-массива
     """
     if not content or not isinstance(content, str):
         return content, []
 
-    marker = _CALLING_TOOLS_PATTERN.search(content)
-    if marker:
+    for pattern in _TOOL_CALL_MARKERS:
+        marker = pattern.search(content)
+        if not marker:
+            continue
         prefix = content[: marker.start()].strip() or None
         raw_calls = _parse_embedded_tool_calls_blob(content[marker.end() :])
         tool_calls = [
@@ -127,6 +193,15 @@ def recover_tool_calls_from_text(content: str) -> Tuple[Optional[str], List[Chat
         ]
         if tool_calls:
             return prefix, tool_calls
+
+    raw_calls = _parse_embedded_tool_calls_blob(content)
+    tool_calls = [
+        tc for tc in (_normalize_recovered_tool_call(raw) for raw in raw_calls) if tc is not None
+    ]
+    if tool_calls:
+        first_brace = content.find("{")
+        prefix = content[:first_brace].strip() or None if first_brace > 0 else None
+        return prefix, tool_calls
 
     return content, []
 
@@ -140,7 +215,9 @@ def should_wrap_plain_text_as_final_answer(content: str, min_chars: int = 200) -
     text = content.strip()
     if len(text) < min_chars:
         return False
-    if _CALLING_TOOLS_PATTERN.search(text):
+    if _CALLING_TOOLS_PATTERN.search(text) or _ACTION_PATTERN.search(text):
+        return False
+    if _parse_embedded_tool_calls_blob(text):
         return False
     try:
         from smolagents.utils import parse_json_blob
@@ -1596,6 +1673,30 @@ class RetryOpenAIServerModel:
             raise AttributeError('model not initialized')
         return getattr(self.model, name)
     
+    def parse_tool_calls(self, message: ChatMessage) -> ChatMessage:
+        """Восстанавливает tool_calls из текста, если API/shлюз не вернул их нативно."""
+        from smolagents.models import parse_json_if_needed
+
+        if message.tool_calls:
+            for tool_call in message.tool_calls:
+                tool_call.function.arguments = parse_json_if_needed(tool_call.function.arguments)
+            return message
+
+        content = self._coerce_content_to_text(getattr(message, "content", None))
+        if content:
+            cleaned_content, recovered = recover_tool_calls_from_text(content)
+            if recovered:
+                logger.info(
+                    f"parse_tool_calls: восстановлено {len(recovered)} tool call(s) из текста модели"
+                )
+                message.content = cleaned_content
+                message.tool_calls = recovered
+                for tool_call in message.tool_calls:
+                    tool_call.function.arguments = parse_json_if_needed(tool_call.function.arguments)
+                return message
+
+        return self.model.parse_tool_calls(message)
+
     def generate(self, messages: List[ChatMessage], **kwargs) -> Any:
         """
         Выполняет запрос к модели с автоматическими повторными попытками.
