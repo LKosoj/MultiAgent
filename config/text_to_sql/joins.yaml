@@ -1,0 +1,57 @@
+# Конфиг join-параметров text-to-sql (граф-джойн + containment-валидатор).
+#
+# Источник идей и контракт — docs/plans/2026-06-29-text2sql-graph-join-
+# containment-design.md (раздел 6). Две training-free техники из EcoTable:
+#   1. минимальный join-путь как граф-алгоритм (KMB Steiner-tree) вместо
+#      greedy-цепочки;
+#   2. containment-ratio валидатор джойнов |A∩B|/|A| по данным.
+#
+# Фича опт-ин: профиль `default` консервативен (greedy + containment off,
+# поведение пайплайна не меняется), профиль `muni_ru` агрессивнее (граф +
+# containment validate) — паттерн Phase 4.
+#
+# Контракт:
+#   * Корень: `profiles.<name>`. Профиль `default` обязателен.
+#   * Активный профиль выбирается env TEXT_TO_SQL_JOINS_PROFILE,
+#     по умолчанию `default`.
+#   * Путь к файлу переопределяется env TEXT_TO_SQL_JOINS_PATH.
+#   * Все 5 полей обязательны в каждом профиле (fail-fast при пропуске).
+#   * Невалидное значение (enum не из списка, float вне [0..1], int<=0,
+#     bool вместо числа) → ValueError. Silent fallback запрещён (AGENTS.md).
+#
+# Поля:
+#   path_algo          — алгоритм построения join-пути; enum greedy|graph.
+#                        greedy = текущая цепочка, graph = KMB Steiner-tree.
+#   containment        — режим containment-валидатора; enum off|validate|weight.
+#                        off = не считать; validate = gate неуверенных рёбер
+#                        по min_containment; weight = понижать вес хороших
+#                        рёбер в графе. ВНИМАНИЕ: `off` обязательно в кавычках —
+#                        bare off в YAML 1.1/PyYAML парсится как bool False.
+#   min_containment    — порог containment для режима validate; float [0..1].
+#   max_terminals      — лимит числа терминалов для граф-алгоритма; int>0.
+#                        Выше порога — откат на greedy (защита от NP-патологии).
+#   containment_sample — размер сэмпла для оценки containment; int>0.
+#
+# Env-оверрайды (env переопределяет yaml, пустой env → yaml):
+#   path_algo          ← TEXT_TO_SQL_JOIN_PATH_ALGO
+#   containment        ← TEXT_TO_SQL_JOIN_CONTAINMENT
+#   min_containment    ← TEXT_TO_SQL_JOIN_MIN_CONTAINMENT
+#   max_terminals      ← TEXT_TO_SQL_JOIN_PATH_MAX_TERMINALS
+#   containment_sample ← TEXT_TO_SQL_CONTAINMENT_SAMPLE
+
+version: 1
+
+profiles:
+  default:
+    path_algo: greedy
+    containment: "off"
+    min_containment: 0.1
+    max_terminals: 8
+    containment_sample: 1000
+
+  muni_ru:
+    path_algo: graph
+    containment: validate
+    min_containment: 0.1
+    max_terminals: 8
+    containment_sample: 1000

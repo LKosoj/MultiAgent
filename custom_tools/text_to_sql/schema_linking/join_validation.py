@@ -21,14 +21,24 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..deprecations import TextToSQLDeprecationWarning
 from ..join_builder import JoinBuilder
+from ..join_config import resolve_max_terminals, resolve_path_algo
+from ..join_path import JoinPathTooManyTerminals, build_join_path
 from ..schema_metadata import ColumnMetadataHelper, get_type, is_fk
-from ..utils import get_table_columns
+from ..utils import get_runtime_context_dsn, get_table_columns
 from .resolution import (
     _resolve_column_name,
     _resolve_table_name,
 )
 
 logger = logging.getLogger(__name__)
+
+# Базовые веса рёбер для граф-джойна (раздел 3.1 дизайна). Меньше = лучше.
+_BASE_WEIGHT = {
+    "fk": 1.0,
+    "bridge": 1.0,
+    "convention_fk": 3.0,
+    "convention_legacy": 5.0,
+}
 
 
 def compute_required_tables(
@@ -431,9 +441,24 @@ class JoinValidator:
                 # Для этой пары уже есть FK-join — convention пропускаем.
                 continue
             if not self._is_duplicate_join(candidate, merged_joins):
+                # Провенанс convention-ребра для графа: fk-aware таблица →
+                # convention_fk (вес 3), иначе legacy-convention (вес 5).
+                # greedy игнорирует лишний ключ `_source` (см. _normalize_edges).
+                candidate = dict(candidate)
+                candidate["_source"] = (
+                    "convention_fk"
+                    if self.join_builder._table_has_fk_metadata(candidate["from_table"])
+                    else "convention_legacy"
+                )
                 merged_joins.append(candidate)
 
-        result = self.join_builder.build_joins(main_table, required_tables, merged_joins)
+        # T4: развилка по path_algo (env > yaml). greedy = текущая цепочка
+        # (verbatim), graph = KMB Steiner-tree с полным fallback-контуром.
+        algo = resolve_path_algo()
+        if algo == "greedy":
+            result = self.join_builder.build_joins(main_table, required_tables, merged_joins)
+        else:
+            result = self._build_joins_graph(main_table, required_tables, merged_joins)
 
         return {
             "joins": result.get("joins", []),
@@ -441,6 +466,153 @@ class JoinValidator:
             "unconnected_tables": list(result.get("unconnected_tables", set())),
             "main_table": main_table,
         }
+
+    # ------------------------------------------------------------------
+    # Graph join-path (KMB Steiner) — opt-in через path_algo=graph
+    # ------------------------------------------------------------------
+    def _to_candidate_edges(
+        self, merged_joins: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Маппит merged-joins в candidate-edges для build_join_path.
+
+        source: via_bridge → "bridge"; иначе ``_source`` (convention_fk /
+        convention_legacy) если есть; иначе "fk". jt нормализуется как в
+        ``JoinBuilder._normalize_edges`` ((join_type or "LEFT").upper().strip()).
+        weight берётся из :data:`_BASE_WEIGHT` по source.
+        """
+        edges: List[Dict[str, Any]] = []
+        for j in merged_joins or []:
+            if j.get("via_bridge"):
+                source = "bridge"
+            elif j.get("_source"):
+                source = j["_source"]
+            else:
+                source = "fk"
+            jt = (j.get("join_type") or "LEFT").upper().strip()
+            edges.append({
+                "a": j.get("from_table"),
+                "b": j.get("to_table"),
+                "a_col": j.get("from_column"),
+                "b_col": j.get("to_column"),
+                "jt": jt,
+                "weight": _BASE_WEIGHT.get(source, _BASE_WEIGHT["convention_legacy"]),
+                "source": source,
+            })
+        return edges
+
+    def _apply_containment(
+        self,
+        edges: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Применяет containment-валидатор к неуверенным рёбрам (раздел 4-5).
+
+        mode=off → рёбра без изменений (ни одного БД-вызова). FK/bridge не
+        сэмплируются (referential integrity гарантирована). validate → drop
+        ребра ниже min_containment; weight → понижение веса хорошего ребра.
+        fail-open: c is None / нет dsn → ребро остаётся.
+        """
+        from ..join_config import (
+            resolve_containment,
+            resolve_containment_sample,
+            resolve_min_containment,
+        )
+
+        mode = resolve_containment()
+        if mode == "off":
+            return edges
+
+        from ..join_containment import estimate_join_containment
+
+        dsn = self.join_builder.dsn or get_runtime_context_dsn()
+        if not dsn:
+            # fail-open: без dsn сэмплировать нечем — рёбра не трогаем.
+            return edges
+
+        min_containment = resolve_min_containment()
+        sample_size = resolve_containment_sample()
+
+        result: List[Dict[str, Any]] = []
+        for e in edges:
+            # FK/bridge не сэмплируем — оставляем как есть.
+            if e["source"] in {"fk", "bridge"}:
+                result.append(e)
+                continue
+            c = estimate_join_containment(
+                dsn,
+                e["a"],
+                e["a_col"],
+                e["b"],
+                e["b_col"],
+                sample_size=sample_size,
+            )
+            if c is None:
+                # fail-open: containment неопределим — ребро остаётся.
+                result.append(e)
+                continue
+            if mode == "validate":
+                if c < min_containment:
+                    logger.warning(
+                        "Dropping low-containment join edge %s.%s -> %s.%s "
+                        "(containment=%.3f < min=%.3f, source=%s)",
+                        e["a"], e["a_col"], e["b"], e["b_col"],
+                        c, min_containment, e["source"],
+                    )
+                    continue
+                result.append(e)
+            else:  # mode == "weight"
+                e = dict(e)
+                e["weight"] *= (1.0 + (1.0 - c))
+                result.append(e)
+        return result
+
+    def _build_joins_graph(
+        self,
+        main_table: str,
+        required_tables: set,
+        merged_joins: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Граф-джойн (KMB Steiner) с полным fallback-контуром на greedy.
+
+        Любой откат логируется явно (AGENTS.md: no silent fallback) и
+        возвращает greedy на НЕфильтрованном ``merged_joins`` (граф не должен
+        отнять рёбра, что взял бы greedy).
+        """
+        try:
+            edges = self._to_candidate_edges(merged_joins)
+            edges = self._apply_containment(edges)
+            result = build_join_path(
+                main_table,
+                required_tables,
+                edges,
+                max_terminals=resolve_max_terminals(),
+                dsn=self.join_builder.dsn,
+            )
+            if not result.get("success"):
+                logger.warning(
+                    "Graph join-path did not connect all required tables "
+                    "(unconnected=%s); falling back to greedy build_joins",
+                    sorted(result.get("unconnected_tables", set())),
+                )
+                return self.join_builder.build_joins(
+                    main_table, required_tables, merged_joins
+                )
+            return result
+        except JoinPathTooManyTerminals as e:
+            logger.warning(
+                "Graph join-path too many terminals (%s); falling back to "
+                "greedy build_joins", e,
+            )
+            return self.join_builder.build_joins(
+                main_table, required_tables, merged_joins
+            )
+        except Exception as e:
+            logger.warning(
+                "Graph join-path failed (%s); falling back to greedy build_joins",
+                type(e).__name__,
+            )
+            return self.join_builder.build_joins(
+                main_table, required_tables, merged_joins
+            )
 
     def validate_llm_joins(
         self,
