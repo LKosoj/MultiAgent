@@ -1,18 +1,24 @@
 import json
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
 
 import requests
 
 from custom_tools.storybook.audio_subtitle import _safe_project_dir
 
 
-DEFAULT_SUNO_BASE_URL = "https://api.sunoapi.org"
-DEFAULT_GENERATE_ENDPOINT = "/api/v1/generate"
-DEFAULT_RECORD_INFO_ENDPOINT = "/api/v1/generate/record-info"
+STUDIO_API_BASE_URL = "https://studio-api.prod.suno.com"
+CLERK_BASE_URL = "https://auth.suno.com"
+CLERK_API_VERSION = "2025-11-10"
+CLERK_JS_VERSION = "5.117.0"
+DEFAULT_MODEL = "chirp-fenix"  # Suno v5.5 (latest as of 2026-06); override via SUNO_MODEL
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def storybook_music_generator_tool(
@@ -37,7 +43,7 @@ def storybook_music_generator_tool(
         enable: If false, skip music generation and write a skipped manifest.
         provider: Music provider name. Currently only "suno" is implemented.
         prompt: Optional explicit music prompt. If empty, it is derived from screenplay/brief data.
-        instrumental: Request instrumental music from Suno-compatible providers.
+        instrumental: Request instrumental music from Suno.
         wait_for_completion: If true, poll until an audio URL is available and download it.
         poll_interval_seconds: Polling interval for async provider jobs.
         timeout_seconds: Max polling time for async provider jobs.
@@ -106,15 +112,15 @@ def storybook_music_generator_tool(
         return _tool_result(payload, manifest_path, music_path)
 
     _load_env_file()
-    api_key = _env("SUNO_API_KEY")
-    if not api_key:
+    cookie_raw = _env("SUNO_COOKIE")
+    if not cookie_raw:
         payload = _manifest_payload(
             session_id=session_id,
             project_id=project_id,
             language=language,
             provider=provider,
             status="skipped",
-            message="SUNO_API_KEY is not configured",
+            message="SUNO_COOKIE is not configured",
             music_path=music_path,
         )
         _write_json(manifest_path, payload)
@@ -122,12 +128,34 @@ def storybook_music_generator_tool(
         return _tool_result(payload, manifest_path, music_path)
 
     music_prompt = _clip_prompt(prompt or _build_music_prompt(base_dir, language))
-    request_payload = _build_suno_payload(music_prompt, instrumental, base_dir)
+    task_id: Optional[str] = None
     try:
-        submit_response = _post_suno_generate(api_key, request_payload)
-        task_id = _extract_task_id(submit_response)
-        if not task_id:
-            message = "Suno response did not include taskId"
+        auth = _authenticate(cookie_raw)
+
+        captcha_required = _captcha_required(auth)
+        manual_token = _env("SUNO_HCAPTCHA_TOKEN") or None
+        if captcha_required and not manual_token:
+            message = "Suno requires a captcha for this request; set SUNO_HCAPTCHA_TOKEN to provide one"
+            payload = _manifest_payload(
+                session_id=session_id,
+                project_id=project_id,
+                language=language,
+                provider=provider,
+                status="skipped",
+                message=message,
+                music_path=music_path,
+                prompt=music_prompt,
+            )
+            _write_json(manifest_path, payload)
+            _merge_music_status(audio_manifest_path, payload, track=None)
+            return _tool_result(payload, manifest_path, music_path)
+        token = manual_token if captcha_required else None
+
+        request_payload = _build_suno_payload(music_prompt, instrumental, base_dir, token)
+        submit_response = _post_suno_generate(auth, request_payload)
+        clip_ids = _extract_clip_ids(submit_response)
+        if not clip_ids:
+            message = "Suno response did not include any clip ids"
             payload = _manifest_payload(
                 session_id=session_id,
                 project_id=project_id,
@@ -144,6 +172,7 @@ def storybook_music_generator_tool(
             return _error_result(message, manifest_path=manifest_path, music_path=music_path)
 
         if not wait_for_completion:
+            task_id = clip_ids[0]
             payload = _manifest_payload(
                 session_id=session_id,
                 project_id=project_id,
@@ -160,9 +189,9 @@ def storybook_music_generator_tool(
             _merge_music_status(audio_manifest_path, payload, track=None)
             return _tool_result(payload, manifest_path, music_path)
 
-        record_payload, audio_url = _wait_for_suno_audio_url(
-            api_key=api_key,
-            task_id=task_id,
+        record_payload, audio_url, task_id = _wait_for_suno_audio_url(
+            auth=auth,
+            clip_ids=clip_ids,
             timeout_seconds=timeout_seconds,
             poll_interval_seconds=poll_interval_seconds,
         )
@@ -195,8 +224,8 @@ def storybook_music_generator_tool(
             status="error",
             message=message,
             music_path=music_path,
-            prompt=music_prompt if "music_prompt" in locals() else None,
-            task_id=task_id if "task_id" in locals() else None,
+            prompt=music_prompt,
+            task_id=task_id,
         )
         _write_json(manifest_path, payload)
         _merge_music_status(audio_manifest_path, payload, track=None)
@@ -233,61 +262,101 @@ def _load_env_file() -> None:
                 os.environ.setdefault(key, value)
 
 
-def _build_suno_payload(prompt: str, instrumental: bool, base_dir: Path) -> Dict[str, Any]:
+def _build_suno_payload(prompt: str, instrumental: bool, base_dir: Path, token: Optional[str]) -> Dict[str, Any]:
     custom_mode = _truthy_env("SUNO_CUSTOM_MODE")
     payload: Dict[str, Any] = {
-        "prompt": prompt,
-        "customMode": custom_mode,
-        "instrumental": instrumental,
-        "model": _env("SUNO_MODEL", "V4_5"),
+        "make_instrumental": instrumental,
+        "mv": _env("SUNO_MODEL", DEFAULT_MODEL),
+        "prompt": "",
+        "generation_type": "TEXT",
+        "token": token,
     }
-    callback_url = _env("SUNO_CALLBACK_URL")
-    if callback_url:
-        payload["callBackUrl"] = callback_url
     if custom_mode:
-        payload["style"] = _clip_text(_env("SUNO_MUSIC_STYLE") or _derive_style(base_dir), 200)
+        payload["tags"] = _clip_text(_env("SUNO_MUSIC_STYLE") or _derive_style(base_dir), 200)
         payload["title"] = _clip_text(_derive_title(base_dir), 80)
+        payload["prompt"] = prompt
+    else:
+        payload["gpt_description_prompt"] = prompt
     return payload
 
 
-def _post_suno_generate(api_key: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = _url(_env("SUNO_API_BASE_URL", DEFAULT_SUNO_BASE_URL), _env("SUNO_GENERATE_ENDPOINT", DEFAULT_GENERATE_ENDPOINT))
-    response = requests.post(url, headers=_headers(api_key), json=payload, timeout=_request_timeout())
+def _authenticate(cookie_raw: str) -> Dict[str, Any]:
+    cookies = _parse_cookies(cookie_raw)
+    client_token = cookies.get("__client")
+    if not client_token:
+        raise RuntimeError("SUNO_COOKIE is missing the __client value")
+    device_id = cookies.get("ajs_anonymous_id") or str(uuid.uuid4())
+    auth = {"cookies": cookies, "client_token": client_token, "device_id": device_id}
+
+    url = _url(CLERK_BASE_URL, "/v1/client") + _clerk_query()
+    response = requests.get(url, headers=_clerk_headers(auth), timeout=_request_timeout())
+    data = _json_response(response)
+    inner = data.get("response")
+    sid = inner.get("last_active_session_id") if isinstance(inner, dict) else None
+    if not sid:
+        raise RuntimeError("Suno auth did not return an active session id")
+    auth["sid"] = str(sid)
+    return auth
+
+
+def _mint_jwt(auth: Dict[str, Any]) -> str:
+    url = _url(CLERK_BASE_URL, f"/v1/client/sessions/{auth['sid']}/tokens") + _clerk_query()
+    response = requests.post(url, headers=_clerk_headers(auth), timeout=_request_timeout())
+    data = _json_response(response)
+    jwt = data.get("jwt")
+    if not jwt:
+        raise RuntimeError("Suno auth did not return a session token")
+    return str(jwt)
+
+
+def _captcha_required(auth: Dict[str, Any]) -> bool:
+    url = _url(STUDIO_API_BASE_URL, "/api/c/check")
+    response = requests.post(
+        url, headers=_studio_headers(auth), json={"ctype": "generation"}, timeout=_request_timeout()
+    )
+    data = _json_response(response)
+    return bool(data.get("required"))
+
+
+def _post_suno_generate(auth: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = _url(STUDIO_API_BASE_URL, "/api/generate/v2/")
+    response = requests.post(url, headers=_studio_headers(auth), json=payload, timeout=_request_timeout())
     return _json_response(response)
 
 
-def _get_suno_record_info(api_key: str, task_id: str) -> Dict[str, Any]:
-    url = _url(
-        _env("SUNO_API_BASE_URL", DEFAULT_SUNO_BASE_URL),
-        _env("SUNO_RECORD_INFO_ENDPOINT", DEFAULT_RECORD_INFO_ENDPOINT),
+def _get_suno_feed(auth: Dict[str, Any], clip_ids: List[str]) -> Dict[str, Any]:
+    url = _url(STUDIO_API_BASE_URL, "/api/feed/v2")
+    response = requests.get(
+        url, headers=_studio_headers(auth), params={"ids": ",".join(clip_ids)}, timeout=_request_timeout()
     )
-    response = requests.get(url, headers=_headers(api_key), params={"taskId": task_id}, timeout=_request_timeout())
     return _json_response(response)
 
 
 def _wait_for_suno_audio_url(
-    api_key: str,
-    task_id: str,
+    auth: Dict[str, Any],
+    clip_ids: List[str],
     timeout_seconds: int,
     poll_interval_seconds: int,
-) -> Tuple[Dict[str, Any], Optional[str]]:
+) -> Tuple[Dict[str, Any], Optional[str], Optional[str]]:
     deadline = time.monotonic() + max(1, int(timeout_seconds or 1))
     poll_interval = max(1, int(poll_interval_seconds or 1))
     last_payload: Dict[str, Any] = {}
-    failure_statuses = {"CREATE_TASK_FAILED", "GENERATE_AUDIO_FAILED", "SENSITIVE_WORD_ERROR", "CALLBACK_EXCEPTION", "FAILED", "ERROR"}
 
     while True:
-        last_payload = _get_suno_record_info(api_key, task_id)
-        status = _extract_status(last_payload)
-        audio_url = _extract_audio_url(last_payload)
-        if audio_url and status in {"SUCCESS", "FIRST_SUCCESS", "COMPLETE", "COMPLETED", "READY"}:
-            return last_payload, audio_url
-        if audio_url and not status:
-            return last_payload, audio_url
-        if status in failure_statuses:
-            raise RuntimeError(f"Suno task failed with status {status}")
+        last_payload = _get_suno_feed(auth, clip_ids)
+        clips = _feed_clips(last_payload)
+        all_failed = bool(clips)
+        for clip in clips:
+            status = str(clip.get("status") or "").strip().lower()
+            audio_url = clip.get("audio_url")
+            if status == "complete" and isinstance(audio_url, str) and audio_url.startswith(("http://", "https://")):
+                return last_payload, audio_url, str(clip.get("id") or "") or None
+            if status != "error":
+                all_failed = False
+        if all_failed:
+            raise RuntimeError("Suno task failed for all clips")
         if time.monotonic() >= deadline:
-            raise TimeoutError(f"Suno task timed out with status {status or 'unknown'}")
+            raise TimeoutError("Suno task timed out before audio was ready")
         time.sleep(poll_interval)
 
 
@@ -317,22 +386,58 @@ def _json_response(response: Any) -> Dict[str, Any]:
     try:
         payload = response.json()
     except Exception as exc:
-        raise RuntimeError(f"Provider response is not JSON: {exc}") from exc
+        raise RuntimeError(f"Suno response is not JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("Provider response must be a JSON object")
-    code = payload.get("code")
-    if code not in (None, 0, 200, "0", "200"):
-        message = payload.get("message") or payload.get("msg") or "provider returned non-success code"
-        raise RuntimeError(str(message))
+        raise RuntimeError("Suno response must be a JSON object")
     return payload
 
 
-def _headers(api_key: str) -> Dict[str, str]:
+def _parse_cookies(raw: str) -> Dict[str, str]:
+    cookies: Dict[str, str] = {}
+    for part in str(raw or "").split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        if key:
+            cookies[key] = value.strip()
+    return cookies
+
+
+def _cookie_header(cookies: Dict[str, str]) -> str:
+    return "; ".join(f"{key}={value}" for key, value in cookies.items())
+
+
+def _clerk_query() -> str:
+    return f"?__clerk_api_version={CLERK_API_VERSION}&_clerk_js_version={CLERK_JS_VERSION}"
+
+
+def _static_headers(device_id: str) -> Dict[str, str]:
     return {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
+        "Affiliate-Id": "undefined",
+        "Device-Id": f'"{device_id}"',
+        "x-suno-client": "Android prerelease-4nt180t 1.0.42",
+        "X-Requested-With": "com.suno.android",
+        "User-Agent": _USER_AGENT,
     }
+
+
+def _clerk_headers(auth: Dict[str, Any]) -> Dict[str, str]:
+    headers = _static_headers(auth["device_id"])
+    headers["Authorization"] = auth["client_token"]
+    headers["Cookie"] = _cookie_header(auth["cookies"])
+    return headers
+
+
+def _studio_headers(auth: Dict[str, Any]) -> Dict[str, str]:
+    jwt = _mint_jwt(auth)
+    headers = _static_headers(auth["device_id"])
+    headers["Authorization"] = f"Bearer {jwt}"
+    headers["Cookie"] = _cookie_header(auth["cookies"])
+    headers["Content-Type"] = "application/json"
+    headers["Accept"] = "application/json"
+    return headers
 
 
 def _build_music_prompt(base_dir: Path, language: str) -> str:
@@ -384,54 +489,25 @@ def _derive_title(base_dir: Path) -> str:
     return "storybook soundtrack"
 
 
-def _extract_task_id(payload: Dict[str, Any]) -> Optional[str]:
-    values = [
-        payload.get("taskId"),
-        payload.get("task_id"),
-        payload.get("id"),
-    ]
-    data = payload.get("data")
-    if isinstance(data, dict):
-        values.extend([data.get("taskId"), data.get("task_id"), data.get("id")])
-    for value in values:
+def _extract_clip_ids(payload: Dict[str, Any]) -> List[str]:
+    clips = _feed_clips(payload)
+    ids: List[str] = []
+    for clip in clips:
+        value = clip.get("id")
         if value not in (None, ""):
-            return str(value)
-    return None
+            ids.append(str(value))
+    return ids
 
 
-def _extract_status(payload: Dict[str, Any]) -> str:
-    candidates = [payload.get("status"), payload.get("state")]
-    data = payload.get("data")
-    if isinstance(data, dict):
-        candidates.extend([data.get("status"), data.get("state")])
-        response = data.get("response")
-        if isinstance(response, dict):
-            candidates.extend([response.get("status"), response.get("state")])
-    for value in candidates:
-        if value not in (None, ""):
-            return str(value).strip().upper()
-    return ""
-
-
-def _extract_audio_url(payload: Dict[str, Any]) -> Optional[str]:
-    for item in _walk_dicts(payload):
-        for key in ("audioUrl", "audio_url", "audio", "sourceAudioUrl", "streamAudioUrl"):
-            value = item.get(key)
-            if isinstance(value, str) and value.startswith(("http://", "https://")):
-                return value
-    return None
-
-
-def _walk_dicts(value: Any) -> List[Dict[str, Any]]:
-    found: List[Dict[str, Any]] = []
-    if isinstance(value, dict):
-        found.append(value)
-        for nested in value.values():
-            found.extend(_walk_dicts(nested))
-    elif isinstance(value, list):
-        for item in value:
-            found.extend(_walk_dicts(item))
-    return found
+def _feed_clips(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    clips = payload.get("clips")
+    if not isinstance(clips, list):
+        data = payload.get("data")
+        if isinstance(data, dict):
+            clips = data.get("clips")
+    if not isinstance(clips, list):
+        return []
+    return [clip for clip in clips if isinstance(clip, dict)]
 
 
 def _merge_music_status(audio_manifest_path: Path, music_manifest: Dict[str, Any], track: Optional[Dict[str, Any]]) -> None:

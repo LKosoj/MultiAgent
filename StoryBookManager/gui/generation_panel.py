@@ -1360,7 +1360,7 @@ class GenerationPanel(ttk.Frame):
             f"enabled={music.get('enabled')}, "
             f"configured={music.get('configured')}, "
             f"model={music.get('model', 'unknown')}, "
-            f"callback={music.get('callback_configured')}, "
+            f"captcha_token={music.get('captcha_token_configured')}, "
             f"status={music.get('status', 'unknown')}, "
             f"music_exists={music.get('music_exists')}",
             self._music_readiness_level(music, errors),

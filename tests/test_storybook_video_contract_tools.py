@@ -50,7 +50,7 @@ def test_preflight_writes_provider_menu_summary(tmp_path, monkeypatch):
 def test_preflight_keeps_suno_separate_from_audio_capability(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _enable_video_env(monkeypatch)
-    monkeypatch.setenv("SUNO_API_KEY", "sk-suno")
+    monkeypatch.setenv("SUNO_COOKIE", "__client=sk-suno")
 
     result = video_contract.storybook_video_preflight_tool(
         session_id="session-1",
@@ -62,7 +62,7 @@ def test_preflight_keeps_suno_separate_from_audio_capability(tmp_path, monkeypat
     artifact = tmp_path / result["artifact_path"]
     saved = json.loads(artifact.read_text(encoding="utf-8"))
     assert saved["capabilities"]["audio"] is False
-    assert "SUNO_API_KEY" not in saved["capability_details"]["audio_env"]
+    assert "SUNO_COOKIE" not in saved["capability_details"]["audio_env"]
 
     readiness = video_contract.storybook_video_music_readiness(
         project_id="project-1",
@@ -235,7 +235,7 @@ def test_video_music_readiness_treats_missing_shots_as_pre_run_warning(tmp_path,
 def test_video_music_readiness_reports_music_final_artifacts_and_errors(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _enable_video_env(monkeypatch)
-    monkeypatch.setenv("SUNO_API_KEY", "sk-suno")
+    monkeypatch.setenv("SUNO_COOKIE", "__client=sk-suno")
     base = tmp_path / "plots" / "storybooks" / "project-1"
     _write_shots(
         tmp_path,
