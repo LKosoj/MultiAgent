@@ -92,7 +92,7 @@ prompt_templates: |-
       "issues": []
     },
     "performance_check": {
-      "plan": "Index lookup on users table",
+      "plan": "Index lookup on main_table",
       "estimated_cost": 12.3,
       "issues": []
     }

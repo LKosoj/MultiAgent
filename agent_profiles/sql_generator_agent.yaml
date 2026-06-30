@@ -84,8 +84,8 @@ prompt_templates: |-
   Пример вывода (JSON):
   ```json
   {
-    "sql": "SELECT\n  r.region_name,\n  SUM(s.sale_amount) as total_revenue\nFROM\n  sales s\nJOIN\n  regions r ON s.region_id = r.id\nWHERE\n  s.sale_date >= '2023-10-01' AND s.sale_date <= '2023-12-31'\nGROUP BY\n  r.region_name\nORDER BY\n  total_revenue DESC;",
-    "description": "Запрос для получения общей выручки по регионам за четвёртый квартал 2023 года, отсортированной по убыванию суммы продаж, возможно есть другие фильтры"
+    "sql": "SELECT\n  rt.group_col,\n  SUM(mt.value_col) as total_value\nFROM\n  main_table mt\nJOIN\n  ref_table rt ON mt.ref_id = rt.id\nWHERE\n  mt.date_col >= '2023-10-01' AND mt.date_col <= '2023-12-31'\nGROUP BY\n  rt.group_col\nORDER BY\n  total_value DESC;",
+    "description": "Иллюстративный пример формата ответа (не отражает реальную схему БД): запрос для получения суммарного значения с группировкой по справочному полю за четвёртый квартал 2023 года, отсортированной по убыванию, возможно есть другие фильтры"
   }
   ```
 

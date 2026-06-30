@@ -97,7 +97,7 @@ prompt_templates: |-
   {
     "timestamp": "2023-12-25T10:30:00Z",
     "session_id": "uuid-...",
-    "user_query": "Покажи выручку по регионам",
+    "user_query": "Агрегируй value_col по group_col",
     "generated_sql": "SELECT ...",
     "verification_status": "Approved",
     "execution_status": "Success",
@@ -110,15 +110,15 @@ prompt_templates: |-
   ```
   Выполнен SQL-запрос:
   ```sql
-  SELECT r.region_name, SUM(s.amount) as total_amount
-  FROM regions r JOIN sales s ON r.id = s.region_id 
-  GROUP BY r.region_name 
-  ORDER BY total_amount DESC LIMIT 10
+  SELECT m.group_col, SUM(r.value_col) as total_value
+  FROM main_table m JOIN ref_table r ON m.id = r.ref_id
+  GROUP BY m.group_col
+  ORDER BY total_value DESC LIMIT 10
   ```
 
   Результаты (данные):
-  - Центральный ФО: *** млн руб.
-  - Северо-Западный ФО: *** млн руб.
+  - Группа A: ***
+  - Группа B: ***
   ...
 
   Затронуто строк: 10

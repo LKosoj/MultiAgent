@@ -69,13 +69,13 @@ prompt_templates: |-
   ## Пример корректного ответа
   {
     "linked_entities": {
-      "metrics": [{"name": "выручка", "table": "sales", "column": "amount"}],
-      "dimensions": [{"name": "время", "table": "sales", "column": "sale_date"}],
-      "filters": {"date_range": {"table": "sales", "column": "sale_date", "start": "2023-10-01", "end": "2023-12-31"}}
+      "metrics": [{"name": "показатель", "table": "main_table", "column": "value_col"}],
+      "dimensions": [{"name": "период", "table": "main_table", "column": "date_col"}],
+      "filters": {"date_range": {"table": "main_table", "column": "date_col", "start": "2023-10-01", "end": "2023-12-31"}}
     },
     "joins": [],
     "schema_info": {},
-    "distinct_values": {"sales": {"region": ["Москва", "СПб"]}}
+    "distinct_values": {"main_table": {"group_col": ["value_1", "value_2"]}}
   }
 
   ## JSON validity
