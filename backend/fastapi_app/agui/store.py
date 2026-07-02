@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+from .auth import Principal, principal_from_record, principal_to_record
+
 
 @dataclass(frozen=True)
 class StoredEvent:
@@ -43,12 +45,64 @@ class EventStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agui_runs (
+                run_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                owner_subject TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                roles TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL
+            )
+            """
+        )
         # UNIQUE гарантирует отсутствие дубликатов seq внутри run_id — защита на случай
         # одновременной записи через разные процессы, где in-process lock не помогает.
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_agui_events_run_seq ON agui_events(run_id, seq)"
         )
         self._conn.commit()
+
+    def record_run(self, run_id: str, thread_id: str, principal: Principal) -> None:
+        created_at_ms = int(time.time() * 1000)
+        record = principal_to_record(principal)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO agui_runs
+                    (run_id, thread_id, owner_subject, tenant_id, roles, created_at_ms)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run_id,
+                    thread_id,
+                    record["subject"],
+                    record["tenant_id"],
+                    json.dumps(record["roles"]),
+                    created_at_ms,
+                ),
+            )
+            self._conn.commit()
+
+    def get_run_principal(self, run_id: str) -> Optional[Principal]:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                SELECT owner_subject, tenant_id, roles
+                FROM agui_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        subject, tenant_id, roles_json = row
+        roles = json.loads(roles_json)
+        return principal_from_record(
+            {"subject": subject, "tenant_id": tenant_id, "roles": roles}
+        )
 
     def append(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int:
         created_at_ms = int(time.time() * 1000)

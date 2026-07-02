@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import types
@@ -279,6 +280,67 @@ def test_text_to_sql_generate_uses_unique_run_id_and_records_parameters(monkeypa
     assert call["parameters"]["allow_enhanced_fallback"] is False
     assert call["parameters"]["run_id"] == first["run_id"]
     assert call["parameters"]["session_id"] == first["session_id"]
+
+
+def test_text_to_sql_session_id_is_scoped_by_principal(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    dsn = "sqlite:///tmp/app.db"
+    alice = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+    bob = Principal(subject="bob", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    base = service._compute_text_to_sql_session_id(dsn)
+    alice_session = service._compute_text_to_sql_session_id(dsn, principal=alice)
+    bob_session = service._compute_text_to_sql_session_id(dsn, principal=bob)
+
+    assert alice_session == service._compute_text_to_sql_session_id(dsn, principal=alice)
+    assert alice_session != bob_session
+    assert alice_session != base
+    assert bob_session != base
+    assert alice_session.startswith(f"{base}__u_")
+    assert service._scope_text_to_sql_session_id(alice_session, alice) == alice_session
+    with pytest.raises(PermissionError, match="session_id scope"):
+        service._scope_text_to_sql_session_id(alice_session, bob)
+
+
+def test_text_to_sql_generate_scopes_explicit_session_by_principal(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    dsn = "sqlite:///tmp/app.db"
+    alice = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+    bob = Principal(subject="bob", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    alice_result = service.handle_service_action(
+        "presets.text_to_sql.generate",
+        {"query": "show users", "dsn": dsn, "session_id": "client-session"},
+        principal=alice,
+    )
+    bob_result = service.handle_service_action(
+        "presets.text_to_sql.generate",
+        {"query": "show users", "dsn": dsn, "session_id": "client-session"},
+        principal=bob,
+    )
+    alice_reuse = service.handle_service_action(
+        "presets.text_to_sql.generate",
+        {"query": "show users", "dsn": dsn, "session_id": alice_result["session_id"]},
+        principal=alice,
+    )
+
+    assert alice_result["session_id"] != bob_result["session_id"]
+    assert alice_reuse["session_id"] == alice_result["session_id"]
+    assert wf_manager.calls[0]["parameters"]["session_id"] == alice_result["session_id"]
+    assert wf_manager.calls[1]["parameters"]["session_id"] == bob_result["session_id"]
+    assert wf_manager.calls[2]["parameters"]["session_id"] == alice_result["session_id"]
+    with pytest.raises(PermissionError, match="session_id scope"):
+        service.handle_service_action(
+            "presets.text_to_sql.generate",
+            {"query": "show users", "dsn": dsn, "session_id": alice_result["session_id"]},
+            principal=bob,
+        )
 
 
 def test_text_to_sql_generate_rejects_foreign_agui_entrypoint(monkeypatch):
@@ -1090,7 +1152,7 @@ def test_agui_redaction_masks_scalar_secrets_query_strings_and_error_text(monkey
 def test_text_to_sql_schema_load_requires_explicit_db_fallback(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
-    monkeypatch.setattr(service, "_load_text_to_sql_schema_from_memory", lambda dsn: None)
+    monkeypatch.setattr(service, "_load_text_to_sql_schema_from_memory", lambda *a, **k: None)
 
     with pytest.raises(ValueError, match="allow_db_schema_fallback=true"):
         service.handle_service_action(
@@ -1102,7 +1164,7 @@ def test_text_to_sql_schema_load_requires_explicit_db_fallback(monkeypatch):
 def test_text_to_sql_schema_load_rejects_non_boolean_fallback_flag(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
-    monkeypatch.setattr(service, "_load_text_to_sql_schema_from_memory", lambda dsn: None)
+    monkeypatch.setattr(service, "_load_text_to_sql_schema_from_memory", lambda *a, **k: None)
 
     with pytest.raises(ValueError, match="allow_db_schema_fallback"):
         service.handle_service_action(
@@ -1523,6 +1585,135 @@ def test_workflow_yaml_actions_reject_path_traversal(monkeypatch):
         service.handle_service_action(
             "workflows.save_yaml",
             {"workflow_name": "../secret", "yaml": "name: secret\nsteps: []"},
+        )
+
+
+def test_service_policy_blocks_admin_actions_for_user(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    blocked_actions = [
+        ("workflows.save_yaml", {"workflow_name": "demo", "yaml": "name: demo\nsteps: []"}),
+        ("tools.invoke", {"tool_name": "demo"}),
+        ("files.read", {"path": "README.md"}),
+        ("config.update", {"config": {}}),
+        ("db.test_configs.save", {"name": "prod", "dsn": "sqlite:///tmp/app.db"}),
+        ("memory.export", {"format": "json"}),
+        ("memory.full_cleanup", {"confirm": True}),
+        ("text_to_sql.history.clear", {"confirm": True}),
+        ("logs.file_content", {"filename": "app_logs.jsonl"}),
+        ("logs.file_search", {"filename": "app_logs.jsonl"}),
+        ("telemetry.enable", {}),
+        ("telemetry.cleanup", {}),
+        ("agents.result", {"run_id": "run-other"}),
+        ("workflows.result", {"run_id": "run-other"}),
+        ("system.prompt_optimizer.run", {"prompt": "x"}),
+        ("system.stale_monitor.start", {}),
+        ("db.introspect_schema", {"dsn": "sqlite:///tmp/app.db"}),
+        ("text_to_sql.schema.load", {"dsn": "sqlite:///tmp/app.db"}),
+        ("utils.call_openai_api_streaming", {"messages": []}),
+        ("presets.image.generate", {"prompt": "x"}),
+    ]
+
+    for action, payload in blocked_actions:
+        with pytest.raises(PermissionError, match="requires role"):
+            service.handle_service_action(action, payload, principal=user)
+
+
+def test_service_action_policy_is_explicit_for_every_dispatch_branch(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    source = Path(service.__file__).read_text(encoding="utf-8")
+    handled = set(re.findall(r'action == "([^"]+)"', source))
+    for match in re.finditer(r"action in \(([^)]*)\)", source):
+        handled.update(re.findall(r'"([^"]+)"', match.group(1)))
+
+    assert handled <= service._ALL_SERVICE_ACTIONS
+    assert service._ALL_SERVICE_ACTIONS == (
+        service._USER_ACTIONS | service._MEMORY_ARCHIVIST_ACTIONS | service._ADMIN_ONLY_ACTIONS
+    )
+    assert not service._USER_ACTIONS & service._ADMIN_ONLY_ACTIONS
+    assert not service._USER_ACTIONS & service._MEMORY_ARCHIVIST_ACTIONS
+    assert not service._ADMIN_ONLY_ACTIONS & service._MEMORY_ARCHIVIST_ACTIONS
+    assert service._ALL_SERVICE_ACTIONS - handled == {"logs.stream", "progress.stream"}
+
+
+def test_service_action_policy_rejects_unclassified_action(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    with pytest.raises(PermissionError, match="not classified"):
+        service._require_service_action_role("demo.echo", user)
+
+
+def test_service_policy_allows_admin_workflow_save(monkeypatch, tmp_path):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+    admin = Principal(
+        subject="admin",
+        tenant_id="tenant-1",
+        roles=frozenset({"admin", "user"}),
+    )
+
+    result = service.handle_service_action(
+        "workflows.save_yaml",
+        {"workflow_name": "demo_policy", "yaml": "name: demo_policy\nsteps: []"},
+        principal=admin,
+    )
+
+    assert result["saved"] is True
+    assert (tmp_path / "workflow_pipelines" / "demo_policy.yaml").exists()
+
+
+def test_service_file_read_has_size_limit(monkeypatch, tmp_path):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+    monkeypatch.setenv("AG_UI_MAX_FILE_READ_BYTES", "8")
+    (tmp_path / "large.txt").write_text("0123456789", encoding="utf-8")
+    admin = Principal(
+        subject="admin",
+        tenant_id="tenant-1",
+        roles=frozenset({"admin", "user"}),
+    )
+
+    with pytest.raises(ValueError, match="file is too large"):
+        service.handle_service_action("files.read", {"path": "large.txt"}, principal=admin)
+
+
+def test_service_log_file_actions_stay_inside_logs_dir(monkeypatch, tmp_path):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "secret_logs.jsonl").write_text(
+        json.dumps({"message": "outside"}) + "\n",
+        encoding="utf-8",
+    )
+    admin = Principal(
+        subject="admin",
+        tenant_id="tenant-1",
+        roles=frozenset({"admin", "user"}),
+    )
+
+    with pytest.raises(ValueError, match="logs directory"):
+        service.handle_service_action(
+            "logs.file_content",
+            {"filename": "../secret_logs.jsonl"},
+            principal=admin,
         )
 
 
@@ -2208,9 +2399,18 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
     assert generation_step.metadata["dsn"] == "{dsn}"
     assert verification_step.metadata["dsn"] == "{dsn}"
     assert audit_step.metadata["dsn"] == "{dsn}"
+    assert schema_step.tool_params["session_id"] == "{session_id}"
     assert "dsn={dsn}" not in generation_step.task
     assert "dsn={dsn}" not in verification_step.task
     assert "dsn={dsn}" not in audit_step.task
+    assert generation_step.output_schema == "json_object"
+    assert generation_step.output_schema_requirements["required"] == [
+        "sql",
+        "description",
+    ]
+    assert generation_step.condition == "{schema_linking_step.join_success}"
+    assert generation_step.metadata["skip_output"]["sql"] == ""
+    assert generation_step.metadata["skip_output"]["error"] == "schema_linking_join_failed"
     assert verification_step.output_schema_requirements["required"] == [
         "verification_status",
         "safety_check",
@@ -2221,7 +2421,7 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
         "Approved",
         "Rejected",
     ]
-    assert "sql_generation_plugin(context=..., user_query=...)" in generation_step.task
+    assert 'sql_generation_plugin(context=..., user_query=..., session_id="{session_id}")' in generation_step.task
     assert "sql_safety_check(sql_query=...)" in verification_step.task
     assert "sql_explain(sql_query=...)" in verification_step.task
 
@@ -3292,6 +3492,56 @@ def test_sql_verification_step_has_condition_on_empty_sql():
     assert "sql_generation.sql" in verification_step.condition, (
         "condition должен проверять поле sql из sql_generation"
     )
+
+
+def test_sql_generation_step_requires_successful_schema_linking():
+    """P-2: join_success=False не должен пускать пайплайн в успешную генерацию SQL."""
+    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
+    WorkflowDefinition = models.WorkflowDefinition
+
+    workflow = WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
+    generation_step = next(
+        step for step in workflow.steps if step.id == "sql_generation"
+    )
+
+    assert generation_step.condition == "{schema_linking_step.join_success}"
+    skip_output = generation_step.metadata.get("skip_output")
+    assert skip_output is not None
+    assert skip_output["sql"] == ""
+    assert skip_output["error"] == "schema_linking_join_failed"
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_sql_generation_join_failure_condition_writes_explicit_skip_output():
+    """P-2: при join_success=False downstream видит явный failure payload, а не успешный SQL."""
+    WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
+    WorkflowContext = sys.modules["workflow.models"].WorkflowContext
+    WorkflowDefinition = sys.modules["workflow.models"].WorkflowDefinition
+
+    workflow = WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
+    generation_step = next(
+        step for step in workflow.steps if step.id == "sql_generation"
+    )
+    engine = object.__new__(WorkflowEngine)
+    context = WorkflowContext(
+        variables={},
+        step_outputs={
+            "schema_linking_step": {
+                "join_success": False,
+                "schema_info": {},
+                "joins": [],
+            },
+            "schema_linking_step.join_success": False,
+        },
+    )
+
+    assert engine._should_skip_step_by_condition(generation_step, context) is True
+    assert context.step_outputs["sql_generation"]["sql"] == ""
+    assert context.step_outputs["sql_generation.error"] == "schema_linking_join_failed"
 
 
 def test_sql_verification_step_skip_output_has_rejected_status():

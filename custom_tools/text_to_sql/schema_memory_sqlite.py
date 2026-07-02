@@ -24,6 +24,7 @@ import hashlib
 import logging
 import sqlite3
 import threading
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -337,7 +338,12 @@ class SchemaMemoryManager:
             str(_redact_schema_memory_value(error)) if error is not None else None
         )
 
-    def ensure_schema_indexed_in_memory(self, dsn: str, db_schema: Dict[str, Dict[str, Dict[str, Any]]]) -> bool:
+    def ensure_schema_indexed_in_memory(
+        self,
+        dsn: str,
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        session_id: Optional[str] = None,
+    ) -> bool:
         """Обеспечивает индексацию схемы в тактической памяти.
 
         Fail-fast: ошибки memory layer / JSON-парса schema-файла пробрасываются
@@ -366,7 +372,7 @@ class SchemaMemoryManager:
                 f"dsn={dsn_to_sanitized_name(dsn)!r}"
             )
 
-        session_id = dsn_to_sanitized_name(dsn)
+        session_id = session_id or dsn_to_sanitized_name(dsn)
         sqlrag_dir = self.repo_root / "sqlrag"
         filename = f"{session_id}.json"
         json_path = sqlrag_dir / filename
@@ -467,14 +473,20 @@ class SchemaMemoryManager:
                 При expected_count=None (по умолчанию) — поведение прежнее: True при > 0.
         """
         from memory.tools import get_memory
+        try:
+            from memory.tools import memory_requester_context
+        except ImportError:
+            memory_requester_context = lambda _agent_name: nullcontext()
 
         # Получаем ТОЛЬКО активные записи (include_historical=False по умолчанию)
-        results = get_memory(
-            session_id=session_id,
-            agent_name="Schema-RAG-Agent",
-            cache_kind="schema_table",
-            include_historical=False  # Явно указываем, что нужны только активные записи
-        )
+        with memory_requester_context("Schema-RAG-Agent"):
+            results = get_memory(
+                session_id=session_id,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_table",
+                include_historical=False,  # Явно указываем, что нужны только активные записи
+                requesting_agent="Schema-RAG-Agent",
+            )
 
         # Проверяем, есть ли записи с нужным хэшем
         active_records_with_hash = 0

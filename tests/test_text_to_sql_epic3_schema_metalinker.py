@@ -183,10 +183,32 @@ def test_optimize_schema_lossless_round_trip():
 
     # 3. Описание таблицы сохранено.
     assert get_table_description(optimized["orders"]) == "Заказы"
+    assert "metadata" not in optimized["orders"]
 
     # 4. Round-trip идемпотентность: повторный optimize не меняет результат.
     twice = SchemaStatsHelper.optimize_schema_for_storage(optimized)
     assert twice == optimized
+
+
+def test_optimize_schema_preserves_table_level_metadata_and_unknown_keys():
+    """S-3: canonical table-level metadata/unknown keys survive autosave shape."""
+    original = {
+        "orders": {
+            "description": "Заказы",
+            "metadata": {"owner": "analytics"},
+            "x-source": {"kind": "introspection"},
+            "columns": {
+                "id": {"type": "INT"},
+            },
+        },
+    }
+
+    optimized = SchemaStatsHelper.optimize_schema_for_storage(original)
+
+    assert optimized["orders"]["metadata"] == {"owner": "analytics"}
+    assert optimized["orders"]["x-source"] == {"kind": "introspection"}
+    assert optimized["orders"]["columns"] == {"id": {"type": "INT"}}
+    assert SchemaStatsHelper.optimize_schema_for_storage(optimized) == optimized
 
 
 # ---------------------------------------------------------------------------

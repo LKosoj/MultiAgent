@@ -372,13 +372,16 @@ class RetrievalService:
             return None
 
         from custom_tools.text_to_sql import rag as _facade
+        from memory.tools import memory_requester_context
 
-        cached = _facade.get_memory(
-            session_id=cache_info["session_id"],
-            agent_name="Schema-RAG-Agent",
-            cache_kind=cache_info["cache_kind"],
-            include_historical=False,
-        )
+        with memory_requester_context("Schema-RAG-Agent"):
+            cached = _facade.get_memory(
+                session_id=cache_info["session_id"],
+                agent_name="Schema-RAG-Agent",
+                cache_kind=cache_info["cache_kind"],
+                include_historical=False,
+                requesting_agent="Schema-RAG-Agent",
+            )
 
         for item in cached if isinstance(cached, list) else []:
             data = item.get("data", {}) if isinstance(item, dict) else {}

@@ -17,6 +17,7 @@ from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
 
 from ..prompts import build_schema_linking_prompt
 from ..utils import parse_llm_json_response
+from .resolution import _resolve_column_name, _resolve_table_name
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +217,7 @@ class LLMLinker:
                 joins_from_llm = parsed.get("joins", [])
                 logger.info(f"LLM returned {len(joins_from_llm)} joins: {joins_from_llm}")
                 linked_entities = parsed.get("linked_entities", {})
+                linked_entities = _normalize_linked_entities(linked_entities, db_schema)
                 if not _has_linked_entities(linked_entities):
                     return {
                         "error": "LLM schema linking returned no linked entities",
@@ -272,6 +274,68 @@ class LLMLinker:
             }
 
 
+def _normalize_entity_list(
+    items: Any,
+    db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    if not isinstance(items, list):
+        return normalized
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        table = item.get("table")
+        column = item.get("column")
+        if not isinstance(table, str) or not isinstance(column, str):
+            continue
+        resolved_table = _resolve_table_name(table, db_schema)
+        if not resolved_table:
+            logger.warning("LLM linked entity references unknown table: %s", table)
+            continue
+        resolved_column = _resolve_column_name(column, resolved_table, db_schema)
+        if not resolved_column:
+            logger.warning(
+                "LLM linked entity references unknown column: %s.%s",
+                table,
+                column,
+            )
+            continue
+        normalized_item = dict(item)
+        normalized_item["table"] = resolved_table
+        normalized_item["column"] = resolved_column
+        normalized.append(normalized_item)
+    return normalized
+
+
+def _normalize_filter_map(
+    filters: Any,
+    db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Dict[str, Any]]:
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(filters, dict):
+        return normalized
+
+    for filter_name, item in filters.items():
+        normalized_items = _normalize_entity_list([item], db_schema)
+        if normalized_items:
+            normalized[filter_name] = normalized_items[0]
+    return normalized
+
+
+def _normalize_linked_entities(
+    linked_entities: Any,
+    db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+) -> Dict[str, Any]:
+    if not isinstance(linked_entities, dict):
+        return {}
+    return {
+        "metrics": _normalize_entity_list(linked_entities.get("metrics"), db_schema),
+        "dimensions": _normalize_entity_list(linked_entities.get("dimensions"), db_schema),
+        "filters": _normalize_filter_map(linked_entities.get("filters"), db_schema),
+    }
+
+
 def _has_linked_entities(linked_entities: Dict[str, Any]) -> bool:
     if not isinstance(linked_entities, dict):
         return False
@@ -284,6 +348,13 @@ def _has_linked_entities(linked_entities: Dict[str, Any]) -> bool:
             for item in items
         )
 
-    return has_binding(linked_entities.get("metrics")) or has_binding(
-        linked_entities.get("dimensions")
+    filters = linked_entities.get("filters")
+    has_filter_binding = isinstance(filters, dict) and any(
+        isinstance(item, dict) and bool(item.get("table")) and bool(item.get("column"))
+        for item in filters.values()
+    )
+    return (
+        has_binding(linked_entities.get("metrics"))
+        or has_binding(linked_entities.get("dimensions"))
+        or has_filter_binding
     )

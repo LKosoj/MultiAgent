@@ -254,11 +254,12 @@ def resolve_threshold(field: str, *, env_override: Optional[str] = None) -> floa
         raw = os.getenv(env_override)
         if raw is not None and raw != "":
             try:
-                return float(raw)
+                raw_float = float(raw)
             except (TypeError, ValueError) as exc:
                 raise ValueError(
                     f"{env_override} must be a float, got {raw!r}"
                 ) from exc
+            return _coerce_float_threshold(raw_float, env_override)
 
     profile = load_similarity_thresholds()
     if not hasattr(profile, field):

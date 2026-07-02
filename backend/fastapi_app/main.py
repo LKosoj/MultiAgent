@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import logging
+import uuid
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -14,6 +15,7 @@ from fastapi.responses import StreamingResponse
 
 from logging_setup import setup_comprehensive_logging
 
+from backend.fastapi_app.agui.auth import Principal, authenticate_request
 from backend.fastapi_app.agui.encoder import EventEncoder
 from backend.fastapi_app.agui.events import EventType
 from backend.fastapi_app.agui.models import RunAgentInput
@@ -59,11 +61,13 @@ async def healthz() -> dict[str, str]:
 
 @app.post("/agent")
 async def agent_endpoint(input_data: RunAgentInput, request: Request) -> StreamingResponse:
+    principal = authenticate_request(request)
+    input_data = _with_server_run_id(input_data)
     accept_header = request.headers.get("accept")
     encoder = run_manager.encoder(accept_header)
 
     try:
-        info = await run_manager.start_run(input_data)
+        info = await run_manager.start_run(input_data, principal=principal)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -75,8 +79,10 @@ async def agent_endpoint(input_data: RunAgentInput, request: Request) -> Streami
 
 @app.post("/v1/runs")
 async def create_run(input_data: RunAgentInput, request: Request) -> dict[str, str]:
+    principal = authenticate_request(request)
+    input_data = _with_server_run_id(input_data)
     try:
-        info = await run_manager.start_run(input_data)
+        info = await run_manager.start_run(input_data, principal=principal)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -99,6 +105,19 @@ _AGUI_EVENT_TYPES = {event_type.value for event_type in EventType}
 
 def _redact_gateway_payload(payload):
     return redact_pii_in_payload(_redact_payload(payload))
+
+
+def _new_run_id() -> str:
+    return f"run-{uuid.uuid4().hex[:16]}"
+
+
+def _with_server_run_id(input_data: RunAgentInput) -> RunAgentInput:
+    return input_data.model_copy(update={"run_id": _new_run_id()})
+
+
+def _ensure_run_access(run_id: str, principal: Principal) -> None:
+    if not run_manager.can_access(run_id, principal):
+        raise HTTPException(status_code=404, detail="run not found")
 
 
 async def _cancel_if_orphaned(run_id: str) -> None:
@@ -141,6 +160,8 @@ async def replay_events(
     after: int = 0,
     follow: bool = True,
 ) -> StreamingResponse:
+    principal = authenticate_request(request)
+    _ensure_run_access(run_id, principal)
     accept_header = request.headers.get("accept")
     encoder = EventEncoder(accept=accept_header)
     info = run_manager.get_info(run_id)
@@ -178,7 +199,9 @@ async def replay_events_v1(
 
 
 @app.get("/agent/{run_id}")
-async def run_status(run_id: str) -> dict[str, str | int | None]:
+async def run_status(run_id: str, request: Request) -> dict[str, str | int | None]:
+    principal = authenticate_request(request)
+    _ensure_run_access(run_id, principal)
     info = run_manager.get_info(run_id)
     if info is None:
         raise HTTPException(status_code=404, detail="run not found")
@@ -192,21 +215,21 @@ async def run_status(run_id: str) -> dict[str, str | int | None]:
 
 
 @app.get("/v1/runs/{run_id}", name="v1_run_status")
-async def run_status_v1(run_id: str) -> dict[str, str | int | None]:
-    info = run_manager.get_info(run_id)
-    if info is None:
-        raise HTTPException(status_code=404, detail="run not found")
+async def run_status_v1(run_id: str, request: Request) -> dict[str, str | int | None]:
+    status_payload = await run_status(run_id=run_id, request=request)
     return {
-        "runId": info.run_id,
-        "threadId": info.thread_id,
-        "status": info.status.value,
-        "startedAtMs": info.started_at_ms,
-        "finishedAtMs": info.finished_at_ms,
+        "runId": status_payload["run_id"],
+        "threadId": status_payload["thread_id"],
+        "status": status_payload["status"],
+        "startedAtMs": status_payload["started_at_ms"],
+        "finishedAtMs": status_payload["finished_at_ms"],
     }
 
 
 @app.post("/agent/{run_id}/cancel")
-async def cancel_run(run_id: str) -> dict[str, bool]:
+async def cancel_run(run_id: str, request: Request) -> dict[str, bool]:
+    principal = authenticate_request(request)
+    _ensure_run_access(run_id, principal)
     cancelled = await run_manager.cancel(run_id)
     if not cancelled:
         info = run_manager.get_info(run_id)
@@ -216,12 +239,14 @@ async def cancel_run(run_id: str) -> dict[str, bool]:
 
 
 @app.post("/v1/runs/{run_id}/cancel", name="v1_run_cancel")
-async def cancel_run_v1(run_id: str) -> dict[str, bool]:
-    return await cancel_run(run_id=run_id)
+async def cancel_run_v1(run_id: str, request: Request) -> dict[str, bool]:
+    return await cancel_run(run_id=run_id, request=request)
 
 
 @app.get("/v1/runs/{run_id}/result", name="v1_run_result")
-async def run_result_v1(run_id: str) -> dict[str, object | None]:
+async def run_result_v1(run_id: str, request: Request) -> dict[str, object | None]:
+    principal = authenticate_request(request)
+    _ensure_run_access(run_id, principal)
     latest_result = None
     latest_service_result = None
     latest_workflow_result = None

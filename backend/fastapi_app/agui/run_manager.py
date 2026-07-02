@@ -9,6 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
+from .auth import Principal, principal_context, system_principal_for_disabled_mode
 from .encoder import EventEncoder
 from .events import BaseEvent, RunErrorEvent, EventType
 from .models import RunAgentInput
@@ -63,6 +64,7 @@ def is_terminal_event(event: BaseEvent) -> bool:
 class RunInfo:
     run_id: str
     thread_id: str
+    principal: Principal
     status: RunStatus
     started_at_ms: int
     finished_at_ms: Optional[int] = None
@@ -102,7 +104,12 @@ class RunManager:
             del self._runs[run_id]
         return len(to_delete)
 
-    async def start_run(self, input_data: RunAgentInput) -> RunInfo:
+    async def start_run(
+        self,
+        input_data: RunAgentInput,
+        principal: Optional[Principal] = None,
+    ) -> RunInfo:
+        principal = principal or system_principal_for_disabled_mode()
         async with self._lock:
             self._evict_stale()
             if input_data.run_id in self._runs:
@@ -112,9 +119,11 @@ class RunManager:
             info = RunInfo(
                 run_id=input_data.run_id,
                 thread_id=input_data.thread_id,
+                principal=principal,
                 status=RunStatus.PENDING,
                 started_at_ms=int(time.time() * 1000),
             )
+            self._store.record_run(input_data.run_id, input_data.thread_id, principal)
             task = asyncio.create_task(self._execute_run(input_data, info))
             info.task = task
             self._runs[input_data.run_id] = info
@@ -124,10 +133,11 @@ class RunManager:
         info.status = RunStatus.RUNNING
         terminal_status = RunStatus.FINISHED
         try:
-            async for event in run_agent(input_data):
-                await self._publish_event(info.run_id, event)
-                if event.type == EventType.RUN_ERROR:
-                    terminal_status = RunStatus.ERRORED
+            with principal_context(info.principal):
+                async for event in run_agent(input_data):
+                    await self._publish_event(info.run_id, event)
+                    if event.type == EventType.RUN_ERROR:
+                        terminal_status = RunStatus.ERRORED
         except asyncio.CancelledError:
             terminal_status = RunStatus.CANCELLED
             await self._publish_event(
@@ -293,6 +303,15 @@ class RunManager:
 
     def get_info(self, run_id: str) -> Optional[RunInfo]:
         return self._runs.get(run_id)
+
+    def can_access(self, run_id: str, principal: Principal) -> bool:
+        info = self._runs.get(run_id)
+        if info is not None:
+            return principal.can_access(info.principal)
+        owner = self._store.get_run_principal(run_id)
+        if owner is not None:
+            return principal.can_access(owner)
+        return self._store.latest_seq(run_id) is not None and principal.has_role("admin")
 
     def encoder(self, accept: Optional[str]) -> EventEncoder:
         return EventEncoder(accept=accept)

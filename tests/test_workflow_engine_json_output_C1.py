@@ -378,6 +378,82 @@ def test_on_step_completed_flattens_after_json_parse(workflow_pkg, monkeypatch):
     assert context.step_outputs["verifier.recommendations"] == "fix it"
 
 
+def test_on_step_completed_normalizes_stringified_sql_generation_response(workflow_pkg):
+    engine_module = workflow_pkg.engine
+    models = workflow_pkg.models
+
+    engine = object.__new__(engine_module.WorkflowEngine)
+
+    class _StubStateManager:
+        async def save_checkpoint(self, **kwargs):
+            return None
+
+    engine.state_manager = _StubStateManager()
+
+    step = models.WorkflowStep(
+        id="sql_generation",
+        task="t",
+        agent_type="sql_generator_agent",
+        output_schema="json_object",
+        output_schema_requirements={"required": ["sql", "description"]},
+    )
+    raw = (
+        '{"sql": "SELECT c.name, SUM(o.amount) AS total '
+        'FROM customers c JOIN orders o ON o.customer_id = c.id '
+        'GROUP BY c.name", "description": "Revenue by customer"}'
+    )
+    step_result = models.StepResult(
+        step_id="sql_generation",
+        status=models.StepStatus.COMPLETED,
+        output=raw,
+    )
+    context = models.WorkflowContext(workflow_id="wf-sql")
+
+    asyncio.run(
+        engine._on_step_completed("wf-sql", step, step_result, context, {})
+    )
+
+    assert step_result.output["sql"].startswith("SELECT c.name")
+    assert context.step_outputs["sql_generation.sql"] == step_result.output["sql"]
+    assert context.step_outputs["sql_generation.description"] == "Revenue by customer"
+
+
+def test_on_step_completed_fails_sql_generation_invalid_json_string(workflow_pkg):
+    engine_module = workflow_pkg.engine
+    models = workflow_pkg.models
+
+    engine = object.__new__(engine_module.WorkflowEngine)
+
+    class _StubStateManager:
+        async def save_checkpoint(self, **kwargs):
+            return None
+
+    engine.state_manager = _StubStateManager()
+
+    step = models.WorkflowStep(
+        id="sql_generation",
+        task="t",
+        agent_type="sql_generator_agent",
+        output_schema="json_object",
+        output_schema_requirements={"required": ["sql", "description"]},
+    )
+    step_result = models.StepResult(
+        step_id="sql_generation",
+        status=models.StepStatus.COMPLETED,
+        output='{"sql": "SELECT 1", "description": ',
+    )
+    context = models.WorkflowContext(workflow_id="wf-sql")
+
+    with pytest.raises(models.WorkflowStepError) as ei:
+        asyncio.run(
+            engine._on_step_completed("wf-sql", step, step_result, context, {})
+        )
+
+    msg = str(ei.value)
+    assert "sql_generation" in msg
+    assert "output is not valid JSON" in msg
+
+
 def test_parallel_step_wrapper_passes_shared_step_results_to_checkpoint(workflow_pkg):
     engine_module = workflow_pkg.engine
     models = workflow_pkg.models

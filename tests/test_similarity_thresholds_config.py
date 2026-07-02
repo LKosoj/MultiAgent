@@ -167,6 +167,17 @@ def test_resolve_threshold_env_invalid_float(monkeypatch):
         )
 
 
+@pytest.mark.parametrize("raw", ["-0.01", "1.01"])
+def test_resolve_threshold_env_out_of_range(monkeypatch, raw):
+    """S-1: env-override must pass the same [0,1] invariant as yaml values."""
+    monkeypatch.setenv("SCHEMA_TABLE_MIN_SCORE", raw)
+
+    with pytest.raises(ValueError, match="SCHEMA_TABLE_MIN_SCORE"):
+        stc.resolve_threshold(
+            "schema_linking_min_score", env_override="SCHEMA_TABLE_MIN_SCORE"
+        )
+
+
 def test_resolve_threshold_unknown_field():
     with pytest.raises(KeyError, match="unknown field"):
         stc.resolve_threshold("no_such_field")

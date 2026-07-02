@@ -5,7 +5,7 @@ SQL Safety валидатор и метрики sqlglot.
 - ``_LiteralMasker`` — stateless маскировка строковых литералов и
   quoted-идентификаторов.
 - ``_RegexValidator`` — regex-проверки (forbidden keywords/functions,
-  IN-список в legacy-режиме, EXPLAIN ANALYZE, комментарии).
+  совместимые helper'ы для IN-списков, EXPLAIN ANALYZE, комментариев).
 - ``_SqlglotValidator`` — AST-проверки через sqlglot (структура стейтмента,
   EXPLAIN ANALYZE на AST-уровне, IN-списки на AST, корневой select/CTE).
 - ``SQLSafetyValidator`` — публичный фасад. Сохраняет ВЕСЬ исторический
@@ -45,7 +45,6 @@ from ..dialects import (
     double_quote_is_string,
     get_current_dialect_name,
     get_sqlglot_dialect,
-    is_sqlglot_enabled,
 )
 
 # Простые метрики для мониторинга. Мутации защищены _SQLGLOT_METRICS_LOCK,
@@ -124,6 +123,28 @@ def _set_operation_classes() -> tuple:
             getattr(exp, name, None) for name in ("Union", "Intersect", "Except")
         ) if cls is not None
     )
+
+
+def _statement_has_select_into(stmt) -> bool:
+    """True if any SELECT node in stmt tree has an INTO side-effect clause."""
+    if exp is None or stmt is None:
+        return False
+
+    select_nodes = []
+    if isinstance(stmt, exp.Select):
+        select_nodes.append(stmt)
+    try:
+        select_nodes.extend(stmt.find_all(exp.Select))
+    except Exception:
+        pass
+
+    for select in select_nodes:
+        try:
+            if select.args.get("into") is not None:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def _parse_with_timeout(sql_query: str, dialect: str | None, timeout_sec: float):
@@ -338,9 +359,9 @@ class _LiteralMasker:
         regex-слой защиты.
         """
         if sqlglot is None:
-            # USE_SQLGLOT=0 в legacy не вызывает эту функцию. Здесь это
-            # означает, что sqlglot недоступен — отдаём исходную строку
-            # как есть, чтобы regex по крайней мере работал.
+            # Если sqlglot недоступен, отдаём исходную строку как есть:
+            # итоговый validator ниже всё равно fail-closed вернёт
+            # SQLGLOT_UNAVAILABLE.
             return sql_query
         from sqlglot.dialects.dialect import Dialect
         from sqlglot.tokens import TokenType
@@ -392,6 +413,41 @@ class _LiteralMasker:
                 buf[idx] = " "
         return "".join(buf)
 
+    @staticmethod
+    def mask_quoted_identifiers_via_lex(sql_query: str, dialect: str | None) -> str:
+        """Маскирует только quoted identifiers, не трогая bare function names."""
+        if sqlglot is None:
+            return sql_query
+        from sqlglot.dialects.dialect import Dialect
+        from sqlglot.tokens import TokenType
+
+        from ..dialects import SQLGLOT_DIALECT_MAPPING
+
+        dialect_key = (dialect or "").lower() or None
+        sqlglot_dialect = SQLGLOT_DIALECT_MAPPING.get(dialect_key, "ansi")
+        get_or_raise_arg = "" if sqlglot_dialect == "ansi" else sqlglot_dialect
+        tokenizer_cls = Dialect.get_or_raise(get_or_raise_arg).tokenizer_class
+        try:
+            tokens = tokenizer_cls().tokenize(sql_query)
+        except _SqlglotTokenError as e:
+            logger.warning(
+                "sqlglot tokenize failed in mask_quoted_identifiers_via_lex: %s; sql=%r",
+                _redact_safety_value(e),
+                _redact_safety_value(sql_query[:200]),
+            )
+            return sql_query
+
+        buf = list(sql_query)
+        n = len(sql_query)
+        for tok in tokens:
+            if tok.token_type != TokenType.IDENTIFIER:
+                continue
+            start = max(0, int(tok.start))
+            end = min(n - 1, int(tok.end))
+            for idx in range(start, end + 1):
+                buf[idx] = " "
+        return "".join(buf)
+
 
 # =====================================================================
 # REGEX VALIDATION  (internal helper, decomposition candidate)
@@ -422,13 +478,14 @@ class _RegexValidator:
 
         Покрывает:
         - EXPLAIN ANALYZE SELECT ...
+        - EXPLAIN ANALYSE SELECT ...
         - EXPLAIN (ANALYZE) SELECT ...
         - EXPLAIN (ANALYZE, BUFFERS) SELECT ...
         - EXPLAIN (FORMAT JSON, ANALYZE TRUE) SELECT ...
         """
         return bool(
             re.match(
-                r"^\s*EXPLAIN\s*(?:\(.*?\bANALYZE\b.*?\)|ANALYZE\b)",
+                r"^\s*EXPLAIN\s*(?:\(.*?\bANALY[ZS]E\b.*?\)|ANALY[ZS]E\b)",
                 upper_sql,
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -443,7 +500,14 @@ class _RegexValidator:
         """
         found = False
         for forbidden_keyword in self.forbidden_keywords:
-            if re.search(fr"\b{re.escape(forbidden_keyword)}\b", upper_sql):
+            keyword = forbidden_keyword.strip().upper()
+            if not keyword:
+                continue
+            if keyword == "REPLACE":
+                pattern = r"(?:^|;)\s*REPLACE\b"
+            else:
+                pattern = fr"\b{re.escape(keyword)}\b"
+            if re.search(pattern, upper_sql):
                 issues.append({
                     "issue_type": "FORBIDDEN_STATEMENT",
                     "description": f"Forbidden SQL keyword '{forbidden_keyword}' detected."
@@ -454,15 +518,21 @@ class _RegexValidator:
     def check_forbidden_functions(
         self, upper_sql: str, issues: List[Dict[str, Any]]
     ) -> bool:
-        """Проверяет forbidden_functions (multi-word patterns). Возвращает True, если найдено."""
+        """Проверяет forbidden_functions как constructs, не как bare identifiers."""
         found = False
         for forbidden_function in self.forbidden_functions:
-            # multi-word конструкции (например "into outfile") матчим как
-            # последовательность слов с произвольным whitespace между ними.
-            tokens = forbidden_function.strip().upper().split()
+            fn = forbidden_function.strip().upper()
+            tokens = fn.split()
             if not tokens:
                 continue
-            pattern = r"\b" + r"\s+".join(re.escape(t) for t in tokens) + r"\b"
+            if len(tokens) > 1:
+                pattern = r"\b" + r"\s+".join(re.escape(t) for t in tokens) + r"\b"
+            elif "." in fn:
+                pattern = r"\b" + r"\s*\.\s*".join(
+                    re.escape(part) for part in fn.split(".") if part
+                ) + r"\b"
+            else:
+                pattern = fr"\b{re.escape(fn)}\s*\("
             if re.search(pattern, upper_sql):
                 issues.append({
                     "issue_type": "FORBIDDEN_FUNCTION",
@@ -474,16 +544,15 @@ class _RegexValidator:
         return found
 
     def check_in_lists(self, masked_query: str, issues: List[Dict[str, Any]]) -> None:
-        """Проверяет размер IN-списков regex-эвристикой (legacy USE_SQLGLOT=0).
+        """Проверяет размер IN-списков regex-эвристикой.
 
-        ВНИМАНИЕ: legacy regex-режим небезопасен с nested parens внутри IN
+        ВНИМАНИЕ: regex-эвристика небезопасна с nested parens внутри IN
         (например ``IN ((SELECT ...))`` или ``IN (func(a, b), c)``): regex
-        ``([^)]*)`` обрывается на первой закрывающей скобке. Этот путь
-        должен быть удалён в будущем; в production он по умолчанию заблокирован
-        в :meth:`SQLSafetyValidator.validate` (см. SQL_SAFETY_ALLOW_LEGACY).
+        ``([^)]*)`` обрывается на первой закрывающей скобке.
 
-        Используется только в legacy-пути; sqlglot-маршрут считает IN-списки
-        через AST в :meth:`_SqlglotValidator.validate_statement_ast` (EPIC 2.6).
+        Runtime sqlglot-маршрут считает IN-списки через AST в
+        :meth:`_SqlglotValidator.validate_statement_ast` (EPIC 2.6). Этот
+        helper оставлен для backward-compatible protected API и тестов.
 
         EPIC 2.8: накапливаем все нарушения IN-list, без early break.
         Fail-fast: ошибки regex не глушим — логируем warning и пробрасываем
@@ -530,7 +599,7 @@ class _RegexValidator:
         должен видеть оригинальный текст (после маскировки строк, но не
         после lex-маскировки идентификаторов).
 
-        Fallback (USE_SQLGLOT=0 или sqlglot недоступен): word-boundary regex.
+        Fallback при недоступном sqlglot: word-boundary regex.
         ``r'(^|\\s|;|\\))--'`` — чтобы выражения вида ``-2 - -1`` не
         считались комментарием (там после ``-`` идёт число, а перед — пробел и
         ``-``, но не word-граница), плюс ``r'/\\*'`` для блочных.
@@ -573,8 +642,8 @@ class _RegexValidator:
                 return True
             return False
 
-        # Legacy fallback (USE_SQLGLOT=0 и sqlglot отсутствует одновременно
-        # маловероятно, но явный путь предусмотрим).
+        # Fallback при недоступном sqlglot: validator позже fail-closed
+        # вернёт SQLGLOT_UNAVAILABLE, но комментарии всё ещё можно обнаружить.
         if re.search(r'(^|\s|;|\))--', masked_query):
             return True
         if re.search(r'/\*', masked_query):
@@ -604,8 +673,8 @@ class _SqlglotValidator:
         self.ast_forbidden_stmt_classes: Tuple[str, ...] = tuple(ast_forbidden_stmt_classes)
         self.ast_forbidden_command_words: FrozenSet[str] = frozenset(ast_forbidden_command_words)
         self.max_in_list_size = max_in_list_size
-        # W7-T4/T5: legacy-путь `is_valid_select_or_cte` (regex fallback при
-        # USE_SQLGLOT=0 или ImportError sqlglot) использует forbidden_keywords,
+        # W7-T4/T5: protected regex fallback в `is_valid_select_or_cte`
+        # использует forbidden_keywords,
         # чтобы блокировать DML/DDL внутри `WITH ... <statement>`. Раньше
         # список был захардкожен прямо в методе — нарушение AGENTS.md (хардкод
         # бизнес-логики в QA-слое). Теперь читаем из safety.yaml-профиля.
@@ -647,7 +716,7 @@ class _SqlglotValidator:
         payload = str(expression) if expression is not None else str(stmt)
         return bool(
             re.search(
-                r"^\s*\(.*?\bANALYZE\b.*?\)|^\s*ANALYZE\b",
+                r"^\s*\(.*?\bANALY[ZS]E\b.*?\)|^\s*ANALY[ZS]E\b",
                 payload.upper(),
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -789,18 +858,17 @@ class _SqlglotValidator:
             })
             return
 
+        if _statement_has_select_into(stmt):
+            issues.append({
+                "issue_type": "FORBIDDEN_STATEMENT",
+                "description": "SELECT ... INTO is not allowed (creates table/file).",
+            })
+
         set_op_classes = _set_operation_classes()
         # Проверяем, что это разрешенный тип стейтмента
         if isinstance(stmt, exp.Select):
-            # Фикс #2: SELECT ... INTO newtable создаёт таблицу (PG/MSSQL).
-            # stmt.args.get('into') непуст при наличии INTO-клаузы.
-            into_node = stmt.args.get("into")
-            if into_node is not None:
-                issues.append({
-                    "issue_type": "FORBIDDEN_STATEMENT",
-                    "description": "SELECT ... INTO is not allowed (creates table/file).",
-                })
             # Простой SELECT без INTO - разрешен; продолжаем проверку IN-списков и функций
+            pass
         elif set_op_classes and isinstance(stmt, set_op_classes):
             # Set-операции (UNION/UNION ALL/INTERSECT/EXCEPT) — рекурсивно
             # валидируем обе ветки. Если дочерний узел не SELECT/With/Union —
@@ -922,8 +990,8 @@ class _SqlglotValidator:
         от `WITH ... DELETE/UPDATE/INSERT` и не ломаться на `;` внутри
         строковых литералов. Для парсинга используется `original_query` (если
         передан), потому что замаскированные литералы могут стать
-        синтаксически невалидными. Для legacy-режима (USE_SQLGLOT=0), когда
-        sqlglot недоступен, остаётся консервативная regex-эвристика по
+        синтаксически невалидными. Когда sqlglot недоступен, остаётся
+        консервативная regex-эвристика по
         masked_query — список запрещённых ключевых слов берётся из
         ``self.forbidden_keywords`` (safety.yaml профиль), без хардкода
         (W7-T4/T5, AGENTS.md).
@@ -969,20 +1037,12 @@ class _SqlglotValidator:
                 return False
 
             stmt = stmts[0]
+            if _statement_has_select_into(stmt):
+                return False
             set_op_classes = _set_operation_classes()
             # WITH ... SELECT обычно парсится как exp.Select с args['with'];
             # exp.With в корне возможен для отдельных диалектов/форм.
             if isinstance(stmt, exp.Select):
-                # Фикс #2: SELECT ... INTO newtable создаёт таблицу/файл
-                # (PG/MSSQL) — это DDL side-effect, а не read-only SELECT.
-                # validate_statement_ast ловит это на AST-пути forbidden-проверок
-                # (USE_SQLGLOT=1). Здесь — независимая проверка внутри
-                # is_valid_select_or_cte: она гейтится на SQLGLOT_AVAILABLE (см.
-                # выше), поэтому закрывает тот же провал и при USE_SQLGLOT=0, когда
-                # AST-проверка forbidden-конструкций не запускается, лишь бы
-                # sqlglot был установлен для парсинга.
-                if stmt.args.get("into") is not None:
-                    return False
                 return True
             if set_op_classes and isinstance(stmt, set_op_classes):
                 # UNION/UNION ALL/INTERSECT/EXCEPT — это set-операции над SELECT,
@@ -992,8 +1052,6 @@ class _SqlglotValidator:
             if isinstance(stmt, exp.With):
                 inner = getattr(stmt, "this", None)
                 if isinstance(inner, exp.Select):
-                    if inner.args.get("into") is not None:
-                        return False
                     return True
                 if set_op_classes and isinstance(inner, set_op_classes):
                     return True
@@ -1190,46 +1248,6 @@ class SQLSafetyValidator:
                 }]
             }
 
-        # USE_SQLGLOT=0 - явный legacy mode, не silent fallback.
-        if not is_sqlglot_enabled():
-            # Legacy regex-режим небезопасен с nested parens в IN-списках и
-            # должен быть удалён в будущем. В production по умолчанию режим
-            # отключён hard-fail'ом; поднять флаг SQL_SAFETY_ALLOW_LEGACY=1
-            # можно только осознанно.
-            # Всегда логируем WARNING при USE_SQLGLOT=0, независимо от среды,
-            # чтобы некорректная конфигурация была видна (M119).
-            logger.warning(
-                "SQL safety: USE_SQLGLOT=0 — legacy regex-only validation is active; "
-                "AST-проверки отключены. Рекомендуется USE_SQLGLOT=1 в production."
-            )
-            env_name = (
-                os.getenv("ENV") or os.getenv("APP_ENV") or ""
-            ).strip().lower()
-            if env_name == "production":
-                allow_legacy = os.getenv("SQL_SAFETY_ALLOW_LEGACY", "0").strip() == "1"
-                if not allow_legacy:
-                    return {
-                        "is_safe": False,
-                        "issues": [{
-                            "issue_type": "LEGACY_VALIDATION_DISABLED",
-                            "description": (
-                                "Legacy SQL safety validation (USE_SQLGLOT=0) is disabled "
-                                "in production. Set SQL_SAFETY_ALLOW_LEGACY=1 to override."
-                            ),
-                        }],
-                    }
-                logger.warning(
-                    "SQL safety: legacy USE_SQLGLOT=0 mode allowed in production via "
-                    "SQL_SAFETY_ALLOW_LEGACY=1; regex-only validation is unsafe."
-                )
-            return self._validate_legacy(
-                q,
-                dsn=dsn,
-                _regex_snap=_regex,
-                _sqlglot_snap=_sqlglot_v,
-                _max_query_length_snap=_max_query_length,
-            )
-
         if self._sqlglot_available:
             return self._validate_with_sqlglot(
                 q,
@@ -1258,7 +1276,7 @@ class SQLSafetyValidator:
         _sqlglot_snap=None,
         _max_query_length_snap=None,
     ) -> Dict[str, Any]:
-        """Legacy read-only validation used only when sqlglot is explicitly disabled."""
+        """Backward-compatible helper; not selected by ``USE_SQLGLOT`` at runtime."""
         # Используем снапшот объектов из _validate_inner (если переданы), чтобы
         # один validate()-вызов работал с консистентной парой объектов (M25/M26/M30).
         regex = _regex_snap if _regex_snap is not None else self._regex
@@ -1288,8 +1306,11 @@ class SQLSafetyValidator:
         masked_for_regex = self._masker.mask_identifiers_via_lex(
             masked_sql, dialect_name, regex.forbidden_keywords
         )
+        masked_for_functions = self._masker.mask_quoted_identifiers_via_lex(
+            masked_sql, dialect_name
+        )
         upper_sql = masked_for_regex.upper().strip()
-        upper_for_functions = masked_sql.upper().strip()
+        upper_for_functions = masked_for_functions.upper().strip()
 
         # EPIC 2.8: накапливаем все запрещённые ключевые слова, без early break,
         # чтобы дать пользователю полную картину нарушений за один проход.
@@ -1369,8 +1390,11 @@ class SQLSafetyValidator:
         masked_for_regex = self._masker.mask_identifiers_via_lex(
             masked_sql, dialect_name, regex.forbidden_keywords
         )
+        masked_for_functions = self._masker.mask_quoted_identifiers_via_lex(
+            masked_sql, dialect_name
+        )
         upper_sql = masked_for_regex.upper().strip()
-        upper_for_functions = masked_sql.upper().strip()
+        upper_for_functions = masked_for_functions.upper().strip()
         has_forbidden_keyword = regex.check_forbidden_keywords(upper_sql, issues)
         if regex.check_forbidden_functions(upper_for_functions, issues):
             has_forbidden_keyword = True

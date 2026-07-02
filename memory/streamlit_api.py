@@ -19,6 +19,23 @@ from .models import TacticalMemoryItem, StrategicGoal
 
 logger = logging.getLogger(__name__)
 
+try:
+    from backend.fastapi_app.agui.auth import (
+        Principal,
+        anonymous_principal,
+        auth_mode,
+        current_principal_or_none,
+        normalize_session_id_for_principal,
+        system_principal_for_disabled_mode,
+    )
+except Exception:  # pragma: no cover - memory package can be used without FastAPI.
+    Principal = Any  # type: ignore[assignment]
+    anonymous_principal = None  # type: ignore[assignment]
+    auth_mode = None  # type: ignore[assignment]
+    current_principal_or_none = None  # type: ignore[assignment]
+    normalize_session_id_for_principal = None  # type: ignore[assignment]
+    system_principal_for_disabled_mode = None  # type: ignore[assignment]
+
 @dataclass
 class MemoryStatus:
     """Статус системы памяти"""
@@ -86,6 +103,16 @@ class AgentMemoryStats:
             self.entry_types = {}
 
 
+@dataclass(frozen=True)
+class _CompatPrincipal:
+    subject: str = "system"
+    tenant_id: str = "default"
+    roles: frozenset[str] = frozenset({"admin", "memory_archivist", "user"})
+
+    def has_role(self, role: str) -> bool:
+        return role in self.roles
+
+
 class MemoryRAGManager:
     """
     Менеджер для работы с Memory/RAG системой через Streamlit UI
@@ -94,6 +121,55 @@ class MemoryRAGManager:
     def __init__(self):
         self.memory_manager = memory_manager
         logger.info("🧠 MemoryRAGManager инициализирован")
+
+    def _current_principal(self, principal: Optional[Principal] = None) -> Principal:
+        if principal is not None:
+            return principal
+        if current_principal_or_none is None:
+            return _CompatPrincipal()
+        context_principal = current_principal_or_none()
+        if context_principal is not None:
+            return context_principal
+        if auth_mode is not None:
+            try:
+                if auth_mode() != "disabled" and anonymous_principal is not None:
+                    return anonymous_principal()
+            except Exception:
+                if anonymous_principal is not None:
+                    return anonymous_principal()
+        if system_principal_for_disabled_mode is not None:
+            return system_principal_for_disabled_mode()
+        return _CompatPrincipal()
+
+    def _has_role(self, principal: Principal, role: str) -> bool:
+        has_role = getattr(principal, "has_role", None)
+        if callable(has_role):
+            return bool(has_role(role))
+        return role in frozenset(getattr(principal, "roles", frozenset()))
+
+    def _can_cross_session(self, principal: Principal) -> bool:
+        return self._has_role(principal, "admin") or self._has_role(principal, "memory_archivist")
+
+    def _require_memory_archivist(self, action: str, principal: Optional[Principal] = None) -> Principal:
+        resolved = self._current_principal(principal)
+        if not self._can_cross_session(resolved):
+            raise PermissionError(f"{action} requires role: memory_archivist")
+        return resolved
+
+    def _resolve_session_filter(
+        self,
+        session_id: Optional[str],
+        action: str,
+        principal: Optional[Principal] = None,
+    ) -> Optional[str]:
+        resolved = self._current_principal(principal)
+        if self._can_cross_session(resolved):
+            return session_id
+        if not session_id:
+            raise PermissionError(f"{action} requires session_id or role: memory_archivist")
+        if normalize_session_id_for_principal is None:
+            return session_id
+        return normalize_session_id_for_principal(session_id, resolved)
 
     @property
     def db_handler(self) -> DatabaseHandler:
@@ -198,7 +274,7 @@ class MemoryRAGManager:
                 error_message=str(e)
             )
 
-    def rebuild_memory(self, force: bool = False) -> MemoryRebuildResult:
+    def rebuild_memory(self, force: bool = False, principal: Optional[Principal] = None) -> MemoryRebuildResult:
         """
         Перестроить векторный индекс ChromaDB из данных SQLite
         
@@ -212,6 +288,8 @@ class MemoryRAGManager:
         result = MemoryRebuildResult(success=False)
         
         try:
+            self._require_memory_archivist("memory rebuild", principal)
+
             # Проверяем состояние системы
             status = self.get_memory_status()
             
@@ -265,7 +343,8 @@ class MemoryRAGManager:
                      memory_type: str = "tactical",
                      limit: int = 10,
                      session_id: Optional[str] = None,
-                     agent_name: Optional[str] = None) -> MemorySearchResult:
+                     agent_name: Optional[str] = None,
+                     principal: Optional[Principal] = None) -> MemorySearchResult:
         """
         Поиск в памяти по семантическому запросу
         
@@ -283,6 +362,8 @@ class MemoryRAGManager:
         result = MemorySearchResult(query=query, memory_type=memory_type)
         
         try:
+            session_id = self._resolve_session_filter(session_id, "memory search", principal)
+
             # Проверяем доступность ChromaDB
             status = self.get_memory_status()
             if not status.chromadb_available:
@@ -413,7 +494,12 @@ class MemoryRAGManager:
 
         return formatted_results
 
-    def get_agent_memory_stats(self, agent_name: str, session_id: str) -> AgentMemoryStats:
+    def get_agent_memory_stats(
+        self,
+        agent_name: str,
+        session_id: str,
+        principal: Optional[Principal] = None,
+    ) -> AgentMemoryStats:
         """
         Получить статистику памяти конкретного агента
         
@@ -424,6 +510,7 @@ class MemoryRAGManager:
         Returns:
             Объект AgentMemoryStats со статистикой
         """
+        session_id = self._resolve_session_filter(session_id, "agent memory stats", principal)
         stats = AgentMemoryStats(agent_name=agent_name, session_id=session_id)
         
         try:
@@ -497,7 +584,7 @@ class MemoryRAGManager:
         
         return stats
 
-    def get_active_agents(self) -> List[Dict[str, Any]]:
+    def get_active_agents(self, principal: Optional[Principal] = None) -> List[Dict[str, Any]]:
         """
         Получить список агентов с активной памятью
         
@@ -505,6 +592,7 @@ class MemoryRAGManager:
             Список агентов с полной статистикой
         """
         agents = []
+        self._require_memory_archivist("active agents", principal)
         
         try:
             status = self.get_memory_status()
@@ -578,7 +666,8 @@ class MemoryRAGManager:
         return agents
 
     def clear_agent_memory(self, agent_name: str, session_id: str, 
-                          confirm: bool = False) -> Dict[str, Any]:
+                          confirm: bool = False,
+                          principal: Optional[Principal] = None) -> Dict[str, Any]:
         """
         Очистить память конкретного агента
         
@@ -597,6 +686,8 @@ class MemoryRAGManager:
             }
         
         try:
+            self._require_memory_archivist("clear agent memory", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {
@@ -669,7 +760,11 @@ class MemoryRAGManager:
                 "error": str(e)
             }
 
-    def clear_agent_memory_all_sessions(self, agent_name: str) -> Dict[str, Any]:
+    def clear_agent_memory_all_sessions(
+        self,
+        agent_name: str,
+        principal: Optional[Principal] = None,
+    ) -> Dict[str, Any]:
         """
         Очистить всю память конкретного агента во всех сессиях.
 
@@ -680,6 +775,11 @@ class MemoryRAGManager:
             dict с ключами success, deleted_sqlite, deleted_chroma, sessions_cleared, error
         """
         try:
+            resolved_principal = self._require_memory_archivist(
+                "clear agent memory across sessions",
+                principal,
+            )
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {"success": False, "error": "SQLite база данных недоступна"}
@@ -699,7 +799,12 @@ class MemoryRAGManager:
             total_sqlite = 0
             total_chroma = 0
             for sid in sessions:
-                res = self.clear_agent_memory(agent_name, sid, confirm=True)
+                res = self.clear_agent_memory(
+                    agent_name,
+                    sid,
+                    confirm=True,
+                    principal=resolved_principal,
+                )
                 if res.get("success"):
                     total_sqlite += res.get("deleted_count", 0)
                     total_chroma += res.get("chromadb_deleted", 0)
@@ -718,7 +823,7 @@ class MemoryRAGManager:
             logger.error("Ошибка очистки памяти агента %s: %s", agent_name, e)
             return {"success": False, "error": str(e)}
 
-    def clear_all_memory(self) -> Dict[str, Any]:
+    def clear_all_memory(self, principal: Optional[Principal] = None) -> Dict[str, Any]:
         """
         Полная очистка всей памяти системы (все сессии, тактическая + стратегическая).
 
@@ -726,6 +831,8 @@ class MemoryRAGManager:
             dict с ключами success, sessions_cleared, deleted_sqlite, deleted_chroma, error
         """
         try:
+            self._require_memory_archivist("clear all memory", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {"success": False, "error": "SQLite база данных недоступна"}
@@ -789,7 +896,11 @@ class MemoryRAGManager:
             logger.error("Ошибка полной очистки памяти: %s", e)
             return {"success": False, "error": str(e)}
 
-    def clear_old_memories(self, days_to_keep: int) -> Dict[str, Any]:
+    def clear_old_memories(
+        self,
+        days_to_keep: int,
+        principal: Optional[Principal] = None,
+    ) -> Dict[str, Any]:
         """
         Удалить записи тактической памяти старше (now - days_to_keep) дней.
 
@@ -800,6 +911,8 @@ class MemoryRAGManager:
             dict с ключами success, deleted_sqlite, deleted_chroma, cutoff, error
         """
         try:
+            self._require_memory_archivist("clear old memories", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {"success": False, "error": "SQLite база данных недоступна"}
@@ -815,14 +928,18 @@ class MemoryRAGManager:
 
                 # Получаем ID для ChromaDB перед удалением
                 cursor.execute(
-                    "SELECT session_id, agent_name, step FROM agent_memory WHERE valid_from < ?",
+                    """
+                    SELECT session_id, agent_name, step
+                    FROM agent_memory
+                    WHERE valid_to IS NOT NULL AND valid_to < ?
+                    """,
                     (cutoff,),
                 )
                 rows = cursor.fetchall()
                 chroma_ids = [f"{r[0]}-{r[1]}-{r[2]}" for r in rows]
 
                 cursor.execute(
-                    "DELETE FROM agent_memory WHERE valid_from < ?",
+                    "DELETE FROM agent_memory WHERE valid_to IS NOT NULL AND valid_to < ?",
                     (cutoff,),
                 )
                 deleted_sqlite = cursor.rowcount
@@ -857,7 +974,7 @@ class MemoryRAGManager:
             logger.error("Ошибка удаления старых записей: %s", e)
             return {"success": False, "error": str(e)}
 
-    def vacuum_database(self) -> Dict[str, Any]:
+    def vacuum_database(self, principal: Optional[Principal] = None) -> Dict[str, Any]:
         """
         Выполнить VACUUM на SQLite-базе данных памяти.
 
@@ -865,6 +982,8 @@ class MemoryRAGManager:
             dict с ключами success, size_before_mb, size_after_mb, error
         """
         try:
+            self._require_memory_archivist("vacuum memory database", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {"success": False, "error": "SQLite база данных недоступна"}
@@ -895,7 +1014,11 @@ class MemoryRAGManager:
             logger.error("Ошибка VACUUM: %s", e)
             return {"success": False, "error": str(e)}
 
-    def get_temporal_stats(self, days: Optional[int] = 7) -> Dict[str, Any]:
+    def get_temporal_stats(
+        self,
+        days: Optional[int] = 7,
+        principal: Optional[Principal] = None,
+    ) -> Dict[str, Any]:
         """
         Агрегаты активности памяти по дням (реальные данные из SQLite).
 
@@ -905,6 +1028,7 @@ class MemoryRAGManager:
         Returns:
             dict с ключами success, rows (list of {date, tactical, strategic}), error
         """
+        self._require_memory_archivist("memory temporal stats", principal)
         try:
             status = self.get_memory_status()
             if not status.sqlite_available:
@@ -958,7 +1082,11 @@ class MemoryRAGManager:
             logger.error("Ошибка temporal stats: %s", e)
             return {"success": False, "error": str(e)}
 
-    def import_memory_records(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def import_memory_records(
+        self,
+        records: List[Dict[str, Any]],
+        principal: Optional[Principal] = None,
+    ) -> Dict[str, Any]:
         """
         Импортировать записи тактической памяти из списка dict.
 
@@ -969,6 +1097,8 @@ class MemoryRAGManager:
             dict с ключами success, imported, skipped, errors
         """
         try:
+            self._require_memory_archivist("memory import", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {"success": False, "error": "SQLite база данных недоступна"}
@@ -1029,7 +1159,8 @@ class MemoryRAGManager:
 
     def export_memory(self, agent_name: Optional[str] = None,
                      session_id: Optional[str] = None,
-                     format: str = "json") -> Dict[str, Any]:
+                     format: str = "json",
+                     principal: Optional[Principal] = None) -> Dict[str, Any]:
         """
         Экспортировать данные памяти
         
@@ -1042,6 +1173,8 @@ class MemoryRAGManager:
             Экспортированные данные
         """
         try:
+            session_id = self._resolve_session_filter(session_id, "memory export", principal)
+
             status = self.get_memory_status()
             if not status.sqlite_available:
                 return {

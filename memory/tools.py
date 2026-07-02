@@ -10,8 +10,11 @@
 import json
 import logging
 import os
+import sqlite3
+import contextlib
+import contextvars
 from typing import Dict, List, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from smolagents import tool
 from smolagents.models import ChatMessage, MessageRole
 import re
@@ -19,32 +22,51 @@ from collections import Counter
 import math
 from agent_command import model_summary, model_big
 from utils import call_openai_api, get_text_topic_relevance_score
+from custom_tools.text_to_sql.schema_memory_chroma import (
+    _distance_to_similarity,
+    _resolve_chroma_metric,
+)
 from .manager import build_json_data_like_predicate, memory_manager
 from .models import TacticalMemoryItem, StrategicGoal, SystemContext
 
 logger = logging.getLogger(__name__)
+_MEMORY_REQUESTING_AGENT: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "memory_requesting_agent",
+    default=None,
+)
+
+
+@contextlib.contextmanager
+def memory_requester_context(agent_name: str):
+    token = _MEMORY_REQUESTING_AGENT.set(agent_name)
+    try:
+        yield
+    finally:
+        _MEMORY_REQUESTING_AGENT.reset(token)
+
+
+def _resolve_requesting_agent(requesting_agent: str | None) -> str | None:
+    trusted_agent = _MEMORY_REQUESTING_AGENT.get()
+    if trusted_agent is None:
+        if requesting_agent:
+            raise PermissionError("requesting_agent requires trusted memory requester context")
+        return None
+    if requesting_agent and requesting_agent != trusted_agent:
+        raise PermissionError("requesting_agent does not match trusted memory requester context")
+    return trusted_agent
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _json_dumps_memory_data(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
 def _distance_to_score(distance: float, metric: str = "cosine") -> float:
-    """Конвертирует ChromaDB distance в score [0, 1] в зависимости от метрики.
-
-    cosine: distance ∈ [0, 2], score = 1 - d/2
-    l2:     distance ∈ [0, ∞), score = 1 / (1 + d)
-    ip:     hnswlib хранит distance = 1 - inner_product, диапазон [0, 2] для
-            нормализованных векторов — аналогично cosine. Используем ту же формулу.
-            См. https://github.com/nmslib/hnswlib#supported-distances
-    """
-    metric = (metric or "cosine").strip().lower()
-    if metric == "cosine":
-        return max(0.0, 1.0 - distance / 2)
-    elif metric == "l2":
-        return 1.0 / (1.0 + distance)
-    elif metric == "ip":
-        # ip-distance в hnswlib = 1 - inner_product → диапазон [0, 2] для нормализованных векторов
-        return max(0.0, 1.0 - distance / 2)
-    else:
-        # Неизвестная метрика — fallback на cosine-формулу
-        return max(0.0, 1.0 - distance / 2)
+    """Конвертирует ChromaDB distance в score через единый text2sql helper."""
+    return _distance_to_similarity(distance, metric)
 
 
 #
@@ -108,10 +130,16 @@ def _normalize_artifact_type(agent_name: str, data: Dict[str, Any]) -> None:
     data["artifact_type"] = _derive_artifact_type(agent_name, data)
 
 
-def _apply_policy_filters(records: List[Dict], requesting_agent: str | None) -> List[Dict]:
+def _apply_policy_filters(
+    records: List[Dict],
+    requesting_agent: str | None,
+    cache_kind: str | None = None,
+) -> List[Dict]:
     """Фильтрует записи согласно политике запрашивающего агента."""
-    if not requesting_agent or not isinstance(records, list):
+    if not isinstance(records, list):
         return records
+    if not requesting_agent:
+        return []
     if requesting_agent == "memory_archivist":
         return records
 
@@ -259,17 +287,6 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
             elif isinstance(obj, str):
                 # Удаляем или заменяем проблемные символы
                 cleaned = obj.replace('\x00', '').replace('\r\n', '\n').replace('\r', '\n')
-                # Ограничиваем длину очень длинных строк
-                if len(cleaned) > 100000:
-                    # Делаем саммари из текста
-                    model = model_summary
-                    if len(cleaned) > 80000:
-                        model = model_big
-                    else:
-                        model = model_summary
-                    prompt = f"Сделай максимально подробный обзор текста, сохранив все детали и факты, математические формулы и т.д. Сохрани ссылки на статьи, из которых ты составляешь обзор. Обзор должен быть на русском языке. Текст:\\n {cleaned}"
-                    cleaned = call_openai_api(prompt, system_prompt="Ты специалист по созданию подробных обзоров. На входе ты получаешь несколько статей, на основе которых ты составляешь общий обзор, соответствующий запросу пользователя. Ты составляешь обзоры на русском языке, сохраняя все детали и факты, математические формулы и т.д! Обязательно сохраняй ссылки на статьи, из которых ты составляешь обзор!", model=model, max_tokens=60000)
-
                 return cleaned
             elif hasattr(obj, '__dict__'):
                 # Обрабатываем объекты с атрибутами (например, ToolCall, ActionStep)
@@ -306,7 +323,7 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
         # форма хранения в БД, чтобы LIKE-паттерны по JSON-ключам были
         # детерминированными (без зависимости от пробелов после ':').
         try:
-            json.dumps(cleaned_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+            _json_dumps_memory_data(cleaned_data)
         except (TypeError, ValueError) as e:
             print(f"Ошибка! Данные не могут быть сериализованы в JSON: {str(e)}")
             return -1
@@ -319,27 +336,44 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
         conn = memory_manager.db_handler._get_connection()
         try:
             cursor = conn.cursor()
-            
-            # Получаем максимальный шаг для данной сессии и агента
-            cursor.execute("""
-                SELECT MAX(step) 
-                FROM agent_memory 
-                WHERE session_id = ? AND agent_name = ?
-            """, (session_id, agent_name))
-            
-            max_step = cursor.fetchone()[0]
-            next_step = 1 if max_step is None else max_step + 1
-            
-            # Сохраняем новые данные в SQLite с темпоральными полями
-            current_time = datetime.now().isoformat()
-            cursor.execute("""
-                INSERT INTO agent_memory (session_id, agent_name, step, instance_step, run_id, data, valid_from, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (session_id, agent_name, next_step, instance_step, run_id,
-                  json.dumps(cleaned_data, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
-                  current_time, current_time, current_time))
-            
-            conn.commit()
+
+            serialized_data = _json_dumps_memory_data(cleaned_data)
+            next_step = None
+            current_time = None
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    cursor.execute("BEGIN IMMEDIATE")
+                    cursor.execute("""
+                        SELECT MAX(step)
+                        FROM agent_memory
+                        WHERE session_id = ? AND agent_name = ?
+                    """, (session_id, agent_name))
+
+                    max_step = cursor.fetchone()[0]
+                    next_step = 1 if max_step is None else max_step + 1
+
+                    current_time = _utc_now_iso()
+                    cursor.execute("""
+                        INSERT INTO agent_memory (session_id, agent_name, step, instance_step, run_id, data, valid_from, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (session_id, agent_name, next_step, instance_step, run_id,
+                          serialized_data, current_time, current_time, current_time))
+
+                    conn.commit()
+                    break
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    if attempt >= max_attempts:
+                        raise
+                    logger.warning(
+                        "Retrying tactical memory insert after step conflict "
+                        "(session=%s agent=%s attempt=%s)",
+                        session_id,
+                        agent_name,
+                        attempt,
+                    )
+
             memory_manager.is_memory_updated = True
             
             # Сохраняем в ChromaDB для семантического поиска
@@ -440,7 +474,34 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                                 ids=[tactical_id]
                             )
                 except Exception as e:
-                    print(f"Предупреждение: не удалось сохранить в тактическую память ChromaDB: {e}")
+                    if isinstance(cleaned_data, dict):
+                        marked_data = dict(cleaned_data)
+                        marked_data["needs_reindex"] = True
+                        marked_data["reindex_error"] = str(e)
+                        marked_data["reindex_updated_at"] = _utc_now_iso()
+                        cursor.execute(
+                            """
+                            UPDATE agent_memory
+                            SET data = ?, updated_at = ?
+                            WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+                            """,
+                            (
+                                _json_dumps_memory_data(marked_data),
+                                marked_data["reindex_updated_at"],
+                                session_id,
+                                agent_name,
+                                next_step,
+                            ),
+                        )
+                        conn.commit()
+                    logger.warning(
+                        "Failed to save tactical memory row to ChromaDB; "
+                        "SQLite row marked needs_reindex (session=%s agent=%s step=%s): %s",
+                        session_id,
+                        agent_name,
+                        next_step,
+                        e,
+                    )
             
             return next_step  # Возвращаем глобальный номер шага
         except Exception as e:
@@ -479,6 +540,11 @@ def get_memory(
     Returns:
         List[Dict]: Список найденных записей
     """
+    try:
+        requesting_agent = _resolve_requesting_agent(requesting_agent)
+    except PermissionError:
+        return []
+
     # Инициализируем переменные для семантического поиска
     use_semantic_results = False
     semantic_records = []
@@ -556,7 +622,9 @@ def get_memory(
                     # Определяем (session_id, agent_name, step) для каждого результата:
                     # - если session_id задан — можно парсить ID по префиксу (как было)
                     # - если session_id=None — берём из metadatas (иначе корректно не распарсить)
-                    _chroma_metric = os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine")
+                    _chroma_metric = _resolve_chroma_metric(
+                        memory_manager.db_handler.tactical_collection
+                    )
                     step_filters = []
                     for i, tactical_id in enumerate(relevant_ids):
                         try:
@@ -765,7 +833,7 @@ def get_memory(
         records = _apply_default_cache_kind_routing(records, cache_kind)
 
         # Применяем политику доступа запрашивающего агента (межагентная видимость + типы артефактов)
-        records = _apply_policy_filters(records, requesting_agent)
+        records = _apply_policy_filters(records, requesting_agent, cache_kind)
 
         # Второй этап: rerank и фильтрация по тематической релевантности через LLM-реранкер
         if query and records and os.getenv("RAG_RERANK_ENABLED", "0") == "1":
@@ -919,8 +987,10 @@ def _filter_records_by_relevance(records: List[Dict], query: str = None,
             filtered_records.append(record)
             current_size += record_size
         else:
-            # Если запись не помещается целиком, пропускаем
-            continue
+            # Записи уже отсортированы по релевантности. Если самая релевантная
+            # оставшаяся запись не помещается, не добираем менее релевантные
+            # мелкие записи вместо неё.
+            break
     
     print(f"🔽 Фильтрация памяти: {len(records)} -> {len(filtered_records)} записей, {current_size} символов")
     
@@ -991,7 +1061,11 @@ def get_memory_summary(session_id: str) -> str:
             memory_manager.is_memory_updated = False
     if need_update:
         try:
-            memory = get_memory(session_id)
+            with memory_requester_context("memory_archivist"):
+                memory = get_memory(
+                    session_id,
+                    requesting_agent="memory_archivist",
+                )
             if len(memory) == 0:
                 # Флаг уже потреблён CAS-claim'ом выше — кэшируем результат, иначе
                 # следующие вызовы (need_update=False) вернут stale memory_manager.summary.
@@ -1107,7 +1181,7 @@ def save_goal(session_id: str, description: str) -> str:
         try:
             cursor = conn.cursor()
             # Сохраняем в SQLite с темпоральными полями
-            current_time = datetime.now().isoformat()
+            current_time = _utc_now_iso()
             cursor.execute("""
                 INSERT INTO strategic_memory (session_id, type, content, status, valid_from, created_at, updated_at) 
                 VALUES (?, 'goal', ?, 'pending', ?, ?, ?)
@@ -1297,7 +1371,7 @@ def save_context(session_id: str, context: str) -> str:
         conn = memory_manager.db_handler._get_connection()
         try:
             cursor = conn.cursor()
-            current_time = datetime.now().isoformat()
+            current_time = _utc_now_iso()
             
             # Получаем старые контексты для деактивации (темпоральный подход)
             cursor.execute("""
@@ -1397,7 +1471,7 @@ def extract_keywords(session_id: str, agent_name: str = None) -> List[str]:
         query = """
         SELECT data
         FROM agent_memory
-        WHERE session_id = ?
+        WHERE session_id = ? AND valid_to IS NULL
         """
         params = [session_id]
         
@@ -1570,7 +1644,7 @@ def summary_agent_memory_step(
         # Получаем данные для конкретного шага — внутри lock, чтобы закрыть TOCTOU
         with memory_manager.db_handler.lock:
             cursor.execute("""
-                SELECT rowid, data, valid_from, updated_at
+                SELECT rowid, data, instance_step, run_id, valid_from, updated_at
                 FROM agent_memory
                 WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
             """, (session_id, agent_name, step))
@@ -1580,7 +1654,7 @@ def summary_agent_memory_step(
         if not result:
             return f"Шаг {step} для агента {agent_name} в сессии {session_id} не найден"
 
-        memory_rowid, data, selected_valid_from, selected_updated_at = result
+        memory_rowid, data, selected_instance_step, selected_run_id, selected_valid_from, selected_updated_at = result
         if not data or data.strip() == '':
             return f"Данные для шага {step} пусты"
 
@@ -1618,7 +1692,7 @@ def summary_agent_memory_step(
 
         # Недеструктивное сохранение: создаем дубликат записи с summary, закрывая старую
         try:
-            current_time = datetime.now().isoformat()
+            current_time = _utc_now_iso()
 
             with memory_manager.db_handler.lock:
                 # Закрываем именно ту активную запись, которую читали до LLM.
@@ -1645,11 +1719,36 @@ def summary_agent_memory_step(
                     conn.rollback()
                     return f"Конфликт записи для шага {step}: запись была изменена параллельным потоком"
 
-                # Теперь вставляем новую запись с тем же step, но с summary данными
+                summary_data = {
+                    "cache_kind": "agent_summary",
+                    "artifact_type": "summary",
+                    "summary_text": generated_text,
+                    "source_agent_name": agent_name,
+                    "source_step": step,
+                }
+                if selected_run_id is not None:
+                    summary_data["run_id"] = selected_run_id
+                if selected_instance_step is not None:
+                    summary_data["instance_step"] = selected_instance_step
+
+                # Теперь вставляем новую запись с тем же step, но с JSON summary-данными
                 cursor.execute("""
-                    INSERT INTO agent_memory (session_id, agent_name, step, data, valid_from, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (session_id, agent_name, step, generated_text, current_time, current_time, current_time))
+                    INSERT INTO agent_memory (
+                        session_id, agent_name, step, instance_step, run_id,
+                        data, valid_from, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    session_id,
+                    agent_name,
+                    step,
+                    selected_instance_step,
+                    selected_run_id,
+                    _json_dumps_memory_data(summary_data),
+                    current_time,
+                    current_time,
+                    current_time,
+                ))
 
                 conn.commit()
                 memory_manager.is_memory_updated = True
@@ -1661,31 +1760,32 @@ def summary_agent_memory_step(
                     embedding = memory_manager._create_embedding(str(generated_text), purpose="passage")
                     if embedding:
                         # Пытаемся обновить; если не существует — добавим
+                        summary_metadata = {
+                            "session_id": session_id,
+                            "agent_name": agent_name,
+                            "step": step,
+                            "tactical_id": tactical_id,
+                            "cache_kind": "agent_summary",
+                            "artifact_type": "summary",
+                            "is_summary": True,
+                        }
+                        if selected_run_id is not None:
+                            summary_metadata["run_id"] = str(selected_run_id)
+                        if selected_instance_step is not None:
+                            summary_metadata["instance_step"] = int(selected_instance_step)
                         try:
                             memory_manager.db_handler.tactical_collection.update(
                                 ids=[tactical_id],
                                 embeddings=[embedding],
                                 documents=[str(generated_text)],
-                                metadatas=[{
-                                    "session_id": session_id,
-                                    "agent_name": agent_name,
-                                    "step": step,
-                                    "tactical_id": tactical_id,
-                                    "is_summary": True
-                                }]
+                                metadatas=[summary_metadata],
                             )
                         except Exception:
                             memory_manager.db_handler.tactical_collection.add(
                                 embeddings=[embedding],
                                 documents=[str(generated_text)],
-                                metadatas=[{
-                                    "session_id": session_id,
-                                    "agent_name": agent_name,
-                                    "step": step,
-                                    "tactical_id": tactical_id,
-                                    "is_summary": True
-                                }],
-                                ids=[tactical_id]
+                                metadatas=[summary_metadata],
+                                ids=[tactical_id],
                             )
             except Exception as e:
                 print(f"Предупреждение: не удалось обновить ChromaDB для summary: {e}")
@@ -1740,14 +1840,18 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
     """
     if not session_id or session_id.strip() == "":
         return "❌ Ошибка: session_id не может быть пустым"
-    
-    conn = memory_manager.db_handler._get_connection()
+
+    lock = memory_manager.db_handler.lock
+    lock.acquire()
+    conn = None
     try:
+        conn = memory_manager.db_handler._get_connection()
         cursor = conn.cursor()
         deleted_tactical = 0
         deleted_strategic = 0
         deleted_chroma_tactical = 0
         deleted_chroma_strategic = 0
+        chroma_errors = []
         
         # Очистка тактической памяти (agent_memory)
         if memory_type in ["tactical", "all"]:
@@ -1762,6 +1866,7 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
             # Удаляем из SQLite
             cursor.execute("DELETE FROM agent_memory WHERE session_id = ?", (session_id,))
             deleted_tactical = cursor.rowcount
+            conn.commit()
             
             # Удаляем из ChromaDB
             if memory_manager.db_handler.tactical_collection and tactical_ids:
@@ -1776,7 +1881,7 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
                         memory_manager.db_handler.tactical_collection.delete(ids=existing_ids)
                         deleted_chroma_tactical = len(existing_ids)
                 except Exception as e:
-                    print(f"⚠️ Предупреждение: не удалось очистить тактическую память в ChromaDB: {e}")
+                    chroma_errors.append(f"tactical Chroma cleanup failed: {e}")
         
         # Очистка стратегической памяти (strategic_memory)
         if memory_type in ["strategic", "all"]:
@@ -1789,6 +1894,7 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
             # Удаляем из SQLite
             cursor.execute("DELETE FROM strategic_memory WHERE session_id = ?", (session_id,))
             deleted_strategic = cursor.rowcount
+            conn.commit()
             
             # Удаляем из ChromaDB
             if memory_manager.db_handler.strategic_collection and strategic_ids:
@@ -1803,7 +1909,7 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
                         memory_manager.db_handler.strategic_collection.delete(ids=existing_ids)
                         deleted_chroma_strategic = len(existing_ids)
                 except Exception as e:
-                    print(f"⚠️ Предупреждение: не удалось очистить стратегическую память в ChromaDB: {e}")
+                    chroma_errors.append(f"strategic Chroma cleanup failed: {e}")
         
         conn.commit()
         
@@ -1813,7 +1919,8 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
         
         # Формируем отчет
         result_lines = []
-        result_lines.append(f"✅ Память для сессии '{session_id}' очищена:")
+        status_icon = "⚠️" if chroma_errors else "✅"
+        result_lines.append(f"{status_icon} Память для сессии '{session_id}' очищена:")
         
         if memory_type in ["tactical", "all"]:
             result_lines.append(f"   📝 Тактическая память: {deleted_tactical} записей (SQLite)")
@@ -1824,13 +1931,19 @@ def clear_session_memory(session_id: str, memory_type: str = "all") -> str:
             result_lines.append(f"   🔍 Стратегическая память: {deleted_chroma_strategic} записей (ChromaDB)")
         
         result_lines.append(f"   🧹 Кэш сброшен")
+        if chroma_errors:
+            result_lines.append("   ⚠️ Требуется reindex ChromaDB:")
+            for error in chroma_errors:
+                result_lines.append(f"      - {error}")
         
         return "\n".join(result_lines)
         
     except Exception as e:
         return f"❌ Ошибка при очистке памяти: {str(e)}"
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+        lock.release()
 
 
 @tool  

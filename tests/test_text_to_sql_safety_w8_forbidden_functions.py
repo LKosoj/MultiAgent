@@ -4,14 +4,13 @@
 запрещённые PostgreSQL admin / cross-DB и ClickHouse table-функции.
 
 Два режима тестирования:
-1. ``extended_validator`` — USE_SQLGLOT=0 + SQL_SAFETY_ALLOW_LEGACY=1: legacy
-   regex-режим (исходные тесты W8-T8, покрывают legacy-путь).
-2. ``extended_validator_sqlglot`` — USE_SQLGLOT=1: прод-режим через
-   AST-проверку check_forbidden_functions_ast (фикс #1/#9). Существующие
-   legacy-тесты НЕ удалены (они проверяют отдельный код-путь).
+1. ``extended_validator`` — USE_SQLGLOT=0 выставлен для совместимости, но
+   runtime обязан игнорировать этот флаг и идти через sqlglot.
+2. ``extended_validator_sqlglot`` — явный USE_SQLGLOT=1: тот же прод-режим
+   через AST/regex static checks.
 
 Также добавлены тесты для SELECT ... INTO (фикс #2): создание таблицы через
-SELECT INTO запрещено в любом режиме с USE_SQLGLOT=1.
+SELECT INTO запрещено независимо от старого USE_SQLGLOT-флага.
 """
 from __future__ import annotations
 
@@ -34,10 +33,9 @@ def _reset_safety_cache():
 def extended_validator(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "extended")
-    # legacy regex-маршрут: устойчиво ловит forbidden_functions через
-    # raw upper(sql) (см. docstring модуля выше).
+    # Совместимость со старой конфигурацией: USE_SQLGLOT=0 больше не должен
+    # переключать валидатор на legacy regex-only маршрут.
     monkeypatch.setenv("USE_SQLGLOT", "0")
-    monkeypatch.setenv("SQL_SAFETY_ALLOW_LEGACY", "1")
     safety_config.reset_cache()
     return SQLSafetyValidator()
 
@@ -90,7 +88,6 @@ def test_strict_profile_has_same_extended_functions(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "strict")
     monkeypatch.setenv("USE_SQLGLOT", "0")
-    monkeypatch.setenv("SQL_SAFETY_ALLOW_LEGACY", "1")
     safety_config.reset_cache()
     v = SQLSafetyValidator()
     new_fns = {
@@ -109,7 +106,6 @@ def test_default_profile_has_no_forbidden_functions(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_PROFILE", raising=False)
     monkeypatch.setenv("USE_SQLGLOT", "0")
-    monkeypatch.setenv("SQL_SAFETY_ALLOW_LEGACY", "1")
     safety_config.reset_cache()
     v = SQLSafetyValidator()
     assert list(v.forbidden_functions) == [], (
@@ -131,7 +127,6 @@ def extended_validator_sqlglot(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "extended")
     monkeypatch.setenv("USE_SQLGLOT", "1")
-    monkeypatch.delenv("SQL_SAFETY_ALLOW_LEGACY", raising=False)
     safety_config.reset_cache()
     return SQLSafetyValidator()
 
@@ -195,6 +190,36 @@ def test_legitimate_select_passes_sqlglot_mode(extended_validator_sqlglot):
     assert res["is_safe"] is True, f"Legitimate query should pass, got {res['issues']}"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT REPLACE(name, 'a', 'b') FROM users",
+        "SELECT file FROM logs",
+        "SELECT url FROM links",
+        "SELECT remote, cluster FROM nodes",
+        'SELECT 1 AS "into outfile"',
+        'SELECT * FROM "system.shutdown"',
+    ],
+)
+def test_extended_profile_allows_legitimate_replace_call_and_column_names(
+    extended_validator_sqlglot, sql
+):
+    res = extended_validator_sqlglot.validate(sql)
+    assert res["is_safe"] is True, f"Legitimate query should pass, got {res['issues']}"
+
+
+def test_replace_into_remains_forbidden_statement(extended_validator_sqlglot):
+    res = extended_validator_sqlglot.validate("REPLACE INTO users (id) VALUES (1)")
+    assert res["is_safe"] is False
+    assert {i["issue_type"] for i in res["issues"]} & {"FORBIDDEN_STATEMENT", "NOT_SELECT"}
+
+
+def test_explain_analyse_british_spelling_rejected(extended_validator_sqlglot):
+    res = extended_validator_sqlglot.validate("EXPLAIN ANALYSE SELECT * FROM users")
+    assert res["is_safe"] is False
+    assert "FORBIDDEN_EXPLAIN_ANALYZE" in {i["issue_type"] for i in res["issues"]}
+
+
 # ---------------------------------------------------------------------------
 # Фикс #2: SELECT ... INTO (создание таблицы) блокируется при USE_SQLGLOT=1
 # ---------------------------------------------------------------------------
@@ -216,6 +241,13 @@ def test_select_into_rejected_sqlglot(extended_validator_sqlglot, sql):
     )
 
 
+def test_select_into_inside_set_operation_rejected_sqlglot(extended_validator_sqlglot):
+    sql = "SELECT id INTO backup_users FROM users UNION SELECT id FROM users_archive"
+    res = extended_validator_sqlglot.validate(sql)
+    assert res["is_safe"] is False
+    assert "FORBIDDEN_STATEMENT" in {i["issue_type"] for i in res["issues"]}
+
+
 @pytest.mark.parametrize(
     "sql",
     [
@@ -223,12 +255,10 @@ def test_select_into_rejected_sqlglot(extended_validator_sqlglot, sql):
         "SELECT id, name INTO backup_users FROM users WHERE active = 1",
     ],
 )
-def test_select_into_rejected_legacy(extended_validator, sql):
-    """Фикс #2: SELECT ... INTO должен блокироваться и на legacy-пути
-    (USE_SQLGLOT=0) — раньше is_valid_select_or_cte пропускал его как обычный
-    SELECT, т.к. не проверял args['into']."""
+def test_select_into_rejected_when_use_sqlglot_zero_is_set(extended_validator, sql):
+    """Фикс #2: SELECT ... INTO блокируется даже при старом USE_SQLGLOT=0."""
     res = extended_validator.validate(sql)
-    assert res["is_safe"] is False, f"SELECT INTO must be rejected (legacy): {sql!r}"
+    assert res["is_safe"] is False, f"SELECT INTO must be rejected: {sql!r}"
 
 
 def test_keyword_function_classes_not_silently_bypassed(extended_validator_sqlglot):

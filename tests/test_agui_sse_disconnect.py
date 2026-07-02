@@ -64,6 +64,7 @@ def _install_runner_stub(monkeypatch) -> None:
 
     stub_service.ForbiddenWorkflowNameError = ForbiddenWorkflowNameError
     stub_service.handle_service_action = lambda *a, **k: {}
+    stub_service._require_service_action_role = lambda _action, _principal: None
     stub_service._redact_payload = lambda value: value
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.service", stub_service)
 
@@ -416,6 +417,9 @@ async def test_replay_follow_aclose_does_not_cancel_detached_run(monkeypatch):
     live_stream = _LiveStream()
 
     class _RunManager:
+        def can_access(self, run_id, principal):
+            return True
+
         def get_info(self, run_id):
             return object()
 

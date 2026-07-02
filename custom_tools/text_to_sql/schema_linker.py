@@ -89,6 +89,7 @@ class SchemaLinker:
         entities: Dict[str, Any],
         schema_info: Dict[str, Any],
         dsn: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Основная функция связывания сущностей со схемой."""
         logger.info("Linking entities to database schema")
@@ -98,11 +99,21 @@ class SchemaLinker:
         )
         
         # Сначала убеждаемся, что схема готова
-        self._ensure_initialized(dsn=effective_dsn)
+        if session_id is None:
+            self._ensure_initialized(dsn=effective_dsn)
+        else:
+            self._ensure_initialized(dsn=effective_dsn, session_id=session_id)
         
         # Получаем схему БД
         try:
-            db_schema = self._get_database_schema(schema_info, dsn=effective_dsn)
+            if session_id is None:
+                db_schema = self._get_database_schema(schema_info, dsn=effective_dsn)
+            else:
+                db_schema = self._get_database_schema(
+                    schema_info,
+                    dsn=effective_dsn,
+                    session_id=session_id,
+                )
             if not db_schema:
                 return {
                     "error": "Failed to load database schema",
@@ -128,7 +139,19 @@ class SchemaLinker:
         logger.info(f"Loaded schema with {len(db_schema)} tables")
         
         # Проверяем кэш
-        cache_info = self.cache_manager.prepare_cache_info(entities, db_schema, dsn=effective_dsn)
+        if session_id is None:
+            cache_info = self.cache_manager.prepare_cache_info(
+                entities,
+                db_schema,
+                dsn=effective_dsn,
+            )
+        else:
+            cache_info = self.cache_manager.prepare_cache_info(
+                entities,
+                db_schema,
+                dsn=effective_dsn,
+                session_id=session_id,
+            )
         # W2-T4: corruption отделена от miss. Если backend кэша упал, мы
         # явно логируем это как ошибку и продолжаем без кэша — caller
         # видит, что данные были пересчитаны (а не «всё штатно, miss»).
@@ -193,6 +216,7 @@ class SchemaLinker:
         self,
         schema_info: Dict[str, Any],
         dsn: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Получает схему БД, делегируя в :class:`SchemaLoader` (SoT) и
         добавляя side-effects: индексацию в память и schema-ready marker.
@@ -219,17 +243,30 @@ class SchemaLinker:
             # Для пути introspection дополнительно оптимизируем схему перед
             # передачей в memory-индекс (сохраняем lossless семантику).
             from .schema_metadata import SchemaStatsHelper
-            indexed = self.memory_manager.ensure_schema_indexed_in_memory(
-                effective_dsn, SchemaStatsHelper.optimize_schema_for_storage(db_schema)
-            )
+            optimized_schema = SchemaStatsHelper.optimize_schema_for_storage(db_schema)
+            if session_id is not None:
+                indexed = self.memory_manager.ensure_schema_indexed_in_memory(
+                    effective_dsn,
+                    optimized_schema,
+                    session_id=session_id,
+                )
+            else:
+                indexed = self.memory_manager.ensure_schema_indexed_in_memory(
+                    effective_dsn,
+                    optimized_schema,
+                )
             if indexed:
-                session_id = dsn_to_sanitized_name(effective_dsn)
+                ready_session_id = session_id or dsn_to_sanitized_name(effective_dsn)
                 self.memory_manager.set_schema_ready_marker(
-                    session_id, get_schema_version(db_schema)
+                    ready_session_id, get_schema_version(db_schema)
                 )
         return db_schema
     
-    def _ensure_initialized(self, dsn: Optional[str] = None) -> None:
+    def _ensure_initialized(
+        self,
+        dsn: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
         """Убеждается, что компоненты инициализированы.
 
         Fail-fast: раньше любой Exception тихо превращался в "schema
@@ -264,8 +301,8 @@ class SchemaLinker:
             logger.warning("DSN not set - schema operations limited")
             return
 
-        session_id = dsn_to_sanitized_name(effective_dsn)
-        logger.debug(f"Schema system initialized for session: {session_id}")
+        resolved_session_id = session_id or dsn_to_sanitized_name(effective_dsn)
+        logger.debug(f"Schema system initialized for session: {resolved_session_id}")
 
     def _check_type_compatibility(self, type1: str, type2: str) -> bool:
         """Thin delegating shim to :meth:`ColumnMetadataHelper.check_type_compatibility`.
@@ -403,8 +440,14 @@ class SchemaLinker:
         entities: Dict[str, Any],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, str]:
-        return self.cache_manager.prepare_cache_info(entities, db_schema, dsn=dsn)
+        return self.cache_manager.prepare_cache_info(
+            entities,
+            db_schema,
+            dsn=dsn,
+            session_id=session_id,
+        )
 
     def _create_table_description(self, table_name: str, table_cols: Dict[str, Dict[str, Any]]) -> str:
         from .schema_metadata import get_type as _get_type, is_fk as _is_fk, is_pk as _is_pk

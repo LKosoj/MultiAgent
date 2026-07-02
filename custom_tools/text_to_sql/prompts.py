@@ -13,6 +13,10 @@ def _redact_prompt_value(value: Any) -> Any:
     return redact_text_to_sql_value(value)
 
 
+def _json_prompt_value(value: Any) -> str:
+    return json.dumps(_redact_prompt_value(value), ensure_ascii=False)
+
+
 def build_nlu_prompt(text: str) -> str:
     """Промпт для извлечения intent и entities из текста."""
     # JSON-обёртка для user-text: устраняет prompt injection через кавычки/переносы.
@@ -84,8 +88,8 @@ def build_schema_linking_prompt(
         "- ОДИН джойн на пару таблиц: не дублируй условие парой ID+name.\n\n"
 
         "ПРИМЕРЫ ШАБЛОНОВ ДЖОЙНОВ (структура, не доменные имена):\n"
-        '+ ПРАВИЛЬНО: {{"from_table": "schema.fact", "from_column": "<ref>_id", "to_table": "schema.dim", "to_column": "id", "join_type": "LEFT"}}\n'
-        '+ ПРАВИЛЬНО: {{"from_table": "schema.t1", "from_column": "<key>_id", "to_table": "schema.t2", "to_column": "<key>_id", "join_type": "LEFT"}}\n'
+        '+ ПРАВИЛЬНО: {"from_table": "schema.fact", "from_column": "<ref>_id", "to_table": "schema.dim", "to_column": "id", "join_type": "LEFT"}\n'
+        '+ ПРАВИЛЬНО: {"from_table": "schema.t1", "from_column": "<key>_id", "to_table": "schema.t2", "to_column": "<key>_id", "join_type": "LEFT"}\n'
         '- НЕПРАВИЛЬНО: несколько джойнов между одной парой таблиц.\n'
         '- НЕПРАВИЛЬНО: <key>_id AND <key>_name одновременно в условии джойна.\n\n'
 
@@ -151,6 +155,7 @@ def build_column_description_prompt_with_context(
     """Промпт для генерации описаний колонок и таблицы с полным контекстом базы данных."""
     
     table_name = list(full_table_schema.keys())[0]
+    table_name_json = _json_prompt_value(table_name)
     table_columns = full_table_schema[table_name]
     
     # Получаем текущее описание таблицы (если есть)
@@ -173,6 +178,8 @@ def build_column_description_prompt_with_context(
     
     # Указываем какие колонки нужно описать
     columns_to_describe = list(cols_to_describe.keys())
+    columns_to_describe_json = _json_prompt_value(columns_to_describe)
+    table_context_json = _json_prompt_value(table_context)
     
     # Формируем секцию с примерами данных
     sample_data_section = ""
@@ -192,7 +199,7 @@ def build_column_description_prompt_with_context(
                 col_info = cols_to_describe.get(col_name, {})
                 col_type = col_info.get('type', 'UNKNOWN') if isinstance(col_info, dict) else 'UNKNOWN'
                 
-                stats_section += f"  {col_name} ({col_type}):\n"
+                stats_section += f"  {_json_prompt_value(col_name)} ({_json_prompt_value(col_type)}):\n"
                 if 'distinct_count' in stats:
                     stats_section += f"    - Уникальных значений: {stats['distinct_count']}\n"
                 if 'null_frac' in stats:
@@ -215,9 +222,9 @@ def build_column_description_prompt_with_context(
                 preview_data = fk_info.get('preview_data', [])
                 preview_columns = fk_info.get('preview_columns', [])
                 
-                fk_section += f"  {col_name} -> {ref_table}:\n"
+                fk_section += f"  {_json_prompt_value(col_name)} -> {_json_prompt_value(ref_table)}:\n"
                 if preview_data and preview_columns:
-                    fk_section += f"    Колонки: {', '.join(preview_columns)}\n"
+                    fk_section += f"    Колонки: {_json_prompt_value(preview_columns)}\n"
                     fk_section += f"    Примеры связей:\n"
                     for i, row in enumerate(preview_data[:2]):
                         if isinstance(row, (list, tuple)):
@@ -230,12 +237,12 @@ def build_column_description_prompt_with_context(
     need_table_description = not current_table_description.strip()
     
     return (
-        f"Ты эксперт по базам данных. Анализируй таблицу '{table_name}' в контексте всей базы данных.\n\n"
+        f"Ты эксперт по базам данных. Анализируй таблицу {table_name_json} в контексте всей базы данных.\n\n"
         
         f"КОНТЕКСТ БАЗЫ ДАННЫХ:\n"
-        f"Доступные таблицы: {', '.join(table_context)}\n\n"
+        f"Доступные таблицы (JSON): {table_context_json}\n\n"
         
-        f"ПОЛНАЯ СХЕМА ТАБЛИЦЫ '{table_name}':\n"
+        f"ПОЛНАЯ СХЕМА ТАБЛИЦЫ {table_name_json}:\n"
         f"{json.dumps(safe_all_columns_info, ensure_ascii=False, indent=2)}\n\n"
         
         f"{sample_data_section}"
@@ -244,7 +251,7 @@ def build_column_description_prompt_with_context(
         
         f"ЗАДАЧА:\n"
         f"1. {'Создай описание таблицы (назначение, что хранит)' if need_table_description else 'Описание таблицы уже есть'}\n"
-        f"2. Создай описания только для этих колонок: {columns_to_describe}\n\n"
+        f"2. Создай описания только для этих колонок (JSON): {columns_to_describe_json}\n\n"
         
         f"Учитывай:\n"
         f"- Связи между колонками внутри таблицы\n"
@@ -261,8 +268,8 @@ def build_column_description_prompt_with_context(
         
         f"Верни ТОЛЬКО JSON вида:\n"
         f"{{\n" +
-        (f"  \"table_description\": {{\"{table_name}\": \"описание назначения таблицы\"}},\n" if need_table_description else "  \"table_description\": {},\n") +
-        f"  \"descriptions\": {{\"{table_name}\": {{\"column\": \"описание с примерами\"}}}}\n"
+        (f"  \"table_description\": {{{table_name_json}: \"описание назначения таблицы\"}},\n" if need_table_description else "  \"table_description\": {},\n") +
+        f"  \"descriptions\": {{{table_name_json}: {{\"column\": \"описание с примерами\"}}}}\n"
         f"}}\n\n"
         f"Описания должны быть информативными (8-20 слов для колонок, 15-30 слов для таблицы) на русском языке и включать примеры для числовых/категориальных колонок."
     )

@@ -104,11 +104,12 @@ class SQLGenerator:
     def _get_schema_from_cache(
         self,
         dsn: str | None = None,
+        session_id: str | None = None,
     ) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:
         """Получает схему БД из кэша памяти."""
         try:
             try:
-                from memory.tools import get_memory
+                from memory.tools import get_memory, memory_requester_context
             except ImportError:
                 logger.warning("Memory tools not available - cannot retrieve schema from cache")
                 return None
@@ -117,14 +118,16 @@ class SQLGenerator:
                 logger.warning("DSN is required - cannot retrieve schema from cache")
                 return None
 
-            session_id = dsn_to_sanitized_name(dsn)
+            session_id = session_id or dsn_to_sanitized_name(dsn)
 
-            memory_results = get_memory(
-                session_id=session_id,
-                agent_name="Schema-RAG-Agent",
-                cache_kind="schema_table",
-                include_historical=False
-            )
+            with memory_requester_context("Schema-RAG-Agent"):
+                memory_results = get_memory(
+                    session_id=session_id,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_table",
+                    include_historical=False,
+                    requesting_agent="Schema-RAG-Agent",
+                )
 
             schema = {}
             for result in memory_results:
@@ -184,6 +187,7 @@ class SQLGenerator:
         context: str,
         user_query: str,
         dsn: str | None = None,
+        session_id: str | None = None,
     ) -> Dict[str, str]:
         """Генерирует SQL запрос из контекста и пользовательского запроса через прямой вызов LLM."""
         logger.info("Generating SQL query")
@@ -200,7 +204,15 @@ class SQLGenerator:
         linked_entities = self._get_linked_entities(structured_context)
         schema_from_context = self._get_schema_from_context(structured_context)
         schema_validation_enabled = self._schema_validation_enabled()
-        db_schema = schema_from_context or self._get_schema_from_cache(effective_dsn)
+        if schema_from_context:
+            db_schema = schema_from_context
+        elif session_id is None:
+            db_schema = self._get_schema_from_cache(effective_dsn)
+        else:
+            db_schema = self._get_schema_from_cache(
+                effective_dsn,
+                session_id=session_id,
+            )
 
         if os.getenv("SQL_GENERATION_USE_STRUCTURED_BUILDER", "0") == "1":
             if effective_dsn is None:
@@ -295,7 +307,7 @@ class SQLGenerator:
                         schema_issues = schema_validation.get("issues", [])
                         logger.warning(f"SQL schema validation failed on attempt {attempt + 1}: {schema_issues}")
 
-                        if self._schema_validation_requires_fail_fast(schema_issues) or attempt == self.max_retries - 1:
+                        if attempt == self.max_retries - 1:
                             return {
                                 "error": "Generated SQL failed schema validation",
                                 "schema_issues": schema_issues,
@@ -357,13 +369,6 @@ class SQLGenerator:
             if isinstance(value, str) and value.strip():
                 return value
         return None
-
-    def _schema_validation_requires_fail_fast(self, schema_issues: List[Dict[str, Any]]) -> bool:
-        return any(
-            isinstance(issue, dict)
-            and issue.get("issue_type") == "SQLGLOT_DISABLED_FOR_SCHEMA_VALIDATION"
-            for issue in schema_issues
-        )
 
     # ----- Backward-compat shims: structured builder (EPIC 8.1) -----
     # Тесты дёргают эти методы как instance-методы. Каждый — 1-line делегат

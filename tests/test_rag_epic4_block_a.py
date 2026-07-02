@@ -80,9 +80,16 @@ def test_indexed_payload_has_no_static_score(monkeypatch):
 
     # _remove_old_file_records делает реальный SQL через memory_manager — отключим.
     monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=None,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
 
     searcher = RAGSearcher()
-    monkeypatch.setattr(searcher, "_remove_old_file_records", lambda session_id, filename: None)
+    monkeypatch.setattr(searcher._indexing, "_collect_chroma_ids_for_file", lambda **kwargs: [])
+    monkeypatch.setattr(searcher._indexing, "_deactivate_file_records", lambda **kwargs: 0)
+    monkeypatch.setattr(searcher._indexing, "_delete_chroma_records", lambda **kwargs: None)
 
     searcher._index_file_in_memory(
         session_id="sess",
@@ -302,6 +309,64 @@ def test_index_registry_thread_safe(monkeypatch):
     assert searcher._get_session_lock("sess-Y") is not lock_a
 
 
+def test_reindex_strict_cleanup_compensates_inserted_chroma_ids(monkeypatch):
+    monkeypatch.setenv("TEXT_TO_SQL_RAG_STRICT_CHROMA_CLEANUP", "1")
+    session_id = "sess"
+    inserted_ids = [
+        f"{session_id}-Schema-RAG-Agent-1",
+        f"{session_id}-Schema-RAG-Agent-2",
+    ]
+
+    class _FailingOldCleanupCollection:
+        def __init__(self):
+            self.ids = set(inserted_ids)
+            self.delete_calls: List[List[str]] = []
+
+        def delete(self, ids):
+            ids = list(ids)
+            self.delete_calls.append(ids)
+            if ids == ["old-id"]:
+                raise RuntimeError("old cleanup failed")
+            for item in ids:
+                self.ids.discard(item)
+
+    collection = _FailingOldCleanupCollection()
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=collection,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+
+    next_step = {"value": 0}
+
+    def fake_save_memory(*, session_id, agent_name, data):
+        next_step["value"] += 1
+        return next_step["value"]
+
+    searcher = RAGSearcher()
+    monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+    monkeypatch.setattr(searcher._indexing, "_collect_chroma_ids_for_file", lambda **kwargs: ["old-id"])
+    monkeypatch.setattr(searcher._indexing, "_deactivate_file_records", lambda **kwargs: 1)
+    reactivated = []
+    monkeypatch.setattr(
+        searcher._indexing,
+        "_reactivate_file_records",
+        lambda **kwargs: reactivated.append(kwargs) or 1,
+    )
+
+    with pytest.raises(RuntimeError, match="ChromaDB delete failed"):
+        searcher._index_file_in_memory(
+            session_id=session_id,
+            filename="sqlrag.md",
+            sql_snippets=["SELECT 1;", "SELECT 2;"],
+            file_hash="hash-123",
+        )
+
+    assert collection.delete_calls == [["old-id"], inserted_ids]
+    assert collection.ids == set()
+    assert reactivated, "strict cleanup failure must reactivate old SQLite rows"
+
+
 # ---------------------------------------------------------------------------
 # 4.6 — _remove_old_file_records использует компактный JSON-паттерн
 # ---------------------------------------------------------------------------
@@ -439,6 +504,37 @@ def test_remove_old_records_matches_actual_save_memory_format(monkeypatch):
     )
     # commit вызван
     assert fake_conn.commits >= 1
+
+
+def test_index_file_saves_before_opening_deactivation_writer(monkeypatch):
+    """Wave 1B: save_memory must not run while this method holds a write tx."""
+    order: List[str] = []
+
+    def fake_save_memory(*, session_id, agent_name, data, **kwargs):
+        order.append(f"save:{data['snippet_index']}")
+        return len(order)
+
+    def fake_get_connection():
+        order.append("get_connection")
+        return _FakeConn()
+
+    db_handler = types.SimpleNamespace(
+        _get_connection=fake_get_connection,
+        tactical_collection=None,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+    monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+
+    searcher = RAGSearcher()
+    searcher._index_file_in_memory(
+        session_id="sess",
+        filename="sqlrag.md",
+        sql_snippets=["SELECT 1;", "SELECT 2;"],
+        file_hash="hash-123",
+    )
+
+    assert order[:2] == ["save:0", "save:1"]
+    assert order[2:] == ["get_connection"]
 
 
 # ---------------------------------------------------------------------------
@@ -662,8 +758,15 @@ def test_indexed_payload_uses_sqlrag_example_cache_kind(monkeypatch):
         return len(saved)
 
     monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=None,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
     searcher = RAGSearcher()
-    monkeypatch.setattr(searcher, "_remove_old_file_records", lambda session_id, filename: None)
+    monkeypatch.setattr(searcher._indexing, "_collect_chroma_ids_for_file", lambda **kwargs: [])
+    monkeypatch.setattr(searcher._indexing, "_deactivate_file_records", lambda **kwargs: 0)
+    monkeypatch.setattr(searcher._indexing, "_delete_chroma_records", lambda **kwargs: None)
 
     searcher._index_file_in_memory(
         session_id="sess",

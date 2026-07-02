@@ -178,7 +178,7 @@ def test_schema_linking_empty_llm_result_uses_explicit_fallback(monkeypatch):
     assert result["linked_entities"]["metrics"][0]["column"] == "amount"
 
 
-def test_schema_linking_filter_only_llm_result_is_explicit_error(monkeypatch):
+def test_schema_linking_filter_only_llm_result_is_valid_linking(monkeypatch):
     memory = _FakeMemory(["orders"])
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
     monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
@@ -198,7 +198,10 @@ def test_schema_linking_filter_only_llm_result_is_explicit_error(monkeypatch):
         {"orders": {"columns": {"status": {"type": "TEXT"}}}},
     )
 
-    assert result["error"] == "LLM schema linking returned no linked entities"
+    assert result["error"] is None
+    assert result["linking_strategy"] == "llm"
+    assert result["linked_entities"]["filters"]["status"]["table"] == "orders"
+    assert result["linked_entities"]["filters"]["status"]["column"] == "status"
 
 
 def test_schema_linker_does_not_cache_empty_error_results(monkeypatch):
@@ -2056,13 +2059,13 @@ def test_sql_explain_dry_run_passes_empty_dsn_sentinel(monkeypatch):
     assert seen["dsn"] == ""
 
 
-def test_sql_generator_schema_validation_sqlglot_disabled_fails_fast(monkeypatch):
+def test_sql_generator_schema_validation_ignores_use_sqlglot_zero(monkeypatch):
     generator = SQLGenerator()
     calls = {"count": 0}
 
     def fake_call_openai_api(**kwargs):
         calls["count"] += 1
-        return json.dumps({"sql_query": "SELECT missing_amount FROM orders"})
+        return json.dumps({"sql_query": "SELECT amount FROM orders"})
 
     monkeypatch.setenv("USE_SQLGLOT", "0")
     monkeypatch.delenv("SQL_GENERATION_USE_STRUCTURED_BUILDER", raising=False)
@@ -2078,7 +2081,8 @@ def test_sql_generator_schema_validation_sqlglot_disabled_fails_fast(monkeypatch
     )
 
     assert calls["count"] == 1
-    assert result["schema_issues"][0]["issue_type"] == "SQLGLOT_DISABLED_FOR_SCHEMA_VALIDATION"
+    assert result["sql_query"] == "SELECT amount FROM orders"
+    assert result.get("schema_issues", []) == []
 
 
 def test_schema_enricher_passes_ref_column_to_fk_preview():
@@ -2188,6 +2192,44 @@ def test_code_formatter_detects_multi_word_keyword():
     with pytest.raises(SQLForbiddenStatementError) as exc2:
         code_formatter("INSERT\nINTO t VALUES(1)", sql_validator=validator)
     assert exc2.value.forbidden_keyword == "INSERT INTO"
+
+
+@pytest.mark.parametrize(
+    ("dsn", "sql_query"),
+    [
+        ("postgresql://user:pass@localhost/db", 'SELECT id, "copy" FROM documents'),
+        ("sqlite:///:memory:", 'SELECT "set" FROM config'),
+        ("duckdb:///:memory:", 'SELECT "use" FROM sessions'),
+    ],
+)
+def test_code_formatter_accepts_quoted_keyword_identifiers(monkeypatch, dsn, sql_query):
+    from custom_tools.text_to_sql.core._sql_generation_api import code_formatter
+    from custom_tools.text_to_sql.validators import SQLSafetyValidator
+
+    monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "extended")
+    validator = SQLSafetyValidator()
+
+    result = code_formatter(sql_query, dsn=dsn, sql_validator=validator)
+
+    assert "formatted_sql_query" in result
+    assert "error" not in result
+
+
+def test_core_code_formatter_uses_runtime_dsn_for_quoted_keyword_identifiers(monkeypatch):
+    from custom_tools.text_to_sql import core as core_module
+    from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context
+
+    monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "extended")
+    core_module.sql_validator.reload()
+    token = set_tool_runtime_context({"dsn": "sqlite:///:memory:"})
+    try:
+        result = core_module.code_formatter('SELECT "set" FROM config')
+        assert "formatted_sql_query" in result
+        assert "error" not in result
+    finally:
+        reset_tool_runtime_context(token)
+        monkeypatch.delenv("TEXT_TO_SQL_SAFETY_PROFILE", raising=False)
+        core_module.sql_validator.reload()
 
 
 # === EPIC 1.9: sql_safety_check fail-fast при LLM-сбое ===

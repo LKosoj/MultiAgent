@@ -34,6 +34,10 @@ class DBPlugin(Protocol):
         """Выполняет безопасный SELECT с ограничением строк и возвращает данные/колонки/время."""
         ...
 
+    def set_statement_timeout(self, conn, timeout_ms: int) -> None:
+        """Sets per-statement execution timeout where supported."""
+        ...
+
     def introspect_schema(self, conn, schema: Optional[str] = None, table_name: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Возвращает схему в новом формате {table: {description, columns: {column: {type, description, constraint_type, references}}}}.
 
@@ -154,6 +158,12 @@ class DBPlugin(Protocol):
 
     def build_distinct_values_query(self, table_name: str, column_name: str, limit: int) -> str:
         """Строит DISTINCT-запрос с лимитом для указанной колонки."""
+        ...
+
+    def build_values_membership_query(
+        self, table_name: str, column_name: str, values: List[Any]
+    ) -> str:
+        """Строит DISTINCT-запрос значений колонки, входящих в values."""
         ...
 
     def get_type_category(self, sql_type: str) -> str:
@@ -402,6 +412,12 @@ class BaseDBPlugin:
             raise ValueError("row_limit must be a positive integer")
         return limit
 
+    def set_statement_timeout(self, conn, timeout_ms: int) -> None:
+        """Default no-op; dialect plugins can set DB-level statement timeout."""
+        timeout = int(timeout_ms)
+        if timeout <= 0:
+            raise ValueError("timeout_ms must be a positive integer")
+
     def limit_select_sql(self, sql: str, row_limit: int) -> str:
         """Applies a top-level row cap while preserving top-level ORDER BY."""
         limit = self._normalize_row_limit(row_limit)
@@ -461,6 +477,30 @@ class BaseDBPlugin:
             f"WHERE {quoted_column} IS NOT NULL "
             f"ORDER BY {quoted_column} "
             f"LIMIT {row_limit}"
+        )
+
+    def _quote_literal(self, value: Any) -> str:
+        return "'" + str(value).replace("'", "''") + "'"
+
+    def build_values_membership_query(
+        self, table_name: str, column_name: str, values: List[Any]
+    ) -> str:
+        """Builds a query for parent values matching a sampled child value set."""
+        quoted_table = self.quote_identifier(table_name)
+        quoted_column = self.quote_identifier(column_name)
+        non_null_values = [value for value in values if value is not None]
+        if not non_null_values:
+            return (
+                f"SELECT DISTINCT {quoted_column} "
+                f"FROM {quoted_table} "
+                "WHERE 1 = 0"
+            )
+        literals = ", ".join(self._quote_literal(value) for value in non_null_values)
+        return (
+            f"SELECT DISTINCT {quoted_column} "
+            f"FROM {quoted_table} "
+            f"WHERE {quoted_column} IN ({literals}) "
+            f"ORDER BY {quoted_column}"
         )
 
     def get_type_category(self, sql_type: str) -> str:

@@ -4,9 +4,10 @@
 на сэмпле. У валидного FK-ребра дочерние значения ⊆ родительских ключей →
 containment ≈ 1; у спурьёзного совпадения по `_id` → ≈ 0.
 
-Подход: два ОТДЕЛЬНЫХ DISTINCT-сэмпла через плагин
-(`build_distinct_values_query` + `execute_select`), пересечение множеств в
-Python — без кросс-табличного подзапроса и без полного скана.
+Подход: сначала DISTINCT-сэмпл дочерних значений через плагин, затем
+membership-запрос к parent только по этим child values. Score =
+matched_child_values / sampled_child_values — без независимого parent LIMIT
+sample, кросс-табличного подзапроса и полного скана.
 
 fail-open: любая ошибка/таймаут/недоступность плагина → `None` (ребро НЕ
 отбрасывается, это refinement, не жёсткий gate), warning в лог. DSN в логах
@@ -94,8 +95,8 @@ def _get_containment_cache_max() -> int:
 
 # --- TTL-кэш (negative-cache: храним и None) -------------------------------
 
-# Ключ — (dsn, table_a, col_a, table_b, col_b); значение — (timestamp, float|None).
-_CONTAINMENT_CACHE: "OrderedDict[Tuple[str, str, str, str, str], Tuple[float, Optional[float]]]" = (
+# Ключ — (dsn, table_a, col_a, table_b, col_b, sample_size); значение — (timestamp, float|None).
+_CONTAINMENT_CACHE: "OrderedDict[Tuple[str, str, str, str, str, int], Tuple[float, Optional[float]]]" = (
     OrderedDict()
 )
 _CONTAINMENT_CACHE_LOCK = threading.RLock()
@@ -145,8 +146,8 @@ def _cache_put(key, value: Optional[float]) -> None:
 # --- Основной хелпер -------------------------------------------------------
 
 
-def _distinct_sample(plugin, conn, table: str, column: str, limit: int) -> set:
-    """Один DISTINCT-сэмпл через плагин → множество строковых значений.
+def _distinct_sample(plugin, conn, table: str, column: str, limit: int) -> list:
+    """Один DISTINCT-сэмпл через плагин → список ненулевых значений.
 
     Бросает наружу при любой проблеме (отсутствие методов, success=False,
     исключение execute_select) — ловит вызывающий fail-open try.
@@ -162,6 +163,20 @@ def _distinct_sample(plugin, conn, table: str, column: str, limit: int) -> set:
         raise RuntimeError("execute_select returned success=False")
     # NULL уже отфильтрован в build_distinct_values_query (WHERE IS NOT NULL),
     # но на всякий случай отсекаем None из данных.
+    return [row[0] for row in result.get("data", []) if row and row[0] is not None]
+
+
+def _parent_membership_values(plugin, conn, table: str, column: str, values: list, limit: int) -> set:
+    """Parent DISTINCT по membership только для sampled child values."""
+    if not hasattr(plugin, "build_values_membership_query"):
+        raise RuntimeError("plugin lacks build_values_membership_query")
+    if not hasattr(plugin, "execute_select"):
+        raise RuntimeError("plugin lacks execute_select")
+
+    sql = plugin.build_values_membership_query(table, column, values)
+    result = plugin.execute_select(conn, sql, row_limit=limit)
+    if not result.get("success", False):
+        raise RuntimeError("execute_select returned success=False")
     return {str(row[0]) for row in result.get("data", []) if row and row[0] is not None}
 
 
@@ -186,7 +201,8 @@ def estimate_join_containment(
     get_plugin=None → ленивый `from db_plugins import get_plugin` (DI-хук
     для тестов).
     """
-    key = (dsn, table_a, col_a, table_b, col_b)
+    limit = sample_size if sample_size is not None else _get_containment_sample()
+    key = (dsn, table_a, col_a, table_b, col_b, limit)
 
     cached = _cache_check(key)
     if cached is not _CACHE_MISS:
@@ -198,7 +214,7 @@ def estimate_join_containment(
         col_a,
         table_b,
         col_b,
-        sample_size=sample_size,
+        sample_size=limit,
         get_plugin=get_plugin,
     )
     _cache_put(key, value)
@@ -228,18 +244,22 @@ def _compute_join_containment(
         conn = plugin.connect(dsn)
         try:
             a_vals = _distinct_sample(plugin, conn, table_a, col_a, limit)
-            b_vals = _distinct_sample(plugin, conn, table_b, col_b, limit)
+            sampled_child_values = {str(value) for value in a_vals}
+            if not sampled_child_values:
+                # Знаменатель 0 — containment неопределим.
+                return None
+
+            matched_parent_values = _parent_membership_values(
+                plugin, conn, table_b, col_b, a_vals, limit
+            )
         finally:
             plugin.close(conn)
 
-        if not a_vals:
-            # Знаменатель 0 — containment неопределим.
-            return None
-        if not b_vals:
+        if not matched_parent_values:
             return 0.0
 
-        intersection = len(a_vals & b_vals)
-        return intersection / len(a_vals)
+        intersection = len(sampled_child_values & matched_parent_values)
+        return intersection / len(sampled_child_values)
     except Exception as e:
         logger.warning(
             "estimate_join_containment failed for dsn=%s %s.%s -> %s.%s: %s "

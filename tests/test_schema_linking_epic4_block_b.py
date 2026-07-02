@@ -770,6 +770,109 @@ def test_schema_linking_di_llm_caller(monkeypatch):
     assert result["linked_entities"]["metrics"][0]["column"] == "amount"
 
 
+def test_llm_linked_entities_normalized_to_schema_keys(monkeypatch):
+    """Wave 1A / L-1: bare LLM table/column names resolve to real schema keys."""
+
+    def fake_llm(**_kwargs):
+        import json as _json
+
+        return _json.dumps({
+            "linked_entities": {
+                "metrics": [
+                    {"name": "amount", "table": "orders", "column": "AMOUNT"},
+                ],
+                "dimensions": [],
+                "filters": {},
+            },
+            "joins": [],
+            "unlinked_entities": [],
+        })
+
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+
+    core = _make_core(relevant_tables=["public.orders"], llm_caller=fake_llm)
+    db_schema = {
+        "public.orders": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "amount": {"type": "DECIMAL"},
+            }
+        }
+    }
+
+    result = core.perform_linking(
+        {"metrics": ["amount"], "dimensions": [], "filters": {}},
+        db_schema,
+    )
+
+    metric = result["linked_entities"]["metrics"][0]
+    assert metric["table"] == "public.orders"
+    assert metric["column"] == "amount"
+    assert result["main_table"] == "public.orders"
+    assert result["join_success"] is True
+    assert result["linking_strategy"] == "llm"
+    assert result["error"] is None
+
+
+def test_llm_filters_only_linking_is_kept(monkeypatch):
+    """Wave 1A / L-2: filters-only LLM output is valid linked output."""
+
+    def fake_llm(**_kwargs):
+        import json as _json
+
+        return _json.dumps({
+            "linked_entities": {
+                "metrics": [],
+                "dimensions": [],
+                "filters": {
+                    "city": {
+                        "name": "city",
+                        "table": "users",
+                        "column": "city",
+                        "operator": "=",
+                        "value": "Москва",
+                    }
+                },
+            },
+            "joins": [],
+            "unlinked_entities": [],
+        })
+
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+
+    core = _make_core(relevant_tables=["public.users"], llm_caller=fake_llm)
+    db_schema = {
+        "public.users": {
+            "columns": {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "city": {"type": "TEXT"},
+            }
+        }
+    }
+
+    result = core.perform_linking(
+        {"metrics": [], "dimensions": [], "filters": {"city": "Москва"}},
+        db_schema,
+    )
+
+    linked_filters = result["linked_entities"]["filters"]
+    assert linked_filters == {
+        "city": {
+            "name": "city",
+            "table": "public.users",
+            "column": "city",
+            "operator": "=",
+            "value": "Москва",
+        }
+    }
+    assert result["main_table"] == "public.users"
+    assert result["join_success"] is True
+    assert result["linking_strategy"] == "llm"
+    assert result["error"] is None
+
+
 def test_schema_linking_no_llm_caller_is_explicit_error(monkeypatch):
     """EPIC 8.6 + AGENTS.md «НЕТ silent fallback»: если ``llm_caller=None`` и
     ``SCHEMA_LINKING_USE_LLM=1`` (включён LLM), и fallbacks выключены,

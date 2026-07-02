@@ -254,8 +254,13 @@ def get_sqlglot_dialect(dsn: str | None = None, *, strict: bool = False) -> str:
 
 
 def is_sqlglot_enabled() -> bool:
-    """Проверяет, включен ли режим sqlglot."""
-    return os.getenv("USE_SQLGLOT", "1") == "1"
+    """Compatibility shim: SQLGlot validation is always enabled.
+
+    ``USE_SQLGLOT=0`` used to switch safety/executor paths to regex fallbacks.
+    That made production behavior diverge from the tested AST path, so the env
+    flag is intentionally ignored while the function stays import-compatible.
+    """
+    return True
 
 
 def get_identifier_quote_char(dialect: str | None = None) -> str:

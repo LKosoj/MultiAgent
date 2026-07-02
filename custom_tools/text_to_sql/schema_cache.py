@@ -298,20 +298,28 @@ class SchemaCacheManager:
         entities: Any,
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> Dict[str, str]:
         """Подготавливает информацию для кэширования."""
-        effective_dsn = (
-            dsn if (isinstance(dsn, str) and dsn.strip())
-            else get_runtime_context_dsn()
-        )
-        # Fail-fast ДО вызова dsn_to_sanitized_name: без DSN нельзя гарантировать
-        # tenant isolation кэша. Молчаливый "default" приводит к cross-tenant leak.
-        # dsn_to_sanitized_name никогда не возвращает пустую строку
-        # (внутренний `return base or "db"`), поэтому валидировать надо именно
-        # исходный dsn ДО санитизации.
-        if not effective_dsn or not isinstance(effective_dsn, str) or not effective_dsn.strip():
-            raise ValueError("DSN is required for schema cache namespace")
-        session_id_cache = dsn_to_sanitized_name(effective_dsn)
+        if isinstance(session_id, str) and session_id.strip():
+            session_id_cache = session_id.strip()
+            effective_dsn = (
+                dsn if (isinstance(dsn, str) and dsn.strip())
+                else get_runtime_context_dsn()
+            )
+        else:
+            effective_dsn = (
+                dsn if (isinstance(dsn, str) and dsn.strip())
+                else get_runtime_context_dsn()
+            )
+            # Fail-fast ДО вызова dsn_to_sanitized_name: без DSN нельзя гарантировать
+            # tenant isolation кэша. Молчаливый "default" приводит к cross-tenant leak.
+            # dsn_to_sanitized_name никогда не возвращает пустую строку
+            # (внутренний `return base or "db"`), поэтому валидировать надо именно
+            # исходный dsn ДО санитизации.
+            if not effective_dsn or not isinstance(effective_dsn, str) or not effective_dsn.strip():
+                raise ValueError("DSN is required for schema cache namespace")
+            session_id_cache = dsn_to_sanitized_name(effective_dsn)
         cache_kind = "schema_linking"
         schema_version = get_schema_version(db_schema)
         linking_env = _collect_linking_cache_env()
@@ -390,7 +398,7 @@ class SchemaCacheManager:
         W2-T4: раньше broad except → return None маскировал corruption
         под miss; теперь это явный контракт.
         """
-        from memory.tools import get_memory
+        from memory.tools import get_memory, memory_requester_context
         from memory.manager import memory_manager
 
         if not (get_memory and memory_manager):
@@ -403,12 +411,14 @@ class SchemaCacheManager:
         # Ищем записи в кэше. IOError/JSONDecodeError/прочие сбои бэкенда
         # — это corruption, не miss; пробрасываем как SchemaCacheCorrupted.
         try:
-            results = get_memory(
-                session_id=cache_info["session_id"],
-                agent_name="Schema-RAG-Agent",
-                cache_kind=cache_info["cache_kind"],
-                include_historical=False,
-            )
+            with memory_requester_context("Schema-RAG-Agent"):
+                results = get_memory(
+                    session_id=cache_info["session_id"],
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind=cache_info["cache_kind"],
+                    include_historical=False,
+                    requesting_agent="Schema-RAG-Agent",
+                )
         except (IOError, OSError, json.JSONDecodeError) as exc:
             raise SchemaCacheCorrupted(
                 f"Failed to read schema-linking cache: {exc!r}"

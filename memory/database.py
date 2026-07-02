@@ -16,6 +16,7 @@ import threading
 import warnings
 import os
 import logging
+from datetime import datetime, timedelta, timezone
 
 warnings.filterwarnings(
     "ignore",
@@ -27,6 +28,89 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
+MEMORY_DB_SCHEMA_VERSION = 1
+
+
+def _sqlite_busy_timeout_ms() -> int:
+    raw = os.getenv("MEMORY_SQLITE_BUSY_TIMEOUT_MS", "5000")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid MEMORY_SQLITE_BUSY_TIMEOUT_MS=%r; using 5000", raw)
+        return 5000
+    return max(0, value)
+
+
+def _embedding_dimension(model) -> int | None:
+    getter = getattr(model, "get_embedding_dimension", None)
+    if not callable(getter):
+        getter = getattr(model, "get_sentence_embedding_dimension", None)
+    if callable(getter):
+        try:
+            dim = getter()
+        except Exception:
+            return None
+        try:
+            return int(dim) if dim is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _deduplicate_active_agent_memory(cursor: sqlite3.Cursor) -> None:
+    """Soft-delete legacy active duplicates before adding the active-row index."""
+    duplicate_groups = cursor.execute(
+        """
+        SELECT GROUP_CONCAT(rowid)
+        FROM agent_memory
+        WHERE valid_to IS NULL
+        GROUP BY session_id, agent_name, step
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+    if not duplicate_groups:
+        return
+
+    base_time = datetime.now(timezone.utc)
+    deduped_rows = 0
+    for group_index, (rowids_csv,) in enumerate(duplicate_groups):
+        rowids = [int(rowid) for rowid in str(rowids_csv).split(",") if rowid]
+        if len(rowids) < 2:
+            continue
+        placeholders = ",".join("?" for _ in rowids)
+        ordered_rowids = [
+            row[0]
+            for row in cursor.execute(
+                f"""
+                SELECT rowid
+                FROM agent_memory
+                WHERE rowid IN ({placeholders})
+                ORDER BY COALESCE(updated_at, created_at, valid_from, timestamp) DESC, rowid DESC
+                """,
+                rowids,
+            ).fetchall()
+        ]
+        for offset, rowid in enumerate(ordered_rowids[1:], start=1):
+            closed_at = (
+                base_time
+                + timedelta(microseconds=group_index * 1000 + offset)
+            ).isoformat()
+            cursor.execute(
+                """
+                UPDATE agent_memory
+                SET valid_to = ?, updated_at = ?
+                WHERE rowid = ? AND valid_to IS NULL
+                """,
+                (closed_at, closed_at, rowid),
+            )
+            deduped_rows += cursor.rowcount
+
+    if deduped_rows:
+        logger.warning(
+            "Soft-deleted %s legacy duplicate active agent_memory rows before "
+            "creating idx_agent_memory_active_step_unique",
+            deduped_rows,
+        )
 
 
 def _patch_chromadb_swig_type_modules() -> None:
@@ -81,9 +165,26 @@ class DatabaseHandler:
         # Инициализация ChromaDB
         self._init_chroma(embedding_model)
     
+    def _configure_connection(self, conn: sqlite3.Connection) -> sqlite3.Connection:
+        busy_timeout_ms = _sqlite_busy_timeout_ms()
+        conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        if self.db_path not in {":memory:", ""}:
+            try:
+                conn.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.DatabaseError as exc:
+                logger.warning("SQLite WAL mode is unavailable for %s: %s", self.db_path, exc)
+        return conn
+
     def _get_connection(self):
-        """Создает новое соединение с базой данных для текущего потока"""
-        return sqlite3.connect(self.db_path, check_same_thread=False)
+        """Создает новое соединение с единой SQLite policy для текущего потока."""
+        conn = sqlite3.connect(
+            self.db_path,
+            timeout=_sqlite_busy_timeout_ms() / 1000,
+            check_same_thread=False,
+            isolation_level="DEFERRED",
+        )
+        return self._configure_connection(conn)
 
     def get_connection(self):
         """Публичный alias для `_get_connection` (см. T3.20).
@@ -127,6 +228,12 @@ class DatabaseHandler:
                 CREATE INDEX IF NOT EXISTS idx_memory_active 
                 ON agent_memory(session_id) WHERE valid_to IS NULL
             ''')
+            _deduplicate_active_agent_memory(cursor)
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memory_active_step_unique
+                ON agent_memory(session_id, agent_name, step)
+                WHERE valid_to IS NULL
+            ''')
             cursor.execute('''
                 CREATE INDEX IF NOT EXISTS idx_memory_run 
                 ON agent_memory(session_id, agent_name, run_id)
@@ -162,6 +269,14 @@ class DatabaseHandler:
                 CREATE INDEX IF NOT EXISTS idx_strategic_active 
                 ON strategic_memory(session_id, type) WHERE valid_to IS NULL
             ''')
+            current_version = cursor.execute("PRAGMA user_version").fetchone()[0]
+            if current_version > MEMORY_DB_SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Memory DB schema version {current_version} is newer than "
+                    f"supported {MEMORY_DB_SCHEMA_VERSION}"
+                )
+            if current_version < MEMORY_DB_SCHEMA_VERSION:
+                cursor.execute(f"PRAGMA user_version = {MEMORY_DB_SCHEMA_VERSION}")
             conn.commit()
         finally:
             conn.close()
@@ -181,6 +296,8 @@ class DatabaseHandler:
                 self.embedding_model = SentenceTransformer(embedding_model)
             # Сохраняем читаемое имя модели для UI
             self.embedding_model_name = embedding_model
+            self.embedding_dimension = _embedding_dimension(self.embedding_model)
+            self.embedding_metadata_mismatch = False
             
             # Создаем клиент ChromaDB с отключенной телеметрией
             from chromadb.config import Settings
@@ -209,11 +326,17 @@ class DatabaseHandler:
             # TEXT_TO_SQL_CHROMA_METRIC (cosine|l2|ip), но cosine — единственный
             # вариант, под который написана downstream-логика.
             chroma_metric = os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine").strip().lower() or "cosine"
+            collection_metadata = {
+                "hnsw:space": chroma_metric,
+                "embedding_model_name": self.embedding_model_name,
+            }
+            if self.embedding_dimension is not None:
+                collection_metadata["embedding_dimension"] = self.embedding_dimension
             self.strategic_collection = self.chroma_client.get_or_create_collection(
                 name="strategic_memory",
                 metadata={
                     "description": "High-level goals and context",
-                    "hnsw:space": chroma_metric,
+                    **collection_metadata,
                 },
             )
 
@@ -221,7 +344,7 @@ class DatabaseHandler:
                 name="tactical_memory",
                 metadata={
                     "description": "Detailed step-by-step agent experience",
-                    "hnsw:space": chroma_metric,
+                    **collection_metadata,
                 },
             )
 
@@ -246,6 +369,32 @@ class DatabaseHandler:
                         _actual,
                         chroma_metric,
                     )
+                if isinstance(_meta, dict):
+                    stored_model = _meta.get("embedding_model_name")
+                    stored_dim = _meta.get("embedding_dimension")
+                    model_mismatch = (
+                        isinstance(stored_model, str)
+                        and stored_model
+                        and stored_model != self.embedding_model_name
+                    )
+                    dim_mismatch = False
+                    if stored_dim is not None and self.embedding_dimension is not None:
+                        try:
+                            dim_mismatch = int(stored_dim) != int(self.embedding_dimension)
+                        except (TypeError, ValueError):
+                            dim_mismatch = True
+                    if model_mismatch or dim_mismatch:
+                        self.embedding_metadata_mismatch = True
+                        logger.error(
+                            "Chroma collection '%s' embedding metadata mismatch: "
+                            "stored model=%r dim=%r, current model=%r dim=%r. "
+                            "Semantic search may fail; rebuild ChromaDB from SQLite.",
+                            _coll_name,
+                            stored_model,
+                            stored_dim,
+                            self.embedding_model_name,
+                            self.embedding_dimension,
+                        )
             
             _patch_chromadb_swig_type_modules()
             print("ChromaDB инициализирована успешно")
@@ -255,6 +404,8 @@ class DatabaseHandler:
             # Fallback: устанавливаем None чтобы система работала только с SQLite
             self.embedding_model = None
             self.embedding_model_name = ""
+            self.embedding_dimension = None
+            self.embedding_metadata_mismatch = False
             self.chroma_client = None
             self.strategic_collection = None
             self.tactical_collection = None

@@ -273,7 +273,12 @@ class NLUMorphemes:
 
 
 def _coerce_str_list(value: Any, field: str) -> List[str]:
-    return coerce_str_list(value, field, yaml_filename="nlu_morphemes.yaml")
+    return coerce_str_list(
+        value,
+        field,
+        yaml_filename="nlu_morphemes.yaml",
+        reject_empty_strings=True,
+    )
 
 
 def _coerce_canonical_groups(value: Any, field: str) -> List[Dict[str, Any]]:

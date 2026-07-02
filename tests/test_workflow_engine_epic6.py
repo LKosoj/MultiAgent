@@ -220,6 +220,33 @@ def test_step_with_substituted_metadata_uses_helper():
     assert new_step.metadata["preload_agents"] == ["sql_generator_agent"]
 
 
+def test_step_with_substituted_metadata_preserves_output_schema_requirements():
+    engine = _engine_instance()
+    models = _workflow_models()
+    WorkflowStep = models.WorkflowStep
+    WorkflowContext = models.WorkflowContext
+
+    requirements = {"required": ["sql", "description"]}
+    step = WorkflowStep(
+        id="sql_generation",
+        task="task",
+        agent_type="sql_generator_agent",
+        metadata={"dsn": "{dsn}"},
+        output_schema="json_object",
+        output_schema_requirements=requirements,
+    )
+    ctx = WorkflowContext(
+        workflow_id="wf-x",
+        session_id="sess-x",
+        variables={"dsn": "sqlite:///tmp/app.db"},
+    )
+
+    new_step = engine._step_with_substituted_metadata(step, ctx)
+
+    assert new_step.output_schema == "json_object"
+    assert new_step.output_schema_requirements == requirements
+
+
 # ===========================================================================
 # 6.2: dict/list values -> json.dumps in task.format
 # ===========================================================================

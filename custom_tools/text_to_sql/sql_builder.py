@@ -76,6 +76,7 @@ def build_sql_from_linked_entities(
 
     select_parts: List[str] = []
     group_by_parts: List[str] = []
+    has_aggregate_metric = False
 
     for dim in dimensions:
         table = dim.get("table")
@@ -133,6 +134,7 @@ def build_sql_from_linked_entities(
         else:
             aggregate_arg = expr
         select_parts.append(f"{func}({aggregate_arg}) AS {alias}")
+        has_aggregate_metric = True
 
     if not select_parts:
         return {}
@@ -185,6 +187,7 @@ def build_sql_from_linked_entities(
             elif to_table in joined_tables and from_join_table not in joined_tables:
                 join_target = from_join_table
             elif from_join_table in joined_tables and to_table in joined_tables:
+                made_progress = True
                 continue
             else:
                 remaining_joins.append(join)
@@ -256,7 +259,7 @@ def build_sql_from_linked_entities(
     if where_parts:
         sql_parts.append(f"WHERE {' AND '.join(where_parts)}")
 
-    if group_by_parts:
+    if has_aggregate_metric and group_by_parts:
         sql_parts.append(f"GROUP BY {', '.join(group_by_parts)}")
 
     sql_query = " ".join(sql_parts)

@@ -831,6 +831,11 @@ def _load_runner_with_service_stub(monkeypatch, handle_service_action):
 
     stub_service = types.ModuleType("backend.fastapi_app.agui.service")
     stub_service.handle_service_action = handle_service_action
+    stub_service._require_service_action_role = (
+        lambda action, principal: None
+        if principal.has_role("admin")
+        else (_ for _ in ()).throw(PermissionError(f"service action '{action}' requires role 'admin'"))
+    )
     stub_service._redact_payload = lambda value: value
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.service", stub_service)
 
@@ -892,12 +897,14 @@ def test_v1_runs_lifecycle(client, monkeypatch):
 
     monkeypatch.setattr(rm, "run_agent", fake_run_agent)
 
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
-    payload = _make_payload(run_id)
+    client_run_id = f"run-{uuid.uuid4().hex[:8]}"
+    payload = _make_payload(client_run_id)
     response = client.post("/v1/runs", json=payload)
     assert response.status_code == 200
     body = response.json()
-    assert body["runId"] == run_id
+    run_id = body["runId"]
+    assert run_id != client_run_id
+    assert run_id.startswith("run-")
     assert "/v1/runs/" in body["eventsUrl"]
 
     for _ in range(20):
@@ -916,6 +923,161 @@ def test_v1_runs_lifecycle(client, monkeypatch):
     result_resp = client.get(f"/v1/runs/{run_id}/result")
     assert result_resp.status_code == 200
     assert result_resp.json()["result"] == {"status": "ok"}
+
+
+def test_agui_auth_required_rejects_missing_and_bad_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN", "secret-token")
+
+    async def fake_run_agent(_input_data):
+        if False:
+            yield None
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    monkeypatch.setattr(gateway, "store", store)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
+    local_client = TestClient(gateway.app)
+
+    payload = _make_payload("client-run")
+
+    assert local_client.post("/v1/runs", json=payload).status_code == 401
+    assert local_client.post(
+        "/v1/runs",
+        json=payload,
+        headers={"Authorization": "Bearer wrong-token"},
+    ).status_code == 403
+
+    response = local_client.post(
+        "/v1/runs",
+        json=payload,
+        headers={"Authorization": "Bearer secret-token"},
+    )
+    assert response.status_code == 200
+    assert response.json()["runId"].startswith("run-")
+
+
+def test_agui_run_access_is_bound_to_authenticated_principal(tmp_path, monkeypatch):
+    token_map = {
+        "token-a": {"subject": "alice", "tenant_id": "tenant-1", "roles": ["user"]},
+        "token-b": {"subject": "bob", "tenant_id": "tenant-1", "roles": ["user"]},
+    }
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN_MAP", json.dumps(token_map))
+
+    async def fake_run_agent(input_data):
+        yield RunStartedEvent(
+            type=EventType.RUN_STARTED,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+            input=input_data,
+            timestamp=int(time.time() * 1000),
+        )
+        yield RunFinishedEvent(
+            type=EventType.RUN_FINISHED,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+            result={"owner": "alice"},
+            timestamp=int(time.time() * 1000),
+        )
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    monkeypatch.setattr(gateway, "store", store)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
+    local_client = TestClient(gateway.app)
+
+    response = local_client.post(
+        "/v1/runs",
+        json=_make_payload("client-selected-run"),
+        headers={"Authorization": "Bearer token-a"},
+    )
+    assert response.status_code == 200
+    run_id = response.json()["runId"]
+    assert run_id != "client-selected-run"
+
+    for _ in range(20):
+        status = local_client.get(
+            f"/v1/runs/{run_id}",
+            headers={"Authorization": "Bearer token-a"},
+        ).json()
+        if status["status"] == "finished":
+            break
+        time.sleep(0.05)
+
+    assert local_client.get(
+        f"/v1/runs/{run_id}/result",
+        headers={"Authorization": "Bearer token-a"},
+    ).status_code == 200
+    assert local_client.get(
+        f"/v1/runs/{run_id}/result",
+        headers={"Authorization": "Bearer token-b"},
+    ).status_code == 404
+    assert local_client.post(
+        f"/v1/runs/{run_id}/cancel",
+        headers={"X-AGUI-Token": "token-b"},
+    ).status_code == 404
+
+
+def test_generic_auth_token_is_not_admin_for_legacy_runs(tmp_path, monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN", "user-token")
+    monkeypatch.setenv("AG_UI_ADMIN_TOKEN", "admin-token")
+
+    async def fake_run_agent(_input_data):
+        if False:
+            yield None
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    monkeypatch.setattr(gateway, "store", store)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
+    local_client = TestClient(gateway.app)
+    store.append(
+        "legacy-run",
+        EventType.RUN_FINISHED.value,
+        {"type": "RUN_FINISHED", "runId": "legacy-run", "result": {"ok": True}},
+    )
+
+    assert local_client.get(
+        "/v1/runs/legacy-run/result",
+        headers={"Authorization": "Bearer user-token"},
+    ).status_code == 404
+    response = local_client.get(
+        "/v1/runs/legacy-run/result",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert response.status_code == 200
+    assert response.json()["result"] == {"ok": True}
+
+
+def test_optional_auth_missing_token_is_anonymous_not_admin(tmp_path, monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "optional")
+
+    async def fake_run_agent(_input_data):
+        if False:
+            yield None
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    monkeypatch.setattr(gateway, "store", store)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
+    local_client = TestClient(gateway.app)
+    store.append(
+        "legacy-run",
+        EventType.RUN_FINISHED.value,
+        {"type": "RUN_FINISHED", "runId": "legacy-run", "result": {"ok": True}},
+    )
+
+    assert local_client.get("/v1/runs/legacy-run/result").status_code == 404
 
 
 def test_v1_run_result_falls_back_to_latest_service_result(client):
@@ -1185,6 +1347,36 @@ async def test_service_action_streams_and_errors_are_redacted(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_service_actions_require_admin_role(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal, principal_context
+
+    runner = _load_runner_with_service_stub(monkeypatch, lambda _action, _payload: {})
+
+    class LoggingManager:
+        def subscribe_all_logs(self, _callback):
+            raise AssertionError("user must not subscribe to all logs")
+
+        def unsubscribe_all_logs(self, _callback):
+            return None
+
+    monkeypatch.setattr(runner, "get_logging_manager", lambda *args, **kwargs: LoggingManager())
+
+    payload = _make_payload(f"run-{uuid.uuid4().hex[:8]}")
+    payload["forwardedProps"] = {
+        "service_action": "logs.stream",
+        "service_payload": {"run_id": "*", "duration_seconds": 0.01},
+    }
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    with principal_context(user):
+        events = [event async for event in runner.run_agent(RunAgentInput(**payload))]
+
+    error_event = next(event for event in events if event.type == EventType.RUN_ERROR)
+    assert error_event.code == "service_action_error"
+    assert "requires role" in error_event.message
+
+
+@pytest.mark.asyncio
 async def test_live_stream_has_independent_followers(tmp_path, monkeypatch):
     async def fake_run_agent(input_data):
         yield RunStartedEvent(
@@ -1349,6 +1541,7 @@ def test_replay_follow_after_boundary_has_no_duplicates(client, monkeypatch):
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     create_resp = client.post("/v1/runs", json=_make_payload(run_id))
     assert create_resp.status_code == 200
+    run_id = create_resp.json()["runId"]
 
     for _ in range(20):
         status = client.get(f"/v1/runs/{run_id}").json()
@@ -1382,6 +1575,7 @@ def test_v1_runs_cancel(client, monkeypatch):
     payload = _make_payload(run_id)
     create_resp = client.post("/v1/runs", json=payload)
     assert create_resp.status_code == 200
+    run_id = create_resp.json()["runId"]
 
     cancel_resp = client.post(f"/v1/runs/{run_id}/cancel")
     assert cancel_resp.status_code == 200

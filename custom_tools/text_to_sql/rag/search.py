@@ -283,13 +283,17 @@ class RAGSearcher:
             # (retrieval.py:262), а не примеры. Раньше здесь запрашивался
             # 'vector_db_search' → проиндексированные примеры не находились
             # вовсе. Запрашиваем правильный namespace примеров.
-            memory_hits = _facade.get_memory(
-                session_id=session_id,
-                agent_name="Schema-RAG-Agent",
-                cache_kind="sqlrag_example",
-                query=query_text,
-                include_historical=False,
-            )
+            from memory.tools import memory_requester_context
+
+            with memory_requester_context("Schema-RAG-Agent"):
+                memory_hits = _facade.get_memory(
+                    session_id=session_id,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="sqlrag_example",
+                    query=query_text,
+                    include_historical=False,
+                    requesting_agent="Schema-RAG-Agent",
+                )
             if isinstance(memory_hits, list):
                 for hit in memory_hits:
                     data = hit.get("data", {}) if isinstance(hit, dict) else {}

@@ -39,6 +39,8 @@ class FakePlugin:
         self.last_limit = None
         # Запоминаем (table, column, limit) для каждого build_distinct_values_query.
         self.distinct_calls = []
+        self.membership_calls = []
+        self._pending_membership = None
 
     def connect(self, dsn):
         self.connect_calls += 1
@@ -54,16 +56,34 @@ class FakePlugin:
         self.last_limit = limit
         return f"SELECT DISTINCT {column_name} FROM {table_name} LIMIT {limit}"
 
+    def build_values_membership_query(self, table_name, column_name, values):
+        values = list(values)
+        self.membership_calls.append(
+            (table_name, column_name, tuple(str(v) for v in values))
+        )
+        self._pending_membership = (table_name, column_name, {str(v) for v in values})
+        return f"SELECT DISTINCT {column_name} FROM {table_name} WHERE {column_name} IN (...)"
+
     def execute_select(self, conn, sql, row_limit=None):
         self.exec_calls += 1
         if self.exec_error is not None:
             raise self.exec_error
         if not self.exec_success:
             return {"success": False, "error_message": "boom"}
+        limit = row_limit if row_limit is not None else 500
+        if self._pending_membership is not None:
+            table, column, values = self._pending_membership
+            self._pending_membership = None
+            matches = [
+                v
+                for v in self.column_values.get((table, column), [])
+                if str(v) in values
+            ]
+            return {"success": True, "data": [(v,) for v in matches[:limit]]}
         # Определяем какие данные вернуть по тексту SQL (table/column в нём есть).
         for (table, column), values in self.column_values.items():
             if f"FROM {table}" in sql and column in sql:
-                return {"success": True, "data": [(v,) for v in values]}
+                return {"success": True, "data": [(v,) for v in values[:limit]]}
         return {"success": True, "data": []}
 
 
@@ -138,6 +158,24 @@ def test_containment_partial_half():
     assert result == 0.5
 
 
+def test_high_cardinality_parent_membership_scores_full_subset():
+    plugin = FakePlugin(
+        {
+            ("child", "parent_id"): list(range(4001, 5001)),
+            ("parent", "id"): list(range(1, 5001)),
+        }
+    )
+    result = estimate_join_containment(
+        DSN, "child", "parent_id", "parent", "id", get_plugin=_di(plugin)
+    )
+    assert result == 1.0
+    assert plugin.distinct_calls == [("child", "parent_id", 1000)]
+    assert len(plugin.membership_calls) == 1
+    table, column, values = plugin.membership_calls[0]
+    assert (table, column) == ("parent", "id")
+    assert set(values) == {str(v) for v in range(4001, 5001)}
+
+
 def test_empty_a_returns_none():
     # Знаменатель 0 → None (неопределимо, НЕ 0.0).
     plugin = FakePlugin(
@@ -201,6 +239,18 @@ def test_plugin_without_build_distinct_returns_none_and_warning(caplog):
     assert result is None
     assert "fail-open" in caplog.text
     # connect случился, close в finally тоже.
+    assert plugin.close_calls == 1
+
+
+def test_plugin_without_membership_query_returns_none_and_warning(monkeypatch, caplog):
+    monkeypatch.delattr(FakePlugin, "build_values_membership_query")
+    plugin = FakePlugin({("a", "col_a"): ["1"]})
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.join_containment"):
+        result = estimate_join_containment(
+            DSN, "a", "col_a", "b", "col_b", get_plugin=_di(plugin)
+        )
+    assert result is None
+    assert "fail-open" in caplog.text
     assert plugin.close_calls == 1
 
 
@@ -276,7 +326,7 @@ def test_ttl_zero_disables_cache(monkeypatch):
 # --- sample_size прокидывается --------------------------------------------
 
 
-def test_sample_size_propagated_to_build_distinct():
+def test_sample_size_propagated_to_child_sample_and_parent_membership():
     plugin = FakePlugin(
         {
             ("a", "col_a"): ["1"],
@@ -286,8 +336,26 @@ def test_sample_size_propagated_to_build_distinct():
     estimate_join_containment(
         DSN, "a", "col_a", "b", "col_b", sample_size=37, get_plugin=_di(plugin)
     )
-    # Оба build_distinct_values_query получили limit=37.
-    assert plugin.distinct_calls == [("a", "col_a", 37), ("b", "col_b", 37)]
+    assert plugin.distinct_calls == [("a", "col_a", 37)]
+    assert plugin.membership_calls == [("b", "col_b", ("1",))]
+
+
+def test_sample_size_is_part_of_cache_key():
+    plugin = FakePlugin(
+        {
+            ("a", "col_a"): ["1"],
+            ("b", "col_b"): ["1"],
+        }
+    )
+    r1 = estimate_join_containment(
+        DSN, "a", "col_a", "b", "col_b", sample_size=10, get_plugin=_di(plugin)
+    )
+    r2 = estimate_join_containment(
+        DSN, "a", "col_a", "b", "col_b", sample_size=1000, get_plugin=_di(plugin)
+    )
+    assert r1 == r2 == 1.0
+    assert plugin.exec_calls == 4
+    assert plugin.distinct_calls == [("a", "col_a", 10), ("a", "col_a", 1000)]
 
 
 def test_env_sample_size_used_when_none(monkeypatch):
@@ -299,7 +367,7 @@ def test_env_sample_size_used_when_none(monkeypatch):
         }
     )
     estimate_join_containment(DSN, "a", "col_a", "b", "col_b", get_plugin=_di(plugin))
-    assert all(limit == 55 for (_, _, limit) in plugin.distinct_calls)
+    assert plugin.distinct_calls == [("a", "col_a", 55)]
 
 
 # --- DSN-маскинг -----------------------------------------------------------

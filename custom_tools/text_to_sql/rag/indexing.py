@@ -379,11 +379,15 @@ class IndexingService:
             # Ищем записи с таким file_hash в метаданных.
             # Late lookup через фасад rag, чтобы поддерживать monkeypatch на rag.get_memory.
             from custom_tools.text_to_sql import rag as _facade
-            cached = _facade.get_memory(
-                session_id=session_id,
-                agent_name="Schema-RAG-Agent",
-                cache_kind="sqlrag_example"  # #17: соответствует cache_kind при индексации
-            )
+            from memory.tools import memory_requester_context
+
+            with memory_requester_context("Schema-RAG-Agent"):
+                cached = _facade.get_memory(
+                    session_id=session_id,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="sqlrag_example",  # #17: соответствует cache_kind при индексации
+                    requesting_agent="Schema-RAG-Agent",
+                )
 
             for item in cached if isinstance(cached, list) else []:
                 data = item.get("data", {})
@@ -394,21 +398,16 @@ class IndexingService:
     def _index_file_in_memory(self, session_id: str, filename: str, sql_snippets: List[str], file_hash: str) -> None:
         """Индексирует SQL-сниппеты из файла в тактическую память.
 
-        W1-T6 (атомарность):
-          * deactivation старых записей (UPDATE valid_to) выполняется на ВЫДЕЛЕННОМ
-            connection (``conn_dx``) БЕЗ commit'а до окончания save_memory-цикла.
-          * save_memory открывает СВОЙ connection (см. memory/tools.py:294) и
-            коммитит каждую INSERT отдельно — это нельзя объединить в одну SQLite
-            tx без рефакторинга save_memory contract. Поэтому используется паттерн
-            "compensation snapshot":
-              - На любой сбой save_memory: (a) собираем уже-вставленные new_steps
-                и UPDATE valid_to=now (новый отдельный conn — compensation INSERT'ов),
-                (b) ROLLBACK conn_dx — старые записи остаются ``valid_to IS NULL``.
-              - На success: COMMIT conn_dx — старые записи деактивированы только
-                после полного цикла.
-          * Chroma cleanup для старых записей вынесен ВНУТРЬ этого метода
-            (см. ниже), а не внутрь _remove_old_file_records, чтобы повторно
-            использовать compensation на ошибке Chroma.
+        W1-T6 (bounded compensation):
+          * save_memory открывает СВОЙ connection и коммитит каждую INSERT
+            отдельно — это нельзя объединить в одну SQLite tx без рефакторинга
+            save_memory contract.
+          * Поэтому не держим uncommitted SQLite writer-transaction во время
+            save_memory: сначала вставляем новые записи, затем отдельной короткой
+            транзакцией деактивируем старые.
+          * На любой сбой после частичных вставок деактивируем уже вставленные
+            new_steps. В strict Chroma cleanup дополнительно реактивируем старые
+            строки, если SQLite-deactivation уже была committed.
 
         HIGH #3 (сохраняется): на любую ошибку — НЕ обновляем registry в caller.
         """
@@ -417,28 +416,18 @@ class IndexingService:
         # 4.5: per-session RLock — реентерабельность для случая, когда уже под локом из ensure().
         with self._get_session_lock(session_id):
             current_time = datetime.now().isoformat()
-
-            # 1) Открываем выделенный conn (conn_dx). Deactivate старые записи,
-            #    собираем chroma_ids — но НЕ commit'им до конца save_memory.
-            conn_dx = _facade.memory_manager.db_handler._get_connection()
             inserted_steps: List[int] = []
-            tactical_ids_old: List[str] = []
+            inserted_tactical_ids: List[str] = []
+            tactical_ids_old = self._collect_chroma_ids_for_file(
+                session_id=session_id, filename=filename
+            )
+            deactivated_old = 0
+            old_deactivation_committed = False
             try:
-                deactivated_old = self._deactivate_file_records(
-                    conn=conn_dx,
-                    session_id=session_id,
-                    filename=filename,
-                    current_time=current_time,
-                )
-
-                # Соберём chroma-ids старых записей (для последующего delete на success).
-                tactical_ids_old = self._collect_chroma_ids_for_file(
-                    session_id=session_id, filename=filename
-                )
-
-                # 2) Индексируем новые сниппеты через save_memory.
-                #    save_memory открывает свой conn и коммитит каждую запись —
-                #    собираем steps, чтобы на failure откатить их вручную.
+                # 1) Индексируем новые сниппеты через save_memory.
+                #    Здесь намеренно нет незакоммиченной SQLite write tx на
+                #    другом connection: иначе второй writer внутри save_memory
+                #    может сам себя заблокировать.
                 for i, snippet in enumerate(sql_snippets):
                     # 4.1: similarity_score не приклеиваем — его считает реранкер на запросе.
                     step = _facade.save_memory(
@@ -462,10 +451,41 @@ class IndexingService:
                             f"(returned {step!r}); aborting indexing transaction."
                         )
                     inserted_steps.append(step)
+                    inserted_tactical_ids.append(f"{session_id}-Schema-RAG-Agent-{step}")
 
-                # 3) Chroma cleanup старых записей. На failure в strict-mode —
-                #    rollback всего батча (см. except ниже). В non-strict —
-                #    только logger.error, SQLite tx коммитим (eventual consistency).
+                # 2) Короткой SQLite-транзакцией деактивируем старые записи
+                #    только после успешной вставки всех новых.
+                conn_dx = _facade.memory_manager.db_handler._get_connection()
+                try:
+                    deactivated_old = self._deactivate_file_records(
+                        conn=conn_dx,
+                        session_id=session_id,
+                        filename=filename,
+                        current_time=current_time,
+                    )
+                    conn_dx.commit()
+                    old_deactivation_committed = True
+                except Exception:
+                    try:
+                        conn_dx.rollback()
+                    except Exception as rb_err:
+                        logger.critical(
+                            "Failed to rollback deactivation tx for %s: %s",
+                            filename, rb_err,
+                        )
+                    raise
+                finally:
+                    try:
+                        conn_dx.close()
+                    except Exception as close_err:
+                        logger.warning(
+                            "Failed to close deactivation conn for %s: %s",
+                            filename, close_err,
+                        )
+
+                # 3) Chroma cleanup старых записей. На failure в strict-mode
+                #    компенсируем committed SQLite-deactivation ниже. В non-strict
+                #    SQLite остаётся source of truth (eventual consistency).
                 strict_chroma = _strict_chroma_cleanup_enabled()
                 chroma_cleanup_err: Optional[Exception] = None
                 try:
@@ -488,11 +508,9 @@ class IndexingService:
 
                 if chroma_cleanup_err is not None:
                     # strict-режим: поднимаем — попадём в общий except,
-                    # сработает compensation для inserted_steps + rollback conn_dx.
+                    # сработает compensation для inserted_steps и reactivation.
                     raise chroma_cleanup_err
 
-                # 4) Всё ок — коммитим deactivation старых записей.
-                conn_dx.commit()
                 logger.info(
                     "Indexed %d SQL snippets from %s (deactivated %d old SQLite rows)",
                     len(sql_snippets), filename, deactivated_old,
@@ -500,18 +518,24 @@ class IndexingService:
 
             except Exception:
                 # Compensation:
-                #   (a) ROLLBACK conn_dx — старые записи остаются valid_to IS NULL.
-                #   (b) Для уже-вставленных через save_memory — deactivate их
-                #       на отдельном connection (save_memory уже сделал commit
-                #       для каждой записи). Это удаляет частично-проиндексированные
-                #       новые записи, чтобы registry-vs-memory drift не возник.
-                try:
-                    conn_dx.rollback()
-                except Exception as rb_err:
-                    logger.critical(
-                        "Failed to rollback conn_dx for %s after indexing error: %s",
-                        filename, rb_err,
-                    )
+                #   (a) если old deactivation уже committed — возвращаем old rows
+                #       в active состояние;
+                #   (b) уже-вставленные через save_memory deactivation'им на
+                #       отдельном connection (save_memory уже сделал commit).
+                if old_deactivation_committed and deactivated_old:
+                    try:
+                        self._reactivate_file_records(
+                            session_id=session_id,
+                            filename=filename,
+                            valid_to=current_time,
+                            current_time=datetime.now().isoformat(),
+                        )
+                    except Exception as comp_err:
+                        logger.critical(
+                            "Failed to reactivate old records for %s after "
+                            "indexing error: %s",
+                            filename, comp_err,
+                        )
 
                 if inserted_steps:
                     try:
@@ -526,14 +550,9 @@ class IndexingService:
                             "Memory state inconsistent — manual cleanup required.",
                             filename, inserted_steps, comp_err,
                         )
+                if inserted_tactical_ids:
+                    self._compensate_inserted_chroma_ids(inserted_tactical_ids)
                 raise
-            finally:
-                try:
-                    conn_dx.close()
-                except Exception as close_err:
-                    logger.warning(
-                        "Failed to close conn_dx for %s: %s", filename, close_err
-                    )
 
     def _remove_old_file_records(self, session_id: str, filename: str) -> None:
         """Удаляет старые записи из файла.
@@ -777,6 +796,69 @@ class IndexingService:
             except Exception as close_err:
                 logger.warning(
                     "Failed to close compensation conn: %s", close_err,
+                )
+
+    def _compensate_inserted_chroma_ids(self, tactical_ids: List[str]) -> None:
+        """Best-effort Chroma cleanup for snippets inserted before reindex failure."""
+        if not tactical_ids:
+            return
+        from custom_tools.text_to_sql import rag as _facade
+
+        tactical = _facade.memory_manager.db_handler.tactical_collection
+        _chroma_safe_delete(tactical, list(tactical_ids), strict=False)
+        logger.warning(
+            "Compensation: deleted %d partially-inserted Chroma records.",
+            len(tactical_ids),
+        )
+
+    def _reactivate_file_records(
+        self,
+        *,
+        session_id: str,
+        filename: str,
+        valid_to: str,
+        current_time: str,
+    ) -> int:
+        """Reactivates old file rows deactivated by this indexing attempt."""
+        from custom_tools.text_to_sql import rag as _facade
+
+        conn = _facade.memory_manager.db_handler._get_connection()
+        try:
+            cursor = conn.cursor()
+            filename_value_json = json.dumps(filename, ensure_ascii=False)
+            like_pattern = (
+                f'%"filename":{_escape_like(filename_value_json, escape_char="~")}%'
+            )
+            cursor.execute(
+                """
+                UPDATE agent_memory
+                SET valid_to = NULL, updated_at = ?
+                WHERE session_id = ? AND agent_name = ? AND valid_to = ?
+                AND data LIKE ? ESCAPE '~'
+                AND data NOT LIKE '%"cache_kind":"schema_table"%'
+                """,
+                (
+                    current_time,
+                    session_id,
+                    "Schema-RAG-Agent",
+                    valid_to,
+                    like_pattern,
+                ),
+            )
+            count = cursor.rowcount if cursor.rowcount is not None else 0
+            conn.commit()
+            logger.warning(
+                "Compensation: reactivated %d old records for %s after "
+                "indexing failure.",
+                count, filename,
+            )
+            return count
+        finally:
+            try:
+                conn.close()
+            except Exception as close_err:
+                logger.warning(
+                    "Failed to close reactivation conn: %s", close_err,
                 )
 
     def _cleanup_orphaned_records(self, session_id: str) -> None:

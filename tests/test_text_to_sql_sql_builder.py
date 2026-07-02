@@ -81,6 +81,68 @@ def test_build_sql_from_linked_entities_basic_select_group_by():
     assert "GROUP BY" in sql
 
 
+def test_build_sql_dimensions_only_does_not_group_by():
+    context = {
+        "linked_entities": {
+            "metrics": [],
+            "dimensions": [{"table": "orders", "column": "status", "name": "status"}],
+            "filters": {},
+        }
+    }
+    result = sql_builder.build_sql_from_linked_entities(
+        context, schema_validator=_NullSchemaValidator()
+    )
+    assert "sql_query" in result, result
+    sql = result["sql_query"]
+    assert "GROUP BY" not in sql
+
+
+def test_build_sql_consumes_pending_join_between_already_joined_tables():
+    context = {
+        "linked_entities": {
+            "metrics": [
+                {"name": "total", "table": "orders", "column": "amount", "aggregation": "sum"},
+            ],
+            "dimensions": [
+                {"name": "customer", "table": "customers", "column": "name"},
+                {"name": "region", "table": "regions", "column": "name"},
+            ],
+            "filters": {},
+        },
+        "joins": [
+            {
+                "from_table": "customers",
+                "from_column": "region_id",
+                "to_table": "regions",
+                "to_column": "id",
+                "join_type": "LEFT",
+            },
+            {
+                "from_table": "orders",
+                "from_column": "customer_id",
+                "to_table": "customers",
+                "to_column": "id",
+                "join_type": "LEFT",
+            },
+            {
+                "from_table": "orders",
+                "from_column": "region_id",
+                "to_table": "regions",
+                "to_column": "id",
+                "join_type": "LEFT",
+            },
+        ],
+    }
+    result = sql_builder.build_sql_from_linked_entities(
+        context, schema_validator=_NullSchemaValidator()
+    )
+    assert "sql_query" in result, result
+    sql = result["sql_query"]
+    assert '"customers"' in sql
+    assert '"regions"' in sql
+    assert sql.count(" JOIN ") == 2
+
+
 def test_build_sql_returns_empty_when_no_metrics_or_dimensions():
     context = {"linked_entities": {"metrics": [], "dimensions": []}}
     result = sql_builder.build_sql_from_linked_entities(

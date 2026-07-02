@@ -424,15 +424,17 @@ def _load_schema_from_memory(dsn: str):
     """Пытается загрузить схему БД из памяти (tactical memory), если доступна."""
     try:
         from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
-        from memory.tools import get_memory
+        from memory.tools import get_memory, memory_requester_context
         session_id = dsn_to_sanitized_name(dsn)
         # Читаем записи, сохраненные индексатором схемы как schema_table
-        records = get_memory(
-            session_id=session_id,
-            cache_kind="schema_table",
-            include_historical=False,
-            requesting_agent="streamlit_ui"
-        )
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=session_id,
+                cache_kind="schema_table",
+                include_historical=False,
+                agent_name="Schema-RAG-Agent",
+                requesting_agent="Schema-RAG-Agent",
+            )
         if not records:
             return None
 

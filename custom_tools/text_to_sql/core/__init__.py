@@ -165,6 +165,7 @@ def sql_generation_plugin(
     context: str,
     user_query: str,
     dsn: Optional[str] = None,
+    session_id: Optional[str] = None,
 ) -> Dict[str, str]:
     """Генерирует SQL по схеме и запросу пользователя.
 
@@ -172,25 +173,34 @@ def sql_generation_plugin(
         context: контекст со схемой и подсказками из schema_linking.
         user_query: исходный запрос пользователя.
         dsn: явный DSN для диалект-aware генерации литералов и quoting.
+        session_id: workflow/session namespace для schema cache (опционально).
 
     Returns:
         Словарь с полями `sql_query` и `notes`.
     """
     from ._sql_generation_api import sql_generation_plugin as _impl
-    return _impl(context, user_query, dsn=dsn, sql_generator=sql_generator)
+    return _impl(
+        context,
+        user_query,
+        dsn=dsn,
+        session_id=session_id,
+        sql_generator=sql_generator,
+    )
 
 
-def code_formatter(sql_query: str) -> Dict[str, str]:
+def code_formatter(sql_query: str, dsn: Optional[str] = None) -> Dict[str, str]:
     """Форматирует SQL и маскирует литералы перед отдачей модели.
 
     Args:
         sql_query: исходный SQL-запрос.
+        dsn: явный DSN для dialect-aware masking/formatting; если None,
+            используется workflow runtime metadata.
 
     Returns:
         Словарь с ключами `formatted_sql` и `masked_sql`.
     """
     from ._sql_generation_api import code_formatter as _impl
-    return _impl(sql_query, sql_validator=sql_validator)
+    return _impl(sql_query, dsn=dsn, sql_validator=sql_validator)
 
 
 def sql_safety_check(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:

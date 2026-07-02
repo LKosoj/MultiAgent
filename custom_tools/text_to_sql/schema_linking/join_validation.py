@@ -565,6 +565,62 @@ class JoinValidator:
                 result.append(e)
         return result
 
+    def _unsafe_shared_parent_steiner_nodes(
+        self,
+        selected_edges: List[Dict[str, Any]],
+        terminals: set,
+    ) -> List[str]:
+        """Find non-required same-direction Steiner nodes that can create fan-out."""
+        if not selected_edges:
+            return []
+
+        incident: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for edge in selected_edges:
+            incident[edge.get("a")].append(edge)
+            incident[edge.get("b")].append(edge)
+
+        unsafe_nodes: List[str] = []
+        for node, node_edges in incident.items():
+            if node in terminals or len(node_edges) < 2:
+                continue
+            if all(edge.get("source") == "bridge" for edge in node_edges):
+                continue
+
+            roles = {
+                "a" if edge.get("a") == node else "b"
+                for edge in node_edges
+            }
+            if len(roles) != 1:
+                continue
+
+            components_with_terminals = 0
+            for edge in node_edges:
+                start = edge.get("b") if edge.get("a") == node else edge.get("a")
+                stack = [start]
+                seen = {node}
+                component_has_terminal = False
+                while stack:
+                    current = stack.pop()
+                    if current in seen:
+                        continue
+                    seen.add(current)
+                    if current in terminals:
+                        component_has_terminal = True
+                    for next_edge in incident.get(current, []):
+                        other = (
+                            next_edge.get("b")
+                            if next_edge.get("a") == current
+                            else next_edge.get("a")
+                        )
+                        if other not in seen:
+                            stack.append(other)
+                if component_has_terminal:
+                    components_with_terminals += 1
+            if components_with_terminals >= 2:
+                unsafe_nodes.append(node)
+
+        return sorted(unsafe_nodes)
+
     def _build_joins_graph(
         self,
         main_table: str,
@@ -592,6 +648,20 @@ class JoinValidator:
                     "Graph join-path did not connect all required tables "
                     "(unconnected=%s); falling back to greedy build_joins",
                     sorted(result.get("unconnected_tables", set())),
+                )
+                return self.join_builder.build_joins(
+                    main_table, required_tables, merged_joins
+                )
+            terminals = set(required_tables) | {main_table}
+            unsafe_nodes = self._unsafe_shared_parent_steiner_nodes(
+                result.get("_selected_edges", []),
+                terminals,
+            )
+            if unsafe_nodes:
+                logger.warning(
+                    "Graph join-path avoided unsafe shared-parent fan-out via "
+                    "non-required Steiner nodes %s; falling back to greedy build_joins",
+                    unsafe_nodes,
                 )
                 return self.join_builder.build_joins(
                     main_table, required_tables, merged_joins

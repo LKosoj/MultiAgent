@@ -402,6 +402,7 @@ def sql_generation_plugin(
     context: str,
     user_query: str,
     dsn: Optional[str] = None,
+    session_id: Optional[str] = None,
     *,
     sql_generator,
 ) -> Dict[str, str]:
@@ -414,6 +415,7 @@ def sql_generation_plugin(
         context: Контекст с привязанными к схеме сущностями
         user_query: Пользовательский запрос на естественном языке
         dsn: явный DSN для диалект-aware генерации литералов и quoting
+        session_id: workflow/session namespace для schema cache (опционально)
         sql_generator: инжектированный SQLGenerator (singleton фасада)
 
     Returns:
@@ -428,14 +430,57 @@ def sql_generation_plugin(
         raise ValueError(
             "sql_generation_plugin requires explicit dsn or workflow runtime metadata"
         )
-    return sql_generator.generate_sql(context, user_query, dsn=effective_dsn)
+    if session_id is None:
+        return sql_generator.generate_sql(
+            context,
+            user_query,
+            dsn=effective_dsn,
+        )
+    return sql_generator.generate_sql(
+        context,
+        user_query,
+        dsn=effective_dsn,
+        session_id=session_id,
+    )
 
 
-def code_formatter(sql_query: str, *, sql_validator) -> Dict[str, str]:
+def _mask_formatter_sql_for_keyword_scan(
+    sql_query: str,
+    dialect_name: str,
+    *,
+    sql_validator,
+) -> str:
+    try:
+        masked_sql = sql_validator._mask_string_literals(
+            sql_query,
+            dialect_name,
+        )
+    except TypeError:
+        # Backward compatibility for tests/custom validators that implemented
+        # the old one-argument hook.
+        masked_sql = sql_validator._mask_string_literals(sql_query)
+
+    mask_identifiers = getattr(sql_validator, "_mask_identifiers_via_lex", None)
+    if callable(mask_identifiers):
+        try:
+            return mask_identifiers(masked_sql, dialect_name)
+        except TypeError:
+            return mask_identifiers(masked_sql)
+    return masked_sql
+
+
+def code_formatter(
+    sql_query: str,
+    dsn: Optional[str] = None,
+    *,
+    sql_validator,
+) -> Dict[str, str]:
     """Диалект-осознанное форматирование SQL.
 
     Args:
         sql_query: SQL-запрос для форматирования
+        dsn: явный DSN для выбора dialect-aware masking/formatting. Если не
+            передан, используется workflow runtime metadata.
 
     Returns:
         Словарь с результатом форматирования. Возможные формы:
@@ -455,13 +500,26 @@ def code_formatter(sql_query: str, *, sql_validator) -> Dict[str, str]:
     """
     logger.info("Formatting SQL code")
 
+    from ..utils import get_runtime_context_dsn
+    from ..dialects import get_current_dialect_name
+
+    effective_dsn = (
+        dsn if isinstance(dsn, str) and dsn.strip() else get_runtime_context_dsn()
+    )
+    strict_dsn = bool(effective_dsn and str(effective_dsn).strip())
+    dialect_name = get_current_dialect_name(effective_dsn, strict=strict_dsn)
+
     # БЕЗОПАСНОСТЬ: Проверяем на запрещенные команды ДО форматирования.
     # Маскируем строковые литералы, чтобы regex не срабатывал на тексте внутри
     # кавычек (например, "SELECT 'do not DROP table'"). Согласуется с поведением
     # SQLSafetyValidator.validate(), который также маскирует литералы перед regex.
     # Список forbidden_keywords читаем у инжектированного валидатора, а не
     # инстанцируем новый — это единственный source of truth для DI.
-    masked_sql = sql_validator._mask_string_literals(sql_query)
+    masked_sql = _mask_formatter_sql_for_keyword_scan(
+        sql_query,
+        dialect_name,
+        sql_validator=sql_validator,
+    )
     upper_sql = masked_sql.upper().strip()
     forbidden = _detect_forbidden_keyword(upper_sql, sql_validator.forbidden_keywords)
     if forbidden is not None:
@@ -491,7 +549,7 @@ def code_formatter(sql_query: str, *, sql_validator) -> Dict[str, str]:
             record_sqlglot_metric("format_count")
             record_sqlglot_metric("parse_attempts")
 
-            dialect = get_sqlglot_dialect()
+            dialect = get_sqlglot_dialect(effective_dsn, strict=strict_dsn)
             sqlglot_dialect = None if dialect == "ansi" else dialect
             # EPIC 7.27: парсим через parse_with_timeout — защита от длинных/злых SQL.
             statements = parse_with_timeout(sql_query.strip(), read=sqlglot_dialect)
@@ -531,7 +589,7 @@ def code_formatter(sql_query: str, *, sql_validator) -> Dict[str, str]:
             logger.error("sqlglot formatting failed: %s", safe_error)
             return {"error": safe_error}
         record_sqlglot_metric("fallback_count")
-        logger.warning("sqlglot formatting failed in legacy mode, using legacy formatter: %s", safe_error)
+        logger.warning("sqlglot formatting failed with compatibility formatter enabled: %s", safe_error)
 
     # Fallback на текущую реализацию
     return _format_sql_legacy(sql_query)

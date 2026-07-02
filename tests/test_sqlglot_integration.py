@@ -5,7 +5,7 @@ import os
 import pytest
 from unittest.mock import patch
 
-# Не перетираем USE_SQLGLOT, если он явно выставлен в CI-окружении (например, =0).
+# Флаг сохранён для совместимости окружений, но runtime теперь игнорирует =0.
 os.environ.setdefault("USE_SQLGLOT", "1")
 
 from custom_tools.text_to_sql.validators import (
@@ -185,8 +185,8 @@ class TestSQLGlotIntegration:
             assert get_sqlglot_dialect() == expected
 
 
-class TestSQLGlotDisabled:
-    """Тесты когда sqlglot отключен."""
+class TestSQLGlotFlagCompatibility:
+    """Тесты совместимости старого USE_SQLGLOT=0 флага."""
 
     @pytest.fixture(autouse=True)
     def _use_sqlglot_disabled(self, monkeypatch):
@@ -195,17 +195,16 @@ class TestSQLGlotDisabled:
         self.safety_validator = SQLSafetyValidator()
         yield  # явная setup/teardown-семантика; monkeypatch откатит env после теста
 
-    def test_explicit_legacy_mode(self):
-        """Тест явного legacy mode через USE_SQLGLOT=0."""
-        assert not is_sqlglot_enabled()
+    def test_use_sqlglot_zero_is_ignored(self):
+        """USE_SQLGLOT=0 больше не переключает validator на legacy regex."""
+        assert is_sqlglot_enabled()
 
-        # Legacy validation разрешена только потому, что режим явно выключил sqlglot.
         result = self.safety_validator.validate("SELECT * FROM users;")
         assert result["is_safe"] is True
 
-        # Запрещенные ключевые слова должны ловиться legacy методом
         result = self.safety_validator.validate("DROP TABLE users;")
         assert result["is_safe"] is False
+        assert "FORBIDDEN_STATEMENT" in {i["issue_type"] for i in result["issues"]}
 
     def test_strict_mode_requires_sqlglot(self, monkeypatch):
         """При USE_SQLGLOT=1 отсутствие sqlglot является явной ошибкой."""
@@ -213,25 +212,22 @@ class TestSQLGlotDisabled:
 
         monkeypatch.setenv("USE_SQLGLOT", "1")
         monkeypatch.setattr(validators, "SQLGLOT_AVAILABLE", False)
-        # Construct a fresh validator AFTER setting USE_SQLGLOT=1 so it sees
-        # the updated env flag rather than the stale instance from the fixture
-        # (which was built under USE_SQLGLOT=0).
         validator = SQLSafetyValidator()
         result = validator.validate("SELECT * FROM users;")
 
         assert result["is_safe"] is False
         assert result["issues"][0]["issue_type"] == "SQLGLOT_UNAVAILABLE"
 
-    def test_schema_validation_reports_sqlglot_disabled_explicitly(self):
+    def test_schema_validation_ignores_use_sqlglot_zero(self):
         schema_validator = SQLSchemaValidator()
 
         result = schema_validator.validate_sql_against_schema(
             "SELECT id FROM users",
-            {"users": {"columns": {"id": {"type": "INTEGER"}}}},
+            {"users": {"id": {"type": "INTEGER"}}},
         )
 
-        assert result["is_valid"] is False
-        assert result["issues"][0]["issue_type"] == "SQLGLOT_DISABLED_FOR_SCHEMA_VALIDATION"
+        assert result["is_valid"] is True
+        assert result["issues"] == []
 
 
 if __name__ == "__main__":

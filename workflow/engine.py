@@ -916,6 +916,7 @@ class WorkflowEngine(DynamicAgentSystem):
             tool_params=dict(step.tool_params) if step.tool_params else {},
             output_retry_policy=step.output_retry_policy,
             output_schema=step.output_schema,
+            output_schema_requirements=step.output_schema_requirements,
         )
         return new_step
 

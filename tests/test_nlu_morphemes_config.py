@@ -73,6 +73,17 @@ def test_nlu_loads_morphemes_from_yaml(tmp_path, monkeypatch):
     assert result["entities"]["filters"] == {}
 
 
+def test_nlu_rejects_empty_morphemes(tmp_path, monkeypatch):
+    """S-2: empty morphemes would match every input and must fail config load."""
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    _write_minimal_config(cfg_path, intent_morpheme="")
+
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(cfg_path))
+
+    with pytest.raises(ValueError, match="must not contain empty strings"):
+        nlu_config.load_nlu_morphemes()
+
+
 def test_nlu_fails_fast_when_yaml_missing(tmp_path, monkeypatch):
     """Если конфиг не найден, fallback обязан падать FileNotFoundError."""
     missing_path = tmp_path / "does_not_exist.yaml"

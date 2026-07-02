@@ -11,7 +11,7 @@ RAG-память для smolagents с политиками доступа
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Literal, Tuple
 from dataclasses import dataclass, field
 from smolagents import AgentMemory
@@ -24,10 +24,14 @@ from memory.manager import get_memory_manager
 logger = logging.getLogger(__name__)
 from memory.tools import (
     save_memory, get_memory, get_memory_summary, 
-    clear_agent_memory, get_session_memory_stats
+    clear_agent_memory, get_session_memory_stats, memory_requester_context
 )
 
 _ACTIVE_RAG_MEMORY: Dict[Tuple[str, str], "RagMemory"] = {}
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
 def get_active_rag_memory(session_id: str, agent_name: str) -> Optional["RagMemory"]:
@@ -200,7 +204,7 @@ class RagMemory(AgentMemory):
         self.steps = [user_step] if user_step is not None else []
         self._compressed_summary = summary
         self._compressed_steps_count = removed - (1 if user_step is not None else 0)
-        self._compressed_at = datetime.now().isoformat()
+        self._compressed_at = _utc_now_iso()
 
         return {
             "status": "ok",
@@ -299,7 +303,7 @@ class RagMemory(AgentMemory):
         
         # Очищаем данные от служебной информации (теперь передается в отдельных параметрах)
         clean_data = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": _utc_now_iso(),
             "agent_context": self.agent_name,
             "policy_scope": self.policy.scope_read,
             "cache_kind": "agent_step",  # Метка для исключения перезаписи
@@ -387,12 +391,13 @@ class RagMemory(AgentMemory):
                 logger.warning(f"⚠️ Неизвестный scope_read={self.policy.scope_read} для {self.agent_name}, возвращаем пусто")
                 return []
             
-            memory_data = get_memory(
-                session_id=session_scope,
-                agent_name=agent_scope,
-                run_id=run_scope,
-                requesting_agent=self.agent_name  # Передаем информацию о запрашивающем агенте
-            )
+            with memory_requester_context(self.agent_name):
+                memory_data = get_memory(
+                    session_id=session_scope,
+                    agent_name=agent_scope,
+                    run_id=run_scope,
+                    requesting_agent=self.agent_name  # Передаем информацию о запрашивающем агенте
+                )
             
             logger.debug(f"🔍 get_full_steps: получено {len(memory_data) if isinstance(memory_data, list) else 'НЕ СПИСОК'} записей для {self.agent_name}")
             logger.debug(f"🔍 get_full_steps: тип memory_data = {type(memory_data)}")
@@ -415,7 +420,7 @@ class RagMemory(AgentMemory):
                             'agent_name': 'memory_summarizer',
                             'step': 0,
                             'data': record.get('data', {}),
-                            'timestamp': datetime.now().isoformat(),
+                            'timestamp': _utc_now_iso(),
                             'is_summary': True
                         }
                     else:
@@ -424,7 +429,7 @@ class RagMemory(AgentMemory):
                             'agent_name': record.get('agent_name'),
                             'step': record.get('step'),
                             'data': record.get('data'),
-                            'timestamp': record.get('valid_from', datetime.now().isoformat())
+                            'timestamp': record.get('valid_from', _utc_now_iso())
                         }
                     steps.append(step)
                 else:
@@ -433,7 +438,7 @@ class RagMemory(AgentMemory):
                         'agent_name': 'unknown',
                         'step': 0,
                         'data': {'raw_data': str(record)},
-                        'timestamp': datetime.now().isoformat()
+                        'timestamp': _utc_now_iso()
                     }
                     steps.append(step)
             except Exception as e:
@@ -448,7 +453,8 @@ class RagMemory(AgentMemory):
         Получение контекста из RAG-памяти с учетом политики и лимитов
         
         Args:
-            max_tokens: Максимальное количество токенов (если None, используется из политики)
+            max_tokens: Историческое имя параметра. В этой реализации значение
+                используется как лимит символов (если None, берется policy.max_tokens).
             
         Returns:
             Сжатый контекст всей памяти агента для передачи в LLM
@@ -459,10 +465,17 @@ class RagMemory(AgentMemory):
                 logger.info(f"🔒 Доступ к памяти заблокирован политикой для {self.agent_name}")
             return ""
         
-        # Используем лимит из политики если не задан явно
-        token_limit = max_tokens or self.policy.max_tokens
-        
+        # Backward compatibility: policy/API still call this max_tokens, but the
+        # implementation has always compared Python string lengths.
+        char_budget = max_tokens or self.policy.max_tokens
+
         context_parts = []
+        all_steps = self.get_full_steps()
+        recent_step_records = all_steps[-self.policy.last_k_steps:]
+        recent_step_keys = {
+            key for key in (self._memory_record_key(step) for step in recent_step_records)
+            if key is not None
+        }
         
         # 1. Стратегический контекст (если разрешен)
         if self.policy.strategic_read:
@@ -472,14 +485,17 @@ class RagMemory(AgentMemory):
         
         # 2. Семантический поиск (если включен)
         if self.policy.search_enabled:
-            recent_context = self._get_recent_context()
+            recent_context = self._get_recent_context(recent_step_records)
             if recent_context:
-                search_results = self._semantic_search(recent_context)
+                search_results = self._semantic_search(
+                    recent_context,
+                    exclude_step_keys=recent_step_keys,
+                )
                 if search_results:
                     context_parts.append(f"[Релевантная информация]:\n{search_results}")
         
         # 3. Последние шаги (оперативный контекст)
-        recent_steps = self._get_recent_steps()
+        recent_steps = self._get_recent_steps(recent_step_records)
         if recent_steps:
             context_parts.append(f"[Последние действия]:\n{recent_steps}")
         
@@ -500,20 +516,20 @@ class RagMemory(AgentMemory):
         full_context = "\n\n".join(context_parts)
 
         trimmed_parts = context_parts
-        if len(full_context) > token_limit:
+        if len(full_context) > char_budget:
             # Пытаемся убрать "Последние действия" как наименее важную секцию
             trimmed_parts = [p for p in context_parts if not p.startswith("[Последние действия]:")]
             full_context = "\n\n".join(trimmed_parts)
 
-        if len(full_context) > token_limit:
+        if len(full_context) > char_budget:
             # Если всё ещё не помещается — убираем "Релевантную информацию"
             trimmed_parts = [p for p in trimmed_parts
                              if not p.startswith("[Релевантная информация]:")]
             full_context = "\n\n".join(trimmed_parts)
 
-        if len(full_context) > token_limit:
+        if len(full_context) > char_budget:
             # Если и стратегический контекст слишком длинный — аккуратно обрезаем итоговый блок
-            full_context = _truncate_block(full_context, token_limit)
+            full_context = _truncate_block(full_context, char_budget)
             
         if self.policy.enable_logging and full_context:
             logger.debug(f"🔍 Контекст сформирован для {self.agent_name}: {len(full_context)} символов")
@@ -689,14 +705,15 @@ class RagMemory(AgentMemory):
         try:
             # Получаем записи ТОЛЬКО текущего запуска через run_id (источник истины — SQLite)
             # Для суммаризации читаем свой run без политических фильтров retrieval
-            records = get_memory(
-                session_id=self.session_id,
-                agent_name=self.agent_name,
-                query="",  # Пустой запрос = получить все (без семантики)
-                run_id=self.current_run_id,
-                include_historical=False,  # Только активные записи
-                requesting_agent=None,
-            )
+            with memory_requester_context(self.agent_name):
+                records = get_memory(
+                    session_id=self.session_id,
+                    agent_name=self.agent_name,
+                    query="",  # Пустой запрос = получить все (без семантики)
+                    run_id=self.current_run_id,
+                    include_historical=False,  # Только активные записи
+                    requesting_agent=self.agent_name,
+                )
             
             filtered_records = [r for r in records if isinstance(r, dict)]
             filtered_records.sort(key=lambda x: x.get('step', 0), reverse=True)
@@ -832,7 +849,7 @@ class RagMemory(AgentMemory):
                     "truncated": context_data["truncated"],
                     "instance_steps": self._instance_step
                 },
-                "timestamp": datetime.now().isoformat()
+                "timestamp": _utc_now_iso()
             }
             
             # Используем новую функцию save_memory с правильными параметрами
@@ -925,13 +942,14 @@ class RagMemory(AgentMemory):
             return []
         
         # Если нехватка результатов и разрешена эскалация - расширяем scope
-        results = get_memory(
-            session_id=session_scope,
-            query=query,
-            agent_name=agent_scope,
-            run_id=run_scope,
-            requesting_agent=self.agent_name
-        )[:max_results]
+        with memory_requester_context(self.agent_name):
+            results = get_memory(
+                session_id=session_scope,
+                query=query,
+                agent_name=agent_scope,
+                run_id=run_scope,
+                requesting_agent=self.agent_name
+            )[:max_results]
         
         if (len(results) < max_results // 2 and 
             self.policy.allow_scope_escalation and 
@@ -941,13 +959,14 @@ class RagMemory(AgentMemory):
             if self.policy.enable_logging:
                 logger.debug(f"🔄 Эскалация поиска для {self.agent_name}: agent → session")
                 
-            session_results = get_memory(
-                session_id=self.session_id,
-                query=query,
-                agent_name=None,  # Поиск по всей сессии
-                run_id=None,
-                requesting_agent=self.agent_name
-            )[:max_results]
+            with memory_requester_context(self.agent_name):
+                session_results = get_memory(
+                    session_id=self.session_id,
+                    query=query,
+                    agent_name=None,  # Поиск по всей сессии
+                    run_id=None,
+                    requesting_agent=self.agent_name
+                )[:max_results]
             
             # Объединяем результаты, убираем дубликаты
             combined_results = results + [r for r in session_results if r not in results]
@@ -992,9 +1011,21 @@ class RagMemory(AgentMemory):
                 logger.error(f"⚠️ Ошибка получения стратегического контекста: {e}")
             return ""
     
-    def _get_recent_context(self) -> str:
+    @staticmethod
+    def _memory_record_key(record: Dict[str, Any]) -> Optional[Tuple[str, Any]]:
+        """Ключ записи, достаточный для отсечения дублей semantic/recent."""
+        if not isinstance(record, dict):
+            return None
+        agent_name = record.get('agent_name')
+        step = record.get('step')
+        if agent_name is None or step is None:
+            return None
+        return str(agent_name), step
+
+    def _get_recent_context(self, recent_steps: Optional[List[Dict]] = None) -> str:
         """Получение краткого контекста для семантического поиска"""
-        recent_steps = self.get_full_steps()[-self.policy.last_k_steps:]
+        if recent_steps is None:
+            recent_steps = self.get_full_steps()[-self.policy.last_k_steps:]
         if not recent_steps:
             return ""
         
@@ -1010,7 +1041,11 @@ class RagMemory(AgentMemory):
         
         return " ".join(context_snippets)
     
-    def _semantic_search(self, context: str) -> str:
+    def _semantic_search(
+        self,
+        context: str,
+        exclude_step_keys: Optional[set[Tuple[str, Any]]] = None,
+    ) -> str:
         """Выполнение семантического поиска на основе контекста"""
         if not context.strip():
             return ""
@@ -1025,6 +1060,8 @@ class RagMemory(AgentMemory):
         # Форматируем результаты
         formatted_results = []
         for result in search_results:
+            if exclude_step_keys and self._memory_record_key(result) in exclude_step_keys:
+                continue
             agent = result.get('agent_name', 'unknown')
             data = result.get('data', {})
             if isinstance(data, dict):
@@ -1033,9 +1070,10 @@ class RagMemory(AgentMemory):
         
         return "\n".join(formatted_results)
     
-    def _get_recent_steps(self) -> str:
+    def _get_recent_steps(self, steps: Optional[List[Dict]] = None) -> str:
         """Получение последних шагов в читаемом формате"""
-        steps = self.get_full_steps()[-self.policy.last_k_steps:]
+        if steps is None:
+            steps = self.get_full_steps()[-self.policy.last_k_steps:]
         if not steps:
             return ""
         
@@ -1052,7 +1090,12 @@ class RagMemory(AgentMemory):
         """Проверка необходимости автосуммаризации"""
         if self._instance_step % 10 == 0:  # Проверяем каждые 10 шагов
             # Получаем общий размер памяти агента
-            memory_data = get_memory(self.session_id, agent_name=self.agent_name, requesting_agent=self.agent_name)
+            with memory_requester_context(self.agent_name):
+                memory_data = get_memory(
+                    self.session_id,
+                    agent_name=self.agent_name,
+                    requesting_agent=self.agent_name,
+                )
             total_size = 0
             for record in memory_data:
                 if isinstance(record, dict):

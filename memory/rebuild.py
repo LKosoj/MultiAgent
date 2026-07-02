@@ -10,10 +10,128 @@
 """
 
 import json
+import os
 from typing import Dict, List
 from smolagents import tool
 
+from .database import _embedding_dimension
 from .manager import memory_manager
+
+
+_SUPPORTED_CHROMA_METRICS = {"cosine", "l2", "ip"}
+
+
+def _metric_from_collection(collection) -> str | None:
+    """Return Chroma hnsw metric from an existing collection, if exposed."""
+    metadata = getattr(collection, "metadata", None)
+    if isinstance(metadata, dict):
+        raw = metadata.get("hnsw:space") or metadata.get("metric")
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip().lower()
+
+    configuration = getattr(collection, "configuration", None)
+    if isinstance(configuration, dict):
+        hnsw = configuration.get("hnsw")
+        if isinstance(hnsw, dict):
+            raw = hnsw.get("space")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip().lower()
+
+    return None
+
+
+def _resolve_rebuild_chroma_metric(handler) -> str:
+    """Resolve metric for recreated collections.
+
+    Existing collection metadata wins over env: rebuild should preserve the
+    actual metric already on disk when Chroma exposes it. Env remains the
+    fallback for fresh collections.
+    """
+    for collection in (
+        getattr(handler, "tactical_collection", None),
+        getattr(handler, "strategic_collection", None),
+    ):
+        metric = _metric_from_collection(collection)
+        if metric:
+            if metric not in _SUPPORTED_CHROMA_METRICS:
+                raise ValueError(
+                    f"Unsupported Chroma distance metric '{metric}' while rebuilding"
+                )
+            return metric
+
+    metric = os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine").strip().lower() or "cosine"
+    if metric not in _SUPPORTED_CHROMA_METRICS:
+        raise ValueError(
+            f"Unsupported TEXT_TO_SQL_CHROMA_METRIC '{metric}' while rebuilding"
+        )
+    return metric
+
+
+def _collection_metadata(handler, description: str, chroma_metric: str) -> Dict:
+    metadata = {
+        "description": description,
+        "hnsw:space": chroma_metric,
+    }
+    embedding_model_name = getattr(handler, "embedding_model_name", "") or ""
+    if embedding_model_name:
+        metadata["embedding_model_name"] = embedding_model_name
+
+    embedding_dimension = getattr(handler, "embedding_dimension", None)
+    if embedding_dimension is None:
+        embedding_dimension = _embedding_dimension(getattr(handler, "embedding_model", None))
+    if embedding_dimension is not None:
+        metadata["embedding_dimension"] = int(embedding_dimension)
+
+    return metadata
+
+
+def _extract_tactical_chroma_text(data: Dict) -> str:
+    """Mirror save_memory's Chroma document text selection for tactical rows."""
+    if isinstance(data, dict):
+        ck = data.get("cache_kind")
+
+        if ck == "agent_step":
+            agent_response = data.get("agent_response")
+            if isinstance(agent_response, str) and agent_response.strip():
+                return agent_response.strip()
+            slim = {
+                k: v
+                for k, v in data.items()
+                if k not in ("timestamp", "policy_scope", "agent_context")
+            }
+            return memory_manager._extract_text_content(slim)
+
+        if ck == "agent_summary":
+            summary_text = data.get("summary_text")
+            if isinstance(summary_text, str) and summary_text.strip():
+                return summary_text.strip()
+            return memory_manager._extract_text_content(data)
+
+        if ck == "schema_table":
+            table_fqn = data.get("table_fqn") or ""
+            desc = data.get("description") or ""
+            cols = []
+            try:
+                table_info = data.get("table_info") or {}
+                if isinstance(table_info, dict):
+                    for col in table_info.get("columns") or []:
+                        if isinstance(col, dict):
+                            name = col.get("name")
+                            col_desc = col.get("description")
+                            if name:
+                                if isinstance(col_desc, str) and col_desc.strip():
+                                    cols.append(f"{name}: {col_desc.strip()}")
+                                else:
+                                    cols.append(str(name))
+            except Exception:
+                cols = []
+            cols_text = "; ".join(cols[:40])
+            base = f"Таблица {table_fqn}. {desc}".strip()
+            if cols_text:
+                base = f"{base}\nКолонки: {cols_text}"
+            return base[:8000]
+
+    return memory_manager._extract_text_content(data)
 
 
 def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
@@ -29,6 +147,8 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
     
     if not handler.chroma_client or not handler.embedding_model:
         return "❌ ChromaDB или модель эмбеддингов не инициализированы."
+
+    chroma_metric = _resolve_rebuild_chroma_metric(handler)
 
     print("🗑️ Удаление существующих коллекций ChromaDB...")
     try:
@@ -51,21 +171,21 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
     # database.py:_init_chroma. Поскольку коллекции выше удалены через
     # delete_collection, эта запись фактически применяется (в отличие от
     # get_or_create_collection поверх существующей коллекции).
-    import os as _os
-    chroma_metric = _os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine").strip().lower() or "cosine"
     handler.strategic_collection = handler.chroma_client.get_or_create_collection(
         name="strategic_memory",
-        metadata={
-            "description": "High-level goals and context",
-            "hnsw:space": chroma_metric,
-        },
+        metadata=_collection_metadata(
+            handler,
+            "High-level goals and context",
+            chroma_metric,
+        ),
     )
     handler.tactical_collection = handler.chroma_client.get_or_create_collection(
         name="tactical_memory",
-        metadata={
-            "description": "Detailed step-by-step agent experience",
-            "hnsw:space": chroma_metric,
-        },
+        metadata=_collection_metadata(
+            handler,
+            "Detailed step-by-step agent experience",
+            chroma_metric,
+        ),
     )
 
     # Восстанавливаем тактическую память из agent_memory
@@ -125,7 +245,7 @@ def _rebuild_tactical_memory(handler) -> tuple[int, int]:
                     continue
                 
                 # Извлекаем текстовое содержимое
-                text_content = memory_manager._extract_text_content(data_dict)
+                text_content = _extract_tactical_chroma_text(data_dict)
                 if not text_content or len(text_content.strip()) < 10:
                     continue  # Пропускаем слишком короткий контент
                 

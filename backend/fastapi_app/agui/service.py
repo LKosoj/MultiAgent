@@ -48,6 +48,7 @@ from telemetry import get_telemetry_manager
 from tool_manager import get_tool_manager
 from unified_logging import get_logging_manager
 from workflow.streamlit_api import WorkflowManager
+from .auth import Principal, current_principal, normalize_session_id_for_principal
 from .redaction import (
     _dsn_fingerprint,
     _is_masked_dsn,
@@ -70,6 +71,169 @@ from utils import call_openai_api_streaming
 
 logger = logging.getLogger(__name__)
 
+_ALL_SERVICE_ACTIONS = frozenset(
+    {
+        "agents.cleanup",
+        "agents.cancel",
+        "agents.create",
+        "agents.dynamic.create",
+        "agents.dynamic.delete",
+        "agents.dynamic.get",
+        "agents.dynamic.list",
+        "agents.dynamic.parse_yaml",
+        "agents.dynamic.register",
+        "agents.events",
+        "agents.list",
+        "agents.profile",
+        "agents.result",
+        "agents.run",
+        "agents.status",
+        "agents.team.run",
+        "config.environment",
+        "config.get",
+        "config.llm_providers",
+        "config.test_llm",
+        "config.update",
+        "config.update_section",
+        "db.benchmark",
+        "db.comprehensive_test",
+        "db.diagnostics",
+        "db.dialect_info",
+        "db.generate_safe_sql",
+        "db.introspect_schema",
+        "db.list",
+        "db.plugin_info",
+        "db.quick_test",
+        "db.sql_limits",
+        "db.test_configs.delete",
+        "db.test_configs.list",
+        "db.test_configs.save",
+        "db.test_connection",
+        "db.validate_dsn",
+        "files.list",
+        "files.read",
+        "files.read_base64",
+        "logs.analytics",
+        "logs.cleanup",
+        "logs.file_content",
+        "logs.file_search",
+        "logs.files",
+        "logs.run_logs",
+        "logs.search",
+        "logs.search_advanced",
+        "logs.span_logs",
+        "logs.stream",
+        "memory.active_agents",
+        "memory.agent_stats",
+        "memory.analytics.keywords",
+        "memory.analytics.summary",
+        "memory.analytics.timeseries",
+        "memory.chroma.cleanup_empty",
+        "memory.cleanup_old",
+        "memory.clear_agent",
+        "memory.compress_database",
+        "memory.embeddings.test",
+        "memory.export",
+        "memory.full_cleanup",
+        "memory.import",
+        "memory.optimize_indexes",
+        "memory.rebuild",
+        "memory.search",
+        "memory.status",
+        "memory.vacuum",
+        "presets.agent_constructor.generate",
+        "presets.diagram.generate",
+        "presets.diagram.preview",
+        "presets.image.analysis_types",
+        "presets.image.analyze",
+        "presets.image.edit",
+        "presets.image.edit_batch",
+        "presets.image.generate",
+        "presets.text_to_sql.generate",
+        "progress.stream",
+        "system.active_runs",
+        "system.checks",
+        "system.diagnostics",
+        "system.init_status",
+        "system.prompt_optimizer.run",
+        "system.stale_monitor.start",
+        "system.stale_monitor.status",
+        "system.stale_monitor.stop",
+        "telemetry.analytics",
+        "telemetry.cleanup",
+        "telemetry.disable",
+        "telemetry.enable",
+        "telemetry.export",
+        "telemetry.filter_traces",
+        "telemetry.generate_report",
+        "telemetry.list_traces",
+        "telemetry.mark_incomplete",
+        "telemetry.trace_events",
+        "telemetry.trace_file",
+        "text_to_sql.history.analytics",
+        "text_to_sql.history.append",
+        "text_to_sql.history.clear",
+        "text_to_sql.history.list",
+        "text_to_sql.schema.load",
+        "tools.active_runs",
+        "tools.cleanup",
+        "tools.definition",
+        "tools.invoke",
+        "tools.list_definitions",
+        "tools.list_mcp",
+        "utils.base64.decode",
+        "utils.base64.encode",
+        "utils.call_openai_api_streaming",
+        "utils.color.convert",
+        "utils.csv.analyze",
+        "utils.hash.generate",
+        "utils.json.format",
+        "utils.text.analyze",
+        "utils.time.diff",
+        "utils.time.now",
+        "utils.url.decode",
+        "utils.url.encode",
+        "workflows.artifacts",
+        "workflows.cancel",
+        "workflows.cleanup",
+        "workflows.generate_report",
+        "workflows.generate_yaml",
+        "workflows.get_yaml",
+        "workflows.list",
+        "workflows.parse_yaml",
+        "workflows.result",
+        "workflows.save_yaml",
+        "workflows.start",
+        "workflows.status",
+        "workflows.storybook_actions",
+        "workflows.storybook_project_inventory",
+        "workflows.storybook_readiness",
+        "workflows.storybook_validate",
+    }
+)
+_USER_ACTIONS = frozenset(
+    {
+        "memory.search",
+        "memory.status",
+        "presets.text_to_sql.generate",
+        "system.init_status",
+        "utils.base64.decode",
+        "utils.base64.encode",
+        "utils.color.convert",
+        "utils.csv.analyze",
+        "utils.hash.generate",
+        "utils.json.format",
+        "utils.text.analyze",
+        "utils.time.diff",
+        "utils.time.now",
+        "utils.url.decode",
+        "utils.url.encode",
+    }
+)
+_MEMORY_ARCHIVIST_ACTIONS = frozenset({"memory.export", "memory.import"})
+_ADMIN_ONLY_ACTIONS = _ALL_SERVICE_ACTIONS - _USER_ACTIONS - _MEMORY_ARCHIVIST_ACTIONS
+_DEFAULT_MAX_FILE_READ_BYTES = 1_000_000
+
 
 def _model_mapping_details(mapping: Any) -> Dict[str, Dict[str, str]]:
     keys = getattr(mapping, "keys", None)
@@ -84,6 +248,68 @@ def _model_mapping_details(mapping: Any) -> Dict[str, Dict[str, str]]:
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
+
+
+def _require_service_action_role(action: str, principal: Principal) -> None:
+    if action not in _ALL_SERVICE_ACTIONS:
+        raise PermissionError(f"service action '{action}' is not classified")
+    if action in _USER_ACTIONS:
+        return
+    if action in _ADMIN_ONLY_ACTIONS:
+        _require_principal_role(principal, "admin", action)
+        return
+    if action in _MEMORY_ARCHIVIST_ACTIONS and not (
+        principal.has_role("admin") or principal.has_role("memory_archivist")
+    ):
+        raise PermissionError(
+            f"service action '{action}' requires role 'memory_archivist'"
+        )
+    return
+
+
+def _require_principal_role(principal: Principal, role: str, action: str) -> None:
+    if principal.has_role(role):
+        return
+    raise PermissionError(f"service action '{action}' requires role '{role}'")
+
+
+def _max_file_read_bytes() -> int:
+    raw = os.getenv("AG_UI_MAX_FILE_READ_BYTES")
+    if raw is None or raw == "":
+        return _DEFAULT_MAX_FILE_READ_BYTES
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("AG_UI_MAX_FILE_READ_BYTES must be an integer") from exc
+    if value <= 0:
+        raise ValueError("AG_UI_MAX_FILE_READ_BYTES must be positive")
+    return value
+
+
+def _read_text_with_size_limit(path: Path) -> str:
+    max_bytes = _max_file_read_bytes()
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"file is too large: {size} bytes > {max_bytes}")
+    return path.read_text(encoding="utf-8")
+
+
+def _read_bytes_with_size_limit(path: Path) -> bytes:
+    max_bytes = _max_file_read_bytes()
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"file is too large: {size} bytes > {max_bytes}")
+    return path.read_bytes()
+
+
+def _log_file_path(filename: Any) -> Path:
+    if not filename:
+        raise ValueError("filename is required")
+    logs_dir = (_project_root() / "logs").resolve()
+    candidate = (logs_dir / str(filename)).resolve()
+    if os.path.commonpath([str(logs_dir), str(candidate)]) != str(logs_dir):
+        raise ValueError("log file must stay inside logs directory")
+    return candidate
 
 
 def _workflow_pipeline_path(workflow_name: Any) -> Path:
@@ -471,18 +697,26 @@ def _extract_query(payload: Dict[str, Any]) -> str:
     return ""
 
 
-def _load_text_to_sql_schema_from_memory(dsn: str) -> Optional[Dict[str, Any]]:
+def _load_text_to_sql_schema_from_memory(
+    dsn: str,
+    principal: Optional[Principal] = None,
+    base_session_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     try:
         from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
-        from memory.tools import get_memory
+        from memory.tools import get_memory, memory_requester_context
 
-        session_id = dsn_to_sanitized_name(dsn)
-        records = get_memory(
-            session_id=session_id,
-            agent_name="Schema-RAG-Agent",
-            cache_kind="schema_table",
-            include_historical=False,
-        )
+        session_id = base_session_id or dsn_to_sanitized_name(dsn)
+        if principal is not None:
+            session_id = _scope_text_to_sql_session_id(session_id, principal)
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=session_id,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_table",
+                requesting_agent="Schema-RAG-Agent",
+                include_historical=False,
+            )
         if not records:
             return None
 
@@ -567,14 +801,24 @@ def _filter_schema(schema_data: Dict[str, Any], schema: Any = None, table_name: 
         filtered[table_key] = table_info
     return filtered
 
-def _compute_text_to_sql_session_id(dsn: str) -> str:
+def _compute_text_to_sql_session_id(
+    dsn: str,
+    principal: Optional[Principal] = None,
+) -> str:
     try:
         from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
 
-        return dsn_to_sanitized_name(dsn) or "default"
+        base_session_id = dsn_to_sanitized_name(dsn) or "default"
     except Exception:
         digest = hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:16]
-        return f"session_{digest}"
+        base_session_id = f"session_{digest}"
+    if principal is None:
+        return base_session_id
+    return _scope_text_to_sql_session_id(base_session_id, principal)
+
+
+def _scope_text_to_sql_session_id(base_session_id: str, principal: Principal) -> str:
+    return normalize_session_id_for_principal(base_session_id, principal)
 
 
 # NOTE: для нового кода предпочтительно использовать `_coerce_strict_bool` —
@@ -1013,8 +1257,12 @@ def _memory_export_csv(records: list[Dict[str, Any]]) -> str:
     return output.getvalue()
 
 
-def _memory_import_records(memory_manager: Any, records: list[Dict[str, Any]],
-                           allow_overwrite: bool) -> Dict[str, Any]:
+def _memory_import_records(
+    memory_manager: Any,
+    records: list[Dict[str, Any]],
+    allow_overwrite: bool,
+    principal: Principal,
+) -> Dict[str, Any]:
     import sqlite3
 
     if not records:
@@ -1106,7 +1354,7 @@ def _memory_import_records(memory_manager: Any, records: list[Dict[str, Any]],
     rebuild = None
     if imported:
         try:
-            rebuild_result = memory_manager.rebuild_memory(force=True)
+            rebuild_result = memory_manager.rebuild_memory(force=True, principal=principal)
             rebuild = _serialize(rebuild_result)
         except Exception as exc:
             errors.append(f"ChromaDB rebuild failed: {exc}")
@@ -2412,9 +2660,13 @@ def _search_log_file(filename: str,
                      case_sensitive: bool,
                      invert_search: bool,
                      context_lines: int) -> list[Dict[str, Any]]:
-    log_path = _ensure_within_root(_project_root() / "logs" / filename)
+    log_path = _log_file_path(filename)
     if not log_path.exists():
         raise ValueError("log file not found")
+    if log_path.stat().st_size > _max_file_read_bytes():
+        raise ValueError(
+            f"file is too large: {log_path.stat().st_size} bytes > {_max_file_read_bytes()}"
+        )
     entries: list[Dict[str, Any]] = []
     with log_path.open("r", encoding="utf-8") as f:
         for idx, line in enumerate(f):
@@ -2762,11 +3014,17 @@ class _LazyManager:
         return getattr(self._get(), name)
 
 
-def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def handle_service_action(
+    action: str,
+    payload: Dict[str, Any],
+    principal: Optional[Principal] = None,
+) -> Dict[str, Any]:
     if payload is None:
         payload = {}
     if not isinstance(payload, dict):
         raise ValueError("service_payload must be an object")
+    principal = principal or current_principal()
+    _require_service_action_role(action, principal)
 
     agent_manager = _LazyManager(_agent_manager)
     wf_manager = _LazyManager(_wf_manager)
@@ -3226,19 +3484,23 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
             limit=int(payload.get("limit", 10)),
             session_id=payload.get("session_id"),
             agent_name=payload.get("agent_name"),
+            principal=principal,
         )
         return {"result": _serialize(result)}
     if action == "memory.rebuild":
-        result = memory_manager.rebuild_memory(force=bool(payload.get("force", False)))
+        result = memory_manager.rebuild_memory(
+            force=bool(payload.get("force", False)),
+            principal=principal,
+        )
         return {"result": _serialize(result)}
     if action == "memory.active_agents":
-        return {"agents": _serialize(memory_manager.get_active_agents())}
+        return {"agents": _serialize(memory_manager.get_active_agents(principal=principal))}
     if action == "memory.agent_stats":
         agent_name = payload.get("agent_name")
         session_id = payload.get("session_id")
         if not agent_name or not session_id:
             raise ValueError("agent_name and session_id are required")
-        result = memory_manager.get_agent_memory_stats(agent_name, session_id)
+        result = memory_manager.get_agent_memory_stats(agent_name, session_id, principal=principal)
         return {"result": _serialize(result)}
     if action == "memory.clear_agent":
         agent_name = payload.get("agent_name")
@@ -3246,12 +3508,26 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         confirm = bool(payload.get("confirm", False))
         if not agent_name or not session_id:
             raise ValueError("agent_name and session_id are required")
-        return {"result": _serialize(memory_manager.clear_agent_memory(agent_name, session_id, confirm=confirm))}
+        return {
+            "result": _serialize(
+                memory_manager.clear_agent_memory(
+                    agent_name,
+                    session_id,
+                    confirm=confirm,
+                    principal=principal,
+                )
+            )
+        }
     if action == "memory.export":
         fmt = (payload.get("format") or "json").lower()
         agent_name = payload.get("agent_name")
         session_id = payload.get("session_id")
-        export_data = memory_manager.export_memory(agent_name=agent_name, session_id=session_id, format=fmt)
+        export_data = memory_manager.export_memory(
+            agent_name=agent_name,
+            session_id=session_id,
+            format=fmt,
+            principal=principal,
+        )
         if export_data.get("success") and fmt == "csv":
             csv_data = _memory_export_csv(export_data.get("data", []))
             export_data["csv"] = csv_data
@@ -3264,7 +3540,11 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
             raise ValueError("format must be json")
         if not isinstance(records, list):
             raise ValueError("records must be a list")
-        return {"result": _serialize(_memory_import_records(memory_manager, records, allow_overwrite))}
+        return {
+            "result": _serialize(
+                _memory_import_records(memory_manager, records, allow_overwrite, principal)
+            )
+        }
     if action == "memory.cleanup_old":
         days = int(payload.get("days", 30))
         confirm = bool(payload.get("confirm", False))
@@ -3395,7 +3675,7 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         schema_name = payload.get("schema")
         table_name = payload.get("table_name")
         warnings: list[str] = []
-        memory_schema = _load_text_to_sql_schema_from_memory(dsn)
+        memory_schema = _load_text_to_sql_schema_from_memory(dsn, principal=principal)
         if memory_schema:
             schema = _filter_schema(memory_schema, schema=schema_name, table_name=table_name)
             return {"schema": _serialize(schema), "source": "memory", "warnings": warnings}
@@ -3671,11 +3951,13 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         return {"files": files}
     if action == "logs.file_content":
         filename = payload.get("filename")
-        if not filename:
-            raise ValueError("filename is required")
-        log_path = _ensure_within_root(_project_root() / "logs" / filename)
+        log_path = _log_file_path(filename)
         if not log_path.exists():
             raise ValueError("log file not found")
+        if log_path.stat().st_size > _max_file_read_bytes():
+            raise ValueError(
+                f"file is too large: {log_path.stat().st_size} bytes > {_max_file_read_bytes()}"
+            )
         limit = int(payload.get("limit", 500))
         query = payload.get("query", "")
         level = payload.get("level")
@@ -3843,7 +4125,8 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         merged_payload["dsn"] = _resolve_dsn_reference(payload.get("dsn"))
         req = parse_text_to_sql_generate(merged_payload)
 
-        session_id = req.session_id or _compute_text_to_sql_session_id(req.dsn)
+        base_session_id = req.session_id or _compute_text_to_sql_session_id(req.dsn)
+        session_id = _scope_text_to_sql_session_id(base_session_id, principal)
         run_id = f"run-{uuid.uuid4().hex[:16]}"
         agui_entrypoint = _workflow_agui_entrypoint(req.workflow_name)
         if agui_entrypoint != "presets.text_to_sql.generate":
@@ -4250,13 +4533,13 @@ def handle_service_action(action: str, payload: Dict[str, Any]) -> Dict[str, Any
         if not path:
             raise ValueError("path is required")
         file_path = _ensure_within_root(_project_root() / path)
-        return {"content": file_path.read_text(encoding="utf-8")}
+        return {"content": _read_text_with_size_limit(file_path)}
     if action == "files.read_base64":
         path = payload.get("path")
         if not path:
             raise ValueError("path is required")
         file_path = _ensure_within_root(_project_root() / path)
-        data = base64.b64encode(file_path.read_bytes()).decode("ascii")
+        data = base64.b64encode(_read_bytes_with_size_limit(file_path)).decode("ascii")
         return {"base64": data, "filename": file_path.name}
 
     raise ValueError(f"Unknown service action: {action}")

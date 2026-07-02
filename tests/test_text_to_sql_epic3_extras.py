@@ -101,6 +101,71 @@ def test_schema_loader_non_dict_json_logs_warning_and_returns_none(tmp_path, cap
     )
 
 
+def test_schema_loader_invalid_json_warns_and_get_database_schema_falls_back(
+    tmp_path, caplog, monkeypatch
+):
+    """S-4: truncated sqlrag JSON must be skipped, not crash the pipeline."""
+    import logging
+
+    repo_root = tmp_path
+    sqlrag_dir = repo_root / "sqlrag"
+    sqlrag_dir.mkdir()
+
+    dsn = "sqlite:///nowhere.db"
+    from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
+    sanitized = dsn_to_sanitized_name(dsn)
+    (sqlrag_dir / f"{sanitized}.json").write_text(
+        '{"enable": true, "schema_info": ',
+        encoding="utf-8",
+    )
+
+    fallback_schema = {"fallback": {"columns": {"id": {"type": "int"}}}}
+    loader = SchemaLoader(repo_root=repo_root)
+    monkeypatch.setattr(loader, "_introspect_via_plugin", lambda _dsn: fallback_schema)
+
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.schema_loader"):
+        result = loader.get_database_schema({}, dsn=dsn)
+
+    assert result == fallback_schema
+    assert any("fallback" in record.message for record in caplog.records)
+
+
+def test_schema_loader_autosave_schema_writes_via_atomic_replace(tmp_path, monkeypatch):
+    """S-4: autosave writes a temp file and atomically replaces the target."""
+    from custom_tools.text_to_sql import schema_loader as schema_loader_module
+    from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
+
+    replace_calls = []
+    real_replace = schema_loader_module.os.replace
+
+    def recording_replace(src, dst):
+        replace_calls.append((Path(src), Path(dst)))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(schema_loader_module.os, "replace", recording_replace)
+
+    dsn = "sqlite:///nowhere.db"
+    db_schema = {
+        "orders": {
+            "metadata": {"owner": "analytics"},
+            "columns": {"id": {"type": "int"}},
+        },
+    }
+    loader = SchemaLoader(repo_root=tmp_path)
+    loader.autosave_schema(dsn, db_schema)
+
+    json_path = tmp_path / "sqlrag" / f"{dsn_to_sanitized_name(dsn)}.json"
+    assert replace_calls
+    tmp_path_used, final_path = replace_calls[0]
+    assert final_path == json_path
+    assert tmp_path_used.parent == json_path.parent
+    assert not tmp_path_used.exists()
+
+    payload = json.loads(json_path.read_text(encoding="utf-8"))
+    assert payload["enable"] is True
+    assert payload["schema_info"]["orders"]["metadata"] == {"owner": "analytics"}
+
+
 # ---------------------------------------------------------------------------
 # 3.24: SCHEMA_INCLUDE_TABLES case-insensitive
 # ---------------------------------------------------------------------------

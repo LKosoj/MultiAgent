@@ -29,7 +29,7 @@ except ImportError:
     sqlglot = None
     exp = None
 
-from ..dialects import get_sqlglot_dialect, is_sqlglot_enabled
+from ..dialects import get_sqlglot_dialect
 
 from .safety import record_sqlglot_metric, _parse_with_timeout, _ParseTimeoutError
 
@@ -92,15 +92,6 @@ class SQLSchemaValidator:
                 "issues": [],
                 "schema_check_skipped": True,
                 "skip_reason": "empty_schema",
-            }
-
-        if not is_sqlglot_enabled():
-            return {
-                "is_valid": False,
-                "issues": [{
-                    "issue_type": "SQLGLOT_DISABLED_FOR_SCHEMA_VALIDATION",
-                    "description": "USE_SQLGLOT=0 disables schema validation. Enable sqlglot or disable TEXT_TO_SQL_VALIDATE_SCHEMA."
-                }]
             }
 
         if not SQLGLOT_AVAILABLE:

@@ -282,6 +282,31 @@ def test_cache_key_changes_when_dsn_host_changes(monkeypatch):
     assert info_a["env_fingerprint"] != info_b["env_fingerprint"]
 
 
+def test_cache_key_changes_when_explicit_session_id_changes(monkeypatch):
+    """Wave 0: scoped workflow session_id is the cache namespace when provided."""
+    cache = SchemaCacheManager()
+    entities = {"metrics": ["revenue"]}
+    schema = {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    dsn = "postgresql://u:p@host:5432/orders"
+
+    info_alice = cache.prepare_cache_info(
+        entities,
+        schema,
+        dsn=dsn,
+        session_id="orders__u_alice",
+    )
+    info_bob = cache.prepare_cache_info(
+        entities,
+        schema,
+        dsn=dsn,
+        session_id="orders__u_bob",
+    )
+
+    assert info_alice["session_id"] == "orders__u_alice"
+    assert info_bob["session_id"] == "orders__u_bob"
+    assert info_alice["cache_key"] != info_bob["cache_key"]
+
+
 def test_cache_key_stable_when_only_credentials_change(monkeypatch):
     """W8-T1: ротация user/password в DSN при том же host:port:db → env_fingerprint сохраняется.
 

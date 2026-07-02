@@ -313,3 +313,66 @@ def test_weight_mode_picks_true_bridge(monkeypatch):
     assert result["success"] is True
     assert "br_true" in result["used_tables"]
     assert "br_false" not in result["used_tables"]
+
+
+def test_graph_rejects_non_required_shared_parent_fanout(monkeypatch, caplog):
+    monkeypatch.setenv("TEXT_TO_SQL_JOIN_PATH_ALGO", "graph")
+    join_config.reset_cache()
+
+    merged = [
+        {
+            "from_table": "A",
+            "from_column": "parent_id",
+            "to_table": "Y",
+            "to_column": "id",
+            "join_type": "LEFT",
+        },
+        {
+            "from_table": "B",
+            "from_column": "parent_id",
+            "to_table": "Y",
+            "to_column": "id",
+            "join_type": "LEFT",
+        },
+    ]
+    v = _validator_with_dsn()
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        result = v._build_joins_graph("A", {"A", "B"}, merged)
+
+    assert result["success"] is False
+    assert result["joins"] == []
+    assert "unsafe shared-parent fan-out" in caplog.text
+    assert "falling back" in caplog.text
+
+
+def test_graph_allows_explicit_bridge_steiner(monkeypatch, caplog):
+    monkeypatch.setenv("TEXT_TO_SQL_JOIN_PATH_ALGO", "graph")
+    join_config.reset_cache()
+
+    merged = [
+        {
+            "from_table": "Y",
+            "from_column": "a_id",
+            "to_table": "A",
+            "to_column": "id",
+            "join_type": "LEFT",
+            "via_bridge": True,
+        },
+        {
+            "from_table": "Y",
+            "from_column": "b_id",
+            "to_table": "B",
+            "to_column": "id",
+            "join_type": "LEFT",
+            "via_bridge": True,
+        },
+    ]
+    v = _validator_with_dsn()
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER_NAME):
+        result = v._build_joins_graph("A", {"A", "B"}, merged)
+
+    assert result["success"] is True
+    assert result["used_tables"] == {"A", "B", "Y"}
+    assert "unsafe shared-parent fan-out" not in caplog.text

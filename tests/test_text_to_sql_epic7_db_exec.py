@@ -26,6 +26,8 @@ from custom_tools.text_to_sql.core._db_exec import (
     _extract_explain_body,
     _normalize_executor_result,
     _normalize_jsonable,
+    _parse_row_limit,
+    _parse_statement_timeout_ms,
     _parse_table_parts_from_describe,
 )
 
@@ -78,6 +80,37 @@ def test_normalize_executor_result_preserves_data_columns_after_refactor():
     )
     assert result["data"] == [[1, "2.5"]]
     assert result["columns"] == ["a", "b"]
+
+
+def test_parse_row_limit_rejects_explicit_value_above_max_cap(monkeypatch):
+    monkeypatch.setenv("DB_EXECUTOR_MAX_ROW_LIMIT", "10")
+
+    value, failure = _parse_row_limit(11, time.time(), "SELECT 1")
+
+    assert value is None
+    assert failure["success"] is False
+    assert "exceeds DB_EXECUTOR_MAX_ROW_LIMIT" in failure["error_message"]
+
+
+def test_parse_row_limit_rejects_env_value_above_max_cap(monkeypatch):
+    monkeypatch.setenv("DB_EXECUTOR_ROW_LIMIT", "20")
+    monkeypatch.setenv("DB_EXECUTOR_MAX_ROW_LIMIT", "10")
+
+    value, failure = _parse_row_limit(None, time.time(), "SELECT 1")
+
+    assert value is None
+    assert failure["success"] is False
+    assert "exceeds DB_EXECUTOR_MAX_ROW_LIMIT" in failure["error_message"]
+
+
+def test_parse_statement_timeout_rejects_invalid_env(monkeypatch):
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "0")
+
+    value, failure = _parse_statement_timeout_ms(time.time(), "SELECT 1")
+
+    assert value is None
+    assert failure["success"] is False
+    assert "DB_EXECUTOR_STATEMENT_TIMEOUT_MS must be a positive integer" in failure["error_message"]
 
 
 # === 7.25: _build_failure_result helper ===
@@ -205,6 +238,110 @@ def test_secure_executor_select_failure_still_closes_conn(monkeypatch):
     assert close_calls == ["the-conn"]
 
 
+def test_secure_executor_applies_statement_timeout_before_select(monkeypatch):
+    calls = []
+
+    class Plugin:
+        def connect(self, dsn):
+            calls.append(("connect", dsn))
+            return "the-conn"
+
+        def close(self, conn):
+            calls.append(("close", conn))
+
+        def set_statement_timeout(self, conn, timeout_ms):
+            calls.append(("timeout", conn, timeout_ms))
+
+        def execute_select(self, conn, sql, row_limit=500):
+            calls.append(("execute", conn, sql, row_limit))
+            return {
+                "success": True,
+                "data": [[1]],
+                "columns": ["one"],
+                "rows_affected": 1,
+                "execution_time_ms": 1,
+                "error_message": None,
+            }
+
+    dsn = "sqlite:///tmp/app.db"
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "1234")
+    monkeypatch.setattr(core_module, "get_plugin", lambda dsn: Plugin())
+    monkeypatch.setattr(
+        core_module,
+        "sql_safety_check",
+        lambda sql_query, dsn=None: {"is_safe": True, "issues": []},
+    )
+
+    result = secure_db_executor("SELECT 1", row_limit=7, dsn=dsn)
+
+    assert result["success"] is True
+    assert calls == [
+        ("connect", dsn),
+        ("timeout", "the-conn", 1234),
+        ("execute", "the-conn", "SELECT 1", 7),
+        ("close", "the-conn"),
+    ]
+
+
+def test_secure_executor_returns_failure_when_statement_timeout_hook_fails(monkeypatch):
+    class Plugin:
+        def connect(self, dsn):
+            return "the-conn"
+
+        def close(self, conn):
+            return None
+
+        def set_statement_timeout(self, conn, timeout_ms):
+            raise RuntimeError("timeout setup failed")
+
+        def execute_select(self, conn, sql, row_limit=500):
+            raise AssertionError("query must not execute when timeout setup fails")
+
+    dsn = "sqlite:///tmp/app.db"
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setattr(core_module, "get_plugin", lambda dsn: Plugin())
+    monkeypatch.setattr(
+        core_module,
+        "sql_safety_check",
+        lambda sql_query, dsn=None: {"is_safe": True, "issues": []},
+    )
+
+    result = secure_db_executor("SELECT 1", dsn=dsn)
+
+    assert result["success"] is False
+    assert "timeout setup failed" in result["error_message"]
+
+
+def test_postgres_plugin_sets_statement_timeout():
+    from db_plugins.postgres import PostgresPlugin
+
+    class Cursor:
+        def __init__(self):
+            self.statements = []
+            self.closed = False
+
+        def execute(self, sql):
+            self.statements.append(sql)
+
+        def close(self):
+            self.closed = True
+
+    class Connection:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    conn = Connection()
+
+    PostgresPlugin().set_statement_timeout(conn, 2500)
+
+    assert conn.cursor_obj.statements == ["SET statement_timeout = 2500"]
+    assert conn.cursor_obj.closed is True
+
+
 # === 7.6/7.2: routing через sqlglot ===
 
 
@@ -324,8 +461,8 @@ def test_classify_statement_regex_fallback_without_sqlglot(sql, expected):
     assert _classify_statement_regex(sql) == expected
 
 
-def test_classify_statement_uses_regex_when_sqlglot_disabled(monkeypatch):
-    """При USE_SQLGLOT=0 _classify_statement должен использовать regex-классификатор."""
+def test_classify_statement_ignores_use_sqlglot_zero(monkeypatch):
+    """USE_SQLGLOT=0 больше не переключает runtime routing на regex."""
     monkeypatch.setenv("USE_SQLGLOT", "0")
     assert _classify_statement("SELECT 1") == "select"
     assert _classify_statement("DESCRIBE t") == "describe"

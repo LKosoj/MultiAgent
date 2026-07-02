@@ -336,11 +336,24 @@ class SchemaStatsHelper:
 
         for table_name, table_schema in db_schema.items():
             optimized_table: Dict[str, Any] = {}
+            has_explicit_columns = (
+                isinstance(table_schema, dict)
+                and isinstance(table_schema.get("columns"), dict)
+            )
 
-            # Сохраняем описание таблицы если есть
-            table_description = get_table_description(table_schema)
-            if table_description:
-                set_table_description(optimized_table, table_description)
+            if has_explicit_columns:
+                optimized_table.update(
+                    {key: value for key, value in table_schema.items() if key != "columns"}
+                )
+            else:
+                # Legacy shape stores columns as top-level dicts. Only keys that
+                # get_table_columns does not treat as columns can be copied safely.
+                if isinstance(table_schema, dict) and "metadata" in table_schema:
+                    optimized_table["metadata"] = table_schema["metadata"]
+
+                table_description = get_table_description(table_schema)
+                if table_description:
+                    set_table_description(optimized_table, table_description)
 
             # Оптимизируем колонки — БЕЗ удаления каких-либо ключей (lossless)
             table_columns = get_table_columns(table_schema)

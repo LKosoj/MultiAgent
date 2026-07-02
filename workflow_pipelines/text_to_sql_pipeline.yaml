@@ -105,6 +105,7 @@ steps:
     tool_params:
       entities: '{intent_extraction_step.entities}'
       dsn: '{dsn}'
+      session_id: '{session_id}'
     depends_on:
       - nlu_processing
       - intent_extraction_step
@@ -132,6 +133,12 @@ steps:
   - id: sql_generation
     step_type: agent
     agent_type: sql_generator_agent
+    output_schema: json_object
+    output_schema_requirements:
+      required:
+        - sql
+        - description
+    condition: '{schema_linking_step.join_success}'
     task: |
       Сгенерируй SQL-запрос для задачи пользователя.
 
@@ -165,7 +172,7 @@ steps:
       - dry_run_only: {dry_run_only}
       - dsn: передан инструментам через workflow runtime metadata
 
-      Используй инструмент sql_generation_plugin(context=..., user_query=...) для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
+      Используй инструмент sql_generation_plugin(context=..., user_query=..., session_id="{session_id}") для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
     depends_on:
       - schema_linking_step
     timeout: 120
@@ -180,6 +187,15 @@ steps:
       safety_level: '{safety_level}'
       use_schema_suggestions: '{use_schema_suggestions}'
       dsn: '{dsn}'
+      # skip_output применяется когда schema_linking_step.join_success=false.
+      # Это fail-closed guard: генератор не должен галлюцинировать SQL по пустой
+      # или несвязанной схеме.
+      skip_output:
+        sql: ""
+        description: "SQL generation skipped: schema linking did not produce a valid join path"
+        error: "schema_linking_join_failed"
+        recommendations:
+          - "Проверьте, что schema_linking вернул связанные таблицы, колонки и join_success=true"
 
   # =====================================================================
   # ЭТАП 5: SQL VERIFICATION (отдельный агент)

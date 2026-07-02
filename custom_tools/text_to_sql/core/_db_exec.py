@@ -161,13 +161,10 @@ def _parse_table_parts_from_describe(sql_query: str) -> list[str]:
 
     Единый парсер DESCRIBE-target (EPIC 7.26): текстовый разбор всегда
     используется как source of truth, sqlglot привлекается только как
-    валидатор синтаксиса при включённом USE_SQLGLOT (sqlglot.tokenize), что
+    валидатор синтаксиса через sqlglot.tokenize, что
     позволяет ловить мусорные DESCRIBE-формы ещё до execute_select.
     """
-    from ..dialects import is_sqlglot_enabled, get_sqlglot_dialect
-
-    if not is_sqlglot_enabled():
-        return _describe_identifier_parts_from_text(sql_query)
+    from ..dialects import get_sqlglot_dialect
 
     try:
         import sqlglot
@@ -338,7 +335,7 @@ def _extract_explain_body(sql_query: str) -> str:
 # === EPIC 7.2 / 7.6: routing через sqlglot AST ===
 _StatementKind = str  # "select" | "describe" | "explain" | "show" | "unknown"
 
-# Маппинг первого ключевого слова → kind для regex-классификатора (USE_SQLGLOT=0).
+# Маппинг первого ключевого слова → kind для совместимого regex-классификатора.
 _REGEX_KEYWORD_MAP: Dict[str, _StatementKind] = {
     "SELECT": "select",
     "WITH": "select",
@@ -350,14 +347,13 @@ _REGEX_KEYWORD_MAP: Dict[str, _StatementKind] = {
 
 
 def _classify_statement_regex(sql_query: str) -> _StatementKind:
-    """Простой regex-классификатор для legacy-режима (USE_SQLGLOT=0).
+    """Простой regex-классификатор, сохранённый для совместимости unit-тестов.
 
     Удаляет leading комментарии (-- и /* */), извлекает первое ключевое слово
-    и маппирует его в kind. Используется только при отключённом sqlglot.
+    и маппирует его в kind. Runtime-маршрутизация всегда использует sqlglot.
 
     Ограничение: ожидает, что SQL начинается с ключевого слова после комментариев;
     leading non-alpha символы (например ';') не удаляются и приводят к 'unknown'.
-    Для production-использования включите sqlglot (USE_SQLGLOT=1).
     """
     # Убираем leading однострочные и блочные комментарии
     stripped = re.sub(r"(--[^\n\r]*|/\*.*?\*/)", " ", sql_query, flags=re.DOTALL).strip()
@@ -375,29 +371,12 @@ def _classify_statement(sql_query: str, dsn: Optional[str] = None) -> _Statement
     Без startswith-эвристик: парсим sqlglot.parse_one с защитой по timeout/length,
     различаем exp.Describe / exp.Command(name=...) / exp.Select / exp.With / set-операции.
 
-    Поведение при деградации НАМЕРЕННО асимметрично:
-      * USE_SQLGLOT=0 — regex-классификатор (legacy-маршрутизация
-        SELECT/DESCRIBE/EXPLAIN/SHOW), т.к. AST-путь полностью выключен;
-      * USE_SQLGLOT=1, но sqlglot import/parse падает — возвращаем "unknown"
-        (fail-closed: executor отклонит стейтмент как unsupported). Здесь НЕ
-        откатываемся на regex, чтобы не возвращать те самые startswith-эвристики,
-        которые AST-режим как раз и заменяет.
+    При деградации sqlglot import/parse возвращаем "unknown" (fail-closed:
+    executor отклонит стейтмент как unsupported). Regex fallback не используется
+    runtime-путём, даже если окружение выставило старый ``USE_SQLGLOT=0``.
     """
-    from ..dialects import is_sqlglot_enabled, get_sqlglot_dialect
+    from ..dialects import get_sqlglot_dialect
     from ..utils import parse_with_timeout
-
-    if not is_sqlglot_enabled():
-        # При отключённом sqlglot используем regex-классификатор.
-        # Это позволяет legacy-режиму корректно маршрутизировать SELECT/DESCRIBE/EXPLAIN/SHOW.
-        # ВАЖНО (безопасность): sql_safety_check выполняется ДО routing — этот
-        # fallback НЕ обходит проверку безопасности, он лишь классифицирует уже
-        # допущенный стейтмент. В этом режиме (USE_SQLGLOT=0) сам sql_safety_check
-        # тоже работает по regex-пути, согласованно с regex-классификацией здесь.
-        logger.warning(
-            "sqlglot disabled: statement routing uses regex fallback "
-            "(USE_SQLGLOT=0). For production use enable sqlglot."
-        )
-        return _classify_statement_regex(sql_query)
 
     try:
         import sqlglot
@@ -533,10 +512,43 @@ _STRATEGIES: Dict[str, Any] = {
 }
 
 
+def _parse_positive_int_env(
+    env_name: str,
+    default: str,
+    start: float,
+    sql_query: str,
+) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+    raw_value = os.getenv(env_name, default)
+    try:
+        parsed = int(raw_value)
+    except (TypeError, ValueError):
+        return None, _normalize_executor_result(
+            _build_failure_result(start, f"Invalid {env_name}: {raw_value!r}"),
+            start_time=start, sql_query=sql_query, row_limit=None,
+        )
+    if parsed <= 0:
+        return None, _normalize_executor_result(
+            _build_failure_result(start, f"{env_name} must be a positive integer"),
+            start_time=start, sql_query=sql_query, row_limit=None,
+        )
+    return parsed, None
+
+
+def _parse_statement_timeout_ms(
+    start: float, sql_query: str
+) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
+    return _parse_positive_int_env(
+        "DB_EXECUTOR_STATEMENT_TIMEOUT_MS",
+        "30000",
+        start,
+        sql_query,
+    )
+
+
 def _parse_row_limit(
     row_limit: Optional[int], start: float, sql_query: str
 ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
-    """Парсит row_limit и возвращает (value, failure_normalized | None)."""
+    """Парсит row_limit/cap и возвращает (value, failure_normalized | None)."""
     if row_limit is None:
         raw_row_limit = os.getenv("DB_EXECUTOR_ROW_LIMIT", "500")
         try:
@@ -561,7 +573,50 @@ def _parse_row_limit(
             _build_failure_result(start, "row_limit must be a positive integer"),
             start_time=start, sql_query=sql_query, row_limit=None,
         )
+
+    max_row_limit, cap_failure = _parse_positive_int_env(
+        "DB_EXECUTOR_MAX_ROW_LIMIT",
+        "10000",
+        start,
+        sql_query,
+    )
+    if cap_failure is not None:
+        return None, cap_failure
+    assert max_row_limit is not None
+    if parsed > max_row_limit:
+        return None, _normalize_executor_result(
+            _build_failure_result(
+                start,
+                f"row_limit {parsed} exceeds DB_EXECUTOR_MAX_ROW_LIMIT {max_row_limit}",
+            ),
+            start_time=start, sql_query=sql_query, row_limit=None,
+        )
     return parsed, None
+
+
+def _apply_statement_timeout(
+    plugin,
+    conn,
+    timeout_ms: int,
+    start: float,
+    sql_query: str,
+    row_limit: int,
+) -> Optional[Dict[str, Any]]:
+    setter = getattr(plugin, "set_statement_timeout", None)
+    if not callable(setter):
+        return None
+    try:
+        setter(conn, timeout_ms)
+    except Exception as e:
+        from ..utils import mask_dsn
+
+        return _normalize_executor_result(
+            _build_failure_result(start, mask_dsn(str(e))),
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+        )
+    return None
 
 
 def secure_db_executor(
@@ -596,6 +651,10 @@ def secure_db_executor(
     if failure is not None:
         return failure
     assert row_limit is not None  # для типчекеров
+    statement_timeout_ms, failure = _parse_statement_timeout_ms(start, sql_query)
+    if failure is not None:
+        return failure
+    assert statement_timeout_ms is not None
 
     from ..utils import get_runtime_context_dsn, is_dry_run_only, mask_dsn
 
@@ -680,6 +739,16 @@ def secure_db_executor(
                 ),
                 start_time=start, sql_query=sql_query, row_limit=row_limit,
             )
+        timeout_failure = _apply_statement_timeout(
+            plugin,
+            conn,
+            statement_timeout_ms,
+            start,
+            sql_query,
+            row_limit,
+        )
+        if timeout_failure is not None:
+            return timeout_failure
         try:
             result = strategy(
                 sql_query=sql_query, plugin=plugin, conn=conn,

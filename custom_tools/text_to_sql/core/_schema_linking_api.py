@@ -115,7 +115,12 @@ def schema_linking(
             "input_warnings": input_warnings,
         }
     linker = SchemaLinker.with_defaults(schema_limiter)
-    result = linker.link_entities_to_schema(entities, schema_info, dsn=effective_dsn)
+    result = linker.link_entities_to_schema(
+        entities,
+        schema_info,
+        dsn=effective_dsn,
+        session_id=session_id,
+    )
     if input_warnings:
         result["input_warnings"] = input_warnings
     return result

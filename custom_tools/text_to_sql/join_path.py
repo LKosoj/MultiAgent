@@ -378,4 +378,5 @@ def build_join_path(
         "joins": join_edges,
         "used_tables": used_tables,
         "unconnected_tables": unconnected_tables,
+        "_selected_edges": pruned,
     }

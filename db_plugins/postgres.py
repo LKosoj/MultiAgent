@@ -59,6 +59,13 @@ class PostgresPlugin(BaseDBPlugin):
         except Exception:
             pass
 
+    def set_statement_timeout(self, conn, timeout_ms: int) -> None:
+        timeout = int(timeout_ms)
+        if timeout <= 0:
+            raise ValueError("timeout_ms must be a positive integer")
+        with self._cursor(conn) as cur:
+            cur.execute(f"SET statement_timeout = {timeout}")
+
     def explain(self, conn, sql: str) -> Dict[str, Any]:
         with self._cursor(conn) as cur:
             try:

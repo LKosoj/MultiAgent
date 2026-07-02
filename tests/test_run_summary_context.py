@@ -1,4 +1,5 @@
 """Проверка передачи контекста в generate_run_summary."""
+from datetime import datetime, timezone
 import json
 import unittest
 from types import SimpleNamespace
@@ -68,7 +69,7 @@ class TestRunSummaryContext(unittest.TestCase):
 
     @patch("memory.rag_memory.save_memory", return_value=1)
     @patch("memory.tools.get_memory")
-    def test_rag_records_included_without_policy_filter(self, mock_get_memory, _save):
+    def test_rag_records_included_with_requester_context(self, mock_get_memory, _save):
         mock_get_memory.return_value = [
             {
                 "agent_name": "researcher",
@@ -86,7 +87,7 @@ class TestRunSummaryContext(unittest.TestCase):
         user_content = self._extract_user_content(self.capture_model.last_messages)
         self.assertIn("Длинный ответ исследователя", user_content)
         mock_get_memory.assert_called_once()
-        self.assertIsNone(mock_get_memory.call_args.kwargs.get("requesting_agent"))
+        self.assertEqual(mock_get_memory.call_args.kwargs.get("requesting_agent"), "researcher")
 
     @patch("memory.rag_memory.save_memory", return_value=1)
     def test_uses_passed_model_not_global(self, _save):
@@ -95,6 +96,57 @@ class TestRunSummaryContext(unittest.TestCase):
         self.memory.generate_run_summary(model=passed)
         self.assertIsNotNone(passed.last_messages)
         self.assertIsNone(self.capture_model.last_messages)
+
+    def test_get_context_treats_legacy_max_tokens_as_char_budget(self):
+        self.memory.policy.strategic_read = True
+        self.memory.policy.search_enabled = False
+        self.memory.get_full_steps = MagicMock(return_value=[])
+        self.memory._get_strategic_context = MagicMock(return_value="x" * 200)
+
+        context = self.memory.get_context(max_tokens=40)
+
+        self.assertTrue(context.endswith("..."))
+        self.assertLessEqual(len(context), 40 + len("\n..."))
+
+    def test_get_context_filters_semantic_duplicate_from_recent_steps(self):
+        duplicate_step = {
+            "agent_name": "researcher",
+            "step": 2,
+            "data": {"agent_response": "duplicate latest context text"},
+        }
+        recent_steps = [
+            {
+                "agent_name": "researcher",
+                "step": 1,
+                "data": {"agent_response": "recent context for semantic query"},
+            },
+            duplicate_step,
+        ]
+        semantic_only_step = {
+            "agent_name": "researcher",
+            "step": 99,
+            "data": {"agent_response": "older semantic context text"},
+        }
+        self.memory.policy.strategic_read = False
+        self.memory.policy.search_enabled = True
+        self.memory.get_full_steps = MagicMock(return_value=recent_steps)
+        self.memory.search_memory = MagicMock(
+            return_value=[duplicate_step, semantic_only_step]
+        )
+
+        context = self.memory.get_context()
+
+        self.assertIn("older semantic context text", context)
+        self.assertEqual(context.count("duplicate latest context text"), 1)
+
+    @patch("memory.rag_memory.save_memory", return_value=1)
+    def test_add_step_writes_utc_aware_timestamp(self, mock_save):
+        self.memory.add_step({"agent_response": "результат"})
+
+        timestamp = mock_save.call_args.kwargs["data"]["timestamp"]
+        parsed = datetime.fromisoformat(timestamp)
+        self.assertIsNotNone(parsed.tzinfo)
+        self.assertEqual(parsed.utcoffset(), timezone.utc.utcoffset(None))
 
     @staticmethod
     def _extract_user_content(messages):

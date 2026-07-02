@@ -4,6 +4,7 @@ Schema Loader - загрузка, нормализация и сохранени
 import os
 import json
 import logging
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from .utils import (
@@ -76,8 +77,17 @@ class SchemaLoader:
         if not json_path.exists():
             return None
 
-        raw = json_path.read_text(encoding="utf-8")
-        obj = json.loads(raw)
+        try:
+            raw = json_path.read_text(encoding="utf-8")
+            obj = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "schema_loader: не удалось прочитать JSON схемы из %s (%s); "
+                "пропускаем файл и используем fallback",
+                json_path,
+                exc,
+            )
+            return None
 
         if not isinstance(obj, dict):
             logger.warning(
@@ -193,10 +203,23 @@ class SchemaLoader:
                 "source": "introspection"
             }
             
-            json_path.write_text(
-                json.dumps(save_data, indent=2, ensure_ascii=False), 
-                encoding="utf-8"
+            payload = json.dumps(save_data, indent=2, ensure_ascii=False)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{json_path.name}.",
+                suffix=".tmp",
+                dir=str(sqlrag_dir),
+                text=True,
             )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                    tmp_file.write(payload)
+                    tmp_file.flush()
+                    os.fsync(tmp_file.fileno())
+                os.replace(tmp_path, json_path)
+            finally:
+                if tmp_path.exists():
+                    tmp_path.unlink()
             
             logger.info(f"✅ Schema autosaved to: {json_path}")
             

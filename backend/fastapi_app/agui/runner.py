@@ -120,6 +120,16 @@ def _normalize_service_payload(raw_payload: Any) -> dict[str, Any]:
     return raw_payload
 
 
+def _require_stream_service_access(action: str, target_run_id: str, current_run_id: str) -> None:
+    from .auth import current_principal
+    from .service import _require_service_action_role
+
+    principal = current_principal()
+    _require_service_action_role(action, principal)
+    if target_run_id != "*" and not principal.has_role("admin") and target_run_id != current_run_id:
+        raise PermissionError(f"service action '{action}' cannot access run '{target_run_id}'")
+
+
 def _service_result_envelope(
     service_action: str,
     ok: bool,
@@ -570,6 +580,7 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                 request_id = payload.get("__request_id")
                 if service_action == "logs.stream":
                     stream_run_id = payload.get("run_id", "*")
+                    _require_stream_service_access(service_action, str(stream_run_id), input_data.run_id)
                     duration = float(payload.get("duration_seconds", 30))
                     async for event in _stream_logs(stream_run_id, duration):
                         yield event
@@ -583,6 +594,7 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                     return
                 if service_action == "progress.stream":
                     stream_run_id = payload.get("run_id", "*")
+                    _require_stream_service_access(service_action, str(stream_run_id), input_data.run_id)
                     duration = float(payload.get("duration_seconds", 30))
                     async for event in _stream_progress(stream_run_id, duration):
                         yield event
