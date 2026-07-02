@@ -115,6 +115,7 @@ def _install_runner_stub(monkeypatch) -> None:
     stub_utils = types.ModuleType("utils")
     stub_utils.call_openai_api_streaming = lambda *a, **k: ""
     monkeypatch.setitem(sys.modules, "utils", stub_utils)
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
 
     # Перезагрузить runner и run_manager, чтобы они подцепили стабы.
     monkeypatch.delitem(sys.modules, "backend.fastapi_app.agui.runner", raising=False)

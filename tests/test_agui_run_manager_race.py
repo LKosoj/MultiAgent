@@ -37,6 +37,7 @@ def _make_payload(run_id: str) -> dict:
 
 
 def _load_run_manager_with_runner_stub(monkeypatch, run_agent):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
     stub_runner = types.ModuleType("backend.fastapi_app.agui.runner")
     stub_runner.run_agent = run_agent
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.runner", stub_runner)
@@ -67,6 +68,32 @@ async def test_start_run_rejects_run_id_with_persisted_history(tmp_path, monkeyp
 
     with pytest.raises(ValueError, match="run_id already exists"):
         await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+
+
+@pytest.mark.asyncio
+async def test_start_run_rejects_when_max_concurrent_runs_reached(tmp_path, monkeypatch):
+    monkeypatch.setenv("AG_UI_MAX_CONCURRENT_RUNS", "1")
+    release = asyncio.Event()
+
+    async def fake_run_agent(input_data):
+        await release.wait()
+        yield RunFinishedEvent(
+            type=EventType.RUN_FINISHED,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+            result=None,
+            timestamp=int(time.time() * 1000),
+        )
+
+    rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
+    manager = rm.RunManager(EventStore(str(tmp_path / "agui_events.db")))
+
+    first = await manager.start_run(RunAgentInput(**_make_payload("run-first")))
+    with pytest.raises(ValueError, match="too many active AG-UI runs"):
+        await manager.start_run(RunAgentInput(**_make_payload("run-second")))
+
+    release.set()
+    await first.task
 
 
 @pytest.mark.asyncio

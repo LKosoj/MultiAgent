@@ -367,10 +367,15 @@ class TestMemoryRAGStreamlitAPI:
 
     def test_get_active_agents(self):
         """Тест получения списка активных агентов"""
+        from backend.fastapi_app.agui.auth import Principal
         from memory.streamlit_api import get_memory_rag_manager
         
         manager = get_memory_rag_manager()
-        agents = manager.get_active_agents()
+        principal = Principal(
+            subject="smoke-test",
+            roles=frozenset({"memory_archivist", "user"}),
+        )
+        agents = manager.get_active_agents(principal=principal)
         
         assert isinstance(agents, list)
         # Список может быть пустым, это нормально для smoke-теста

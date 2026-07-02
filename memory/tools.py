@@ -26,6 +26,7 @@ from custom_tools.text_to_sql.schema_memory_chroma import (
     _distance_to_similarity,
     _resolve_chroma_metric,
 )
+from .chroma_text import extract_tactical_chroma_text
 from .manager import build_json_data_like_predicate, memory_manager
 from .models import TacticalMemoryItem, StrategicGoal, SystemContext
 
@@ -67,6 +68,23 @@ def _json_dumps_memory_data(data: Any) -> str:
 def _distance_to_score(distance: float, metric: str = "cosine") -> float:
     """Конвертирует ChromaDB distance в score через единый text2sql helper."""
     return _distance_to_similarity(distance, metric)
+
+
+def _lexical_query_terms(query: str | None) -> List[str]:
+    if not query:
+        return []
+    # Keep code-like identifiers (oktmo/okato/territory IDs) as tokens while
+    # filtering out very short natural-language glue words.
+    raw_terms = re.findall(r"[A-Za-zА-Яа-яЁё0-9_%-]{3,}", query)
+    return list(dict.fromkeys(term.casefold() for term in raw_terms))[:8]
+
+
+def _like_escape(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
 
 
 #
@@ -333,7 +351,10 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
         return -1
     
     with memory_manager.db_handler.lock:
-        conn = memory_manager.db_handler._get_connection()
+        try:
+            conn = memory_manager.db_handler._get_connection()
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(f"memory database write failed: {e}") from e
         try:
             cursor = conn.cursor()
 
@@ -379,59 +400,10 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
             # Сохраняем в ChromaDB для семантического поиска
             if memory_manager.db_handler.tactical_collection and memory_manager.db_handler.embedding_model:
                 try:
-                    # Извлекаем текстовое содержимое для создания эмбеддинга
-                    text_content = ""
-                    if isinstance(cleaned_data, dict):
-                        ck = cleaned_data.get("cache_kind")
-
-                        # 1) Агентские шаги: эмбеддим в основном "смысл" (agent_response),
-                        # чтобы не замусоривать embedding служебными полями.
-                        if ck == "agent_step":
-                            ar = cleaned_data.get("agent_response")
-                            if isinstance(ar, str) and ar.strip():
-                                text_content = ar.strip()
-                            else:
-                                # fallback: исключаем явные служебные поля
-                                slim = {k: v for k, v in cleaned_data.items() if k not in ("timestamp", "policy_scope", "agent_context")}
-                                text_content = memory_manager._extract_text_content(slim)
-
-                        # 2) Суммари: эмбеддим текст суммари
-                        elif ck == "agent_summary":
-                            st = cleaned_data.get("summary_text")
-                            if isinstance(st, str) and st.strip():
-                                text_content = st.strip()
-                            else:
-                                text_content = memory_manager._extract_text_content(cleaned_data)
-
-                        # 3) Схема: эмбеддим компактное описание (не весь table_info)
-                        elif ck == "schema_table":
-                            table_fqn = cleaned_data.get("table_fqn") or ""
-                            desc = cleaned_data.get("description") or ""
-                            cols = []
-                            try:
-                                ti = cleaned_data.get("table_info") or {}
-                                if isinstance(ti, dict):
-                                    for c in (ti.get("columns") or []):
-                                        if isinstance(c, dict):
-                                            nm = c.get("name")
-                                            cd = c.get("description")
-                                            if nm:
-                                                if cd and isinstance(cd, str) and cd.strip():
-                                                    cols.append(f"{nm}: {cd.strip()}")
-                                                else:
-                                                    cols.append(str(nm))
-                            except Exception:
-                                cols = []
-                            cols_text = "; ".join(cols[:40])
-                            base = f"Таблица {table_fqn}. {desc}".strip()
-                            if cols_text:
-                                base = f"{base}\nКолонки: {cols_text}"
-                            # ограничиваем, чтобы не раздувать индексацию
-                            text_content = base[:8000]
-                        else:
-                            text_content = memory_manager._extract_text_content(cleaned_data)
-                    else:
-                        text_content = memory_manager._extract_text_content(cleaned_data)
+                    text_content = extract_tactical_chroma_text(
+                        cleaned_data,
+                        fallback_extractor=memory_manager._extract_text_content,
+                    )
                     if text_content:
                         embedding = memory_manager._create_embedding(text_content, purpose="passage")
                         if embedding:
@@ -504,6 +476,8 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                     )
             
             return next_step  # Возвращаем глобальный номер шага
+        except sqlite3.OperationalError as e:
+            raise RuntimeError(f"memory database write failed: {e}") from e
         except Exception as e:
             print(f"Ошибка при сохранении в базу данных: {str(e)}")
             return -1  # Возвращаем -1 при ошибке
@@ -575,7 +549,10 @@ def get_memory(
         if not query and not agent_name and not cache_kind and not cache_key and not schema_version:
             return []
 
-    conn = memory_manager.db_handler._get_connection()
+    try:
+        conn = memory_manager.db_handler._get_connection()
+    except sqlite3.OperationalError as e:
+        raise RuntimeError(f"memory database read failed: {e}") from e
     try:
         cursor = conn.cursor()
         
@@ -698,6 +675,50 @@ def get_memory(
                     # semantic_search_results пуст или без 'ids' — пустой результат
                     semantic_records = []
                     use_semantic_results = True
+
+                if use_semantic_results and not semantic_records:
+                    terms = _lexical_query_terms(query)
+                    if terms:
+                        try:
+                            lexical_limit = int(os.getenv("RAG_LEXICAL_FALLBACK_LIMIT", "50"))
+                        except (TypeError, ValueError):
+                            lexical_limit = 50
+                        lexical_limit = max(1, min(lexical_limit, 200))
+
+                        temporal_condition = "AND valid_to IS NULL" if not include_historical else ""
+                        lexical_sql = f"""
+                            SELECT agent_name, step, instance_step, run_id, data, valid_from, valid_to
+                            FROM agent_memory
+                            WHERE 1=1 {temporal_condition}
+                        """
+                        lexical_params: List[Any] = []
+                        if session_id is not None:
+                            lexical_sql += " AND session_id = ?"
+                            lexical_params.append(session_id)
+                        if agent_name:
+                            lexical_sql += " AND agent_name = ?"
+                            lexical_params.append(agent_name)
+                        if run_id:
+                            lexical_sql += " AND run_id = ?"
+                            lexical_params.append(run_id)
+                        for field_name, field_value in (
+                            ("cache_kind", cache_kind),
+                            ("cache_key", cache_key),
+                            ("schema_version", schema_version),
+                        ):
+                            if field_value:
+                                predicate, predicate_params = build_json_data_like_predicate(
+                                    field_name, field_value
+                                )
+                                lexical_sql += f" AND {predicate}"
+                                lexical_params.extend(predicate_params)
+                        lexical_sql += " AND ("
+                        lexical_sql += " OR ".join("LOWER(data) LIKE ? ESCAPE '\\'" for _ in terms)
+                        lexical_sql += ") ORDER BY step ASC LIMIT ?"
+                        lexical_params.extend(f"%{_like_escape(term)}%" for term in terms)
+                        lexical_params.append(lexical_limit)
+                        cursor.execute(lexical_sql, lexical_params)
+                        semantic_records = [row + (0.01,) for row in cursor.fetchall()]
                     
             except Exception as e:
                 # Сюда теперь доходит и EmbeddingUnavailableError/EmbeddingFailedError
@@ -887,6 +908,8 @@ def get_memory(
             filtered_records = _apply_memory_filtering(records, query, length, cache_kind, requesting_agent)
             return filtered_records
         
+    except sqlite3.OperationalError as e:
+        raise RuntimeError(f"memory database read failed: {e}") from e
     except Exception as e:
         print(f"Критическая ошибка в get_memory: {e}")
         return []

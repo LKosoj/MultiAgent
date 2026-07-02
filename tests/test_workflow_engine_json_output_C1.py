@@ -202,6 +202,17 @@ def test_normalize_step_output_parses_json_string_when_schema_declared(engine, w
     assert normalized == {"verification_status": "Rejected", "n": 3}
 
 
+def test_normalize_step_output_parses_single_line_fenced_json(engine, workflow_pkg):
+    step = _make_step(workflow_pkg, output_schema="json_object")
+
+    normalized, parsed = engine._normalize_step_output(
+        step, '```json {"verification_status": "Rejected", "n": 3}```'
+    )
+
+    assert parsed is True
+    assert normalized == {"verification_status": "Rejected", "n": 3}
+
+
 def test_normalize_step_output_raises_on_invalid_json_when_schema_declared(engine, workflow_pkg):
     step = _make_step(workflow_pkg, output_schema="json_object")
     with pytest.raises(workflow_pkg.models.WorkflowStepError) as ei:
@@ -209,6 +220,46 @@ def test_normalize_step_output_raises_on_invalid_json_when_schema_declared(engin
     msg = str(ei.value)
     assert "verifier" in msg
     assert "not-json-at-all" in msg
+
+
+def test_normalize_sql_generation_recovers_plain_sql_when_json_schema_declared(engine, workflow_pkg):
+    step = _make_step(
+        workflow_pkg,
+        id="sql_generation",
+        output_schema="json_object",
+        output_schema_requirements={"required": ["sql", "description"]},
+    )
+
+    normalized, parsed = engine._normalize_step_output(step, "```sql\nSELECT 1\n```")
+
+    assert parsed is True
+    assert normalized["sql"] == "SELECT 1"
+    assert normalized["description"] == "Recovered from non-JSON sql_generation output"
+    assert "output_normalization_warning" in normalized
+
+
+def test_normalize_sql_generation_rejects_prose_when_json_schema_declared(engine, workflow_pkg):
+    step = _make_step(
+        workflow_pkg,
+        id="sql_generation",
+        output_schema="json_object",
+        output_schema_requirements={"required": ["sql", "description"]},
+    )
+
+    with pytest.raises(workflow_pkg.models.WorkflowStepError):
+        engine._normalize_step_output(step, "Here is the query you asked for.")
+
+
+def test_normalize_sql_generation_rejects_non_sql_fenced_text(engine, workflow_pkg):
+    step = _make_step(
+        workflow_pkg,
+        id="sql_generation",
+        output_schema="json_object",
+        output_schema_requirements={"required": ["sql", "description"]},
+    )
+
+    with pytest.raises(workflow_pkg.models.WorkflowStepError):
+        engine._normalize_step_output(step, "```text\nSELECT 1\n```")
 
 
 def test_normalize_step_output_redacts_invalid_json_snippet(engine, workflow_pkg):

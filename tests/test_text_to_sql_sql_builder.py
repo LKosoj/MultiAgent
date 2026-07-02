@@ -1,4 +1,6 @@
 """EPIC 8.1: тесты module-level функций `sql_builder` без SQLGenerator."""
+from datetime import date
+
 import pytest
 
 from custom_tools.text_to_sql import sql_builder
@@ -79,6 +81,118 @@ def test_build_sql_from_linked_entities_basic_select_group_by():
     assert "FROM" in sql
     assert "orders" in sql
     assert "GROUP BY" in sql
+
+
+def test_build_sql_groups_temporal_dimension_by_sqlite_month():
+    context = {
+        "linked_entities": {
+            "metrics": [{"table": "orders", "column": "amount", "aggregation": "sum", "name": "total"}],
+            "dimensions": [
+                {
+                    "table": "orders",
+                    "column": "created_at",
+                    "name": "month",
+                    "date_grain": "month",
+                }
+            ],
+            "filters": {},
+        }
+    }
+
+    result = sql_builder.build_sql_from_linked_entities(
+        context,
+        schema_validator=_NullSchemaValidator(),
+        dsn="sqlite:///tmp/app.db",
+    )
+
+    assert "sql_query" in result, result
+    sql = result["sql_query"]
+    assert "strftime('%Y-%m'," in sql
+    assert "GROUP BY strftime('%Y-%m'," in sql
+
+
+def test_build_sql_groups_temporal_dimension_by_mysql_month():
+    context = {
+        "linked_entities": {
+            "metrics": [{"table": "orders", "column": "amount", "aggregation": "sum", "name": "total"}],
+            "dimensions": [
+                {
+                    "table": "orders",
+                    "column": "created_at",
+                    "name": "month",
+                    "date_grain": "month",
+                }
+            ],
+            "filters": {},
+        }
+    }
+
+    result = sql_builder.build_sql_from_linked_entities(
+        context,
+        schema_validator=_NullSchemaValidator(),
+        dsn="mysql://user:pass@db.example.com:3306/app",
+    )
+
+    assert "sql_query" in result, result
+    sql = result["sql_query"]
+    assert "DATE_FORMAT(" in sql
+    assert "'%Y-%m'" in sql
+    assert "DATE_TRUNC" not in sql
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "sapiq://user:pass@db.example.com:2638/app",
+        "impala://user:pass@db.example.com:21050/app",
+    ],
+)
+def test_build_sql_temporal_dimension_fails_closed_for_unsupported_dialects(dsn):
+    context = {
+        "linked_entities": {
+            "metrics": [{"table": "orders", "column": "amount", "aggregation": "sum", "name": "total"}],
+            "dimensions": [
+                {
+                    "table": "orders",
+                    "column": "created_at",
+                    "name": "month",
+                    "date_grain": "month",
+                }
+            ],
+            "filters": {},
+        }
+    }
+
+    result = sql_builder.build_sql_from_linked_entities(
+        context,
+        schema_validator=_NullSchemaValidator(),
+        dsn=dsn,
+    )
+
+    assert result["sql_query"] == ""
+    assert "Temporal bucketing is not supported" in result["error"]
+
+
+def test_relative_date_range_previous_quarter_is_deterministic():
+    assert sql_builder.resolve_relative_date_range(
+        "last_quarter",
+        today=date(2026, 7, 2),
+    ) == {"start": "2026-04-01", "end": "2026-06-30"}
+
+
+def test_filter_value_conditions_relative_last_7_days(monkeypatch):
+    monkeypatch.setattr(sql_builder, "_today", lambda: date(2026, 7, 2))
+
+    conds = sql_builder.filter_value_conditions(
+        '"orders"."created_at"',
+        {"relative": "last_7_days"},
+        {"operator": "="},
+    )
+
+    assert conds == [
+        '"orders"."created_at" >= \'2026-06-26\'',
+        '"orders"."created_at" <= \'2026-07-02\'',
+    ]
 
 
 def test_build_sql_dimensions_only_does_not_group_by():

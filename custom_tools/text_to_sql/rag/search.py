@@ -17,13 +17,13 @@ import warnings
 from pathlib import Path
 from typing import Any, ClassVar, Dict, List, Optional
 
-from memory.tools import get_memory
 from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
 
 from ..deprecations import TextToSQLDeprecationWarning
 from ._state import SharedIndexState
 from .embedding_utils import EmbeddingUtils
 from .indexing import IndexingService
+from .memory_gateway import RAGMemoryGateway
 from .retrieval import RetrievalService
 
 logger = logging.getLogger(__name__)
@@ -51,26 +51,29 @@ class RAGSearcher:
     # экземпляров RAGSearcher шарят один и тот же registry/locks.
     _shared_state: ClassVar[SharedIndexState] = SharedIndexState()
 
-    def __init__(self):
+    def __init__(self, *, memory_gateway: Optional[RAGMemoryGateway] = None):
         # Поднимаемся к корню проекта.
         # __file__ = .../custom_tools/text_to_sql/rag/search.py
         # parents[0]=rag, parents[1]=text_to_sql, parents[2]=custom_tools, parents[3]=repo root
         self.repo_root = Path(__file__).resolve().parents[3]
+        self._memory_gateway = memory_gateway or RAGMemoryGateway()
 
         # Композиция: собираем сервисы. Сервисы получают host (self),
         # чтобы при cross-call (например, _ensure_sqlrag_files_indexed
         # вызывает _remove_old_file_records) запрос шёл через RAGSearcher —
         # тогда monkeypatch на инстанс RAGSearcher работает корректно.
-        self._embeddings = EmbeddingUtils()
+        self._embeddings = EmbeddingUtils(memory_gateway=self._memory_gateway)
         self._indexing = IndexingService(
             state=self._shared_state,
             repo_root=self.repo_root,
             embeddings=self._embeddings,
+            memory_gateway=self._memory_gateway,
         )
         self._indexing._host = self
         self._retrieval = RetrievalService(
             repo_root=self.repo_root,
             embeddings=self._embeddings,
+            memory_gateway=self._memory_gateway,
         )
         self._retrieval._host = self
 
@@ -276,7 +279,6 @@ class RAGSearcher:
             # (см. indexing.py: "ValueError frontmatter пробрасываем выше").
             self._ensure_sqlrag_files_indexed()
 
-            from custom_tools.text_to_sql import rag as _facade
             # T8 / #17: индексированные sqlrag-примеры пишутся под
             # cache_kind='sqlrag_example' (см. indexing.py:449), тогда как
             # 'vector_db_search' — ОТДЕЛЬНЫЙ namespace кэша поисковой выдачи
@@ -286,7 +288,7 @@ class RAGSearcher:
             from memory.tools import memory_requester_context
 
             with memory_requester_context("Schema-RAG-Agent"):
-                memory_hits = _facade.get_memory(
+                memory_hits = self._memory_gateway.get_memory(
                     session_id=session_id,
                     agent_name="Schema-RAG-Agent",
                     cache_kind="sqlrag_example",
@@ -295,9 +297,13 @@ class RAGSearcher:
                     requesting_agent="Schema-RAG-Agent",
                 )
             if isinstance(memory_hits, list):
+                seen_sql: set[str] = set()
                 for hit in memory_hits:
                     data = hit.get("data", {}) if isinstance(hit, dict) else {}
                     for sql_text in self._extract_sql_candidates_from_data(data):
+                        if sql_text in seen_sql:
+                            continue
+                        seen_sql.add(sql_text)
                         results.append({
                             "sql_example": sql_text,
                         })

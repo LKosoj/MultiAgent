@@ -342,6 +342,20 @@ def test_sapiq_distinct_values_query_uses_top_not_limit():
     assert "SELECT DISTINCT" in query
 
 
+def test_build_lookup_values_query_quotes_identifiers_and_literals():
+    query = BaseDBPlugin().build_lookup_values_query(
+        "public.orders",
+        "city name",
+        "city_id",
+        ["O'Reilly"],
+    )
+
+    assert 'SELECT DISTINCT "city name" AS lookup_value' in query
+    assert "city_id AS return_value" in query
+    assert "FROM public.orders" in query
+    assert "'O''Reilly'" in query
+
+
 def test_sapiq_execute_select_keeps_existing_top_query():
     cursor = RecordingCursor(rows=[(idx,) for idx in range(10)])
     query = SAPIQPlugin().build_distinct_values_query("DBA.sales", "region", 5)

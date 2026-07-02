@@ -576,22 +576,27 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 error_class="loop_detected"
             )
         
-        # Выполняем с adaptive retry
+        retry_context = {
+            "step": step,
+            "workflow_context": context,
+            "previous_results": previous_results,
+            "step_budget": step_budget
+        }
+
+        # Выполняем с adaptive retry, кроме явно non-retryable шагов с side effects.
         try:
-            step_result = await self.retry_engine.execute_with_retry(
-                step_id=step.id,
-                step_func=self._execute_single_step_attempt,
-                context={
-                    "step": step,
-                    "workflow_context": context,
-                    "previous_results": previous_results,
-                    "step_budget": step_budget
-                },
-                max_retries=3,
-                base_delay=1.0,
-                max_delay=30.0,
-                backoff_multiplier=1.5
-            )
+            if self._is_enhanced_step_retryable(step):
+                step_result = await self.retry_engine.execute_with_retry(
+                    step_id=step.id,
+                    step_func=self._execute_single_step_attempt,
+                    context=retry_context,
+                    max_retries=3,
+                    base_delay=1.0,
+                    max_delay=30.0,
+                    backoff_multiplier=1.5
+                )
+            else:
+                step_result = await self._execute_single_step_attempt(retry_context)
             
             # Записываем выполнение в loop detector
             execution_data = {
@@ -622,6 +627,10 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 error=str(e),
                 error_class="execution_error"
             )
+
+    @staticmethod
+    def _is_enhanced_step_retryable(step: WorkflowStep) -> bool:
+        return (step.metadata or {}).get("retryable", True) is not False
     
     async def _check_result_cache(self, step: WorkflowStep, context: WorkflowContext) -> Optional[StepResult]:
         """Проверить кэш результатов"""
@@ -720,6 +729,8 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 step.id, BudgetType.TIME, duration, "step", 
                 f"Step execution time"
             )
+            if getattr(step_result.status, "value", step_result.status) == StepStatus.FAILED.value:
+                return step_result
             
             # Post-step validation and decision
             if self.feature_manager.is_feature_enabled("post_step_judge", workflow_context.workflow_id, step.id):

@@ -106,6 +106,7 @@ def _load_runner_with_workflow_stub(monkeypatch, manager_holder: list):
 
     stub_service = types.ModuleType("backend.fastapi_app.agui.service")
     stub_service.handle_service_action = lambda *_a, **_k: {}
+    stub_service._require_service_action_role = lambda _action, _principal: None
     stub_service._redact_payload = lambda value: value
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.service", stub_service)
 

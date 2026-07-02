@@ -8,10 +8,23 @@ T11-orch: дополнительные тесты наблюдаемости (lo
 """
 import json
 import logging
+import importlib
 import tempfile
 from pathlib import Path
 
 from custom_tools.text_to_sql import core
+
+
+def test_core_singletons_are_lazy_on_import():
+    _ = core.sql_generator
+    reloaded = importlib.reload(core)
+
+    for name in ("nlu_processor", "rag_searcher", "sql_validator", "schema_limiter", "sql_generator"):
+        assert name not in reloaded.__dict__
+
+    generator = reloaded.sql_generator
+
+    assert reloaded.__dict__["sql_generator"] is generator
 
 
 def test_sql_generator_singleton_identity_stable():
@@ -71,6 +84,7 @@ def test_sql_generation_plugin_does_not_construct_new_instance(monkeypatch):
     """SQLGenerator() НЕ должен вызываться повторно при каждом sql_generation_plugin."""
     from custom_tools.text_to_sql import sql_generator as sg_module
 
+    singleton = core.sql_generator
     init_count = {"value": 0}
     original_init = sg_module.SQLGenerator.__init__
 
@@ -79,7 +93,7 @@ def test_sql_generation_plugin_does_not_construct_new_instance(monkeypatch):
         original_init(self)
 
     monkeypatch.setattr(sg_module.SQLGenerator, "__init__", counting_init)
-    monkeypatch.setattr(core.sql_generator, "generate_sql", lambda *a, **k: {"sql_query": ""})
+    monkeypatch.setattr(singleton, "generate_sql", lambda *a, **k: {"sql_query": ""})
 
     core.sql_generation_plugin("ctx", "q", dsn="sqlite:///tmp/app.db")
     core.sql_generation_plugin("ctx", "q", dsn="sqlite:///tmp/app.db")

@@ -459,13 +459,99 @@ class JoinValidator:
             result = self.join_builder.build_joins(main_table, required_tables, merged_joins)
         else:
             result = self._build_joins_graph(main_table, required_tables, merged_joins)
+        join_semantics = self._join_semantics(result.get("joins", []), db_schema)
 
         return {
             "joins": result.get("joins", []),
             "success": result.get("success", False),
             "unconnected_tables": list(result.get("unconnected_tables", set())),
             "main_table": main_table,
+            "join_semantics": join_semantics,
+            "join_warnings": [
+                item["warning"] for item in join_semantics if item.get("warning")
+            ],
         }
+
+    def _join_semantics(
+        self,
+        joins: List[Dict[str, Any]],
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        semantics: List[Dict[str, Any]] = []
+        for join in joins or []:
+            cardinality = self._join_cardinality(join, db_schema)
+            source = (
+                "bridge"
+                if join.get("via_bridge")
+                else str(join.get("_source") or "fk")
+            )
+            warning = None
+            if cardinality in {"one_to_many", "unknown"}:
+                warning = (
+                    f"{join.get('from_table')}.{join.get('from_column')} -> "
+                    f"{join.get('to_table')}.{join.get('to_column')} has "
+                    f"{cardinality} cardinality; aggregation may fan out"
+                )
+            semantics.append({
+                "from_table": join.get("from_table"),
+                "to_table": join.get("to_table"),
+                "join_type": join.get("join_type"),
+                "source": source,
+                "cardinality": cardinality,
+                "warning": warning,
+            })
+        return semantics
+
+    def _join_cardinality(
+        self,
+        join: Dict[str, Any],
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> str:
+        from_table = _resolve_table_name(join.get("from_table"), db_schema)
+        to_table = _resolve_table_name(join.get("to_table"), db_schema)
+        from_column = (
+            _resolve_column_name(join.get("from_column"), from_table, db_schema)
+            if from_table
+            else None
+        )
+        to_column = (
+            _resolve_column_name(join.get("to_column"), to_table, db_schema)
+            if to_table
+            else None
+        )
+        if not all([from_table, to_table, from_column, to_column]):
+            return "unknown"
+        if self._column_references(
+            from_table, from_column, to_table, to_column, db_schema
+        ):
+            return "many_to_one"
+        if self._column_references(
+            to_table, to_column, from_table, from_column, db_schema
+        ):
+            return "one_to_many"
+        return "unknown"
+
+    def _column_references(
+        self,
+        source_table: str,
+        source_column: str,
+        target_table: str,
+        target_column: str,
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> bool:
+        from .resolution import _get_column_meta
+
+        meta = _get_column_meta(source_table, source_column, db_schema)
+        if not isinstance(meta, dict) or not is_fk(meta):
+            return False
+        ref_table, ref_column = _parse_fk_reference(meta.get("references", ""))
+        resolved_ref_table = _resolve_table_name(ref_table, db_schema)
+        resolved_ref_column = (
+            _resolve_column_name(ref_column, resolved_ref_table, db_schema)
+            if resolved_ref_table
+            else None
+        )
+        return resolved_ref_table == target_table and resolved_ref_column == target_column
 
     # ------------------------------------------------------------------
     # Graph join-path (KMB Steiner) — opt-in через path_algo=graph

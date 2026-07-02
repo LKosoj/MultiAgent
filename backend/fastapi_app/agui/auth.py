@@ -70,7 +70,12 @@ def normalize_session_id_for_principal(session_id: str, principal: Principal) ->
 
 
 def current_principal() -> Principal:
-    return _CURRENT_PRINCIPAL.get() or system_principal_for_disabled_mode()
+    principal = _CURRENT_PRINCIPAL.get()
+    if principal is not None:
+        return principal
+    if auth_mode() == "disabled":
+        return system_principal_for_disabled_mode()
+    return anonymous_principal()
 
 
 def current_principal_or_none() -> Principal | None:
@@ -89,7 +94,7 @@ def principal_context(principal: Principal) -> Iterator[None]:
 def auth_mode() -> str:
     raw = os.getenv("AG_UI_AUTH_MODE")
     if raw is None:
-        raw = "required" if _has_configured_tokens() else "disabled"
+        raw = "required"
     mode = raw.strip().lower()
     if mode not in _VALID_AUTH_MODES:
         raise HTTPException(

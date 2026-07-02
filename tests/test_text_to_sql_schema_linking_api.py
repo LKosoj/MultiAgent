@@ -72,6 +72,7 @@ def test_new_kwarg_api_explicit_schema_info(monkeypatch):
     assert deprecation == [], f"unexpected DeprecationWarnings: {deprecation}"
     assert isinstance(out, dict)
     assert "linked_entities" in out
+    assert out["sql_generation_allowed"] is bool(out.get("join_success"))
 
 
 def test_deprecated_dict_as_session_emits_warning(monkeypatch):
@@ -166,3 +167,62 @@ def test_schema_linking_uses_explicit_dsn_for_schema_resolution(monkeypatch):
 
     assert captured["dsn"] == selected_dsn
     assert "linked_entities" in out
+
+
+def test_schema_linking_forwards_value_grounding_kwarg(monkeypatch):
+    captured = {}
+
+    def fake_link(self, entities, schema_info, dsn=None, session_id=None, value_grounding=None):
+        captured["value_grounding"] = value_grounding
+        return {
+            "linked_entities": {"metrics": [], "dimensions": [], "filters": {}},
+            "joins": [],
+            "join_success": True,
+        }
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(
+        _entities(),
+        schema_info=_schema(),
+        dsn="sqlite:///tmp/test.db",
+        value_grounding=True,
+    )
+
+    assert captured["value_grounding"] is True
+    assert out["sql_generation_allowed"] is True
+    assert out["confidence"] == 0.75
+    assert out["ambiguity"]["requires_clarification"] is True
+
+
+def test_schema_linking_confidence_threshold_can_abstain(monkeypatch):
+    def fake_link(self, entities, schema_info, dsn=None, session_id=None, value_grounding=None):
+        return {
+            "linked_entities": {
+                "metrics": [{"table": "orders", "column": "amount"}],
+                "dimensions": [],
+                "filters": {},
+            },
+            "joins": [],
+            "join_success": True,
+            "unlinked_entities": ["unknown_metric"],
+        }
+
+    monkeypatch.setenv("TEXT_TO_SQL_MIN_CONFIDENCE_TO_GENERATE", "0.95")
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(
+        _entities(),
+        schema_info=_schema(),
+        dsn="sqlite:///tmp/test.db",
+    )
+
+    assert out["confidence"] == 0.9
+    assert out["abstain"] is True
+    assert out["sql_generation_allowed"] is False

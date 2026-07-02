@@ -16,7 +16,10 @@ from typing import Any, Dict
 
 import pytest
 
-from custom_tools.text_to_sql._yaml_config_loader import YamlConfigLoader
+from custom_tools.text_to_sql._yaml_config_loader import (
+    YamlConfigLoader,
+    resolve_active_profile_name,
+)
 
 
 class _Holder:
@@ -173,3 +176,45 @@ def test_profile_extra_partitions_cache(tmp_path, monkeypatch):
     active_profile["name"] = "default"
     default_again = loader.load()
     assert default_again is default_result
+
+
+def test_resolve_active_profile_name_uses_umbrella_fallback(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_TEST_PROFILE", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+
+    assert (
+        resolve_active_profile_name(
+            None, env_var="TEXT_TO_SQL_TEST_PROFILE", default="default"
+        )
+        == "muni_ru"
+    )
+
+
+def test_resolve_active_profile_name_precedence(monkeypatch):
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "umbrella")
+    monkeypatch.setenv("TEXT_TO_SQL_TEST_PROFILE", "subsystem")
+
+    assert (
+        resolve_active_profile_name(
+            "explicit", env_var="TEXT_TO_SQL_TEST_PROFILE", default="default"
+        )
+        == "explicit"
+    )
+    assert (
+        resolve_active_profile_name(
+            None, env_var="TEXT_TO_SQL_TEST_PROFILE", default="default"
+        )
+        == "subsystem"
+    )
+
+
+def test_resolve_active_profile_name_empty_values_fall_back(monkeypatch):
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "")
+    monkeypatch.setenv("TEXT_TO_SQL_TEST_PROFILE", "")
+
+    assert (
+        resolve_active_profile_name(
+            "", env_var="TEXT_TO_SQL_TEST_PROFILE", default="default"
+        )
+        == "default"
+    )

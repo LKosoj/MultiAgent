@@ -12,6 +12,10 @@ parameters:
     type: string
     description: "DSN целевой БД для загрузки sqlrag-схемы и интроспекции. Для tool-step передается через tool_params.dsn; для agent tool calls — через workflow runtime metadata. Не вставлять DSN в prompt или ответ."
     required: false
+  - name: value_grounding
+    type: boolean
+    description: "Opt-in: уточнять значения linked filters через bounded DB lookup. По умолчанию выключено; при ошибке lookup сохраняет исходные значения."
+    required: false
 output:
   type: object
   properties:

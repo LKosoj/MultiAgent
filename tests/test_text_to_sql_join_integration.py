@@ -109,6 +109,17 @@ def test_graph_happy_path_no_fallback_warning(monkeypatch, caplog):
     assert "falling back" not in caplog.text
 
 
+def test_join_semantics_reports_cardinality_sidecar():
+    schema = _chain_schema()
+    metrics = _entities("A", "B")
+
+    result = JoinValidator().build_joins(metrics, [], {}, schema, main_table="A")
+
+    assert result["join_semantics"][0]["cardinality"] == "many_to_one"
+    assert result["join_semantics"][0]["join_type"] == "INNER"
+    assert result["join_warnings"] == []
+
+
 # ---------------------------------------------------------------------------
 # 3. fallback too-many-terminals: max_terminals=1 + ≥2 required
 # ---------------------------------------------------------------------------

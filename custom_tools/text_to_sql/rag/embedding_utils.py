@@ -6,18 +6,18 @@ EPIC 8.10: класс перешёл с mixin-режима на самостоя
 (пин-тест ``test_cosine_similarity_module_function`` обращается к
 ``EmbeddingUtilsMixin._cosine_similarity``).
 """
-import os
 import json
+import os
 import hashlib
 from typing import Any, List, Optional
 
 from memory.manager import (
-    memory_manager,
     EmbeddingUnavailableError,
     EmbeddingFailedError,
 )
 
 from ._similarity import cosine_similarity
+from .memory_gateway import RAGMemoryGateway
 
 
 class EmbeddingUtils:
@@ -29,6 +29,9 @@ class EmbeddingUtils:
     путаницы (private API на уровне RAGSearcher) — это пересечение
     с публичностью внутри сервиса допустимо.
     """
+
+    def __init__(self, *, memory_gateway: Optional[RAGMemoryGateway] = None) -> None:
+        self._memory_gateway = memory_gateway or RAGMemoryGateway()
 
     def _get_session_id(self) -> str:
         """Получает session_id для текущего соединения.
@@ -120,9 +123,7 @@ class EmbeddingUtils:
         Возвращает None ТОЛЬКО когда внутренняя функция вернула None
         (пустой/короткий текст — штатный edge case, не ошибка).
         """
-        # Late lookup через фасад rag для поддержки monkeypatch на rag.memory_manager.
-        from custom_tools.text_to_sql import rag as _facade
-        _mm = _facade.memory_manager
+        _mm = self._memory_gateway.memory_manager
         fn = getattr(_mm, "_create_embedding", None)
         if fn is None:
             raise EmbeddingUnavailableError(

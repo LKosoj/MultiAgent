@@ -21,6 +21,24 @@ from backend.fastapi_app.agui.models import RunAgentInput
 from backend.fastapi_app.agui.store import EventStore
 
 
+def test_agui_redaction_facade_exports_service_symbols():
+    from backend.fastapi_app.agui import redaction
+
+    for name in (
+        "_dsn_fingerprint",
+        "_is_masked_dsn",
+        "_is_sensitive_query_key",
+        "_looks_like_dsn",
+        "_redact_dsn",
+        "_redact_payload",
+        "_redact_query_string",
+        "_redact_text",
+        "_sanitize_report_b64_gzip",
+        "redact_pii_in_payload",
+    ):
+        assert hasattr(redaction, name), f"missing redaction facade export: {name}"
+
+
 def _make_payload(run_id: str) -> dict:
     return {
         "threadId": f"thread-{run_id}",
@@ -820,6 +838,7 @@ def _load_run_manager_with_runner_stub(monkeypatch, run_agent):
 
 
 def _load_runner_with_service_stub(monkeypatch, handle_service_action):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
     stub_agent_system = types.ModuleType("agent_system")
 
     class DynamicAgentSystem:
@@ -862,6 +881,8 @@ def _load_runner_with_service_stub(monkeypatch, handle_service_action):
 
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> TestClient:
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
+
     async def stub_run_agent(_input_data):
         if False:
             yield None
@@ -874,6 +895,54 @@ def client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setattr(gateway, "store", store)
     monkeypatch.setattr(gateway, "run_manager", run_manager)
     return TestClient(gateway.app)
+
+
+def test_agui_auth_defaults_to_required_without_tokens(tmp_path, monkeypatch):
+    for env_name in (
+        "AG_UI_AUTH_MODE",
+        "AG_UI_AUTH_TOKEN",
+        "AG_UI_ADMIN_TOKEN",
+        "AG_UI_USER_TOKEN",
+        "AG_UI_MEMORY_ARCHIVIST_TOKEN",
+        "AG_UI_AUTH_TOKEN_MAP",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    async def fake_run_agent(_input_data):
+        if False:
+            yield None
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    monkeypatch.setattr(gateway, "store", store)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
+    local_client = TestClient(gateway.app)
+
+    response = local_client.post("/v1/runs", json=_make_payload("client-run"))
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "AG-UI authentication token is required"
+
+
+def test_current_principal_without_context_is_anonymous_when_auth_required(monkeypatch):
+    for env_name in (
+        "AG_UI_AUTH_MODE",
+        "AG_UI_AUTH_TOKEN",
+        "AG_UI_ADMIN_TOKEN",
+        "AG_UI_USER_TOKEN",
+        "AG_UI_MEMORY_ARCHIVIST_TOKEN",
+        "AG_UI_AUTH_TOKEN_MAP",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+
+    from backend.fastapi_app.agui.auth import current_principal
+
+    principal = current_principal()
+
+    assert principal.subject == "anonymous"
+    assert principal.roles == frozenset({"user"})
 
 
 def test_v1_runs_lifecycle(client, monkeypatch):
@@ -1270,6 +1339,56 @@ async def test_service_payload_non_dict_returns_explicit_error(monkeypatch):
     error_event = next(event for event in events if event.type == EventType.RUN_ERROR)
     assert error_event.code == "service_payload_invalid"
     assert error_event.message == "service_payload must be an object"
+
+
+@pytest.mark.asyncio
+async def test_timeout_safe_service_action_returns_explicit_error(monkeypatch):
+    def handle_service_action(_action, _payload):
+        time.sleep(0.05)
+        return {"late": True}
+
+    runner = _load_runner_with_service_stub(monkeypatch, handle_service_action)
+    monkeypatch.setenv("AG_UI_SERVICE_ACTION_TIMEOUT_SECONDS", "0.001")
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    payload = _make_payload(run_id)
+    payload["forwardedProps"] = {
+        "service_action": "utils.text.analyze",
+        "service_payload": {"__request_id": "req-slow"},
+    }
+
+    events = [event async for event in runner.run_agent(RunAgentInput(**payload))]
+
+    error_event = next(event for event in events if event.type == EventType.RUN_ERROR)
+    service_event = next(event for event in events if event.type == EventType.CUSTOM)
+    assert error_event.code == "service_action_error"
+    assert "utils.text.analyze" in error_event.message
+    assert "timeout" in error_event.message
+    assert service_event.value["ok"] is False
+
+
+@pytest.mark.asyncio
+async def test_mutating_service_action_is_not_reported_timed_out_while_thread_continues(monkeypatch):
+    def handle_service_action(action, _payload):
+        assert action == "presets.text_to_sql.generate"
+        time.sleep(0.02)
+        return {"run_id": "workflow-run"}
+
+    runner = _load_runner_with_service_stub(monkeypatch, handle_service_action)
+    monkeypatch.setenv("AG_UI_SERVICE_ACTION_TIMEOUT_SECONDS", "0.001")
+    run_id = f"run-{uuid.uuid4().hex[:8]}"
+    payload = _make_payload(run_id)
+    payload["forwardedProps"] = {
+        "service_action": "presets.text_to_sql.generate",
+        "service_payload": {"__request_id": "req-mutating"},
+    }
+
+    events = [event async for event in runner.run_agent(RunAgentInput(**payload))]
+
+    assert not [event for event in events if event.type == EventType.RUN_ERROR]
+    service_event = next(event for event in events if event.type == EventType.CUSTOM)
+    finished_event = next(event for event in events if event.type == EventType.RUN_FINISHED)
+    assert service_event.value["ok"] is True
+    assert finished_event.result["ok"] is True
 
 
 @pytest.mark.asyncio

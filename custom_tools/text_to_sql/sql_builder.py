@@ -6,9 +6,11 @@
 """
 import logging
 import math
+from datetime import date, timedelta
 from typing import Any, Dict, List, Optional, Set
 
 from .dialects import (
+    get_current_dialect_name,
     quote_identifier,
     quote_single_identifier,
     sql_string_literal,
@@ -16,6 +18,10 @@ from .dialects import (
 from .constants import JOIN_TYPE_ALIASES
 
 logger = logging.getLogger(__name__)
+
+
+class UnsupportedTemporalBucketError(ValueError):
+    """Raised when a date grain cannot be rendered for the active SQL dialect."""
 
 
 def build_sql_from_linked_entities(
@@ -84,6 +90,10 @@ def build_sql_from_linked_entities(
         if not table or not column:
             continue
         expr = quote_identifier(f"{table}.{column}", dsn=effective_dsn)
+        try:
+            expr = temporal_bucket_expression(expr, _date_grain(dim), dsn=effective_dsn)
+        except UnsupportedTemporalBucketError as exc:
+            return {"error": str(exc), "sql_query": ""}
         # Alias — одиночный идентификатор: точка внутри alias не должна
         # split'иться, иначе `"foo"."bar"` в позиции AS даёт syntax error.
         alias = quote_single_identifier(str(dim.get("name") or column), dsn=effective_dsn)
@@ -425,6 +435,10 @@ def filter_value_conditions(
     operator = operator_aliases.get(operator, operator)
 
     if isinstance(value, dict):
+        relative_range = resolve_relative_date_range(value.get("relative") or value.get("period"))
+        if relative_range and "start" not in value and "end" not in value:
+            value = {**value, **relative_range}
+
         if "operator" in value:
             if "value" not in value:
                 return None
@@ -500,6 +514,104 @@ def filter_value_conditions(
     if operator not in {"=", "!=", "<>", ">", ">=", "<", "<=", "LIKE"}:
         return None
     return [f"{expr} {operator} {sql_literal(value, dsn=dsn)}"]
+
+
+def _date_grain(entity: Dict[str, Any]) -> str | None:
+    raw = (
+        entity.get("date_grain")
+        or entity.get("time_grain")
+        or entity.get("grain")
+        or entity.get("bucket")
+    )
+    if not isinstance(raw, str):
+        return None
+    grain = raw.strip().casefold()
+    aliases = {
+        "daily": "day",
+        "date": "day",
+        "weekly": "week",
+        "monthly": "month",
+        "quarterly": "quarter",
+        "yearly": "year",
+        "yyyy-mm": "month",
+        "yyyy": "year",
+    }
+    return aliases.get(grain, grain if grain in {"day", "week", "month", "quarter", "year"} else None)
+
+
+def temporal_bucket_expression(expr: str, grain: str | None, dsn: str | None = None) -> str:
+    if not grain:
+        return expr
+    try:
+        dialect = get_current_dialect_name(dsn, strict=bool(dsn and str(dsn).strip()))
+    except Exception as exc:
+        raise UnsupportedTemporalBucketError(
+            f"Temporal bucketing is not supported: cannot resolve SQL dialect for DSN ({exc})"
+        ) from exc
+    if dialect == "sqlite":
+        if grain == "day":
+            return f"DATE({expr})"
+        if grain == "week":
+            return f"strftime('%Y-W%W', {expr})"
+        if grain == "month":
+            return f"strftime('%Y-%m', {expr})"
+        if grain == "quarter":
+            return (
+                f"strftime('%Y', {expr}) || '-Q' || "
+                f"CAST(((CAST(strftime('%m', {expr}) AS INTEGER) + 2) / 3) AS INTEGER)"
+            )
+        if grain == "year":
+            return f"strftime('%Y', {expr})"
+    if dialect == "mysql":
+        if grain == "day":
+            return f"DATE({expr})"
+        if grain == "week":
+            return f"DATE_FORMAT({expr}, '%x-W%v')"
+        if grain == "month":
+            return f"DATE_FORMAT({expr}, '%Y-%m')"
+        if grain == "quarter":
+            return f"CONCAT(YEAR({expr}), '-Q', QUARTER({expr}))"
+        if grain == "year":
+            return f"YEAR({expr})"
+    if dialect in {"postgres", "duckdb", "sql"}:
+        return f"DATE_TRUNC('{grain}', {expr})"
+    raise UnsupportedTemporalBucketError(
+        f"Temporal bucketing is not supported for SQL dialect {dialect!r}"
+    )
+
+
+def resolve_relative_date_range(value: Any, *, today: date | None = None) -> Dict[str, str] | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    key = value.strip().casefold().replace("-", "_").replace(" ", "_")
+    today = today or _today()
+    if key == "today":
+        start = end = today
+    elif key == "yesterday":
+        start = end = today - timedelta(days=1)
+    elif key in {"last_7_days", "past_7_days"}:
+        start, end = today - timedelta(days=6), today
+    elif key in {"last_30_days", "past_30_days"}:
+        start, end = today - timedelta(days=29), today
+    elif key in {"current_month", "this_month"}:
+        start, end = today.replace(day=1), today
+    elif key in {"previous_month", "last_month"}:
+        first_this_month = today.replace(day=1)
+        end = first_this_month - timedelta(days=1)
+        start = end.replace(day=1)
+    elif key in {"previous_quarter", "last_quarter"}:
+        current_quarter = (today.month - 1) // 3 + 1
+        first_current_quarter = date(today.year, 3 * (current_quarter - 1) + 1, 1)
+        end = first_current_quarter - timedelta(days=1)
+        previous_quarter = (end.month - 1) // 3 + 1
+        start = date(end.year, 3 * (previous_quarter - 1) + 1, 1)
+    else:
+        return None
+    return {"start": start.isoformat(), "end": end.isoformat()}
+
+
+def _today() -> date:
+    return date.today()
 
 
 def sql_literal(value: Any, dsn: str | None = None) -> str:

@@ -218,7 +218,10 @@ def _load_config_object() -> PromptsConfig:
 def resolve_active_profile_name(explicit: str | None = None) -> str:
     """Какой профиль использовать: явный аргумент → env → ``"default"``."""
     return _shared_resolve_active_profile_name(
-        explicit, env_var=_ENV_PROFILE_VAR, default=_DEFAULT_PROFILE
+        explicit,
+        env_var=_ENV_PROFILE_VAR,
+        default=_DEFAULT_PROFILE,
+        umbrella_map={"muni_ru": _DEFAULT_PROFILE},
     )
 
 

@@ -90,6 +90,7 @@ class SchemaLinker:
         schema_info: Dict[str, Any],
         dsn: Optional[str] = None,
         session_id: Optional[str] = None,
+        value_grounding: Optional[bool] = None,
     ) -> Dict[str, Any]:
         """Основная функция связывания сущностей со схемой."""
         logger.info("Linking entities to database schema")
@@ -181,7 +182,13 @@ class SchemaLinker:
                 db_schema,
                 dsn=effective_dsn,
             )
-            return cached_result
+            return self._apply_value_grounding(
+                cached_result,
+                entities=entities,
+                db_schema=db_schema,
+                dsn=effective_dsn,
+                value_grounding=value_grounding,
+            )
 
         # Выполняем связывание
         result = self.linking_core.perform_linking(entities, db_schema, dsn=effective_dsn)
@@ -210,7 +217,32 @@ class SchemaLinker:
                     exc,
                 )
 
-        return result
+        return self._apply_value_grounding(
+            result,
+            entities=entities,
+            db_schema=db_schema,
+            dsn=effective_dsn,
+            value_grounding=value_grounding,
+        )
+
+    def _apply_value_grounding(
+        self,
+        result: Dict[str, Any],
+        *,
+        entities: Dict[str, Any],
+        db_schema: Dict[str, Any],
+        dsn: Optional[str],
+        value_grounding: Optional[bool],
+    ) -> Dict[str, Any]:
+        from .value_grounding import ground_linked_filter_values
+
+        return ground_linked_filter_values(
+            result,
+            original_entities=entities,
+            db_schema=db_schema,
+            dsn=dsn,
+            value_grounding=value_grounding,
+        )
     
     def _get_database_schema(
         self,

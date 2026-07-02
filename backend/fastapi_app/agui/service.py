@@ -405,30 +405,32 @@ def _db_test_config_secrets_path() -> Path:
 
 
 def _load_db_test_configs() -> Dict[str, Dict[str, Any]]:
-    path = _db_test_configs_path()
-    if not path.exists():
-        _persist_legacy_db_test_config_secrets({})
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        _persist_legacy_db_test_config_secrets({})
-        return {}
-    if not isinstance(data, dict):
-        _persist_legacy_db_test_config_secrets({})
-        return {}
-    return _persist_legacy_db_test_config_secrets(data)
+    with _DB_TEST_CONFIGS_LOCK:
+        path = _db_test_configs_path()
+        if not path.exists():
+            _persist_legacy_db_test_config_secrets({})
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            _persist_legacy_db_test_config_secrets({})
+            return {}
+        if not isinstance(data, dict):
+            _persist_legacy_db_test_config_secrets({})
+            return {}
+        return _persist_legacy_db_test_config_secrets(data)
 
 
 def _load_db_test_config_secrets() -> Dict[str, str]:
-    path = _db_test_config_secrets_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    with _DB_TEST_CONFIGS_LOCK:
+        path = _db_test_config_secrets_path()
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 
 def _masked_dsn_requires_public_normalization(dsn: str) -> bool:
@@ -535,50 +537,52 @@ def _persist_legacy_db_test_config_secrets(configs: Dict[str, Dict[str, Any]]) -
 
 
 def _save_db_test_config_secrets(secrets: Dict[str, str]) -> None:
-    path = _db_test_config_secrets_path()
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1  # fdopen owns the descriptor now
-            json.dump(secrets, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
-        path.chmod(0o600)
-    finally:
-        # Очистка в ЛЮБОМ исходе (в т.ч. BaseException: KeyboardInterrupt/SystemExit).
-        # На успехе fd уже == -1 (закрыт os.fdopen-контекстом), а temp_name переименован
-        # в path → unlink(missing_ok=True) — безопасный no-op (path не трогаем).
-        if fd != -1:
+    with _DB_TEST_CONFIGS_LOCK:
+        path = _db_test_config_secrets_path()
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1  # fdopen owns the descriptor now
+                json.dump(secrets, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_name, path)
+            path.chmod(0o600)
+        finally:
+            # Очистка в ЛЮБОМ исходе (в т.ч. BaseException: KeyboardInterrupt/SystemExit).
+            # На успехе fd уже == -1 (закрыт os.fdopen-контекстом), а temp_name переименован
+            # в path → unlink(missing_ok=True) — безопасный no-op (path не трогаем).
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
-                os.close(fd)
+                Path(temp_name).unlink(missing_ok=True)
             except OSError:
                 pass
-        try:
-            Path(temp_name).unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _save_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> None:
-    path = _db_test_configs_path()
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            fd = -1  # fdopen owns the descriptor now
-            json.dump(configs, handle, ensure_ascii=False, indent=2)
-        os.replace(temp_name, path)
-    finally:
-        # Очистка в ЛЮБОМ исходе (в т.ч. BaseException). На успехе fd уже == -1,
-        # temp_name переименован в path → unlink(missing_ok=True) — безопасный no-op.
-        if fd != -1:
+    with _DB_TEST_CONFIGS_LOCK:
+        path = _db_test_configs_path()
+        fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent), text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1  # fdopen owns the descriptor now
+                json.dump(configs, handle, ensure_ascii=False, indent=2)
+            os.replace(temp_name, path)
+        finally:
+            # Очистка в ЛЮБОМ исходе (в т.ч. BaseException). На успехе fd уже == -1,
+            # temp_name переименован в path → unlink(missing_ok=True) — безопасный no-op.
+            if fd != -1:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
             try:
-                os.close(fd)
+                Path(temp_name).unlink(missing_ok=True)
             except OSError:
                 pass
-        try:
-            Path(temp_name).unlink(missing_ok=True)
-        except OSError:
-            pass
 
 
 def _serialize_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> list[Dict[str, Any]]:
@@ -592,34 +596,58 @@ def _serialize_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> list[Dict[
     ]
 
 
-def _resolve_dsn_reference(dsn: Any) -> Any:
+def _db_test_config_owner_fields(principal: Principal) -> Dict[str, str]:
+    return {
+        "owner_subject": principal.subject,
+        "tenant_id": principal.tenant_id,
+    }
+
+
+def _can_access_db_test_config(config: Dict[str, Any], principal: Principal) -> bool:
+    if principal.has_role("admin"):
+        return True
+    return (
+        config.get("owner_subject") == principal.subject
+        and config.get("tenant_id") == principal.tenant_id
+    )
+
+
+def _require_db_test_config_access(config: Dict[str, Any], principal: Principal) -> None:
+    if _can_access_db_test_config(config, principal):
+        return
+    raise PermissionError("saved DB config is not accessible for current principal")
+
+
+def _resolve_dsn_reference(dsn: Any, principal: Optional[Principal] = None) -> Any:
     if not isinstance(dsn, str) or not dsn.startswith(_DB_TEST_CONFIG_REF_PREFIX):
         return dsn
-    name = unquote(dsn[len(_DB_TEST_CONFIG_REF_PREFIX):])
-    public_configs = _load_db_test_configs()
-    secrets = _load_db_test_config_secrets()
-    resolved = secrets.get(name)
-    if not resolved:
-        legacy_config = public_configs.get(name) or {}
-        legacy_dsn = legacy_config.get("dsn")
+    principal = principal or current_principal()
+    with _DB_TEST_CONFIGS_LOCK:
+        name = unquote(dsn[len(_DB_TEST_CONFIG_REF_PREFIX):])
+        public_configs = _load_db_test_configs()
+        secrets = _load_db_test_config_secrets()
+        public_config = public_configs.get(name) or {}
+        _require_db_test_config_access(public_config, principal)
+        resolved = secrets.get(name)
+        if not resolved:
+            legacy_dsn = public_config.get("dsn")
+            if (
+                isinstance(legacy_dsn, str)
+                and not _is_masked_dsn(legacy_dsn)
+                and not _is_partially_masked_dsn(legacy_dsn)
+            ):
+                return legacy_dsn
+            raise ValueError("saved DB config secret is unavailable")
+        public_dsn = public_config.get("dsn")
+        if not isinstance(public_dsn, str) or public_config.get("dsn_fingerprint") != _dsn_fingerprint(resolved):
+            raise ValueError("saved DB config secret is unavailable")
         if (
-            isinstance(legacy_dsn, str)
-            and not _is_masked_dsn(legacy_dsn)
-            and not _is_partially_masked_dsn(legacy_dsn)
+            _masked_dsn_requires_public_normalization(public_dsn)
+            or _is_partially_masked_dsn(public_dsn)
+            or not _is_masked_dsn(public_dsn)
         ):
-            return legacy_dsn
-        raise ValueError("saved DB config secret is unavailable")
-    public_config = public_configs.get(name) or {}
-    public_dsn = public_config.get("dsn")
-    if not isinstance(public_dsn, str) or public_config.get("dsn_fingerprint") != _dsn_fingerprint(resolved):
-        raise ValueError("saved DB config secret is unavailable")
-    if (
-        _masked_dsn_requires_public_normalization(public_dsn)
-        or _is_partially_masked_dsn(public_dsn)
-        or not _is_masked_dsn(public_dsn)
-    ):
-        raise ValueError("saved DB config secret is unavailable")
-    return resolved
+            raise ValueError("saved DB config secret is unavailable")
+        return resolved
 
 
 def _t2s_history_path() -> Path:
@@ -870,6 +898,36 @@ def _coerce_strict_bool(value: Any, *, default: bool = False, field_name: str = 
         if normalized in {"", "0", "false", "no", "off"}:
             return False
     raise ValueError(f"{field_name} must be boolean")
+
+
+def _coerce_int_range(
+    value: Any,
+    *,
+    default: int,
+    min_value: int,
+    max_value: int,
+    field_name: str,
+) -> int:
+    if value is None or value == "":
+        parsed = default
+    elif isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer")
+    elif isinstance(value, int):
+        parsed = value
+    elif isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError(f"{field_name} must be an integer")
+        parsed = int(value)
+    elif isinstance(value, str):
+        try:
+            parsed = int(value.strip())
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+    else:
+        raise ValueError(f"{field_name} must be an integer")
+    if parsed < min_value or parsed > max_value:
+        raise ValueError(f"{field_name} must be between {min_value} and {max_value}")
+    return parsed
 
 
 def _storybook_project_id_from_payload(payload: Dict[str, Any], *, required: bool) -> str | None:
@@ -2494,6 +2552,7 @@ _CONFIG_MANAGER_LOCK = threading.RLock()
 _TELEMETRY_MANAGER_LOCK = threading.RLock()
 _LOGGING_MANAGER_LOCK = threading.RLock()
 _TOOL_MANAGER_LOCK = threading.RLock()
+_DB_TEST_CONFIGS_LOCK = threading.RLock()
 
 
 def _agent_manager() -> AgentManager:
@@ -3249,7 +3308,7 @@ def handle_service_action(
         if validator is not None:
             inputs = dict(parameters)
             if "dsn" in inputs:
-                inputs["dsn"] = _resolve_dsn_reference(inputs.get("dsn"))
+                inputs["dsn"] = _resolve_dsn_reference(inputs.get("dsn"), principal=principal)
             # W9-A3: переводим ValidationError -> ValueError, чтобы AG-UI
             # dispatcher вернул service_action_error с понятным текстом
             # (а не уронил 500 на pydantic-ошибке). Совпадает с поведением
@@ -3478,10 +3537,17 @@ def handle_service_action(
         query = payload.get("query")
         if not query:
             raise ValueError("query is required")
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=10,
+            min_value=1,
+            max_value=100,
+            field_name="limit",
+        )
         result = memory_manager.search_memory(
             query=query,
             memory_type=payload.get("memory_type", "tactical"),
-            limit=int(payload.get("limit", 10)),
+            limit=limit,
             session_id=payload.get("session_id"),
             agent_name=payload.get("agent_name"),
             principal=principal,
@@ -3522,10 +3588,18 @@ def handle_service_action(
         fmt = (payload.get("format") or "json").lower()
         agent_name = payload.get("agent_name")
         session_id = payload.get("session_id")
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=1000,
+            min_value=1,
+            max_value=10000,
+            field_name="limit",
+        )
         export_data = memory_manager.export_memory(
             agent_name=agent_name,
             session_id=session_id,
             format=fmt,
+            limit=limit,
             principal=principal,
         )
         if export_data.get("success") and fmt == "csv":
@@ -3575,14 +3649,42 @@ def handle_service_action(
         return {"result": _serialize(_memory_full_cleanup(memory_manager))}
     if action == "memory.analytics.summary":
         days = payload.get("days")
-        days_val = int(days) if days is not None else None
+        days_val = (
+            _coerce_int_range(
+                days,
+                default=30,
+                min_value=1,
+                max_value=3650,
+                field_name="days",
+            )
+            if days is not None
+            else None
+        )
         return {"result": _serialize(_memory_analytics_summary(memory_manager, days_val))}
     if action == "memory.analytics.timeseries":
-        days = int(payload.get("days", 30))
+        days = _coerce_int_range(
+            payload.get("days"),
+            default=30,
+            min_value=1,
+            max_value=3650,
+            field_name="days",
+        )
         return {"result": _serialize(_memory_analytics_timeseries(memory_manager, days))}
     if action == "memory.analytics.keywords":
-        limit = int(payload.get("limit", 50))
-        min_len = int(payload.get("min_len", 4))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=50,
+            min_value=1,
+            max_value=500,
+            field_name="limit",
+        )
+        min_len = _coerce_int_range(
+            payload.get("min_len"),
+            default=4,
+            min_value=1,
+            max_value=100,
+            field_name="min_len",
+        )
         return {"result": _serialize(_memory_analytics_keywords(memory_manager, limit, min_len))}
     if action == "memory.embeddings.test":
         text = payload.get("text") or "test"
@@ -3596,13 +3698,13 @@ def handle_service_action(
             raise ValueError("scheme is required")
         return {"plugin": _serialize(db_manager.get_plugin_info(scheme))}
     if action == "db.validate_dsn":
-        dsn = _resolve_dsn_reference(payload.get("dsn"))
+        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         if not dsn:
             raise ValueError("dsn is required")
         check_schema = _coerce_bool(payload.get("check_schema_requirement"), True)
         return {"result": _redact_payload(_serialize(db_manager.validate_dsn(dsn, check_schema_requirement=check_schema)))}
     if action == "db.test_connection":
-        dsn = _resolve_dsn_reference(payload.get("dsn"))
+        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         if not dsn:
             raise ValueError("dsn is required")
         timeout = int(payload.get("timeout_seconds", 10))
@@ -3637,7 +3739,7 @@ def handle_service_action(
             raise ValueError("scheme is required")
         return _db_quick_test(scheme, db_manager)
     if action == "db.comprehensive_test":
-        dsn = _resolve_dsn_reference(payload.get("dsn"))
+        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         if not dsn:
             raise ValueError("dsn is required")
         timeout = int(payload.get("timeout_seconds", 10))
@@ -3654,7 +3756,7 @@ def handle_service_action(
     if action == "db.diagnostics":
         return _db_plugin_diagnostics(db_manager)
     if action == "db.introspect_schema":
-        dsn = _resolve_dsn_reference(payload.get("dsn"))
+        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         if not dsn:
             raise ValueError("dsn is required")
         schema_name = payload.get("schema")
@@ -3669,7 +3771,7 @@ def handle_service_action(
             plugin.close(conn)
         return {"schema": _serialize(schema)}
     if action == "text_to_sql.schema.load":
-        dsn = _resolve_dsn_reference(payload.get("dsn"))
+        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         if not dsn:
             raise ValueError("dsn is required")
         schema_name = payload.get("schema")
@@ -3707,39 +3809,42 @@ def handle_service_action(
         description = payload.get("description", "")
         if not name or not dsn:
             raise ValueError("name and dsn are required")
-        resolved_dsn = _resolve_dsn_reference(dsn)
-        if (
-            not isinstance(resolved_dsn, str)
-            or _is_masked_dsn(resolved_dsn)
-            or _is_partially_masked_dsn(resolved_dsn)
-        ):
-            raise ValueError("valid raw dsn or connection_ref is required")
-        configs = _load_db_test_configs()
-        secrets = _load_db_test_config_secrets()
-        secrets[name] = resolved_dsn
-        configs[name] = {
-            "dsn": _redact_dsn(resolved_dsn),
-            "dsn_fingerprint": _dsn_fingerprint(resolved_dsn),
-            "description": description,
-            "created_at": datetime.now().isoformat(),
-        }
-        _save_db_test_config_secrets(secrets)
-        _save_db_test_configs(configs)
-        return {
-            "saved": True,
-            "configs": _serialize_db_test_configs(configs),
-        }
+        with _DB_TEST_CONFIGS_LOCK:
+            resolved_dsn = _resolve_dsn_reference(dsn, principal=principal)
+            if (
+                not isinstance(resolved_dsn, str)
+                or _is_masked_dsn(resolved_dsn)
+                or _is_partially_masked_dsn(resolved_dsn)
+            ):
+                raise ValueError("valid raw dsn or connection_ref is required")
+            configs = _load_db_test_configs()
+            secrets = _load_db_test_config_secrets()
+            secrets[name] = resolved_dsn
+            configs[name] = {
+                "dsn": _redact_dsn(resolved_dsn),
+                "dsn_fingerprint": _dsn_fingerprint(resolved_dsn),
+                "description": description,
+                "created_at": datetime.now().isoformat(),
+                **_db_test_config_owner_fields(principal),
+            }
+            _save_db_test_config_secrets(secrets)
+            _save_db_test_configs(configs)
+            return {
+                "saved": True,
+                "configs": _serialize_db_test_configs(configs),
+            }
     if action == "db.test_configs.delete":
         name = payload.get("name")
         if not name:
             raise ValueError("name is required")
-        configs = _load_db_test_configs()
-        secrets = _load_db_test_config_secrets()
-        removed = configs.pop(name, None)
-        secrets.pop(name, None)
-        _save_db_test_configs(configs)
-        _save_db_test_config_secrets(secrets)
-        return {"deleted": bool(removed), "configs": _serialize_db_test_configs(configs)}
+        with _DB_TEST_CONFIGS_LOCK:
+            configs = _load_db_test_configs()
+            secrets = _load_db_test_config_secrets()
+            removed = configs.pop(name, None)
+            secrets.pop(name, None)
+            _save_db_test_configs(configs)
+            _save_db_test_config_secrets(secrets)
+            return {"deleted": bool(removed), "configs": _serialize_db_test_configs(configs)}
 
     if action == "config.get":
         return {"config": _serialize(config_manager.get_config())}
@@ -3880,7 +3985,13 @@ def handle_service_action(
         )
         return {"traces": _serialize(filtered)}
     if action == "telemetry.cleanup":
-        max_age_days = int(payload.get("max_age_days", 7))
+        max_age_days = _coerce_int_range(
+            payload.get("max_age_days"),
+            default=7,
+            min_value=1,
+            max_value=3650,
+            field_name="max_age_days",
+        )
         telemetry_manager.cleanup_old_traces(max_age_days=max_age_days)
         return {"cleaned": True}
     if action == "telemetry.mark_incomplete":
@@ -3897,14 +4008,26 @@ def handle_service_action(
             raise ValueError("run_id is required")
         return {"report": _redact_payload(_serialize(_telemetry_generate_report(telemetry_manager, run_id)))}
     if action == "telemetry.analytics":
-        days = int(payload.get("days", 7))
+        days = _coerce_int_range(
+            payload.get("days"),
+            default=7,
+            min_value=1,
+            max_value=3650,
+            field_name="days",
+        )
         return {"result": _serialize(_telemetry_analytics(telemetry_manager, days))}
 
     if action == "logs.run_logs":
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
-        limit = int(payload.get("limit", 1000))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=1000,
+            min_value=1,
+            max_value=5000,
+            field_name="limit",
+        )
         return {"logs": _redact_payload(_serialize(logging_manager.get_run_logs(run_id, limit=limit)))}
     if action == "logs.span_logs":
         run_id = payload.get("run_id")
@@ -3915,7 +4038,13 @@ def handle_service_action(
     if action in ("logs.search", "logs.search_advanced"):
         query = payload.get("query", "")
         level = payload.get("level")
-        limit = int(payload.get("limit", 100))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=100,
+            min_value=1,
+            max_value=5000,
+            field_name="limit",
+        )
         start_time = payload.get("start_time")
         end_time = payload.get("end_time")
         start_dt = datetime.fromisoformat(start_time) if start_time else None
@@ -3958,7 +4087,13 @@ def handle_service_action(
             raise ValueError(
                 f"file is too large: {log_path.stat().st_size} bytes > {_max_file_read_bytes()}"
             )
-        limit = int(payload.get("limit", 500))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=500,
+            min_value=1,
+            max_value=5000,
+            field_name="limit",
+        )
         query = payload.get("query", "")
         level = payload.get("level")
         use_regex = bool(payload.get("use_regex", False))
@@ -3993,13 +4128,25 @@ def handle_service_action(
         filename = payload.get("filename")
         if not filename:
             raise ValueError("filename is required")
-        limit = int(payload.get("limit", 500))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=500,
+            min_value=1,
+            max_value=5000,
+            field_name="limit",
+        )
         query = payload.get("query", "")
         level = payload.get("level")
         use_regex = bool(payload.get("use_regex", False))
         case_sensitive = bool(payload.get("case_sensitive", False))
         invert_search = bool(payload.get("invert_search", False))
-        context_lines = int(payload.get("context_lines", 0))
+        context_lines = _coerce_int_range(
+            payload.get("context_lines"),
+            default=0,
+            min_value=0,
+            max_value=20,
+            field_name="context_lines",
+        )
         start_time = _parse_iso_dt(payload.get("start_time"))
         end_time = _parse_iso_dt(payload.get("end_time"))
         return {
@@ -4017,10 +4164,22 @@ def handle_service_action(
             ))
         }
     if action == "logs.analytics":
-        max_files = int(payload.get("max_files", 20))
+        max_files = _coerce_int_range(
+            payload.get("max_files"),
+            default=20,
+            min_value=1,
+            max_value=500,
+            field_name="max_files",
+        )
         return {"result": _serialize(_logs_analytics(max_files=max_files))}
     if action == "logs.cleanup":
-        max_age_days = int(payload.get("max_age_days", 7))
+        max_age_days = _coerce_int_range(
+            payload.get("max_age_days"),
+            default=7,
+            min_value=1,
+            max_value=3650,
+            field_name="max_age_days",
+        )
         logging_manager.cleanup_old_logs(max_age_days=max_age_days)
         return {"cleaned": True}
 
@@ -4035,13 +4194,25 @@ def handle_service_action(
         if text is None:
             raise ValueError("text is required")
         delimiter = payload.get("delimiter", ",")
-        sample_rows = int(payload.get("sample_rows", 5))
+        sample_rows = _coerce_int_range(
+            payload.get("sample_rows"),
+            default=5,
+            min_value=1,
+            max_value=1000,
+            field_name="sample_rows",
+        )
         return {"result": _serialize(_utils_csv_analyze(text, delimiter, sample_rows))}
     if action == "utils.text.analyze":
         text = payload.get("text")
         if text is None:
             raise ValueError("text is required")
-        top_n = int(payload.get("top_n", 20))
+        top_n = _coerce_int_range(
+            payload.get("top_n"),
+            default=20,
+            min_value=1,
+            max_value=1000,
+            field_name="top_n",
+        )
         return {"result": _serialize(_utils_text_analyze(text, top_n))}
     if action == "utils.hash.generate":
         text = payload.get("text")
@@ -4122,7 +4293,7 @@ def handle_service_action(
 
         merged_payload = dict(payload)
         merged_payload["query"] = _extract_query(payload)  # natural_query → query
-        merged_payload["dsn"] = _resolve_dsn_reference(payload.get("dsn"))
+        merged_payload["dsn"] = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
         req = parse_text_to_sql_generate(merged_payload)
 
         base_session_id = req.session_id or _compute_text_to_sql_session_id(req.dsn)
@@ -4169,7 +4340,13 @@ def handle_service_action(
             "parameters": _redact_payload(parameters),
         }
     if action == "text_to_sql.history.list":
-        limit = int(payload.get("limit", 100))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=100,
+            min_value=1,
+            max_value=1000,
+            field_name="limit",
+        )
         return {"entries": _serialize(_t2s_history_list(limit))}
     if action == "text_to_sql.history.append":
         entry = payload.get("entry")
@@ -4183,7 +4360,13 @@ def handle_service_action(
         _t2s_history_clear()
         return {"cleared": True}
     if action == "text_to_sql.history.analytics":
-        limit = int(payload.get("limit", 200))
+        limit = _coerce_int_range(
+            payload.get("limit"),
+            default=200,
+            min_value=1,
+            max_value=1000,
+            field_name="limit",
+        )
         entries = _t2s_history_list(limit)
         return {"result": _serialize(_t2s_history_analytics(entries))}
 

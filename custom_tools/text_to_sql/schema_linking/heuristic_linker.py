@@ -23,6 +23,14 @@ from .join_validation import _parse_fk_reference_table
 logger = logging.getLogger(__name__)
 
 
+def _is_identifier_like_dimension_candidate(entity_name: Any, column_name: str) -> bool:
+    entity = str(entity_name or "").strip().casefold()
+    column = str(column_name or "").strip().casefold()
+    if entity in {"id", "identifier", "key", "code"} or entity.endswith(("_id", "_code", "_key")):
+        return False
+    return column in {"id", "uuid", "guid", "code"} or column.endswith(("_id", "_code", "_key"))
+
+
 class HeuristicLinker:
     """Эвристическое связывание сущностей со схемой.
 
@@ -281,6 +289,8 @@ class HeuristicLinker:
                         col_meta = table_cols.get(candidate)
                         if isinstance(col_meta, dict) and is_fk(col_meta):
                             continue
+                        if _is_identifier_like_dimension_candidate(d, candidate):
+                            continue
                         other_candidates.append((t, candidate, cand_score))
                         break
                     # если все кандидаты FK — таблица не добавляется (поведение сохраняется)
@@ -297,6 +307,8 @@ class HeuristicLinker:
                     for _mc, _ms in _main_ranked:
                         _mc_meta = _main_tbl_cols.get(_mc)
                         if isinstance(_mc_meta, dict) and is_fk(_mc_meta):
+                            continue
+                        if _is_identifier_like_dimension_candidate(d, _mc):
                             continue
                         main_candidate = (_mc, _ms)
                         break

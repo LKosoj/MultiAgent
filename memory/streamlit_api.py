@@ -1160,6 +1160,7 @@ class MemoryRAGManager:
     def export_memory(self, agent_name: Optional[str] = None,
                      session_id: Optional[str] = None,
                      format: str = "json",
+                     limit: int = 1000,
                      principal: Optional[Principal] = None) -> Dict[str, Any]:
         """
         Экспортировать данные памяти
@@ -1174,6 +1175,7 @@ class MemoryRAGManager:
         """
         try:
             session_id = self._resolve_session_filter(session_id, "memory export", principal)
+            limit = max(1, int(limit))
 
             status = self.get_memory_status()
             if not status.sqlite_available:
@@ -1200,7 +1202,8 @@ class MemoryRAGManager:
                     query += " AND session_id = ?"
                     params.append(session_id)
                 
-                query += " ORDER BY timestamp"
+                query += " ORDER BY timestamp LIMIT ?"
+                params.append(limit)
                 
                 cursor.execute(query, params)
                 rows = cursor.fetchall()

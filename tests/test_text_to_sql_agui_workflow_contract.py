@@ -44,6 +44,7 @@ def _restore_light_workflow_modules():
 
 
 def _load_service_with_stubs(monkeypatch, wf_manager):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
     for module_name in [
         "backend.fastapi_app.agui.service",
         "agent_streamlit_api",
@@ -343,6 +344,35 @@ def test_text_to_sql_generate_scopes_explicit_session_by_principal(monkeypatch):
         )
 
 
+def test_text_to_sql_generate_rejects_admin_saved_db_config_for_plain_user(monkeypatch, tmp_path):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+    admin = Principal(
+        subject="admin",
+        tenant_id="tenant-1",
+        roles=frozenset({"admin", "user"}),
+    )
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+    saved = service.handle_service_action(
+        "db.test_configs.save",
+        {"name": "prod", "dsn": "postgresql://alice:secret@example.com/app"},
+        principal=admin,
+    )
+    ref = saved["configs"][0]["connection_ref"]
+
+    with pytest.raises(PermissionError, match="saved DB config is not accessible"):
+        service.handle_service_action(
+            "presets.text_to_sql.generate",
+            {"query": "show users", "dsn": ref},
+            principal=user,
+        )
+
+    assert wf_manager.calls == []
+
+
 def test_text_to_sql_generate_rejects_foreign_agui_entrypoint(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
@@ -583,6 +613,28 @@ def test_db_test_configs_save_list_resolve_and_delete(monkeypatch, tmp_path):
     assert [config["name"] for config in deleted["configs"]] == ["stars"]
     with pytest.raises(ValueError, match="secret is unavailable"):
         service._resolve_dsn_reference(saved_config["connection_ref"])
+
+
+def test_db_test_configs_parallel_saves_preserve_all_entries(monkeypatch, tmp_path):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+
+    def save_one(index: int):
+        return service.handle_service_action(
+            "db.test_configs.save",
+            {
+                "name": f"prod-{index}",
+                "dsn": f"sqlite:///tmp/app-{index}.db",
+            },
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(save_one, range(20)))
+
+    listed = service.handle_service_action("db.test_configs.list", {})
+    names = {item["name"] for item in listed["configs"]}
+    assert names == {f"prod-{index}" for index in range(20)}
 
 
 def test_db_test_configs_migrates_legacy_raw_dsn(monkeypatch, tmp_path):
@@ -1674,6 +1726,52 @@ def test_service_policy_allows_admin_workflow_save(monkeypatch, tmp_path):
     assert (tmp_path / "workflow_pipelines" / "demo_policy.yaml").exists()
 
 
+def test_memory_search_rejects_oversize_limit_before_manager_call(monkeypatch):
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+
+    class MemoryManager:
+        def search_memory(self, **_kwargs):
+            raise AssertionError("oversize limit must be rejected before manager call")
+
+    monkeypatch.setattr(service, "_memory_manager", lambda: MemoryManager())
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+        service.handle_service_action(
+            "memory.search",
+            {"query": "orders", "limit": 101},
+        )
+
+
+def test_memory_export_passes_bounded_limit_to_manager(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    calls = []
+
+    class MemoryManager:
+        def export_memory(self, **kwargs):
+            calls.append(kwargs)
+            return {"success": True, "format": kwargs["format"], "count": 0, "data": []}
+
+    monkeypatch.setattr(service, "_memory_manager", lambda: MemoryManager())
+    archivist = Principal(
+        subject="archivist",
+        tenant_id="tenant-1",
+        roles=frozenset({"memory_archivist", "user"}),
+    )
+
+    result = service.handle_service_action(
+        "memory.export",
+        {"format": "json", "limit": 25},
+        principal=archivist,
+    )
+
+    assert result["result"]["success"] is True
+    assert calls[0]["limit"] == 25
+
+
 def test_service_file_read_has_size_limit(monkeypatch, tmp_path):
     from backend.fastapi_app.agui.auth import Principal
 
@@ -2383,6 +2481,8 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
     assert workflow.error_handling["on_failure"] != "continue"
     assert workflow.requires_enhanced_engine is True
     assert round_tripped.requires_enhanced_engine is True
+    assert workflow.metadata["agui_entrypoint"] == "presets.text_to_sql.generate"
+    assert workflow.metadata["forbid_workflows_start"] is True
     assert workflow.inputs["query"] == ""
     assert workflow.inputs["dsn"] == ""
     assert schema_step.tool_params["entities"] == "{intent_extraction_step.entities}"
@@ -2393,6 +2493,8 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
     assert "dry_run_only" in workflow.inputs
     assert workflow.inputs["allow_enhanced_fallback"] is False
     assert audit_step.metadata["max_rows"] == "{max_rows}"
+    assert audit_step.metadata["retryable"] is False
+    assert audit_step.metadata["required_runtime_gate"] == "secure_db_executor"
     assert audit_step.metadata["dry_run_only"] == "{dry_run_only}"
     assert audit_step.metadata["allow_enhanced_fallback"] == "{allow_enhanced_fallback}"
     assert schema_step.tool_params["dsn"] == "{dsn}"
@@ -2408,7 +2510,7 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
         "sql",
         "description",
     ]
-    assert generation_step.condition == "{schema_linking_step.join_success}"
+    assert generation_step.condition == "{schema_linking_step.sql_generation_allowed}"
     assert generation_step.metadata["skip_output"]["sql"] == ""
     assert generation_step.metadata["skip_output"]["error"] == "schema_linking_join_failed"
     assert verification_step.output_schema_requirements["required"] == [
@@ -2421,6 +2523,8 @@ def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
         "Approved",
         "Rejected",
     ]
+    assert verification_step.metadata["advisory_only"] is True
+    assert verification_step.metadata["required_runtime_gate"] == "db_audit"
     assert 'sql_generation_plugin(context=..., user_query=..., session_id="{session_id}")' in generation_step.task
     assert "sql_safety_check(sql_query=...)" in verification_step.task
     assert "sql_explain(sql_query=...)" in verification_step.task
@@ -3506,7 +3610,7 @@ def test_sql_generation_step_requires_successful_schema_linking():
         step for step in workflow.steps if step.id == "sql_generation"
     )
 
-    assert generation_step.condition == "{schema_linking_step.join_success}"
+    assert generation_step.condition == "{schema_linking_step.sql_generation_allowed}"
     skip_output = generation_step.metadata.get("skip_output")
     assert skip_output is not None
     assert skip_output["sql"] == ""
@@ -3532,16 +3636,49 @@ def test_sql_generation_join_failure_condition_writes_explicit_skip_output():
         step_outputs={
             "schema_linking_step": {
                 "join_success": False,
+                "sql_generation_allowed": False,
                 "schema_info": {},
                 "joins": [],
             },
-            "schema_linking_step.join_success": False,
+            "schema_linking_step.sql_generation_allowed": False,
         },
     )
 
     assert engine._should_skip_step_by_condition(generation_step, context) is True
     assert context.step_outputs["sql_generation"]["sql"] == ""
     assert context.step_outputs["sql_generation.error"] == "schema_linking_join_failed"
+
+
+@pytest.mark.filterwarnings("ignore")
+def test_sql_generation_runs_when_schema_linking_is_disabled_by_user():
+    """N-1: use_schema_suggestions=false must not disable SQL generation."""
+    WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
+    WorkflowContext = sys.modules["workflow.models"].WorkflowContext
+    WorkflowDefinition = sys.modules["workflow.models"].WorkflowDefinition
+
+    workflow = WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
+    generation_step = next(
+        step for step in workflow.steps if step.id == "sql_generation"
+    )
+    engine = object.__new__(WorkflowEngine)
+    context = WorkflowContext(
+        variables={},
+        step_outputs={
+            "schema_linking_step": {
+                "status": "skipped_disabled",
+                "join_success": False,
+                "sql_generation_allowed": True,
+                "schema_info": {},
+                "joins": [],
+            },
+            "schema_linking_step.sql_generation_allowed": True,
+        },
+    )
+
+    assert engine._should_skip_step_by_condition(generation_step, context) is False
+    assert "sql_generation" not in context.step_outputs
 
 
 def test_sql_verification_step_skip_output_has_rejected_status():

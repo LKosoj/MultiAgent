@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 def _redact_schema_memory_value(value: Any) -> Any:
     try:
-        from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+        from custom_tools.text_to_sql.redaction import _redact_payload, redact_pii_in_payload
 
         if isinstance(value, BaseException):
             value = str(value)
@@ -842,12 +842,9 @@ class SchemaMemoryManager:
             # Получаем DSN для определения session_id. Не используем DB_DSN как
             # implicit fallback: это может смешать tenant-local db_schema с
             # memory index от другой БД.
-            if isinstance(dsn, str) and dsn.strip():
-                effective_dsn = dsn
-            else:
-                from .utils import get_runtime_context_dsn
+            from .utils import resolve_dsn
 
-                effective_dsn = get_runtime_context_dsn() or ""
+            effective_dsn = resolve_dsn(dsn) or ""
             if not effective_dsn:
                 self._set_search_status("memory_unavailable", "runtime DSN is required for schema memory search")
                 return []

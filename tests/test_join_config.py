@@ -25,6 +25,7 @@ def _reset_state(monkeypatch):
     for var in (
         "TEXT_TO_SQL_JOINS_PATH",
         "TEXT_TO_SQL_JOINS_PROFILE",
+        "TEXT2SQL_PROFILE",
         "TEXT_TO_SQL_JOIN_PATH_ALGO",
         "TEXT_TO_SQL_JOIN_CONTAINMENT",
         "TEXT_TO_SQL_JOIN_MIN_CONTAINMENT",
@@ -66,6 +67,21 @@ def test_muni_ru_is_aggressive(monkeypatch):
     assert profile.name == "muni_ru"
     assert profile.path_algo == "graph"
     assert profile.containment == "validate"
+
+
+def test_umbrella_text2sql_profile_selects_muni_ru(monkeypatch):
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    jc.reset_cache()
+    assert jc.resolve_active_profile() == "muni_ru"
+    assert jc.load_join_config().path_algo == "graph"
+
+
+def test_specific_join_profile_env_wins_over_umbrella(monkeypatch):
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "default")
+    jc.reset_cache()
+    assert jc.resolve_active_profile() == "default"
+    assert jc.load_join_config().path_algo == "greedy"
 
 
 def test_off_parsed_as_string_not_bool():

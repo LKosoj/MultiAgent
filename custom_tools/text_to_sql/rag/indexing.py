@@ -16,11 +16,9 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 import yaml
 
-from memory.manager import memory_manager
-from memory.tools import save_memory, get_memory
-
 from ._state import SharedIndexState
 from .embedding_utils import EmbeddingUtils
+from .memory_gateway import RAGMemoryGateway
 
 logger = logging.getLogger(__name__)
 
@@ -205,10 +203,12 @@ class IndexingService:
         state: SharedIndexState,
         repo_root: Path,
         embeddings: EmbeddingUtils,
+        memory_gateway: Optional[RAGMemoryGateway] = None,
     ):
         self._state = state
         self._repo_root = repo_root
         self._embeddings = embeddings
+        self._memory_gateway = memory_gateway or RAGMemoryGateway()
         # _host выставляется RAGSearcher после конструктора (см. search.py).
         self._host: Optional[Any] = None
 
@@ -377,12 +377,10 @@ class IndexingService:
         # 4.5: под per-session lock — чтение _index_registry/get_memory без гонок.
         with self._get_session_lock(session_id):
             # Ищем записи с таким file_hash в метаданных.
-            # Late lookup через фасад rag, чтобы поддерживать monkeypatch на rag.get_memory.
-            from custom_tools.text_to_sql import rag as _facade
             from memory.tools import memory_requester_context
 
             with memory_requester_context("Schema-RAG-Agent"):
-                cached = _facade.get_memory(
+                cached = self._memory_gateway.get_memory(
                     session_id=session_id,
                     agent_name="Schema-RAG-Agent",
                     cache_kind="sqlrag_example",  # #17: соответствует cache_kind при индексации
@@ -403,16 +401,13 @@ class IndexingService:
             отдельно — это нельзя объединить в одну SQLite tx без рефакторинга
             save_memory contract.
           * Поэтому не держим uncommitted SQLite writer-transaction во время
-            save_memory: сначала вставляем новые записи, затем отдельной короткой
-            транзакцией деактивируем старые.
-          * На любой сбой после частичных вставок деактивируем уже вставленные
-            new_steps. В strict Chroma cleanup дополнительно реактивируем старые
-            строки, если SQLite-deactivation уже была committed.
+            save_memory: сначала короткой транзакцией деактивируем старые строки,
+            затем вставляем новые.
+          * На любой сбой после committed-деактивации реактивируем старые строки;
+            уже-вставленные new_steps деактивируем отдельной compensation.
 
         HIGH #3 (сохраняется): на любую ошибку — НЕ обновляем registry в caller.
         """
-        from custom_tools.text_to_sql import rag as _facade
-
         # 4.5: per-session RLock — реентерабельность для случая, когда уже под локом из ensure().
         with self._get_session_lock(session_id):
             current_time = datetime.now().isoformat()
@@ -424,38 +419,11 @@ class IndexingService:
             deactivated_old = 0
             old_deactivation_committed = False
             try:
-                # 1) Индексируем новые сниппеты через save_memory.
-                #    Здесь намеренно нет незакоммиченной SQLite write tx на
-                #    другом connection: иначе второй writer внутри save_memory
-                #    может сам себя заблокировать.
-                for i, snippet in enumerate(sql_snippets):
-                    # 4.1: similarity_score не приклеиваем — его считает реранкер на запросе.
-                    step = _facade.save_memory(
-                        session_id=session_id,
-                        agent_name="Schema-RAG-Agent",
-                        data={
-                            "cache_source": "vector_db_search",
-                            "cache_kind": "sqlrag_example",  # #17: отдельный namespace от кэша поиска
-                            "source": "sqlrag_file",
-                            "filename": filename,
-                            "file_hash": file_hash,
-                            "snippet_index": i,
-                            "sql_example": snippet,
-                        }
-                    )
-                    # save_memory возвращает -1 при internal error (см. memory/tools.py:423).
-                    # Не глушим — поднимаем явный RuntimeError, чтобы compensation сработала.
-                    if not isinstance(step, int) or step < 0:
-                        raise RuntimeError(
-                            f"save_memory failed for snippet #{i} of {filename} "
-                            f"(returned {step!r}); aborting indexing transaction."
-                        )
-                    inserted_steps.append(step)
-                    inserted_tactical_ids.append(f"{session_id}-Schema-RAG-Agent-{step}")
-
-                # 2) Короткой SQLite-транзакцией деактивируем старые записи
-                #    только после успешной вставки всех новых.
-                conn_dx = _facade.memory_manager.db_handler._get_connection()
+                # 1) Короткой SQLite-транзакцией деактивируем старые записи
+                #    до вставки новых. Это убирает окно, где old+new активны
+                #    одновременно, и не возвращает SQLITE_BUSY self-deadlock:
+                #    transaction уже committed до вызова save_memory.
+                conn_dx = self._memory_gateway.memory_manager.db_handler._get_connection()
                 try:
                     deactivated_old = self._deactivate_file_records(
                         conn=conn_dx,
@@ -482,6 +450,35 @@ class IndexingService:
                             "Failed to close deactivation conn for %s: %s",
                             filename, close_err,
                         )
+
+                # 2) Индексируем новые сниппеты через save_memory.
+                #    Здесь намеренно нет незакоммиченной SQLite write tx на
+                #    другом connection: иначе второй writer внутри save_memory
+                #    может сам себя заблокировать.
+                for i, snippet in enumerate(sql_snippets):
+                    # 4.1: similarity_score не приклеиваем — его считает реранкер на запросе.
+                    step = self._memory_gateway.save_memory(
+                        session_id=session_id,
+                        agent_name="Schema-RAG-Agent",
+                        data={
+                            "cache_source": "vector_db_search",
+                            "cache_kind": "sqlrag_example",  # #17: отдельный namespace от кэша поиска
+                            "source": "sqlrag_file",
+                            "filename": filename,
+                            "file_hash": file_hash,
+                            "snippet_index": i,
+                            "sql_example": snippet,
+                        }
+                    )
+                    # save_memory возвращает -1 при internal error (см. memory/tools.py:423).
+                    # Не глушим — поднимаем явный RuntimeError, чтобы compensation сработала.
+                    if not isinstance(step, int) or step < 0:
+                        raise RuntimeError(
+                            f"save_memory failed for snippet #{i} of {filename} "
+                            f"(returned {step!r}); aborting indexing transaction."
+                        )
+                    inserted_steps.append(step)
+                    inserted_tactical_ids.append(f"{session_id}-Schema-RAG-Agent-{step}")
 
                 # 3) Chroma cleanup старых записей. На failure в strict-mode
                 #    компенсируем committed SQLite-deactivation ниже. В non-strict
@@ -569,9 +566,7 @@ class IndexingService:
         # 4.5: per-session RLock защищает консистентность относительно индексации.
         with self._get_session_lock(session_id):
             try:
-                from custom_tools.text_to_sql import rag as _facade
-
-                conn = _facade.memory_manager.db_handler._get_connection()
+                conn = self._memory_gateway.memory_manager.db_handler._get_connection()
                 current_time = datetime.now().isoformat()
                 try:
                     deactivated = self._deactivate_file_records(
@@ -697,8 +692,7 @@ class IndexingService:
         warning (collection.get не является source of truth).
         """
         try:
-            from custom_tools.text_to_sql import rag as _facade
-            tactical = _facade.memory_manager.db_handler.tactical_collection
+            tactical = self._memory_gateway.memory_manager.db_handler.tactical_collection
             if not tactical:
                 return []
             results = tactical.get(where={"$and": [
@@ -724,8 +718,9 @@ class IndexingService:
     ) -> None:
         """Удаляет Chroma-документы для пары (session_id, filename).
 
-        Если ``tactical_ids`` передан и непуст — удаляет по ids (быстрее, идемпотентнее).
-        Иначе — заново ищет по metadata. Любая ошибка Chroma пробрасывается наверх
+        Если ``tactical_ids`` передан — удаляет только эти ids (пустой список
+        означает no-op). Только ``tactical_ids is None`` включает fallback-поиск
+        по metadata. Любая ошибка Chroma пробрасывается наверх
         — caller решает, как реагировать (strict raise vs soft log).
 
         W8-T3: фактический delete делегирован в ``_chroma_safe_delete(strict=True)``,
@@ -733,13 +728,12 @@ class IndexingService:
         сохранено: caller (``_index_file_in_memory`` / ``_remove_old_file_records``)
         видит исключение и принимает решение о compensation.
         """
-        from custom_tools.text_to_sql import rag as _facade
-        tactical = _facade.memory_manager.db_handler.tactical_collection
+        tactical = self._memory_gateway.memory_manager.db_handler.tactical_collection
         if not tactical:
             return
 
         ids_to_delete: List[str]
-        if tactical_ids:
+        if tactical_ids is not None:
             ids_to_delete = list(tactical_ids)
         else:
             results = tactical.get(where={"$and": [
@@ -771,8 +765,7 @@ class IndexingService:
         """
         if not inserted_steps:
             return
-        from custom_tools.text_to_sql import rag as _facade
-        conn = _facade.memory_manager.db_handler._get_connection()
+        conn = self._memory_gateway.memory_manager.db_handler._get_connection()
         try:
             cursor = conn.cursor()
             for step in inserted_steps:
@@ -802,9 +795,7 @@ class IndexingService:
         """Best-effort Chroma cleanup for snippets inserted before reindex failure."""
         if not tactical_ids:
             return
-        from custom_tools.text_to_sql import rag as _facade
-
-        tactical = _facade.memory_manager.db_handler.tactical_collection
+        tactical = self._memory_gateway.memory_manager.db_handler.tactical_collection
         _chroma_safe_delete(tactical, list(tactical_ids), strict=False)
         logger.warning(
             "Compensation: deleted %d partially-inserted Chroma records.",
@@ -820,9 +811,7 @@ class IndexingService:
         current_time: str,
     ) -> int:
         """Reactivates old file rows deactivated by this indexing attempt."""
-        from custom_tools.text_to_sql import rag as _facade
-
-        conn = _facade.memory_manager.db_handler._get_connection()
+        conn = self._memory_gateway.memory_manager.db_handler._get_connection()
         try:
             cursor = conn.cursor()
             filename_value_json = json.dumps(filename, ensure_ascii=False)
@@ -869,9 +858,7 @@ class IndexingService:
                 from datetime import datetime
 
                 # Получаем все записи с source="sqlrag_file" для данной сессии.
-                # Late lookup через фасад rag для поддержки monkeypatch на rag.memory_manager.
-                from custom_tools.text_to_sql import rag as _facade
-                conn = _facade.memory_manager.db_handler._get_connection()
+                conn = self._memory_gateway.memory_manager.db_handler._get_connection()
                 try:
                     cursor = conn.cursor()
 
@@ -906,50 +893,55 @@ class IndexingService:
                             )
                             continue
 
-                    # Деактивируем осиротевшие записи
                     if orphaned_steps:
                         current_time = datetime.now().isoformat()
+                        try:
+                            for step in orphaned_steps:
+                                cursor.execute(
+                                    """
+                                    UPDATE agent_memory
+                                    SET valid_to = ?, updated_at = ?
+                                    WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+                                    """,
+                                    (current_time, current_time, session_id, "Schema-RAG-Agent", step)
+                                )
 
-                        for step in orphaned_steps:
-                            cursor.execute(
-                                """
-                                UPDATE agent_memory
-                                SET valid_to = ?, updated_at = ?
-                                WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
-                                """,
-                                (current_time, current_time, session_id, "Schema-RAG-Agent", step)
-                            )
+                            # Также очищаем из ChromaDB.
+                            # W8-T3: используем единый helper `_chroma_safe_delete`.
+                            # Commit SQLite делаем только после успешной Chroma
+                            # очистки, чтобы strict failure не оставлял строки
+                            # деактивированными.
+                            if orphaned_filenames:
+                                tactical = self._memory_gateway.memory_manager.db_handler.tactical_collection
+                                if tactical:
+                                    strict_chroma = _strict_chroma_cleanup_enabled()
+                                    for filename in orphaned_filenames:
+                                        results = tactical.get(where={"$and": [
+                                            {"session_id": {"$eq": session_id}},
+                                            {"filename": {"$eq": filename}}
+                                        ]})
 
-                        conn.commit()
-                        logger.info(f"Cleaned up {len(orphaned_steps)} orphaned records for {len(orphaned_filenames)} deleted files: {', '.join(orphaned_filenames)}")
+                                        if results and results.get("ids"):
+                                            ids_to_delete = list(results["ids"])
+                                            if ids_to_delete:
+                                                _chroma_safe_delete(
+                                                    tactical, ids_to_delete, strict=strict_chroma,
+                                                )
+                                                logger.info(
+                                                    f"Deleted {len(ids_to_delete)} orphaned ChromaDB records for {filename}"
+                                                )
 
-                    # Также очищаем из ChromaDB.
-                    # W8-T3: используем единый helper `_chroma_safe_delete`.
-                    # strict читаем из env (`TEXT_TO_SQL_RAG_STRICT_CHROMA_CLEANUP`)
-                    # — same env, что и в `_remove_old_file_records`. Strict-режим
-                    # пробрасывает RuntimeError наружу из delete, и оборачивающий
-                    # `except (OSError, sqlite3.DatabaseError)` его НЕ ловит —
-                    # это намеренно (fail-fast), см. AGENTS.md.
-                    if orphaned_filenames:
-                        tactical = _facade.memory_manager.db_handler.tactical_collection
-                        if tactical:
-                            strict_chroma = _strict_chroma_cleanup_enabled()
-                            for filename in orphaned_filenames:
-                                # Удаляем записи по метаданным filename
-                                results = tactical.get(where={"$and": [
-                                    {"session_id": {"$eq": session_id}},
-                                    {"filename": {"$eq": filename}}
-                                ]})
-
-                                if results and results.get("ids"):
-                                    ids_to_delete = list(results["ids"])
-                                    if ids_to_delete:
-                                        _chroma_safe_delete(
-                                            tactical, ids_to_delete, strict=strict_chroma,
-                                        )
-                                        logger.info(
-                                            f"Deleted {len(ids_to_delete)} orphaned ChromaDB records for {filename}"
-                                        )
+                            conn.commit()
+                            logger.info(f"Cleaned up {len(orphaned_steps)} orphaned records for {len(orphaned_filenames)} deleted files: {', '.join(orphaned_filenames)}")
+                        except Exception:
+                            try:
+                                conn.rollback()
+                            except Exception as rollback_err:
+                                logger.warning(
+                                    "Failed to rollback orphan cleanup transaction: %s",
+                                    rollback_err,
+                                )
+                            raise
 
                 finally:
                     conn.close()

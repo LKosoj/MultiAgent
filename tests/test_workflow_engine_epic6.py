@@ -382,6 +382,41 @@ def test_agent_exception_log_redacts_secret_values(caplog):
     assert "postgresql://***:***@" in caplog.text
 
 
+def test_agent_max_steps_exhaustion_fails_workflow_step():
+    engine = _engine_instance()
+    models = _workflow_models()
+    WorkflowContext = models.WorkflowContext
+    WorkflowStep = models.WorkflowStep
+
+    class AgentMaxStepsError(Exception):
+        pass
+
+    class LastMemoryStep:
+        error = AgentMaxStepsError("Reached max steps.")
+
+    class Agent:
+        memory = types.SimpleNamespace(steps=[LastMemoryStep()])
+
+        def run(self, task, stream=False):
+            return "fallback final answer after max steps"
+
+    class Factory:
+        def create_agent(self, **kwargs):
+            return Agent()
+
+    class ResourceManager:
+        def record_api_call(self, workflow_id):
+            raise AssertionError("max_steps exhaustion must fail before recording success")
+
+    engine.factory = Factory()
+    engine.resource_manager = ResourceManager()
+    step = WorkflowStep(id="agent", task="t", agent_type="sql_generator_agent")
+    context = WorkflowContext(workflow_id="wf-1", session_id="sess-1")
+
+    with pytest.raises(RuntimeError, match="reached max_steps"):
+        asyncio.run(engine._execute_agent_step(step, context, "task"))
+
+
 def test_tool_exception_log_redacts_secret_values(caplog, monkeypatch):
     engine = _engine_instance()
     models = _workflow_models()
@@ -543,6 +578,69 @@ def test_enhanced_output_retry_recurses_through_retry_policy():
     assert recursive_calls, "enhanced retry must re-enter output_retry_policy handling"
 
 
+def test_enhanced_non_retryable_step_skips_adaptive_retry():
+    engine = _enhanced_engine_instance()
+    models = _workflow_models()
+    StepStatus = models.StepStatus
+    StepResult = models.StepResult
+    WorkflowContext = models.WorkflowContext
+    WorkflowStep = models.WorkflowStep
+
+    class BudgetManager:
+        def create_step_budget(self, step_id):
+            return object()
+
+        def consume_budget(self, *args, **kwargs):
+            calls["budget_consumed"] += 1
+
+    class CircuitBreakerManager:
+        def is_agent_available(self, agent_name):
+            return True
+
+        async def call_agent_safely(self, **kwargs):
+            calls["attempts"] += 1
+            step = kwargs["step"]
+            return StepResult(
+                step_id=step.id,
+                status=StepStatus.FAILED,
+                error="audit side effect failed",
+            )
+
+    class LoopDetector:
+        def is_step_in_loop(self, workflow_id, step_id):
+            return False, None
+
+        def record_step_execution(self, workflow_id, step_id, execution_data):
+            return False
+
+    class RetryEngine:
+        async def execute_with_retry(self, *args, **kwargs):
+            raise AssertionError("non-retryable side-effect step must not use adaptive retry")
+
+    calls = {"attempts": 0, "budget_consumed": 0}
+
+    engine.budget_manager = BudgetManager()
+    engine.circuit_breaker_manager = CircuitBreakerManager()
+    engine.loop_detector = LoopDetector()
+    engine.retry_engine = RetryEngine()
+    engine.feature_manager = types.SimpleNamespace(is_feature_enabled=lambda *args, **kwargs: False)
+
+    step = WorkflowStep(
+        id="db_audit",
+        task="audit",
+        agent_type="db_audit_agent",
+        metadata={"retryable": False},
+    )
+    context = WorkflowContext(workflow_id="wf-non-retryable", session_id="sess")
+
+    result = asyncio.run(engine._execute_enhanced_step(step, context, {}))
+
+    assert calls["attempts"] == 1
+    assert calls["budget_consumed"] == 1
+    assert result.status == StepStatus.FAILED
+    assert result.error == "audit side effect failed"
+
+
 def test_pipeline_yaml_declares_run_id_input():
     """run_id должен быть объявлен в inputs пайплайна как пустая строка (как session_id)."""
     models = load_light_workflow_models()
@@ -633,6 +731,7 @@ def test_pipeline_has_3_decomposed_steps_sql_gen_verify_audit():
     assert gen_step.agent_type == "sql_generator_agent"
     assert ver_step.agent_type == "sql_verifier_agent"
     assert aud_step.agent_type == "db_audit_agent"
+    assert aud_step.metadata["retryable"] is False
 
     # depends_on выстраивается в цепочку
     assert "schema_linking_step" in gen_step.depends_on
@@ -1207,6 +1306,86 @@ def test_output_retry_policy_respects_max_iterations():
     assert call_counter["sql_verification"] == max_iter + 1
     # Финальный output — Rejected
     assert result.output["verification_status"] == "Rejected"
+
+
+def test_output_retry_policy_rerun_chain_for_execution_feedback():
+    engine = _engine_instance()
+    workflow = _load_text_to_sql_workflow()
+    models = _workflow_models()
+    StepStatus = models.StepStatus
+    StepResult = models.StepResult
+    WorkflowContext = models.WorkflowContext
+
+    db_step = next(s for s in workflow.steps if s.id == "db_audit")
+    assert db_step.output_retry_policy is not None
+    assert db_step.output_retry_policy["rerun_chain"] == ["sql_generation", "sql_verification"]
+
+    ctx = WorkflowContext(
+        workflow_id="wf-exec-feedback",
+        session_id="sess-exec-feedback",
+        variables={
+            "query": "test",
+            "dsn": "sqlite:///x.db",
+            "max_rows": 10,
+            "session_id": "sess-exec-feedback",
+            "run_id": "run-exec-feedback",
+            "safety_level": "strict",
+            "include_explanation": True,
+            "validate_schema": True,
+            "dry_run_only": False,
+            "use_schema_suggestions": True,
+            "allow_enhanced_fallback": False,
+        },
+    )
+
+    class _StateManager:
+        async def save_checkpoint(self, **kwargs):
+            return None
+
+    engine.state_manager = _StateManager()
+    calls = []
+
+    async def fake_execute_step(step, context, workflow_def):
+        calls.append(step.id)
+        from datetime import datetime as _dt
+
+        outputs = {
+            "sql_generation": {"sql": "SELECT 2", "description": "fixed"},
+            "sql_verification": _verification_output("Approved"),
+            "db_audit": {"status": "ok", "retry_recommended": False},
+        }
+        return StepResult(
+            step_id=step.id,
+            status=StepStatus.COMPLETED,
+            output=outputs[step.id],
+            start_time=_dt.now(),
+            end_time=_dt.now(),
+        )
+
+    from datetime import datetime as _dt
+
+    initial = StepResult(
+        step_id="db_audit",
+        status=StepStatus.COMPLETED,
+        output={"status": "failed", "retry_recommended": True, "recommendations": ["fix date"]},
+        start_time=_dt.now(),
+        end_time=_dt.now(),
+    )
+
+    retried = asyncio.run(
+        engine._maybe_run_output_retry(
+            db_step,
+            initial,
+            ctx,
+            workflow,
+            step_executor=fake_execute_step,
+            step_results={},
+        )
+    )
+
+    assert calls == ["sql_generation", "sql_verification", "db_audit"]
+    assert retried is not None
+    assert ctx.variables["sql_execution_feedback"].startswith('{"status": "failed"')
 
 
 def test_final_output_from_db_audit():

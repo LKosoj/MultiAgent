@@ -6,7 +6,14 @@ import json
 import logging
 import inspect
 from typing import Dict, List, Any, Optional
-from .utils import get_table_columns, get_table_description, set_table_description, mask_dsn, get_runtime_context_dsn
+from .utils import (
+    get_runtime_context_dsn,
+    get_table_columns,
+    get_table_description,
+    mask_dsn,
+    resolve_dsn,
+    set_table_description,
+)
 from .prompts import build_column_description_prompt_with_context
 from .schema_metadata import is_fk
 from .core import pii_masking
@@ -381,9 +388,10 @@ class SchemaEnricher:
             from db_plugins import get_plugin
 
             # Трёхуровневый приоритет: явный аргумент > runtime-context > env.
-            effective_dsn = (
-                dsn if (isinstance(dsn, str) and dsn.strip())
-                else get_runtime_context_dsn() or os.getenv("DB_DSN")
+            explicit_dsn = dsn if (isinstance(dsn, str) and dsn.strip()) else None
+            effective_dsn = resolve_dsn(
+                explicit_dsn or get_runtime_context_dsn(),
+                allow_env=True,
             )
             if not effective_dsn:
                 raise DBSampleFailed(
@@ -596,12 +604,25 @@ class SchemaEnricher:
                 ref_column = col_part.rstrip(')').strip()
                 return ref_table, ref_column
             
-            # Вариант 2: table_name.column_name
+            # Вариант 2: table_name.column_name или schema.table.column.
+            # Для table-only FK references вида public.orders колонка не
+            # указана явно; plugin.get_fk_preview умеет её доразрешить.
             elif '.' in references:
-                parts = references.rsplit('.', 1)
+                parts = [part.strip() for part in references.split('.')]
                 if len(parts) == 2:
-                    ref_table = parts[0].strip()
-                    ref_column = parts[1].strip()
+                    schema_part, table_or_column = parts
+                    column_hint = table_or_column.casefold()
+                    looks_like_column = (
+                        column_hint in {"id", "uuid", "guid", "code", "key"}
+                        or column_hint.startswith("id_")
+                        or column_hint.endswith(("_id", "_code", "_key"))
+                    )
+                    if not looks_like_column:
+                        return references.strip(), None
+                    return schema_part, table_or_column
+                if len(parts) > 2:
+                    ref_table = ".".join(parts[:-1]).strip()
+                    ref_column = parts[-1].strip()
                     return ref_table, ref_column
             
             # Вариант 3: только table_name (без колонки)

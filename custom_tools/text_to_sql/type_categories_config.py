@@ -15,9 +15,10 @@ AGENTS.md, EPIC 5.2).
   * Содержимое кэшируется по абсолютному пути; ``reset_cache()`` для тестов.
 
 Контракт классификации:
-  * ``get_category(sql_type)`` — substring-match по lowercase-форме
+  * ``get_category(sql_type)`` — token-aware match по lowercase-форме
     ``sql_type``. Сравнение жадное: первая подошедшая категория выигрывает,
-    порядок категорий — как в yaml.
+    порядок категорий — как в yaml. Короткий токен ``int`` не матчится
+    внутри ``point``/``interval``.
   * Если ни одна категория не подошла → ``"other"``.
 """
 
@@ -112,8 +113,19 @@ class TypeCategoriesConfig:
 
         self._compat_pairs: FrozenSet[FrozenSet[str]] = frozenset(compat_pairs)
 
+    @staticmethod
+    def _matches_type_token(lowered: str, token: str) -> bool:
+        if token == "int":
+            import re
+
+            return re.search(
+                r"(?<![a-z0-9_])(?:int|integer|int2|int4|int8)(?![a-z0-9_])",
+                lowered,
+            ) is not None
+        return token in lowered
+
     def get_category(self, sql_type: str) -> str:
-        """Категория для SQL-типа (substring match, lowercase).
+        """Категория для SQL-типа (token-aware match, lowercase).
 
         Если ни одна категория не подошла — возвращает ``"other"``.
         Пустая/``None``-форма приведёт к ``"other"`` без exception
@@ -124,7 +136,7 @@ class TypeCategoriesConfig:
         lowered = sql_type.lower().strip()
         for name in self._category_order:
             for token in self.categories[name]:
-                if token in lowered:
+                if self._matches_type_token(lowered, token):
                     return name
         return _OTHER_CATEGORY
 

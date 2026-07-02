@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Any
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from backend.fastapi_app.agui.redaction import (
+from custom_tools.text_to_sql.redaction import (
     _is_sensitive_key,
     _normalize_sensitive_key,
     _redact_payload as _agui_redact_payload,

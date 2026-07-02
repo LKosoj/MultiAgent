@@ -15,7 +15,8 @@ NLU_PY = REPO_ROOT / "custom_tools" / "text_to_sql" / "nlu.py"
 
 
 @pytest.fixture(autouse=True)
-def _reset_morphemes_cache():
+def _reset_morphemes_cache(monkeypatch):
+    monkeypatch.delenv("TEXT2SQL_PROFILE", raising=False)
     nlu_config.reset_cache()
     yield
     nlu_config.reset_cache()
@@ -126,6 +127,31 @@ def test_muni_ru_profile_preserves_legacy_revenue_extraction(monkeypatch):
 
     assert result["entities"]["metrics"] == ["revenue"]
     assert "region" in result["entities"]["dimensions"]
+
+
+def test_umbrella_text2sql_profile_selects_muni_ru_nlu(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_PROFILE", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    result = processor.extract_intent("покажи выручку по регионам")
+
+    assert result["entities"]["metrics"] == ["revenue"]
+
+
+def test_specific_nlu_profile_env_wins_over_umbrella(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "default")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
+    monkeypatch.setattr(nlu, "call_openai_api", None)
+
+    processor = NLUProcessor()
+    with pytest.raises(RuntimeError, match="disabled by config"):
+        processor.extract_intent("покажи выручку по регионам")
 
 
 def test_muni_ru_profile_preserves_top_n_and_order(monkeypatch):

@@ -28,8 +28,9 @@ from custom_tools.text_to_sql.validators.safety_config import (  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def _reset_config_cache():
+def _reset_config_cache(monkeypatch):
     """Гарантируем, что каждый тест видит свежий загрузчик."""
+    monkeypatch.delenv("TEXT2SQL_PROFILE", raising=False)
     safety_config.reset_cache()
     yield
     safety_config.reset_cache()
@@ -69,6 +70,44 @@ def test_env_profile_selects_strict(monkeypatch):
     assert "KILL" in profile.ast_forbidden_command_words
     assert profile.max_query_length == 4000
     assert profile.max_in_list_size == 200
+
+
+def test_umbrella_text2sql_profile_selects_safety_profile(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_PROFILE", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "extended")
+    safety_config.reset_cache()
+
+    profile = load_safety_profile()
+
+    assert profile.profile_name == "extended"
+
+
+def test_umbrella_text2sql_muni_ru_uses_default_safety_profile(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_PROFILE", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    safety_config.reset_cache()
+
+    profile = load_safety_profile()
+
+    assert profile.profile_name == "default"
+
+
+def test_specific_safety_profile_env_wins_over_umbrella(monkeypatch):
+    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "extended")
+    monkeypatch.setenv("TEXT_TO_SQL_SAFETY_PROFILE", "strict")
+    safety_config.reset_cache()
+
+    profile = load_safety_profile()
+
+    assert profile.profile_name == "strict"
+
+
+def test_explicit_empty_safety_profile_fails_fast():
+    with pytest.raises(ValueError, match="non-empty string"):
+        load_safety_profile("")
 
 
 def test_fail_fast_missing_yaml(monkeypatch):

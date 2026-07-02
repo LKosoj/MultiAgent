@@ -104,6 +104,24 @@ class ServicePayloadInvalidError(ValueError):
 
 
 _TEXT_TO_SQL_SERVICE_ACTION = "presets.text_to_sql.generate"
+_TIMEOUT_SAFE_SERVICE_ACTIONS = frozenset(
+    {
+        "memory.search",
+        "memory.status",
+        "system.init_status",
+        "utils.base64.decode",
+        "utils.base64.encode",
+        "utils.color.convert",
+        "utils.csv.analyze",
+        "utils.hash.generate",
+        "utils.json.format",
+        "utils.text.analyze",
+        "utils.time.diff",
+        "utils.time.now",
+        "utils.url.decode",
+        "utils.url.encode",
+    }
+)
 
 
 class TextToSqlServiceActionRequiredError(ValueError):
@@ -118,6 +136,23 @@ def _normalize_service_payload(raw_payload: Any) -> dict[str, Any]:
     if not isinstance(raw_payload, dict):
         raise ServicePayloadInvalidError("service_payload must be an object")
     return raw_payload
+
+
+def _service_action_timeout_seconds() -> float:
+    raw = os.getenv("AG_UI_SERVICE_ACTION_TIMEOUT_SECONDS")
+    if raw is None or raw == "":
+        return 30.0
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"AG_UI_SERVICE_ACTION_TIMEOUT_SECONDS must be positive, got {raw!r}"
+        ) from exc
+    if value <= 0:
+        raise ValueError(
+            f"AG_UI_SERVICE_ACTION_TIMEOUT_SECONDS must be > 0, got {value}"
+        )
+    return value
 
 
 def _require_stream_service_access(action: str, target_run_id: str, current_run_id: str) -> None:
@@ -245,6 +280,11 @@ async def _run_workflow(
     workflow_name, pipelines_dir, error = _resolve_workflow_name(forwarded)
     if workflow_name is None or pipelines_dir is None:
         raise ValueError(error or "workflow name not resolved")
+
+    from .auth import current_principal
+    from .service import _require_service_action_role
+
+    _require_service_action_role("workflows.start", current_principal())
 
     agui_entrypoint = _workflow_agui_entrypoint(workflow_name, pipelines_dir)
     if agui_entrypoint == _TEXT_TO_SQL_SERVICE_ACTION:
@@ -608,7 +648,18 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                     return
                 from .service import handle_service_action
 
-                result = await asyncio.to_thread(handle_service_action, service_action, payload)
+                call = asyncio.to_thread(handle_service_action, service_action, payload)
+                if service_action in _TIMEOUT_SAFE_SERVICE_ACTIONS:
+                    timeout_seconds = _service_action_timeout_seconds()
+                    try:
+                        result = await asyncio.wait_for(call, timeout=timeout_seconds)
+                    except asyncio.TimeoutError as exc:
+                        raise TimeoutError(
+                            f"service action '{service_action}' exceeded "
+                            f"{timeout_seconds:g}s timeout"
+                        ) from exc
+                else:
+                    result = await call
                 result_envelope = redact_pii_in_payload(_redact_payload(_service_result_envelope(
                     service_action,
                     True,

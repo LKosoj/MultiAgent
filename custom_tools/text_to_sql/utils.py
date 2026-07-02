@@ -146,6 +146,26 @@ def get_runtime_context_dsn() -> Optional[str]:
     return None
 
 
+def resolve_dsn(dsn: Optional[str] = None, *, allow_env: bool = False) -> Optional[str]:
+    """Resolve a text-to-sql DSN using the standard precedence.
+
+    Precedence: explicit argument -> workflow runtime metadata -> ``DB_DSN``
+    when ``allow_env=True``. Callers that need additional opt-in warnings
+    should keep their local policy wrapper and use this only after that policy
+    decision is made.
+    """
+    if isinstance(dsn, str) and dsn.strip():
+        return dsn
+    runtime_dsn = get_runtime_context_dsn()
+    if runtime_dsn:
+        return runtime_dsn
+    if allow_env:
+        env_dsn = os.getenv("DB_DSN")
+        if isinstance(env_dsn, str) and env_dsn.strip():
+            return env_dsn
+    return None
+
+
 def _normalize_dsn_key(key: Any) -> str:
     text = unquote_plus(str(key))
     text = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", "_", text)
@@ -265,7 +285,7 @@ def mask_dsn(text: str) -> str:
 def redact_text_to_sql_value(value: Any) -> Any:
     """Fail-closed redaction for Text-to-SQL prompt/log/API boundaries."""
     try:
-        from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+        from custom_tools.text_to_sql.redaction import _redact_payload, redact_pii_in_payload
 
         def redact_string(text: Any) -> str:
             masked = mask_dsn(str(text))

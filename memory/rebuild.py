@@ -11,14 +11,18 @@
 
 import json
 import os
+import threading
+from contextlib import nullcontext
 from typing import Dict, List
 from smolagents import tool
 
+from .chroma_text import extract_tactical_chroma_text
 from .database import _embedding_dimension
 from .manager import memory_manager
 
 
 _SUPPORTED_CHROMA_METRICS = {"cosine", "l2", "ip"}
+_REBUILD_LOCK = threading.RLock()
 
 
 def _metric_from_collection(collection) -> str | None:
@@ -87,51 +91,17 @@ def _collection_metadata(handler, description: str, chroma_metric: str) -> Dict:
 
 def _extract_tactical_chroma_text(data: Dict) -> str:
     """Mirror save_memory's Chroma document text selection for tactical rows."""
-    if isinstance(data, dict):
-        ck = data.get("cache_kind")
+    return extract_tactical_chroma_text(
+        data,
+        fallback_extractor=memory_manager._extract_text_content,
+    )
 
-        if ck == "agent_step":
-            agent_response = data.get("agent_response")
-            if isinstance(agent_response, str) and agent_response.strip():
-                return agent_response.strip()
-            slim = {
-                k: v
-                for k, v in data.items()
-                if k not in ("timestamp", "policy_scope", "agent_context")
-            }
-            return memory_manager._extract_text_content(slim)
 
-        if ck == "agent_summary":
-            summary_text = data.get("summary_text")
-            if isinstance(summary_text, str) and summary_text.strip():
-                return summary_text.strip()
-            return memory_manager._extract_text_content(data)
-
-        if ck == "schema_table":
-            table_fqn = data.get("table_fqn") or ""
-            desc = data.get("description") or ""
-            cols = []
-            try:
-                table_info = data.get("table_info") or {}
-                if isinstance(table_info, dict):
-                    for col in table_info.get("columns") or []:
-                        if isinstance(col, dict):
-                            name = col.get("name")
-                            col_desc = col.get("description")
-                            if name:
-                                if isinstance(col_desc, str) and col_desc.strip():
-                                    cols.append(f"{name}: {col_desc.strip()}")
-                                else:
-                                    cols.append(str(name))
-            except Exception:
-                cols = []
-            cols_text = "; ".join(cols[:40])
-            base = f"Таблица {table_fqn}. {desc}".strip()
-            if cols_text:
-                base = f"{base}\nКолонки: {cols_text}"
-            return base[:8000]
-
-    return memory_manager._extract_text_content(data)
+def _handler_lock_cm(handler):
+    lock = getattr(handler, "lock", None)
+    if lock is None:
+        return nullcontext()
+    return lock
 
 
 def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
@@ -148,53 +118,71 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
     if not handler.chroma_client or not handler.embedding_model:
         return "❌ ChromaDB или модель эмбеддингов не инициализированы."
 
+    with _REBUILD_LOCK, _handler_lock_cm(handler):
+        return _rebuild_chromadb_from_sqlite_locked(handler)
+
+
+def _rebuild_chromadb_from_sqlite_locked(handler) -> str:
     chroma_metric = _resolve_rebuild_chroma_metric(handler)
+    print("🔎 Подготовка данных для пересборки ChromaDB...")
+    tactical_records, tactical_errors = _prepare_tactical_memory(handler)
+    strategic_records, strategic_errors = _prepare_strategic_memory(handler)
 
-    print("🗑️ Удаление существующих коллекций ChromaDB...")
+    collections_touched = False
     try:
-        # Удаляем существующие коллекции
+        print("🗑️ Удаление существующих коллекций ChromaDB...")
+        collections_touched = True
         try:
-            handler.chroma_client.delete_collection("strategic_memory")
-        except Exception:
-            pass  # Коллекция может не существовать
+            # Удаляем существующие коллекции
+            try:
+                handler.chroma_client.delete_collection("strategic_memory")
+            except Exception:
+                pass  # Коллекция может не существовать
 
-        try:
-            handler.chroma_client.delete_collection("tactical_memory")
-        except Exception:
-            pass  # Коллекция может не существовать
-    except Exception as e:
-        print(f"⚠️ Предупреждение при удалении коллекций: {e}")
+            try:
+                handler.chroma_client.delete_collection("tactical_memory")
+            except Exception:
+                pass  # Коллекция может не существовать
+        except Exception as e:
+            print(f"⚠️ Предупреждение при удалении коллекций: {e}")
 
-    print("🔧 Создание новых коллекций...")
-    # Пересоздаем коллекции.
-    # W5-T1: явная метрика hnsw:space (default cosine), согласована с
-    # database.py:_init_chroma. Поскольку коллекции выше удалены через
-    # delete_collection, эта запись фактически применяется (в отличие от
-    # get_or_create_collection поверх существующей коллекции).
-    handler.strategic_collection = handler.chroma_client.get_or_create_collection(
-        name="strategic_memory",
-        metadata=_collection_metadata(
-            handler,
-            "High-level goals and context",
-            chroma_metric,
-        ),
-    )
-    handler.tactical_collection = handler.chroma_client.get_or_create_collection(
-        name="tactical_memory",
-        metadata=_collection_metadata(
-            handler,
-            "Detailed step-by-step agent experience",
-            chroma_metric,
-        ),
-    )
+        print("🔧 Создание новых коллекций...")
+        # Пересоздаем коллекции.
+        # W5-T1: явная метрика hnsw:space (default cosine), согласована с
+        # database.py:_init_chroma. Поскольку коллекции выше удалены через
+        # delete_collection, эта запись фактически применяется (в отличие от
+        # get_or_create_collection поверх существующей коллекции).
+        handler.strategic_collection = handler.chroma_client.get_or_create_collection(
+            name="strategic_memory",
+            metadata=_collection_metadata(
+                handler,
+                "High-level goals and context",
+                chroma_metric,
+            ),
+        )
+        handler.tactical_collection = handler.chroma_client.get_or_create_collection(
+            name="tactical_memory",
+            metadata=_collection_metadata(
+                handler,
+                "Detailed step-by-step agent experience",
+                chroma_metric,
+            ),
+        )
 
-    # Восстанавливаем тактическую память из agent_memory
-    print("📊 Восстановление тактической памяти...")
-    tactical_count, tactical_errors = _rebuild_tactical_memory(handler)
-    
-    # Восстанавливаем стратегическую память из strategic_memory
-    print("🎯 Восстановление стратегической памяти...")
-    strategic_count, strategic_errors = _rebuild_strategic_memory(handler)
+        # Восстанавливаем тактическую память из agent_memory
+        print("📊 Восстановление тактической памяти...")
+        tactical_count = _add_tactical_memory(handler, tactical_records)
+
+        # Восстанавливаем стратегическую память из strategic_memory
+        print("🎯 Восстановление стратегической памяти...")
+        strategic_count = _add_strategic_memory(handler, strategic_records)
+    except Exception:
+        if collections_touched and hasattr(handler, "embedding_metadata_mismatch"):
+            handler.embedding_metadata_mismatch = True
+        raise
+
+    if hasattr(handler, "embedding_metadata_mismatch"):
+        handler.embedding_metadata_mismatch = False
     
     # Выводим итоговую статистику
     result = f"✅ ChromaDB успешно пересоздана из SQLite:\n"
@@ -210,14 +198,14 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
     return result
 
 
-def _rebuild_tactical_memory(handler) -> tuple[int, int]:
-    """Восстанавливает тактическую память из таблицы agent_memory
+def _prepare_tactical_memory(handler) -> tuple[List[Dict], int]:
+    """Читает SQLite и готовит embeddings до удаления старых Chroma коллекций.
     
     Args:
         handler: DatabaseHandler
         
     Returns:
-        tuple: (количество восстановленных записей, количество ошибок)
+        tuple: (prepared records, количество ошибок)
     """
     conn = handler._get_connection()
     try:
@@ -229,14 +217,12 @@ def _rebuild_tactical_memory(handler) -> tuple[int, int]:
         )
         
         records = cursor.fetchall()
-        synced_count = 0
+        prepared: List[Dict] = []
         errors_count = 0
         
         for session_id, agent_name, step, instance_step, run_id, data_json in records:
+            tactical_id = f"{session_id}-{agent_name}-{step}"
             try:
-                # Создаем составной ID как в оригинальном коде
-                tactical_id = f"{session_id}-{agent_name}-{step}"
-                
                 # Парсим JSON данные
                 try:
                     data_dict = json.loads(data_json)
@@ -250,7 +236,11 @@ def _rebuild_tactical_memory(handler) -> tuple[int, int]:
                     continue  # Пропускаем слишком короткий контент
                 
                 # Создаем эмбеддинг
-                embedding = memory_manager._create_embedding(text_content, purpose="passage")
+                embedding = memory_manager._create_embedding(
+                    text_content,
+                    purpose="passage",
+                    allow_metadata_mismatch=True,
+                )
                 if not embedding:
                     continue
                 
@@ -275,37 +265,55 @@ def _rebuild_tactical_memory(handler) -> tuple[int, int]:
                 if instance_step is not None:
                     metadata["instance_step"] = int(instance_step)
 
-                handler.tactical_collection.add(
-                    embeddings=[embedding],
-                    documents=[text_content],
-                    metadatas=[metadata],
-                    ids=[tactical_id]
+                prepared.append(
+                    {
+                        "embedding": embedding,
+                        "document": text_content,
+                        "metadata": metadata,
+                        "id": tactical_id,
+                    }
                 )
-                
-                synced_count += 1
-                if synced_count % 20 == 0:
-                    print(f"   Синхронизировано: {synced_count} записей")
                     
             except Exception as e:
                 errors_count += 1
                 if errors_count <= 3:  # Показываем только первые 3 ошибки
-                    print(f"   ⚠️ Ошибка синхронизации {tactical_id}: {e}")
+                    print(f"   ⚠️ Ошибка подготовки тактической памяти {tactical_id}: {e}")
         
-        print(f"   ✅ Тактическая память: {synced_count} записей, ошибок: {errors_count}")
-        return synced_count, errors_count
+        return prepared, errors_count
         
     finally:
         conn.close()
 
 
-def _rebuild_strategic_memory(handler) -> tuple[int, int]:
-    """Восстанавливает стратегическую память из таблицы strategic_memory
+def _add_tactical_memory(handler, records: List[Dict]) -> int:
+    synced_count = 0
+    for record in records:
+        handler.tactical_collection.add(
+            embeddings=[record["embedding"]],
+            documents=[record["document"]],
+            metadatas=[record["metadata"]],
+            ids=[record["id"]],
+        )
+        synced_count += 1
+        if synced_count % 20 == 0:
+            print(f"   Синхронизировано: {synced_count} записей")
+    print(f"   ✅ Тактическая память: {synced_count} записей")
+    return synced_count
+
+
+def _rebuild_tactical_memory(handler) -> tuple[int, int]:
+    records, errors_count = _prepare_tactical_memory(handler)
+    return _add_tactical_memory(handler, records), errors_count
+
+
+def _prepare_strategic_memory(handler) -> tuple[List[Dict], int]:
+    """Читает strategic_memory и готовит embeddings до удаления Chroma.
     
     Args:
         handler: DatabaseHandler
         
     Returns:
-        tuple: (количество восстановленных записей, количество ошибок)
+        tuple: (prepared records, количество ошибок)
     """
     conn = handler._get_connection()
     try:
@@ -314,7 +322,7 @@ def _rebuild_strategic_memory(handler) -> tuple[int, int]:
         cursor.execute("SELECT memory_id, session_id, type, content FROM strategic_memory WHERE valid_to IS NULL ORDER BY memory_id")
         
         records = cursor.fetchall()
-        synced_count = 0
+        prepared: List[Dict] = []
         errors_count = 0
         
         for memory_id, session_id, memory_type, content in records:
@@ -323,34 +331,55 @@ def _rebuild_strategic_memory(handler) -> tuple[int, int]:
                     continue  # Пропускаем слишком короткий контент
                 
                 # Создаем эмбеддинг
-                embedding = memory_manager._create_embedding(content, purpose="passage")
+                embedding = memory_manager._create_embedding(
+                    content,
+                    purpose="passage",
+                    allow_metadata_mismatch=True,
+                )
                 if not embedding:
                     continue
                 
-                # Добавляем в ChromaDB
-                handler.strategic_collection.add(
-                    embeddings=[embedding],
-                    documents=[content],
-                    metadatas=[{
-                        "session_id": session_id,
-                        "type": memory_type,
-                        "memory_id": memory_id
-                    }],
-                    ids=[str(memory_id)]
+                prepared.append(
+                    {
+                        "embedding": embedding,
+                        "document": content,
+                        "metadata": {
+                            "session_id": session_id,
+                            "type": memory_type,
+                            "memory_id": memory_id,
+                        },
+                        "id": str(memory_id),
+                    }
                 )
-                
-                synced_count += 1
                 
             except Exception as e:
                 errors_count += 1
                 if errors_count <= 3:
-                    print(f"   ⚠️ Ошибка синхронизации стратегической памяти {memory_id}: {e}")
+                    print(f"   ⚠️ Ошибка подготовки стратегической памяти {memory_id}: {e}")
         
-        print(f"   ✅ Стратегическая память: {synced_count} записей, ошибок: {errors_count}")
-        return synced_count, errors_count
+        return prepared, errors_count
         
     finally:
         conn.close()
+
+
+def _add_strategic_memory(handler, records: List[Dict]) -> int:
+    synced_count = 0
+    for record in records:
+        handler.strategic_collection.add(
+            embeddings=[record["embedding"]],
+            documents=[record["document"]],
+            metadatas=[record["metadata"]],
+            ids=[record["id"]],
+        )
+        synced_count += 1
+    print(f"   ✅ Стратегическая память: {synced_count} записей")
+    return synced_count
+
+
+def _rebuild_strategic_memory(handler) -> tuple[int, int]:
+    records, errors_count = _prepare_strategic_memory(handler)
+    return _add_strategic_memory(handler, records), errors_count
 
 
 @tool

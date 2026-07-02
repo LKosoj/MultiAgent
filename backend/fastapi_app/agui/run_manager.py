@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
-from .auth import Principal, principal_context, system_principal_for_disabled_mode
+from .auth import Principal, current_principal, principal_context
 from .encoder import EventEncoder
 from .events import BaseEvent, RunErrorEvent, EventType
 from .models import RunAgentInput
@@ -37,6 +38,20 @@ _TERMINAL_EVENT_TYPES: frozenset[str] = frozenset(
 _WORKFLOW_TERMINAL_STATUSES: frozenset[str] = frozenset(
     {"completed", "failed", "cancelled"}
 )
+_DEFAULT_MAX_CONCURRENT_RUNS = 128
+
+
+def _max_concurrent_runs() -> int:
+    raw = os.getenv("AG_UI_MAX_CONCURRENT_RUNS")
+    if raw is None or raw == "":
+        return _DEFAULT_MAX_CONCURRENT_RUNS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"AG_UI_MAX_CONCURRENT_RUNS must be a positive integer, got {raw!r}") from exc
+    if value < 1:
+        raise ValueError(f"AG_UI_MAX_CONCURRENT_RUNS must be >= 1, got {value}")
+    return value
 
 
 def is_terminal_event_payload(event_type: str, payload: dict) -> bool:
@@ -109,13 +124,22 @@ class RunManager:
         input_data: RunAgentInput,
         principal: Optional[Principal] = None,
     ) -> RunInfo:
-        principal = principal or system_principal_for_disabled_mode()
+        principal = principal or current_principal()
         async with self._lock:
             self._evict_stale()
             if input_data.run_id in self._runs:
                 raise ValueError(f"run_id already exists: {input_data.run_id}")
             if self._store.latest_seq(input_data.run_id) is not None:
                 raise ValueError(f"run_id already exists: {input_data.run_id}")
+            max_concurrent = _max_concurrent_runs()
+            active_count = sum(
+                1 for info in self._runs.values()
+                if info.status not in _TERMINAL_STATUSES
+            )
+            if active_count >= max_concurrent:
+                raise ValueError(
+                    f"too many active AG-UI runs: {active_count} >= {max_concurrent}"
+                )
             info = RunInfo(
                 run_id=input_data.run_id,
                 thread_id=input_data.thread_id,

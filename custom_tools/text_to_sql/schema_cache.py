@@ -29,6 +29,8 @@ from .utils import dsn_to_sanitized_name, get_runtime_context_dsn, get_schema_ve
 
 logger = logging.getLogger(__name__)
 
+SCHEMA_LINKING_LOGIC_VERSION = "2026-07-02-q3-dimension-id-disambiguation"
+
 
 # W2-T4: явный контракт между «честный miss» и «сбой кэша».
 # Раньше load_from_cache / save_to_cache ловили все исключения и возвращали
@@ -170,12 +172,20 @@ def _normalize_for_hash(value: Any, parent_key: Optional[str] = None) -> Any:
 # Источники истины:
 #   * DB_DSN — host:port:db (БЕЗ user/password! credentials не должны попадать в
 #     стабильный fingerprint, иначе ротация пароля ломает cache hits без необходимости).
-#   * TEXT_TO_SQL_*_PROFILE — профили yaml-конфигов, читаются модулями lazily.
+#   * TEXT2SQL_PROFILE / TEXT_TO_SQL_*_PROFILE — профили yaml-конфигов,
+#     читаются модулями lazily.
 #   * TEXT_TO_SQL_SCHEMA_SOURCE_PATH — путь к schema-json, если используется external loader.
 _T2S_PROFILE_ENV_VARS: tuple = (
+    "TEXT2SQL_PROFILE",
+    "TEXT_TO_SQL_COLUMN_ALIASES_PROFILE",
+    "TEXT_TO_SQL_JOINS_PROFILE",
+    "TEXT_TO_SQL_LLM_MODELS_PROFILE",
     "TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE",
     "TEXT_TO_SQL_NLU_PROFILE",
+    "TEXT_TO_SQL_PROMPTS_PROFILE",
+    "TEXT_TO_SQL_SCHEMA_LINKING_PROFILE",
     "TEXT_TO_SQL_SIGNIFICANCE_PROFILE",
+    "TEXT_TO_SQL_SIMILARITY_PROFILE",
     "TEXT_TO_SQL_SCHEMA_SOURCE_PATH",
 )
 
@@ -323,6 +333,7 @@ class SchemaCacheManager:
         cache_kind = "schema_linking"
         schema_version = get_schema_version(db_schema)
         linking_env = _collect_linking_cache_env()
+        linking_env["__schema_linking_logic_version__"] = SCHEMA_LINKING_LOGIC_VERSION
         # BLAKE2b с session_id-солью изолирует cache_key между сессиями:
         # одни и те же entities/schema/env у разных tenant'ов дают РАЗНЫЕ
         # ключи, что закрывает риск cross-tenant cache hit при коллизии

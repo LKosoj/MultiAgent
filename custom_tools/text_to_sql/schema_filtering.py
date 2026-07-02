@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 def _redact_schema_filtering_error(error: Exception) -> str:
     try:
-        from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+        from custom_tools.text_to_sql.redaction import _redact_payload, redact_pii_in_payload
 
         return str(redact_pii_in_payload(_redact_payload(str(error))))
     except Exception:
@@ -165,16 +165,15 @@ class SchemaColumnFilter:
             selected_columns = directly_linked | minimal_key_columns
             logger.debug(f"  Aggressive mode: reduced from {len(directly_linked | key_columns | semantic_columns)} to {len(selected_columns)} columns")
         
-        # Если таблица числится среди required (directly_linked непуст),
-        # но после фильтрации не осталось ни одной колонки — добавлять её
-        # в filtered_schema бессмысленно (пустой контекст не даст LLM ни
-        # выбрать колонку, ни построить join). Громко логируем и
+        # Если после фильтрации не осталось ни одной колонки — добавлять
+        # таблицу в filtered_schema бессмысленно (пустой контекст не даст LLM
+        # ни выбрать колонку, ни построить join). Громко логируем и
         # сигнализируем skip отдельным флагом, чтобы вызывающая сторона
         # могла отфильтровать таблицу из итогового context'а.
-        if not selected_columns and directly_linked:
+        if not selected_columns:
             logger.warning(
                 "Table '%s' has 0 columns after filtering — skipping "
-                "(was referenced by linked entities/joins)",
+                "(no linked/key/semantic columns)",
                 table_name,
             )
             return {"__skip__": True}
@@ -193,8 +192,14 @@ class SchemaColumnFilter:
             if col_name in table_columns:
                 filtered_columns[col_name] = table_columns[col_name]
 
-        if filtered_columns:
-            filtered_table_schema["columns"] = filtered_columns
+        if not filtered_columns:
+            logger.warning(
+                "Table '%s' has 0 materialized columns after filtering — skipping",
+                table_name,
+            )
+            return {"__skip__": True}
+
+        filtered_table_schema["columns"] = filtered_columns
         
         # Логируем статистику фильтрации
         total_count = len(table_columns)

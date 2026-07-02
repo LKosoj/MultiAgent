@@ -18,12 +18,15 @@ AST-классов sqlglot, командных слов и числовых ли
 
 from __future__ import annotations
 
-import os
 import threading
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Tuple
 
-from .._yaml_config_loader import YamlConfigLoader, build_mapping_error_message
+from .._yaml_config_loader import (
+    YamlConfigLoader,
+    build_mapping_error_message,
+    resolve_active_profile_name as _shared_resolve_active_profile_name,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_CONFIG_PATH = _REPO_ROOT / "config" / "text_to_sql" / "safety.yaml"
@@ -133,14 +136,16 @@ def _coerce_positive_int(value: Any, field: str) -> int:
 
 
 def _resolve_profile_name(profile: str | None) -> str:
-    if profile is not None:
-        if not isinstance(profile, str) or not profile:
-            raise ValueError("safety profile name must be a non-empty string")
-        return profile
-    env_profile = os.getenv(_ENV_PROFILE)
-    if env_profile:
-        return env_profile
-    return _DEFAULT_PROFILE
+    if profile is not None and not isinstance(profile, str):
+        raise ValueError("safety profile name must be a string")
+    if profile is not None and not profile:
+        raise ValueError("safety profile name must be a non-empty string")
+    return _shared_resolve_active_profile_name(
+        profile,
+        env_var=_ENV_PROFILE,
+        default=_DEFAULT_PROFILE,
+        umbrella_map={"muni_ru": _DEFAULT_PROFILE},
+    )
 
 
 def _not_found_message(path: Path, env_var: str) -> str:

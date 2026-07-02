@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 def _redact_retry_error(error: Any) -> str:
     try:
-        from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+        from custom_tools.text_to_sql.redaction import _redact_payload, redact_pii_in_payload
 
         return str(redact_pii_in_payload(_redact_payload(str(error))))
     except Exception:

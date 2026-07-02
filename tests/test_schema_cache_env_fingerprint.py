@@ -34,7 +34,11 @@ def _clean_t2s_env(monkeypatch):
     import os
 
     for key in list(os.environ.keys()):
-        if key.startswith("TEXT_TO_SQL_") or key.startswith(LINKING_CACHE_ENV_PREFIXES):
+        if (
+            key == "TEXT2SQL_PROFILE"
+            or key.startswith("TEXT_TO_SQL_")
+            or key.startswith(LINKING_CACHE_ENV_PREFIXES)
+        ):
             monkeypatch.delenv(key, raising=False)
     yield
 
@@ -211,6 +215,31 @@ def test_env_fingerprint_changes_on_nlu_profile(monkeypatch):
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     fp_unset = _compute_env_fingerprint()
     monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    fp_set = _compute_env_fingerprint()
+    assert fp_unset != fp_set
+
+
+def test_env_fingerprint_changes_on_umbrella_profile(monkeypatch):
+    """W8-T1: TEXT2SQL_PROFILE тоже инвалидирует."""
+    monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
+    fp_unset = _compute_env_fingerprint()
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    fp_set = _compute_env_fingerprint()
+    assert fp_unset != fp_set
+
+
+@pytest.mark.parametrize(
+    "profile_env",
+    [
+        "TEXT_TO_SQL_COLUMN_ALIASES_PROFILE",
+        "TEXT_TO_SQL_JOINS_PROFILE",
+    ],
+)
+def test_env_fingerprint_changes_on_linking_profile_envs(monkeypatch, profile_env):
+    """Schema-linking cache must invalidate when linking profiles change."""
+    monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
+    fp_unset = _compute_env_fingerprint()
+    monkeypatch.setenv(profile_env, "muni_ru")
     fp_set = _compute_env_fingerprint()
     assert fp_unset != fp_set
 

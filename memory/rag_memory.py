@@ -9,8 +9,9 @@ RAG-память для smolagents с политиками доступа
 - SQLite + ChromaDB backend
 """
 
-import json
 import logging
+import json
+import os
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, Literal, Tuple
 from dataclasses import dataclass, field
@@ -465,9 +466,13 @@ class RagMemory(AgentMemory):
                 logger.info(f"🔒 Доступ к памяти заблокирован политикой для {self.agent_name}")
             return ""
         
-        # Backward compatibility: policy/API still call this max_tokens, but the
-        # implementation has always compared Python string lengths.
-        char_budget = max_tokens or self.policy.max_tokens
+        token_budget = max_tokens or self.policy.max_tokens
+        try:
+            chars_per_token = int(os.getenv("MEMORY_CHARS_PER_TOKEN", "4"))
+        except (TypeError, ValueError):
+            chars_per_token = 4
+        chars_per_token = max(1, chars_per_token)
+        char_budget = int(token_budget) * chars_per_token
 
         context_parts = []
         all_steps = self.get_full_steps()
@@ -507,7 +512,7 @@ class RagMemory(AgentMemory):
                 return text
             cut = text[:limit]
             nl = cut.rfind("\n")
-            if nl > max(0, limit - 300):
+            if nl > max(limit // 2, limit - 300):
                 cut = cut[:nl]
             return cut.rstrip() + "\n..."
 

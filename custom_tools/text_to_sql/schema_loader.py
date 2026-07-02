@@ -254,7 +254,11 @@ class SchemaFilter:
                 return db_schema
 
             wanted_raw = [t.strip() for t in include.split(",") if t.strip()]
-            wanted_ci = {t.casefold() for t in wanted_raw}
+            wanted_full_ci = {t.casefold() for t in wanted_raw}
+            wanted_base_ci = {t.split(".")[-1].casefold() for t in wanted_raw}
+            wanted_unqualified_ci = {
+                t.casefold() for t in wanted_raw if "." not in t
+            }
             logger.info(f"Filtering schema to include only: {wanted_raw}")
 
             def _base(tn: str) -> str:
@@ -262,7 +266,14 @@ class SchemaFilter:
 
             filtered: Dict[str, Dict[str, Dict[str, Any]]] = {}
             for t, table_schema in db_schema.items():
-                if t.casefold() in wanted_ci or _base(t).casefold() in wanted_ci:
+                table_ci = t.casefold()
+                table_base_ci = _base(t).casefold()
+                table_is_qualified = "." in t
+                if (
+                    table_ci in wanted_full_ci
+                    or (table_is_qualified and table_base_ci in wanted_unqualified_ci)
+                    or (not table_is_qualified and table_base_ci in wanted_base_ci)
+                ):
                     filtered[t] = table_schema
 
             logger.info(f"Schema filtered: {len(filtered)}/{len(db_schema)} tables kept")

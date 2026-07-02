@@ -62,7 +62,7 @@ _SQLGLOT_METRICS_LOCK = threading.Lock()
 
 def _redact_safety_value(value: Any) -> Any:
     try:
-        from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+        from custom_tools.text_to_sql.redaction import _redact_payload, redact_pii_in_payload
 
         if isinstance(value, BaseException):
             value = str(value)

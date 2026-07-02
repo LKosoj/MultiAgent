@@ -166,6 +166,16 @@ class DBPlugin(Protocol):
         """Строит DISTINCT-запрос значений колонки, входящих в values."""
         ...
 
+    def build_lookup_values_query(
+        self,
+        table_name: str,
+        lookup_column: str,
+        return_column: str,
+        values: List[Any],
+    ) -> str:
+        """Строит DISTINCT lookup-запрос: lookup_column IN values → return_column."""
+        ...
+
     def get_type_category(self, sql_type: str) -> str:
         """Группа SQL-типа (integer/numeric/string/temporal/other).
 
@@ -501,6 +511,34 @@ class BaseDBPlugin:
             f"FROM {quoted_table} "
             f"WHERE {quoted_column} IN ({literals}) "
             f"ORDER BY {quoted_column}"
+        )
+
+    def build_lookup_values_query(
+        self,
+        table_name: str,
+        lookup_column: str,
+        return_column: str,
+        values: List[Any],
+    ) -> str:
+        """Builds a query mapping lookup values to return-column values."""
+        quoted_table = self.quote_identifier(table_name)
+        quoted_lookup = self.quote_identifier(lookup_column)
+        quoted_return = self.quote_identifier(return_column)
+        non_null_values = [value for value in values if value is not None]
+        if not non_null_values:
+            return (
+                f"SELECT DISTINCT {quoted_lookup} AS lookup_value, "
+                f"{quoted_return} AS return_value "
+                f"FROM {quoted_table} "
+                "WHERE 1 = 0"
+            )
+        literals = ", ".join(self._quote_literal(value) for value in non_null_values)
+        return (
+            f"SELECT DISTINCT {quoted_lookup} AS lookup_value, "
+            f"{quoted_return} AS return_value "
+            f"FROM {quoted_table} "
+            f"WHERE {quoted_lookup} IN ({literals}) "
+            f"ORDER BY {quoted_lookup}, {quoted_return}"
         )
 
     def get_type_category(self, sql_type: str) -> str:

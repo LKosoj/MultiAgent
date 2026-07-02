@@ -124,7 +124,13 @@ class MemoryManager:
             return text
         return f"{purpose}: {text}"
 
-    def _create_embedding(self, text: str, purpose: Literal["query", "passage"] = "passage") -> Optional[List[float]]:
+    def _create_embedding(
+        self,
+        text: str,
+        purpose: Literal["query", "passage"] = "passage",
+        *,
+        allow_metadata_mismatch: bool = False,
+    ) -> Optional[List[float]]:
         """Создает эмбеддинг для текста.
 
         Args:
@@ -146,6 +152,14 @@ class MemoryManager:
         if not self.db_handler.embedding_model:
             raise EmbeddingUnavailableError(
                 "Embedding model is not configured on db_handler"
+            )
+        if (
+            getattr(self.db_handler, "embedding_metadata_mismatch", False)
+            and not allow_metadata_mismatch
+        ):
+            raise EmbeddingUnavailableError(
+                "Chroma embedding metadata does not match the configured model; "
+                "rebuild ChromaDB from SQLite before semantic memory operations."
             )
 
         clean_text = self._normalize_text_for_embedding(text)

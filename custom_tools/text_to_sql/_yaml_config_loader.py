@@ -26,7 +26,7 @@ from __future__ import annotations
 import os
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Generic, Hashable, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, Hashable, Mapping, Optional, TypeVar
 
 import yaml
 
@@ -197,17 +197,26 @@ def coerce_str_list(
 
 
 def resolve_active_profile_name(
-    explicit: Optional[str], *, env_var: str, default: str
+    explicit: Optional[str],
+    *,
+    env_var: str,
+    default: str,
+    umbrella_map: Optional[Mapping[str, str]] = None,
 ) -> str:
     """Какой профиль использовать.
 
-    Приоритет: явный аргумент (если непустой) → env-переменная → ``default``.
-    Общая реализация для всех profile-aware loader'ов с одинаковой
-    семантикой выбора.
+    Приоритет: явный аргумент (если непустой) → профильная env-переменная
+    подсистемы → umbrella env ``TEXT2SQL_PROFILE`` → ``default``. Старые
+    ``TEXT_TO_SQL_*_PROFILE`` остаются explicit compatibility overrides.
     """
     if explicit:
         return explicit
     from_env = os.getenv(env_var)
     if from_env:
         return from_env
+    umbrella = os.getenv("TEXT2SQL_PROFILE")
+    if umbrella:
+        if umbrella_map and umbrella in umbrella_map:
+            return umbrella_map[umbrella]
+        return umbrella
     return default

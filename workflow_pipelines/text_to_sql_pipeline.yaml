@@ -20,6 +20,7 @@ inputs:
   validate_schema: true
   dry_run_only: false
   use_schema_suggestions: true
+  value_grounding: false
   allow_enhanced_fallback: false
 
 outputs:
@@ -106,6 +107,7 @@ steps:
       entities: '{intent_extraction_step.entities}'
       dsn: '{dsn}'
       session_id: '{session_id}'
+      value_grounding: '{value_grounding}'
     depends_on:
       - nlu_processing
       - intent_extraction_step
@@ -119,6 +121,7 @@ steps:
           filters: {}
         joins: []
         join_success: false
+        sql_generation_allowed: true
         unlinked_entities: []
         schema_info: {}
     timeout: 60
@@ -138,7 +141,7 @@ steps:
       required:
         - sql
         - description
-    condition: '{schema_linking_step.join_success}'
+    condition: '{schema_linking_step.sql_generation_allowed}'
     task: |
       Сгенерируй SQL-запрос для задачи пользователя.
 
@@ -187,7 +190,7 @@ steps:
       safety_level: '{safety_level}'
       use_schema_suggestions: '{use_schema_suggestions}'
       dsn: '{dsn}'
-      # skip_output применяется когда schema_linking_step.join_success=false.
+      # skip_output применяется когда schema_linking_step.sql_generation_allowed=false.
       # Это fail-closed guard: генератор не должен галлюцинировать SQL по пустой
       # или несвязанной схеме.
       skip_output:
@@ -195,7 +198,7 @@ steps:
         description: "SQL generation skipped: schema linking did not produce a valid join path"
         error: "schema_linking_join_failed"
         recommendations:
-          - "Проверьте, что schema_linking вернул связанные таблицы, колонки и join_success=true"
+          - "Проверьте, что schema_linking вернул связанные таблицы, колонки и sql_generation_allowed=true"
 
   # =====================================================================
   # ЭТАП 5: SQL VERIFICATION (отдельный агент)
@@ -242,6 +245,8 @@ steps:
       backoff_strategy: fixed
     metadata:
       pipeline_type: text_to_sql
+      advisory_only: true
+      required_runtime_gate: db_audit
       session_id: '{session_id}'
       run_id: '{run_id}'
       safety_level: '{safety_level}'
@@ -311,6 +316,7 @@ steps:
       - Результаты выполнения запроса
       - Анализ полученных данных
       - Выводы и ограничения (если есть)
+      - Если выполнение упало, вернуло техническую ошибку или явно бессмысленный пустой результат, добавь структурный маркер retry_recommended=true и конкретные recommendations — workflow использует это как execution feedback для повторной генерации.
 
       При сохранении успешного SQL в RAG вызывай save_successful_sql(...). DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструментам из metadata шага, чтобы файл попал в session_id целевой БД, а не в DB_DSN окружения.
 
@@ -322,6 +328,8 @@ steps:
       max_retries: 1
     metadata:
       pipeline_type: text_to_sql
+      retryable: false
+      required_runtime_gate: secure_db_executor
       max_rows: '{max_rows}'
       dsn: '{dsn}'
       session_id: '{session_id}'
@@ -337,6 +345,14 @@ steps:
         status: skipped_rejected_by_verifier
         reason: SQL was rejected by verifier; db_audit not executed
         executed: false
+    output_retry_policy:
+      condition: '{db_audit.retry_recommended}'
+      rerun_step: sql_generation
+      rerun_chain:
+        - sql_generation
+        - sql_verification
+      max_iterations: 1
+      feedback_field: sql_execution_feedback
 
 error_handling:
   on_failure: fail

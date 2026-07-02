@@ -1,5 +1,6 @@
 import sqlite3
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -199,3 +200,31 @@ def test_chroma_embedding_metadata_mismatch_is_visible(monkeypatch, tmp_path):
 
     assert handler.embedding_dimension == 5
     assert handler.embedding_metadata_mismatch is True
+
+
+def test_embedding_metadata_mismatch_is_enforced_except_rebuild_bypass():
+    from memory.manager import EmbeddingUnavailableError, MemoryManager
+
+    class FakeEmbedding:
+        def tolist(self):
+            return [0.1, 0.2]
+
+    class FakeModel:
+        def encode(self, text, convert_to_tensor=False):
+            return FakeEmbedding()
+
+    manager = object.__new__(MemoryManager)
+    manager.db_handler = SimpleNamespace(
+        embedding_model=FakeModel(),
+        embedding_metadata_mismatch=True,
+        embedding_model_name="new-model",
+    )
+
+    with pytest.raises(EmbeddingUnavailableError, match="metadata does not match"):
+        manager._create_embedding("semantic text", purpose="passage")
+
+    assert manager._create_embedding(
+        "semantic text",
+        purpose="passage",
+        allow_metadata_mismatch=True,
+    ) == [0.1, 0.2]

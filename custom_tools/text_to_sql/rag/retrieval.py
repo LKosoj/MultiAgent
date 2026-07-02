@@ -6,6 +6,7 @@ EPIC 8.10: класс перешёл с mixin-режима на сервис (к
 ``RetrievalMixin`` оставлен как алиас.
 """
 import atexit
+import hashlib
 import math
 import os
 import re
@@ -16,7 +17,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from memory.manager import (
-    memory_manager,
     EmbeddingUnavailableError,
     EmbeddingFailedError,
 )
@@ -24,6 +24,7 @@ from memory.manager import (
 from ..schema_memory import _resolve_chroma_metric, _distance_to_similarity
 from ._similarity import cosine_similarity
 from .embedding_utils import EmbeddingUtils
+from .memory_gateway import RAGMemoryGateway
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,12 @@ def _shutdown_chroma_pool() -> None:
 
 
 atexit.register(_shutdown_chroma_pool)
+
+
+def _release_chroma_inflight(_future: Any = None) -> None:
+    global _CHROMA_INFLIGHT
+    with _CHROMA_INFLIGHT_LOCK:
+        _CHROMA_INFLIGHT = max(0, _CHROMA_INFLIGHT - 1)
 
 
 def _max_n_results() -> int:
@@ -259,9 +266,16 @@ class RetrievalService:
     больше не mixin для RAGSearcher.
     """
 
-    def __init__(self, *, repo_root: Path, embeddings: EmbeddingUtils):
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        embeddings: EmbeddingUtils,
+        memory_gateway: Optional[RAGMemoryGateway] = None,
+    ):
         self._repo_root = repo_root
         self._embeddings = embeddings
+        self._memory_gateway = memory_gateway or RAGMemoryGateway()
         # _host выставляется RAGSearcher после конструктора (см. search.py).
         # Используется, чтобы monkeypatch на host.repo_root корректно
         # отражался в сервисе (тесты подменяют searcher.repo_root).
@@ -292,6 +306,16 @@ class RetrievalService:
 
     def _create_embedding_safe(self, text: str, purpose: str = "passage"):
         return self._embeddings._create_embedding_safe(text, purpose=purpose)
+
+    def _sqlrag_file_version(self, session_id: str) -> str:
+        path = self.repo_root / "sqlrag" / f"{session_id}.md"
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return "missing"
+        except OSError as exc:
+            return f"unavailable:{type(exc).__name__}"
+        return hashlib.sha256(content).hexdigest()
 
     # --- Основные операции --------------------------------------------------
     def _prepare_cache_info(
@@ -325,9 +349,7 @@ class RetrievalService:
 
         # Embedding model id входит в cache_key, чтобы смена модели
         # эмбеддингов не приводила к коллизии кэша.
-        from custom_tools.text_to_sql import rag as _facade
-        import hashlib
-        _mm = _facade.memory_manager
+        _mm = self._memory_gateway.memory_manager
         model_id = getattr(getattr(_mm, "db_handler", None), "embedding_model_name", None)
         if not model_id:
             model_id = os.getenv("RAG_EMBEDDING_MODEL_ID")
@@ -345,8 +367,9 @@ class RetrievalService:
         else:
             base_key = self._embedding_to_key(query_embedding, top_k)
             key_source = "embedding"
+        sqlrag_version = self._sqlrag_file_version(session_id_cache)
         cache_key = hashlib.sha256(
-            f"{model_id_for_key}|{key_source}|{base_key}".encode("utf-8")
+            f"{model_id_for_key}|{key_source}|{base_key}|sqlrag:{sqlrag_version}".encode("utf-8")
         ).hexdigest()
         schema_version = get_schema_version(None)
 
@@ -371,11 +394,10 @@ class RetrievalService:
         if not cache_info.get("cacheable", True):
             return None
 
-        from custom_tools.text_to_sql import rag as _facade
         from memory.tools import memory_requester_context
 
         with memory_requester_context("Schema-RAG-Agent"):
-            cached = _facade.get_memory(
+            cached = self._memory_gateway.get_memory(
                 session_id=cache_info["session_id"],
                 agent_name="Schema-RAG-Agent",
                 cache_kind=cache_info["cache_kind"],
@@ -406,9 +428,7 @@ class RetrievalService:
         if not cache_info.get("cacheable", True):
             return
 
-        from custom_tools.text_to_sql import rag as _facade
-
-        _facade.save_memory(
+        self._memory_gateway.save_memory(
             session_id=cache_info["session_id"],
             agent_name="Schema-RAG-Agent",
             data={
@@ -448,9 +468,7 @@ class RetrievalService:
         ):
             raise ValueError("query_embedding is empty; cannot search")
 
-        # Late lookup через фасад rag для поддержки monkeypatch на rag.memory_manager.
-        from custom_tools.text_to_sql import rag as _facade
-        _mm = _facade.memory_manager
+        _mm = self._memory_gateway.memory_manager
 
         # Ожидаемые ветви "нет коллекции / нет модели / некорректный вход" —
         # это не ошибка, это штатный пустой результат (логируем как debug).
@@ -489,7 +507,8 @@ class RetrievalService:
         # под локом до возврата executor — читаем глобал только после этого вызова.
         executor = _get_chroma_pool()
         # Overload-guard считает inflight (running+queued) через атомарный счётчик
-        # _CHROMA_INFLIGHT под локом. Декремент — в finally, гарантируем при любом исходе.
+        # _CHROMA_INFLIGHT под локом. Декремент — только callback'ом Future,
+        # чтобы timeout не освобождал слот, пока sync Chroma-call реально жив.
         global _CHROMA_INFLIGHT
         max_workers = _CHROMA_POOL_MAX_WORKERS or _chroma_pool_max_workers()
         with _CHROMA_INFLIGHT_LOCK:
@@ -507,21 +526,22 @@ class RetrievalService:
                     n_results=n_results,
                 )
             )
-            try:
-                raw = _future.result(timeout=timeout_sec)
-            except FuturesTimeout:
-                _future.cancel()
-                logger.error(
-                    "ChromaDB query exceeded %ds (RAG_CHROMA_QUERY_TIMEOUT_SEC); "
-                    "worker remains stuck in pool (cannot cancel sync C-call)",
-                    timeout_sec,
-                )
-                raise RuntimeError(
-                    f"ChromaDB query exceeded {timeout_sec}s"
-                )
-        finally:
-            with _CHROMA_INFLIGHT_LOCK:
-                _CHROMA_INFLIGHT -= 1
+        except Exception:
+            _release_chroma_inflight()
+            raise
+        _future.add_done_callback(_release_chroma_inflight)
+        try:
+            raw = _future.result(timeout=timeout_sec)
+        except FuturesTimeout:
+            _future.cancel()
+            logger.error(
+                "ChromaDB query exceeded %ds (RAG_CHROMA_QUERY_TIMEOUT_SEC); "
+                "worker remains stuck in pool (cannot cancel sync C-call)",
+                timeout_sec,
+            )
+            raise RuntimeError(
+                f"ChromaDB query exceeded {timeout_sec}s"
+            )
 
         try:
             docs = raw.get("documents", [[]])[0] if raw else []
@@ -580,8 +600,7 @@ class RetrievalService:
 
         # 4.11: требуем доступности реранкера, чтобы не отдавать «голые» сниппеты.
         if os.getenv("RAG_DOC_FALLBACK_RERANK_REQUIRED", "1") == "1":
-            from custom_tools.text_to_sql import rag as _facade
-            _mm = _facade.memory_manager
+            _mm = self._memory_gateway.memory_manager
             if not getattr(_mm, "_create_embedding", None):
                 logger.debug(
                     "Doc fallback skipped: embedding model unavailable and "
@@ -774,9 +793,7 @@ class RetrievalService:
         """
         if not items:
             return []
-        # Late lookup через фасад rag для поддержки monkeypatch на rag.memory_manager.
-        from custom_tools.text_to_sql import rag as _facade
-        _mm = _facade.memory_manager
+        _mm = self._memory_gateway.memory_manager
         if not (getattr(_mm, "db_handler", None)
                 and getattr(_mm.db_handler, "embedding_model", None)):
             # W2-T3: было silent ``return items`` — теперь fail-fast,

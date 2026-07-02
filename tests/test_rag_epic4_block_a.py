@@ -14,8 +14,11 @@ EPIC 4 — RAG fixes (блок A).
   * 4.10 _search_chroma возвращает top_k, отсортированный по similarity desc;
   * 4.11 doc-fallback требует доступного реранкера;
   * 4.27 cosine_similarity вынесен в модуль и thin-wrapper на mixin'е.
+  * R-2(mem) _delete_chroma_records: [] — no-op, None — metadata fallback.
+  * R-2/R-3(mem) Chroma timeout keeps inflight slot; reindex deactivates old before new.
 """
 import os
+import sqlite3
 import threading
 import types
 from typing import Any, Dict, List
@@ -67,9 +70,169 @@ def _make_memory_manager(*, db_handler=None, create_embedding=None):
     return mm
 
 
+class _FakeRAGMemoryGateway:
+    def __init__(self, *, db_handler=None, create_embedding=None, memory_hits=None):
+        self.saved: List[Dict[str, Any]] = []
+        self.get_calls: List[Dict[str, Any]] = []
+        self.memory_hits = memory_hits if memory_hits is not None else []
+        self.memory_manager = _make_memory_manager(
+            db_handler=db_handler,
+            create_embedding=create_embedding,
+        )
+
+    def save_memory(self, **kwargs):
+        self.saved.append(kwargs)
+        return len(self.saved)
+
+    def get_memory(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return self.memory_hits
+
+
 # ---------------------------------------------------------------------------
 # 4.1 — индексация без статического similarity_score
 # ---------------------------------------------------------------------------
+
+def test_rag_services_use_injected_memory_gateway(monkeypatch):
+    """I-7: RAG services must depend on injected memory gateway, not globals."""
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=None,
+    )
+    gateway = _FakeRAGMemoryGateway(
+        db_handler=db_handler,
+        create_embedding=lambda text, purpose="passage": [0.25, 0.75],
+    )
+    monkeypatch.setattr(
+        rag,
+        "save_memory",
+        lambda **kwargs: pytest.fail("RAG service bypassed injected gateway"),
+    )
+    monkeypatch.setattr(
+        rag,
+        "memory_manager",
+        types.SimpleNamespace(db_handler=types.SimpleNamespace(
+            _get_connection=lambda: pytest.fail("RAG service bypassed injected gateway"),
+            tactical_collection=None,
+        )),
+    )
+
+    searcher = RAGSearcher(memory_gateway=gateway)
+    monkeypatch.setattr(searcher._indexing, "_collect_chroma_ids_for_file", lambda **kwargs: [])
+    monkeypatch.setattr(searcher._indexing, "_deactivate_file_records", lambda **kwargs: 0)
+    monkeypatch.setattr(searcher._indexing, "_delete_chroma_records", lambda **kwargs: None)
+
+    assert searcher._create_embedding_safe("SELECT 1;", purpose="passage") == [0.25, 0.75]
+    assert searcher._load_from_cache(
+        {
+            "session_id": "sess",
+            "cache_kind": "vector_db_search",
+            "cache_key": "missing",
+            "schema_version": "schema-v1",
+            "cacheable": True,
+        }
+    ) is None
+    searcher._save_to_cache(
+        {
+            "session_id": "sess",
+            "cache_kind": "vector_db_search",
+            "cache_key": "cache-key",
+            "schema_version": "schema-v1",
+            "cacheable": True,
+        },
+        [{"sql_example": "SELECT 1;"}],
+    )
+    searcher._index_file_in_memory(
+        session_id="sess",
+        filename="sqlrag.md",
+        sql_snippets=["SELECT 2;"],
+        file_hash="hash-123",
+    )
+
+    assert [call["data"]["cache_kind"] for call in gateway.saved] == [
+        "vector_db_search",
+        "sqlrag_example",
+    ]
+    assert gateway.get_calls[0]["cache_kind"] == "vector_db_search"
+
+
+def test_search_examples_by_query_deduplicates_across_memory_hits(monkeypatch):
+    monkeypatch.setenv("DB_DSN", "sqlite:///tmp/rag-dedupe.db")
+    gateway = _FakeRAGMemoryGateway(
+        memory_hits=[
+            {"data": {"sql_example": "SELECT 1"}},
+            {"data": {"sql_example": "SELECT 1;"}},
+            {"data": {"sql_example": "SELECT 2"}},
+        ],
+    )
+    searcher = RAGSearcher(memory_gateway=gateway)
+    monkeypatch.setattr(searcher, "_ensure_sqlrag_files_indexed", lambda: None)
+    monkeypatch.setattr(searcher, "_rerank_results_by_text", lambda query, items, top_k: items[:top_k])
+
+    results = searcher.search_examples_by_query("query", top_k=3)
+
+    assert [item["sql_example"] for item in results] == ["SELECT 1;", "SELECT 2;"]
+
+
+def test_orphan_cleanup_strict_chroma_failure_rolls_back_sqlite(monkeypatch):
+    monkeypatch.setenv("TEXT_TO_SQL_RAG_STRICT_CHROMA_CLEANUP", "1")
+    raw_conn = sqlite3.connect(":memory:")
+    raw_conn.execute(
+        """
+        CREATE TABLE agent_memory (
+            session_id TEXT,
+            agent_name TEXT,
+            step INTEGER,
+            data TEXT,
+            valid_to TEXT,
+            updated_at TEXT
+        )
+        """
+    )
+    raw_conn.execute(
+        "INSERT INTO agent_memory VALUES (?, ?, ?, ?, NULL, NULL)",
+        (
+            "sess",
+            "Schema-RAG-Agent",
+            7,
+            '{"source":"sqlrag_file","filename":"deleted.sql.md"}',
+        ),
+    )
+    raw_conn.commit()
+
+    class _NoCloseConn:
+        def cursor(self):
+            return raw_conn.cursor()
+
+        def commit(self):
+            return raw_conn.commit()
+
+        def rollback(self):
+            return raw_conn.rollback()
+
+        def close(self):
+            pass
+
+    class _FailingCollection:
+        def get(self, where):
+            return {"ids": ["old-id"]}
+
+        def delete(self, ids):
+            raise RuntimeError("chroma broken")
+
+    gateway = _FakeRAGMemoryGateway(
+        db_handler=types.SimpleNamespace(
+            _get_connection=lambda: _NoCloseConn(),
+            tactical_collection=_FailingCollection(),
+        )
+    )
+    searcher = RAGSearcher(memory_gateway=gateway)
+
+    with pytest.raises(RuntimeError, match="ChromaDB delete failed"):
+        searcher._cleanup_orphaned_records("sess")
+
+    row = raw_conn.execute("SELECT valid_to FROM agent_memory WHERE step = 7").fetchone()
+    assert row[0] is None
 
 def test_indexed_payload_has_no_static_score(monkeypatch):
     saved: List[Dict[str, Any]] = []
@@ -367,6 +530,171 @@ def test_reindex_strict_cleanup_compensates_inserted_chroma_ids(monkeypatch):
     assert reactivated, "strict cleanup failure must reactivate old SQLite rows"
 
 
+class _TrackingChromaCollection:
+    def __init__(self, ids=None):
+        self.ids = list(ids or [])
+        self.get_calls: List[Dict[str, Any]] = []
+        self.delete_calls: List[List[str]] = []
+
+    def get(self, **kwargs):
+        self.get_calls.append(kwargs)
+        return {"ids": list(self.ids)}
+
+    def delete(self, ids):
+        ids = list(ids)
+        self.delete_calls.append(ids)
+        self.ids = [item for item in self.ids if item not in ids]
+
+
+def test_reindex_empty_tactical_ids_does_not_delete_new_chroma_records(monkeypatch):
+    session_id = "sess"
+    collection = _TrackingChromaCollection()
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=collection,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+
+    def fake_save_memory(*, session_id, agent_name, data, **kwargs):
+        step = len(collection.ids) + 1
+        collection.ids.append(f"{session_id}-{agent_name}-{step}")
+        return step
+
+    monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+
+    searcher = RAGSearcher()
+    searcher._index_file_in_memory(
+        session_id=session_id,
+        filename="sqlrag.md",
+        sql_snippets=["SELECT 1;", "SELECT 2;"],
+        file_hash="hash-123",
+    )
+
+    assert collection.ids == [
+        "sess-Schema-RAG-Agent-1",
+        "sess-Schema-RAG-Agent-2",
+    ]
+    assert collection.delete_calls == []
+    assert len(collection.get_calls) == 1
+
+
+def test_delete_chroma_records_none_falls_back_to_metadata_lookup(monkeypatch):
+    collection = _TrackingChromaCollection(["old-1", "old-2"])
+    db_handler = types.SimpleNamespace(tactical_collection=collection)
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+
+    searcher = RAGSearcher()
+    searcher._indexing._delete_chroma_records(
+        session_id="sess",
+        filename="sqlrag.md",
+        tactical_ids=None,
+    )
+
+    assert len(collection.get_calls) == 1
+    assert collection.delete_calls == [["old-1", "old-2"]]
+    assert collection.ids == []
+
+
+def test_reindex_deactivates_old_records_before_inserting_new(monkeypatch):
+    operations: List[str] = []
+    session_id = "sess"
+    collection = _TrackingChromaCollection(["old-id"])
+    db_handler = types.SimpleNamespace(
+        _get_connection=lambda: _FakeConn(),
+        tactical_collection=collection,
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+
+    def fake_save_memory(*, session_id, agent_name, data, **kwargs):
+        operations.append("save")
+        return len([item for item in operations if item == "save"])
+
+    monkeypatch.setattr(rag, "save_memory", fake_save_memory)
+    searcher = RAGSearcher()
+    monkeypatch.setattr(
+        searcher._indexing,
+        "_deactivate_file_records",
+        lambda **kwargs: operations.append("deactivate_old") or 1,
+    )
+    monkeypatch.setattr(
+        searcher._indexing,
+        "_collect_chroma_ids_for_file",
+        lambda **kwargs: ["old-id"],
+    )
+
+    searcher._index_file_in_memory(
+        session_id=session_id,
+        filename="sqlrag.md",
+        sql_snippets=["SELECT 1;", "SELECT 2;"],
+        file_hash="hash-123",
+    )
+
+    assert operations[0] == "deactivate_old"
+    assert operations[1:] == ["save", "save"]
+    assert collection.delete_calls == [["old-id"]]
+
+
+def test_chroma_timeout_keeps_inflight_slot_until_future_finishes(monkeypatch):
+    callbacks = []
+
+    class _TimeoutFuture:
+        def result(self, timeout=None):
+            raise retrieval_mod.FuturesTimeout()
+
+        def cancel(self):
+            return False
+
+        def add_done_callback(self, callback):
+            callbacks.append(callback)
+
+    class _Executor:
+        def submit(self, fn):
+            return _TimeoutFuture()
+
+    collection = types.SimpleNamespace()
+    db_handler = types.SimpleNamespace(
+        tactical_collection=collection,
+        embedding_model=object(),
+    )
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+    monkeypatch.setattr(retrieval_mod, "_get_chroma_pool", lambda: _Executor())
+    monkeypatch.setattr(retrieval_mod, "_CHROMA_POOL_MAX_WORKERS", 1)
+    monkeypatch.setattr(retrieval_mod, "_CHROMA_INFLIGHT", 0)
+    monkeypatch.setenv("RAG_CHROMA_QUERY_TIMEOUT_SEC", "1")
+
+    searcher = RAGSearcher()
+
+    with pytest.raises(RuntimeError, match="ChromaDB query exceeded"):
+        searcher._search_chroma([0.1, 0.2], top_k=1)
+
+    assert retrieval_mod._CHROMA_INFLIGHT == 1
+    with pytest.raises(RuntimeError, match="Chroma query pool overloaded"):
+        searcher._search_chroma([0.1, 0.2], top_k=1)
+
+    callbacks[0](_TimeoutFuture())
+    assert retrieval_mod._CHROMA_INFLIGHT == 0
+
+
+def test_vector_cache_key_changes_when_sqlrag_file_changes(monkeypatch, tmp_path):
+    sqlrag_dir = tmp_path / "sqlrag"
+    sqlrag_dir.mkdir()
+    sqlrag_file = sqlrag_dir / "sess.md"
+    sqlrag_file.write_text("```sql\nSELECT 1;\n```\n", encoding="utf-8")
+
+    db_handler = types.SimpleNamespace(embedding_model_name="model-a")
+    monkeypatch.setattr(rag, "memory_manager", _make_memory_manager(db_handler=db_handler))
+
+    searcher = RAGSearcher()
+    searcher.repo_root = tmp_path
+    monkeypatch.setattr(searcher._retrieval._embeddings, "_get_session_id", lambda: "sess")
+
+    first = searcher._prepare_cache_info([0.1, 0.2], top_k=3, query_text="show total")
+    sqlrag_file.write_text("```sql\nSELECT 2;\n```\n", encoding="utf-8")
+    second = searcher._prepare_cache_info([0.1, 0.2], top_k=3, query_text="show total")
+
+    assert first["cache_key"] != second["cache_key"]
+
+
 # ---------------------------------------------------------------------------
 # 4.6 — _remove_old_file_records использует компактный JSON-паттерн
 # ---------------------------------------------------------------------------
@@ -506,17 +834,26 @@ def test_remove_old_records_matches_actual_save_memory_format(monkeypatch):
     assert fake_conn.commits >= 1
 
 
-def test_index_file_saves_before_opening_deactivation_writer(monkeypatch):
-    """Wave 1B: save_memory must not run while this method holds a write tx."""
+def test_index_file_closes_deactivation_writer_before_saving_new(monkeypatch):
+    """R-3: old rows are deactivated first, but no writer stays open during save_memory."""
     order: List[str] = []
 
     def fake_save_memory(*, session_id, agent_name, data, **kwargs):
         order.append(f"save:{data['snippet_index']}")
-        return len(order)
+        return int(data["snippet_index"]) + 1
+
+    class TrackingConn(_FakeConn):
+        def commit(self):
+            order.append("commit")
+            return super().commit()
+
+        def close(self):
+            order.append("close")
+            return super().close()
 
     def fake_get_connection():
         order.append("get_connection")
-        return _FakeConn()
+        return TrackingConn()
 
     db_handler = types.SimpleNamespace(
         _get_connection=fake_get_connection,
@@ -533,8 +870,7 @@ def test_index_file_saves_before_opening_deactivation_writer(monkeypatch):
         file_hash="hash-123",
     )
 
-    assert order[:2] == ["save:0", "save:1"]
-    assert order[2:] == ["get_connection"]
+    assert order == ["get_connection", "commit", "close", "save:0", "save:1"]
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import pytest
 
 
 def _load_service_with_stubs(monkeypatch, wf_manager):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
     for module_name in [
         "backend.fastapi_app.agui.service",
         "agent_streamlit_api",
@@ -509,6 +510,12 @@ def _load_runner_with_minimal_stubs(monkeypatch):
     utils_module = types.ModuleType("utils")
     utils_module.call_openai_api_streaming = lambda *args, **kwargs: ""
     monkeypatch.setitem(sys.modules, "utils", utils_module)
+
+    service_module = types.ModuleType("backend.fastapi_app.agui.service")
+    service_module._require_service_action_role = lambda _action, _principal: None
+    service_module.handle_service_action = lambda *args, **kwargs: {}
+    service_module._redact_payload = lambda value: value
+    monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.service", service_module)
 
     workflow_pkg = types.ModuleType("workflow")
     workflow_streamlit = types.ModuleType("workflow.streamlit_api")

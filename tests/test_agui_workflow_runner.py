@@ -99,6 +99,8 @@ class _StubWorkflowManager:
 def _load_runner_with_workflow_stub(monkeypatch, manager_holder: list):
     """Изолированно перезагружает runner, подменяя тяжёлые зависимости."""
 
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
+
     stub_agent_system = types.ModuleType("agent_system")
 
     class DynamicAgentSystem:
@@ -111,6 +113,12 @@ def _load_runner_with_workflow_stub(monkeypatch, manager_holder: list):
     stub_service = types.ModuleType("backend.fastapi_app.agui.service")
     stub_service.handle_service_action = lambda *_a, **_k: {}
     stub_service._redact_payload = lambda value: value
+
+    def _require_service_action_role(action, principal):
+        if action == "workflows.start" and not principal.has_role("admin"):
+            raise PermissionError(f"service action '{action}' requires role 'admin'")
+
+    stub_service._require_service_action_role = _require_service_action_role
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.service", stub_service)
 
     stub_logging = types.ModuleType("unified_logging")
@@ -529,3 +537,56 @@ async def test_run_workflow_rejects_text_to_sql_pipeline_via_forwarded_props(mon
     assert manager_holder == [] or manager_holder[0].start_calls == []
     # RUN_FINISHED не должен быть эмитнут.
     assert not [e for e in events if e.type == EventType.RUN_FINISHED]
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_requires_workflows_start_role_for_forwarded_props(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal, principal_context
+
+    manager_holder: list[_StubWorkflowManager] = []
+    runner = _load_runner_with_workflow_stub(monkeypatch, manager_holder)
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+
+    agui_run_id = f"run-{uuid.uuid4().hex[:8]}"
+    payload = _make_payload(
+        agui_run_id,
+        {"workflow_name": "demo_pipeline", "execution_mode": "workflow"},
+    )
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    with principal_context(user):
+        events = [event async for event in runner.run_agent(RunAgentInput(**payload))]
+
+    error_events = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert len(error_events) == 1
+    assert error_events[0].code == "execution_error"
+    assert "workflows.start" in error_events[0].message
+    assert "requires role 'admin'" in error_events[0].message
+    assert manager_holder == []
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_checks_role_before_protected_text_to_sql_metadata(monkeypatch):
+    from backend.fastapi_app.agui.auth import Principal, principal_context
+
+    manager_holder: list[_StubWorkflowManager] = []
+    runner = _load_runner_with_workflow_stub(monkeypatch, manager_holder)
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+
+    agui_run_id = f"run-{uuid.uuid4().hex[:8]}"
+    payload = _make_payload(
+        agui_run_id,
+        {"workflow_name": "text_to_sql_pipeline", "execution_mode": "workflow"},
+    )
+    user = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+
+    with principal_context(user):
+        events = [event async for event in runner.run_agent(RunAgentInput(**payload))]
+
+    error_events = [event for event in events if event.type == EventType.RUN_ERROR]
+    assert len(error_events) == 1
+    assert error_events[0].code == "execution_error"
+    assert "workflows.start" in error_events[0].message
+    assert "requires role 'admin'" in error_events[0].message
+    assert "presets.text_to_sql.generate" not in error_events[0].message
+    assert manager_holder == []

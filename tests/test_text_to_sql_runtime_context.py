@@ -61,6 +61,22 @@ def stub_mcp_tools(monkeypatch):
     _clear_workflow_cached_attrs()
 
 
+def test_resolve_dsn_precedence(monkeypatch):
+    from custom_tools.text_to_sql.utils import resolve_dsn
+    from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context
+
+    monkeypatch.setenv("DB_DSN", "sqlite:///env.db")
+    token = set_tool_runtime_context({"dsn": "sqlite:///runtime.db"})
+    try:
+        assert resolve_dsn("sqlite:///explicit.db", allow_env=True) == "sqlite:///explicit.db"
+        assert resolve_dsn(None, allow_env=True) == "sqlite:///runtime.db"
+    finally:
+        reset_tool_runtime_context(token)
+
+    assert resolve_dsn(None, allow_env=True) == "sqlite:///env.db"
+    assert resolve_dsn(None, allow_env=False) is None
+
+
 def test_sql_generation_plugin_reads_runtime_dsn_when_argument_omitted():
     from custom_tools.text_to_sql.core import _sql_generation_api
     from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context

@@ -79,6 +79,28 @@ def test_get_memory_without_filters(mock_memory_manager):
     assert isinstance(results, list)
 
 
+def test_get_memory_raises_on_sqlite_operational_error(monkeypatch):
+    class BrokenDBHandler:
+        tactical_collection = None
+
+        def _get_connection(self):
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(
+        memory_tools,
+        "memory_manager",
+        types.SimpleNamespace(db_handler=BrokenDBHandler()),
+    )
+
+    with memory_tools.memory_requester_context("agent"):
+        with pytest.raises(RuntimeError, match="memory database read failed"):
+            get_memory(
+                session_id="sess",
+                agent_name="agent",
+                requesting_agent="agent",
+            )
+
+
 def test_get_memory_with_partial_filters(mock_memory_manager):
     """Тест с частичными фильтрами."""
     results = get_memory(
@@ -278,6 +300,57 @@ def test_get_memory_uses_actual_chroma_l2_metric_for_semantic_scores(monkeypatch
     assert results[0]["score"] == pytest.approx(0.2)
 
 
+def test_get_memory_uses_bounded_lexical_fallback_when_semantic_empty(monkeypatch, tmp_path):
+    db_handler = _make_sqlite_db_handler(tmp_path)
+    _insert_memory_row(
+        db_handler,
+        step=1,
+        data_text=_compact_json({
+            "cache_kind": "sqlrag_example",
+            "sql_example": "SELECT * FROM territories WHERE oktmo = '45382000'",
+        }),
+        session_id="sess",
+        agent_name="Schema-RAG-Agent",
+    )
+    _insert_memory_row(
+        db_handler,
+        step=2,
+        data_text=_compact_json({
+            "cache_kind": "schema_table",
+            "table_fqn": "public.other",
+            "description": "45382000 appears in another namespace",
+        }),
+        session_id="sess",
+        agent_name="Schema-RAG-Agent",
+    )
+    db_handler.tactical_collection = types.SimpleNamespace(
+        metadata={"hnsw:space": "cosine"},
+        configuration=None,
+    )
+    memory_manager = types.SimpleNamespace(
+        db_handler=db_handler,
+        _search_semantic_with_scores=lambda *_args, **_kwargs: {
+            "ids": [],
+            "distances": [[]],
+            "metadatas": [[]],
+        },
+    )
+    monkeypatch.setattr(memory_tools, "memory_manager", memory_manager)
+    monkeypatch.setenv("RAG_LEXICAL_FALLBACK_LIMIT", "10")
+    monkeypatch.setenv("RAG_RERANK_ENABLED", "0")
+
+    with memory_tools.memory_requester_context("Schema-RAG-Agent"):
+        results = get_memory(
+            session_id="sess",
+            query="45382000",
+            cache_kind="sqlrag_example",
+            requesting_agent="Schema-RAG-Agent",
+        )
+
+    assert [item["step"] for item in results] == [1]
+    assert results[0]["score"] == pytest.approx(0.01)
+
+
 def test_summary_agent_memory_step_detects_replaced_active_row(monkeypatch, tmp_path):
     db_handler = _make_sqlite_db_handler(tmp_path)
     memory_manager = types.SimpleNamespace(
@@ -399,6 +472,49 @@ def test_save_memory_preserves_large_strings_without_llm_summarization(monkeypat
     assert payload["agent_response"] == large_text
 
 
+def test_save_memory_uses_shared_tactical_chroma_text_extractor(monkeypatch, tmp_path):
+    db_handler = _make_sqlite_db_handler(tmp_path)
+    added = {}
+
+    class TacticalCollection:
+        def add(self, *, embeddings, documents, metadatas, ids):
+            added["embeddings"] = embeddings
+            added["documents"] = documents
+            added["metadatas"] = metadatas
+            added["ids"] = ids
+
+    db_handler.tactical_collection = TacticalCollection()
+    db_handler.embedding_model = object()
+    memory_manager = types.SimpleNamespace(
+        db_handler=db_handler,
+        is_memory_updated=False,
+        _resolve_conflicts=lambda *_args, **_kwargs: [],
+        _deactivate_conflicting_records=lambda *_args, **_kwargs: None,
+        _extract_text_content=lambda data: "fallback-text",
+        _create_embedding=lambda text, purpose: [0.1, 0.2],
+    )
+    seen = {}
+
+    def fake_extract(data, *, fallback_extractor):
+        seen["data"] = data
+        seen["fallback"] = fallback_extractor
+        return "shared-text"
+
+    monkeypatch.setattr(memory_tools, "memory_manager", memory_manager)
+    monkeypatch.setattr(memory_tools, "extract_tactical_chroma_text", fake_extract)
+
+    step = memory_tools.save_memory(
+        "sess",
+        "agent",
+        {"cache_kind": "agent_step", "agent_response": "raw text"},
+    )
+
+    assert step == 1
+    assert seen["data"]["agent_response"] == "raw text"
+    assert seen["fallback"] is memory_manager._extract_text_content
+    assert added["documents"] == ["shared-text"]
+
+
 def test_save_memory_retries_step_allocation_after_unique_conflict(monkeypatch):
     class FakeCursor:
         def __init__(self, conn):
@@ -469,6 +585,27 @@ def test_save_memory_retries_step_allocation_after_unique_conflict(monkeypatch):
     assert fake_conn.commits == 1
     assert fake_conn.inserted_step == 2
     assert memory_manager.is_memory_updated is True
+
+
+def test_save_memory_raises_on_sqlite_operational_error(monkeypatch):
+    db_handler = types.SimpleNamespace(
+        lock=threading.Lock(),
+        _get_connection=lambda: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database is locked")
+        ),
+        tactical_collection=None,
+        embedding_model=None,
+    )
+    memory_manager = types.SimpleNamespace(
+        db_handler=db_handler,
+        is_memory_updated=False,
+        _resolve_conflicts=lambda *_args, **_kwargs: [],
+        _deactivate_conflicting_records=lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(memory_tools, "memory_manager", memory_manager)
+
+    with pytest.raises(RuntimeError, match="memory database write failed"):
+        memory_tools.save_memory("sess", "agent", {"value": "payload"})
 
 
 def test_save_memory_marks_row_needs_reindex_on_chroma_failure(monkeypatch, tmp_path):

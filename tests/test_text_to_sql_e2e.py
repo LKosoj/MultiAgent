@@ -48,6 +48,7 @@ _TOOL_OUTPUTS: dict[str, dict[str, Any]] = {
         },
         "joins": [],
         "join_success": True,
+        "sql_generation_allowed": True,
         "unlinked_entities": [],
         "schema_info": {
             "orders": {

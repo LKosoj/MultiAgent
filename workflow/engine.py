@@ -42,6 +42,59 @@ _SENTINEL_MISSING = object()
 # Декларативное имя схемы для пост-парсинга str-output шага через json.loads.
 # См. WorkflowStep.output_schema и _normalize_step_output ниже.
 _JSON_OBJECT_SCHEMA = "json_object"
+_CODE_FENCE_RE = re.compile(
+    r"^\s*```(?P<label>[A-Za-z0-9_+-]*)[ \t]*(?:\r?\n)?(?P<body>.*?)\r?\n?```\s*$",
+    flags=re.DOTALL,
+)
+_SQL_FENCE_LABELS = {"", "sql", "postgres", "postgresql", "sqlite"}
+
+
+def _json_candidate_from_fence(raw_output: str) -> str:
+    fence_match = _CODE_FENCE_RE.match(raw_output)
+    if fence_match is None:
+        return raw_output
+    label = fence_match.group("label").lower()
+    body = fence_match.group("body").strip()
+    if label == "json" or (label == "" and body.lstrip().startswith(("{", "["))):
+        return body
+    return raw_output
+
+
+def _strip_leading_sql_comments(sql_text: str) -> str:
+    remaining = sql_text.lstrip()
+    while True:
+        if remaining.startswith("--"):
+            newline = remaining.find("\n")
+            if newline == -1:
+                return ""
+            remaining = remaining[newline + 1 :].lstrip()
+            continue
+        if remaining.startswith("/*"):
+            end = remaining.find("*/", 2)
+            if end == -1:
+                return remaining
+            remaining = remaining[end + 2 :].lstrip()
+            continue
+        return remaining
+
+
+def _recoverable_sql_generation_text(raw_output: str) -> Optional[str]:
+    sql_text = raw_output.strip()
+    if not sql_text:
+        return None
+
+    fence_match = _CODE_FENCE_RE.match(sql_text)
+    if fence_match is not None:
+        label = fence_match.group("label").lower()
+        if label not in _SQL_FENCE_LABELS:
+            return None
+        sql_text = fence_match.group("body").strip()
+
+    if sql_text.lstrip().startswith(("{", "[")):
+        return None
+    if re.match(r"(?is)^(select|with)\b", _strip_leading_sql_comments(sql_text)):
+        return sql_text
+    return None
 
 
 class WorkflowEngine(DynamicAgentSystem):
@@ -657,18 +710,24 @@ class WorkflowEngine(DynamicAgentSystem):
         # W1-review: LLM-агенты иногда оборачивают JSON в ```json ... ```
         # code-fence несмотря на инструкцию. Снимаем обёртку до json.loads,
         # чтобы не зависеть только от prompt-discipline.
-        candidate = raw_output
-        fence_match = re.match(
-            r"^\s*```(?:json|JSON)?\s*\n?(.*?)\n?```\s*$",
-            raw_output,
-            flags=re.DOTALL,
-        )
-        if fence_match is not None:
-            candidate = fence_match.group(1).strip()
+        candidate = _json_candidate_from_fence(raw_output)
 
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
+            if step.id == "sql_generation":
+                sql_text = _recoverable_sql_generation_text(raw_output)
+                if sql_text is not None:
+                    fallback_output = {
+                        "sql": sql_text,
+                        "description": "Recovered from non-JSON sql_generation output",
+                        "output_normalization_warning": (
+                            "sql_generation returned a non-JSON string; "
+                            "treating it as raw SQL for verification"
+                        ),
+                    }
+                    self._validate_step_output_requirements(step, fallback_output)
+                    return fallback_output, True
             snippet = _redact_workflow_log_value(raw_output[:200])
             raise WorkflowStepError(
                 f"Step '{step.id}' declared output_schema=json_object but "
@@ -1098,11 +1157,9 @@ class WorkflowEngine(DynamicAgentSystem):
                 keep_current_output = True
                 return None
 
+            step_by_id = {s.id: s for s in workflow_def.steps}
             # Ищем rerun_step в workflow_def
-            rerun_step = next(
-                (s for s in workflow_def.steps if s.id == rerun_step_id),
-                None,
-            )
+            rerun_step = step_by_id.get(rerun_step_id)
             if rerun_step is None:
                 logger.warning(
                     "⚠️ output_retry_policy: rerun_step '%s' не найден в workflow",
@@ -1110,6 +1167,21 @@ class WorkflowEngine(DynamicAgentSystem):
                 )
                 keep_current_output = True
                 return None
+            rerun_chain_ids = policy.get("rerun_chain")
+            if isinstance(rerun_chain_ids, list) and rerun_chain_ids:
+                rerun_steps = []
+                for chain_step_id in rerun_chain_ids:
+                    chain_step = step_by_id.get(str(chain_step_id))
+                    if chain_step is None:
+                        logger.warning(
+                            "⚠️ output_retry_policy: rerun_chain step '%s' не найден в workflow",
+                            chain_step_id,
+                        )
+                        keep_current_output = True
+                        return None
+                    rerun_steps.append(chain_step)
+            else:
+                rerun_steps = [rerun_step]
 
             # Готовим feedback: сериализуем output в JSON-строку для подстановки
             # в task rerun_step (через context.variables[feedback_field]).
@@ -1134,34 +1206,34 @@ class WorkflowEngine(DynamicAgentSystem):
 
             execute_step = step_executor or self._execute_workflow_step
 
-            # Запускаем rerun_step заново
-            rerun_result = await execute_step(rerun_step, context, workflow_def)
-            # NB: enum identity не используем — в тестах с lightweight workflow
-            # модуль models переинициализируется, и StepStatus.COMPLETED в engine
-            # может не совпасть с StepStatus.COMPLETED в моках. Сравниваем по value.
-            rerun_status_value = getattr(rerun_result.status, "value", rerun_result.status)
-            if rerun_status_value != StepStatus.COMPLETED.value:
-                logger.error(
-                    "❌ output_retry_policy: rerun_step '%s' завершился со статусом %s; "
-                    "оставляем исходный результат шага '%s'",
-                    rerun_step_id,
-                    rerun_result.status,
-                    step.id,
-                )
-                keep_current_output = True
-                return None
-            if step_results is not None:
-                step_results[rerun_step_id] = rerun_result
-            # Сохраняем результат rerun_step в context, чтобы зависящие от него
-            # шаги (в т.ч. текущий) видели свежий output.
-            if not rerun_step_committed_by_executor:
-                await self._on_step_completed(
-                    context.workflow_id,
-                    rerun_step,
-                    rerun_result,
-                    context,
-                    step_results if step_results is not None else {},
-                )
+            for chain_step in rerun_steps:
+                rerun_result = await execute_step(chain_step, context, workflow_def)
+                # NB: enum identity не используем — в тестах с lightweight workflow
+                # модуль models переинициализируется, и StepStatus.COMPLETED в engine
+                # может не совпасть с StepStatus.COMPLETED в моках. Сравниваем по value.
+                rerun_status_value = getattr(rerun_result.status, "value", rerun_result.status)
+                if rerun_status_value != StepStatus.COMPLETED.value:
+                    logger.error(
+                        "❌ output_retry_policy: rerun step '%s' завершился со статусом %s; "
+                        "оставляем исходный результат шага '%s'",
+                        chain_step.id,
+                        rerun_result.status,
+                        step.id,
+                    )
+                    keep_current_output = True
+                    return None
+                if step_results is not None:
+                    step_results[chain_step.id] = rerun_result
+                # Сохраняем результат rerun step в context, чтобы зависящие от него
+                # шаги (в т.ч. текущий) видели свежий output.
+                if not rerun_step_committed_by_executor:
+                    await self._on_step_completed(
+                        context.workflow_id,
+                        chain_step,
+                        rerun_result,
+                        context,
+                        step_results if step_results is not None else {},
+                    )
 
             # Перезапускаем текущий шаг. Если он успешен, не откатываем
             # context.step_outputs в finally: enhanced executor может уже
@@ -1216,6 +1288,7 @@ class WorkflowEngine(DynamicAgentSystem):
                 
                 # Выполняем задачу напрямую через агента
                 result = agent.run(task, stream=False)
+                result = self._unwrap_agent_run_result_or_raise(step, agent, result)
                 
                 # Регистрируем API вызов для мониторинга
                 self.resource_manager.record_api_call(context.workflow_id)
@@ -1236,6 +1309,22 @@ class WorkflowEngine(DynamicAgentSystem):
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(None, _execute_agent_sync)
 
+        return result
+
+    def _unwrap_agent_run_result_or_raise(self, step: WorkflowStep, agent: Any, result: Any) -> Any:
+        """Convert smolagents max_steps exhaustion into a workflow failure."""
+
+        if getattr(result, "state", None) == "max_steps_error":
+            raise RuntimeError(f"Agent {step.agent_type} reached max_steps without final answer")
+
+        memory_steps = getattr(getattr(agent, "memory", None), "steps", None)
+        if memory_steps:
+            last_error = getattr(memory_steps[-1], "error", None)
+            if last_error and last_error.__class__.__name__ == "AgentMaxStepsError":
+                raise RuntimeError(f"Agent {step.agent_type} reached max_steps without final answer")
+
+        if getattr(result, "state", None) == "success" and hasattr(result, "output"):
+            return result.output
         return result
 
     async def _execute_tool_step(self, step: WorkflowStep, context: WorkflowContext, task: str) -> Any:
@@ -1922,6 +2011,7 @@ class WorkflowEngine(DynamicAgentSystem):
             
             # Выполняем менеджера
             result = manager.run(formatted_task, stream=False)
+            result = self._unwrap_agent_run_result_or_raise(step, manager, result)
             
             # Регистрируем API вызов
             self.resource_manager.record_api_call(context.workflow_id)

@@ -97,7 +97,7 @@ class TestRunSummaryContext(unittest.TestCase):
         self.assertIsNotNone(passed.last_messages)
         self.assertIsNone(self.capture_model.last_messages)
 
-    def test_get_context_treats_legacy_max_tokens_as_char_budget(self):
+    def test_get_context_converts_token_budget_to_char_budget(self):
         self.memory.policy.strategic_read = True
         self.memory.policy.search_enabled = False
         self.memory.get_full_steps = MagicMock(return_value=[])
@@ -106,7 +106,8 @@ class TestRunSummaryContext(unittest.TestCase):
         context = self.memory.get_context(max_tokens=40)
 
         self.assertTrue(context.endswith("..."))
-        self.assertLessEqual(len(context), 40 + len("\n..."))
+        self.assertGreater(len(context), 40)
+        self.assertLessEqual(len(context), 160 + len("\n..."))
 
     def test_get_context_filters_semantic_duplicate_from_recent_steps(self):
         duplicate_step = {

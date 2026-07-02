@@ -36,7 +36,8 @@ FIXME EPIC-8.5 deferred: 13 функций-обёрток ниже выгляд�
 это анкоры monkeypatch + явный контракт, а не дубль ради дубля.
 """
 import logging
-from typing import Dict, List, Optional
+import threading
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +59,6 @@ except ImportError as exc:
 
 from memory.manager import memory_manager  # noqa: E402
 
-# Внутренние компоненты — singletons.
-from ..nlu import NLUProcessor  # noqa: E402
-from ..rag import RAGSearcher  # noqa: E402
-from ..validators import SQLSafetyValidator, SchemaLimiter  # noqa: E402
-from ..sql_generator import SQLGenerator  # noqa: E402
 from ..utils import configure_logging  # noqa: E402
 
 # W2-T7: реэкспорт исключения для callers и тестов. code_formatter теперь
@@ -73,12 +69,64 @@ from ._db_exec import MissingDSNError  # noqa: E402,F401
 # Настраиваем логирование (как в оригинальном core.py)
 configure_logging()
 
-# Инициализируем процессоры (singletons фасада)
-nlu_processor = NLUProcessor()
-rag_searcher = RAGSearcher()
-sql_validator = SQLSafetyValidator()
-schema_limiter = SchemaLimiter()
-sql_generator = SQLGenerator()
+_SINGLETON_NAMES = frozenset({
+    "nlu_processor",
+    "rag_searcher",
+    "sql_validator",
+    "schema_limiter",
+    "sql_generator",
+})
+_SINGLETON_LOCK = threading.RLock()
+
+for _singleton_name in _SINGLETON_NAMES:
+    globals().pop(_singleton_name, None)
+
+
+def _build_core_singleton(name: str) -> Any:
+    if name == "nlu_processor":
+        from ..nlu import NLUProcessor
+
+        return NLUProcessor()
+    if name == "rag_searcher":
+        from ..rag import RAGSearcher
+
+        return RAGSearcher()
+    if name == "sql_validator":
+        from ..validators import SQLSafetyValidator
+
+        return SQLSafetyValidator()
+    if name == "schema_limiter":
+        from ..validators import SchemaLimiter
+
+        return SchemaLimiter()
+    if name == "sql_generator":
+        from ..sql_generator import SQLGenerator
+
+        return SQLGenerator()
+    raise AttributeError(name)
+
+
+def _get_core_singleton(name: str) -> Any:
+    if name not in _SINGLETON_NAMES:
+        raise AttributeError(name)
+
+    existing = globals().get(name)
+    if existing is not None:
+        return existing
+
+    with _SINGLETON_LOCK:
+        existing = globals().get(name)
+        if existing is not None:
+            return existing
+        instance = _build_core_singleton(name)
+        globals()[name] = instance
+        return instance
+
+
+def __getattr__(name: str) -> Any:
+    if name in _SINGLETON_NAMES:
+        return _get_core_singleton(name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # === Публичные фасадные функции ===
@@ -97,7 +145,7 @@ def natural_language_processing(text: str, session_id: Optional[str] = None) -> 
         Словарь с полями `tokens` и `pos_tags`.
     """
     from ._nlu_api import natural_language_processing as _impl
-    return _impl(text, session_id, nlu_processor=nlu_processor)
+    return _impl(text, session_id, nlu_processor=_get_core_singleton("nlu_processor"))
 
 
 def intent_extraction(text: str, session_id: Optional[str] = None) -> Dict[str, object]:
@@ -111,7 +159,7 @@ def intent_extraction(text: str, session_id: Optional[str] = None) -> Dict[str, 
         Словарь с полями `intent` и `entities`.
     """
     from ._nlu_api import intent_extraction as _impl
-    return _impl(text, session_id, nlu_processor=nlu_processor)
+    return _impl(text, session_id, nlu_processor=_get_core_singleton("nlu_processor"))
 
 
 def vector_db_search(query: str, top_k: int = 3) -> List[Dict[str, object]]:
@@ -125,7 +173,7 @@ def vector_db_search(query: str, top_k: int = 3) -> List[Dict[str, object]]:
         Список словарей с найденными примерами и их similarity-score.
     """
     from ._rag_api import vector_db_search as _impl
-    return _impl(query, top_k, rag_searcher=rag_searcher)
+    return _impl(query, top_k, rag_searcher=_get_core_singleton("rag_searcher"))
 
 
 def schema_linking(
@@ -133,6 +181,7 @@ def schema_linking(
     session_id: Optional[str] = None,
     schema_info: Optional[dict] = None,
     dsn: Optional[str] = None,
+    value_grounding: Optional[bool] = None,
 ) -> Dict[str, object]:
     """Связывает извлечённые сущности с таблицами/колонками схемы.
 
@@ -142,6 +191,7 @@ def schema_linking(
         schema_info: явная схема БД для линкинга (опционально); если None —
             линкер возьмёт схему из кэша/интроспекции.
         dsn: DSN целевой БД для загрузки sqlrag-схемы и интроспекции.
+        value_grounding: opt-in DB lookup для уточнения значений фильтров.
 
     Returns:
         Словарь со связанными сущностями, joins и информацией о схеме.
@@ -157,7 +207,8 @@ def schema_linking(
         session_id,
         schema_info,
         dsn,
-        schema_limiter=schema_limiter,
+        value_grounding=value_grounding,
+        schema_limiter=_get_core_singleton("schema_limiter"),
     )
 
 
@@ -184,7 +235,7 @@ def sql_generation_plugin(
         user_query,
         dsn=dsn,
         session_id=session_id,
-        sql_generator=sql_generator,
+        sql_generator=_get_core_singleton("sql_generator"),
     )
 
 
@@ -200,7 +251,7 @@ def code_formatter(sql_query: str, dsn: Optional[str] = None) -> Dict[str, str]:
         Словарь с ключами `formatted_sql` и `masked_sql`.
     """
     from ._sql_generation_api import code_formatter as _impl
-    return _impl(sql_query, dsn=dsn, sql_validator=sql_validator)
+    return _impl(sql_query, dsn=dsn, sql_validator=_get_core_singleton("sql_validator"))
 
 
 def sql_safety_check(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:
@@ -214,7 +265,7 @@ def sql_safety_check(sql_query: str, dsn: Optional[str] = None) -> Dict[str, obj
         Словарь со статусом safety_status и списком violations.
     """
     from ._sql_generation_api import sql_safety_check as _impl
-    return _impl(sql_query, sql_validator=sql_validator, dsn=dsn)
+    return _impl(sql_query, sql_validator=_get_core_singleton("sql_validator"), dsn=dsn)
 
 
 def sql_explain(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:
@@ -229,7 +280,7 @@ def sql_explain(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:
         Словарь с планом и метаинформацией.
     """
     from ._sql_generation_api import sql_explain as _impl
-    return _impl(sql_query, dsn, sql_validator=sql_validator)
+    return _impl(sql_query, dsn, sql_validator=_get_core_singleton("sql_validator"))
 
 
 def secure_db_executor(
@@ -255,8 +306,8 @@ def secure_db_executor(
         sql_query,
         row_limit,
         dsn,
-        sql_validator=sql_validator,
-        schema_limiter=schema_limiter,
+        sql_validator=_get_core_singleton("sql_validator"),
+        schema_limiter=_get_core_singleton("schema_limiter"),
     )
 
 

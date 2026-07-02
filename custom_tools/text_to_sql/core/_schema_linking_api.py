@@ -51,6 +51,7 @@ def schema_linking(
     session_id: Optional[str] = None,
     schema_info: Optional[Dict[str, object]] = None,
     dsn: Optional[str] = None,
+    value_grounding: Optional[bool] = None,
     *,
     schema_limiter,
 ) -> Dict[str, object]:
@@ -62,6 +63,7 @@ def schema_linking(
         schema_info: Явная схема БД для линкинга; если None — берётся из кэша/
             интроспекции через SchemaLinker.
         dsn: DSN целевой БД для загрузки sqlrag-схемы и интроспекции.
+        value_grounding: opt-in DB lookup для уточнения значений linked filters.
 
     Returns:
         Словарь с привязанными к схеме сущностями.
@@ -105,22 +107,33 @@ def schema_linking(
     effective_dsn = dsn or get_runtime_context_dsn()
     entities, input_warnings = _normalize_schema_linking_entities(entities)
     if not entities:
-        return {
+        result = {
             "error": "Invalid schema_linking entities payload",
             "linked_entities": {"metrics": [], "dimensions": [], "filters": {}},
             "joins": [],
             "join_success": False,
+            "sql_generation_allowed": False,
             "unlinked_entities": [],
             "schema_info": {},
             "input_warnings": input_warnings,
         }
+        from ..quality import schema_linking_quality
+
+        result.update(schema_linking_quality(result))
+        return result
     linker = SchemaLinker.with_defaults(schema_limiter)
     result = linker.link_entities_to_schema(
         entities,
         schema_info,
         dsn=effective_dsn,
         session_id=session_id,
+        value_grounding=value_grounding,
     )
+    from ..quality import schema_linking_quality
+
+    quality = schema_linking_quality(result)
+    result.update(quality)
+    result["sql_generation_allowed"] = bool(result.get("join_success")) and not bool(quality.get("abstain"))
     if input_warnings:
         result["input_warnings"] = input_warnings
     return result
