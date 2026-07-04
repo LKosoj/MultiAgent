@@ -35,8 +35,34 @@ _DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1"
 _DEFAULT_TIMEOUT_SECONDS = 60
 _DEFAULT_MAX_WAIT_SECONDS = 900
 _DEFAULT_POLL_INTERVAL_SECONDS = 15
+_DEFAULT_POLL_MAX_TRANSIENT_ERRORS = 5
+_DEFAULT_POLL_BACKOFF_CAP_SECONDS = 120
 _AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+
+
+class _PollTransientError(Exception):
+    """Transient poll failure (network / non-200) after retry budget; task_id survives."""
+
+    def __init__(self, message: str, task_id: Optional[str] = None):
+        super().__init__(message)
+        self.task_id = task_id
+
+
+class _PollTimeoutError(Exception):
+    """Poll deadline exceeded while the provider task may still be running."""
+
+    def __init__(self, message: str, task_id: Optional[str] = None):
+        super().__init__(message)
+        self.task_id = task_id
+
+
+class _ProviderGenerationError(Exception):
+    """Provider reported a genuine terminal failure for the task."""
+
+    def __init__(self, message: str, task_id: Optional[str] = None):
+        super().__init__(message)
+        self.task_id = task_id
 
 
 def load_env_file() -> None:
@@ -432,6 +458,14 @@ def _discover_shot_image(
     return candidate if os.path.exists(candidate) else None
 
 
+def _requested_frame_dimensions(item: Dict[str, Any]) -> Tuple[int, int]:
+    """User-requested width/height (catalog-independent) for the M-6 input hash."""
+    try:
+        return int(item.get("width") or 0), int(item.get("height") or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
 def _extract_cost_and_currency(status_payload: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
     usage = status_payload.get("usage") or {}
     if "cost" in usage:
@@ -507,6 +541,7 @@ def _generate_single_video_aitunnel(
                 "currency": trusted_output_job.get("currency"),
             }
         requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+        requested_width, requested_height = _requested_frame_dimensions(item)
         frame_types = ["first_frame"] + (["last_frame"] if end_image else [])
         model_name = configured_model
         size_params: Dict[str, str] = {}
@@ -527,12 +562,15 @@ def _generate_single_video_aitunnel(
             if not output_exists:
                 raise
 
+        # M-6: hash user inputs only; the catalog-resolved model/size/duration are
+        # stored as job metadata below, never fed into input_hash.
         input_hash = _build_input_hash(
-            model_name=model_name,
+            model_name=configured_model,
             prompt_hash=prompt_hash,
             source_image_hashes=source_image_hashes,
-            duration=duration,
-            size_params=size_params,
+            requested_duration=requested_duration,
+            requested_width=requested_width,
+            requested_height=requested_height,
             seed=seed,
             frame_types=frame_types,
         )
@@ -549,6 +587,8 @@ def _generate_single_video_aitunnel(
                     source_image_hashes=source_image_hashes,
                     input_hash=input_hash,
                     output_path=str(video_path),
+                    resolved_size_params=size_params,
+                    resolved_duration=duration,
                 )
             )
         else:
@@ -614,7 +654,11 @@ def _generate_single_video_aitunnel(
             else None
         )
 
-        resume_job = job_store.find_resumable_job(shot_key, input_hash) if job_store else None
+        resume_job = (
+            job_store.find_resumable_job(shot_key, input_hash, prompt_hash, source_image_hashes)
+            if job_store
+            else None
+        )
         status_payload: Dict[str, Any] = {}
         task_id = None
         video_url = None
@@ -625,7 +669,21 @@ def _generate_single_video_aitunnel(
             video_url = resume_job.get("video_url")
             video_url_requires_auth = _stored_video_url_requires_auth(resume_job, str(video_url or ""), base_url)
             status = resume_job.get("status")
-            if video_url and status in {"completed", "download_failed", "downloaded"}:
+            if status == "download_failed" and task_id:
+                # M-14: the stored URL may be a signed CDN link that has since expired;
+                # re-poll the task_id for a fresh unsigned URL instead of hammering the
+                # stale one forever.
+                status_payload = _wait_for_video_completion_aitunnel(
+                    task_id=task_id,
+                    headers=headers,
+                    base_url=base_url,
+                    on_poll=poll_callback,
+                )
+                unsigned_urls = status_payload.get("unsigned_urls") or []
+                video_url = unsigned_urls[0] if unsigned_urls else f"{base_url}/videos/{task_id}/content?index=0"
+                video_url_requires_auth = not bool(unsigned_urls)
+            elif video_url and status in {"completed", "download_failed", "downloaded"}:
+                # download_failed without task_id: reuse the previously stored URL.
                 status_payload = {"usage": {}}
             elif task_id:
                 status_payload = _wait_for_video_completion_aitunnel(
@@ -645,58 +703,90 @@ def _generate_single_video_aitunnel(
                     "Найдена неоднозначная provider job без task_id/video_url; "
                     "повторная отправка заблокирована, чтобы не создать дубликат платной задачи"
                 )
-            if job_store:
-                job_store.update_job(
-                    shot_key,
-                    input_hash,
-                    {
-                        "status": "submitting",
-                        "model": model_name,
-                        "prompt_hash": prompt_hash,
-                        "source_image_hashes": source_image_hashes,
-                        "output_path": str(video_path),
-                        "error": None,
-                    },
-                    "submitting_at",
-                )
-            submit_response = requests.post(
-                f"{base_url}/videos",
-                headers=headers,
-                json=payload,
-                timeout=_DEFAULT_TIMEOUT_SECONDS,
+            # H-3 (money-critical): a prior job for these inputs may be marked failed while
+            # its paid task_id actually completed at the provider. Before spending on a
+            # resubmit, verify the old task_id with a single free GET and adopt it if done.
+            old_task_id = (
+                job_store.find_task_id_for_resubmit(shot_key, input_hash, prompt_hash, source_image_hashes)
+                if job_store
+                else None
             )
-            if submit_response.status_code not in (200, 202):
-                raise RuntimeError(
-                    f"AITUNNEL submit failed: {submit_response.status_code} - {submit_response.text}"
-                )
-
-            submit_payload = submit_response.json()
-            task_id = submit_payload.get("id")
-            if not task_id:
-                raise RuntimeError(f"Не получен id задачи от AITUNNEL: {submit_payload}")
-
-            if job_store:
-                job_store.update_job(
-                    shot_key,
-                    input_hash,
-                    {
-                        "task_id": task_id,
-                        "status": submit_payload.get("status") or "submitted",
-                        "model": model_name,
-                        "prompt_hash": prompt_hash,
-                        "source_image_hashes": source_image_hashes,
-                        "output_path": str(video_path),
-                        "error": None,
-                    },
-                    "submitted_at",
-                )
-
-            status_payload = _wait_for_video_completion_aitunnel(
-                task_id=task_id,
-                headers=headers,
-                base_url=base_url,
-                on_poll=poll_callback,
+            adopted_payload = (
+                _verify_completed_task_before_resubmit(old_task_id, headers, base_url)
+                if old_task_id
+                else None
             )
+            if adopted_payload is not None:
+                task_id = old_task_id
+                status_payload = adopted_payload
+                if job_store:
+                    job_store.update_job(
+                        shot_key,
+                        input_hash,
+                        {
+                            "task_id": task_id,
+                            "status": "submitted",
+                            "model": model_name,
+                            "prompt_hash": prompt_hash,
+                            "source_image_hashes": source_image_hashes,
+                            "output_path": str(video_path),
+                            "error": None,
+                        },
+                        "submitted_at",
+                    )
+            else:
+                if job_store:
+                    job_store.update_job(
+                        shot_key,
+                        input_hash,
+                        {
+                            "status": "submitting",
+                            "model": model_name,
+                            "prompt_hash": prompt_hash,
+                            "source_image_hashes": source_image_hashes,
+                            "output_path": str(video_path),
+                            "error": None,
+                        },
+                        "submitting_at",
+                    )
+                submit_response = requests.post(
+                    f"{base_url}/videos",
+                    headers=headers,
+                    json=payload,
+                    timeout=_DEFAULT_TIMEOUT_SECONDS,
+                )
+                if submit_response.status_code not in (200, 202):
+                    raise RuntimeError(
+                        f"AITUNNEL submit failed: {submit_response.status_code} - {submit_response.text}"
+                    )
+
+                submit_payload = submit_response.json()
+                task_id = submit_payload.get("id")
+                if not task_id:
+                    raise RuntimeError(f"Не получен id задачи от AITUNNEL: {submit_payload}")
+
+                if job_store:
+                    job_store.update_job(
+                        shot_key,
+                        input_hash,
+                        {
+                            "task_id": task_id,
+                            "status": submit_payload.get("status") or "submitted",
+                            "model": model_name,
+                            "prompt_hash": prompt_hash,
+                            "source_image_hashes": source_image_hashes,
+                            "output_path": str(video_path),
+                            "error": None,
+                        },
+                        "submitted_at",
+                    )
+
+                status_payload = _wait_for_video_completion_aitunnel(
+                    task_id=task_id,
+                    headers=headers,
+                    base_url=base_url,
+                    on_poll=poll_callback,
+                )
             unsigned_urls = status_payload.get("unsigned_urls") or []
             video_url = unsigned_urls[0] if unsigned_urls else f"{base_url}/videos/{task_id}/content?index=0"
             video_url_requires_auth = not bool(unsigned_urls)
@@ -771,7 +861,14 @@ def _generate_single_video_aitunnel(
     except Exception as exc:
         if job_store and input_hash:
             current_job = job_store.find_current_job(shot_key, input_hash)
-            status = "download_failed" if current_job and current_job.get("status") == "download_failed" else "failed"
+            if current_job and current_job.get("status") == "download_failed":
+                status = "download_failed"
+            elif isinstance(exc, (_PollTransientError, _PollTimeoutError)) and getattr(exc, "task_id", None):
+                # H-3: transient/timeout poll failures keep a live task_id — mark
+                # resumable (poll_timeout), never failed, or the paid task is lost.
+                status = "poll_timeout"
+            else:
+                status = "failed"
             job_store.update_job(shot_key, input_hash, {"status": status, "error": str(exc)}, "failed_at")
         logger.error("❌ AITUNNEL: ошибка генерации %s-%s: %s", scene_number, shot_number, exc)
         return {
@@ -797,21 +894,22 @@ def _record_poll_update(
     input_hash: str,
     payload: Dict[str, Any],
 ) -> None:
-    status = payload.get("status") or "unknown"
+    # M-13: record the raw provider status in provider_status only. The internal
+    # lifecycle status is driven exclusively by explicit transitions, so a novel
+    # provider status can never masquerade as a terminal internal failure.
     updates: Dict[str, Any] = {
-        "status": status,
+        "provider_status": payload.get("status") or "unknown",
         "error": payload.get("error"),
     }
     cost, currency = _extract_cost_and_currency(payload)
     if cost is not None:
         updates["cost"] = cost
         updates["currency"] = currency
-    job_store.update_job(
-        shot_key,
-        input_hash,
-        updates,
-        "failed_at" if status == "failed" else "polled_at",
-    )
+    job_store.update_job(shot_key, input_hash, updates, "polled_at")
+
+
+def _poll_backoff_seconds(attempt: int, base_interval: int) -> float:
+    return min(base_interval * (2 ** max(0, attempt - 1)), _DEFAULT_POLL_BACKOFF_CAP_SECONDS)
 
 
 def _wait_for_video_completion_aitunnel(
@@ -823,18 +921,39 @@ def _wait_for_video_completion_aitunnel(
     on_poll: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     start_time = time.time()
+    transient_errors = 0
 
     while time.time() - start_time < max_wait_time:
-        response = requests.get(
-            f"{base_url}/videos/{task_id}",
-            headers=headers,
-            timeout=_DEFAULT_TIMEOUT_SECONDS,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"AITUNNEL polling failed: {response.status_code} - {response.text}"
+        # H-3: network/non-200 failures are transient — retry with capped backoff
+        # inside the deadline instead of failing the job and losing the task_id.
+        try:
+            response = requests.get(
+                f"{base_url}/videos/{task_id}",
+                headers=headers,
+                timeout=_DEFAULT_TIMEOUT_SECONDS,
             )
+        except requests.RequestException as exc:
+            transient_errors += 1
+            if transient_errors > _DEFAULT_POLL_MAX_TRANSIENT_ERRORS:
+                raise _PollTransientError(
+                    f"AITUNNEL polling network errors exceeded budget for task {task_id}: {exc}",
+                    task_id=task_id,
+                )
+            time.sleep(_poll_backoff_seconds(transient_errors, poll_interval))
+            continue
 
+        if response.status_code != 200:
+            transient_errors += 1
+            if transient_errors > _DEFAULT_POLL_MAX_TRANSIENT_ERRORS:
+                raise _PollTransientError(
+                    f"AITUNNEL polling failed for task {task_id}: "
+                    f"{response.status_code} - {response.text}",
+                    task_id=task_id,
+                )
+            time.sleep(_poll_backoff_seconds(transient_errors, poll_interval))
+            continue
+
+        transient_errors = 0
         payload = response.json()
         status = payload.get("status")
         if on_poll:
@@ -842,13 +961,46 @@ def _wait_for_video_completion_aitunnel(
         if status == "completed":
             return payload
         if status == "failed":
-            raise RuntimeError(f"AITUNNEL generation failed: {payload.get('error')}")
-        if status not in {"pending", "in_progress"}:
-            raise RuntimeError(f"Неизвестный статус AITUNNEL: {status}")
-
+            raise _ProviderGenerationError(
+                f"AITUNNEL generation failed: {payload.get('error')}",
+                task_id=task_id,
+            )
+        # M-13: any other status (queued/moderation/unknown/pending/in_progress) is
+        # treated as still-in-progress until the deadline, not an instant failure.
         time.sleep(poll_interval)
 
-    raise TimeoutError(f"Превышено время ожидания AITUNNEL task {task_id}")
+    raise _PollTimeoutError(
+        f"Превышено время ожидания AITUNNEL task {task_id}",
+        task_id=task_id,
+    )
+
+
+def _verify_completed_task_before_resubmit(
+    task_id: str,
+    headers: Dict[str, str],
+    base_url: str,
+) -> Optional[Dict[str, Any]]:
+    """One free GET of an old task_id before paying for a resubmit (H-3).
+
+    Returns the status payload only if the provider reports the task already
+    completed (adopt it, no new submit). Returns None on genuine failure,
+    in-progress, or transient errors so the caller submits a fresh task — a
+    genuinely-failed task is never resurrected.
+    """
+    try:
+        response = requests.get(
+            f"{base_url}/videos/{task_id}",
+            headers=headers,
+            timeout=_DEFAULT_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException:
+        return None
+    if response.status_code != 200:
+        return None
+    payload = response.json()
+    if payload.get("status") == "completed":
+        return payload
+    return None
 
 
 def _download_video_aitunnel(video_url: str, output_path: str, headers: Dict[str, str]) -> None:

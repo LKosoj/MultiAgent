@@ -4,11 +4,14 @@ import logging
 import re
 import random
 import threading
+import fcntl
+import hashlib
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_command import model_hard, model_code, model_ultimate, model_lite
 from utils import call_openai_api, parse_llm_json
+from .project_paths import safe_storybook_project_dir
 
 
 # Импорты из модуля screenplay_shots_generator_utils
@@ -250,12 +253,13 @@ def screenplay_shots_generator_tool(
         # Возвращаем пустую структуру в формате items.json
         return {"items": [], "consistency_rules": []}
     
-    # Пути к файлам
-    screenplay_path = f"plots/storybooks/{project_id}/91_screenplay/screenplay.json"
-    characters_path = f"plots/storybooks/{project_id}/20_bible/characters.json"
-    locations_path = f"plots/storybooks/{project_id}/20_bible/locations.json"
-    consistency_rules_path = f"plots/storybooks/{project_id}/20_bible/consistency_rules.json"
-    style_images_path = f"plots/storybooks/{project_id}/30_style/style_images.json"
+    # Пути к файлам (M-23: единый резолвер, как в audio_subtitle/montage)
+    base_dir = str(safe_storybook_project_dir(project_id))
+    screenplay_path = f"{base_dir}/91_screenplay/screenplay.json"
+    characters_path = f"{base_dir}/20_bible/characters.json"
+    locations_path = f"{base_dir}/20_bible/locations.json"
+    consistency_rules_path = f"{base_dir}/20_bible/consistency_rules.json"
+    style_images_path = f"{base_dir}/30_style/style_images.json"
     
     # Проверяем существование файлов
     for path in [screenplay_path, characters_path, locations_path]:
@@ -319,8 +323,8 @@ def screenplay_shots_generator_tool(
 
     logger.info(f"🎬 Обрабатываем {len(screenplay_scenes)} сцен из режиссерского сценария...")
     
-    # Создаем директорию для shots
-    shots_dir = f"plots/storybooks/{project_id}/97_shots"
+    # Создаем директорию для shots (M-23: единый резолвер)
+    shots_dir = f"{base_dir}/97_shots"
     os.makedirs(shots_dir, exist_ok=True)
     
     shots_path = f"{shots_dir}/shots.json"
@@ -331,61 +335,139 @@ def screenplay_shots_generator_tool(
     shots_exists = os.path.exists(shots_path)
     fcpxml_exists = os.path.exists(fcpxml_path)
     photo_fcpxml_exists = os.path.exists(photo_fcpxml_path)
-    
+
     # If the caller requests a partial scope or force regen, do NOT short-circuit on existing shots.json.
     requested_partial = (scene_numbers is not None) or (max_scenes is not None)
 
-    if shots_exists and fcpxml_exists and (not force) and (not requested_partial):
-        logger.info("✅ Файлы shots.json и shots_timeline.fcpxml уже существуют, загружаем shots.json")
-        with open(shots_path, "r", encoding="utf-8") as f:
-            shots_data = json.load(f)
-        
-        # Генерируем photo FCPXML если его нет
-        if not photo_fcpxml_exists:
-            shots_items = shots_data.get("items", [])
-            _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
-            logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
-        
-        return shots_data
-    
-    if shots_exists and not fcpxml_exists and (not force) and (not requested_partial):
-        logger.info("📋 shots.json существует, но shots_timeline.fcpxml отсутствует - генерируем FCPXML файлы")
-        with open(shots_path, "r", encoding="utf-8") as f:
-            shots_data = json.load(f)
-        
-        # Генерируем FCPXML для видео
-        shots_items = shots_data.get("items", [])
-        _generate_fcpxml(project_id, shots_items, fcpxml_path)
-        logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
-        
-        # Генерируем photo FCPXML если его нет
-        if not photo_fcpxml_exists:
-            _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
-            logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
-        
-        return shots_data
-    
-    # Генерируем shots.json (и FCPXML, если его нет)
-    logger.info("🎬 Генерируем shots.json...")
+    # Полный набор номеров сцен фильма (до фильтрации по scope) — нужен, чтобы решить,
+    # покрывает ли результат весь фильм для маркера generation_completed (C-2).
+    all_scene_numbers = {
+        int(sc.get("scene_number", 0))
+        for sc in (screenplay_data.get("screenplay") or [])
+        if isinstance(sc, dict)
+    }
 
-    # Читаем seed из brief.json
-    brief_path = f"plots/storybooks/{project_id}/00_brief.json"
+    # Читаем метаданные существующего shots.json (для resume/short-circuit и стабильного seed).
+    on_disk_meta: Dict[str, Any] = {}
+    if shots_exists:
+        try:
+            with open(shots_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                on_disk_meta = loaded
+        except Exception as e:
+            logger.warning("⚠️ Не удалось прочитать существующий shots.json: %s", e)
+            on_disk_meta = {}
+
+    # seed: on-disk (resume) → brief.json → random (L-12: стабильный seed при resume)
     seed = random.randint(1, 1000000)  # Значение по умолчанию
-    if os.path.exists(brief_path):
+    brief_path = f"{base_dir}/00_brief.json"
+    if shots_exists and isinstance(on_disk_meta.get("seed"), int):
+        seed = on_disk_meta.get("seed")
+        logger.info("🎲 Используем seed из существующего shots.json (resume): %s", seed)
+    elif os.path.exists(brief_path):
         try:
             with open(brief_path, "r", encoding="utf-8") as f:
                 brief_data = json.load(f)
             seed = brief_data.get("seed", seed)
-            logger.info(f"🎲 Используем seed из brief.json: {seed}")
+            logger.info("🎲 Используем seed из brief.json: %s", seed)
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось прочитать seed из brief.json: {e}, используем случайный seed: {seed}")
+            logger.warning("⚠️ Не удалось прочитать seed из brief.json: %s, используем случайный seed: %s", e, seed)
     else:
-        logger.warning(f"⚠️ brief.json не найден, используем случайный seed: {seed}")
-    
+        logger.warning("⚠️ brief.json не найден, используем случайный seed: %s", seed)
+
+    # inputs_hash по стабильным входам всего фильма (M-26)
+    inputs_hash = _compute_inputs_hash(
+        screenplay_data=screenplay_data,
+        characters_data=characters_data,
+        locations_data=locations_data,
+        consistency_rules=consistency_rules,
+        style_images_data=style_images_data,
+        seed=seed,
+        language=language,
+        generate_end_shots=generate_end_shots,
+    )
+
+    completed_scenes_on_disk: set = set()
+    try:
+        completed_scenes_on_disk = {int(x) for x in (on_disk_meta.get("completed_scenes") or [])}
+    except Exception:
+        completed_scenes_on_disk = set()
+
+    resume_active = False  # пропустить завершённые сцены и merge-нуть on-disk superset
+
+    if shots_exists and on_disk_meta and (not force) and (not requested_partial):
+        if "generation_completed" not in on_disk_meta:
+            # Legacy shots.json без маркера завершённости → старая эвристика (shots + fcpxml).
+            shots_data = on_disk_meta
+            shots_items = shots_data.get("items", [])
+            if fcpxml_exists:
+                logger.info("✅ Legacy shots.json и shots_timeline.fcpxml уже существуют, загружаем shots.json")
+            else:
+                logger.info("📋 Legacy shots.json без shots_timeline.fcpxml — генерируем FCPXML")
+                _generate_fcpxml(project_id, shots_items, fcpxml_path)
+                logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
+            if not photo_fcpxml_exists:
+                _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
+                logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+            return shots_data
+        else:
+            gen_done = on_disk_meta.get("generation_completed") is True
+            hash_ok = on_disk_meta.get("inputs_hash") == inputs_hash
+            if gen_done and hash_ok:
+                logger.info("✅ shots.json уже полностью сгенерирован (generation_completed=true, inputs_hash совпал)")
+                shots_data = on_disk_meta
+                shots_items = shots_data.get("items", [])
+                if not fcpxml_exists:
+                    _generate_fcpxml(project_id, shots_items, fcpxml_path)
+                    logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
+                if not photo_fcpxml_exists:
+                    _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
+                    logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+                return shots_data
+            elif (not gen_done) and hash_ok:
+                # Частичный checkpoint с теми же входами → resume только недостающих сцен.
+                resume_active = True
+                screenplay_scenes = [
+                    sc for sc in screenplay_scenes
+                    if int(sc.get("scene_number", 0)) not in completed_scenes_on_disk
+                ]
+                logger.info(
+                    "♻️ Resume: пропускаем %s завершённых сцен, догенерируем %s",
+                    len(completed_scenes_on_disk),
+                    len(screenplay_scenes),
+                )
+            else:
+                logger.info("♻️ inputs_hash не совпал или генерация неполна без совпадения — полная перегенерация")
+
+    # R3: под requested_partial блок resume/short-circuit (выше) пропускается,
+    # поэтому inputs_hash on-disk НЕ сверялся. Если стабильные входы всего фильма
+    # изменились, on-disk completed_scenes и его items относятся к ДРУГИМ входам:
+    # нельзя ни засчитывать их завершёнными (иначе ложный generation_completed / C-2),
+    # ни мёржить superset'ом (иначе смешанный shots.json из старых+новых входов).
+    # Наследуем on-disk состояние (seed completed_scenes + superset-merge) только при
+    # совпадении inputs_hash; иначе пишем чисто под текущие входы (перезапись).
+    on_disk_hash_matches = bool(on_disk_meta) and (on_disk_meta.get("inputs_hash") == inputs_hash)
+    partial_write = resume_active or (requested_partial and on_disk_hash_matches)
+
+    # Генерируем shots.json (и FCPXML, если его нет)
+    logger.info("🎬 Генерируем shots.json...")
+
     all_start_items = []  # Все start кадры
     all_end_items = []    # Все end кадры
     checkpoint_state_lock = threading.Lock()
     checkpoint_scene_items: Dict[int, Dict[str, List[Dict[str, Any]]]] = {}
+    # Сцены, полностью завершённые в этом (или предыдущем resume) прогоне — для маркера C-2.
+    # Обновляется только после успешного future сцены → консервативно (mid-flight сцены не входят).
+    # WS-D1: из seed'а исключаем сцены ТЕКУЩЕГО scope — их мы перегенерируем в этом прогоне,
+    # и до их фактического завершения они НЕ должны считаться готовыми (иначе прерванная
+    # точечная перегенерация уже завершённой сцены даст ложный generation_completed после
+    # обычного resume). Для resume_active current_scope не пересекается с completed_scenes_on_disk
+    # (screenplay_scenes уже отфильтрован), поэтому вычитание там — no-op.
+    current_scope = {int(sc.get("scene_number", 0)) for sc in (screenplay_scenes or [])}
+    completed_scene_numbers: set = (
+        (set(completed_scenes_on_disk) - current_scope) if partial_write else set()
+    )
     total_shots = 0
     item_number = 1
     page_number = 1  # Последовательный счетчик для page_number
@@ -423,8 +505,11 @@ def screenplay_shots_generator_tool(
                 session_id=session_id,
                 scene_numbers=scene_numbers,
                 max_scenes=max_scenes,
+                generation_completed=False,
+                completed_scenes=sorted(completed_scene_numbers),
+                inputs_hash=inputs_hash,
             )
-            _write_shots_data(shots_path, checkpoint_data)
+            _merge_write_shots(shots_path, shots_data=checkpoint_data, partial=partial_write)
             logger.info(
                 "💾 Checkpoint shots.json обновлен после shot %s сцены %s (%s items)",
                 shot_number,
@@ -572,13 +657,17 @@ def screenplay_shots_generator_tool(
                         local_item += 1
                         local_page += 1
                         logger.info(f"✅ [scene {scene_number}] Успешно сгенерирован START кадр {shot_number}")
+                    else:
+                        raise RuntimeError(
+                            f"[scene {scene_number}] Пустой результат генерации START для shot {shot_number}"
+                        )
                 except Exception as e:
                     logger.error(f"❌ [scene {scene_number}] Ошибка генерации START: {e}")
                     raise RuntimeError(
                         f"[scene {scene_number}] Ошибка генерации START для shot {shot_number}: {e}"
                     ) from e
             
-            if generate_end_shots and start_llm_result and start_llm_result.get("add_end_shot", "true").lower() == "true":
+            if generate_end_shots and start_llm_result and str(start_llm_result.get("add_end_shot", "true")).strip().lower() == "true":
                 try:
                     logger.info(f"🎯 [scene {scene_number}] Генерируем END кадр {shot_number}")
                     end_llm_result = _generate_shot_prompt(
@@ -694,6 +783,12 @@ def screenplay_shots_generator_tool(
                         previous_shot_has_end_shot = False
                         previous_end_llm_result = None
                         previous_end_shot_item = None
+                        logger.error(
+                            f"❌ [scene {scene_number}] Пустой результат генерации END для shot {shot_number}"
+                        )
+                        raise RuntimeError(
+                            f"[scene {scene_number}] Пустой результат генерации END для shot {shot_number}"
+                        )
                 except Exception as e:
                     logger.error(f"❌ [scene {scene_number}] Ошибка генерации END: {e}")
                     previous_shot_has_end_shot = False
@@ -729,6 +824,12 @@ def screenplay_shots_generator_tool(
                 res = fut.result()
                 all_start_items.extend(res.get("start", []))
                 all_end_items.extend(res.get("end", []))
+                with checkpoint_state_lock:
+                    try:
+                        completed_scene_numbers.add(int(futures[fut].get("scene_number")))
+                    except Exception:
+                        pass
+                    completed_snapshot = sorted(completed_scene_numbers)
                 checkpoint_data = _build_shots_data(
                     all_start_items=all_start_items,
                     all_end_items=all_end_items,
@@ -737,8 +838,11 @@ def screenplay_shots_generator_tool(
                     session_id=session_id,
                     scene_numbers=scene_numbers,
                     max_scenes=max_scenes,
+                    generation_completed=False,
+                    completed_scenes=completed_snapshot,
+                    inputs_hash=inputs_hash,
                 )
-                _write_shots_data(shots_path, checkpoint_data)
+                _merge_write_shots(shots_path, shots_data=checkpoint_data, partial=partial_write)
                 logger.info(
                     "💾 Checkpoint shots.json синхронизирован после завершения сцены %s (%s items)",
                     futures[fut].get("scene_number"),
@@ -751,6 +855,10 @@ def screenplay_shots_generator_tool(
                     f"Ошибка обработки сцены {s.get('scene_number')}: {e}"
                 ) from e
 
+    with checkpoint_state_lock:
+        final_completed = sorted(completed_scene_numbers)
+    # generation_completed=true только при полном успехе всего фильма (C-2).
+    generation_completed = bool(all_scene_numbers) and set(final_completed) >= all_scene_numbers
     shots_data = _build_shots_data(
         all_start_items=all_start_items,
         all_end_items=all_end_items,
@@ -759,13 +867,17 @@ def screenplay_shots_generator_tool(
         session_id=session_id,
         scene_numbers=scene_numbers,
         max_scenes=max_scenes,
+        generation_completed=generation_completed,
+        completed_scenes=final_completed,
+        inputs_hash=inputs_hash,
     )
-    shots_items = shots_data["items"]
-    
+
     logger.info("🈯 Shots prompts already generated on language: %s", language)
-    
-    # Сохраняем shots.json
-    _write_shots_data(shots_path, shots_data)
+
+    # Сохраняем shots.json (merge superset при partial/resume, иначе перезапись)
+    shots_data = _merge_write_shots(shots_path, shots_data=shots_data, partial=partial_write)
+    shots_items = shots_data["items"]
+    total_shots = len(shots_items)
     
     logger.info(f"✅ Кадры сценария сохранены: {shots_path}")
     
@@ -797,6 +909,9 @@ def _build_shots_data(
     session_id: str,
     scene_numbers: Optional[List[int]],
     max_scenes: Optional[int],
+    generation_completed: Optional[bool] = None,
+    completed_scenes: Optional[List[int]] = None,
+    inputs_hash: Optional[str] = None,
 ) -> Dict[str, Any]:
     shots_items: List[Dict[str, Any]] = []
     shots_by_key: Dict[tuple[int, int], Dict[str, Dict[str, Any]]] = {}
@@ -828,7 +943,7 @@ def _build_shots_data(
         item["page_number"] = idx
         item["number"] = idx
 
-    return {
+    result: Dict[str, Any] = {
         "items": shots_items,
         "consistency_rules": consistency_rules,
         "parallel_generation": True,
@@ -839,24 +954,137 @@ def _build_shots_data(
             else (f"partial:{int(max_scenes)}" if max_scenes is not None else "all")
         ),
     }
+    if generation_completed is not None:
+        result["generation_completed"] = bool(generation_completed)
+    if completed_scenes is not None:
+        result["completed_scenes"] = sorted({int(x) for x in completed_scenes})
+    if inputs_hash is not None:
+        result["inputs_hash"] = inputs_hash
+    return result
+
+
+def _compute_inputs_hash(
+    *,
+    screenplay_data: Dict[str, Any],
+    characters_data: Any,
+    locations_data: Any,
+    consistency_rules: Any,
+    style_images_data: Any,
+    seed: int,
+    language: str,
+    generate_end_shots: bool,
+) -> str:
+    """sha256 по стабильным входам всего фильма (M-26).
+
+    Только стабильные входы (урок M-6): сценарий, справочники персонажей/локаций,
+    consistency_rules, style_images, seed, язык, флаг end-кадров. scene_numbers/max_scenes
+    (scope одного запуска) сюда НЕ входят — hash идентифицирует фильм, а не scope.
+    """
+    payload = {
+        "screenplay": screenplay_data,
+        "characters": characters_data,
+        "locations": locations_data,
+        "consistency_rules": consistency_rules,
+        "style_images": style_images_data,
+        "seed": seed,
+        "language": language,
+        "generate_end_shots": bool(generate_end_shots),
+    }
+    try:
+        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        blob = repr(payload)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 _SHOTS_WRITE_LOCK = threading.Lock()
 
 
-def _write_shots_data(shots_path: str, shots_data: Dict[str, Any]) -> None:
-    """Атомарная потокобезопасная запись shots.json.
+def _shot_merge_key(item: Dict[str, Any]) -> tuple:
+    try:
+        return (
+            int(item.get("scene_number", 0)),
+            int(item.get("shot_number", 0)),
+            str(item.get("shot_type", "")),
+        )
+    except Exception:
+        return (0, 0, str(item.get("shot_type", "")))
 
-    Checkpoint'ы пишутся параллельно из нескольких worker-потоков в
-    ThreadPoolExecutor; без синхронизации получался повреждённый JSON.
+
+def _merge_shots_payload(on_disk: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
+    """Union-merge SUPERSET по ключу (scene_number, shot_number, shot_type).
+
+    КРИТИЧНО: сохраняет on-disk items вне текущего scope (иначе теряется фильм);
+    свежие items переопределяют одноимённые; сквозная перенумерация page_number/number.
+    Верхнеуровневые метаданные берём из fresh (seed/inputs_hash/completed_scenes уже слиты вызывающим).
+    """
+    on_disk_items = (on_disk or {}).get("items") or []
+    fresh_items = fresh.get("items") or []
+    by_key: Dict[tuple, Dict[str, Any]] = {}
+    for it in on_disk_items:
+        by_key[_shot_merge_key(it)] = it
+    for it in fresh_items:
+        by_key[_shot_merge_key(it)] = it  # свежие переопределяют одноимённые
+
+    def _sort_key(kv):
+        scene, shot, typ = kv[0]
+        type_order = 0 if typ == "start" else (1 if typ == "end" else 2)
+        return (scene, shot, type_order, typ)
+
+    merged = [v for _, v in sorted(by_key.items(), key=_sort_key)]
+    for idx, item in enumerate(merged, start=1):
+        item["page_number"] = idx
+        item["number"] = idx
+
+    out = dict(fresh)
+    out["items"] = merged
+    return out
+
+
+def _merge_write_shots(
+    shots_path: str,
+    *,
+    shots_data: Dict[str, Any],
+    partial: bool,
+) -> Dict[str, Any]:
+    """Атомарная кросс-процессная запись shots.json (M-7/H-4).
+
+    flock на sidecar `{path}.lock` (НЕ подменяется)→(при partial: перечитать
+    shots_path + union-merge superset)→уникальный tmp `{path}.{pid}.tmp`→
+    os.replace→flock(LOCK_UN). Флокать сам shots_path нельзя: os.replace меняет
+    inode, и второй процесс флокнул бы уже НОВЫЙ inode (окно потерянного апдейта).
+    Внутрипроцессный _SHOTS_WRITE_LOCK защищает от гонки потоков-чекпойнтеров.
+    Возвращает фактически записанный payload (после merge).
     """
     directory = os.path.dirname(shots_path) or "."
     os.makedirs(directory, exist_ok=True)
-    tmp = f"{shots_path}.tmp"
+    lock_path = f"{shots_path}.lock"
     with _SHOTS_WRITE_LOCK:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(shots_data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, shots_path)
+        with open(lock_path, "a+", encoding="utf-8") as lock_f:
+            fcntl.flock(lock_f, fcntl.LOCK_EX)
+            try:
+                if partial:
+                    on_disk: Dict[str, Any] = {}
+                    try:
+                        with open(shots_path, "r", encoding="utf-8") as rf:
+                            raw = rf.read()
+                        if raw.strip():
+                            loaded = json.loads(raw)
+                            if isinstance(loaded, dict):
+                                on_disk = loaded
+                    except FileNotFoundError:
+                        on_disk = {}
+                    except Exception as e:
+                        logger.warning("⚠️ Не удалось перечитать shots.json для merge: %s", e)
+                        on_disk = {}
+                    shots_data = _merge_shots_payload(on_disk, shots_data)
+                tmp = f"{shots_path}.{os.getpid()}.tmp"
+                with open(tmp, "w", encoding="utf-8") as wf:
+                    json.dump(shots_data, wf, ensure_ascii=False, indent=2)
+                os.replace(tmp, shots_path)
+            finally:
+                fcntl.flock(lock_f, fcntl.LOCK_UN)
+    return shots_data
 
 def _classify_shot_type(shot_description: str, camera_plan: str) -> Dict[str, Any]:
     """
@@ -2464,7 +2692,7 @@ def _convert_end_to_start_shot_item(
     # Подмешиваем style_images.json напрямую (для linked start у нас screenplay_data минимальный)
     style_images_data = {}
     try:
-        style_images_path = f"plots/storybooks/{project_id}/30_style/style_images.json"
+        style_images_path = f"{str(safe_storybook_project_dir(project_id))}/30_style/style_images.json"
         if os.path.exists(style_images_path):
             with open(style_images_path, "r", encoding="utf-8") as f:
                 style_images_data = json.load(f) or {}

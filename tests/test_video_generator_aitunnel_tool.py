@@ -578,6 +578,17 @@ def test_project_id_completed_download_failed_job_downloads_without_post(tmp_pat
 
     def fake_get_resume(url, headers=None, timeout=None, stream=False):
         del headers, timeout, stream
+        # M-14: a download_failed job with a live task_id must re-poll the task for a
+        # fresh unsigned URL instead of blindly re-hitting the (possibly expired) old one.
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(
+                status_code=200,
+                json_payload={
+                    "id": "job-1",
+                    "status": "completed",
+                    "unsigned_urls": ["https://cdn.example/job-1.mp4"],
+                },
+            )
         if url == "https://cdn.example/job-1.mp4":
             return _FakeResponse(status_code=200, content=b"resumed")
         raise AssertionError(f"Unexpected GET url: {url}")
@@ -890,8 +901,9 @@ def test_project_id_submitting_job_without_task_id_blocks_duplicate_post(tmp_pat
         model_name="installed-model",
         prompt_hash=prompt_hash,
         source_image_hashes=source_hashes,
-        duration=6,
-        size_params={"size": "1920x1080"},
+        requested_duration=6,
+        requested_width=1920,
+        requested_height=1080,
         seed=None,
         frame_types=["first_frame"],
     )
@@ -1107,3 +1119,542 @@ def test_sample_before_batch_string_false_does_not_enable_sample_mode(tmp_path, 
     assert Path(first_item["video_path"]).exists()
     assert Path(second_item["video_path"]).exists()
     assert [job["status"] for job in _read_provider_jobs(shots_dir)] == ["downloaded", "downloaded"]
+
+
+def _completed_job_payload(task_id: str, url: str) -> dict:
+    return {
+        "id": task_id,
+        "status": "completed",
+        "unsigned_urls": [url],
+    }
+
+
+def test_poll_transient_non200_retries(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    poll_calls = []
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            poll_calls.append(url)
+            # H-3: the first polls fail transiently (non-200); the job must retry
+            # inside the deadline instead of failing and dropping the paid task_id.
+            if len(poll_calls) <= 2:
+                return _FakeResponse(status_code=503, text="upstream unavailable")
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    assert len(poll_calls) == 3
+    assert Path(item["video_path"]).read_bytes() == b"video"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
+
+
+def test_poll_transient_exhaustion_marks_poll_timeout_and_resumes(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    post_calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        post_calls.append(url)
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get_failing(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=502, text="bad gateway")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_failing)
+
+    first = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+    )
+
+    assert first["status"] == "error"
+    job = _read_provider_jobs(shots_dir)[0]
+    # H-3: exhausting the transient budget must keep the paid task_id and leave the
+    # job resumable (poll_timeout), never failed.
+    assert job["status"] == "poll_timeout"
+    assert job["task_id"] == "job-1"
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("poll_timeout resume must not POST a duplicate paid task")
+
+    def fake_get_recovered(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"recovered")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_recovered)
+
+    resumed = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+    )
+
+    assert resumed["status"] == "success"
+    assert len(post_calls) == 1
+    assert Path(item["video_path"]).read_bytes() == b"recovered"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
+
+
+def test_unknown_provider_status_treated_as_in_progress(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    poll_calls = []
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            poll_calls.append(url)
+            # M-13: an unrecognized provider status is not a terminal failure; polling
+            # keeps going until a real completed/failed verdict arrives.
+            if len(poll_calls) == 1:
+                return _FakeResponse(status_code=200, json_payload={"id": "job-1", "status": "moderation"})
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    assert len(poll_calls) == 2
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
+
+
+def test_provider_status_recorded_separately(tmp_path):
+    provider_jobs_path = tmp_path / "provider_jobs.json"
+    store = aitunnel_module._ProviderJobStore(str(provider_jobs_path))
+    store.ensure_job(
+        aitunnel_module._new_provider_job(
+            shot_key="1-1",
+            model="installed-model",
+            prompt_hash="prompt-1",
+            source_image_hashes={"start_image": "hash-1", "end_image": None},
+            input_hash="input-1",
+            output_path=str(tmp_path / "video.mp4"),
+        )
+    )
+    store.update_job("1-1", "input-1", {"status": "submitted", "task_id": "job-1"}, "submitted_at")
+
+    # M-13: a poll update writes the raw provider value into provider_status only; the
+    # internal lifecycle status is untouched and no failure timestamp is stamped.
+    aitunnel_module._record_poll_update(store, "1-1", "input-1", {"status": "moderation", "error": None})
+
+    job = _read_provider_jobs(tmp_path)[0]
+    assert job["provider_status"] == "moderation"
+    assert job["status"] == "submitted"
+    assert "failed_at" not in job["timestamps"]
+    assert "polled_at" in job["timestamps"]
+
+
+def test_download_failed_repolls_for_fresh_url(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get_first(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/stale-signed.mp4"))
+        if url == "https://cdn.example/stale-signed.mp4":
+            return _FakeResponse(status_code=200, content=b"first")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_first)
+
+    first = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+    assert first["status"] == "success"
+
+    # Simulate a download that failed against an already-expired signed URL.
+    provider_jobs_path = shots_dir / "provider_jobs.json"
+    provider_jobs = json.loads(provider_jobs_path.read_text(encoding="utf-8"))
+    provider_jobs["jobs"][0]["status"] = "download_failed"
+    provider_jobs["jobs"][0]["video_url"] = "https://cdn.example/stale-signed.mp4"
+    provider_jobs_path.write_text(json.dumps(provider_jobs), encoding="utf-8")
+    Path(item["video_path"]).unlink()
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("download_failed re-poll must not POST")
+
+    def fake_get_resume(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            # M-14: re-poll yields a *fresh* unsigned URL, not the stale one.
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/fresh-signed.mp4"))
+        if url == "https://cdn.example/fresh-signed.mp4":
+            return _FakeResponse(status_code=200, content=b"fresh")
+        raise AssertionError(f"stale URL must never be re-fetched: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_resume)
+
+    resumed = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert resumed["status"] == "success"
+    assert Path(item["video_path"]).read_bytes() == b"fresh"
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["status"] == "downloaded"
+    assert job["video_url"] == "https://cdn.example/fresh-signed.mp4"
+
+
+def test_verify_old_task_id_before_resubmit_adopts_completed(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    post_calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        post_calls.append(url)
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get_failed(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(
+                status_code=200,
+                json_payload={"id": "job-1", "status": "failed", "error": "provider glitch"},
+            )
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_failed)
+
+    first = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+    assert first["status"] == "error"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "failed"
+
+    # The paid task actually finished at the provider after we gave up on it.
+    verify_calls = []
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("must adopt the completed paid task, not resubmit a duplicate")
+
+    def fake_get_completed(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            verify_calls.append(url)
+            return _FakeResponse(
+                status_code=200,
+                json_payload={
+                    "id": "job-1",
+                    "status": "completed",
+                    "unsigned_urls": ["https://cdn.example/job-1.mp4"],
+                    "usage": {"cost_rub": 5.0},
+                },
+            )
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"adopted")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get_completed)
+
+    second = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert second["status"] == "success"
+    # Exactly-once: the second run adopts job-1 via a single free GET, no new submit.
+    assert len(post_calls) == 1
+    assert len(verify_calls) == 1
+    assert second["results"][0]["task_id"] == "job-1"
+    assert Path(item["video_path"]).read_bytes() == b"adopted"
+    assert _read_provider_jobs(shots_dir)[-1]["status"] == "downloaded"
+
+
+def test_input_hash_ignores_catalog_size_and_duration(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    catalog_a = {
+        "installed-model": {
+            "min_price_per_second": 1,
+            "max_price_per_second": 2,
+            "supported_sizes": ["1920x1080"],
+            "supported_resolutions": ["1080p"],
+            "supported_aspect_ratios": ["16:9"],
+            "supported_durations": [6],
+            "supported_frame_images": ["first_frame", "last_frame"],
+            "supports_seed": True,
+        }
+    }
+    catalog_b = {
+        "installed-model": {
+            "min_price_per_second": 1,
+            "max_price_per_second": 2,
+            "supported_sizes": ["1280x720"],
+            "supported_resolutions": ["720p"],
+            "supported_aspect_ratios": ["16:9"],
+            "supported_durations": [8],
+            "supported_frame_images": ["first_frame", "last_frame"],
+            "supports_seed": True,
+        }
+    }
+    active_catalog = {"value": catalog_a}
+    monkeypatch.setattr(
+        aitunnel_module,
+        "_get_aitunnel_video_models",
+        lambda force_refresh=False: active_catalog["value"],
+    )
+
+    post_calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        post_calls.append(url)
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    first = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+    assert first["status"] == "success"
+    hash_after_first = _read_provider_jobs(shots_dir)[0]["input_hash"]
+
+    # The provider catalog now resolves a different size/duration for the same shot.
+    active_catalog["value"] = catalog_b
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("M-6: a catalog change must not force a paid resubmit")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+
+    second = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert second["status"] == "success"
+    assert len(post_calls) == 1
+    jobs = _read_provider_jobs(shots_dir)
+    assert len(jobs) == 1
+    assert jobs[0]["input_hash"] == hash_after_first
+    assert all(job["status"] != "stale" for job in jobs)
+
+
+def test_input_hash_stores_resolved_params_as_metadata(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    # Requested 1920x1080 / 6s resolves to a different catalog size/duration.
+    monkeypatch.setattr(
+        aitunnel_module,
+        "_get_aitunnel_video_models",
+        lambda force_refresh=False: {
+            "installed-model": {
+                "min_price_per_second": 1,
+                "max_price_per_second": 2,
+                "supported_sizes": ["1280x720"],
+                "supported_resolutions": ["720p"],
+                "supported_aspect_ratios": ["16:9"],
+                "supported_durations": [8],
+                "supported_frame_images": ["first_frame", "last_frame"],
+                "supports_seed": True,
+            }
+        },
+    )
+
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, timeout
+        captured["json"] = json
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    # The provider actually received the catalog-resolved size/duration...
+    assert captured["json"]["size"] == "1280x720"
+    assert captured["json"]["duration"] == 8
+
+    job = _read_provider_jobs(shots_dir)[0]
+    # ...which is stored only as job metadata, never folded into the input hash.
+    assert job["resolved_size_params"] == {"size": "1280x720"}
+    assert job["resolved_duration"] == 8
+    assert job["hash_inputs_version"] == 2
+
+    expected_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model",
+        prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+        source_image_hashes={
+            "start_image": aitunnel_module._hash_source_image(item["start_image"]),
+            "end_image": None,
+        },
+        requested_duration=6,
+        requested_width=1920,
+        requested_height=1080,
+        seed=None,
+        frame_types=["first_frame"],
+    )
+    assert job["input_hash"] == expected_hash
+
+
+def test_legacy_v1_jobs_not_marked_stale_and_resume_by_shot_identity(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    # A legacy (pre-M-6) job: same shot identity, an old-formula input_hash and no
+    # hash_inputs_version field. Its live paid task_id must be reused, not resubmitted.
+    prompt_hash = aitunnel_module._hash_text(item["video_prompt"])
+    source_hashes = {
+        "start_image": aitunnel_module._hash_source_image(item["start_image"]),
+        "end_image": None,
+    }
+    legacy_jobs = {
+        "version": 1,
+        "jobs": [
+            {
+                "shot_key": "1-1",
+                "provider": "aitunnel",
+                "model": "installed-model",
+                "prompt_hash": prompt_hash,
+                "source_image_hashes": source_hashes,
+                "input_hash": "legacy-old-formula-hash",
+                "task_id": "job-legacy",
+                "status": "submitted",
+                "cost": None,
+                "currency": None,
+                "output_path": item["video_path"],
+                "video_url": None,
+                "error": None,
+                "timestamps": {"submitted_at": "2026-01-01T00:00:00Z"},
+            }
+        ],
+    }
+    (shots_dir / "provider_jobs.json").write_text(json.dumps(legacy_jobs), encoding="utf-8")
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("legacy job must resume by shot identity, not resubmit a paid task")
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-legacy"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-legacy", "https://cdn.example/job-legacy.mp4"))
+        if url == "https://cdn.example/job-legacy.mp4":
+            return _FakeResponse(status_code=200, content=b"legacy-video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    assert result["results"][0]["task_id"] == "job-legacy"
+    assert Path(item["video_path"]).read_bytes() == b"legacy-video"
+
+    jobs = _read_provider_jobs(shots_dir)
+    legacy_job = next(job for job in jobs if job.get("task_id") == "job-legacy")
+    # M-6 compat: a hash-formula bump must never stale a legacy job (its task_id lives).
+    assert legacy_job["status"] != "stale"

@@ -129,6 +129,29 @@ def test_enhanced_engine_treats_status_error_dict_as_tool_error():
     assert engine._extract_error_from_result(result) == "provider unavailable"
 
 
+def test_is_tool_error_result_truthiness_and_narrowed_patterns():
+    """WS-A / M-5: истинность значения (не наличие ключа) + сужение строковых паттернов."""
+    engine = _enhanced_engine_instance()
+
+    # Falsy error/exception у успешного результата НЕ трактуются как ошибка.
+    assert engine._is_tool_error_result({"error": None}) is False
+    assert engine._is_tool_error_result({"exception": ""}) is False
+    assert engine._is_tool_error_result({"status": "completed"}) is False
+    # Truthy error/exception/status=error → ошибка.
+    assert engine._is_tool_error_result({"error": "boom"}) is True
+    assert engine._is_tool_error_result({"exception": "trace"}) is True
+    assert engine._is_tool_error_result({"status": "error"}) is True
+
+    # Сужение M-5: удалённые широкие NL-подстроки больше не сигналят сбой.
+    assert engine._is_tool_error_result("Файл не найден пользователем") is False
+    assert engine._is_tool_error_result("Отсутствуют исходные данные") is False
+    assert engine._is_tool_error_result("Путь не существует на диске") is False
+    # Оставшиеся точные паттерны по-прежнему ловятся.
+    assert engine._is_tool_error_result("Traceback (most recent call last)") is True
+    assert engine._is_tool_error_result("RuntimeError: boom") is True
+    assert engine._is_tool_error_result("Ошибка: нет доступа") is True
+
+
 # ===========================================================================
 # 6.1: _substitute_variables_in_metadata
 # ===========================================================================
@@ -1644,12 +1667,19 @@ def test_enhanced_engine_required_workflow_disallows_legacy_fallback(monkeypatch
         asyncio.run(engine.execute_workflow(workflow, context))
 
 
-def test_enhanced_engine_required_workflow_disallows_generic_legacy_resume():
+def test_enhanced_engine_required_workflow_resume_uses_enhanced():
+    """WS-A / M-3: resume (skip_steps задан) для requires_enhanced_engine пайплайна
+    исполняется enhanced-движком, а НЕ бросает и НЕ деградирует в legacy."""
+    from datetime import datetime as _dt
+
     engine = _enhanced_engine_instance()
     models = _workflow_models()
     WorkflowDefinition = models.WorkflowDefinition
     WorkflowContext = models.WorkflowContext
-    WorkflowExecutionError = models.WorkflowExecutionError
+    WorkflowResult = models.WorkflowResult
+    WorkflowStatus = models.WorkflowStatus
+    StepResult = models.StepResult
+    StepStatus = models.StepStatus
 
     workflow = WorkflowDefinition(
         name="requires-enhanced",
@@ -1657,6 +1687,27 @@ def test_enhanced_engine_required_workflow_disallows_generic_legacy_resume():
         requires_enhanced_engine=True,
     )
     context = WorkflowContext(workflow_id="wf-resume", session_id="sess-resume")
+    restored = {"s1": StepResult(step_id="s1", status=StepStatus.COMPLETED, output={"ok": True})}
+    captured = {}
 
-    with pytest.raises(WorkflowExecutionError, match="generic resume uses legacy execution"):
-        asyncio.run(engine.execute_workflow(workflow, context, skip_steps=set()))
+    async def fake_enhanced(workflow_def, ctx, client_id=None, *, skip_steps=None,
+                            restored_step_results=None):
+        captured["skip_steps"] = skip_steps
+        captured["restored"] = restored_step_results
+        return WorkflowResult(
+            workflow_id=ctx.workflow_id,
+            status=WorkflowStatus.COMPLETED,
+            start_time=_dt.now(),
+        )
+
+    engine._execute_enhanced_workflow = fake_enhanced
+
+    result = asyncio.run(
+        engine.execute_workflow(
+            workflow, context, skip_steps={"s1"}, restored_step_results=restored,
+        )
+    )
+
+    assert result.status == WorkflowStatus.COMPLETED
+    assert captured["skip_steps"] == {"s1"}
+    assert captured["restored"] is restored

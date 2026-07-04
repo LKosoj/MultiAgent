@@ -4,7 +4,10 @@ import logging
 import time
 import base64
 import mimetypes
+import threading
 import requests
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from google import genai
@@ -63,6 +66,37 @@ from custom_tools.storybook.video_generator_common import (
     update_shots_with_descriptions,
     sync_items_to_memory
 )
+
+
+def _error_result(message: str, **extra: Any) -> Dict[str, Any]:
+    result = {
+        "status": "error",
+        "message": message,
+        "error": message,
+        "results": [],
+    }
+    result.update(extra)
+    return result
+
+
+def _is_non_empty_file(path: str) -> bool:
+    try:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _sanitize_url_for_log(url: str) -> str:
+    """Возвращает netloc + усечённый путь без query для безопасного логирования подписанных URL."""
+    try:
+        parsed = urlparse(str(url or ""))
+        path = parsed.path or ""
+        if len(path) > 32:
+            path = path[:32] + "..."
+        return f"{parsed.netloc}{path}" if parsed.netloc else "<url>"
+    except Exception:
+        return "<url>"
+
 
 # --- Основная логика генерации Veo ---
 
@@ -172,7 +206,7 @@ def video_generator_veo_tool(
         shot = item.get("shot_number")
         video_path = item.get("video_path")
         
-        if not video_path or os.path.exists(video_path):
+        if not video_path or _is_non_empty_file(video_path):
             logger.debug(f"Skip existing or invalid video path: {video_path}")
             continue
             
@@ -242,15 +276,25 @@ def video_generator_veo_tool(
                     results.append({"success": False, "error": str(e)})
 
     successful = len([r for r in results if r.get("success")])
+    total = len(results)
 
     # Синхронизируем изменения обратно в items в памяти
     sync_items_to_memory(items, items_list)
 
-    return {
-        "status": "success",
-        "message": f"Сгенерировано {successful} видео Veo",
-        "results": results
+    stats = {
+        "total": total,
+        "successful": successful,
+        "failed": total - successful
     }
+    message = f"Сгенерировано {successful} из {total} видео Veo"
+    if successful == total:
+        return {
+            "status": "success",
+            "message": message,
+            "results": results,
+            "stats": stats,
+        }
+    return _error_result(message, results=results, stats=stats)
 
 def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], language: str, use_vertex: bool, project_id: str, location: str) -> Dict[str, Any]:
     scene = item.get("scene_number")
@@ -314,12 +358,26 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
         )
         
         logger.info(f"⏳ Veo started: {operation.name} ({scene}-{shot})")
-        
-        # Поллинг
+
+        # Поллинг с дедлайном (M-10): не крутимся вечно на зависшей операции
+        start_time = time.time()
+        max_wait_time = 600
         while not operation.done:
+            if time.time() - start_time >= max_wait_time:
+                logger.error(f"⏰ Превышено время ожидания Veo ({max_wait_time}s) для {scene}-{shot}")
+                return {
+                    "success": False,
+                    "error": f"Превышено время ожидания Veo ({max_wait_time}s)",
+                    "scene": scene,
+                    "shot": shot
+                }
             time.sleep(5)
-            operation = client.operations.get(operation)
-            
+            try:
+                operation = client.operations.get(operation)
+            except Exception as e:
+                logger.warning(f"⚠️ Veo: сбой опроса операции {scene}-{shot}, повтор: {e}")
+                continue
+
         if operation.error:
             return {
                 "success": False,
@@ -345,31 +403,50 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
         if not video_uri and not video_bytes:
              return {"success": False, "error": f"No video URI or bytes. Response item: {operation.response.generated_videos[0]}", "scene": scene, "shot": shot}
         
-        os.makedirs(os.path.dirname(video_path), exist_ok=True)
+        # Скачиваем/сохраняем атомарно: во временный файл + os.replace (M-9)
+        output = Path(video_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
 
-        if video_bytes:
-            logger.info(f"💾 Saving Veo video from bytes to {video_path}...")
-            with open(video_path, 'wb') as f:
-                f.write(video_bytes)
-        else:
-            logger.info(f"⬇️ Downloading Veo video from {video_uri[:50]}...")
-            
-            download_url = video_uri
-            if not use_vertex and api_key:
-                download_url = f"{video_uri}&key={api_key}"
-                
-            resp = requests.get(download_url, stream=True, timeout=(30, 600))
-            if resp.status_code != 200:
-                 return {"success": False, "error": f"Download failed: {resp.status_code} {resp.text}", "scene": scene, "shot": shot}
-                 
-            with open(video_path, 'wb') as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                
-        if os.path.exists(video_path) and os.path.getsize(video_path) > 0:
+        try:
+            if video_bytes:
+                logger.info(f"💾 Saving Veo video from bytes to {video_path}...")
+                with open(tmp_path, 'wb') as f:
+                    f.write(video_bytes)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                logger.info(f"⬇️ Downloading Veo video from {_sanitize_url_for_log(video_uri)}...")
+
+                # L-1: ключ передаём заголовком x-goog-api-key, не в query-параметре URL
+                download_headers = {}
+                if not use_vertex and api_key:
+                    download_headers["x-goog-api-key"] = api_key
+
+                resp = requests.get(video_uri, headers=download_headers, stream=True, timeout=(30, 600))
+                if resp.status_code != 200:
+                    return {"success": False, "error": f"Download failed: {resp.status_code} {_sanitize_url_for_log(video_uri)}", "scene": scene, "shot": shot}
+
+                with open(tmp_path, 'wb') as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+                return {"success": False, "error": "Empty file after download/save", "scene": scene, "shot": shot}
+            os.replace(tmp_path, output)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+        if _is_non_empty_file(video_path):
             return {"success": True, "video_path": video_path, "scene": scene, "shot": shot}
-        else:
-            return {"success": False, "error": "Empty file after download/save", "scene": scene, "shot": shot}
+        return {"success": False, "error": "Empty file after download/save", "scene": scene, "shot": shot}
 
     except Exception as e:
         return {

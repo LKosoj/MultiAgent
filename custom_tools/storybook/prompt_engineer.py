@@ -5,6 +5,7 @@ import logging
 from typing import Dict, Any, List
 from utils import call_openai_api, parse_llm_json
 from agent_command import model_code
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -1016,7 +1017,7 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
     Returns:
         str: Путь к каталогу сгенерированных промптов (`40_prompts`).
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     prompts_dir = f"{base}/40_prompts"
     
     # Проверяем целостность: существуют ли ВСЕ промпты (не только первый)

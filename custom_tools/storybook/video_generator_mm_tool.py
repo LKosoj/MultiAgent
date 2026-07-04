@@ -4,7 +4,10 @@ import logging
 import time
 import base64
 import mimetypes
+import threading
 import requests
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,7 +23,7 @@ def load_env_file():
                 line = line.strip()
                 if line and not line.startswith('#') and '=' in line:
                     key, value = line.split('=', 1)
-                    os.environ[key] = value
+                    os.environ.setdefault(key, value)
 
 load_env_file()
 
@@ -39,6 +42,44 @@ try:
 except ImportError:
     translate_prompts_in_items = None
     logger.warning("⚠️ Модуль utils.translate_prompts_in_items не найден")
+
+# MiniMax-Hailuo-02 поддерживает только фиксированные длительности видео
+_MM_SUPPORTED_DURATIONS = (6, 10)
+
+
+def _error_result(message: str, **extra: Any) -> Dict[str, Any]:
+    result = {
+        "status": "error",
+        "message": message,
+        "error": message,
+        "results": [],
+    }
+    result.update(extra)
+    return result
+
+
+def _is_non_empty_file(path: str) -> bool:
+    try:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _sanitize_url_for_log(url: str) -> str:
+    """Возвращает netloc + усечённый путь без query для безопасного логирования подписанных URL."""
+    try:
+        parsed = urlparse(str(url or ""))
+        path = parsed.path or ""
+        if len(path) > 32:
+            path = path[:32] + "..."
+        return f"{parsed.netloc}{path}" if parsed.netloc else "<url>"
+    except Exception:
+        return "<url>"
+
+
+def _snap_to_supported_duration_mm(duration: int) -> int:
+    """Приводит длительность к ближайшему поддерживаемому MiniMax-Hailuo-02 значению."""
+    return min(_MM_SUPPORTED_DURATIONS, key=lambda allowed: (abs(allowed - duration), allowed))
 
 
 def video_generator_mm_tool(
@@ -150,11 +191,11 @@ def video_generator_mm_tool(
             logger.debug(f"⏭️ Пропускаем кадр без video_prompt или video_path: {scene_number}-{shot_number}")
             continue
         
-        # Проверяем, существует ли уже видео
-        if os.path.exists(video_path):
+        # Проверяем, существует ли уже непустое видео
+        if _is_non_empty_file(video_path):
             logger.info(f"✅ Видео уже существует: {video_path}")
             continue
-        
+
         video_dir = os.path.dirname(video_path)
         
         # 1) Пробуем взять явные пути изображений из item
@@ -288,17 +329,21 @@ def video_generator_mm_tool(
 
     # Синхронизируем изменения обратно в items в памяти
     sync_items_to_memory(items, items_list)
-    
-    return {
-        "status": "success",
-        "message": f"Сгенерировано {successful} из {total} видео MiniMax",
-        "results": results,
-        "stats": {
-            "total": total,
-            "successful": successful,
-            "failed": total - successful
-        }
+
+    stats = {
+        "total": total,
+        "successful": successful,
+        "failed": total - successful
     }
+    message = f"Сгенерировано {successful} из {total} видео MiniMax"
+    if successful == total:
+        return {
+            "status": "success",
+            "message": message,
+            "results": results,
+            "stats": stats,
+        }
+    return _error_result(message, results=results, stats=stats)
 
 
 def _generate_single_video_mm(item: Dict[str, Any], session_id: str, seed: Optional[int], language: str = 'en') -> Dict[str, Any]:
@@ -321,11 +366,9 @@ def _generate_single_video_mm(item: Dict[str, Any], session_id: str, seed: Optio
     shot_number = item.get("shot_number", "?")
     timing = item.get("timing", "00:00 - 00:06")
     
-    # Определяем длительность видео из timing ДО логирования
-    duration = _parse_duration_from_timing(timing)
-    # Принудительно фиксируем длительность при необходимости
-    duration = 6
-    
+    # Определяем длительность видео из timing и приводим к поддерживаемым MiniMax-Hailuo-02 значениям
+    duration = _snap_to_supported_duration_mm(_parse_duration_from_timing(timing))
+
     logger.info(f"🎥 Генерируем видео MiniMax для сцены {scene_number}, кадр {shot_number} длительность {duration}")
     if end_image:
         logger.info(f"📹 Используем start + end изображения для анимации MiniMax")
@@ -576,24 +619,39 @@ def _fetch_video_result_mm(file_id: str, output_path: str, api_key: str) -> bool
             logger.error(f"❌ Не получен download_url от MiniMax API: {result}")
             return False
         
-        logger.info(f"🔗 URL скачивания видео MiniMax: {download_url}")
-        
-        # Скачиваем видео по полученному URL
+        logger.info(f"🔗 URL скачивания видео MiniMax: {_sanitize_url_for_log(download_url)}")
+
+        # Скачиваем видео по полученному URL атомарно: во временный файл + os.replace
         video_response = requests.get(download_url, timeout=120, stream=True)
         video_response.raise_for_status()
-        
-        with open(output_path, 'wb') as f:
-            for chunk in video_response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        try:
+            with tmp_path.open('wb') as f:
+                for chunk in video_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+                logger.error(f"❌ Файл не создался или пустой: {output_path}")
+                return False
+            os.replace(tmp_path, output)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
         # Проверяем, что файл создался и не пустой
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if _is_non_empty_file(output_path):
             logger.info(f"✅ Видео MiniMax скачано: {output_path}")
             return True
-        else:
-            logger.error(f"❌ Файл не создался или пустой: {output_path}")
-            return False
+        logger.error(f"❌ Файл не создался или пустой: {output_path}")
+        return False
             
     except Exception as e:
         logger.error(f"❌ Ошибка скачивания видео MiniMax {file_id}: {e}")

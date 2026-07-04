@@ -121,8 +121,14 @@ class StepTracker(ttk.Frame):
             self._on_restart_requested(step_id)
 
     def update_step(self, step_id: str, status: str,
-                    duration_sec: Optional[float] = None):
-        """Обновляет статус шага (thread-safe через self.after)."""
+                    duration_sec: Optional[float] = None,
+                    error: Optional[str] = None):
+        """Обновляет статус шага (thread-safe через self.after).
+
+        Для упавшего шага (status == "failed") при наличии error в подписи
+        времени показывается усечённая причина, чтобы оператор видел её прямо
+        в трекере, а не только в логе (M-29).
+        """
         if step_id not in self._labels:
             return
 
@@ -133,7 +139,10 @@ class StepTracker(ttk.Frame):
             self._labels[step_id].config(
                 text=f"{icon} {step_id}", fg=color, font=font
             )
-            if duration_sec is not None:
+            if status == "failed" and error:
+                short = error if len(error) <= 40 else error[:37] + "…"
+                self._time_labels[step_id].config(text=short)
+            elif duration_sec is not None:
                 if duration_sec < 60:
                     text = f"{duration_sec:.1f}s"
                 else:

@@ -332,3 +332,518 @@ def test_music_generator_rejects_project_id_path_traversal(tmp_path, monkeypatch
         "music_path": "",
         "music_status": "error",
     }
+
+
+def test_music_generator_writes_submitted_manifest_with_clip_ids_before_polling(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_args, **_kwargs: None)
+    project_id = "proj_music_submit_first"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    manifest_path = base / "98_audio" / "music_manifest.json"
+
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            # Snapshot the on-disk manifest at the moment polling begins.
+            if "at_poll" not in captured:
+                captured["at_poll"] = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return _FakeResponse(
+                json_payload={"clips": [{"id": "clip-1", "status": "complete", "audio_url": "https://cdn.example/m.mp3"}]}
+            )
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "success"
+    assert captured["at_poll"]["status"] == "submitted"
+    assert captured["at_poll"]["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_preserves_clip_ids_on_timeout(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_args, **_kwargs: None)
+    clock = itertools.chain([0.0], itertools.repeat(1000.0))
+    monkeypatch.setattr(music_generator.time, "monotonic", lambda: next(clock))
+    project_id = "proj_music_preserve_timeout"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    calls = {"post": [], "get": []}
+    _install_fakes(
+        monkeypatch,
+        calls,
+        clips=[{"id": "clip-1", "status": "streaming"}, {"id": "clip-2", "status": "queued"}],
+    )
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    assert "timed out" in result["message"].lower()
+    assert not (base / "98_audio" / "music.mp3").exists()
+    # Durable submission survives the timeout so a later run can resume-poll (no double charge).
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_resumes_saved_clip_ids_without_resubmitting(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_args, **_kwargs: None)
+    project_id = "proj_music_resume"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    # Simulate a prior run that submitted a paid Suno job but was killed before download.
+    _write_json(
+        base / "98_audio" / "music_manifest.json",
+        {"provider": "suno", "status": "submitted", "clip_ids": ["clip-1", "clip-2"]},
+    )
+
+    calls = {"post": [], "get": []}
+    _install_fakes(monkeypatch, calls)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "success"
+    assert result["task_id"] == "clip-1"
+    assert (base / "98_audio" / "music.mp3").read_bytes() == b"mp3-bytes"
+    # No resubmission: /api/generate/v2/ must never be called on resume.
+    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "success"
+
+
+def test_music_generator_truncates_provider_response_in_manifest(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_args, **_kwargs: None)
+    project_id = "proj_music_truncate"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    bulky_clips = [
+        {
+            "id": "clip-1",
+            "status": "complete",
+            "title": "Theme",
+            "audio_url": "https://cdn.example/m.mp3",
+            "metadata": {"blob": "x" * 2000},
+            "lyric": "la la la",
+        },
+        {"id": "clip-2", "status": "streaming", "title": "Alt", "metadata": {"blob": "y" * 2000}},
+    ]
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": clip["id"]} for clip in bulky_clips]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            return _FakeResponse(json_payload={"clips": bulky_clips, "major_model_version": "v5", "moderated": True})
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "success"
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    provider_response = manifest["provider_response"]
+    for clip in provider_response["clips"]:
+        assert set(clip.keys()) <= {"id", "status", "title"}
+    assert provider_response["major_model_version"] == "v5"
+    assert provider_response["moderated"] is True
+    # Bulky fields are stripped.
+    assert "x" * 2000 not in json.dumps(manifest, ensure_ascii=False)
+
+
+def test_music_generator_writes_manifest_atomically(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SUNO_COOKIE", raising=False)
+    project_id = "proj_music_atomic"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    replaced = []
+    real_replace = music_generator.os.replace
+
+    def spy_replace(src, dst):
+        replaced.append(str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(music_generator.os, "replace", spy_replace)
+
+    result = music_generator.storybook_music_generator_tool("sess", project_id)
+
+    assert result["status"] == "skipped"
+    assert any(dst.endswith("music_manifest.json") for dst in replaced)
+    assert list((base / "98_audio").glob(".*.tmp")) == []
+
+
+def test_music_generator_keeps_submission_on_transient_feed_http_error(tmp_path, monkeypatch):
+    # Транзиентная HTTP-ошибка feed В ПРОЦЕССЕ ПЕРВОГО поллинга не должна затирать
+    # durable "submitted"-манифест в "error" — иначе следующий прогон не резюмирует
+    # и ресабмитит оплаченную джобу (двойная оплата Suno).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_transient_first"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            return _FakeResponse(status_code=429, text="rate limited")
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    assert not (base / "98_audio" / "music.mp3").exists()
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_keeps_submission_on_transient_feed_error_during_resume(tmp_path, monkeypatch):
+    # Транзиент feed при resume: НЕ ресабмитим (иначе двойная оплата), submitted сохраняется.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_transient_resume"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    _write_json(
+        base / "98_audio" / "music_manifest.json",
+        {"provider": "suno", "status": "submitted", "clip_ids": ["clip-1", "clip-2"]},
+    )
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            return _FakeResponse(status_code=503, text="upstream unavailable")
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    assert result["status"] == "submitted"
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_keeps_submission_on_transient_download_error(tmp_path, monkeypatch):
+    # Джоба сгенерирована и ОПЛАЧЕНА (poll вернул audio_url), но СКАЧИВАНИЕ временно упало
+    # (CDN 5xx). Манифест НЕ должен уйти в "error" → иначе следующий прогон не резюмирует и
+    # ресабмитит оплаченную джобу (двойная оплата).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_dl_fail"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            return _FakeResponse(json_payload={"clips": [
+                {"id": "clip-1", "status": "complete", "audio_url": "https://cdn.example/music.mp3"},
+            ]})
+        # Скачивание готового аудио временно недоступно.
+        return _FakeResponse(status_code=503, text="cdn unavailable")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    assert not (base / "98_audio" / "music.mp3").exists()
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_resume_download_failure_keeps_submission(tmp_path, monkeypatch):
+    # То же на resume-пути: клип готов, скачивание упало → сохраняем "submitted", НЕ ресабмитим.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_resume_dl"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    _write_json(
+        base / "98_audio" / "music_manifest.json",
+        {"provider": "suno", "status": "submitted", "clip_ids": ["clip-1", "clip-2"]},
+    )
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            return _FakeResponse(json_payload={"clips": [
+                {"id": "clip-1", "status": "complete", "audio_url": "https://cdn.example/music.mp3"},
+            ]})
+        return _FakeResponse(status_code=503, text="cdn unavailable")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_transient_auth_preserves_existing_submission(tmp_path, monkeypatch):
+    # Транзиент в auth ДО resume не должен затирать durable "submitted"-манифест оплаченной
+    # pending-джобы (иначе следующий прогон ресабмитит = двойная оплата).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_auth_transient"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    _write_json(
+        base / "98_audio" / "music_manifest.json",
+        {"provider": "suno", "status": "submitted", "clip_ids": ["clip-1", "clip-2"]},
+    )
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        raise AssertionError(f"no POST expected before resume: {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        # Транзиент Clerk на самом первом шаге auth (до resume).
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(status_code=503, text="clerk down")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    # Существующий submitted-манифест не тронут; сабмит не выполнялся.
+    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_keeps_submission_on_connection_transient_during_poll(tmp_path, monkeypatch):
+    # Сетевой транзиент (ReadTimeout/обрыв соединения) при ПЕРВОМ поллинге feed — ответ не
+    # получен, это НЕ genuine-провал джобы. Собственный сабмит уже записал durable "submitted";
+    # манифест НЕ должен уйти в "error", иначе следующий прогон ресабмитит оплаченную джобу.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_conn_first"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            raise music_generator.requests.exceptions.ReadTimeout("read timed out")
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "error"
+    assert not (base / "98_audio" / "music.mp3").exists()
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]
+
+
+def test_music_generator_keeps_submission_on_connection_transient_during_resume(tmp_path, monkeypatch):
+    # Сетевой транзиент (ConnectionError) при поллинге на RESUME-пути: НЕ ресабмитим оплаченную
+    # джобу (иначе двойная оплата), durable "submitted" сохраняется для следующего прогона.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
+    monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
+    monkeypatch.setattr(music_generator.time, "sleep", lambda *_a, **_k: None)
+    project_id = "proj_music_conn_resume"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "audio_manifest.json", {"tts_status": "unavailable", "audio_tracks": []})
+    _write_json(
+        base / "98_audio" / "music_manifest.json",
+        {"provider": "suno", "status": "submitted", "clip_ids": ["clip-1", "clip-2"]},
+    )
+
+    calls = {"post": [], "get": []}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls["post"].append({"url": url})
+        if "/v1/client/sessions/" in url:
+            return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
+        if "/api/c/check" in url:
+            return _FakeResponse(json_payload={"required": False})
+        if "/api/generate/v2/" in url:
+            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
+        raise AssertionError(f"unexpected POST {url}")
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls["get"].append({"url": url})
+        if "/v1/client" in url and "/sessions/" not in url:
+            return _FakeResponse(json_payload={"response": {"last_active_session_id": "sid-1"}})
+        if "/api/feed/v2" in url:
+            raise music_generator.requests.exceptions.ConnectionError("connection reset by peer")
+        return _FakeResponse(content=b"mp3-bytes")
+
+    monkeypatch.setattr(music_generator.requests, "post", fake_post)
+    monkeypatch.setattr(music_generator.requests, "get", fake_get)
+
+    result = music_generator.storybook_music_generator_tool(
+        "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
+    )
+
+    assert result["status"] == "submitted"
+    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "submitted"
+    assert manifest["clip_ids"] == ["clip-1", "clip-2"]

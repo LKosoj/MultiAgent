@@ -12,7 +12,7 @@ from .engine import WorkflowEngine
 from .models import (
     WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
     StepResult, StepStatus, WorkflowStep, StepPlan, ValidationResult, Decision,
-    ResourceLimits, WorkflowExecutionError
+    ResourceLimits, RetryPolicy, WorkflowExecutionError
 )
 
 # Enhanced components
@@ -25,7 +25,7 @@ from .intelligence.aggregator import FinalAggregator
 
 # Resilience components
 from .resilience.circuit_breaker import CircuitBreakerManager
-from .resilience.retry import AdaptiveRetryEngine
+from .resilience.retry import AdaptiveRetryEngine, JudgeRetryRequested
 from .resilience.budget import BudgetManager, BudgetType
 from .resilience.loop_detection import LoopDetector
 
@@ -219,17 +219,19 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                               restored_step_results: Optional[Dict[str, StepResult]] = None) -> WorkflowResult:
         """Enhanced выполнение workflow"""
 
-        # Generic resume (skip_steps задан) выполняется через базовый исполнитель,
-        # который поддерживает пропуск завершённых шагов. Enhanced-слой пока не
-        # реализует resume поверх интеллектуального исполнителя — делегируем в legacy.
-        # ВАЖНО: при resume intelligent-фичи (адаптивная маршрутизация, enhanced-хуки)
-        # НЕ применяются — перезапускаемые шаги исполняются базовой логикой. Это
-        # осознанный компромисс: восстановление прогресса важнее enhanced-семантики.
+        # Resume (skip_steps задан): пропускаем уже завершённые шаги.
+        # Пайплайны с requires_enhanced_engine исполняем через enhanced-исполнитель
+        # (M-3), а не деградируем в legacy — иначе поздний сбой (montage/video)
+        # требовал бы полного дорогого ре-рана. Перезапускаемые side-effect-шаги
+        # опираются на per-tool идемпотентность (provider_jobs.json): движковый
+        # resume их НЕ пропускает, но повторный вызов тула переиспользует джобу.
+        # Остальные (не-required) пайплайны резюмируются базовым исполнителем.
         if skip_steps is not None:
             if workflow_definition.requires_enhanced_engine:
-                raise WorkflowExecutionError(
-                    f"Workflow '{workflow_definition.name}' requires enhanced engine "
-                    "(pipeline.requires_enhanced_engine=true), but generic resume uses legacy execution"
+                return await self._execute_enhanced_workflow(
+                    workflow_definition, context, client_id,
+                    skip_steps=skip_steps,
+                    restored_step_results=restored_step_results,
                 )
             return await super().execute_workflow(
                 workflow_definition, context, client_id,
@@ -268,9 +270,24 @@ class EnhancedWorkflowEngine(WorkflowEngine):
     
     async def _execute_enhanced_workflow(self, workflow_def: WorkflowDefinition,
                                         context: Optional[WorkflowContext] = None,
-                                        client_id: Optional[str] = None) -> WorkflowResult:
+                                        client_id: Optional[str] = None,
+                                        *,
+                                        skip_steps: Optional[Set[str]] = None,
+                                        restored_step_results: Optional[Dict[str, StepResult]] = None) -> WorkflowResult:
         """Enhanced выполнение с интеллектуальным управлением"""
-        
+
+        # M-1: checkpoint_strategy — best-effort валидация. Реально чекпойнт пишется
+        # после каждого шага (см. _on_step_completed); поле лишь документирует это.
+        # Предупреждаем оператора при неизвестном значении, чтобы не строить ложных
+        # ожиданий (сам ключ не влияет на исполнение).
+        checkpoint_strategy = workflow_def.error_handling.get("checkpoint_strategy")
+        if checkpoint_strategy is not None and checkpoint_strategy not in {"after_each_step"}:
+            logger.warning(
+                "⚠️ Неизвестный checkpoint_strategy=%r — поддерживается только "
+                "'after_each_step'; значение игнорируется",
+                checkpoint_strategy,
+            )
+
         # Создаем контекст если не передан
         if context is None:
             context = WorkflowContext(
@@ -290,11 +307,19 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             workflow_budget = self.budget_manager.create_workflow_budget(workflow_id)
             logger.info(f"💰 Created budget for workflow '{workflow_id}'")
             
-            # Сохраняем начальное состояние (используем базовый helper)
-            resource_lease = await self._on_workflow_started(workflow_def, context, client_id, start_time)
-            
+            # Сохраняем начальное состояние (используем базовый helper).
+            # На resume пред-заполняем checkpoint восстановленными шагами.
+            resource_lease = await self._on_workflow_started(
+                workflow_def, context, client_id, start_time,
+                step_results=restored_step_results,
+            )
+
             # Выполняем шаги с enhanced логикой
-            step_results = await self._execute_enhanced_steps(workflow_def, context)
+            step_results = await self._execute_enhanced_steps(
+                workflow_def, context,
+                skip_steps=skip_steps,
+                restored_step_results=restored_step_results,
+            )
 
             if await self._is_workflow_cancelled(workflow_id):
                 return await self._build_cancelled_workflow_result(
@@ -364,20 +389,42 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 await self._release_workflow_resources(workflow_id)
     
     async def _execute_enhanced_steps(self, workflow_def: WorkflowDefinition,
-                                     context: WorkflowContext) -> Dict[str, StepResult]:
+                                     context: WorkflowContext,
+                                     *,
+                                     skip_steps: Optional[Set[str]] = None,
+                                     restored_step_results: Optional[Dict[str, StepResult]] = None) -> Dict[str, StepResult]:
         """Выполнение шагов с enhanced логикой"""
-        
+
         if workflow_def.parallel_execution:
-            return await self._execute_enhanced_steps_parallel(workflow_def, context)
+            return await self._execute_enhanced_steps_parallel(
+                workflow_def, context,
+                restored_step_results=restored_step_results,
+            )
         else:
-            return await self._execute_enhanced_steps_sequential(workflow_def, context)
-    
+            return await self._execute_enhanced_steps_sequential(
+                workflow_def, context,
+                skip_steps=skip_steps,
+                restored_step_results=restored_step_results,
+            )
+
     async def _execute_enhanced_steps_sequential(self, workflow_def: WorkflowDefinition,
-                                               context: WorkflowContext) -> Dict[str, StepResult]:
+                                               context: WorkflowContext,
+                                               *,
+                                               skip_steps: Optional[Set[str]] = None,
+                                               restored_step_results: Optional[Dict[str, StepResult]] = None) -> Dict[str, StepResult]:
         """Последовательное выполнение с enhanced логикой"""
-        step_results = {}
-        
+        # Resume: пред-заполняем результатами восстановленных шагов.
+        step_results = dict(restored_step_results or {})
+        # H-2 (part B): публикуем workflow_def на context, чтобы _execute_enhanced_step
+        # мог прочитать retry-политику (в parallel-пути это делается отдельно).
+        context._workflow_definition = workflow_def
+
         for step in workflow_def.steps:
+            # Resume: пропускаем уже завершённые шаги (их результат уже в step_results).
+            if skip_steps is not None and step.id in skip_steps:
+                logger.info("⏭️ Enhanced resume: пропускаем завершённый шаг %s", step.id)
+                continue
+
             logger.info(f"🔄 Processing step '{step.id}' with enhanced logic")
 
             if await self._is_workflow_cancelled(context.workflow_id):
@@ -492,19 +539,23 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         return retried
 
     async def _execute_enhanced_steps_parallel(self, workflow_def: WorkflowDefinition,
-                                             context: WorkflowContext) -> Dict[str, StepResult]:
+                                             context: WorkflowContext,
+                                             *,
+                                             restored_step_results: Optional[Dict[str, StepResult]] = None) -> Dict[str, StepResult]:
         """Параллельное выполнение с enhanced логикой"""
         from .orchestration.parallel_executor import ParallelWorkflowExecutor
-        
+
         # Сохраняем workflow_definition как временный атрибут для параллельных задач
         context._workflow_definition = workflow_def
-        
+
         parallel_executor = ParallelWorkflowExecutor(
             max_concurrent=workflow_def.max_parallel_steps
         )
-        
+
         logger.info(f"🚀 Enhanced: Начинаем параллельное выполнение с enhanced логикой")
-        
+
+        # Resume: восстановленные шаги передаём в initial_step_results — их ключи
+        # попадают в completed_steps исполнителя, поэтому они не запускаются повторно.
         return await parallel_executor.execute_steps_parallel(
             workflow_def.steps,
             context,
@@ -513,6 +564,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             condition_checker=self._should_skip_step_by_condition,
             stop_checker=lambda: self._is_workflow_cancelled(context.workflow_id),
             stop_on_failure=(workflow_def.error_handling.get("on_failure", "continue") != "continue"),
+            initial_step_results=restored_step_results,
         )
     
     async def _execute_enhanced_step_wrapper(self, step, context):
@@ -583,6 +635,23 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             "step_budget": step_budget
         }
 
+        # H-2: уважаем retry-политику из YAML (step.retry_policy > global_retry_policy >
+        # дефолт), а не хардкод 3/1.0/30.0. workflow_def доступен через context
+        # (публикуется sequential/parallel исполнителями перед диспетчеризацией).
+        workflow_def = getattr(context, "_workflow_definition", None)
+        policy = (
+            step.retry_policy
+            or (workflow_def.global_retry_policy if workflow_def is not None else None)
+            or RetryPolicy()
+        )
+        # M-1: auto_retry_transient=false отключает движковый retry (0 доп. попыток).
+        auto_retry_transient = True
+        if workflow_def is not None:
+            auto_retry_transient = self._coerce_bool(
+                workflow_def.error_handling.get("auto_retry_transient", True), True
+            )
+        effective_max_retries = policy.max_retries if auto_retry_transient else 0
+
         # Выполняем с adaptive retry, кроме явно non-retryable шагов с side effects.
         try:
             if self._is_enhanced_step_retryable(step):
@@ -590,10 +659,11 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     step_id=step.id,
                     step_func=self._execute_single_step_attempt,
                     context=retry_context,
-                    max_retries=3,
-                    base_delay=1.0,
-                    max_delay=30.0,
-                    backoff_multiplier=1.5
+                    max_retries=effective_max_retries,
+                    base_delay=policy.base_delay,
+                    max_delay=policy.max_delay,
+                    backoff_multiplier=1.5,
+                    retry_on_errors=policy.retry_on_errors,
                 )
             else:
                 step_result = await self._execute_single_step_attempt(retry_context)
@@ -732,8 +802,20 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             if getattr(step_result.status, "value", step_result.status) == StepStatus.FAILED.value:
                 return step_result
             
-            # Post-step validation and decision
-            if self.feature_manager.is_feature_enabled("post_step_judge", workflow_context.workflow_id, step.id):
+            # Post-step validation and decision.
+            # M-4: LLM-судья валидирует output против text-плана и на детерминированных
+            # tool-шагах даёт ложные RETRY/STOP (валидный dict/путь оценивается как «не text»).
+            # Судим только НЕ-tool (агентные) шаги.
+            if step.step_type == "tool":
+                # M-4: детерминированный tool-шаг НЕ судим LLM-судьёй (он даёт
+                # ложные RETRY/STOP: валидный dict/путь оценивается как «не text»).
+                # Успешно завершённый tool-шаг детерминирован → присваиваем полную
+                # оценку качества. Без этого дефолтный quality_score=0.0 будет
+                # отвергнут gate'ом приемлемости в execute_with_retry
+                # (_is_result_acceptable: quality_score<0.3 → «poor quality» →
+                # ложный провал детерминированного шага после ретраев).
+                step_result.quality_score = 1.0
+            elif self.feature_manager.is_feature_enabled("post_step_judge", workflow_context.workflow_id, step.id):
                 default_plan = StepPlan(
                     step_id=step.id,
                     refined_task=step.task,
@@ -763,9 +845,13 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 logger.info(f"⚖️ Step '{step.id}' validation: score={validation_result.overall_score:.2f}, "
                            f"decision={decision.action}")
                 
-                # Если решение не "proceed", выбрасываем исключение для retry
+                # Если решение не "proceed", выбрасываем исключение для retry.
+                # JudgeRetryRequested помечает вердикт судьи как повтор ПО КАЧЕСТВУ,
+                # чтобы execute_with_retry не отсекал его retry_on_errors-фильтром
+                # (класс "unknown_error") и ретраил как прежде — иначе агентный шаг
+                # валится без единой повторной попытки (регресс H-2).
                 if decision.action != "proceed":
-                    raise Exception(f"Decision: {decision.action} - {decision.reason}")
+                    raise JudgeRetryRequested(f"Decision: {decision.action} - {decision.reason}")
             
             step_result.status = StepStatus.COMPLETED
             return step_result
@@ -1046,9 +1132,6 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 "RuntimeError:",
                 "Exception:",
                 "Ошибка:",
-                "Отсутствуют",
-                "не найден",
-                "не существует",
                 "Traceback"
             ]
             
@@ -1059,7 +1142,10 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         
         # Если результат - словарь с полем error
         if isinstance(result, dict):
-            if 'error' in result or 'exception' in result:
+            # Проверяем истинность значения, а не наличие ключа: {"error": None}
+            # или {"exception": ""} у успешного результата не должны трактоваться
+            # как ошибка (иначе любой новый тул с декоративным error=None упадёт).
+            if result.get('error') or result.get('exception'):
                 return True
             if str(result.get('status', '')).strip().lower() == 'error':
                 return True

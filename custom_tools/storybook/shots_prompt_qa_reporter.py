@@ -27,10 +27,8 @@ def _ensure_repo_root_on_syspath() -> Path:
             if sbm_root.is_dir() and str(sbm_root) not in sys.path:
                 insert_at = 1 if len(sys.path) > 0 and sys.path[0] == str(repo_root) else 0
                 sys.path.insert(insert_at, str(sbm_root))
-            try:
-                os.chdir(repo_root)
-            except Exception:
-                pass
+            # NOTE(M-22): no os.chdir at import time — importing this module must not
+            # mutate the process cwd. Runtime chdir stays in _ensure_repo_root_context().
             return repo_root
     # fallback: just keep current dir
     return Path.cwd()
@@ -326,7 +324,9 @@ def main() -> int:
     if not scenes:
         scenes = [1]
 
-    base = Path("plots/storybooks") / project_id
+    from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
+    base = safe_storybook_project_dir(project_id)
     shots_json_path = str(base / "97_shots" / "shots.json")
     screenplay_json_path = str(base / "91_screenplay" / "screenplay.json")
 

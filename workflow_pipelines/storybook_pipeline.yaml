@@ -32,7 +32,6 @@ global_retry_policy:
   - rate_limit
   - timeout
 global_resource_limits:
-  max_duration_seconds: 600
   max_api_calls_per_minute: 15
 steps:
 - id: brief_from_prompt
@@ -279,6 +278,11 @@ steps:
   step_type: tool
   task: Generate video from shots
   timeout: 1200
+  # Дорогой side-effect-шаг: движковый retry запрещён до появления настоящей
+  # идемпотентности (полагаемся на provider_jobs.json), иначе слепой повтор
+  # пере-триггерит платную генерацию. См. H-2.
+  metadata:
+    retryable: false
 #  tool_name: video_generator_veo_tool
 #  tool_name: video_generator_mm_tool
   tool_name: video_generator_aitunnel_tool
@@ -317,6 +321,10 @@ steps:
   step_type: tool
   task: Generate or reuse background music and register it in audio manifest
   timeout: 900
+  # Дорогой side-effect-шаг: движковый retry запрещён (идемпотентность на уровне
+  # тула через music-манифест). См. H-2.
+  metadata:
+    retryable: false
   tool_name: storybook_music_generator_tool
   output_schema: json_object
   output_schema_requirements:
@@ -339,6 +347,10 @@ steps:
   step_type: tool
   task: Assemble final video, timeline, subtitles, manifest and final review
   timeout: 1200
+  # Дорогой side-effect-шаг (ffmpeg-рендер): движковый retry запрещён, повтор
+  # рендерит заново без выигрыша. См. H-2.
+  metadata:
+    retryable: false
   tool_name: montage_assembler_tool
   output_schema: json_object
   output_schema_requirements:
@@ -381,7 +393,6 @@ error_handling:
   auto_retry_transient: true
   save_partial_results: true
   checkpoint_strategy: after_each_step
-  save_checkpoint_interval: 300
 metadata:
   author: Pipeline Constructor
   category: general

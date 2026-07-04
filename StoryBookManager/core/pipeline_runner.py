@@ -89,6 +89,9 @@ class PipelineRunner:
                         step_id=step.id,
                         step_status=status,
                         step_duration=duration,
+                        step_error=getattr(step_result, "error", None),
+                        step_error_class=(getattr(step_result, "error_class", "") or None),
+                        step_traceback=(getattr(step_result, "metadata", None) or {}).get("traceback"),
                     )
                 except Exception as e:
                     logger.error(f"Ошибка в progress_callback для шага {step.id}: {e}")
@@ -115,6 +118,78 @@ class PipelineRunner:
             if self._original_execute_workflow_step is not None and self.engine:
                 self.engine._execute_workflow_step = self._original_execute_workflow_step
                 self._original_execute_workflow_step = None
+
+    @staticmethod
+    def _report_failed_steps(result: Any, progress_callback: Optional[Callable]) -> None:
+        """M-29: движок вызывает completion-хук ТОЛЬКО для успешных шагов, поэтому
+        упавший шаг иначе не доходит до UI (остаётся pending — «маскируется под
+        не-провал»). После завершения воркфлоу реконсилируем по result.step_results:
+        каждый FAILED-шаг доводим до progress_callback со step_status='failed' и
+        деталями ошибки (класс/traceback) — тем же каналом, что и завершённые шаги."""
+        if not progress_callback:
+            return
+        step_results = getattr(result, "step_results", None) or {}
+        if not isinstance(step_results, dict):
+            return
+        for step_id, sr in step_results.items():
+            status = getattr(getattr(sr, "status", None), "value", None) or str(getattr(sr, "status", ""))
+            if str(status).lower() != "failed":
+                continue
+            try:
+                progress_callback(
+                    message=f"Шаг '{step_id}' завершён с ошибкой",
+                    step_id=step_id,
+                    step_status="failed",
+                    step_duration=getattr(sr, "duration_seconds", None),
+                    step_error=getattr(sr, "error", None),
+                    step_error_class=(getattr(sr, "error_class", "") or None),
+                    step_traceback=(getattr(sr, "metadata", None) or {}).get("traceback"),
+                )
+            except Exception as exc:
+                logger.error(f"Ошибка в progress_callback для упавшего шага {step_id}: {exc}")
+
+    def _acquire_project_lock(self, project_id: str):
+        """Не-блокирующий advisory-lock по project_id (M-31).
+
+        Мирроринг паттерна `_ProviderJobsFileLock` (flock по конвенционному файлу
+        в корне проекта), но с LOCK_NB: если проект уже выполняется в другой
+        сессии/поверхности — сразу возвращаем None, а не ждём. Конвенция файла
+        `.pipeline.lock` фиксируется здесь, чтобы позже на неё сели Streamlit/AG-UI.
+        flock снимается ОС при закрытии fd/завершении процесса → stale-lock не остаётся.
+        """
+        from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
+        project_dir = safe_storybook_project_dir(project_id)
+        project_dir.mkdir(parents=True, exist_ok=True)
+        handle = (project_dir / ".pipeline.lock").open("a+", encoding="utf-8")
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            # Не-POSIX окружение: advisory-lock недоступен, продолжаем без него.
+            pass
+        except BlockingIOError:
+            handle.close()
+            return None
+        return handle
+
+    @staticmethod
+    def _release_project_lock(handle) -> None:
+        """Снимает advisory-lock проекта (симметрично _acquire_project_lock)."""
+        if handle is None:
+            return
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        finally:
+            try:
+                handle.close()
+            except Exception:
+                pass
 
     @staticmethod
     def _normalize_workflow_status(result: Any) -> Optional[str]:
@@ -166,11 +241,15 @@ class PipelineRunner:
         return {"status": "error", "message": error_message, "result": result}
 
     @staticmethod
-    def _step_output_artifacts() -> Dict[str, List[str]]:
-        """Канонические артефакты storybook pipeline для проверки частичного запуска."""
-        # TODO: перенести ожидаемые артефакты шагов в pipeline metadata/source of truth,
-        # чтобы валидация частичного запуска не зависела от локального словаря путей.
-        return {
+    def _step_output_artifacts(workflow_def=None) -> Dict[str, List[str]]:
+        """Канонические артефакты storybook pipeline для проверки частичного запуска.
+
+        Если передан workflow_def и у шага задан metadata.output_artifacts —
+        он имеет приоритет над встроенным словарём. Так источник истины об
+        ожидаемых артефактах постепенно переносится в саму pipeline metadata
+        (см. §6.5 аудита), а словарь ниже остаётся обратно-совместимым fallback.
+        """
+        artifacts: Dict[str, List[str]] = {
             "brief_from_prompt": ["00_brief.json"],
             "init_project": ["00_brief.json"],
             "story_planner": ["10_synopsis/synopsis.json", "10_synopsis/beats.json"],
@@ -190,10 +269,12 @@ class PipelineRunner:
             "screenplay_generator": ["91_screenplay/screenplay.json"],
             "screenplay_shots_generator": ["97_shots/shots.json"],
             "shots_prompt_qa": ["97_shots/shots.json"],
-            "artist_batch_shots": ["97_shots"],
+            "artist_batch_shots": ["97_shots/shots.json"],
             "storybook_video_preflight": ["96_video_contract/provider_menu_summary.json"],
             "storybook_video_delivery_promise": ["96_video_contract/delivery_promise.json"],
-            "video_generator": ["97_shots"],
+            # Каталог 97_shots существует уже после кадров, поэтому маркером
+            # реально стартовавшей видео-генерации служит durable-леджер задач.
+            "video_generator": ["97_shots/provider_jobs.json"],
             "storybook_audio_subtitle": [
                 "98_audio/subtitles.srt",
                 "98_audio/audio_manifest.json",
@@ -212,6 +293,12 @@ class PipelineRunner:
             ],
             "storybook_video_decision_log": ["96_video_contract/decision_log.json"],
         }
+        if workflow_def is not None:
+            for step in getattr(workflow_def, "steps", None) or []:
+                override = (getattr(step, "metadata", None) or {}).get("output_artifacts")
+                if override:
+                    artifacts[step.id] = list(override)
+        return artifacts
 
     @classmethod
     def _collect_required_artifacts(
@@ -221,7 +308,7 @@ class PipelineRunner:
     ) -> List[str]:
         """Возвращает список артефактов, обязательных перед запуском start_step."""
         step_map = {step.id: step for step in workflow_def.steps}
-        artifact_map = cls._step_output_artifacts()
+        artifact_map = cls._step_output_artifacts(workflow_def)
         visited: Set[str] = set()
         visiting: Set[str] = set()
         required: List[str] = []
@@ -267,10 +354,18 @@ class PipelineRunner:
         """
         if not self.engine:
             return {"status": "error", "message": "Workflow engine не инициализирован"}
-        
+
+        project_lock = None
         try:
             input_overrides = input_overrides or {}
             logger.info(f"🚀 Запуск полного pipeline для проекта {project_id}")
+
+            project_lock = self._acquire_project_lock(project_id)
+            if project_lock is None:
+                return {
+                    "status": "error",
+                    "message": f"Проект {project_id} уже выполняется в другой сессии/поверхности",
+                }
 
             yaml_path = project_root / "workflow_pipelines" / "storybook_pipeline.yaml"
 
@@ -300,6 +395,7 @@ class PipelineRunner:
                 **execution_variables
             )
 
+            self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Pipeline завершен для проекта {project_id}")
             return self._build_runner_response(
                 result,
@@ -313,13 +409,17 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка выполнения pipeline: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
-    
+
     @staticmethod
     def validate_step_dependencies(workflow_def, start_step_id: str) -> list:
         """Проверяет что все зависимости start_step_id входят в пропускаемые шаги.
 
+        ДИАГНОСТИЧЕСКИЙ helper, НЕ гейт: run_from_step больше его не вызывает
+        (частичный запуск опирается на артефакт-валидацию на диске + развязку
+        пограничных depends_on). Оставлен для обратной совместимости с внешним кодом.
         Возвращает список неудовлетворённых зависимостей (пустой = ОК).
         Зависимости читаются из depends_on в YAML.
         """
@@ -357,10 +457,18 @@ class PipelineRunner:
         """
         if not self.engine:
             return {"status": "error", "message": "Workflow engine не инициализирован"}
-        
+
+        project_lock = None
         try:
             input_overrides = input_overrides or {}
             logger.info(f"🚀 Запуск pipeline с шага {step_id} для проекта {project_id}")
+
+            project_lock = self._acquire_project_lock(project_id)
+            if project_lock is None:
+                return {
+                    "status": "error",
+                    "message": f"Проект {project_id} уже выполняется в другой сессии/поверхности",
+                }
 
             yaml_path = project_root / "workflow_pipelines" / "storybook_pipeline.yaml"
 
@@ -376,17 +484,33 @@ class PipelineRunner:
 
             start_index = step_ids.index(step_id)
 
-            dep_errors = self.validate_step_dependencies(workflow_def, step_id)
-            if dep_errors:
-                msg = "Неудовлетворённые зависимости:\n" + "\n".join(
-                    f"  • {e}" for e in dep_errors
+            # H-8: hard-fail снят. validate_step_dependencies теперь только
+            # ДИАГНОСТИКА (не гейт): логируем, какие апстрим-шаги пропускаются и
+            # должны присутствовать на диске как артефакты. Артефакт-валидация уже
+            # выполнена GUI-слоем (validate_project_for_pipeline), а пограничные
+            # depends_on развязываются ниже, поэтому запуск НЕ блокируется.
+            dep_diagnostics = self.validate_step_dependencies(workflow_def, step_id)
+            if dep_diagnostics:
+                logger.info(
+                    "Неудовлетворённые зависимости (диагностика, запуск не блокируется): %s",
+                    "; ".join(dep_diagnostics),
                 )
-                return {"status": "error", "message": msg}
 
             for skipped_step in workflow_def.steps[:start_index]:
                 logger.info(f"⏭️ Шаг '{skipped_step.id}' будет пропущен (выполнение с {step_id})")
 
-            workflow_def.steps = workflow_def.steps[start_index:]
+            # Срез оставшихся шагов на deepcopy, чтобы не мутировать кэшированный
+            # WorkflowDefinition между запусками в одном процессе Tkinter.
+            remaining_steps = [copy.deepcopy(step) for step in workflow_def.steps[start_index:]]
+            remaining_ids = {step.id for step in remaining_steps}
+            # Развязываем пограничные depends_on на ВЫРЕЗАННЫЕ шаги: иначе
+            # DependencyGraph движка (has_cycles/get_ready_steps) увидит висячие
+            # ссылки на несуществующие узлы → ValueError «циклические зависимости»
+            # или deadlock. Внутренние зависимости среза сохраняются.
+            for step in remaining_steps:
+                step.depends_on = [dep for dep in step.depends_on if dep in remaining_ids]
+            workflow_def.steps = remaining_steps
+
             if progress_callback:
                 self._install_step_hook(progress_callback, len(workflow_def.steps))
 
@@ -397,15 +521,28 @@ class PipelineRunner:
                 context_variables["task"] = task
             context_variables.update(input_overrides)
 
+            # Грузим step_outputs вырезанных шагов из последнего checkpoint проекта,
+            # чтобы оставшиеся шаги резолвили {вырезанный_шаг.field} в шаблонах/condition
+            # (как это делает run_single_step). Нет checkpoint — продолжаем с пустым
+            # step_outputs (шаги, читающие апстрим с диска, работают).
+            context_step_outputs: Dict[str, Any] = {}
+            checkpoint = await self._get_latest_project_checkpoint(project_id)
+            base_context = getattr(checkpoint, "context", None) if checkpoint else None
+            base_outputs = getattr(base_context, "step_outputs", None)
+            if base_outputs:
+                context_step_outputs = copy.deepcopy(base_outputs)
+
             self.current_workflow_id = f"sbm_partial_{project_id}_{uuid.uuid4().hex[:8]}"
             context = WorkflowContext(
                 workflow_id=self.current_workflow_id,
                 session_id=project_id,
-                variables=context_variables
+                variables=context_variables,
+                step_outputs=context_step_outputs,
             )
 
             result = await self.engine.execute_workflow(workflow_def, context)
 
+            self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Partial pipeline завершен для проекта {project_id} с шага {step_id}")
             response = self._build_runner_response(
                 result,
@@ -422,6 +559,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка выполнения pipeline с шага {step_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
 
@@ -512,9 +650,17 @@ class PipelineRunner:
                 "message": f"Для шага '{step_id}' требуется сохранённый контекст предыдущего pipeline",
             }
 
+        project_lock = None
         try:
             input_overrides = input_overrides or {}
             logger.info(f"🚀 Перезапуск одного шага {step_id} для проекта {project_id}")
+
+            project_lock = self._acquire_project_lock(project_id)
+            if project_lock is None:
+                return {
+                    "status": "error",
+                    "message": f"Проект {project_id} уже выполняется в другой сессии/поверхности",
+                }
 
             yaml_path = project_root / "workflow_pipelines" / "storybook_pipeline.yaml"
             if not yaml_path.exists():
@@ -569,6 +715,7 @@ class PipelineRunner:
 
             result = await self.engine.execute_workflow(workflow_def, context)
 
+            self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Single-step rerun завершён для проекта {project_id}, шаг {step_id}")
             response = self._build_runner_response(
                 result,
@@ -586,6 +733,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка single-step rerun для шага {step_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
 
@@ -605,7 +753,19 @@ class PipelineRunner:
                 "message": f"Не найден checkpoint с контекстом для workflow '{workflow_id}'",
             }
 
+        project_lock = None
         try:
+            # M-31: сериализуем resume по project_id (session_id из checkpoint-контекста),
+            # чтобы он не гонялся с параллельным запуском того же проекта.
+            project_id = getattr(checkpoint.context, "session_id", None)
+            if project_id:
+                project_lock = self._acquire_project_lock(project_id)
+                if project_lock is None:
+                    return {
+                        "status": "error",
+                        "message": f"Проект {project_id} уже выполняется в другой сессии/поверхности",
+                    }
+
             yaml_path = project_root / "workflow_pipelines" / "storybook_pipeline.yaml"
             if not yaml_path.exists():
                 return {"status": "error", "message": f"Pipeline файл не найден: {yaml_path}"}
@@ -638,6 +798,7 @@ class PipelineRunner:
 
             self.current_workflow_id = workflow_id
             result = await self.engine.execute_workflow(workflow_def, context)
+            self._report_failed_steps(result, progress_callback)
             logger.info(
                 "✅ Workflow %s возобновлён из checkpoint (%s)",
                 workflow_id,
@@ -659,9 +820,10 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка восстановления workflow {workflow_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
-    
+
     async def pause_pipeline(self) -> Dict[str, Any]:
         """Ставит pipeline на паузу между шагами."""
         if not self.current_workflow_id:

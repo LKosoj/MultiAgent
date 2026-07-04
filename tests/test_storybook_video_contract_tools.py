@@ -158,8 +158,14 @@ def test_preflight_can_load_provider_env_from_repo_env_file(tmp_path, monkeypatc
 
     video_contract._load_env_file()
 
-    provider, _providers = video_contract._select_provider()
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool"
+    )
+    provider, providers = video_contract._select_provider()
     assert provider == "aitunnel"
+    aitunnel = next(p for p in providers if p["name"] == "aitunnel")
+    assert aitunnel["configured"] is True
+    assert aitunnel["active"] is True
 
 
 def test_delivery_promise_disabled_run_is_explicit_skip(tmp_path, monkeypatch):
@@ -338,3 +344,159 @@ def test_video_music_readiness_reports_invalid_provider_jobs_schema(tmp_path, mo
     assert result["ready"] is False
     assert result["artifacts"]["provider_jobs"]["status"] == "invalid"
     assert "invalid_json_shape:provider_jobs.json" in result["errors"]
+
+
+def _clear_provider_env(monkeypatch):
+    for name in [
+        "AITUNNEL_API_KEY",
+        "AITUNNEL_VIDEO_MODEL",
+        "MINIMAX_API_KEY",
+        "KLING_API_KEY",
+        "KLING_API_SECRET_KEY",
+        "GOOGLE_CLOUD_PROJECT",
+        "GEMINI_API_KEY",
+    ]:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_delivery_promise_does_not_promise_when_active_provider_unconfigured(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _clear_provider_env(monkeypatch)
+    # Only minimax is configured, but the active pipeline tool is aitunnel.
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool"
+    )
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["provider"] == "aitunnel"
+    assert result["capabilities"]["video"] is False
+    assert result["will_generate_video"] is False
+    assert "video_provider_unavailable" in result["blocking_reasons"]
+
+
+def test_preflight_reports_active_provider_not_first_configured(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _clear_provider_env(monkeypatch)
+    # Both aitunnel (first in the menu) and minimax are configured, but minimax is active.
+    monkeypatch.setenv("AITUNNEL_API_KEY", "sk-test")
+    monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", "video-model")
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_mm_tool"
+    )
+
+    result = video_contract.storybook_video_preflight_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    artifact = tmp_path / result["artifact_path"]
+    saved = json.loads(artifact.read_text(encoding="utf-8"))
+    assert saved["provider"] == "minimax"
+    assert saved["capabilities"]["video"] is True
+    active = [p for p in saved["capability_details"]["providers_considered"] if p["active"]]
+    assert [p["name"] for p in active] == ["minimax"]
+
+
+def test_delivery_promise_promises_when_active_provider_configured(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool"
+    )
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["provider"] == "aitunnel"
+    assert result["will_generate_video"] is True
+    assert result["blocking_reasons"] == []
+
+
+def test_decision_log_records_active_provider_not_menu_pick(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _clear_provider_env(monkeypatch)
+    monkeypatch.setenv("AITUNNEL_API_KEY", "sk-test")
+    monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", "video-model")
+    monkeypatch.setenv("MINIMAX_API_KEY", "mm-key")
+    monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_mm_tool"
+    )
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+    video_contract.storybook_video_preflight_tool("session-1", "project-1")
+    video_contract.storybook_video_delivery_promise_tool("session-1", "project-1")
+
+    result = video_contract.storybook_video_decision_log_tool(
+        session_id="session-1",
+        project_id="project-1",
+    )
+
+    provider_decision = next(d for d in result["decisions"] if d["name"] == "video_provider")
+    assert provider_decision["selected"] == "minimax"
+
+
+def test_active_provider_unresolved_blocks_promise(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)  # aitunnel is fully configured
+    # The pipeline YAML can no longer be resolved to a known provider -> fail-closed.
+    monkeypatch.setattr(video_contract, "_active_video_tool_name", lambda: None)
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["provider"] == "none"
+    assert result["capabilities"]["video"] is False
+    assert result["will_generate_video"] is False
+    assert "video_provider_unresolved" in result["blocking_reasons"]
+
+
+def test_decision_log_status_reflects_missing_final_video(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.setattr(
+        video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool"
+    )
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+    video_contract.storybook_video_preflight_tool("session-1", "project-1")
+    video_contract.storybook_video_delivery_promise_tool("session-1", "project-1")
+
+    result = video_contract.storybook_video_decision_log_tool("session-1", "project-1")
+    assert result["final_video_status"] == "missing"
+    assert result["status"] == "incomplete"
+
+    final_dir = tmp_path / "plots" / "storybooks" / "project-1" / "99_final"
+    final_dir.mkdir(parents=True, exist_ok=True)
+    (final_dir / "final_video.mp4").write_bytes(b"mp4")
+
+    present = video_contract.storybook_video_decision_log_tool("session-1", "project-1")
+    assert present["final_video_status"] == "present"
+    assert present["status"] == "success"
+
+
+def test_live_yaml_video_step_maps_to_known_provider():
+    # Switch-agnostic drift guard: whichever tool_name is left uncommented in the
+    # canonical pipeline must map to a known provider (catches step-id/tool typos).
+    tool_name = video_contract._active_video_tool_name()
+    assert tool_name in video_contract._TOOL_NAME_TO_PROVIDER
+    provider = video_contract._active_video_provider()
+    assert provider is not None
+    assert provider in set(video_contract._TOOL_NAME_TO_PROVIDER.values())

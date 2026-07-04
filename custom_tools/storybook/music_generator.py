@@ -21,6 +21,17 @@ _USER_AGENT = (
 )
 
 
+class _SunoTransientError(RuntimeError):
+    """Временный сбой чтения ответа Suno (HTTP 429/5xx, не-JSON, разрыв связи).
+
+    Отделяет «статус джобы временно недоступен» от genuine-провала
+    ``RuntimeError("Suno task failed for all clips")``. При транзиентной ошибке
+    В ПРОЦЕССЕ ПОЛЛИНГА джоба уже отправлена и оплачена — сохраняем durable
+    "submitted"-манифест (с clip_ids) и НЕ ресабмитим, чтобы не платить за
+    второй Suno job; следующий прогон дорезюмирует поллинг.
+    """
+
+
 def storybook_music_generator_tool(
     session_id: str,
     project_id: str,
@@ -129,8 +140,35 @@ def storybook_music_generator_tool(
 
     music_prompt = _clip_prompt(prompt or _build_music_prompt(base_dir, language))
     task_id: Optional[str] = None
+    clip_ids: List[str] = []
     try:
         auth = _authenticate(cookie_raw)
+
+        # M-20: money-safety resume. If a prior run already submitted a paid Suno job
+        # (durable clip_ids persisted in music_manifest.json), poll those clip ids on the
+        # free feed before resubmitting. force_regenerate bypasses this; captcha is not
+        # required to poll an existing submission.
+        if not force_regenerate:
+            saved_clip_ids = _saved_submitted_clip_ids(manifest_path)
+            if saved_clip_ids:
+                clip_ids = saved_clip_ids
+                resumed = _resume_saved_clips(
+                    auth=auth,
+                    clip_ids=saved_clip_ids,
+                    session_id=session_id,
+                    project_id=project_id,
+                    language=language,
+                    provider=provider,
+                    music_path=music_path,
+                    manifest_path=manifest_path,
+                    audio_manifest_path=audio_manifest_path,
+                    music_prompt=music_prompt,
+                    timeout_seconds=timeout_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                )
+                if resumed is not None:
+                    return resumed
+                clip_ids = []
 
         captcha_required = _captcha_required(auth)
         manual_token = _env("SUNO_HCAPTCHA_TOKEN") or None
@@ -183,18 +221,48 @@ def storybook_music_generator_tool(
                 music_path=music_path,
                 prompt=music_prompt,
                 task_id=task_id,
+                clip_ids=clip_ids,
                 provider_response=submit_response,
             )
             _write_json(manifest_path, payload)
             _merge_music_status(audio_manifest_path, payload, track=None)
             return _tool_result(payload, manifest_path, music_path)
 
-        record_payload, audio_url, task_id = _wait_for_suno_audio_url(
-            auth=auth,
+        # M-20: persist clip_ids as "submitted" BEFORE polling so a kill/timeout mid-poll
+        # cannot orphan the paid Suno job; the next run resume-polls these ids for free.
+        submitted_payload = _manifest_payload(
+            session_id=session_id,
+            project_id=project_id,
+            language=language,
+            provider=provider,
+            status="submitted",
+            message="Suno music generation submitted; polling for completion",
+            music_path=music_path,
+            prompt=music_prompt,
+            task_id=clip_ids[0],
             clip_ids=clip_ids,
-            timeout_seconds=timeout_seconds,
-            poll_interval_seconds=poll_interval_seconds,
+            provider_response=submit_response,
         )
+        _write_json(manifest_path, submitted_payload)
+        _merge_music_status(audio_manifest_path, submitted_payload, track=None)
+
+        try:
+            record_payload, audio_url, task_id = _wait_for_suno_audio_url(
+                auth=auth,
+                clip_ids=clip_ids,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except TimeoutError as exc:
+            # Keep the durable "submitted" manifest (with clip_ids) intact so a later run
+            # resume-polls instead of paying for a second Suno job.
+            return _error_result(str(exc), manifest_path=manifest_path, music_path=music_path)
+        except _SunoTransientError as exc:
+            # Транзиентная ошибка чтения Suno-feed (HTTP 429/5xx / не-JSON) в процессе
+            # поллинга: джоба уже отправлена и оплачена, статус лишь временно недоступен.
+            # Сохраняем durable "submitted"-манифест (clip_ids на месте) — НЕ даём внешнему
+            # except перезаписать его в "error", иначе следующий прогон ресабмитит (двойная оплата).
+            return _error_result(str(exc), manifest_path=manifest_path, music_path=music_path)
         if not audio_url:
             message = "Suno task completed without an audio URL"
             payload = _manifest_payload(
@@ -213,9 +281,27 @@ def storybook_music_generator_tool(
             _merge_music_status(audio_manifest_path, payload, track=None)
             return _error_result(message, manifest_path=manifest_path, music_path=music_path)
 
-        _download_audio(audio_url, music_path)
+        try:
+            _download_audio(audio_url, music_path)
+        except Exception as exc:
+            # Джоба сгенерирована и ОПЛАЧЕНА (audio_url получен) — сбой лишь на СКАЧИВАНИИ
+            # (CDN 5xx / обрыв соединения / пустой файл). Сохраняем durable "submitted"-манифест
+            # (он на диске с момента сабмита, clip_ids на месте), чтобы следующий прогон
+            # дорезюмировал и докачал бесплатно. НЕ даём внешнему except перезаписать статус
+            # в "error", иначе resume пропустится и джоба будет ресабмичена = двойная оплата.
+            return _error_result(
+                f"Suno audio download failed: {exc}",
+                manifest_path=manifest_path,
+                music_path=music_path,
+            )
     except Exception as exc:
         message = f"Suno music generation failed: {exc}"
+        # WS-G: не затираем durable "submitted"-манифест уже оплаченной pending-джобы, если
+        # ТЕКУЩИЙ прогон ещё не сформировал собственный сабмит (напр. транзиент в auth/сети ДО
+        # resume): иначе следующий прогон не резюмирует сохранённые clip_ids и ресабмитит =
+        # двойная оплата. Собственный сабмит этого прогона выставляет clip_ids (непустой).
+        if not clip_ids and _saved_submitted_clip_ids(manifest_path):
+            return _error_result(message, manifest_path=manifest_path, music_path=music_path)
         payload = _manifest_payload(
             session_id=session_id,
             project_id=project_id,
@@ -226,6 +312,7 @@ def storybook_music_generator_tool(
             music_path=music_path,
             prompt=music_prompt,
             task_id=task_id,
+            clip_ids=clip_ids or None,
         )
         _write_json(manifest_path, payload)
         _merge_music_status(audio_manifest_path, payload, track=None)
@@ -242,6 +329,7 @@ def storybook_music_generator_tool(
         music_path=music_path,
         prompt=music_prompt,
         task_id=task_id,
+        clip_ids=clip_ids,
         track=track,
         provider_response=record_payload,
     )
@@ -326,9 +414,17 @@ def _post_suno_generate(auth: Dict[str, Any], payload: Dict[str, Any]) -> Dict[s
 
 def _get_suno_feed(auth: Dict[str, Any], clip_ids: List[str]) -> Dict[str, Any]:
     url = _url(STUDIO_API_BASE_URL, "/api/feed/v2")
-    response = requests.get(
-        url, headers=_studio_headers(auth), params={"ids": ",".join(clip_ids)}, timeout=_request_timeout()
-    )
+    try:
+        response = requests.get(
+            url, headers=_studio_headers(auth), params={"ids": ",".join(clip_ids)}, timeout=_request_timeout()
+        )
+    except requests.exceptions.RequestException as exc:
+        # WS-G: транзиент сетевого слоя (read-timeout / обрыв соединения / DNS) при поллинге
+        # уже отправленной и ОПЛАЧЕННОЙ джобы — ответ не получен, статус клипов временно
+        # недоступен. Конвертируем в _SunoTransientError, чтобы poll-обработчики сохранили
+        # durable "submitted" и НЕ ресабмитили (иначе двойная оплата). Genuine-провал джобы
+        # ("failed for all clips") рождается уже ПОСЛЕ успешного чтения feed и идёт своим путём.
+        raise _SunoTransientError(f"Suno feed request failed: {exc}") from exc
     return _json_response(response)
 
 
@@ -382,13 +478,16 @@ def _json_response(response: Any) -> Dict[str, Any]:
     status_code = getattr(response, "status_code", 200)
     if status_code >= 400:
         text = getattr(response, "text", "")
-        raise RuntimeError(f"HTTP {status_code}: {text[:300]}")
+        # Транзиент: HTTP-ошибка от Suno API/гейтвея. Не означает провал джобы —
+        # её статус временно недоступен, ресабмит недопустим (двойная оплата).
+        raise _SunoTransientError(f"HTTP {status_code}: {text[:300]}")
     try:
         payload = response.json()
     except Exception as exc:
-        raise RuntimeError(f"Suno response is not JSON: {exc}") from exc
+        # Не-JSON (например HTML-страница 502 от прокси) — тоже транзиент.
+        raise _SunoTransientError(f"Suno response is not JSON: {exc}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeError("Suno response must be a JSON object")
+        raise _SunoTransientError("Suno response must be a JSON object")
     return payload
 
 
@@ -510,6 +609,131 @@ def _feed_clips(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [clip for clip in clips if isinstance(clip, dict)]
 
 
+def _saved_submitted_clip_ids(manifest_path: Path) -> List[str]:
+    """Return durable clip ids from a prior "submitted" music_manifest.json (M-20 resume)."""
+    manifest = _read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        return []
+    if str(manifest.get("status") or "").strip().lower() != "submitted":
+        return []
+    clip_ids = manifest.get("clip_ids")
+    if not isinstance(clip_ids, list):
+        return []
+    return [str(clip_id) for clip_id in clip_ids if clip_id not in (None, "")]
+
+
+def _resume_saved_clips(
+    auth: Dict[str, Any],
+    clip_ids: List[str],
+    session_id: str,
+    project_id: str,
+    language: str,
+    provider: str,
+    music_path: Path,
+    manifest_path: Path,
+    audio_manifest_path: Path,
+    music_prompt: str,
+    timeout_seconds: int,
+    poll_interval_seconds: int,
+) -> Optional[Dict[str, Any]]:
+    """Poll saved clip ids before resubmitting a paid Suno job (M-20).
+
+    Returns a tool result to short-circuit resubmission, or ``None`` when a fresh
+    submission is warranted (all saved clips failed).
+    """
+    try:
+        record_payload, audio_url, task_id = _wait_for_suno_audio_url(
+            auth=auth,
+            clip_ids=clip_ids,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+        )
+    except TimeoutError:
+        # Clips still in progress at the deadline: keep the submission, do NOT resubmit.
+        payload = _manifest_payload(
+            session_id=session_id,
+            project_id=project_id,
+            language=language,
+            provider=provider,
+            status="submitted",
+            message="Suno clips still in progress; kept existing submission without resubmitting",
+            music_path=music_path,
+            prompt=music_prompt,
+            task_id=clip_ids[0],
+            clip_ids=clip_ids,
+        )
+        _write_json(manifest_path, payload)
+        _merge_music_status(audio_manifest_path, payload, track=None)
+        return _tool_result(payload, manifest_path, music_path)
+    except _SunoTransientError:
+        # Транзиент чтения feed при resume (HTTP 429/5xx / не-JSON): статус клипов
+        # временно недоступен, но джоба жива и оплачена. НЕ ресабмитим — сохраняем
+        # "submitted" для следующего прогона (иначе двойная оплата).
+        payload = _manifest_payload(
+            session_id=session_id,
+            project_id=project_id,
+            language=language,
+            provider=provider,
+            status="submitted",
+            message="Suno feed temporarily unavailable; kept existing submission without resubmitting",
+            music_path=music_path,
+            prompt=music_prompt,
+            task_id=clip_ids[0],
+            clip_ids=clip_ids,
+        )
+        _write_json(manifest_path, payload)
+        _merge_music_status(audio_manifest_path, payload, track=None)
+        return _tool_result(payload, manifest_path, music_path)
+    except RuntimeError:
+        # All saved clips failed (genuine): a fresh submission is warranted.
+        return None
+
+    if not audio_url:
+        return None
+
+    try:
+        _download_audio(audio_url, music_path)
+    except Exception as exc:
+        # Клип готов и ОПЛАЧЕН (poll вернул audio_url), сбой лишь на СКАЧИВАНИИ. Сохраняем
+        # статус "submitted" (а не "error"), чтобы следующий прогон дорезюмировал и докачал
+        # бесплатно, а не ресабмитил джобу = двойная оплата.
+        message = f"Suno resume download failed: {exc}"
+        payload = _manifest_payload(
+            session_id=session_id,
+            project_id=project_id,
+            language=language,
+            provider=provider,
+            status="submitted",
+            message=message,
+            music_path=music_path,
+            prompt=music_prompt,
+            task_id=clip_ids[0],
+            clip_ids=clip_ids,
+        )
+        _write_json(manifest_path, payload)
+        _merge_music_status(audio_manifest_path, payload, track=None)
+        return _error_result(message, manifest_path=manifest_path, music_path=music_path)
+
+    track = _music_track(music_path, provider, task_id=task_id, reused=False)
+    payload = _manifest_payload(
+        session_id=session_id,
+        project_id=project_id,
+        language=language,
+        provider=provider,
+        status="success",
+        message="Resumed existing Suno submission without resubmitting",
+        music_path=music_path,
+        prompt=music_prompt,
+        task_id=task_id,
+        clip_ids=clip_ids,
+        track=track,
+        provider_response=record_payload,
+    )
+    _write_json(manifest_path, payload)
+    _merge_music_status(audio_manifest_path, payload, track=track)
+    return _tool_result(payload, manifest_path, music_path)
+
+
 def _merge_music_status(audio_manifest_path: Path, music_manifest: Dict[str, Any], track: Optional[Dict[str, Any]]) -> None:
     audio_manifest = _read_json(audio_manifest_path)
     if not isinstance(audio_manifest, dict):
@@ -559,6 +783,7 @@ def _manifest_payload(
     music_path: Path,
     prompt: Optional[str] = None,
     task_id: Optional[str] = None,
+    clip_ids: Optional[List[str]] = None,
     track: Optional[Dict[str, Any]] = None,
     reused_existing: bool = False,
     provider_response: Optional[Dict[str, Any]] = None,
@@ -579,9 +804,31 @@ def _manifest_payload(
         payload["prompt"] = prompt
     if task_id:
         payload["task_id"] = task_id
+    if clip_ids:
+        payload["clip_ids"] = [str(clip_id) for clip_id in clip_ids]
     if provider_response is not None:
-        payload["provider_response"] = provider_response
+        payload["provider_response"] = _summarize_provider_response(provider_response)
     return payload
+
+
+def _summarize_provider_response(payload: Any) -> Any:
+    """Keep only clips[].{id,status,title} plus top-level scalar flags.
+
+    Full Suno feed payloads carry bulky per-clip metadata/lyrics that must not be
+    persisted verbatim in music_manifest.json (INFO finding).
+    """
+    if not isinstance(payload, dict):
+        return payload
+    summary: Dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in ("clips", "data") or isinstance(value, (dict, list)):
+            continue
+        summary[key] = value
+    summary["clips"] = [
+        {"id": clip.get("id"), "status": clip.get("status"), "title": clip.get("title")}
+        for clip in _feed_clips(payload)
+    ]
+    return summary
 
 
 def _tool_result(payload: Dict[str, Any], manifest_path: Path, music_path: Path) -> Dict[str, Any]:
@@ -637,7 +884,9 @@ def _read_json(path: Path) -> Any:
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def _url(base_url: str, endpoint: str) -> str:

@@ -13,7 +13,8 @@ from typing import Any, Dict, Optional
 
 
 _PROVIDER_NAME = "aitunnel"
-_PROVIDER_JOBS_VERSION = 1
+_PROVIDER_JOBS_VERSION = 2
+_CURRENT_HASH_INPUTS_VERSION = 2
 _PROVIDER_JOBS_THREAD_LOCKS: Dict[str, threading.RLock] = {}
 _PROVIDER_JOBS_THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -38,13 +39,21 @@ class _ProviderJobStore:
             payload = json.load(jobs_file)
 
         if isinstance(payload, list):
-            return {"version": _PROVIDER_JOBS_VERSION, "jobs": payload}
-        if isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
-            return {
+            data = {"version": _PROVIDER_JOBS_VERSION, "jobs": payload}
+        elif isinstance(payload, dict) and isinstance(payload.get("jobs"), list):
+            data = {
                 "version": payload.get("version", _PROVIDER_JOBS_VERSION),
                 "jobs": payload["jobs"],
             }
-        raise ValueError(f"Неверная структура provider_jobs.json: {self.path}")
+        else:
+            raise ValueError(f"Неверная структура provider_jobs.json: {self.path}")
+
+        # Legacy jobs predate per-job hash_inputs_version (M-6): treat as v1 so the
+        # migration compat measures (no-stale + shot-identity resume) engage.
+        for job in data["jobs"]:
+            if isinstance(job, dict):
+                job.setdefault("hash_inputs_version", 1)
+        return data
 
     def mark_stale_for_changed_input(self, shot_key: str, input_hash: str) -> None:
         now = _utc_now_iso()
@@ -55,6 +64,11 @@ class _ProviderJobStore:
                 if job.get("provider") != _PROVIDER_NAME:
                     continue
                 if job.get("shot_key") != shot_key:
+                    continue
+                if job.get("hash_inputs_version", 1) != _CURRENT_HASH_INPUTS_VERSION:
+                    # M-6 compat: a hash-formula bump changes input_hash for unchanged
+                    # shots; never stale a legacy job just because of that, or its live
+                    # task_id would be lost and the paid task resubmitted.
                     continue
                 if job.get("input_hash") == input_hash or job.get("status") == "stale":
                     continue
@@ -93,17 +107,50 @@ class _ProviderJobStore:
             job = self._find_latest_locked(shot_key, input_hash)
             return _copy_job(job) if job else None
 
-    def find_resumable_job(self, shot_key: str, input_hash: str) -> Optional[Dict[str, Any]]:
+    def find_resumable_job(
+        self,
+        shot_key: str,
+        input_hash: str,
+        prompt_hash: Optional[str] = None,
+        source_image_hashes: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Optional[Dict[str, Any]]:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             for job in reversed(self._data["jobs"]):
                 if job.get("provider") != _PROVIDER_NAME:
                     continue
-                if job.get("shot_key") != shot_key or job.get("input_hash") != input_hash:
+                if not _job_matches_identity(job, shot_key, input_hash, prompt_hash, source_image_hashes):
                     continue
                 if job.get("status") in {"stale", "failed", "prepared"}:
                     continue
                 return _copy_job(job)
+            return None
+
+    def find_task_id_for_resubmit(
+        self,
+        shot_key: str,
+        input_hash: str,
+        prompt_hash: Optional[str] = None,
+        source_image_hashes: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Optional[str]:
+        """task_id of a prior non-resumable job for the same shot inputs.
+
+        Used to verify (single free GET) whether an already-paid task actually
+        completed before spending money on a resubmit; matches by input_hash or,
+        for legacy-hash jobs, by shot identity (M-6 migration).
+        """
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            for job in reversed(self._data["jobs"]):
+                if job.get("provider") != _PROVIDER_NAME:
+                    continue
+                if not job.get("task_id"):
+                    continue
+                if job.get("status") == "stale":
+                    continue
+                if not _job_matches_identity(job, shot_key, input_hash, prompt_hash, source_image_hashes):
+                    continue
+                return job.get("task_id")
             return None
 
     def find_latest_output_job_for_shot(self, shot_key: str, output_path: str) -> Optional[Dict[str, Any]]:
@@ -178,6 +225,27 @@ def _copy_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return json.loads(json.dumps(job))
 
 
+def _job_matches_identity(
+    job: Dict[str, Any],
+    shot_key: str,
+    input_hash: str,
+    prompt_hash: Optional[str],
+    source_image_hashes: Optional[Dict[str, Optional[str]]],
+) -> bool:
+    if job.get("shot_key") != shot_key:
+        return False
+    if job.get("input_hash") == input_hash:
+        return True
+    # M-6 compat: a legacy-hash job has a different input_hash for the same shot;
+    # fall back to shot identity so its live task_id is reused, not resubmitted.
+    if job.get("hash_inputs_version", 1) != _CURRENT_HASH_INPUTS_VERSION and prompt_hash is not None:
+        return (
+            job.get("prompt_hash") == prompt_hash
+            and (job.get("source_image_hashes") or {}) == (source_image_hashes or {})
+        )
+    return False
+
+
 class _ProviderJobsFileLock:
     def __init__(self, path: Path):
         self.path = path
@@ -231,6 +299,8 @@ def _new_provider_job(
     source_image_hashes: Dict[str, Optional[str]],
     input_hash: str,
     output_path: str,
+    resolved_size_params: Optional[Dict[str, str]] = None,
+    resolved_duration: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "shot_key": shot_key,
@@ -239,8 +309,12 @@ def _new_provider_job(
         "prompt_hash": prompt_hash,
         "source_image_hashes": source_image_hashes,
         "input_hash": input_hash,
+        "hash_inputs_version": _CURRENT_HASH_INPUTS_VERSION,
+        "resolved_size_params": resolved_size_params,
+        "resolved_duration": resolved_duration,
         "task_id": None,
         "status": "prepared",
+        "provider_status": None,
         "cost": None,
         "currency": None,
         "output_path": output_path,
@@ -309,21 +383,27 @@ def _build_input_hash(
     model_name: str,
     prompt_hash: str,
     source_image_hashes: Dict[str, Optional[str]],
-    duration: int,
-    size_params: Dict[str, str],
+    requested_duration: int,
+    requested_width: int,
+    requested_height: int,
     seed: Optional[int],
     frame_types: list[str],
+    generate_audio: bool = False,
 ) -> str:
+    # M-6: hash only user-controlled inputs. The resolved duration/size come from
+    # the provider's (process-cached, mutable) model catalog and must NOT enter the
+    # hash, or a catalog change would force mass paid regeneration of unchanged shots.
     return _hash_json(
         {
             "provider": _PROVIDER_NAME,
             "model": model_name,
             "prompt_hash": prompt_hash,
             "source_image_hashes": source_image_hashes,
-            "duration": duration,
-            "size_params": size_params,
+            "requested_duration": requested_duration,
+            "requested_width": requested_width,
+            "requested_height": requested_height,
             "seed": seed,
-            "generate_audio": False,
+            "generate_audio": generate_audio,
             "frame_types": frame_types,
         }
     )

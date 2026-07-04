@@ -12,6 +12,12 @@ from utils import call_openai_api, extract_json_from_markdown
 from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import (
     _extract_shot_frame_spec_llm,
 )
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.domain_glossary_config import (
+    resolve_active_domain_profile,
+    compose_anchor_glossary_note,
+    compose_qa_domain_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +45,13 @@ def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
+
+
+def _safe_int(value: Any, default: int = -1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 
 def _normalize_cam_plan(s: str) -> str:
@@ -232,7 +245,7 @@ def _llm_judge_video_prompt_lite(
         "| DIRECTION | Preserve EXACT movement direction from storyboard. Downward cues -> downward verbs only. Upward cues -> upward verbs only. Never reverse. |\n"
         "| TIMING/MOMENT | Preserve EXACT timing. Contact cues (touches/makes contact) -> contact moment only. Pre-contact cues (above/hovering) -> pre-contact state only. No phase shifting. |\n"
         "| KEY ACTION | Reflect key action and timing from storyboard. No drift, no time shift. |\n"
-        "| POV/ANCHOR PHRASE | Keep explicit POV/anchor phrases. Translate to English. No anchor substitution (e.g., bleachers!=podium). |\n"
+        "| POV/ANCHOR PHRASE | Keep explicit POV/anchor phrases. Translate to English. No anchor substitution (do not swap one anchor location for another). |\n"
         "| CLOSE-UP FRAMING | Tight framing on specified subject. Environment = blurred light/shapes only. No room/venue detail. |\n"
         "| REACTION/GAZE | No forced \"looking at camera\" for reactions unless storyboard says so. Prefer off-screen/sideways gaze. |\n\n"
         "## Additional rules\n"
@@ -240,9 +253,10 @@ def _llm_judge_video_prompt_lite(
         "- No absence-assertions (\"no X\"/\"without X\") unless storyboard explicitly requires absence.\n"
         "- Describe transition/micro-dynamics, not static restatement.\n"
         "- No invented story events. No raw newlines in strings.\n"
-        "- Anchor glossary: \u0442\u0440\u0438\u0431\u0443\u043d\u0430->podium/lectern, \u043c\u0438\u043a\u0440\u043e\u0444\u043e\u043d->microphone, \u043c\u043e\u043d\u0438\u0442\u043e\u0440->monitor, \u0430\u043d\u0435\u0441\u0442\u0435\u0437\u0438\u043e\u043b\u043e\u0433->anesthesiologist, \u0430\u0441\u0441\u0438\u0441\u0442\u0435\u043d\u0442->assistant.\n"
-        "- Pattern \"\u0432\u0438\u0434 \u0438\u0437-\u0437\u0430 <ANCHOR>\"/\"\u0443 <ANCHOR>\"/\"\u0437\u0430 <ANCHOR>\" -> translate <ANCHOR> to English and include it.\n"
     )
+    # M-25: \u0434\u043e\u043c\u0435\u043d\u043d\u044b\u0439 RU->EN glossary/anchor-pattern \u0432\u044b\u043d\u0435\u0441\u0435\u043d \u0432 domain_glossary_config.
+    # \u0414\u0435\u0444\u043e\u043b\u0442\u043d\u044b\u0439 \u043f\u0440\u043e\u0444\u0438\u043b\u044c \u043f\u0443\u0441\u0442 => note == "" (\u043f\u0440\u043e\u043c\u043f\u0442 \u043e\u0441\u0442\u0430\u0451\u0442\u0441\u044f \u0443\u043d\u0438\u0432\u0435\u0440\u0441\u0430\u043b\u044c\u043d\u044b\u043c).
+    sys += compose_anchor_glossary_note()
     if needs_close:
         sys += "- For CLOSE UP and EXTREME CLOSE UP: candidate MUST contain the words \"close-up\" or \"close up\".\n"
     if needs_extreme:
@@ -1110,7 +1124,7 @@ Output: COMPACT PATCH OPS only. No full prompt rewrites. STRICT JSON object, no 
 | DIRECTION LOCK | Preserve EXACT movement direction from storyboard. Never reverse. |
 | TIMING/MOMENT LOCK | Preserve EXACT timing. Contact = contact, not pre-contact. No phase shifting. |
 | SCENE vs SHOT TRUTH | storyboard.description = ground truth. Do NOT spray scene.action props across shots. Remove foreign concrete objects. |
-| STAGE GEOMETRY | Seats face stage. Podium on stage side. Physically consistent layout. |
+| SPATIAL LAYOUT | Keep the physical layout self-consistent with the screenplay. Do NOT invent venue/seating geometry absent from the storyboard. |
 | CLOSE-UP FRAMING | MUST contain "close-up"/"extreme close-up" tokens. Remove room/venue establishing clauses. One blur-hint max. Keep primary subject unchanged. |
 | SPLIT SCREEN | If camera_plan includes SPLIT SCREEN, video_prompt MUST contain "split-screen". |
 | video_prompt set | When changing START video_prompt and cannot guarantee exact substring match, PREFER patch.video_prompt.set with FULL final string. |
@@ -1138,6 +1152,11 @@ Output: COMPACT PATCH OPS only. No full prompt rewrites. STRICT JSON object, no 
 - 'set' is FORBIDDEN for english_prompt. Only micro-edits allowed.
 - For video_prompt: ONLY 'set' is allowed (no replacements/prepend/append). video_prompt must remain single-line English.
 """.replace("{MAX_REPAIRS}", str(int(max_repairs)))
+
+    # M-25: тот же доменный блок, что и в per-scene repair pass, чтобы кросс-сценовый
+    # глобальный проход применял spatial/physics-локи активного профиля симметрично.
+    # Дефолтный профиль пуст => ничего не добавляется, промпт остаётся универсальным.
+    system_prompt += compose_qa_domain_prompt()
 
     payload = {"screenplay_outline": outline, "generated_prompts": generated}
     payload_str = json.dumps(payload, ensure_ascii=False)
@@ -1222,25 +1241,43 @@ def shots_prompt_qa_tool(
         logger.warning(f"🧪 shots_prompt_qa_tool: модель '{model}' не найдена в model_mapping, используем model_hard")
         model_obj = model_hard
 
-    screenplay_path = f"plots/storybooks/{project_id}/91_screenplay/screenplay.json"
-    shots_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
-    report_path = f"plots/storybooks/{project_id}/97_shots/shots_prompt_qa_report.json"
+    base = str(safe_storybook_project_dir(project_id))
+    screenplay_path = f"{base}/91_screenplay/screenplay.json"
+    shots_path = f"{base}/97_shots/shots.json"
+    report_path = f"{base}/97_shots/shots_prompt_qa_report.json"
 
     if shots_data is None:
         shots_data = _read_json(shots_path) or {"items": [], "consistency_rules": []}
 
-    # Skip повторную валидацию, если уже провалидировано (если не force)
+    # Skip повторную валидацию, если ЗАПРОШЕННЫЕ сцены уже провалидированы (если не force).
+    # M-27: per-scene coverage. Новый prompts_validated=True выставляется только при полном
+    # покрытии, поэтому флаг True => можно пропустить любой скоуп. Иначе пропуск только если
+    # requested ⊆ prompts_validated_scenes. Легаси prompts_validated=True без scenes => scope=all.
     if not force:
-        already_validated = bool(shots_data.get("prompts_validated"))
-        if not already_validated and os.path.exists(shots_path):
+        on_disk_meta: Dict[str, Any] = {}
+        if os.path.exists(shots_path):
             try:
                 on_disk_meta = _read_json(shots_path) or {}
-                already_validated = bool(on_disk_meta.get("prompts_validated"))
             except Exception:
-                already_validated = False
-
-        if already_validated:
-            logger.info("🧪 shots_prompt_qa_tool: пропуск — shots.json уже помечен как prompts_validated=true")
+                on_disk_meta = {}
+        validated_flag = bool(shots_data.get("prompts_validated")) or bool(on_disk_meta.get("prompts_validated"))
+        validated_scenes = {
+            _safe_int(x) for x in (shots_data.get("prompts_validated_scenes") or [])
+        } | {
+            _safe_int(x) for x in (on_disk_meta.get("prompts_validated_scenes") or [])
+        }
+        validated_scenes.discard(-1)
+        if scene_numbers is not None:
+            try:
+                requested = {int(x) for x in (scene_numbers or [])}
+            except Exception:
+                requested = set()
+            can_skip = validated_flag or (bool(requested) and requested <= validated_scenes)
+        else:
+            # requested = все сцены; полное покрытие соответствует prompts_validated=True.
+            can_skip = validated_flag
+        if can_skip:
+            logger.info("🧪 shots_prompt_qa_tool: пропуск — запрошенные сцены уже провалидированы")
             return shots_data
 
     screenplay_data = _read_json(screenplay_path) or {}
@@ -1269,8 +1306,13 @@ def shots_prompt_qa_tool(
             }
 
     if not items:
-        logger.info("🧪 shots_prompt_qa_tool: shots_data.items пустой, нечего валидировать")
-        return shots_data
+        # H-5: пустой items — это провал генерации кадров, а НЕ «успешная» валидация.
+        # Раньше здесь молча возвращался shots_data, из-за чего пустая генерация
+        # помечалась как пройденная. Теперь падаем явно.
+        raise RuntimeError(
+            "shots_prompt_qa_tool: shots_data.items пустой — нечего валидировать "
+            "(генерация кадров не дала ни одного шота)"
+        )
 
     scenes_by_number: Dict[int, Dict[str, Any]] = {}
     for sc in screenplay_scenes:
@@ -1322,7 +1364,7 @@ If shot_frame_spec exists for a shot, validate against it:
 ### Step 3: Per-shot validation against storyboard
 For each shot, check:
 1. Location/time matches scene (no wrong room/hall).
-2. Staging/zone consistency (stage/podium/aisle placement per screenplay).
+2. Spatial/zone consistency (physical placement of subjects/props per screenplay).
 3. Camera plan consistency (shot size/framing not contradicted).
 4. Language: english_prompt stays in its current language; video_prompt = English only, no Cyrillic; negative_prompt stays in its current language.
 5. START = T=0 static state (no dynamic verbs). END = T=final stop-frame (no process verbs like "being", "moving", "starts to").
@@ -1361,17 +1403,10 @@ Apply these violation checks in order. Each is a HARD CONTRADICTION requiring re
 ### POV & gaze locks
 | Lock | Rule |
 |------|------|
-| POV/ANCHOR PHRASE | Keep explicit POV/anchor phrases from storyboard. Translate to English for video_prompt. No substitution (bleachers != podium). |
+| POV/ANCHOR PHRASE | Keep explicit POV/anchor phrases from storyboard. Translate to English for video_prompt. No substitution (do not swap one anchor location for another). |
 | POV CHARACTER REF | For POV shots: OK to show no body. If any body parts visible, they MUST match POV character identity. Add missing POV character reference_image_paths. |
 | OVER-SHOULDER IDENTITY | Visible back/shoulder/head silhouette MUST match named character identity. |
 | REACTION/GAZE | No forced "looking at camera" for reaction shots unless storyboard says so. Prefer off-screen/sideways gaze. |
-
-### Spatial & physics locks
-| Lock | Rule |
-|------|------|
-| STAGE/AUDITORIUM GEOMETRY | Seats face stage. Podium on stage side. Do NOT place rows behind speaker when camera faces stage. Consistent physical layout. |
-| MICROPHONE/PODIUM ANCHOR | Hand/claw touching mic = podium/lectern mic on stage side. Primary focus on contact. Environment = generic blur hint. |
-| AUDIENCE REACTION ZONE | Audience members positioned in seating area, NOT on stage (unless storyboard says so). Podium/mic = distant background anchor only. |
 
 ### Content integrity locks
 | Lock | Rule |
@@ -1398,7 +1433,6 @@ Apply these violation checks in order. Each is a HARD CONTRADICTION requiring re
 
 ### Translation note
 - video_prompt = English only. Translate anchor nouns from Russian correctly.
-- Glossary: трибуна->podium/lectern, микрофон->microphone, монитор->monitor, анестезиолог->anesthesiologist, ассистент->assistant.
 
 ### Video_prompt repair structure (semantic, not rigid)
 When repairing START video_prompt:
@@ -1436,6 +1470,11 @@ When repairing START video_prompt:
 
 If there are no issues, return {"repairs": [], "notes": "ok"}.
 """
+    # M-25: доменный блок (spatial/physics locks + RU->EN glossary + POV substitution)
+    # вынесен в domain_glossary_config. Дефолтный профиль пуст => ничего не добавляется,
+    # промпт остаётся универсальным. Активный проект выбирает профиль через
+    # STORYBOOK_DOMAIN_PROFILE — качество не падает.
+    system_prompt += compose_qa_domain_prompt()
 
     report: Dict[str, Any] = {
         "project_id": project_id,
@@ -1448,7 +1487,10 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
         "rejected": [],
     }
 
-    scene_numbers_all = sorted(set(items_by_scene.keys()) & set(scenes_by_number.keys()))
+    # Полный набор валидируемых сцен (пересечение сгенерированных и сценарных) —
+    # нужен для M-27, чтобы отличать «покрыты все сцены» от частичного скоупа.
+    all_validatable_scenes = sorted(set(items_by_scene.keys()) & set(scenes_by_number.keys()))
+    scene_numbers_all = list(all_validatable_scenes)
     if scene_numbers is not None:
         try:
             allow = {int(x) for x in (scene_numbers or [])}
@@ -1458,11 +1500,38 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
     if max_scenes is not None:
         scene_numbers_all = scene_numbers_all[: max(0, int(max_scenes))]
 
+    # H-5: если в запрошенном скоупе не оказалось ни одного шота к валидации —
+    # это пустая генерация в этом скоупе, а не успех. Считаем ожидаемые
+    # (scene, shot) по storyboard vs присутствующие в items.
+    scope_scene_set = set(scene_numbers_all)
+    items_in_scope = [
+        it for it in items if _safe_int(it.get("scene_number")) in scope_scene_set
+    ]
+    expected_pairs = {
+        (sn, shn) for (sn, shn) in storyboard_lookup.keys() if sn in scope_scene_set
+    }
+    present_pairs = {
+        (_safe_int(it.get("scene_number")), _safe_int(it.get("shot_number")))
+        for it in items_in_scope
+    }
+    report["items_total"] = len(items_in_scope)
+    report["missing_shots"] = [
+        {"scene_number": sn, "shot_number": shn}
+        for (sn, shn) in sorted(expected_pairs - present_pairs)
+    ]
+    if report["items_total"] == 0:
+        raise RuntimeError(
+            "shots_prompt_qa_tool: в запрошенном скоупе нет ни одного шота к "
+            f"валидации (scenes={scene_numbers_all or 'all'}) — генерация кадров пуста"
+        )
+
     # ------------------------------------------------------------------
     # Параллельная обработка сцен через ThreadPoolExecutor
     # ------------------------------------------------------------------
     _items_lock = threading.Lock()
     _report_lock = threading.Lock()
+    # M-27: сцены, реально прошедшие валидацию (для per-scene coverage-статуса).
+    _processed_scenes: set = set()
 
     def _process_scene_qa(scene_number: int) -> None:
         """Обрабатывает одну сцену: пре-валидация + LLM QA + применение ремонтов."""
@@ -1746,6 +1815,7 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
 
         with _report_lock:
             report["scenes_processed"] += 1
+            _processed_scenes.add(int(scene_number))
             report["repairs_suggested"] += len(repairs)
             report["repairs_applied"] += applied_count
             report["repairs_rejected"] += len(rejected)
@@ -1809,10 +1879,25 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
             logger.info("🧪 shots_prompt_qa_tool: global screenplay pass done (no repairs)")
 
     # Ставим флаг только если реально обработали хотя бы одну сцену
+    # M-27: per-scene coverage. Ведём prompts_validated_scenes (union уже валидированных
+    # и только что обработанных). prompts_validated=True — ТОЛЬКО когда покрыты все
+    # валидируемые сцены. prompts_validated_scope сохраняем как раньше.
     if report.get("scenes_processed", 0) > 0:
         from datetime import datetime, timezone
 
-        shots_data["prompts_validated"] = True
+        existing_scenes = {
+            _safe_int(x) for x in (shots_data.get("prompts_validated_scenes") or [])
+        }
+        existing_scenes.discard(-1)
+        # Легаси: prompts_validated=True без scenes => считаем покрытыми все валидируемые.
+        if shots_data.get("prompts_validated") and not shots_data.get("prompts_validated_scenes"):
+            existing_scenes |= set(all_validatable_scenes)
+        validated_scenes = sorted(existing_scenes | {int(s) for s in _processed_scenes})
+        shots_data["prompts_validated_scenes"] = validated_scenes
+        shots_data["prompts_validated"] = (
+            bool(all_validatable_scenes)
+            and set(all_validatable_scenes) <= set(validated_scenes)
+        )
         shots_data["prompts_validated_at"] = datetime.now(timezone.utc).isoformat()
         shots_data["prompts_validated_tool"] = "shots_prompt_qa_tool"
         shots_data["prompts_validated_temperature"] = temperature
@@ -1843,6 +1928,23 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
                 try:
                     # Reload latest file content (if any) and merge items by key to avoid stomping
                     on_disk = _read_json(shots_path) or {}
+                    # M-27: union per-scene coverage с тем, что уже на диске — не затираем
+                    # сцены, провалидированные параллельными скоупами.
+                    if (
+                        shots_data.get("prompts_validated_scenes") is not None
+                        or on_disk.get("prompts_validated_scenes")
+                    ):
+                        merged_scenes = {
+                            _safe_int(x) for x in (shots_data.get("prompts_validated_scenes") or [])
+                        } | {
+                            _safe_int(x) for x in (on_disk.get("prompts_validated_scenes") or [])
+                        }
+                        merged_scenes.discard(-1)
+                        shots_data["prompts_validated_scenes"] = sorted(merged_scenes)
+                        shots_data["prompts_validated"] = (
+                            bool(all_validatable_scenes)
+                            and set(all_validatable_scenes) <= merged_scenes
+                        )
                     on_disk_items = on_disk.get("items") or []
                     if on_disk_items:
                         # Build index from updated in-memory items

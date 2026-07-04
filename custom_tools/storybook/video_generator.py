@@ -3,7 +3,10 @@ import json
 import logging
 import time
 import base64
+import threading
 import requests
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,6 +59,37 @@ def encode_jwt_token(ak, sk):
     }
     token = jwt.encode(payload, sk, headers=headers)
     return token
+
+
+def _error_result(message: str, **extra: Any) -> Dict[str, Any]:
+    result = {
+        "status": "error",
+        "message": message,
+        "error": message,
+        "results": [],
+    }
+    result.update(extra)
+    return result
+
+
+def _is_non_empty_file(path: str) -> bool:
+    try:
+        return bool(path) and os.path.exists(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
+def _sanitize_url_for_log(url: str) -> str:
+    """Возвращает netloc + усечённый путь без query для безопасного логирования подписанных URL."""
+    try:
+        parsed = urlparse(str(url or ""))
+        path = parsed.path or ""
+        if len(path) > 32:
+            path = path[:32] + "..."
+        return f"{parsed.netloc}{path}" if parsed.netloc else "<url>"
+    except Exception:
+        return "<url>"
+
 
 def video_generator_tool(
     session_id: str,
@@ -144,19 +178,24 @@ def video_generator_tool(
     
     # Фильтруем кадры, которые нужно конвертировать в видео
     video_items = []
+    seen_shots = set()  # Для дедупликации по scene_number + shot_number
     for item in items_list:
+        # Берем только START кадры для генерации видео (паритет с mm/veo)
+        if item.get("shot_type") != "start":
+            continue
+
         video_prompt = item.get("video_prompt", "").strip()
         video_path = item.get("video_path")
         scene_number = item.get("scene_number", "?")
         shot_number = item.get("shot_number", "?")
-        
+
         # Проверяем обязательные поля
         if not video_prompt or not video_path:
             logger.debug(f"⏭️ Пропускаем кадр без video_prompt или video_path: {scene_number}-{shot_number}")
             continue
-        
-        # Проверяем, существует ли уже видео
-        if os.path.exists(video_path):
+
+        # Проверяем, существует ли уже непустое видео
+        if _is_non_empty_file(video_path):
             logger.info(f"✅ Видео уже существует: {video_path}")
             continue
         
@@ -197,11 +236,18 @@ def video_generator_tool(
             end_image = end_path
             logger.debug(f"🖼️ Найдено end изображение: {end_pattern}")
         
+        # Проверяем дедупликацию по scene_number + shot_number
+        shot_key = f"{scene_number}-{shot_number}"
+        if shot_key in seen_shots:
+            logger.debug(f"⏭️ Пропускаем дубликат кадра: {shot_key}")
+            continue
+
         # Добавляем найденные изображения в item
         item_copy = item.copy()
         item_copy["start_image"] = start_image
         item_copy["end_image"] = end_image
-        
+
+        seen_shots.add(shot_key)
         video_items.append(item_copy)
     
     if not video_items:
@@ -259,17 +305,21 @@ def video_generator_tool(
 
     # Синхронизируем изменения обратно в items в памяти
     sync_items_to_memory(items, items_list)
-    
-    return {
-        "status": "success",
-        "message": f"Сгенерировано {successful} из {total} видео",
-        "results": results,
-        "stats": {
-            "total": total,
-            "successful": successful,
-            "failed": total - successful
-        }
+
+    stats = {
+        "total": total,
+        "successful": successful,
+        "failed": total - successful
     }
+    message = f"Сгенерировано {successful} из {total} видео"
+    if successful == total:
+        return {
+            "status": "success",
+            "message": message,
+            "results": results,
+            "stats": stats,
+        }
+    return _error_result(message, results=results, stats=stats)
 
 
 def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, Any]:
@@ -440,12 +490,12 @@ def _wait_for_video_completion(task_id: str, session_id: str, token: str, max_wa
                 headers=headers,
                 timeout=(30, 600)
             )
-            
-            # Если прошло больше 13 минут и статус не succeed, то возвращаем None
-            if time.time() - start_time > 900 and response.status_code != 200:
-                logger.error(f"❌ Ошибка проверки статуса task {task_id}: {str(response)}")
-                return None
-            
+
+            # Обрабатываем не-200 ответ: логируем и повторяем попытку
+            if response.status_code != 200:
+                logger.error(f"❌ Ошибка проверки статуса task {task_id}: {response.status_code} - {response.text}")
+                time.sleep(check_interval)
+                continue
 
             result = response.json()
             #logger.info(f"🔄 Статус task {task_id}: {str(result)}")
@@ -502,22 +552,38 @@ def _download_video(video_url: str, output_path: str) -> bool:
         
         response = requests.get(video_url, timeout=(30, 600), stream=True)
         response.raise_for_status()
-        
-        with open(output_path, "wb") as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-        
+
+        # Скачиваем атомарно: во временный файл + os.replace
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+        try:
+            with tmp_path.open("wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+                logger.error(f"❌ Файл не создался или пустой: {output_path}")
+                return False
+            os.replace(tmp_path, output)
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
         # Проверяем, что файл создался и не пустой
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+        if _is_non_empty_file(output_path):
             logger.info(f"✅ Видео скачано: {output_path}")
             return True
-        else:
-            logger.error(f"❌ Файл не создался или пустой: {output_path}")
-            return False
-            
+        logger.error(f"❌ Файл не создался или пустой: {output_path}")
+        return False
+
     except Exception as e:
-        logger.error(f"❌ Ошибка скачивания видео {video_url}: {e}")
+        logger.error(f"❌ Ошибка скачивания видео {_sanitize_url_for_log(video_url)}: {e}")
         return False
 
 

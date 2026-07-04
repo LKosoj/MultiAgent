@@ -1,0 +1,75 @@
+# Source: extracted from custom_tools/storybook/shots_prompt_qa.py и
+# custom_tools/storybook/screenplay_shots_generator_utils/shared_utils.py (WS-E, M-25).
+#
+# Доменно-специфичные подсказки для storyboard QA-промптов: сценический/
+# подиум/медицинский набор (podium, microphone, anesthesiologist, gloves-
+# continuity и т.п.). Раньше эти строки были захардкожены в «универсальных»
+# промптах и тянули closed-world-предположения в кадры любых проектов.
+#
+# Держим их здесь, а не в .py — это source of truth конкретного домена
+# (ср. config/text_to_sql/prompts/schema_linking_examples.yaml).
+#
+# Активный профиль выбирается:
+#   1. явный аргумент функций compose_*/get_active_profile;
+#   2. env STORYBOOK_DOMAIN_PROFILE;
+#   3. иначе — "default" (пустой, доменных строк в промпты не добавляется).
+#
+# Override пути: env STORYBOOK_DOMAIN_GLOSSARY_PATH.
+version: 1
+
+profiles:
+  # ---------------------------------------------------------------
+  # Дефолтный профиль: НИКАКИХ доменных подсказок.
+  # Промпт остаётся универсальным (структурные правила про
+  # identity/timing/framing/POV сохраняются в .py, они не доменные).
+  # ---------------------------------------------------------------
+  default:
+    anchor_glossary: []
+    anchor_patterns: []
+    spatial_locks: []
+    pov_anchor_examples: []
+    continuity_token_rules: []
+
+  # ---------------------------------------------------------------
+  # Сценический/медицинский профиль активного проекта пользователя.
+  # Восстанавливает легаси-набор, ранее захардкоженный в промптах QA.
+  # Активируется через STORYBOOK_DOMAIN_PROFILE=stage_medical — качество
+  # активного проекта при этом не падает.
+  # ---------------------------------------------------------------
+  stage_medical:
+    # RU->EN словарь якорных существительных для video_prompt.
+    anchor_glossary:
+      - {source: "трибуна", target: "podium/lectern"}
+      - {source: "микрофон", target: "microphone"}
+      - {source: "монитор", target: "monitor"}
+      - {source: "анестезиолог", target: "anesthesiologist"}
+      - {source: "ассистент", target: "assistant"}
+
+    # RU-паттерны POV/anchor-фраз: <ANCHOR> переводится и включается в кадр.
+    anchor_patterns:
+      - "вид из-за <ANCHOR>"
+      - "у <ANCHOR>"
+      - "за <ANCHOR>"
+
+    # Пространственные локи сцены/подиума/зрительного зала.
+    spatial_locks:
+      - lock: "STAGE/AUDITORIUM GEOMETRY"
+        rule: "Seats face stage. Podium on stage side. Do NOT place rows behind speaker when camera faces stage. Consistent physical layout."
+      - lock: "MICROPHONE/PODIUM ANCHOR"
+        rule: "Hand/claw touching mic = podium/lectern mic on stage side. Primary focus on contact. Environment = generic blur hint."
+      - lock: "AUDIENCE REACTION ZONE"
+        rule: "Audience members positioned in seating area, NOT on stage (unless storyboard says so). Podium/mic = distant background anchor only."
+
+    # Примеры недопустимой подмены якоря (POV/ANCHOR PHRASE lock).
+    pov_anchor_examples:
+      - "bleachers != podium"
+
+    # Правила continuity для negative_prompt (M-24/M-25):
+    # если реквизит удалён — добавить запрет; если в промежуточном
+    # состоянии (kept) — снять конфликтующие запреты.
+    continuity_token_rules:
+      - token: "gloves"
+        add_negative: "no gloves on hands"
+        strip_negatives:
+          - "no gloves on hands"
+          - "no gloves"

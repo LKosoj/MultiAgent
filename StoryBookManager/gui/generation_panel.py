@@ -850,14 +850,22 @@ class GenerationPanel(ttk.Frame):
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
-                                   step_duration: float = None):
+                                   step_duration: float = None,
+                                   step_error: str = None,
+                                   step_error_class: str = None,
+                                   step_traceback: str = None):
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
+                if step_status == "failed" and (step_error or step_error_class):
+                    reason = f"{(step_error_class or '').strip()} {(step_error or '').strip()}".strip()
+                    _log(f"    ↳ причина: {reason}", "error")
+                    if step_traceback:
+                        _log(f"    ↳ traceback:\n{step_traceback[-2000:]}", "error")
                 if progress is not None:
                     _progress(progress, message)
                 if step_id and step_status:
-                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
-                               self.step_tracker.update_step(si, ss, sd))
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration, se=step_error:
+                               self.step_tracker.update_step(si, ss, sd, error=se))
 
             result = run_pipeline_sync(
                 self.pipeline_runner,
@@ -899,14 +907,22 @@ class GenerationPanel(ttk.Frame):
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
-                                   step_duration: float = None):
+                                   step_duration: float = None,
+                                   step_error: str = None,
+                                   step_error_class: str = None,
+                                   step_traceback: str = None):
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
+                if step_status == "failed" and (step_error or step_error_class):
+                    reason = f"{(step_error_class or '').strip()} {(step_error or '').strip()}".strip()
+                    _log(f"    ↳ причина: {reason}", "error")
+                    if step_traceback:
+                        _log(f"    ↳ traceback:\n{step_traceback[-2000:]}", "error")
                 if progress is not None:
                     _progress(progress, message)
                 if step_id and step_status:
-                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
-                               self.step_tracker.update_step(si, ss, sd))
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration, se=step_error:
+                               self.step_tracker.update_step(si, ss, sd, error=se))
 
             loop = asyncio.new_event_loop()
             try:
@@ -955,14 +971,22 @@ class GenerationPanel(ttk.Frame):
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
-                                   step_duration: float = None):
+                                   step_duration: float = None,
+                                   step_error: str = None,
+                                   step_error_class: str = None,
+                                   step_traceback: str = None):
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
+                if step_status == "failed" and (step_error or step_error_class):
+                    reason = f"{(step_error_class or '').strip()} {(step_error or '').strip()}".strip()
+                    _log(f"    ↳ причина: {reason}", "error")
+                    if step_traceback:
+                        _log(f"    ↳ traceback:\n{step_traceback[-2000:]}", "error")
                 if progress is not None:
                     _progress(progress, message)
                 if step_id and step_status:
-                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
-                               self.step_tracker.update_step(si, ss, sd))
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration, se=step_error:
+                               self.step_tracker.update_step(si, ss, sd, error=se))
 
             loop = asyncio.new_event_loop()
             try:
@@ -1008,14 +1032,22 @@ class GenerationPanel(ttk.Frame):
 
             def progress_callback(message: str, progress: float = None,
                                    step_id: str = None, step_status: str = None,
-                                   step_duration: float = None):
+                                   step_duration: float = None,
+                                   step_error: str = None,
+                                   step_error_class: str = None,
+                                   step_traceback: str = None):
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
+                if step_status == "failed" and (step_error or step_error_class):
+                    reason = f"{(step_error_class or '').strip()} {(step_error or '').strip()}".strip()
+                    _log(f"    ↳ причина: {reason}", "error")
+                    if step_traceback:
+                        _log(f"    ↳ traceback:\n{step_traceback[-2000:]}", "error")
                 if progress is not None:
                     _progress(progress, message)
                 if step_id and step_status:
-                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration:
-                               self.step_tracker.update_step(si, ss, sd))
+                    self.after(0, lambda si=step_id, ss=step_status, sd=step_duration, se=step_error:
+                               self.step_tracker.update_step(si, ss, sd, error=se))
 
             loop = asyncio.new_event_loop()
             try:
@@ -1684,7 +1716,11 @@ class GenerationPanel(ttk.Frame):
         result = messagebox.askyesno(
             "Остановка генерации",
             "Вы действительно хотите остановить выполнение?\n"
-            "Текущий шаг будет завершён, прогресс сохранится в чекпоинте."
+            "Отмена сработает МЕЖДУ шагами; уже отправленные provider-джобы видео "
+            "продолжатся у провайдера (стоимость капает), но их task_id сохранены "
+            "в 97_shots/provider_jobs.json и будут переиспользованы при следующем "
+            "запуске без повторной платной генерации.\n"
+            "Прогресс завершённых шагов сохранится в чекпоинте."
         )
         if not result:
             return
@@ -1694,6 +1730,11 @@ class GenerationPanel(ttk.Frame):
         self.pipeline_runner._pause_event.set()
         self.status_label.config(text="Остановка после активных шагов...")
         self.add_log("⏹ Отправлен сигнал остановки...", "warning")
+        self.add_log(
+            "ℹ Активные provider-джобы видео не прерываются досрочно; "
+            "их результаты будут переиспользованы из леджера 97_shots/provider_jobs.json.",
+            "warning",
+        )
 
         def _cancel_in_thread():
             try:

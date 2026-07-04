@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -11,6 +12,7 @@ def storybook_audio_subtitle_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
+    allow_missing_subtitles: bool = False,
 ) -> Dict[str, Any]:
     """Create subtitle and audio planning artifacts for a storybook project.
 
@@ -19,8 +21,11 @@ def storybook_audio_subtitle_tool(
         project_id: Storybook project identifier under plots/storybooks.
         language: Language code stored in generated metadata.
         enable: When false, skip artifact generation and return planned output paths.
+        allow_missing_subtitles: When false (default), an empty cue set is a hard error;
+            when true, an empty cue set succeeds with a ``no_subtitle_cues`` warning.
     """
     enable = _as_bool(enable)
+    allow_missing_subtitles = _as_bool(allow_missing_subtitles)
     try:
         base_dir = _safe_project_dir(project_id)
     except ValueError as exc:
@@ -28,6 +33,9 @@ def storybook_audio_subtitle_tool(
             "status": "error",
             "message": str(exc),
             "error": str(exc),
+            "subtitles_path": "",
+            "audio_manifest_path": "",
+            "cue_sheet_path": "",
             "results": [],
         }
     audio_dir = base_dir / "98_audio"
@@ -71,15 +79,26 @@ def storybook_audio_subtitle_tool(
     screenplay_lookup = _build_screenplay_lookup(screenplay_data)
     cues, skipped = _build_cues(items, screenplay_lookup)
 
-    subtitles_path.write_text(_format_srt(cues), encoding="utf-8")
+    warnings: List[str] = []
+    if not cues and allow_missing_subtitles:
+        warnings.append("no_subtitle_cues")
 
+    # subtitles.srt is a planning/preview artifact only; montage (WS-F) rebuilds the
+    # final SRT from edit_decisions x cue_sheet against the real timeline.
+    _atomic_write_text(subtitles_path, _format_srt(cues))
+
+    # cue_sheet.json is the authoritative source of cue TEXT for montage. It exposes the
+    # (scene_number, shot_number) join keys plus per-cue text/text_source, and marks the
+    # timeline as "planned" because final timing is owned by montage (WS-F), not this tool.
     cue_sheet = {
         "project_id": str(project_id),
         "session_id": session_id,
         "language": language,
+        "timeline": "planned",
         "source_shots_path": str(shots_path),
         "source_screenplay_path": str(screenplay_path) if screenplay_path.exists() else None,
         "cue_count": len(cues),
+        "warnings": warnings,
         "cues": cues,
         "skipped": skipped,
     }
@@ -103,10 +122,14 @@ def storybook_audio_subtitle_tool(
     }
     _write_json(manifest_path, audio_manifest)
 
-    status = "error" if errors and not cues else "success"
-    message = f"Generated {len(cues)} subtitle cues; TTS unavailable"
-    if errors and not cues:
-        message = "; ".join(errors)
+    if not cues and not allow_missing_subtitles:
+        status = "error"
+        message = "; ".join(errors) if errors else "No subtitle cues were produced"
+    else:
+        status = "success"
+        message = f"Generated {len(cues)} subtitle cues; TTS unavailable"
+        if not cues:
+            message = "No subtitle cues were produced; continuing (allow_missing_subtitles=true)"
 
     result = {
         "status": status,
@@ -116,12 +139,14 @@ def storybook_audio_subtitle_tool(
         "cue_sheet_path": str(cue_sheet_path),
         "cue_count": len(cues),
         "tts_status": "unavailable",
+        "warnings": warnings,
         "results": {
             "subtitles_path": str(subtitles_path),
             "audio_manifest_path": str(manifest_path),
             "cue_sheet_path": str(cue_sheet_path),
             "cue_count": len(cues),
             "tts_status": "unavailable",
+            "warnings": warnings,
         },
     }
     if status == "error":
@@ -134,8 +159,14 @@ def _read_json(path: Path) -> Any:
 
 
 def _write_json(path: Path, payload: Dict[str, Any]) -> None:
+    _atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
 
 
 def _extract_items(shots_data: Any) -> List[Dict[str, Any]]:

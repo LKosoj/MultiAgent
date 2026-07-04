@@ -7,6 +7,7 @@ import json
 import os
 import logging
 import threading
+import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -682,27 +683,44 @@ def update_shots_with_descriptions(
         try:
             logger.info(f"💾 Сохраняем обновленные данные в {shots_file_path}")
 
-            # Загружаем существующие верхнеуровневые поля
-            existing_data = {}
-            try:
-                if os.path.exists(shots_file_path):
-                    with open(shots_file_path, 'r', encoding='utf-8') as rf:
-                        loaded = json.load(rf)
-                        if isinstance(loaded, dict):
-                            existing_data = loaded
-            except Exception as read_err:
-                logger.warning(f"⚠️ Не удалось перечитать существующий shots.json: {read_err}")
+            # M-7: атомарная кросс-процессная запись (flock + tmp + os.replace),
+            # чтобы не биться с чекпойнтерами shots.json из других шагов пайплайна.
+            # flock на sidecar `{path}.lock` (НЕ подменяется): флок на самом
+            # shots_file_path бесполезен — os.replace меняет inode, второй процесс
+            # флокнул бы новый inode (окно потерянного апдейта).
+            os.makedirs(os.path.dirname(shots_file_path) or ".", exist_ok=True)
+            lock_path = f"{shots_file_path}.lock"
+            with open(lock_path, 'a+', encoding='utf-8') as lock_f:
+                fcntl.flock(lock_f, fcntl.LOCK_EX)
+                try:
+                    # Загружаем существующие верхнеуровневые поля под блокировкой
+                    existing_data = {}
+                    try:
+                        with open(shots_file_path, 'r', encoding='utf-8') as rf:
+                            raw = rf.read()
+                        if raw.strip():
+                            loaded = json.loads(raw)
+                            if isinstance(loaded, dict):
+                                existing_data = loaded
+                    except FileNotFoundError:
+                        existing_data = {}
+                    except Exception as read_err:
+                        logger.warning(f"⚠️ Не удалось перечитать существующий shots.json: {read_err}")
 
-            # Обновляем только items, сохраняя остальные ключи
-            if isinstance(existing_data, dict):
-                existing_data["items"] = items_list
-                shots_data = existing_data
-            else:
-                shots_data = {"items": items_list}
+                    # Обновляем только items, сохраняя остальные ключи
+                    if isinstance(existing_data, dict):
+                        existing_data["items"] = items_list
+                        shots_data = existing_data
+                    else:
+                        shots_data = {"items": items_list}
 
-            with open(shots_file_path, 'w', encoding='utf-8') as wf:
-                json.dump(shots_data, wf, ensure_ascii=False, indent=2)
-            
+                    tmp = f"{shots_file_path}.{os.getpid()}.tmp"
+                    with open(tmp, 'w', encoding='utf-8') as wf:
+                        json.dump(shots_data, wf, ensure_ascii=False, indent=2)
+                    os.replace(tmp, shots_file_path)
+                finally:
+                    fcntl.flock(lock_f, fcntl.LOCK_UN)
+
             logger.info(f"✅ Успешно обновлено {updated_count} элементов в {shots_file_path}")
             return updated_count
         except Exception as write_err:

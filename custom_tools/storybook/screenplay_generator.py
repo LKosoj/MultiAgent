@@ -1,10 +1,12 @@
 import json
 import os
 import logging
+import fcntl
 from typing import Any, Dict, Optional
 
 from agent_command import model_hard, model_ultimate
 from utils import call_openai_api, extract_json_from_markdown
+from .project_paths import safe_storybook_project_dir
 from .entity_generator_utils import (
     analyze_missing_locations,
     analyze_missing_characters,
@@ -474,10 +476,11 @@ def _sync_screenplay_entities(project_id: str, screenplay_data: Dict[str, Any]) 
     Использует LLM для интеллектуального поиска и генерации описаний.
     """
     
-    # Пути к файлам библии
-    characters_path = f"plots/storybooks/{project_id}/20_bible/characters.json"
-    locations_path = f"plots/storybooks/{project_id}/20_bible/locations.json"
-    
+    # Пути к файлам библии (M-23: единый резолвер, как в audio_subtitle/montage)
+    base_dir = str(safe_storybook_project_dir(project_id))
+    characters_path = f"{base_dir}/20_bible/characters.json"
+    locations_path = f"{base_dir}/20_bible/locations.json"
+
     # Читаем существующие данные
     existing_characters = []
     existing_locations = []
@@ -571,8 +574,9 @@ def screenplay_generator_tool(
             "message": "Режиссерский сценарий не был создан"
         }
 
-    # Создаем директорию для сценария
-    screenplay_dir = f"plots/storybooks/{project_id}/91_screenplay"
+    # Создаем директорию для сценария (M-23: единый резолвер)
+    base_dir = str(safe_storybook_project_dir(project_id))
+    screenplay_dir = f"{base_dir}/91_screenplay"
     os.makedirs(screenplay_dir, exist_ok=True)
     
     # Сохраняем сценарий в JSON
@@ -588,7 +592,7 @@ def screenplay_generator_tool(
         }
 
     # Читаем готовую историю
-    story_path = f"plots/storybooks/{project_id}/20_story/story.json"
+    story_path = f"{base_dir}/20_story/story.json"
     
     if not os.path.exists(story_path):
         logger.error(f"❌ Не найден файл истории: {story_path}")
@@ -598,7 +602,7 @@ def screenplay_generator_tool(
         story_data = json.load(f)
     
     # Читаем бриф
-    brief_path = f"plots/storybooks/{project_id}/00_brief.json"
+    brief_path = f"{base_dir}/00_brief.json"
     brief_data = {}
     if os.path.exists(brief_path):
         with open(brief_path, "r", encoding="utf-8") as f:
@@ -608,8 +612,8 @@ def screenplay_generator_tool(
     bible_data = {}
     
     # Пытаемся читать из новой структуры 20_bible/
-    characters_path = f"plots/storybooks/{project_id}/20_bible/characters.json"
-    locations_path = f"plots/storybooks/{project_id}/20_bible/locations.json"
+    characters_path = f"{base_dir}/20_bible/characters.json"
+    locations_path = f"{base_dir}/20_bible/locations.json"
     
     if os.path.exists(characters_path):
         with open(characters_path, "r", encoding="utf-8") as f:
@@ -621,13 +625,13 @@ def screenplay_generator_tool(
     
     # Fallback на старую структуру 10_bible/bible.json
     if not bible_data:
-        bible_path = f"plots/storybooks/{project_id}/10_bible/bible.json"
+        bible_path = f"{base_dir}/10_bible/bible.json"
         if os.path.exists(bible_path):
             with open(bible_path, "r", encoding="utf-8") as f:
                 bible_data = json.load(f)
     
     # Читаем информацию о стиле
-    style_path = f"plots/storybooks/{project_id}/30_style/style_images.json"
+    style_path = f"{base_dir}/30_style/style_images.json"
     style_data = {}
     if os.path.exists(style_path):
         with open(style_path, "r", encoding="utf-8") as f:
@@ -1059,9 +1063,19 @@ def screenplay_generator_tool(
     except Exception as e:
         logger.warning(f"⚠️ Screenplay self-check failed (continuing with original): {e}")
     
-    with open(screenplay_path, "w", encoding="utf-8") as f:
-        json.dump(screenplay_data, f, ensure_ascii=False, indent=2)
-    
+    # M-7: атомарная кросс-процессная запись финального сценария (flock + tmp + os.replace).
+    # flock на sidecar `{path}.lock` (НЕ подменяется): флок на самом screenplay_path
+    # бесполезен — os.replace меняет inode, второй процесс флокнул бы новый inode.
+    with open(f"{screenplay_path}.lock", "a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            tmp = f"{screenplay_path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(screenplay_data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, screenplay_path)
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+
     logger.info(f"✅ Режиссерский сценарий сохранен: {screenplay_path}")
     
     # Синхронизация новых персонажей и локаций

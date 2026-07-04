@@ -10,8 +10,18 @@ import random
 
 from ..models import StepResult, StepStatus, ErrorClass
 from ..policy.models import RetryStrategyType
+from ..retry_engine import classify_error
 
 logger = logging.getLogger(__name__)
+
+
+class JudgeRetryRequested(Exception):
+    """Вердикт пост-шаг-судьи «не proceed» — это сигнал повтора по КАЧЕСТВУ, а НЕ
+    транспортная ошибка. execute_with_retry ретраит его как прежде (в обход
+    retry_on_errors-фильтрации по классу ошибки), чтобы LLM-агент мог
+    перегенерировать вывод. Без этого непустой дефолтный retry_on_errors
+    классифицировал бы его как unknown_error и валил шаг без единой повторной
+    попытки (регресс H-2 для агентных шагов enhanced-пайплайнов)."""
 
 
 def _redact_retry_error(error: Any) -> str:
@@ -163,8 +173,15 @@ class AdaptiveRetryEngine:
                                 max_retries: int = 3,
                                 base_delay: float = 1.0,
                                 max_delay: float = 60.0,
-                                backoff_multiplier: float = 2.0) -> StepResult:
-        """Выполнить функцию с адаптивными повторами"""
+                                backoff_multiplier: float = 2.0,
+                                retry_on_errors: Optional[List[str]] = None) -> StepResult:
+        """Выполнить функцию с адаптивными повторами.
+
+        retry_on_errors: если задан (список классов из classify_error), то при
+        исключении класса ВНЕ этого списка попытки прекращаются немедленно
+        (нетранзиентные auth/validation ошибки дорогих side-effect-шагов не
+        повторяются вслепую). None (дефолт) = прежнее поведение (повторяем всё).
+        """
         
         attempt = 0
         last_error = None
@@ -191,15 +208,49 @@ class AdaptiveRetryEngine:
                     logger.info(f"✅ Step '{step_id}' succeeded on attempt {attempt}")
                     return result
                 else:
-                    # Результат неприемлемый, но не критичная ошибка
-                    logger.warning(f"⚠️ Step '{step_id}' returned poor quality result on attempt {attempt}")
-                    last_error = "Poor quality result"
-                    
+                    # Результат неприемлемый. Различаем FAILED-StepResult и низкое
+                    # качество: _execute_step_with_policy ловит исключение шага и
+                    # ВОЗВРАЩАЕТ FAILED-результат (не бросает), поэтому фильтрация по
+                    # классам ошибок из except-ветки его не видела — нетранзиентные
+                    # сбои (auth/validation) ретраились бы max_retries раз вслепую (M-1).
+                    failed_result = (
+                        isinstance(result, StepResult) and result.status == StepStatus.FAILED
+                    )
+                    result_error = (
+                        getattr(result, "error", None) if isinstance(result, StepResult) else None
+                    )
+                    last_error = result_error or "Poor quality result"
+                    logger.warning(
+                        "⚠️ Step '%s' returned unacceptable result on attempt %s: %s",
+                        step_id, attempt, last_error,
+                    )
+
+                    if failed_result and retry_on_errors is not None:
+                        error_class = getattr(result, "error_class", "") or (
+                            classify_error(result_error) if result_error else ""
+                        )
+                        if error_class and error_class not in retry_on_errors:
+                            logger.info(
+                                "⛔ Step '%s': класс ошибки '%s' (FAILED-результат) не в "
+                                "retry_on_errors=%s — прекращаем retry",
+                                step_id, error_class, retry_on_errors,
+                            )
+                            await self._record_failure(step_id, attempt, retry_context)
+                            return StepResult(
+                                step_id=step_id,
+                                status=StepStatus.FAILED,
+                                error=f"Non-retryable error ({error_class}): {last_error}",
+                                start_time=retry_context["start_time"],
+                                end_time=datetime.now(),
+                                retry_count=attempt,
+                                metadata={"retry_context": retry_context},
+                            )
+
             except Exception as e:
                 safe_error = _redact_retry_error(e)
                 last_error = safe_error
                 logger.warning("❌ Step '%s' failed on attempt %s: %s", step_id, attempt, safe_error)
-                
+
                 # Записываем попытку
                 attempt_info = {
                     "attempt_number": attempt,
@@ -209,7 +260,30 @@ class AdaptiveRetryEngine:
                     "timestamp": attempt_start.isoformat()
                 }
                 retry_context["attempts"].append(attempt_info)
-            
+
+                # H-2/M-1: если политика ограничивает retry по классам ошибок, а
+                # текущий класс в неё не входит — прекращаем попытки немедленно
+                # (не жжём деньги ретраями нетранзиентных сбоев). Вердикт судьи
+                # (JudgeRetryRequested) НЕ фильтруем по классам — это запрос
+                # повтора по качеству, ретраим как раньше.
+                if retry_on_errors is not None and not isinstance(e, JudgeRetryRequested):
+                    error_class = classify_error(e)
+                    if error_class not in retry_on_errors:
+                        logger.info(
+                            "⛔ Step '%s': класс ошибки '%s' не в retry_on_errors=%s — прекращаем retry",
+                            step_id, error_class, retry_on_errors,
+                        )
+                        await self._record_failure(step_id, attempt, retry_context)
+                        return StepResult(
+                            step_id=step_id,
+                            status=StepStatus.FAILED,
+                            error=f"Non-retryable error ({error_class}): {safe_error}",
+                            start_time=retry_context["start_time"],
+                            end_time=datetime.now(),
+                            retry_count=attempt,
+                            metadata={"retry_context": retry_context}
+                        )
+
             # Если это не последняя попытка, применяем стратегию
             if attempt <= max_retries:
                 await self._apply_retry_strategy(step_id, attempt, retry_context, context)

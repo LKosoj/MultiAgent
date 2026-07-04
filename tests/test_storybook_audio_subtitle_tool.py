@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from custom_tools.storybook import audio_subtitle
 from custom_tools.storybook.audio_subtitle import storybook_audio_subtitle_tool
 
 
@@ -98,3 +99,101 @@ def test_storybook_audio_subtitle_rejects_project_id_path_traversal(tmp_path, mo
 
     assert result["status"] == "error"
     assert "project_id must be a safe path segment" in result["message"]
+
+
+def _write_shots_without_cues(base: Path):
+    # Valid shots.json (so there is no read error) but nothing produces a cue:
+    # no timing and no text -> every item is skipped -> zero cues.
+    _write_json(base / "97_shots" / "shots.json", {"items": [{"scene_number": 1, "shot_number": 1}]})
+
+
+def test_storybook_audio_subtitle_errors_on_zero_cues(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_id = "proj_zero_cues"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_shots_without_cues(base)
+
+    result = storybook_audio_subtitle_tool("sess", project_id)
+
+    assert result["status"] == "error"
+    assert result["cue_count"] == 0
+    assert result["error"] == result["message"]
+
+
+def test_storybook_audio_subtitle_allow_missing_subtitles_returns_success(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_id = "proj_allow_missing"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_shots_without_cues(base)
+
+    result = storybook_audio_subtitle_tool("sess", project_id, allow_missing_subtitles=True)
+
+    assert result["status"] == "success"
+    assert result["cue_count"] == 0
+    assert "no_subtitle_cues" in result["warnings"]
+    cue_sheet = json.loads((base / "98_audio" / "cue_sheet.json").read_text(encoding="utf-8"))
+    assert cue_sheet["cue_count"] == 0
+    assert "no_subtitle_cues" in cue_sheet["warnings"]
+
+
+def test_storybook_audio_subtitle_error_result_has_required_output_keys(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    result = storybook_audio_subtitle_tool("sess", "../outside")
+
+    assert result["status"] == "error"
+    for key in ("subtitles_path", "audio_manifest_path", "cue_sheet_path"):
+        assert key in result
+        assert result[key] == ""
+
+
+def test_storybook_audio_subtitle_writes_are_atomic(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_id = "proj_atomic"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(
+        base / "97_shots" / "shots.json",
+        {"items": [{"scene_number": 1, "shot_number": 1, "timing": "00:00 - 00:03", "subtitle": "Cue"}]},
+    )
+
+    replaced = []
+    real_replace = audio_subtitle.os.replace
+
+    def spy_replace(src, dst):
+        replaced.append(str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(audio_subtitle.os, "replace", spy_replace)
+
+    result = storybook_audio_subtitle_tool("sess", project_id)
+
+    assert result["status"] == "success"
+    assert any(dst.endswith("subtitles.srt") for dst in replaced)
+    assert any(dst.endswith("cue_sheet.json") for dst in replaced)
+    assert any(dst.endswith("audio_manifest.json") for dst in replaced)
+    assert list((base / "98_audio").glob(".*.tmp")) == []
+
+
+def test_storybook_audio_subtitle_cue_sheet_exposes_join_keys_for_montage(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_id = "proj_join_keys"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(
+        base / "97_shots" / "shots.json",
+        {
+            "items": [
+                {"scene_number": 1, "shot_number": 1, "timing": "00:00 - 00:03", "subtitle": "First"},
+                {"scene_number": 2, "shot_number": 1, "timing": {"start": 3, "end": 6}, "subtitle": "Second"},
+            ]
+        },
+    )
+
+    result = storybook_audio_subtitle_tool("sess", project_id)
+
+    assert result["status"] == "success"
+    cue_sheet = json.loads((base / "98_audio" / "cue_sheet.json").read_text(encoding="utf-8"))
+    assert cue_sheet["timeline"] == "planned"
+    assert cue_sheet["cue_count"] == 2
+    for cue in cue_sheet["cues"]:
+        for key in ("scene_number", "shot_number", "text", "text_source"):
+            assert key in cue

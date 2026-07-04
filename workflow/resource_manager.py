@@ -19,8 +19,15 @@ logger = logging.getLogger(__name__)
 
 
 class ResourcePool:
-    """Пул ресурсов с ограничениями и квотированием"""
-    
+    """Пул ресурсов с ограничениями и квотированием.
+
+    ВНИМАНИЕ (M-2): из ResourceLimits здесь enforce-ятся только max_memory_mb,
+    max_api_calls_per_minute и concurrent. Поле ``max_duration_seconds`` НЕ
+    применяется как wall-clock дедлайн workflow/шага — оно игнорируется при
+    выделении ресурсов. Указание его в global_resource_limits YAML не ограничивает
+    время выполнения (для тайм-аутов отдельных шагов используйте step.timeout).
+    """
+
     def __init__(self, max_concurrent: int = 10, max_memory_mb: int = 8192, 
                  max_api_calls_per_minute: int = 1000):
         self.max_concurrent = max_concurrent

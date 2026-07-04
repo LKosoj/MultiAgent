@@ -18,7 +18,7 @@ parameters:
     required: false
   - name: "max_concurrency"
     type: "int"
-    description: "Максимальное количество параллельных запросов к API (по умолчанию 3)"
+    description: "Максимальное количество параллельных запросов к API (по умолчанию 2)"
     required: false
   - name: "enable"
     type: "bool"

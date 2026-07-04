@@ -11,6 +11,10 @@ import hashlib
 import re
 from agent_command import model_code, model_hard, model_ultimate, model_lite
 from utils import call_openai_api, parse_llm_json
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.domain_glossary_config import (
+    continuity_token_rules as _domain_continuity_token_rules,
+)
 import logging
 
 import threading
@@ -1090,9 +1094,14 @@ def black_screen_storyboard_shot(
     )
     obj = parse_llm_json(response)
     if not isinstance(obj, dict) or "is_black_screen" not in obj:
-        raise ValueError(
-            f"black_screen_storyboard_shot: LLM вернула невалидный JSON без поля is_black_screen: {response!r}"
+        # M-24: невалидный ответ классификатора НЕ должен валить всю сцену.
+        # Мягкий guard: считаем шот НЕ-чёрным (консервативно генерируем кадр)
+        # и НЕ кэшируем фолбэк, чтобы следующий вызов попробовал заново.
+        logger.warning(
+            f"black_screen_storyboard_shot: LLM вернула невалидный JSON без поля "
+            f"is_black_screen, fallback=False: {response!r}"
         )
+        return False
     result = bool(obj.get("is_black_screen"))
 
     with _BLACK_SCREEN_DETECTION_LOCK:
@@ -1124,31 +1133,46 @@ def _validate_negative_prompt_consistency(
     """
     Валидирует и исправляет negative_prompt на основе prop_continuity.
     Устраняет противоречия между запретами и фактическим состоянием реквизита.
+
+    M-25: доменные токены реквизита вынесены в domain_glossary_config —
+    continuity_token_rules активного профиля. Дефолтный профиль пуст => функция
+    работает как no-op (промпт возвращается без изменений).
     """
     if not prop_continuity:
         return negative_prompt
-    
+
+    rules = _domain_continuity_token_rules()
+    if not rules:
+        return negative_prompt
+
     corrected_prompt = negative_prompt
-    
-    # Обрабатываем удаленные предметы
-    removed_items = prop_continuity.get("removed", [])
-    for item in removed_items:
-        if "gloves" in item.lower():
-            if "no gloves on hands" not in corrected_prompt:
-                corrected_prompt += ", no gloves on hands"
-    
-    # Обрабатываем сохраненные предметы с промежуточными состояниями
-    kept_items = prop_continuity.get("kept", [])
-    for item in kept_items:
-        if "partially removed" in item.lower() or "hanging" in item.lower() or "being taken off" in item.lower():
-            # Убираем запреты на предметы в промежуточном состоянии
-            if "gloves" in item.lower():
-                corrected_prompt = corrected_prompt.replace("no gloves on hands", "")
-                corrected_prompt = corrected_prompt.replace("no gloves", "")
-    
+    removed_items = prop_continuity.get("removed", []) or []
+    kept_items = prop_continuity.get("kept", []) or []
+
+    for rule in rules:
+        token = str(rule.get("token", "")).lower()
+        if not token:
+            continue
+        add_negative = str(rule.get("add_negative") or "")
+        strip_negatives = rule.get("strip_negatives") or []
+
+        # Удалённый реквизит -> добавляем запрет.
+        for item in removed_items:
+            if token in str(item).lower():
+                if add_negative and add_negative not in corrected_prompt:
+                    corrected_prompt += f", {add_negative}"
+
+        # Реквизит в промежуточном состоянии -> снимаем конфликтующие запреты.
+        for item in kept_items:
+            il = str(item).lower()
+            if "partially removed" in il or "hanging" in il or "being taken off" in il:
+                if token in il:
+                    for neg in strip_negatives:
+                        corrected_prompt = corrected_prompt.replace(neg, "")
+
     # Убираем лишние запятые и пробелы
     corrected_prompt = ", ".join([part.strip() for part in corrected_prompt.split(",") if part.strip()])
-    
+
     return corrected_prompt
 
 def _determine_narrative_position(scene_number: int, shot_number: int, total_shots_in_scene: int) -> str:
@@ -1238,7 +1262,7 @@ def _create_missing_location_llm(
         logger.info(f"🔒 ЗАБЛОКИРОВАН ПРОЦЕСС СОЗДАНИЯ: '{location_name}' для сцены {scene_number}")
         
         # ШАГ 1: Перечитываем файл для проверки, не создал ли другой поток эту локацию
-        locations_path = f"plots/storybooks/{project_id}/20_bible/locations.json"
+        locations_path = f"{safe_storybook_project_dir(project_id)}/20_bible/locations.json"
         current_locations = []
         
         if os.path.exists(locations_path):

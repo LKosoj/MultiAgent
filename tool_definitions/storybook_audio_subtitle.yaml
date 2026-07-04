@@ -20,3 +20,7 @@ parameters:
     type: bool
     description: "If true, writes subtitle and audio planning artifacts; if false, skips execution"
     required: false
+  - name: allow_missing_subtitles
+    type: bool
+    description: "If false (default), zero subtitle cues is a hard error; if true, an empty cue set succeeds with a no_subtitle_cues warning"
+    required: false

@@ -27,6 +27,46 @@ def _redact_retry_error(error: Any) -> str:
         return "<redacted>"
 
 
+def classify_error(error: Exception) -> str:
+    """Классификация типа ошибки для принятия решения о retry.
+
+    Module-level, чтобы enhanced-путь (resilience/retry.py AdaptiveRetryEngine)
+    уважал те же классы ошибок, что и базовый RetryEngine, и корректно матчил
+    retry_on_errors из YAML.
+    """
+    error_str = str(error).lower()
+
+    # Сетевые ошибки и таймауты (включая тексты step/провайдер-таймаутов)
+    if any(keyword in error_str for keyword in [
+        'connection', 'network', 'timeout', 'dns',
+        'timed out', 'task timeout', 'превышено время', 'ожидани',
+    ]):
+        return "network_error"
+
+    # Rate limiting
+    if any(keyword in error_str for keyword in ['rate limit', 'too many requests', '429']):
+        return "rate_limit"
+
+    # Временные ошибки API
+    if any(keyword in error_str for keyword in ['502', '503', '504', 'service unavailable']):
+        return "temporary_failure"
+
+    # Ошибки модели
+    if any(keyword in error_str for keyword in ['model', 'inference', 'cuda', 'memory']):
+        return "model_error"
+
+    # Ошибки валидации - не retry
+    if any(keyword in error_str for keyword in ['validation', 'invalid', 'bad request', '400']):
+        return "validation_error"
+
+    # Ошибки авторизации - не retry
+    if any(keyword in error_str for keyword in ['unauthorized', '401', '403', 'forbidden']):
+        return "auth_error"
+
+    # По умолчанию - неизвестная ошибка
+    return "unknown_error"
+
+
 class RetryEngine:
     """Движок повторных попыток с поддержкой различных стратегий"""
     
@@ -141,35 +181,7 @@ class RetryEngine:
     
     def _classify_error(self, error: Exception) -> str:
         """Классификация типа ошибки для принятия решения о retry"""
-        error_str = str(error).lower()
-        error_type = type(error).__name__.lower()
-        
-        # Сетевые ошибки
-        if any(keyword in error_str for keyword in ['connection', 'network', 'timeout', 'dns']):
-            return "network_error"
-            
-        # Rate limiting
-        if any(keyword in error_str for keyword in ['rate limit', 'too many requests', '429']):
-            return "rate_limit"
-            
-        # Временные ошибки API
-        if any(keyword in error_str for keyword in ['502', '503', '504', 'service unavailable']):
-            return "temporary_failure"
-            
-        # Ошибки модели
-        if any(keyword in error_str for keyword in ['model', 'inference', 'cuda', 'memory']):
-            return "model_error"
-            
-        # Ошибки валидации - не retry
-        if any(keyword in error_str for keyword in ['validation', 'invalid', 'bad request', '400']):
-            return "validation_error"
-            
-        # Ошибки авторизации - не retry  
-        if any(keyword in error_str for keyword in ['unauthorized', '401', '403', 'forbidden']):
-            return "auth_error"
-            
-        # По умолчанию - неизвестная ошибка
-        return "unknown_error"
+        return classify_error(error)
     
     def _should_retry(self, error_type: str, policy: RetryPolicy) -> bool:
         """Определяет, нужно ли повторять выполнение при данном типе ошибки"""

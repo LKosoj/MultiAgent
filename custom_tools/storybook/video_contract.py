@@ -3,11 +3,27 @@ import os
 import shutil
 from pathlib import Path
 
+import yaml
+
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
 
 
 CONTRACT_VERSION = 1
 STORYBOOK_WORKFLOW_NAME = "storybook_pipeline"
+
+# Preflight/promise read the video_generator step's active tool_name straight
+# from the canonical pipeline YAML so the honest provider is whatever the owner
+# left uncommented there (provider switch = comment/uncomment tool_name).
+_WORKFLOW_YAML_PATH = (
+    Path(__file__).resolve().parents[2] / "workflow_pipelines" / "storybook_pipeline.yaml"
+)
+_VIDEO_GENERATOR_STEP_ID = "video_generator"
+_TOOL_NAME_TO_PROVIDER = {
+    "video_generator_aitunnel_tool": "aitunnel",
+    "video_generator_mm_tool": "minimax",
+    "video_generator_veo_tool": "veo",
+    "video_generator_tool": "kling",
+}
 
 
 STORYBOOK_WORKFLOW_ACTIONS = (
@@ -305,7 +321,9 @@ def storybook_video_delivery_promise_tool(
     if enabled and summary["shots_error"]:
         blocking_reasons.append("shots_json_invalid")
     if enabled and not summary["capabilities"]["video"]:
-        blocking_reasons.append("video_provider_unavailable")
+        blocking_reasons.append(
+            "video_provider_unresolved" if summary["provider"] == "none" else "video_provider_unavailable"
+        )
     if enabled and not summary["capabilities"]["render"]:
         blocking_reasons.append("render_capability_unavailable")
     if enabled and not expected_outputs:
@@ -364,13 +382,22 @@ def storybook_video_decision_log_tool(
 
     final_video_path = base / "99_final" / "final_video.mp4"
     final_video_status = "present" if final_video_path.exists() else "missing"
+    generation_enabled = _as_bool(
+        delivery.get("generation_enabled", preflight.get("generation_enabled", True))
+    )
+    if final_video_status == "present":
+        status = "success"
+    elif not generation_enabled:
+        status = "skipped"
+    else:
+        status = "incomplete"
     decisions = _decision_entries(preflight, delivery, approved)
     payload = {
         "version": CONTRACT_VERSION,
         "session_id": session_id,
         "project_id": project_id,
         "language": language,
-        "status": "success",
+        "status": status,
         "approved": approved,
         "decisions": decisions,
         "final_video_status": final_video_status,
@@ -522,7 +549,7 @@ def _provider_summary(session_id, project_id, language, enable):
     ffprobe_path = shutil.which("ffprobe")
     capabilities = {
         "image": _image_capability(),
-        "video": provider != "none",
+        "video": any(p["active"] and p["configured"] for p in providers),
         "audio": _audio_capability(),
         "render": bool(ffmpeg_path and ffprobe_path),
     }
@@ -573,7 +600,9 @@ def _readiness_blockers(summary, capabilities):
     if summary.get("shots_error"):
         blockers.append("shots_json_invalid")
     if not capabilities.get("video"):
-        blockers.append("video_provider_unavailable")
+        blockers.append(
+            "video_provider_unresolved" if summary.get("provider") == "none" else "video_provider_unavailable"
+        )
     if not capabilities.get("render"):
         blockers.append("render_capability_unavailable")
     if summary.get("shots_exists") and summary.get("expected_video_count", 0) == 0:
@@ -713,7 +742,25 @@ def _expected_video_items(items):
     return expected
 
 
+def _active_video_tool_name():
+    """Return the uncommented tool_name of the video_generator step (fail-closed)."""
+    try:
+        data = yaml.safe_load(_WORKFLOW_YAML_PATH.read_text(encoding="utf-8"))
+        for step in data["steps"]:
+            if step.get("id") == _VIDEO_GENERATOR_STEP_ID:
+                return step.get("tool_name")
+        return None
+    except (OSError, yaml.YAMLError, KeyError):
+        return None
+
+
+def _active_video_provider():
+    """Map the active video tool_name to a provider name, or None if unresolved."""
+    return _TOOL_NAME_TO_PROVIDER.get(_active_video_tool_name())
+
+
 def _select_provider():
+    active = _active_video_provider()
     providers = [
         {
             "name": "aitunnel",
@@ -736,15 +783,9 @@ def _select_provider():
             "required_env": ["GOOGLE_CLOUD_PROJECT or GEMINI_API_KEY"],
         },
     ]
-    requested = (os.getenv("STORYBOOK_VIDEO_PROVIDER") or "").strip().lower()
-    if requested:
-        for provider in providers:
-            if provider["name"] == requested:
-                return (requested if provider["configured"] else "none"), providers
     for provider in providers:
-        if provider["configured"]:
-            return provider["name"], providers
-    return "none", providers
+        provider["active"] = provider["name"] == active
+    return (active or "none"), providers
 
 
 def _image_capability():
@@ -769,15 +810,22 @@ def _audio_capability():
 def _decision_entries(preflight, delivery, approved):
     provider = preflight.get("provider") or "none"
     capabilities = preflight.get("capabilities") or {}
+    video_ok = bool(capabilities.get("video"))
     delivery_status = delivery.get("status") or "unknown"
     will_generate = bool(delivery.get("will_generate_video"))
+    if video_ok:
+        provider_reason = f"Active video provider '{provider}' is configured"
+    elif provider == "none":
+        provider_reason = "No active video provider could be resolved from the pipeline"
+    else:
+        provider_reason = f"Active video provider '{provider}' is not configured"
     return [
         {
             "name": "video_provider",
             "options_considered": [p["name"] for p in preflight.get("capability_details", {}).get("providers_considered", [])],
             "selected": provider,
-            "reason": "Selected configured provider" if provider != "none" else "No configured video provider was available",
-            "confidence": 0.9 if provider != "none" else 0.4,
+            "reason": provider_reason,
+            "confidence": 0.9 if video_ok else 0.4,
             "cost": _known_provider_cost(provider),
             "approved": approved,
         },
