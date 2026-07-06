@@ -20,8 +20,9 @@ _PROVIDER_JOBS_THREAD_LOCKS_GUARD = threading.Lock()
 
 
 class _ProviderJobStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str, provider_name: str = _PROVIDER_NAME):
         self.path = Path(path)
+        self.provider_name = provider_name
         self._lock = threading.RLock()
         self._data = self._load()
 
@@ -61,7 +62,7 @@ class _ProviderJobStore:
             self._data = self._load()
             changed = False
             for job in self._data["jobs"]:
-                if job.get("provider") != _PROVIDER_NAME:
+                if job.get("provider") != self.provider_name:
                     continue
                 if job.get("shot_key") != shot_key:
                     continue
@@ -117,9 +118,16 @@ class _ProviderJobStore:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             for job in reversed(self._data["jobs"]):
-                if job.get("provider") != _PROVIDER_NAME:
+                if job.get("provider") != self.provider_name:
                     continue
-                if not _job_matches_identity(job, shot_key, input_hash, prompt_hash, source_image_hashes):
+                if not _job_matches_identity(
+                    job,
+                    shot_key,
+                    input_hash,
+                    prompt_hash,
+                    source_image_hashes,
+                    allow_legacy_identity=self.provider_name == _PROVIDER_NAME,
+                ):
                     continue
                 if job.get("status") in {"stale", "failed", "prepared"}:
                     continue
@@ -142,13 +150,20 @@ class _ProviderJobStore:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             for job in reversed(self._data["jobs"]):
-                if job.get("provider") != _PROVIDER_NAME:
+                if job.get("provider") != self.provider_name:
                     continue
                 if not job.get("task_id"):
                     continue
                 if job.get("status") == "stale":
                     continue
-                if not _job_matches_identity(job, shot_key, input_hash, prompt_hash, source_image_hashes):
+                if not _job_matches_identity(
+                    job,
+                    shot_key,
+                    input_hash,
+                    prompt_hash,
+                    source_image_hashes,
+                    allow_legacy_identity=self.provider_name == _PROVIDER_NAME,
+                ):
                     continue
                 return job.get("task_id")
             return None
@@ -157,7 +172,7 @@ class _ProviderJobStore:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             for job in reversed(self._data["jobs"]):
-                if job.get("provider") != _PROVIDER_NAME:
+                if job.get("provider") != self.provider_name:
                     continue
                 if job.get("shot_key") != shot_key:
                     continue
@@ -172,7 +187,7 @@ class _ProviderJobStore:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             return any(
-                job.get("provider") == _PROVIDER_NAME and job.get("shot_key") == shot_key
+                job.get("provider") == self.provider_name and job.get("shot_key") == shot_key
                 for job in self._data["jobs"]
             )
 
@@ -195,6 +210,7 @@ class _ProviderJobStore:
                     source_image_hashes=updates.get("source_image_hashes") or {},
                     input_hash=input_hash,
                     output_path=str(updates.get("output_path") or ""),
+                    provider_name=self.provider_name,
                 )
                 self._data["jobs"].append(job)
 
@@ -203,9 +219,45 @@ class _ProviderJobStore:
             self._save_locked()
             return _copy_job(job)
 
+    def claim_submitting_job(
+        self,
+        shot_key: str,
+        input_hash: str,
+        updates: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Atomically mark a prepared job as submitting before a paid POST."""
+        now = _utc_now_iso()
+        with self._lock, self._acquire_file_lock():
+            self._data = self._load()
+            job = self._find_latest_locked(shot_key, input_hash)
+            if job is None:
+                job = _new_provider_job(
+                    shot_key=shot_key,
+                    model=str(updates.get("model") or ""),
+                    prompt_hash=str(updates.get("prompt_hash") or ""),
+                    source_image_hashes=updates.get("source_image_hashes") or {},
+                    input_hash=input_hash,
+                    output_path=str(updates.get("output_path") or ""),
+                    provider_name=self.provider_name,
+                )
+                self._data["jobs"].append(job)
+
+            if (
+                job.get("task_id")
+                or job.get("video_url")
+                or job.get("status") not in {None, "prepared", "failed"}
+            ):
+                return {"claimed": False, "job": _copy_job(job)}
+
+            job.update(updates)
+            job["status"] = "submitting"
+            _touch_job(job, now, "submitting_at")
+            self._save_locked()
+            return {"claimed": True, "job": _copy_job(job)}
+
     def _find_latest_locked(self, shot_key: str, input_hash: str) -> Optional[Dict[str, Any]]:
         for job in reversed(self._data["jobs"]):
-            if job.get("provider") != _PROVIDER_NAME:
+            if job.get("provider") != self.provider_name:
                 continue
             if job.get("shot_key") != shot_key:
                 continue
@@ -231,6 +283,7 @@ def _job_matches_identity(
     input_hash: str,
     prompt_hash: Optional[str],
     source_image_hashes: Optional[Dict[str, Optional[str]]],
+    allow_legacy_identity: bool = True,
 ) -> bool:
     if job.get("shot_key") != shot_key:
         return False
@@ -238,7 +291,11 @@ def _job_matches_identity(
         return True
     # M-6 compat: a legacy-hash job has a different input_hash for the same shot;
     # fall back to shot identity so its live task_id is reused, not resubmitted.
-    if job.get("hash_inputs_version", 1) != _CURRENT_HASH_INPUTS_VERSION and prompt_hash is not None:
+    if (
+        allow_legacy_identity
+        and job.get("hash_inputs_version", 1) != _CURRENT_HASH_INPUTS_VERSION
+        and prompt_hash is not None
+    ):
         return (
             job.get("prompt_hash") == prompt_hash
             and (job.get("source_image_hashes") or {}) == (source_image_hashes or {})
@@ -301,10 +358,11 @@ def _new_provider_job(
     output_path: str,
     resolved_size_params: Optional[Dict[str, str]] = None,
     resolved_duration: Optional[int] = None,
+    provider_name: str = _PROVIDER_NAME,
 ) -> Dict[str, Any]:
     return {
         "shot_key": shot_key,
-        "provider": _PROVIDER_NAME,
+        "provider": provider_name,
         "model": model,
         "prompt_hash": prompt_hash,
         "source_image_hashes": source_image_hashes,
@@ -389,13 +447,14 @@ def _build_input_hash(
     seed: Optional[int],
     frame_types: list[str],
     generate_audio: bool = False,
+    provider_name: str = _PROVIDER_NAME,
 ) -> str:
     # M-6: hash only user-controlled inputs. The resolved duration/size come from
     # the provider's (process-cached, mutable) model catalog and must NOT enter the
     # hash, or a catalog change would force mass paid regeneration of unchanged shots.
     return _hash_json(
         {
-            "provider": _PROVIDER_NAME,
+            "provider": provider_name,
             "model": model_name,
             "prompt_hash": prompt_hash,
             "source_image_hashes": source_image_hashes,

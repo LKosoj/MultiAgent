@@ -7,7 +7,7 @@ import threading
 import requests
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import jwt
@@ -33,6 +33,13 @@ from custom_tools.storybook.video_generator_common import (
     update_shots_with_descriptions,
     sync_items_to_memory
 )
+from custom_tools.storybook.video_generator_aitunnel_jobs import (
+    _ProviderJobStore,
+    _build_input_hash,
+    _hash_source_image,
+    _hash_text,
+    _new_provider_job,
+)
 
 # Импорты из проекта
 try:
@@ -44,6 +51,24 @@ except ImportError:
 
 ak = os.getenv("KLING_API_KEY")
 sk = os.getenv("KLING_API_SECRET_KEY")
+_KLING_PROVIDER_NAME = "kling"
+_KLING_MODEL_NAME = "kling-v2-1"
+_KLING_MODE = "pro"
+_KLING_ASPECT_RATIO = "16:9"
+
+
+class _KlingPollTimeoutError(Exception):
+    def __init__(self, message: str, task_id: str):
+        super().__init__(message)
+        self.task_id = task_id
+
+
+class _KlingSubmitFailedError(Exception):
+    pass
+
+
+class _KlingLedgerUpdateError(Exception):
+    pass
 
 # --- Вспомогательные функции для Kling ---
 
@@ -124,12 +149,6 @@ def video_generator_tool(
         Словарь с результатами генерации видео для каждого кадра.
     """
     
-    # Получаем API ключ
-    api_key = os.getenv("KLING_API_KEY")
-    if not api_key:
-        logger.error("❌ KLING_API_KEY не найден в переменных окружения")
-        return {"status": "error", "message": "KLING_API_KEY не найден", "results": []}
-    
     # Парсим входные данные
     if isinstance(items, str):
         try:
@@ -175,6 +194,25 @@ def video_generator_tool(
     if not enable:
         logger.info("🎬 Генерация видео Kling отключена (enable=False). Анализ изображений завершен.")
         return {"status": "skipped", "message": "Генерация видео отключена, анализ изображений выполнен", "results": []}
+
+    api_key = os.getenv("KLING_API_KEY")
+    api_secret = os.getenv("KLING_API_SECRET_KEY")
+    if not api_key or not api_secret:
+        logger.error("❌ KLING_API_KEY или KLING_API_SECRET_KEY не найдены в переменных окружения")
+        return {"status": "error", "message": "KLING_API_KEY или KLING_API_SECRET_KEY не найдены", "results": []}
+
+    try:
+        job_store = (
+            _ProviderJobStore(
+                f"plots/storybooks/{project_id}/97_shots/provider_jobs.json",
+                provider_name=_KLING_PROVIDER_NAME,
+            )
+            if project_id
+            else None
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения provider_jobs.json: {e}")
+        return _error_result(f"Ошибка чтения provider_jobs.json: {e}")
     
     # Фильтруем кадры, которые нужно конвертировать в видео
     video_items = []
@@ -194,16 +232,20 @@ def video_generator_tool(
             logger.debug(f"⏭️ Пропускаем кадр без video_prompt или video_path: {scene_number}-{shot_number}")
             continue
 
-        # Проверяем, существует ли уже непустое видео
-        if _is_non_empty_file(video_path):
+        # Проверяем, существует ли уже непустое видео. В project_id-режиме
+        # пропускаем его через single-step, чтобы отметить downloaded в ledger.
+        output_exists = _is_non_empty_file(video_path)
+        if output_exists:
             logger.info(f"✅ Видео уже существует: {video_path}")
-            continue
+            if job_store is None:
+                continue
         
         # Анализируем директорию, где должно быть видео, для поиска изображений
         video_dir = os.path.dirname(video_path)
         if not os.path.exists(video_dir):
             logger.debug(f"⏭️ Директория видео не существует: {video_dir}")
-            continue
+            if not output_exists:
+                continue
         
         # Ищем start и end изображения в директории
         start_image = None
@@ -229,7 +271,8 @@ def video_generator_tool(
             logger.debug(f"🖼️ Найдено start изображение: {start_pattern}")
         else:
             logger.debug(f"⏭️ Start изображение не найдено: {start_pattern}, пропускаем")
-            continue
+            if not output_exists:
+                continue
         
         # Проверяем наличие end изображения (опционально)
         if os.path.exists(end_path):
@@ -270,7 +313,7 @@ def video_generator_tool(
         with ThreadPoolExecutor(max_workers=len(batch_items)) as executor:
             # Создаем задачи для текущего пакета
             future_to_item = {
-                executor.submit(_generate_single_video, item, session_id): item 
+                executor.submit(_generate_single_video, item, session_id, job_store, api_key, api_secret): item
                 for item in batch_items
             }
             
@@ -322,7 +365,13 @@ def video_generator_tool(
     return _error_result(message, results=results, stats=stats)
 
 
-def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, Any]:
+def _generate_single_video(
+    item: Dict[str, Any],
+    session_id: str,
+    job_store: Optional[_ProviderJobStore] = None,
+    api_key: Optional[str] = None,
+    api_secret: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Генерирует одно видео из изображений (start и опционально end) с использованием Kling AI API.
     """
@@ -332,7 +381,9 @@ def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, A
     video_path = item.get("video_path")
     scene_number = item.get("scene_number", "?")
     shot_number = item.get("shot_number", "?")
+    shot_key = f"{scene_number}-{shot_number}"
     timing = item.get("timing", "00:00 - 00:05")
+    input_hash: Optional[str] = None
     
     logger.info(f"🎥 Генерируем видео для сцены {scene_number}, кадр {shot_number}")
     if end_image:
@@ -340,114 +391,301 @@ def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, A
     else:
         logger.info(f"📹 Используем только start изображение")
 
-    if not ak or not sk:
-        return {
-            "success": False,
-            "error": "KLING_API_KEY или KLING_API_SECRET_KEY не заданы",
-            "scene_number": scene_number,
-            "shot_number": shot_number,
-            "video_path": video_path,
-        }
-
     try:
-        # Создаем директорию для видео
-        os.makedirs(os.path.dirname(video_path), exist_ok=True)
-
-        # Кодируем start изображение в base64
-        with open(start_image, "rb") as img_file:
-            image_data = base64.b64encode(img_file.read()).decode('utf-8')
-
-        # Кодируем end изображение в base64 (если есть)
-        image_tail_data = None
-        if end_image:
-            with open(end_image, "rb") as img_file:
-                image_tail_data = base64.b64encode(img_file.read()).decode('utf-8')
-
-        # Определяем длительность видео из timing
         duration = _parse_duration_from_timing(timing)
-
-        token = encode_jwt_token(ak, sk)
-        # Подготавливаем запрос к Kling AI API
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json"
+        prompt_hash = _hash_text(str(video_prompt or ""))
+        source_image_hashes = {
+            "start_image": _hash_source_image(start_image),
+            "end_image": _hash_source_image(end_image),
         }
-
-        payload = {
-            "model_name": "kling-v2-1",
-            "image": image_data,
-            "image_tail": image_tail_data,  # Конечное изображение (если есть)
-            "prompt": video_prompt,
-            "negative_prompt": "blurry, distorted, low quality, artifacts, watermark",
-            "cfg_scale": 0.5,
-            "mode": "pro",  # standard или pro
-            "duration": duration,  # 5 или 10 секунд
-            "aspect_ratio": "16:9"  # 16:9, 9:16, 1:1
-        }
-        
-        # Отправляем запрос на создание видео
-        logger.debug(f"📤 Отправляем запрос в Kling AI для сцены {scene_number}-{shot_number}")
-
-        response = requests.post(
-            "https://api-singapore.klingai.com/v1/videos/image2video",
-            headers=headers,
-            json=payload,
-            timeout=(30, 600)
+        output_exists = _is_non_empty_file(str(video_path or ""))
+        trusted_output_job = (
+            job_store.find_latest_output_job_for_shot(shot_key, str(video_path))
+            if job_store and output_exists
+            else None
         )
-        
-        if response.status_code != 200:
-            error_msg = f"Ошибка API Kling: {response.status_code} - {response.text}"
-            logger.error(error_msg)
+        trusted_source_hashes = trusted_output_job.get("source_image_hashes") if trusted_output_job else {}
+        missing_trusted_source_hash = any(
+            source_image_hashes.get(name) is None and bool((trusted_source_hashes or {}).get(name))
+            for name in source_image_hashes
+        )
+        trusted_metadata_matches = (
+            trusted_output_job
+            and trusted_output_job.get("prompt_hash") == prompt_hash
+            and trusted_output_job.get("model") == _KLING_MODEL_NAME
+            and trusted_output_job.get("resolved_duration") == duration
+            and (trusted_output_job.get("resolved_size_params") or {}) == {
+                "mode": _KLING_MODE,
+                "aspect_ratio": _KLING_ASPECT_RATIO,
+            }
+        )
+        if trusted_output_job and missing_trusted_source_hash and trusted_metadata_matches:
+            job_store.update_job(
+                trusted_output_job["shot_key"],
+                trusted_output_job["input_hash"],
+                {
+                    "status": "downloaded",
+                    "output_path": str(video_path),
+                    "error": None,
+                },
+                "downloaded_at",
+            )
             return {
-                "success": False,
-                "error": error_msg,
+                "success": True,
+                "video_path": video_path,
                 "scene_number": scene_number,
                 "shot_number": shot_number,
-                "video_path": video_path
+                "task_id": trusted_output_job.get("task_id"),
+                "video_url": trusted_output_job.get("video_url"),
+                "error": None,
             }
-        
-        result = response.json()
-        task_id = result.get("data", {}).get("task_id")
-        
-        if not task_id:
-            error_msg = f"Не получен task_id от API: {result}"
-            logger.error(error_msg)
+        frame_types = ["first_frame"] + (["last_frame"] if end_image else [])
+        input_hash = _build_input_hash(
+            model_name=f"{_KLING_MODEL_NAME}|{_KLING_MODE}|{_KLING_ASPECT_RATIO}",
+            prompt_hash=prompt_hash,
+            source_image_hashes=source_image_hashes,
+            requested_duration=duration,
+            requested_width=0,
+            requested_height=0,
+            seed=None,
+            frame_types=frame_types,
+            provider_name=_KLING_PROVIDER_NAME,
+        )
+
+        if job_store:
+            job_store.mark_stale_for_changed_input(shot_key, input_hash)
+            existing_job = job_store.find_current_job(shot_key, input_hash)
+            has_prior_job_for_shot = job_store.has_job_for_shot(shot_key)
+            job_store.ensure_job(
+                _new_provider_job(
+                    shot_key=shot_key,
+                    model=_KLING_MODEL_NAME,
+                    prompt_hash=prompt_hash,
+                    source_image_hashes=source_image_hashes,
+                    input_hash=input_hash,
+                    output_path=str(video_path),
+                    resolved_size_params={"mode": _KLING_MODE, "aspect_ratio": _KLING_ASPECT_RATIO},
+                    resolved_duration=duration,
+                    provider_name=_KLING_PROVIDER_NAME,
+                )
+            )
+        else:
+            existing_job = None
+            has_prior_job_for_shot = False
+
+        if output_exists and (not job_store or existing_job or not has_prior_job_for_shot):
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "status": "downloaded",
+                        "model": _KLING_MODEL_NAME,
+                        "prompt_hash": prompt_hash,
+                        "source_image_hashes": source_image_hashes,
+                        "output_path": str(video_path),
+                        "error": None,
+                    },
+                    "downloaded_at",
+                )
             return {
-                "success": False,
-                "error": error_msg,
+                "success": True,
+                "video_path": video_path,
                 "scene_number": scene_number,
                 "shot_number": shot_number,
-                "video_path": video_path
+                "task_id": existing_job.get("task_id") if existing_job else None,
+                "video_url": existing_job.get("video_url") if existing_job else None,
+                "error": None,
             }
-        
-        logger.info(f"📋 Получен task_id: {task_id} для сцены {scene_number}-{shot_number}")
-        
-        # Ожидаем завершения генерации
-        video_url = _wait_for_video_completion(task_id, session_id, token)
-        
+
+        api_key = api_key or ak
+        api_secret = api_secret or sk
+        if not api_key or not api_secret:
+            raise RuntimeError("KLING_API_KEY или KLING_API_SECRET_KEY не заданы")
+
+        resume_job = (
+            job_store.find_resumable_job(shot_key, input_hash, prompt_hash, source_image_hashes)
+            if job_store
+            else None
+        )
+        task_id = None
+
+        if resume_job and resume_job.get("task_id"):
+            task_id = resume_job.get("task_id")
+            logger.info(f"↩️ Kling resume task_id={task_id} для сцены {scene_number}-{shot_number}")
+        elif resume_job and resume_job.get("status") in {"submitting", "submitted", "pending", "in_progress", "poll_timeout"}:
+            raise RuntimeError(
+                "Найдена неоднозначная Kling provider job без task_id; "
+                "повторная отправка заблокирована, чтобы не создать дубликат платной задачи"
+            )
+        else:
+            if not start_image or not os.path.exists(start_image):
+                raise ValueError(f"Start image not found: {start_image}")
+
+            os.makedirs(os.path.dirname(video_path), exist_ok=True)
+
+            with open(start_image, "rb") as img_file:
+                image_data = base64.b64encode(img_file.read()).decode('utf-8')
+
+            image_tail_data = None
+            if end_image:
+                with open(end_image, "rb") as img_file:
+                    image_tail_data = base64.b64encode(img_file.read()).decode('utf-8')
+
+            token = encode_jwt_token(api_key, api_secret)
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json"
+            }
+
+            payload = {
+                "model_name": _KLING_MODEL_NAME,
+                "image": image_data,
+                "image_tail": image_tail_data,
+                "prompt": video_prompt,
+                "negative_prompt": "blurry, distorted, low quality, artifacts, watermark",
+                "cfg_scale": 0.5,
+                "mode": _KLING_MODE,
+                "duration": duration,
+                "aspect_ratio": _KLING_ASPECT_RATIO
+            }
+
+            if job_store:
+                claim = job_store.claim_submitting_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "model": _KLING_MODEL_NAME,
+                        "prompt_hash": prompt_hash,
+                        "source_image_hashes": source_image_hashes,
+                        "output_path": str(video_path),
+                        "error": None,
+                    },
+                )
+                if not claim.get("claimed"):
+                    raise RuntimeError(
+                        "Найдена неоднозначная Kling provider job без task_id; "
+                        "повторная отправка заблокирована, чтобы не создать дубликат платной задачи"
+                    )
+
+            logger.debug(f"📤 Отправляем запрос в Kling AI для сцены {scene_number}-{shot_number}")
+            response = requests.post(
+                "https://api-singapore.klingai.com/v1/videos/image2video",
+                headers=headers,
+                json=payload,
+                timeout=(30, 600)
+            )
+
+            if response.status_code != 200:
+                raise _KlingSubmitFailedError(f"Ошибка API Kling: {response.status_code} - {response.text}")
+
+            result = response.json()
+            task_id = result.get("data", {}).get("task_id")
+
+            if not task_id:
+                raise _KlingSubmitFailedError(f"Не получен task_id от API: {result}")
+
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "task_id": task_id,
+                        "status": "submitted",
+                        "provider_status": "submitted",
+                        "error": None,
+                    },
+                    "submitted_at",
+                )
+
+        logger.info(f"📋 Kling task_id: {task_id} для сцены {scene_number}-{shot_number}")
+
+        video_url = _wait_for_video_completion(
+            task_id,
+            session_id,
+            api_key,
+            api_secret,
+            on_poll=(
+                (lambda payload: _record_kling_poll_update(job_store, shot_key, input_hash, payload))
+                if job_store
+                else None
+            ),
+            raise_on_timeout=job_store is not None,
+        )
+
         if not video_url:
-            return {
-                "success": False,
-                "error": "Не удалось получить URL видео",
-                "scene_number": scene_number,
-                "shot_number": shot_number,
-                "video_path": video_path
-            }
-        
-        # Скачиваем видео
+            raise RuntimeError("Не удалось получить URL видео")
+
+        if job_store:
+            job_store.update_job(
+                shot_key,
+                input_hash,
+                {
+                    "task_id": task_id,
+                    "status": "completed",
+                    "provider_status": "succeed",
+                    "video_url": video_url,
+                    "video_url_requires_auth": False,
+                    "error": None,
+                },
+                "completed_at",
+            )
+            job_store.update_job(shot_key, input_hash, {"status": "downloading", "error": None}, None)
+
         success = _download_video(video_url, video_path)
-        
+        if not success:
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {"status": "download_failed", "error": "Ошибка скачивания видео", "video_url": video_url},
+                    "failed_at",
+                )
+            raise RuntimeError("Ошибка скачивания видео")
+
+        if job_store:
+            job_store.update_job(
+                shot_key,
+                input_hash,
+                {
+                    "status": "downloaded",
+                    "task_id": task_id,
+                    "video_url": video_url,
+                    "video_url_requires_auth": False,
+                    "output_path": str(video_path),
+                    "error": None,
+                },
+                "downloaded_at",
+            )
+
         return {
-            "success": success,
-            "video_path": video_path if success else None,
+            "success": True,
+            "video_path": video_path,
             "scene_number": scene_number,
             "shot_number": shot_number,
             "task_id": task_id,
-            "video_url": video_url if success else None,
-            "error": None if success else "Ошибка скачивания видео"
+            "video_url": video_url,
+            "error": None
         }
-        
+
     except Exception as e:
+        if job_store and input_hash:
+            current_job = job_store.find_current_job(shot_key, input_hash)
+            if current_job and current_job.get("status") == "download_failed":
+                status = "download_failed"
+            elif (
+                current_job
+                and current_job.get("status") == "submitting"
+                and not current_job.get("task_id")
+                and not isinstance(e, _KlingSubmitFailedError)
+                and not isinstance(e, _KlingLedgerUpdateError)
+            ):
+                status = "submitting"
+            elif isinstance(e, (_KlingPollTimeoutError, _KlingLedgerUpdateError)):
+                status = "poll_timeout"
+            else:
+                status = "failed"
+            job_store.update_job(shot_key, input_hash, {"status": status, "error": str(e)}, "failed_at")
         logger.error(f"❌ Исключение при генерации видео сцена {scene_number}-{shot_number}: {e}")
         return {
             "success": False,
@@ -458,7 +696,33 @@ def _generate_single_video(item: Dict[str, Any], session_id: str) -> Dict[str, A
         }
 
 
-def _wait_for_video_completion(task_id: str, session_id: str, token: str, max_wait_time: int = 600) -> Optional[str]:
+def _record_kling_poll_update(
+    job_store: _ProviderJobStore,
+    shot_key: str,
+    input_hash: str,
+    payload: Dict[str, Any],
+) -> None:
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    job_store.update_job(
+        shot_key,
+        input_hash,
+        {
+            "provider_status": data.get("task_status") or "unknown",
+            "error": data.get("task_status_msg") or payload.get("message"),
+        },
+        "polled_at",
+    )
+
+
+def _wait_for_video_completion(
+    task_id: str,
+    session_id: str,
+    api_key: str,
+    api_secret: str,
+    max_wait_time: int = 600,
+    on_poll: Optional[Callable[[Dict[str, Any]], None]] = None,
+    raise_on_timeout: bool = False,
+) -> Optional[str]:
     """
     Ожидает завершения генерации видео и возвращает URL.
     
@@ -480,7 +744,7 @@ def _wait_for_video_completion(task_id: str, session_id: str, token: str, max_wa
             time.sleep(50)
             first_check = False
         try:
-            token = encode_jwt_token(ak, sk)
+            token = encode_jwt_token(api_key, api_secret)
             headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json"
@@ -498,45 +762,47 @@ def _wait_for_video_completion(task_id: str, session_id: str, token: str, max_wa
                 continue
 
             result = response.json()
-            #logger.info(f"🔄 Статус task {task_id}: {str(result)}")
-            data = result.get("data", {})
-            status = data.get("task_status")
-            
-            logger.debug(f"🔄 Статус task {task_id}: {status}")
-            
-            if status == "succeed":
-                # Видео готово
-                task_result = data.get("task_result", {})
-                videos = task_result.get("videos", [])
-                if videos and len(videos) > 0:
-                    video_url = videos[0].get("url")
-                    if video_url:
-                        logger.info(f"✅ Видео готово: {task_id}")
-                        return video_url
-                
-                logger.error(f"❌ Видео готово, но URL не найден в ответе: {result}")
-                return None
-                
-            elif status == "failed":
-                logger.error(f"❌ Генерация видео провалилась: {task_id}")
-                return None
-                
-            elif status in ["submitted", "processing"]:
-                # Видео еще генерируется, ждем
-                time.sleep(check_interval)
-                continue
-                
-            else:
-                logger.warning(f"⚠️ Неизвестный статус: {status} для task {task_id}")
-                time.sleep(check_interval)
-                continue
-                
         except Exception as e:
             logger.error(f"❌ Ошибка при проверке статуса task {task_id}: {e}")
             time.sleep(check_interval)
             continue
+
+        if on_poll:
+            try:
+                on_poll(result)
+            except Exception as exc:
+                raise _KlingLedgerUpdateError(str(exc)) from exc
+        data = result.get("data", {})
+        status = data.get("task_status")
+
+        logger.debug(f"🔄 Статус task {task_id}: {status}")
+
+        if status == "succeed":
+            task_result = data.get("task_result", {})
+            videos = task_result.get("videos", [])
+            if videos and len(videos) > 0:
+                video_url = videos[0].get("url")
+                if video_url:
+                    logger.info(f"✅ Видео готово: {task_id}")
+                    return video_url
+            logger.error(f"❌ Видео готово, но URL не найден в ответе: {result}")
+            return None
+
+        if status == "failed":
+            logger.error(f"❌ Генерация видео провалилась: {task_id}")
+            return None
+
+        if status in ["submitted", "processing"]:
+            time.sleep(check_interval)
+            continue
+
+        logger.warning(f"⚠️ Неизвестный статус: {status} для task {task_id}")
+        time.sleep(check_interval)
+        continue
     
     logger.error(f"⏰ Превышено время ожидания для task {task_id}")
+    if raise_on_timeout:
+        raise _KlingPollTimeoutError(f"Превышено время ожидания для task {task_id}", task_id)
     return None
 
 

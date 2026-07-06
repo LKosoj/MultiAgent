@@ -792,3 +792,40 @@ def sync_items_to_memory(
         logger.warning(f"⚠️ Не удалось синхронизировать элементы с памятью: {e}")
         return 0
 
+
+def parse_duration_seconds_from_timing(timing: str, default: int = 6, minimum: int = 1, maximum: int = 10) -> int:
+    try:
+        if " - " in timing:
+            start_str, end_str = timing.split(" - ")
+            start_seconds = _time_str_to_seconds(start_str.strip(), 0)
+            end_seconds = _time_str_to_seconds(end_str.strip(), 0)
+            duration = end_seconds - start_seconds
+        elif timing.endswith("s"):
+            duration = int(timing[:-1])
+        else:
+            duration = default
+
+        if duration < minimum:
+            return minimum
+        if duration > maximum:
+            return maximum
+        return duration
+    except Exception:
+        return default
+
+
+def _time_str_to_seconds(time_str: str, default: int = 0) -> int:
+    try:
+        parts = time_str.split(":")
+        if len(parts) == 2:
+            minutes = int(parts[0])
+            seconds = int(parts[1])
+            return minutes * 60 + seconds
+        if len(parts) == 3:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+            seconds = int(parts[2])
+            return hours * 3600 + minutes * 60 + seconds
+        return default
+    except Exception:
+        return default

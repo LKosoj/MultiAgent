@@ -167,6 +167,10 @@ def _make_item(shots_dir: Path, scene: int = 1, shot: int = 1, prompt: str = "A 
     }
 
 
+def _read_provider_jobs(shots_dir: Path):
+    return json.loads((shots_dir / "provider_jobs.json").read_text(encoding="utf-8"))["jobs"]
+
+
 def _patch_common(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
@@ -267,7 +271,11 @@ def test_veo_skips_existing_nonempty_video(tmp_path, monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert result["stats"] == {"total": 0, "successful": 0, "failed": 0}
+    assert result["stats"] == {"total": 1, "successful": 1, "failed": 0}
+    jobs = _read_provider_jobs(shots_dir)
+    assert len(jobs) == 1
+    assert jobs[0]["provider"] == "veo"
+    assert jobs[0]["status"] == "downloaded"
 
 
 def test_veo_regenerates_when_existing_video_is_empty(tmp_path, monkeypatch):
@@ -285,6 +293,137 @@ def test_veo_regenerates_when_existing_video_is_empty(tmp_path, monkeypatch):
     assert result["status"] == "success"
     assert result["stats"]["successful"] == 1
     assert Path(item["video_path"]).read_bytes() == b"veo-bytes"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
+
+
+def test_veo_persists_provider_job_and_resumes_without_generate_call(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+    captured = {}
+    submit_calls = []
+
+    def resolver(prompt):
+        submit_calls.append(prompt)
+        return _FakeOperation(
+            name="operations/op-1",
+            done=True,
+            response=_FakeOpResponse([_FakeGenVideo(_FakeVideoObj(video_bytes=b"veo-first"))]),
+        )
+
+    _install_client(monkeypatch, resolver, captured=captured)
+
+    first = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert first["status"] == "success"
+    assert Path(item["video_path"]).read_bytes() == b"veo-first"
+    jobs = _read_provider_jobs(shots_dir)
+    assert len(jobs) == 1
+    assert jobs[0]["provider"] == "veo"
+    assert jobs[0]["task_id"] == "operations/op-1"
+    assert jobs[0]["status"] == "downloaded"
+    assert {"submitted_at", "completed_at", "downloaded_at"}.issubset(jobs[0]["timestamps"])
+
+    provider_jobs_path = shots_dir / "provider_jobs.json"
+    provider_jobs = json.loads(provider_jobs_path.read_text(encoding="utf-8"))
+    provider_jobs["jobs"][0]["status"] = "poll_timeout"
+    provider_jobs_path.write_text(json.dumps(provider_jobs), encoding="utf-8")
+    Path(item["video_path"]).unlink()
+
+    def forbidden_resolver(prompt):
+        del prompt
+        raise AssertionError("resume must not call generate_videos")
+
+    _install_client(
+        monkeypatch,
+        forbidden_resolver,
+        poll_results=[
+            _FakeOperation(
+                name="operations/op-1",
+                done=True,
+                response=_FakeOpResponse([_FakeGenVideo(_FakeVideoObj(video_bytes=b"veo-resumed"))]),
+            )
+        ],
+    )
+
+    resumed = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert resumed["status"] == "success"
+    assert submit_calls == ["A calm sea"]
+    assert Path(item["video_path"]).read_bytes() == b"veo-resumed"
+
+
+def test_veo_submit_exception_keeps_submitting_and_blocks_next_post(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+
+    def resolver(prompt):
+        del prompt
+        raise RuntimeError("400 invalid prompt")
+
+    _install_client(monkeypatch, resolver)
+
+    result = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "error"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "submitting"
+
+    _install_client(monkeypatch, resolver)
+
+    retry = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert retry["status"] == "error"
+    assert "дубликат платной задачи" in retry["results"][0]["error"]
+
+
+def test_veo_poll_ledger_write_error_is_not_swallowed(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+
+    def resolver(prompt):
+        del prompt
+        return _FakeOperation(name="operations/op-1", done=False)
+
+    _install_client(
+        monkeypatch,
+        resolver,
+        poll_results=[
+            _FakeOperation(
+                name="operations/op-1",
+                done=True,
+                response=_FakeOpResponse([_FakeGenVideo(_FakeVideoObj(video_bytes=b"veo-bytes"))]),
+            )
+        ],
+    )
+
+    def failing_poll_update(*args, **kwargs):
+        del args, kwargs
+        raise FileNotFoundError("ledger disappeared")
+
+    monkeypatch.setattr(veo_module, "_record_veo_poll_update", failing_poll_update)
+
+    result = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "error"
+    assert "ledger disappeared" in result["results"][0]["error"]
+    jobs = _read_provider_jobs(shots_dir)
+    assert jobs[0]["status"] == "poll_timeout"
+    assert jobs[0]["task_id"] == "operations/op-1"
 
 
 # --- M-8: failed>0 -> status error with top-level error ------------------------------------------

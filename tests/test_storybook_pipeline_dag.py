@@ -72,6 +72,14 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_music_generator"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
 
+    def test_montage_assembler_receives_audio_policy_flags(self):
+        steps = {step.id: step for step in self._load_storybook().steps}
+
+        params = steps["montage_assembler"].tool_params
+
+        self.assertEqual(params["allow_missing_audio"], "{final_allow_missing_audio}")
+        self.assertEqual(params["music_enabled"], "{generate_music}")
+
     def test_pipeline_runner_knows_video_tail_artifacts(self):
         from StoryBookManager.core.pipeline_runner import PipelineRunner
 

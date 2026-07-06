@@ -367,6 +367,7 @@ steps:
     language: '{language}'
     enable: '{generate_screenplay}'
     allow_missing_audio: '{final_allow_missing_audio}'
+    music_enabled: '{generate_music}'
   depends_on:
   - storybook_music_generator
 - id: storybook_video_decision_log

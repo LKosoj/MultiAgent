@@ -66,6 +66,48 @@ from custom_tools.storybook.video_generator_common import (
     update_shots_with_descriptions,
     sync_items_to_memory
 )
+from custom_tools.storybook.video_generator_aitunnel_jobs import (
+    _ProviderJobStore,
+    _build_input_hash,
+    _hash_source_image,
+    _hash_text,
+    _new_provider_job,
+)
+
+
+_VEO_PROVIDER_NAME = "veo"
+_VEO_MODEL_NAME = 'veo-3.1-generate-preview'
+_VEO_ASPECT_RATIO = "16:9"
+_VEO_RESOLUTION = "720p"
+
+
+class _VeoPollTimeoutError(Exception):
+    def __init__(self, message: str, task_id: str):
+        super().__init__(message)
+        self.task_id = task_id
+
+
+class _VeoSubmitUnknownError(Exception):
+    pass
+
+
+class _VeoLedgerUpdateError(Exception):
+    pass
+
+
+class _VeoOperationRef:
+    def __init__(self, name: str):
+        self.name = name
+        self.done = False
+        self.error = None
+        self.response = None
+
+
+def _veo_operation_ref_from_name(name: str) -> Any:
+    operation_type = getattr(types, "GenerateVideosOperation", None)
+    if operation_type is not None:
+        return operation_type(name=name, done=False)
+    return _VeoOperationRef(name)
 
 
 def _error_result(message: str, **extra: Any) -> Dict[str, Any]:
@@ -192,6 +234,15 @@ def video_generator_veo_tool(
     else:
         logger.debug("Using Gemini API Key (Warning: last_frame may not work)")
 
+    try:
+        job_store = _ProviderJobStore(
+            f"plots/storybooks/{project_id}/97_shots/provider_jobs.json",
+            provider_name=_VEO_PROVIDER_NAME,
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка чтения provider_jobs.json: {e}")
+        return _error_result(f"Ошибка чтения provider_jobs.json: {e}")
+
     # Подготовка задач
     video_items = []
     seen_shots = set()
@@ -206,9 +257,12 @@ def video_generator_veo_tool(
         shot = item.get("shot_number")
         video_path = item.get("video_path")
         
-        if not video_path or _is_non_empty_file(video_path):
+        output_exists = _is_non_empty_file(str(video_path or ""))
+        if not video_path:
             logger.debug(f"Skip existing or invalid video path: {video_path}")
             continue
+        if output_exists:
+            logger.debug(f"Existing video path will be recorded in ledger: {video_path}")
             
         # Поиск изображений (аналогично mm_tool)
         start_img = item.get("start_image")
@@ -225,7 +279,8 @@ def video_generator_veo_tool(
 
         if not start_img or not os.path.exists(start_img):
             logger.debug(f"Start image not found for {scene}-{shot}: {start_img}")
-            continue
+            if not output_exists:
+                continue
             
         # End image
         end_img = item.get("end_image")
@@ -258,7 +313,16 @@ def video_generator_veo_tool(
         
         with ThreadPoolExecutor(max_workers=len(batch)) as executor:
             futures = {
-                executor.submit(_generate_single_video_veo, item, api_key, language, use_vertex, project_id_vertex, location_vertex): item 
+                executor.submit(
+                    _generate_single_video_veo,
+                    item,
+                    api_key,
+                    language,
+                    use_vertex,
+                    project_id_vertex,
+                    location_vertex,
+                    job_store,
+                ): item
                 for item in batch
             }
             
@@ -296,13 +360,23 @@ def video_generator_veo_tool(
         }
     return _error_result(message, results=results, stats=stats)
 
-def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], language: str, use_vertex: bool, project_id: str, location: str) -> Dict[str, Any]:
+def _generate_single_video_veo(
+    item: Dict[str, Any],
+    api_key: Optional[str],
+    language: str,
+    use_vertex: bool,
+    project_id: str,
+    location: str,
+    job_store: Optional[_ProviderJobStore] = None,
+) -> Dict[str, Any]:
     scene = item.get("scene_number")
     shot = item.get("shot_number")
+    shot_key = f"{scene}-{shot}"
     video_path = item.get("video_path")
     start_path = item.get("start_image")
     end_path = item.get("end_image")
-    
+    input_hash: Optional[str] = None
+
     # Локализация промпта
     if translate_prompts_in_items and language != 'en':
         tr_item = translate_prompts_in_items(item, 'en')
@@ -314,8 +388,109 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
         prompt = "Cinematic shot" # Fallback
 
     logger.info(f"🎥 Veo: Сцена {scene}-{shot}, Prompt: {prompt[:50]}...")
-    
+
     try:
+        backend_identity = f"vertex:{project_id}:{location}" if use_vertex else "gemini"
+        prompt_hash = _hash_text(str(prompt or ""))
+        source_image_hashes = {
+            "start_image": _hash_source_image(start_path),
+            "end_image": _hash_source_image(end_path),
+        }
+        output_exists = _is_non_empty_file(str(video_path or ""))
+        trusted_output_job = (
+            job_store.find_latest_output_job_for_shot(shot_key, str(video_path))
+            if job_store and output_exists
+            else None
+        )
+        trusted_source_hashes = trusted_output_job.get("source_image_hashes") if trusted_output_job else {}
+        missing_trusted_source_hash = any(
+            source_image_hashes.get(name) is None and bool((trusted_source_hashes or {}).get(name))
+            for name in source_image_hashes
+        )
+        trusted_metadata_matches = (
+            trusted_output_job
+            and trusted_output_job.get("prompt_hash") == prompt_hash
+            and trusted_output_job.get("model") == _VEO_MODEL_NAME
+            and (trusted_output_job.get("resolved_size_params") or {}) == {
+                "aspect_ratio": _VEO_ASPECT_RATIO,
+                "resolution": _VEO_RESOLUTION,
+            }
+        )
+        if trusted_output_job and missing_trusted_source_hash and trusted_metadata_matches:
+            job_store.update_job(
+                trusted_output_job["shot_key"],
+                trusted_output_job["input_hash"],
+                {
+                    "status": "downloaded",
+                    "output_path": str(video_path),
+                    "error": None,
+                },
+                "downloaded_at",
+            )
+            return {
+                "success": True,
+                "video_path": video_path,
+                "scene": scene,
+                "shot": shot,
+                "task_id": trusted_output_job.get("task_id"),
+            }
+        frame_types = ["first_frame"] + (["last_frame"] if end_path else [])
+        input_hash = _build_input_hash(
+            model_name=f"{_VEO_MODEL_NAME}|{backend_identity}|{_VEO_ASPECT_RATIO}|{_VEO_RESOLUTION}|1",
+            prompt_hash=prompt_hash,
+            source_image_hashes=source_image_hashes,
+            requested_duration=0,
+            requested_width=0,
+            requested_height=0,
+            seed=None,
+            frame_types=frame_types,
+            provider_name=_VEO_PROVIDER_NAME,
+        )
+
+        if job_store:
+            job_store.mark_stale_for_changed_input(shot_key, input_hash)
+            existing_job = job_store.find_current_job(shot_key, input_hash)
+            has_prior_job_for_shot = job_store.has_job_for_shot(shot_key)
+            job_store.ensure_job(
+                _new_provider_job(
+                    shot_key=shot_key,
+                    model=_VEO_MODEL_NAME,
+                    prompt_hash=prompt_hash,
+                    source_image_hashes=source_image_hashes,
+                    input_hash=input_hash,
+                    output_path=str(video_path),
+                    resolved_size_params={"aspect_ratio": _VEO_ASPECT_RATIO, "resolution": _VEO_RESOLUTION},
+                    resolved_duration=None,
+                    provider_name=_VEO_PROVIDER_NAME,
+                )
+            )
+        else:
+            existing_job = None
+            has_prior_job_for_shot = False
+
+        if output_exists and (not job_store or existing_job or not has_prior_job_for_shot):
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "status": "downloaded",
+                        "model": _VEO_MODEL_NAME,
+                        "prompt_hash": prompt_hash,
+                        "source_image_hashes": source_image_hashes,
+                        "output_path": str(video_path),
+                        "error": None,
+                    },
+                    "downloaded_at",
+                )
+            return {
+                "success": True,
+                "video_path": video_path,
+                "scene": scene,
+                "shot": shot,
+                "task_id": existing_job.get("task_id") if existing_job else None,
+            }
+
         if use_vertex:
             client = genai.Client(
                 vertexai=True,
@@ -324,137 +499,297 @@ def _generate_single_video_veo(item: Dict[str, Any], api_key: Optional[str], lan
             )
         else:
             client = genai.Client(api_key=api_key)
-        
-        # Читаем файлы
-        with open(start_path, "rb") as f:
-            start_bytes = f.read()
-            
-        end_bytes = None
-        if end_path and os.path.exists(end_path):
-            with open(end_path, "rb") as f:
-                end_bytes = f.read()
 
-        # Конфигурация для Veo
-        # Используем модель veo-3.1-fast-generate-preview по требованию
-        
-        model_name = 'veo-3.1-generate-preview'
-        #model_name = 'veo-3.1-fast-generate-preview'
-        
-        config_params = {
-            "number_of_videos": 1,
-            "aspect_ratio": "16:9",
-            "resolution": "720p"
-        }
-        
-        if end_bytes:
-            config_params["last_frame"] = types.Image(image_bytes=end_bytes, mime_type="image/png")
-            
-        # Запуск генерации
-        operation = client.models.generate_videos(
-            model=model_name,
-            prompt=prompt,
-            image=types.Image(image_bytes=start_bytes, mime_type="image/png"),
-            config=types.GenerateVideosConfig(**config_params)
+        resume_job = (
+            job_store.find_resumable_job(shot_key, input_hash, prompt_hash, source_image_hashes)
+            if job_store
+            else None
         )
-        
-        logger.info(f"⏳ Veo started: {operation.name} ({scene}-{shot})")
+        if resume_job and resume_job.get("task_id"):
+            operation = _veo_operation_ref_from_name(str(resume_job["task_id"]))
+            logger.info(f"↩️ Veo resume operation={operation.name} ({scene}-{shot})")
+        elif resume_job and resume_job.get("status") in {"submitting", "submitted", "pending", "in_progress", "poll_timeout"}:
+            raise RuntimeError(
+                "Найдена неоднозначная Veo provider job без task_id; "
+                "повторная отправка заблокирована, чтобы не создать дубликат платной задачи"
+            )
+        else:
+            if not start_path or not os.path.exists(start_path):
+                raise ValueError(f"Start image not found: {start_path}")
 
-        # Поллинг с дедлайном (M-10): не крутимся вечно на зависшей операции
-        start_time = time.time()
-        max_wait_time = 600
-        while not operation.done:
-            if time.time() - start_time >= max_wait_time:
-                logger.error(f"⏰ Превышено время ожидания Veo ({max_wait_time}s) для {scene}-{shot}")
-                return {
-                    "success": False,
-                    "error": f"Превышено время ожидания Veo ({max_wait_time}s)",
-                    "scene": scene,
-                    "shot": shot
-                }
-            time.sleep(5)
-            try:
-                operation = client.operations.get(operation)
-            except Exception as e:
-                logger.warning(f"⚠️ Veo: сбой опроса операции {scene}-{shot}, повтор: {e}")
-                continue
+            with open(start_path, "rb") as f:
+                start_bytes = f.read()
 
-        if operation.error:
-            return {
-                "success": False,
-                "error": str(operation.error),
-                "scene": scene,
-                "shot": shot
+            end_bytes = None
+            if end_path and os.path.exists(end_path):
+                with open(end_path, "rb") as f:
+                    end_bytes = f.read()
+
+            config_params = {
+                "number_of_videos": 1,
+                "aspect_ratio": _VEO_ASPECT_RATIO,
+                "resolution": _VEO_RESOLUTION,
             }
-            
-        # Получение видео
-        logger.debug(f"Operation Response for {scene}-{shot}: {operation.response}")
 
-        if hasattr(operation.response, 'rai_media_filtered_count') and operation.response.rai_media_filtered_count and operation.response.rai_media_filtered_count > 0:
-             logger.warning(f"⚠️ Video generation filtered by safety settings. Reasons: {operation.response.rai_media_filtered_reasons}")
-             return {"success": False, "error": "Video filtered by safety settings", "scene": scene, "shot": shot}
+            if end_bytes:
+                config_params["last_frame"] = types.Image(image_bytes=end_bytes, mime_type="image/png")
 
-        if not hasattr(operation.response, 'generated_videos') or not operation.response.generated_videos:
-             return {"success": False, "error": f"No videos in response: {operation.response}", "scene": scene, "shot": shot}
+            if job_store:
+                claim = job_store.claim_submitting_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "model": _VEO_MODEL_NAME,
+                        "prompt_hash": prompt_hash,
+                        "source_image_hashes": source_image_hashes,
+                        "output_path": str(video_path),
+                        "error": None,
+                    },
+                )
+                if not claim.get("claimed"):
+                    raise RuntimeError(
+                        "Найдена неоднозначная Veo provider job без task_id; "
+                        "повторная отправка заблокирована, чтобы не создать дубликат платной задачи"
+                    )
 
-        video_obj = operation.response.generated_videos[0].video
-        video_uri = video_obj.uri
-        video_bytes = video_obj.video_bytes
+            try:
+                operation = client.models.generate_videos(
+                    model=_VEO_MODEL_NAME,
+                    prompt=prompt,
+                    image=types.Image(image_bytes=start_bytes, mime_type="image/png"),
+                    config=types.GenerateVideosConfig(**config_params)
+                )
+            except Exception as submit_error:
+                raise _VeoSubmitUnknownError(str(submit_error)) from submit_error
 
-        if not video_uri and not video_bytes:
-             return {"success": False, "error": f"No video URI or bytes. Response item: {operation.response.generated_videos[0]}", "scene": scene, "shot": shot}
-        
-        # Скачиваем/сохраняем атомарно: во временный файл + os.replace (M-9)
-        output = Path(video_path)
-        output.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+            logger.info(f"⏳ Veo started: {operation.name} ({scene}-{shot})")
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "task_id": operation.name,
+                        "status": "submitted",
+                        "provider_status": "submitted",
+                        "error": None,
+                    },
+                    "submitted_at",
+                )
+
+        operation = _wait_for_veo_operation(
+            client,
+            operation,
+            on_poll=(
+                (lambda op: _record_veo_poll_update(job_store, shot_key, input_hash, op))
+                if job_store
+                else None
+            ),
+        )
+        video_uri, video_bytes = _extract_veo_video(operation, scene, shot)
+
+        if job_store:
+            job_store.update_job(
+                shot_key,
+                input_hash,
+                {
+                    "task_id": operation.name,
+                    "status": "completed",
+                    "provider_status": "done",
+                    "video_url": video_uri,
+                    "video_url_requires_auth": bool(video_uri and not use_vertex and api_key),
+                    "error": None,
+                },
+                "completed_at",
+            )
+            job_store.update_job(shot_key, input_hash, {"status": "downloading", "error": None}, None)
 
         try:
-            if video_bytes:
-                logger.info(f"💾 Saving Veo video from bytes to {video_path}...")
-                with open(tmp_path, 'wb') as f:
-                    f.write(video_bytes)
-                    f.flush()
-                    os.fsync(f.fileno())
-            else:
-                logger.info(f"⬇️ Downloading Veo video from {_sanitize_url_for_log(video_uri)}...")
-
-                # L-1: ключ передаём заголовком x-goog-api-key, не в query-параметре URL
-                download_headers = {}
-                if not use_vertex and api_key:
-                    download_headers["x-goog-api-key"] = api_key
-
-                resp = requests.get(video_uri, headers=download_headers, stream=True, timeout=(30, 600))
-                if resp.status_code != 200:
-                    return {"success": False, "error": f"Download failed: {resp.status_code} {_sanitize_url_for_log(video_uri)}", "scene": scene, "shot": shot}
-
-                with open(tmp_path, 'wb') as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                    f.flush()
-                    os.fsync(f.fileno())
-
-            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
-                return {"success": False, "error": "Empty file after download/save", "scene": scene, "shot": shot}
-            os.replace(tmp_path, output)
-        finally:
-            if tmp_path.exists():
-                try:
-                    tmp_path.unlink()
-                except OSError:
-                    pass
+            _save_or_download_veo_video(
+                video_path=video_path,
+                video_uri=video_uri,
+                video_bytes=video_bytes,
+                api_key=api_key,
+                use_vertex=use_vertex,
+            )
+        except Exception as download_error:
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {"status": "download_failed", "error": str(download_error), "video_url": video_uri},
+                    "failed_at",
+                )
+            raise
 
         if _is_non_empty_file(video_path):
-            return {"success": True, "video_path": video_path, "scene": scene, "shot": shot}
-        return {"success": False, "error": "Empty file after download/save", "scene": scene, "shot": shot}
+            if job_store:
+                job_store.update_job(
+                    shot_key,
+                    input_hash,
+                    {
+                        "status": "downloaded",
+                        "task_id": operation.name,
+                        "video_url": video_uri,
+                        "video_url_requires_auth": bool(video_uri and not use_vertex and api_key),
+                        "output_path": str(video_path),
+                        "error": None,
+                    },
+                    "downloaded_at",
+                )
+            return {
+                "success": True,
+                "video_path": video_path,
+                "scene": scene,
+                "shot": shot,
+                "task_id": operation.name,
+            }
+        raise RuntimeError("Empty file after download/save")
 
     except Exception as e:
+        if job_store and input_hash:
+            current_job = job_store.find_current_job(shot_key, input_hash)
+            if current_job and current_job.get("status") == "download_failed":
+                status = "download_failed"
+            elif (
+                current_job
+                and current_job.get("status") == "submitting"
+                and not current_job.get("task_id")
+                and not isinstance(e, _VeoLedgerUpdateError)
+            ):
+                status = "submitting"
+            elif isinstance(e, (_VeoPollTimeoutError, _VeoLedgerUpdateError)):
+                status = "poll_timeout"
+            else:
+                status = "failed"
+            job_store.update_job(shot_key, input_hash, {"status": status, "error": str(e)}, "failed_at")
         return {
             "success": False,
             "error": str(e),
             "scene": scene,
             "shot": shot
         }
+
+
+def _record_veo_poll_update(
+    job_store: _ProviderJobStore,
+    shot_key: str,
+    input_hash: str,
+    operation: Any,
+) -> None:
+    provider_status = "done" if getattr(operation, "done", False) else "running"
+    job_store.update_job(
+        shot_key,
+        input_hash,
+        {"provider_status": provider_status, "error": str(getattr(operation, "error", "") or "") or None},
+        "polled_at",
+    )
+
+
+def _wait_for_veo_operation(
+    client: Any,
+    operation: Any,
+    max_wait_time: int = 600,
+    on_poll: Optional[Any] = None,
+) -> Any:
+    start_time = time.time()
+    while not getattr(operation, "done", False):
+        if time.time() - start_time >= max_wait_time:
+            task_id = str(getattr(operation, "name", ""))
+            logger.error(f"⏰ Превышено время ожидания Veo ({max_wait_time}s) для {task_id}")
+            raise _VeoPollTimeoutError(f"Превышено время ожидания Veo ({max_wait_time}s)", task_id)
+        time.sleep(5)
+        try:
+            operation = client.operations.get(operation)
+        except Exception as e:
+            logger.warning(f"⚠️ Veo: сбой опроса операции {getattr(operation, 'name', '')}, повтор: {e}")
+            continue
+        if on_poll:
+            try:
+                on_poll(operation)
+            except Exception as exc:
+                raise _VeoLedgerUpdateError(str(exc)) from exc
+
+    if on_poll:
+        try:
+            on_poll(operation)
+        except Exception as exc:
+            raise _VeoLedgerUpdateError(str(exc)) from exc
+    if getattr(operation, "error", None):
+        raise RuntimeError(str(operation.error))
+    return operation
+
+
+def _extract_veo_video(operation: Any, scene: Any, shot: Any) -> tuple[Optional[str], Optional[bytes]]:
+    logger.debug(f"Operation Response for {scene}-{shot}: {operation.response}")
+
+    if (
+        hasattr(operation.response, 'rai_media_filtered_count')
+        and operation.response.rai_media_filtered_count
+        and operation.response.rai_media_filtered_count > 0
+    ):
+        logger.warning(
+            f"⚠️ Video generation filtered by safety settings. "
+            f"Reasons: {operation.response.rai_media_filtered_reasons}"
+        )
+        raise RuntimeError("Video filtered by safety settings")
+
+    if not hasattr(operation.response, 'generated_videos') or not operation.response.generated_videos:
+        raise RuntimeError(f"No videos in response: {operation.response}")
+
+    video_obj = operation.response.generated_videos[0].video
+    video_uri = video_obj.uri
+    video_bytes = video_obj.video_bytes
+
+    if not video_uri and not video_bytes:
+        raise RuntimeError(f"No video URI or bytes. Response item: {operation.response.generated_videos[0]}")
+    return video_uri, video_bytes
+
+
+def _save_or_download_veo_video(
+    video_path: str,
+    video_uri: Optional[str],
+    video_bytes: Optional[bytes],
+    api_key: Optional[str],
+    use_vertex: bool,
+) -> None:
+    output = Path(video_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output.with_name(f".{output.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp")
+
+    try:
+        if video_bytes:
+            logger.info(f"💾 Saving Veo video from bytes to {video_path}...")
+            with open(tmp_path, 'wb') as f:
+                f.write(video_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+        else:
+            logger.info(f"⬇️ Downloading Veo video from {_sanitize_url_for_log(str(video_uri or ''))}...")
+
+            download_headers = {}
+            if not use_vertex and api_key:
+                download_headers["x-goog-api-key"] = api_key
+
+            resp = requests.get(video_uri, headers=download_headers, stream=True, timeout=(30, 600))
+            if resp.status_code != 200:
+                raise RuntimeError(f"Download failed: {resp.status_code} {_sanitize_url_for_log(str(video_uri or ''))}")
+
+            with open(tmp_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+
+        if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            raise RuntimeError("Empty file after download/save")
+        os.replace(tmp_path, output)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
 
 if __name__ == "__main__":
     # Тест

@@ -24,3 +24,7 @@ parameters:
     type: bool
     description: "If true, allows a video-only montage when no audio track exists"
     required: false
+  - name: music_enabled
+    type: bool
+    description: "If true, requires a usable music/audio track unless missing audio is explicitly allowed"
+    required: false

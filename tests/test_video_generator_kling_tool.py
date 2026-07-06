@@ -56,13 +56,24 @@ def _make_item(shots_dir: Path, scene: int = 1, shot: int = 1, prompt: str = "A 
     }
 
 
+def _read_provider_jobs(shots_dir: Path):
+    return json.loads((shots_dir / "provider_jobs.json").read_text(encoding="utf-8"))["jobs"]
+
+
 def _patch_common(monkeypatch):
     monkeypatch.setenv("KLING_API_KEY", "kling-key")
-    monkeypatch.setattr(kling_module, "ak", "kling-key")
-    monkeypatch.setattr(kling_module, "sk", "kling-secret")
+    monkeypatch.setenv("KLING_API_SECRET_KEY", "kling-secret")
+    monkeypatch.setattr(kling_module, "ak", None)
+    monkeypatch.setattr(kling_module, "sk", None)
     monkeypatch.setattr(kling_module.time, "sleep", lambda *a, **k: None)
     monkeypatch.setattr(kling_module, "update_shots_with_descriptions", lambda *a, **k: False)
-    monkeypatch.setattr(kling_module, "encode_jwt_token", lambda *a, **k: "fake-token")
+
+    def fake_token(api_key, api_secret):
+        assert api_key == "kling-key"
+        assert api_secret == "kling-secret"
+        return "fake-token"
+
+    monkeypatch.setattr(kling_module, "encode_jwt_token", fake_token)
 
 
 def _install_success_mocks(monkeypatch, video_url="https://cdn.kling.example/videos/out.mp4?sign=SECRET"):
@@ -102,6 +113,7 @@ def test_kling_generates_and_downloads_video(tmp_path, monkeypatch):
     assert result["stats"] == {"total": 1, "successful": 1, "failed": 0}
     assert Path(item["video_path"]).read_bytes() == b"kling-video-bytes"
     assert result["results"][0]["task_id"] == "task-1"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
 
 
 # --- L-5: only START shots, dedup by scene+shot --------------------------------------------------
@@ -180,7 +192,11 @@ def test_kling_skips_existing_nonempty_video(tmp_path, monkeypatch):
     )
 
     assert result["status"] == "success"
-    assert "Нет кадров" in result["message"]
+    assert result["stats"] == {"total": 1, "successful": 1, "failed": 0}
+    jobs = _read_provider_jobs(shots_dir)
+    assert len(jobs) == 1
+    assert jobs[0]["provider"] == "kling"
+    assert jobs[0]["status"] == "downloaded"
 
 
 def test_kling_regenerates_when_existing_video_is_empty(tmp_path, monkeypatch):
@@ -198,6 +214,105 @@ def test_kling_regenerates_when_existing_video_is_empty(tmp_path, monkeypatch):
     assert result["status"] == "success"
     assert result["stats"]["successful"] == 1
     assert Path(item["video_path"]).read_bytes() == b"kling-video-bytes"
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "downloaded"
+
+
+def test_kling_persists_provider_job_and_resumes_without_post(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    _, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+    video_url = "https://cdn.kling.example/videos/out.mp4?sign=SECRET"
+    post_calls = []
+    download_calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, json, timeout
+        if post_calls:
+            raise AssertionError("resume must not POST a duplicate Kling task")
+        post_calls.append(url)
+        return _FakeResponse(200, {"data": {"task_id": "task-1"}})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if _STATUS_MARKER in url and url.endswith("task-1"):
+            return _FakeResponse(200, {"data": {
+                "task_status": "succeed",
+                "task_result": {"videos": [{"url": video_url}]},
+            }})
+        if url == video_url:
+            download_calls.append(url)
+            return _FakeResponse(200, content=f"kling-video-{len(download_calls)}".encode("utf-8"))
+        raise AssertionError(f"Unexpected GET {url}")
+
+    monkeypatch.setattr(kling_module.requests, "post", fake_post)
+    monkeypatch.setattr(kling_module.requests, "get", fake_get)
+
+    first = kling_module.video_generator_tool(
+        session_id="s", items={"items": [item]}, project_id="project-kling",
+        enable=True, max_concurrency=1,
+    )
+
+    assert first["status"] == "success"
+    assert Path(item["video_path"]).read_bytes() == b"kling-video-1"
+    jobs = _read_provider_jobs(shots_dir)
+    assert len(jobs) == 1
+    assert jobs[0]["provider"] == "kling"
+    assert jobs[0]["task_id"] == "task-1"
+    assert jobs[0]["status"] == "downloaded"
+    assert jobs[0]["video_url"] == video_url
+    assert {"submitted_at", "polled_at", "completed_at", "downloaded_at"}.issubset(jobs[0]["timestamps"])
+
+    provider_jobs_path = shots_dir / "provider_jobs.json"
+    provider_jobs = json.loads(provider_jobs_path.read_text(encoding="utf-8"))
+    provider_jobs["jobs"][0]["status"] = "poll_timeout"
+    provider_jobs_path.write_text(json.dumps(provider_jobs), encoding="utf-8")
+    Path(item["video_path"]).unlink()
+
+    resumed = kling_module.video_generator_tool(
+        session_id="s", items={"items": [item]}, project_id="project-kling",
+        enable=True, max_concurrency=1,
+    )
+
+    assert resumed["status"] == "success"
+    assert len(post_calls) == 1
+    assert Path(item["video_path"]).read_bytes() == b"kling-video-2"
+
+
+def test_kling_poll_ledger_write_error_keeps_task_resumable(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    _, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        return _FakeResponse(200, {"data": {"task_id": "task-1"}})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if _STATUS_MARKER in url and url.endswith("task-1"):
+            return _FakeResponse(200, {"data": {
+                "task_status": "succeed",
+                "task_result": {"videos": [{"url": "https://cdn.kling.example/out.mp4"}]},
+            }})
+        raise AssertionError(f"Unexpected GET {url}")
+
+    def failing_poll_update(*args, **kwargs):
+        del args, kwargs
+        raise FileNotFoundError("ledger disappeared")
+
+    monkeypatch.setattr(kling_module.requests, "post", fake_post)
+    monkeypatch.setattr(kling_module.requests, "get", fake_get)
+    monkeypatch.setattr(kling_module, "_record_kling_poll_update", failing_poll_update)
+
+    result = kling_module.video_generator_tool(
+        session_id="s", items={"items": [item]}, project_id="project-kling",
+        enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "error"
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["status"] == "poll_timeout"
+    assert job["task_id"] == "task-1"
 
 
 # --- M-8: failed>0 -> status error with top-level error ------------------------------------------
@@ -226,6 +341,7 @@ def test_kling_reports_error_when_all_generation_fails(tmp_path, monkeypatch):
     assert result["error"] == result["message"]
     assert result["stats"] == {"total": 1, "successful": 0, "failed": 1}
     assert result["results"][0]["success"] is False
+    assert _read_provider_jobs(shots_dir)[0]["status"] == "failed"
 
 
 def test_kling_partial_failure_is_reported_as_error(tmp_path, monkeypatch):
