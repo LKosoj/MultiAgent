@@ -5,6 +5,8 @@ import os
 import json
 import logging
 import tempfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 from .utils import (
@@ -16,8 +18,21 @@ from .utils import (
     mask_dsn,
 )
 from .schema_metadata import SchemaStatsHelper
+from .schema_namespace import (
+    SchemaFreshnessUnavailable,
+    SchemaNamespace,
+    SchemaScope,
+    canonical_schema_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LoadedSchema:
+    schema: Dict[str, Any]
+    namespace: SchemaNamespace
+    source: str
 
 
 class SchemaLoader:
@@ -25,6 +40,82 @@ class SchemaLoader:
     
     def __init__(self, repo_root: Path):
         self.repo_root = repo_root
+        self.file_manager = SchemaFileManager(repo_root)
+
+    def load_scoped_schema(
+        self,
+        schema_info: Dict[str, Any],
+        dsn: str,
+        scope: SchemaScope,
+    ) -> LoadedSchema:
+        """Live-validate a scoped schema before considering its snapshot."""
+        if not isinstance(scope, SchemaScope):
+            raise TypeError("scope must be a SchemaScope")
+        if not isinstance(dsn, str) or not dsn.strip():
+            raise SchemaFreshnessUnavailable(
+                "DSN is required for live schema introspection"
+            )
+
+        # ``schema_info`` is an outer legacy adapter input. A trusted scoped
+        # run must validate the current authorization view against the DB.
+        del schema_info
+        try:
+            live_schema = self._introspect_via_plugin(dsn, autosave=False)
+            live_fingerprint = canonical_schema_fingerprint(live_schema)
+        except Exception as exc:
+            raise SchemaFreshnessUnavailable(
+                "Required live schema introspection is unavailable"
+            ) from exc
+
+        namespace = SchemaNamespace(
+            scope=scope,
+            schema_fingerprint=live_fingerprint,
+        )
+        if scope.transient:
+            return LoadedSchema(live_schema, namespace, "live")
+
+        snapshot = self.file_manager.load_scoped_snapshot(scope)
+        if self._snapshot_matches_live(snapshot, scope, live_fingerprint):
+            return LoadedSchema(
+                snapshot["schema_info"],  # type: ignore[index]
+                namespace,
+                "validated_snapshot",
+            )
+
+        self.file_manager.save_scoped_snapshot(
+            scope,
+            {
+                "snapshot_version": 1,
+                "schema_scope": scope.to_mapping(),
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "schema_fingerprint": live_fingerprint,
+                "schema_info": live_schema,
+            },
+        )
+        return LoadedSchema(live_schema, namespace, "live")
+
+    @staticmethod
+    def _snapshot_matches_live(
+        snapshot: Optional[Dict[str, Any]],
+        scope: SchemaScope,
+        live_fingerprint: str,
+    ) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        if snapshot.get("snapshot_version") != 1:
+            return False
+        if snapshot.get("schema_scope") != scope.to_mapping():
+            return False
+        stored_schema = snapshot.get("schema_info")
+        stored_fingerprint = snapshot.get("schema_fingerprint")
+        if not isinstance(stored_schema, dict):
+            return False
+        if stored_fingerprint != live_fingerprint:
+            return False
+        try:
+            return canonical_schema_fingerprint(stored_schema) == live_fingerprint
+        except (TypeError, ValueError):
+            return False
     
     def get_database_schema(
         self,
@@ -115,7 +206,12 @@ class SchemaLoader:
 
         return None
     
-    def _introspect_via_plugin(self, dsn: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    def _introspect_via_plugin(
+        self,
+        dsn: str,
+        *,
+        autosave: bool = True,
+    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Интроспекция схемы через плагин БД."""
         try:
             from db_plugins import get_plugin
@@ -131,7 +227,9 @@ class SchemaLoader:
                 schema_arg = plugin.parse_schema_from_dsn(dsn)
                 
                 # Санитайзируем DSN для логов
-                session_id = dsn_to_sanitized_name(dsn)
+                session_id = (
+                    dsn_to_sanitized_name(dsn) if autosave else "scoped-live-schema"
+                )
                 logger.info(f"Starting database schema introspection for session: {session_id}")
                 if schema_arg:
                     logger.info(f"Target schema: {schema_arg}")
@@ -145,7 +243,8 @@ class SchemaLoader:
                 db_schema = self._normalize_table_names(db_schema, dsn)
                 
                 # Автосохранение схемы
-                self.autosave_schema(dsn, db_schema)
+                if autosave:
+                    self.autosave_schema(dsn, db_schema)
                 
                 return db_schema
                 
@@ -307,6 +406,55 @@ class SchemaFileManager:
         """Получает путь к файлу схемы."""
         name = dsn_to_sanitized_name(dsn)
         return self.sqlrag_dir / f"{name}.json"
+
+    def get_scoped_schema_file_path(self, scope: SchemaScope) -> Path:
+        if not isinstance(scope, SchemaScope):
+            raise TypeError("scope must be a SchemaScope")
+        return self.sqlrag_dir / f"schema-v1-{scope.scope_key}.json"
+
+    def load_scoped_snapshot(
+        self,
+        scope: SchemaScope,
+    ) -> Optional[Dict[str, Any]]:
+        path = self.get_scoped_schema_file_path(scope)
+        if not path.exists():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to read scoped schema snapshot %s: %s", path, exc)
+            return None
+        return value if isinstance(value, dict) else None
+
+    def save_scoped_snapshot(
+        self,
+        scope: SchemaScope,
+        snapshot: Dict[str, Any],
+    ) -> None:
+        self.ensure_sqlrag_directory()
+        path = self.get_scoped_schema_file_path(scope)
+        payload = json.dumps(snapshot, ensure_ascii=False, indent=2)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(self.sqlrag_dir),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(payload)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, path)
+            dir_fd = os.open(self.sqlrag_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
     
     def schema_file_exists(self, dsn: str) -> bool:
         """Проверяет существование файла схемы."""

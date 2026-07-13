@@ -1,24 +1,64 @@
-import os
-import yaml
 import importlib
 import logging
-from smolagents import CodeAgent, ToolCallingAgent, DuckDuckGoSearchTool, OpenAIServerModel, MultiStepAgent, tool
-from smolagents.memory import ActionStep, FinalAnswerStep
+from collections.abc import Iterator, Mapping
+from pathlib import Path
+from time import perf_counter
+from types import MappingProxyType
 from typing import Dict, Any, List, Optional
+
+import yaml
+from smolagents import CodeAgent, ToolCallingAgent, tool
+from smolagents.memory import ActionStep, FinalAnswerStep
 from datetime import datetime
-from agent_command import AGENT_PROFILES, model_mapping
+import agent_command
 from adaptive_planning import (
     normalize_planning_interval,
     AdaptivePlanningToolCallingAgent,
     AdaptivePlanningCodeAgent,
 )
-from mcp_tools import mcp_clients, mcp_tools
-from memory.rag_memory import create_rag_memory
-from memory.observation_storage import compact_observation_for_context
-
 logger = logging.getLogger(__name__)
 
 CODE_EXECUTION_TIMEOUT_SECONDS = 600
+
+
+class _LazyAgentProfiles(Mapping[str, Mapping[str, Any]]):
+    """Read-only YAML metadata view kept for the historical public import."""
+
+    def __init__(self, profiles_dir: str | Path) -> None:
+        self.profiles_dir = Path(profiles_dir)
+        self._profiles: Optional[Mapping[str, Mapping[str, Any]]] = None
+
+    def _load(self) -> Mapping[str, Mapping[str, Any]]:
+        if self._profiles is not None:
+            return self._profiles
+        profiles: Dict[str, Mapping[str, Any]] = {}
+        for profile_path in sorted(self.profiles_dir.glob("*.yaml")):
+            if profile_path.stem == "optimization_metadata":
+                continue
+            with profile_path.open("r", encoding="utf-8") as profile_file:
+                profile = yaml.safe_load(profile_file) or {}
+            if not isinstance(profile, dict) or not profile.get("enable", True):
+                continue
+            model_key = profile.get("model")
+            if isinstance(model_key, str):
+                profile.setdefault("model_key", model_key)
+            profiles[profile_path.stem] = MappingProxyType(profile)
+        self._profiles = MappingProxyType(profiles)
+        return self._profiles
+
+    def __getitem__(self, key: str) -> Mapping[str, Any]:
+        return self._load()[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._load())
+
+    def __len__(self) -> int:
+        return len(self._load())
+
+
+AGENT_PROFILES: Mapping[str, Mapping[str, Any]] = _LazyAgentProfiles(
+    Path(__file__).resolve().parent / "agent_profiles"
+)
 
 def _build_agents_info(agents_list: List) -> str:
     """Создает информацию о доступных агентах для включения в промпт менеджера."""
@@ -93,66 +133,147 @@ def _build_composite_prompt(profile: Dict[str, Any], pipeline_type: str = "gener
 
     return composite_prompt
 
-def load_tools():
-    """Загружает и инициализирует инструменты из YAML-конфигураций и MCP."""
-    tool_mapping = {}
-    tool_dir = 'tool_definitions'
-    
-    # 1. Загрузка инструментов из YAML-файлов
-    for filename in os.listdir(tool_dir):
-        if filename.endswith('.yaml'):
-            with open(os.path.join(tool_dir, filename), 'r', encoding='utf-8') as f:
-                tool_config = yaml.safe_load(f)
-                
-                tool_name = tool_config['name']
-                source_type = tool_config.get('source_type', 'custom_function')
-                source_path = tool_config['implementation_source']
-                
-                try:
-                    if source_type == 'custom_function':
-                        module_path, func_name = source_path.rsplit('.', 1)
-                        module = importlib.import_module(module_path)
-                        func = getattr(module, func_name)
-                        if hasattr(func, "name") and not hasattr(func, "__name__"):
-                            tool_mapping[tool_name] = func
-                        else:
-                            tool_mapping[tool_name] = tool(func)
-                    
-                    elif source_type == 'class_instance':
-                        module_path, class_name = source_path.rsplit('.', 1)
-                        module = importlib.import_module(module_path)
-                        tool_class = getattr(module, class_name)
-                        tool_mapping[tool_name] = tool_class()
-                    
-                    elif source_type == 'mcp_tool':
-                        client_name, method_name = source_path.split('.')
-                        client = mcp_clients.get(client_name)
-                        if client:
-                            tool_mapping[tool_name] = getattr(client, method_name)
-                        else:
-                            logger.warning(f"Предупреждение: MCP-клиент '{client_name}' не найден.")
-                            
-                except (ImportError, AttributeError) as e:
-                    logger.error(f"Ошибка при загрузке инструмента '{tool_name}': {e}")
+class ToolRegistry:
+    """Lazy allowlist resolver backed by tool-definition metadata."""
 
-    # 2. Интеграция предварительно загруженных MCP-инструментов
-    for mcp_tool_obj in mcp_tools:
-        if hasattr(mcp_tool_obj, 'name'):
-            tool_mapping[mcp_tool_obj.name] = mcp_tool_obj
-            logger.info(f"Инструмент MCP '{mcp_tool_obj.name}' успешно интегрирован.")
-        else:
-            logger.warning(f"Предупреждение: MCP-инструмент {mcp_tool_obj} не имеет атрибута 'name' и будет проигнорирован.")
-    
-    return tool_mapping
+    _KNOWN_MCP_TOOL_NAMES = frozenset(
+        {"sequentialthinking_tools", "get_thinking_history", "clear_thinking_history"}
+    )
+
+    def __init__(self, definitions_dir: str | Path = "tool_definitions") -> None:
+        self.definitions_dir = Path(definitions_dir)
+        self._definitions: Optional[Dict[str, Dict[str, str]]] = None
+        self.mcp_provider_loaded = False
+
+    @staticmethod
+    def normalize_name(tool_name: str) -> str:
+        return tool_name.replace("()", "")
+
+    def definition_names(self) -> List[str]:
+        return sorted(self._index_definitions())
+
+    def _index_definitions(self) -> Dict[str, Dict[str, str]]:
+        if self._definitions is not None:
+            return self._definitions
+
+        definitions: Dict[str, Dict[str, str]] = {}
+        for definition_path in sorted(self.definitions_dir.glob("*.yaml")):
+            with definition_path.open("r", encoding="utf-8") as definition_file:
+                config = yaml.safe_load(definition_file) or {}
+            name = config.get("name")
+            nested_source = config.get("source") or {}
+            source_type = config.get("source_type", nested_source.get("type"))
+            source_path = config.get(
+                "implementation_source", nested_source.get("path")
+            )
+            if not isinstance(name, str) or not isinstance(source_path, str):
+                continue
+            if name in definitions:
+                raise ValueError(f"Duplicate tool definition: {name}")
+            definitions[name] = {
+                "source_type": str(source_type or "custom_function"),
+                "source_path": source_path,
+            }
+        self._definitions = definitions
+        return definitions
+
+    def _resolve_definition(self, name: str, definition: Dict[str, str]):
+        source_type = definition["source_type"]
+        source_path = definition["source_path"]
+        if source_type == "custom_function":
+            module_path, function_name = source_path.rsplit(".", 1)
+            function = getattr(importlib.import_module(module_path), function_name)
+            if hasattr(function, "name") and not hasattr(function, "__name__"):
+                return function
+            return tool(function)
+        if source_type == "class_instance":
+            module_path, class_name = source_path.rsplit(".", 1)
+            tool_class = getattr(importlib.import_module(module_path), class_name)
+            return tool_class()
+        if source_type == "mcp_tool":
+            return self._resolve_mcp_tool(name, source_path)
+        raise ValueError(f"Unsupported source type '{source_type}' for tool '{name}'")
+
+    def _resolve_mcp_tool(self, name: str, source_path: Optional[str] = None):
+        mcp_module = importlib.import_module("mcp_tools")
+        self.mcp_provider_loaded = True
+        for mcp_tool in mcp_module.mcp_tools:
+            if getattr(mcp_tool, "name", None) == name:
+                return mcp_tool
+        if source_path and "." in source_path:
+            client_name, method_name = source_path.rsplit(".", 1)
+            client = mcp_module.mcp_clients.get(client_name)
+            if client is not None and hasattr(client, method_name):
+                return getattr(client, method_name)
+        return None
+
+    def resolve_many(
+        self,
+        tool_names: List[str],
+        *,
+        profile_name: str,
+    ) -> Dict[str, Any]:
+        definitions = self._index_definitions()
+        resolved: Dict[str, Any] = {}
+        missing: List[str] = []
+        for raw_name in tool_names:
+            name = self.normalize_name(raw_name)
+            definition = definitions.get(name)
+            try:
+                if definition is not None:
+                    resolved_tool = self._resolve_definition(name, definition)
+                elif name in self._KNOWN_MCP_TOOL_NAMES:
+                    resolved_tool = self._resolve_mcp_tool(name)
+                else:
+                    resolved_tool = None
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to resolve required tool '{name}' for profile "
+                    f"'{profile_name}': {exc}"
+                ) from exc
+            if resolved_tool is None:
+                missing.append(name)
+            else:
+                resolved[name] = resolved_tool
+        if missing:
+            raise ValueError(
+                f"Required tool(s) {', '.join(missing)} not found for profile "
+                f"{profile_name}"
+            )
+        return resolved
+
+
+def load_tools():
+    """Compatibility entrypoint for callers that explicitly request all YAML tools."""
+    registry = ToolRegistry()
+    return registry.resolve_many(
+        registry.definition_names(),
+        profile_name="load_tools",
+    )
+
+
+def _default_memory_factory(**kwargs):
+    from memory.rag_memory import create_rag_memory
+
+    return create_rag_memory(**kwargs)
+
+
+def _compact_observation_for_context(*args, **kwargs):
+    from memory.observation_storage import compact_observation_for_context
+
+    return compact_observation_for_context(*args, **kwargs)
 
 class AgentFactory:
     """Фабрика для динамического создания агентов с разными профилями."""
     
-    def __init__(self):
+    def __init__(self, tool_registry=None, memory_factory=None):
         self.agent_counter = 1
         self.agents = []
         self.manager_agent = None
-        self.tool_mapping = load_tools()
+        self.tool_registry = tool_registry or ToolRegistry()
+        self._memory_factory = memory_factory or _default_memory_factory
+        self.tool_mapping = {}
+        self.last_startup_diagnostics: Dict[str, Any] = {}
 
     def _create_tool(self, tool_name: str):
         """Возвращает инструмент из загруженного словаря инструментов."""
@@ -172,12 +293,21 @@ class AgentFactory:
             logger.error("Рекомендуем использовать инструменты последовательно, а не одновременно")
             return None
         
-        created_tool = self.tool_mapping.get(clean_tool_name)
-        
-        if created_tool is None:
-            logger.warning(f"ВНИМАНИЕ: Инструмент '{clean_tool_name}' не найден в tool_mapping.")
-        
-        return created_tool
+        if clean_tool_name in self.tool_mapping:
+            return self.tool_mapping[clean_tool_name]
+        try:
+            resolved = self.tool_registry.resolve_many(
+                [clean_tool_name],
+                profile_name="direct",
+            )
+        except ValueError:
+            logger.warning(
+                "ВНИМАНИЕ: Инструмент '%s' не найден в tool registry.",
+                clean_tool_name,
+            )
+            return None
+        self.tool_mapping.update(resolved)
+        return resolved[clean_tool_name]
 
     def create_agent(self, profile_type: str, session_id: str, task: str, pipeline_type: str = "general", preload_agents: Optional[List[str]] = None, profile_override: Optional[Dict[str, Any]] = None) -> CodeAgent:
         """Создает агента определенного профиля."""
@@ -191,8 +321,7 @@ class AgentFactory:
             # иначе CodeAgent/ToolCallingAgent получат строку вместо модели и упадут.
             model_val = profile.get('model')
             if isinstance(model_val, str):
-                from agent_command import model_mapping
-                profile['model'] = model_mapping.get(model_val)
+                profile['model'] = agent_command.model_mapping.get(model_val)
                 # ValueError ТОЛЬКО для непустого, но неизвестного ключа — иначе тихий
                 # None позже даст невнятный AttributeError в CodeAgent. Пустая строка ""
                 # — легитимный «модель не указана» (дефолт DynamicAgentDefinition.model):
@@ -200,12 +329,12 @@ class AgentFactory:
                 if profile['model'] is None and model_val:
                     raise ValueError(
                         f"Unknown model key in profile_override: {model_val!r}. "
-                        f"Доступные: {sorted(model_mapping.keys())}"
+                        f"Доступные: {sorted(agent_command.model_mapping.keys())}"
                     )
-        elif profile_type not in AGENT_PROFILES:
+        elif profile_type not in agent_command.AGENT_PROFILES:
             raise ValueError(f"Unknown profile type: {profile_type}")
         else:
-            profile = AGENT_PROFILES[profile_type]
+            profile = agent_command.AGENT_PROFILES[profile_type]
         
         # Убедимся, что profile['tools'] это список
         profile_tools = profile.get('tools', [])
@@ -213,10 +342,33 @@ class AgentFactory:
             logger.warning(f"Предупреждение: 'tools' для профиля {profile_type} не является списком. Установлен пустой список.")
             profile_tools = []
             
-        tools = [self._create_tool(tool) for tool in profile_tools]
-        
-        # Фильтруем None значения, если инструмент не был создан
-        tools = [t for t in tools if t is not None]
+        resolve_started = perf_counter()
+        requested_names = [
+            self.tool_registry.normalize_name(tool_name)
+            for tool_name in profile_tools
+            if isinstance(tool_name, str)
+        ]
+        resolved_tools = self.tool_registry.resolve_many(
+            requested_names,
+            profile_name=profile_type,
+        )
+        self.tool_mapping.update(resolved_tools)
+        tools = [
+            resolved_tools[self.tool_registry.normalize_name(tool_name)]
+            if isinstance(tool_name, str)
+            else tool_name
+            for tool_name in profile_tools
+        ]
+        self.last_startup_diagnostics = {
+            "profile": profile_type,
+            "requested_tools": requested_names,
+            "resolved_tools": list(resolved_tools),
+            "mcp_provider_loaded": bool(
+                getattr(self.tool_registry, "mcp_provider_loaded", False)
+            ),
+            "memory_provider_loaded": False,
+            "elapsed_ms": round((perf_counter() - resolve_started) * 1000, 3),
+        }
 
         # Memory-инструменты больше не используются - вся память работает через RagMemory
         # Все агенты получают RagMemory с соответствующими политиками доступа
@@ -238,12 +390,13 @@ class AgentFactory:
             
             if agent_type == 'tool_calling':
                 # Создаем RAG-память и для ToolCallingAgent
-                rag_memory = create_rag_memory(
+                rag_memory = self._memory_factory(
                     session_id=session_id,
                     agent_name=agent_id,
                     profile_type=profile_type,
                     profile_config=profile
                 )
+                self.last_startup_diagnostics["memory_provider_loaded"] = True
                 
                 # Получаем provide_run_summary из memory_policy
                 memory_policy = profile.get('memory_policy', {})
@@ -293,12 +446,13 @@ class AgentFactory:
                 # Всегда создаем RAG-память с политикой для профиля
                 
                 # Создаем RAG-память (SQLite + ChromaDB) с политикой профиля
-                rag_memory = create_rag_memory(
+                rag_memory = self._memory_factory(
                     session_id=session_id,
                     agent_name=agent_id,
                     profile_type=profile_type,
                     profile_config=profile  # Передаем конфигурацию для чтения memory_policy
                 )
+                self.last_startup_diagnostics["memory_provider_loaded"] = True
                 
                 # Получаем provide_run_summary из memory_policy
                 memory_policy = profile.get('memory_policy', {})
@@ -351,7 +505,7 @@ class AgentFactory:
                 # EnvironmentError без OPENAI_API_KEY_DB — деградируем в None,
                 # тогда Mixin делает обычный (тяжёлый) replan.
                 try:
-                    agent._monitor_model = model_mapping.get('model_lite')
+                    agent._monitor_model = agent_command.model_mapping.get('model_lite')
                 except Exception as e:
                     logger.warning(f"⚠️ Adaptive planning: модель-монитор недоступна ({e}); replan останется безусловным")
                     agent._monitor_model = None
@@ -391,7 +545,7 @@ class AgentFactory:
             run_id = getattr(getattr(agent, "memory", None), "current_run_id", None)
             step_number = getattr(memory_step, "step_number", None)
 
-            memory_step.observations = compact_observation_for_context(
+            memory_step.observations = _compact_observation_for_context(
                 observations,
                 session_id=session_id,
                 agent_name=agent_name,

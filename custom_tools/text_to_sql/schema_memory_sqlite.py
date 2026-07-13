@@ -31,6 +31,8 @@ from typing import Any, Dict, List, Optional
 
 from .schema_memory_chroma import _resolve_chroma_metric, _distance_to_similarity
 from .schema_metadata import is_pk, is_fk
+from .schema_namespace import SchemaNamespace, SchemaScope
+from .successful_sql_memory import canonical_schema_table_id
 from .utils import (
     dsn_to_sanitized_name,
     get_schema_version,
@@ -340,7 +342,7 @@ class SchemaMemoryManager:
 
     def ensure_schema_indexed_in_memory(
         self,
-        dsn: str,
+        dsn: str | SchemaNamespace,
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         session_id: Optional[str] = None,
     ) -> bool:
@@ -362,22 +364,46 @@ class SchemaMemoryManager:
         """
         from memory.tools import save_memory, get_memory
 
+        if isinstance(dsn, SchemaScope):
+            raise TypeError(
+                "SchemaScope is unversioned; schema memory requires SchemaNamespace"
+            )
+        namespace = dsn if isinstance(dsn, SchemaNamespace) else None
+
         if not save_memory:
             # Раньше тут было ``return False`` — caller не отличал
             # «memory-стек не загружен» от «таблиц нет». Теперь явно
             # сигнализируем конфигурационную проблему наверх.
+            identity = (
+                f"namespace={namespace.version_key!r}"
+                if namespace is not None
+                else f"dsn={dsn_to_sanitized_name(dsn)!r}"
+            )
             raise SchemaIndexingMemoryUnavailable(
                 "memory.tools.save_memory is unavailable; "
                 "cannot ensure schema indexed for "
-                f"dsn={dsn_to_sanitized_name(dsn)!r}"
+                f"{identity}"
             )
 
-        session_id = session_id or dsn_to_sanitized_name(dsn)
+        if namespace is not None:
+            session_id = namespace.version_key
+        else:
+            session_id = session_id or dsn_to_sanitized_name(dsn)
         sqlrag_dir = self.repo_root / "sqlrag"
-        filename = f"{session_id}.json"
+        filename = (
+            f"schema-v1-{namespace.version_key}.json"
+            if namespace is not None
+            else f"{session_id}.json"
+        )
         json_path = sqlrag_dir / filename
 
-        if json_path.exists():
+        if namespace is not None:
+            schema_data = {
+                "enable": True,
+                "schema_info": db_schema,
+                "source": "validated_live_schema",
+            }
+        elif json_path.exists():
             # Corrupt schema-файл — это критично; раньше json.JSONDecodeError
             # глушился в `return False` и схема оказывалась "не индексирована"
             # без видимой причины. Теперь — fail-fast.
@@ -419,9 +445,13 @@ class SchemaMemoryManager:
         # Меняем формат хэша — старые записи `file_hash` инвалидируются и
         # переиндексируются при следующем вызове (это OK: индекс
         # самовосстанавливается из источника).
-        file_hash = hashlib.blake2b(
-            normalized_content.encode("utf-8"), digest_size=16
-        ).hexdigest()
+        file_hash = (
+            namespace.version_key
+            if namespace is not None
+            else hashlib.blake2b(
+                normalized_content.encode("utf-8"), digest_size=16
+            ).hexdigest()
+        )
 
         # W5-T3: double-checked locking. Без лока ниже сразу два процесса/
         # worker'а могут проскочить is_schema_indexed (оба видят "нет"),
@@ -433,13 +463,24 @@ class SchemaMemoryManager:
         # Быстрый путь без лока: если индекс уже актуален — выходим без
         # дорогостоящего захвата flock.
         expected_count = len(db_schema)
-        if self.is_schema_indexed(session_id, file_hash, expected_count=expected_count):
+        index_identity: str | SchemaNamespace = namespace or session_id
+        if self.is_schema_indexed(
+            index_identity,
+            file_hash,
+            expected_count=expected_count,
+            expected_table_keys=tuple(db_schema),
+        ):
             return True
 
         with self._write_lock_cm():
             # Double-check внутри лока: пока ждали, другой worker мог
             # уже проиндексировать схему.
-            if self.is_schema_indexed(session_id, file_hash, expected_count=expected_count):
+            if self.is_schema_indexed(
+                index_identity,
+                file_hash,
+                expected_count=expected_count,
+                expected_table_keys=tuple(db_schema),
+            ):
                 return True
 
             # Удаляем старые записи для этого файла (внутренний acquire
@@ -453,10 +494,45 @@ class SchemaMemoryManager:
             # значит ровно одно: ``db_schema`` пуст (нет таблиц для
             # индексации) — это штатное "нет данных", caller получит ``False``
             # и сможет отличить его от ``raise``.
-            indexed_count = self.index_schema_in_memory(session_id, filename, db_schema, file_hash)
-            return bool(indexed_count)
+            if namespace is None:
+                indexed_count = self.index_schema_in_memory(
+                    session_id,
+                    filename,
+                    db_schema,
+                    file_hash,
+                )
+            else:
+                indexed_count = self.index_schema_in_memory(
+                    session_id,
+                    filename,
+                    db_schema,
+                    file_hash,
+                    schema_version=namespace.version_key,
+                    semantic_namespace_key=namespace.version_key,
+                )
+            if namespace is None:
+                return bool(indexed_count)
+            if indexed_count == 0:
+                return False
+            if not self.is_schema_indexed(
+                namespace,
+                file_hash,
+                expected_count=expected_count,
+                expected_table_keys=tuple(db_schema),
+            ):
+                raise SchemaIndexingError(
+                    "Schema source rows were saved but exact semantic IDs did not reconcile",
+                    indexed_count=indexed_count,
+                )
+            return True
 
-    def is_schema_indexed(self, session_id: str, file_hash: str, expected_count: Optional[int] = None) -> bool:
+    def is_schema_indexed(
+        self,
+        session_id: str | SchemaNamespace,
+        file_hash: str,
+        expected_count: Optional[int] = None,
+        expected_table_keys: Optional[tuple[str, ...]] = None,
+    ) -> bool:
         """Проверяет, проиндексирована ли схема с данным хэшем.
 
         Идемпотентный check. `return False` означает "записи с таким хэшем
@@ -472,6 +548,43 @@ class SchemaMemoryManager:
                 иначе детектирует частичную индексацию и возвращает False.
                 При expected_count=None (по умолчанию) — поведение прежнее: True при > 0.
         """
+        if isinstance(session_id, SchemaScope):
+            raise TypeError(
+                "SchemaScope is unversioned; schema memory requires SchemaNamespace"
+            )
+        namespace = session_id if isinstance(session_id, SchemaNamespace) else None
+        if namespace is not None:
+            from memory.index_consistency import reconcile_tactical_namespace
+
+            with self._write_lock_cm():
+                reconciliation = reconcile_tactical_namespace(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_table",
+                    repair_missing=True,
+                )
+            expected_ids = (
+                {
+                    canonical_schema_table_id(namespace.version_key, table_fqn)
+                    for table_fqn in expected_table_keys
+                }
+                if expected_table_keys is not None
+                else set(reconciliation.expected_ids)
+            )
+            actual_ids = set(reconciliation.indexed_ids)
+            return (
+                bool(expected_ids)
+                and not reconciliation.failed_ids
+                and not reconciliation.missing_ids
+                and not reconciliation.unexpected_ids
+                and expected_ids == set(reconciliation.expected_ids) == actual_ids
+                and (
+                    expected_count is None
+                    or expected_count <= 0
+                    or len(expected_ids) == expected_count
+                )
+            )
+
         from memory.tools import get_memory
         try:
             from memory.tools import memory_requester_context
@@ -646,7 +759,16 @@ class SchemaMemoryManager:
                     f"SQLite committed; set TEXT_TO_SQL_STRICT_CHROMA_CLEANUP=1 to fail-fast."
                 )
 
-    def index_schema_in_memory(self, session_id: str, filename: str, db_schema: Dict[str, Dict[str, Dict[str, Any]]], file_hash: str) -> int:
+    def index_schema_in_memory(
+        self,
+        session_id: str,
+        filename: str,
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        file_hash: str,
+        *,
+        schema_version: Optional[str] = None,
+        semantic_namespace_key: Optional[str] = None,
+    ) -> int:
         """Индексирует схему в тактической памяти по таблицам.
 
         W2-T1: fail-fast вместо silent ``return 0``.
@@ -671,7 +793,7 @@ class SchemaMemoryManager:
                 f"(filename={filename!r})"
             )
 
-        schema_version = get_schema_version(db_schema)
+        schema_version = schema_version or get_schema_version(db_schema)
         indexed_count = 0
         # Аккумулируем неудачи по таблицам, чтобы дать caller'у видеть,
         # какие именно записи не были сохранены (частичный успех).
@@ -727,17 +849,26 @@ class SchemaMemoryManager:
                     ]
                 }
             }
+            if semantic_namespace_key is not None:
+                metadata["semantic_id"] = canonical_schema_table_id(
+                    semantic_namespace_key,
+                    table_fqn,
+                )
 
             # Per-table save: ловим узко вокруг save_memory, чтобы не
             # маскировать ошибки построения metadata (это — баги).
             # Раньше единый broad-except поверх всего цикла глушил И сбои
             # БД, И ошибки сборки metadata, скрывая реальную причину.
             try:
-                save_memory(
+                saved_step = save_memory(
                     session_id=session_id,
                     agent_name="Schema-RAG-Agent",
                     data=metadata,
                 )
+                if semantic_namespace_key is not None and (
+                    type(saved_step) is not int or saved_step < 0
+                ):
+                    raise RuntimeError("save_memory did not persist the schema row")
             except Exception as exc:  # noqa: BLE001 — собираем все per-table сбои
                 # Память может быть SQLite/Chroma; разные backends → разные
                 # исключения. Контекст (таблица + причина) логируем сразу,
@@ -827,8 +958,24 @@ class SchemaMemoryManager:
             logger.warning(f"Failed to create table description for {table_fqn}: {e}")
             return f"Таблица {table_fqn}"
 
-    def find_semantic_relevant_tables(self, entities: List[str], dsn: Optional[str] = None) -> List[str]:
+    def find_semantic_relevant_tables(
+        self,
+        entities: List[str],
+        namespace: Optional[SchemaNamespace] = None,
+        dsn: Optional[str] = None,
+    ) -> List[str]:
         """Находит семантически релевантные таблицы через поиск в памяти с фильтрацией по скору."""
+        if isinstance(namespace, SchemaScope):
+            raise TypeError(
+                "SchemaScope is unversioned; semantic search requires SchemaNamespace"
+            )
+        if isinstance(namespace, str):
+            if dsn is not None:
+                raise TypeError("DSN was provided twice")
+            dsn = namespace
+            namespace = None
+        if namespace is not None and not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be a SchemaNamespace or null")
         try:
             from memory.manager import memory_manager
 
@@ -839,17 +986,33 @@ class SchemaMemoryManager:
                 self._set_search_status("memory_unavailable", "memory manager or tactical_collection is unavailable")
                 return []
 
-            # Получаем DSN для определения session_id. Не используем DB_DSN как
-            # implicit fallback: это может смешать tenant-local db_schema с
-            # memory index от другой БД.
-            from .utils import resolve_dsn
+            if namespace is not None:
+                session_id = namespace.version_key
+                from memory.index_consistency import reconcile_tactical_namespace
 
-            effective_dsn = resolve_dsn(dsn) or ""
-            if not effective_dsn:
-                self._set_search_status("memory_unavailable", "runtime DSN is required for schema memory search")
-                return []
+                reconciliation = reconcile_tactical_namespace(
+                    session_id=session_id,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_table",
+                    repair_missing=True,
+                )
+                if not reconciliation.exact:
+                    self._set_search_status(
+                        "memory_unavailable",
+                        "schema semantic IDs are not exactly reconciled",
+                    )
+                    return []
+                active_semantic_ids = set(reconciliation.expected_ids)
+            else:
+                # Legacy outer adapter: direct library calls still accept DSN.
+                from .utils import resolve_dsn
 
-            session_id = dsn_to_sanitized_name(effective_dsn)
+                effective_dsn = resolve_dsn(dsn) or ""
+                if not effective_dsn:
+                    self._set_search_status("memory_unavailable", "runtime DSN is required for schema memory search")
+                    return []
+                session_id = dsn_to_sanitized_name(effective_dsn)
+                active_semantic_ids = None
 
             # Формируем поисковый запрос из сущностей
             search_terms = []
@@ -941,6 +1104,8 @@ class SchemaMemoryManager:
             metric = _resolve_chroma_metric(tactical_collection)
             scored_results = []
             for i, (id_val, distance, metadata) in enumerate(zip(ids, distances, metadatas)):
+                if active_semantic_ids is not None and id_val not in active_semantic_ids:
+                    continue
                 similarity = _distance_to_similarity(distance, metric)
                 table_fqn = metadata.get("table_fqn")
 
@@ -1020,8 +1185,28 @@ class SchemaMemoryManager:
             self._set_search_status("memory_unavailable", str(e))
             return []
 
-    def set_schema_ready_marker(self, session_id: str, schema_version: str) -> None:
+    def set_schema_ready_marker(
+        self,
+        session_id: str | SchemaNamespace,
+        schema_version: Optional[str] = None,
+    ) -> None:
         """Устанавливает маркер готовности схемы."""
+        if isinstance(session_id, SchemaScope):
+            raise TypeError(
+                "SchemaScope is unversioned; ready marker requires SchemaNamespace"
+            )
+        if isinstance(session_id, SchemaNamespace):
+            namespace = session_id
+            if not self.is_schema_indexed(
+                namespace,
+                namespace.version_key,
+            ):
+                raise SchemaIndexingError(
+                    "schema ready marker rejected: semantic IDs are not reconciled"
+                )
+            return
+        if not isinstance(schema_version, str) or not schema_version:
+            raise ValueError("schema_version is required")
         try:
             from memory.tools import save_memory
 

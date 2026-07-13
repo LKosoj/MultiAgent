@@ -2,7 +2,7 @@
 Фасад package custom_tools.text_to_sql.core (Phase 7 декомпозиция).
 
 Сохраняет публичный API оригинального core.py:
-- 13 публичных функций text-to-sql пайплайна;
+- публичные функции text-to-sql пайплайна;
 - 4 singletons (nlu_processor, rag_searcher, sql_validator, schema_limiter);
 - module-level зависимости call_openai_api и get_plugin
   (доступны для monkeypatch.setattr из тестов).
@@ -129,6 +129,57 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _request_safety_policy(
+    safety_policy: Any,
+    *,
+    sql_validator: Any = None,
+    fallback_to_startup_policy: bool = False,
+) -> Any:
+    """Resolve the safety policy to use for one text-to-sql operation.
+
+    Precedence: explicit ``safety_policy`` → workflow runtime context →
+    ``sql_validator.policy`` (if a validator was already bound to one) →
+    (opt-in) ``load_startup_safety_policy()``.
+
+    ``sql_validator``/``fallback_to_startup_policy`` are opt-in so the two
+    facade call sites that must be allowed to return ``None`` (T14: dedup —
+    ``_request_safety_validator`` and ``finalize_text_to_sql_run``) keep their
+    exact previous behaviour. Consumers that need a guaranteed non-null
+    policy (previously the duplicated ``_effective_safety_policy`` in
+    ``_sql_generation_api.py`` and the inline copy in
+    ``_db_exec.secure_db_executor``) opt in explicitly so validator-policy and
+    executor-policy can never diverge (single source).
+    """
+    from ..validators import TextToSqlSafetyPolicy, load_startup_safety_policy
+    from tool_runtime_context import get_runtime_context_safety_policy
+
+    if safety_policy is not None and not isinstance(
+        safety_policy, TextToSqlSafetyPolicy
+    ):
+        raise TypeError("safety_policy must be a TextToSqlSafetyPolicy or null")
+    policy = (
+        safety_policy
+        or get_runtime_context_safety_policy()
+        or getattr(sql_validator, "policy", None)
+    )
+    if policy is None and fallback_to_startup_policy:
+        policy = load_startup_safety_policy()
+    if policy is not None and not isinstance(policy, TextToSqlSafetyPolicy):
+        raise TypeError("safety_policy must be a TextToSqlSafetyPolicy")
+    return policy
+
+
+def _request_safety_validator(
+    safety_policy: Any,
+) -> tuple[Any, Any]:
+    from ..validators import SQLSafetyValidator
+
+    policy = _request_safety_policy(safety_policy)
+    if policy is None:
+        return _get_core_singleton("sql_validator"), None
+    return SQLSafetyValidator(policy=policy), policy
+
+
 # === Публичные фасадные функции ===
 # Каждая делегирует в _impl с инъекцией singletons как kwargs.
 # Внешний контракт (сигнатуры) сохранён.
@@ -182,6 +233,8 @@ def schema_linking(
     schema_info: Optional[dict] = None,
     dsn: Optional[str] = None,
     value_grounding: Optional[bool] = None,
+    *,
+    schema_scope: Optional[dict] = None,
 ) -> Dict[str, object]:
     """Связывает извлечённые сущности с таблицами/колонками схемы.
 
@@ -192,6 +245,7 @@ def schema_linking(
             линкер возьмёт схему из кэша/интроспекции.
         dsn: DSN целевой БД для загрузки sqlrag-схемы и интроспекции.
         value_grounding: opt-in DB lookup для уточнения значений фильтров.
+        schema_scope: доверенный внутренний scope из admitted workflow.
 
     Returns:
         Словарь со связанными сущностями, joins и информацией о схеме.
@@ -208,6 +262,7 @@ def schema_linking(
         schema_info,
         dsn,
         value_grounding=value_grounding,
+        schema_scope=schema_scope,
         schema_limiter=_get_core_singleton("schema_limiter"),
     )
 
@@ -217,6 +272,8 @@ def sql_generation_plugin(
     user_query: str,
     dsn: Optional[str] = None,
     session_id: Optional[str] = None,
+    *,
+    safety_policy: Any = None,
 ) -> Dict[str, str]:
     """Генерирует SQL по схеме и запросу пользователя.
 
@@ -225,68 +282,105 @@ def sql_generation_plugin(
         user_query: исходный запрос пользователя.
         dsn: явный DSN для диалект-aware генерации литералов и quoting.
         session_id: workflow/session namespace для schema cache (опционально).
+        safety_policy: Внутренняя immutable policy текущего workflow-запроса.
 
     Returns:
         Словарь с полями `sql_query` и `notes`.
     """
     from ._sql_generation_api import sql_generation_plugin as _impl
+    policy = _request_safety_policy(safety_policy)
     return _impl(
         context,
         user_query,
         dsn=dsn,
         session_id=session_id,
+        safety_policy=policy,
         sql_generator=_get_core_singleton("sql_generator"),
     )
 
 
-def code_formatter(sql_query: str, dsn: Optional[str] = None) -> Dict[str, str]:
+def code_formatter(
+    sql_query: str,
+    dsn: Optional[str] = None,
+    *,
+    safety_policy: Any = None,
+) -> Dict[str, str]:
     """Форматирует SQL и маскирует литералы перед отдачей модели.
 
     Args:
         sql_query: исходный SQL-запрос.
         dsn: явный DSN для dialect-aware masking/formatting; если None,
             используется workflow runtime metadata.
+        safety_policy: Внутренняя immutable policy текущего workflow-запроса.
 
     Returns:
         Словарь с ключами `formatted_sql` и `masked_sql`.
     """
     from ._sql_generation_api import code_formatter as _impl
-    return _impl(sql_query, dsn=dsn, sql_validator=_get_core_singleton("sql_validator"))
+    validator, _ = _request_safety_validator(safety_policy)
+    return _impl(sql_query, dsn=dsn, sql_validator=validator)
 
 
-def sql_safety_check(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:
+def sql_safety_check(
+    sql_query: str,
+    dsn: Optional[str] = None,
+    *,
+    safety_policy: Any = None,
+) -> Dict[str, object]:
     """Проверяет SQL на безопасность (запрещённые операторы, IN-list, comments).
 
     Args:
         sql_query: SQL-запрос для проверки.
         dsn: явный DSN для выбора SQL-диалекта и dialect-specific safety правил.
+        safety_policy: Внутренняя immutable policy текущего workflow-запроса.
 
     Returns:
         Словарь со статусом safety_status и списком violations.
     """
     from ._sql_generation_api import sql_safety_check as _impl
-    return _impl(sql_query, sql_validator=_get_core_singleton("sql_validator"), dsn=dsn)
+    validator, policy = _request_safety_validator(safety_policy)
+    return _impl(
+        sql_query,
+        sql_validator=validator,
+        dsn=dsn,
+        safety_policy=policy,
+    )
 
 
-def sql_explain(sql_query: str, dsn: Optional[str] = None) -> Dict[str, object]:
+def sql_explain(
+    sql_query: str,
+    dsn: Optional[str] = None,
+    *,
+    safety_policy: Any = None,
+) -> Dict[str, object]:
     """Возвращает план выполнения SQL через `EXPLAIN`.
 
     Args:
         sql_query: SQL-запрос для анализа.
         dsn: явный DSN; если None, env ``DB_DSN`` используется только при
             ``SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1`` opt-in.
+        safety_policy: Внутренняя immutable policy текущего workflow-запроса.
 
     Returns:
         Словарь с планом и метаинформацией.
     """
     from ._sql_generation_api import sql_explain as _impl
-    return _impl(sql_query, dsn, sql_validator=_get_core_singleton("sql_validator"))
+    validator, policy = _request_safety_validator(safety_policy)
+    return _impl(
+        sql_query,
+        dsn,
+        sql_validator=validator,
+        safety_policy=policy,
+    )
 
 
 def secure_db_executor(
     sql_query: str,
     row_limit: Optional[int] = None,
     dsn: Optional[str] = None,
+    *,
+    dry_run_only: Optional[bool] = None,
+    safety_policy: Any = None,
 ) -> Dict[str, object]:
     """Безопасно выполняет SELECT/DESCRIBE/EXPLAIN на БД с row-limit.
 
@@ -297,17 +391,72 @@ def secure_db_executor(
             кроме dry-run; env ``DB_DSN`` используется только при
             ``SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1`` opt-in. Если DSN отсутствует
             без dry-run/opt-in — поднимается ``MissingDSNError``.
+        dry_run_only: явный per-call запрет выполнения SQL. Операторский
+            ``TEXT_TO_SQL_DRY_RUN_ONLY`` остаётся fail-safe override.
+        safety_policy: Внутренняя immutable policy текущего workflow-запроса.
 
     Returns:
         Словарь с success, data, columns, rows_affected, error_message.
     """
+    if dry_run_only is not None and type(dry_run_only) is not bool:
+        raise TypeError("dry_run_only must be a boolean or null")
+
     from ._db_exec import secure_db_executor as _impl
+    validator, policy = _request_safety_validator(safety_policy)
     return _impl(
         sql_query,
         row_limit,
         dsn,
-        sql_validator=_get_core_singleton("sql_validator"),
-        schema_limiter=_get_core_singleton("schema_limiter"),
+        dry_run_only=dry_run_only,
+        safety_policy=policy,
+        sql_validator=validator,
+    )
+
+
+def finalize_text_to_sql_run(
+    sql_query: str,
+    user_query: str,
+    verification_status: str,
+    dsn: str,
+    row_limit: int,
+    dry_run_only: bool,
+    session_id: str,
+    run_id: str,
+    *,
+    safety_policy: Any = None,
+    namespace_version_key: str | None = None,
+) -> Dict[str, object]:
+    """Apply the deterministic Text-to-SQL execution and audit gates.
+
+    Args:
+        sql_query: Generated SQL approved for final execution.
+        user_query: Original natural-language request.
+        verification_status: Structured verifier status.
+        dsn: Explicit target database DSN.
+        row_limit: Maximum number of result rows.
+        dry_run_only: Whether final generated SQL execution is forbidden.
+        session_id: Stable workflow session identifier.
+        run_id: Unique workflow run identifier.
+        safety_policy: Internal immutable policy for this workflow request.
+        namespace_version_key: Opaque schema version key from schema linking.
+
+    Returns:
+        Strict terminal outcome mapping.
+    """
+    from ._terminal import finalize_text_to_sql_run as _impl
+    policy = _request_safety_policy(safety_policy)
+
+    return _impl(
+        sql_query,
+        user_query,
+        verification_status,
+        dsn,
+        row_limit,
+        dry_run_only,
+        session_id,
+        run_id,
+        safety_policy=policy,
+        namespace_version_key=namespace_version_key,
     )
 
 
@@ -354,8 +503,18 @@ def save_successful_sql(
     user_query: str = "",
     execution_result: str = "",
     dsn: str | None = None,
+    *,
+    namespace_version_key: str | None = None,
+    dialect: str | None = None,
+    run_id: str | None = None,
+    approved: bool | None = None,
+    executed: bool | None = None,
+    execution_success: bool | None = None,
+    audited: bool | None = None,
 ) -> Dict[str, str]:
     """Сохраняет успешный SQL в kбазу примеров для дальнейшего обучения.
+
+    Единственный легитимный вызывающий — core/_terminal.py; для агентов см. custom_tools/sql_tools.py.
 
     Args:
         sql_query: успешно выполненный SQL.
@@ -364,12 +523,49 @@ def save_successful_sql(
         dsn: DSN целевой БД для выбора sqlrag/session_id. В workflow-запусках
             может быть передан через runtime metadata; silent DB_DSN fallback
             не используется.
+        namespace_version_key: Opaque schema version key for typed memory.
+        dialect: Validated SQL dialect identifier for the typed example.
+        run_id: Successful workflow run identifier.
+        approved: Trusted terminal approval evidence.
+        executed: Trusted terminal execution evidence.
+        execution_success: Trusted executor success evidence.
+        audited: Trusted audit success evidence.
 
     Returns:
         Словарь со статусом сохранения.
     """
     from ._audit import save_successful_sql as _impl
-    return _impl(sql_query, user_query, execution_result, dsn=dsn)
+    return _impl(
+        sql_query,
+        user_query,
+        execution_result,
+        dsn=dsn,
+        namespace_version_key=namespace_version_key,
+        dialect=dialect,
+        run_id=run_id,
+        approved=approved,
+        executed=executed,
+        execution_success=execution_success,
+        audited=audited,
+    )
+
+
+def successful_sql_retrieval(
+    namespace_version_key: str,
+    user_query: str,
+) -> Dict[str, Any]:
+    """Retrieve bounded successful SQL examples for one schema namespace.
+
+    Args:
+        namespace_version_key: Opaque version key from the trusted schema-linking step.
+        user_query: Original natural-language query used for semantic ranking.
+
+    Returns:
+        Typed retrieval mapping with status, examples, and bounded context JSON.
+    """
+    from ..successful_sql_memory import successful_sql_retrieval as _impl
+
+    return _impl(namespace_version_key, user_query)
 
 
 def purge_schema_linking_rag_cache(
@@ -420,7 +616,7 @@ from ._pii import _reset_call_openai_api_cache as reset_pii_caller_cache  # noqa
 # попадают: они доступны через прямой импорт для tests, но не реэкспортируются
 # по `from custom_tools.text_to_sql.core import *`.
 __all__ = [
-    # 13 публичных функций пайплайна
+    # Публичные функции пайплайна
     "natural_language_processing",
     "intent_extraction",
     "vector_db_search",
@@ -430,9 +626,11 @@ __all__ = [
     "sql_safety_check",
     "sql_explain",
     "secure_db_executor",
+    "finalize_text_to_sql_run",
     "pii_masking",
     "audit_logger",
     "save_successful_sql",
+    "successful_sql_retrieval",
     "purge_schema_linking_rag_cache",
     # singletons
     "nlu_processor",

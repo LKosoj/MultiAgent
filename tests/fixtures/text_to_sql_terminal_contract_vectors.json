@@ -1,0 +1,512 @@
+{
+  "base": {
+    "run_id": "run-vector-1",
+    "status": "succeeded",
+    "reason_code": "",
+    "sql": "SELECT 1 AS value",
+    "generated": true,
+    "approved": true,
+    "executed": true,
+    "dry_run": false,
+    "audited": true,
+    "data": [[1]],
+    "columns": ["value"],
+    "rows_affected": 1,
+    "error": null,
+    "execution": {
+      "success": true,
+      "data": [[1]],
+      "columns": ["value"],
+      "rows_affected": 1,
+      "execution_time_ms": 2,
+      "error_message": null,
+      "dry_run_only": false,
+      "skipped_execution": false,
+      "sql_query": "SELECT 1 AS value",
+      "applied_row_limit": 10,
+      "safety_issues": []
+    },
+    "audit": {"status": "logged", "log_id": "audit-vector-1"},
+    "persistence": {
+      "status": "saved",
+      "filename": "query.md",
+      "path": "/tmp/query.md"
+    }
+  },
+  "cases": [
+    {
+      "name": "valid_baseline_array_row",
+      "valid": true,
+      "overrides": {}
+    },
+    {
+      "name": "valid_object_row",
+      "valid": true,
+      "overrides": {
+        "data": [{"value": 1}],
+        "execution": {"data": [{"value": 1}]}
+      }
+    },
+    {
+      "name": "valid_explain_result",
+      "valid": true,
+      "overrides": {
+        "sql": "EXPLAIN SELECT 1",
+        "data": [["SCAN constant row"]],
+        "columns": ["Plan"],
+        "execution": {
+          "sql_query": "EXPLAIN SELECT 1",
+          "data": [["SCAN constant row"]],
+          "columns": ["Plan"],
+          "explain_result": {
+            "plan": "SCAN constant row",
+            "estimated_cost": 10.0,
+            "rows_to_scan": null,
+            "issues": []
+          }
+        }
+      }
+    },
+    {
+      "name": "valid_failed_safety_evidence",
+      "valid": true,
+      "overrides": {
+        "status": "failed",
+        "reason_code": "EXECUTION_FAILED",
+        "executed": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "Unsafe query.",
+        "execution": {
+          "success": false,
+          "data": [],
+          "columns": [],
+          "rows_affected": 0,
+          "error_message": "Unsafe query.",
+          "skipped_execution": true,
+          "safety_issues": [
+            {"issue_type": "FORBIDDEN_STATEMENT", "description": "Write statement denied."}
+          ]
+        },
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      }
+    },
+    {
+      "name": "invalid_execution_sql_mismatch",
+      "valid": false,
+      "overrides": {"execution": {"sql_query": "SELECT 2 AS value"}}
+    },
+    {
+      "name": "invalid_trusted_execution_unknown_field",
+      "valid": false,
+      "overrides": {"execution": {"unexpected": "value"}}
+    },
+    {
+      "name": "invalid_applied_row_limit_boolean",
+      "valid": false,
+      "overrides": {"execution": {"applied_row_limit": true}}
+    },
+    {
+      "name": "invalid_applied_row_limit_zero",
+      "valid": false,
+      "overrides": {"execution": {"applied_row_limit": 0}}
+    },
+    {
+      "name": "invalid_rows_over_applied_limit",
+      "valid": false,
+      "overrides": {
+        "data": [[1], [2]],
+        "rows_affected": 2,
+        "execution": {
+          "data": [[1], [2]],
+          "rows_affected": 2,
+          "applied_row_limit": 1
+        }
+      }
+    },
+    {
+      "name": "invalid_array_row_width",
+      "valid": false,
+      "overrides": {
+        "data": [[1, 2]],
+        "execution": {"data": [[1, 2]]}
+      }
+    },
+    {
+      "name": "invalid_object_row_keys",
+      "valid": false,
+      "overrides": {
+        "data": [{"other": 1}],
+        "execution": {"data": [{"other": 1}]}
+      }
+    },
+    {
+      "name": "invalid_safety_issues_not_array",
+      "valid": false,
+      "overrides": {"execution": {"safety_issues": {"issue_type": "X"}}}
+    },
+    {
+      "name": "invalid_safety_issue_shape",
+      "valid": false,
+      "overrides": {
+        "execution": {
+          "safety_issues": [{"issue_type": "X", "description": "blocked", "extra": true}]
+        }
+      }
+    },
+    {
+      "name": "invalid_success_with_safety_issue",
+      "valid": false,
+      "overrides": {
+        "execution": {
+          "safety_issues": [{"issue_type": "X", "description": "blocked"}]
+        }
+      }
+    },
+    {
+      "name": "invalid_safety_issue_empty_description",
+      "valid": false,
+      "overrides": {
+        "execution": {
+          "safety_issues": [{"issue_type": "X", "description": "   "}]
+        }
+      }
+    },
+    {
+      "name": "invalid_explain_result_shape",
+      "valid": false,
+      "overrides": {
+        "execution": {
+          "explain_result": {"plan": "SCAN", "issues": []}
+        }
+      }
+    },
+    {
+      "name": "invalid_explain_result_for_non_plan_rows",
+      "valid": false,
+      "overrides": {
+        "execution": {
+          "explain_result": {
+            "plan": "SCAN",
+            "estimated_cost": null,
+            "rows_to_scan": null,
+            "issues": []
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid_explain_estimated_cost_boolean",
+      "valid": false,
+      "overrides": {
+        "sql": "EXPLAIN SELECT 1",
+        "data": [["SCAN"]],
+        "columns": ["Plan"],
+        "execution": {
+          "sql_query": "EXPLAIN SELECT 1",
+          "data": [["SCAN"]],
+          "columns": ["Plan"],
+          "explain_result": {
+            "plan": "SCAN",
+            "estimated_cost": true,
+            "rows_to_scan": null,
+            "issues": []
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid_explain_rows_to_scan_boolean",
+      "valid": false,
+      "overrides": {
+        "sql": "EXPLAIN SELECT 1",
+        "data": [["SCAN"]],
+        "columns": ["Plan"],
+        "execution": {
+          "sql_query": "EXPLAIN SELECT 1",
+          "data": [["SCAN"]],
+          "columns": ["Plan"],
+          "explain_result": {
+            "plan": "SCAN",
+            "estimated_cost": null,
+            "rows_to_scan": true,
+            "issues": []
+          }
+        }
+      }
+    },
+    {
+      "name": "valid_explain_result_with_advisory_issues",
+      "valid": true,
+      "overrides": {
+        "sql": "EXPLAIN SELECT 1",
+        "data": [["SCAN"]],
+        "columns": ["Plan"],
+        "execution": {
+          "sql_query": "EXPLAIN SELECT 1",
+          "data": [["SCAN"]],
+          "columns": ["Plan"],
+          "explain_result": {
+            "plan": "SCAN",
+            "estimated_cost": null,
+            "rows_to_scan": null,
+            "issues": [{"issue_type": "FULL_SCAN", "description": "scan"}]
+          }
+        }
+      }
+    },
+    {
+      "name": "invalid_generated_without_non_whitespace_sql",
+      "valid": false,
+      "overrides": {
+        "sql": "   ",
+        "execution": {"sql_query": "   "}
+      }
+    },
+    {
+      "name": "invalid_abstained_result_rows_without_execution_evidence",
+      "valid": false,
+      "overrides": {
+        "status": "abstained",
+        "reason_code": "VERIFIER_REJECTED",
+        "approved": false,
+        "executed": false,
+        "audited": false,
+        "data": [[1]],
+        "columns": ["value"],
+        "rows_affected": 1,
+        "error": null,
+        "execution": {"$replace": {}},
+        "audit": {"$replace": {}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      }
+    },
+    {
+      "name": "valid_execution_failed_after_db_attempt",
+      "valid": true,
+      "overrides": {
+        "status": "failed",
+        "reason_code": "EXECUTION_FAILED",
+        "executed": true,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "database unavailable",
+        "execution": {
+          "success": false,
+          "data": [],
+          "columns": [],
+          "rows_affected": 0,
+          "error_message": "database unavailable"
+        },
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      }
+    },
+    {
+      "name": "invalid_execution_failed_claims_success_and_saved_persistence",
+      "valid": false,
+      "overrides": {
+        "status": "failed",
+        "reason_code": "EXECUTION_FAILED",
+        "error": "database unavailable"
+      }
+    }
+  ],
+  "reason_evidence_cases": [
+    {
+      "reason_code": "VERIFIER_CONTRACT_INVALID",
+      "profile": "no_runtime",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "VERIFIER_CONTRACT_INVALID",
+        "approved": false,
+        "executed": false,
+        "audited": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "invalid verifier result",
+        "execution": {"$replace": {}},
+        "audit": {"$replace": {}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {"data": [[1]], "columns": ["value"], "rows_affected": 1}
+    },
+    {
+      "reason_code": "EXECUTOR_CONTRACT_INVALID",
+      "profile": "untrusted_executor",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "EXECUTOR_CONTRACT_INVALID",
+        "executed": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "invalid executor result",
+        "execution": {"$replace": {"raw_success": "yes"}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {"executed": true}
+    },
+    {
+      "reason_code": "AUDIT_CONTRACT_INVALID",
+      "profile": "audit_failure",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "AUDIT_CONTRACT_INVALID",
+        "audited": false,
+        "error": "invalid audit result",
+        "audit": {"$replace": {"status": "error", "error": "invalid audit result"}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {"audited": true, "audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "AUDIT_FAILED",
+      "profile": "audit_failure",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "AUDIT_FAILED",
+        "audited": false,
+        "error": "audit unavailable",
+        "audit": {"$replace": {"status": "error", "error": "audit unavailable"}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {"audited": true, "audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "EXECUTION_FAILED",
+      "profile": "execution_failure",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "EXECUTION_FAILED",
+        "executed": true,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "database unavailable",
+        "execution": {
+          "success": false,
+          "data": [],
+          "columns": [],
+          "rows_affected": 0,
+          "error_message": "database unavailable"
+        },
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {
+        "execution": {"success": true, "data": [[1]], "columns": ["value"], "rows_affected": 1},
+        "data": [[1]],
+        "columns": ["value"],
+        "rows_affected": 1,
+        "persistence": {"$replace": {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}}
+      }
+    },
+    {
+      "reason_code": "PERSISTENCE_CONTRACT_INVALID",
+      "profile": "persistence_contract_failure",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "PERSISTENCE_CONTRACT_INVALID",
+        "error": "invalid persistence result",
+        "persistence": {"$replace": {"status": "error", "error": "invalid persistence result"}}
+      },
+      "invalid_overrides": {"persistence": {"$replace": {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}}}
+    },
+    {
+      "reason_code": "DB_AUDIT_MISSING",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_MISSING", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "db_audit missing", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"audited": true, "audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "DB_AUDIT_FAILED",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_FAILED", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "db_audit failed", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"executed": true}
+    },
+    {
+      "reason_code": "DB_AUDIT_NOT_TERMINAL",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_NOT_TERMINAL", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "db_audit not terminal", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"dry_run": true}
+    },
+    {
+      "reason_code": "DB_AUDIT_OUTPUT_INVALID",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_OUTPUT_INVALID", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "db_audit output invalid", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"data": [[1]], "columns": ["value"], "rows_affected": 1}
+    },
+    {
+      "reason_code": "DB_AUDIT_RUN_ID_MISMATCH",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_RUN_ID_MISMATCH", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "run mismatch", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"audited": true, "audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "DB_AUDIT_SKIPPED_WITHOUT_ABSTENTION",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_SKIPPED_WITHOUT_ABSTENTION", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "invalid skip", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"execution": {"$replace": {"raw": true}}}
+    },
+    {
+      "reason_code": "DB_AUDIT_SKIPPED_AFTER_APPROVAL",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "DB_AUDIT_SKIPPED_AFTER_APPROVAL", "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "approved SQL skipped", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"persistence": {"$replace": {"status": "error", "error": "unexpected"}}}
+    },
+    {
+      "reason_code": "MANDATORY_STEP_NOT_COMPLETED",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "MANDATORY_STEP_NOT_COMPLETED", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "step missing", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"executed": true}
+    },
+    {
+      "reason_code": "SQL_GENERATION_OUTPUT_MISMATCH",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "SQL_GENERATION_OUTPUT_MISMATCH", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "SQL mismatch", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"data": [[1]], "columns": ["value"], "rows_affected": 1}
+    },
+    {
+      "reason_code": "SQL_VERIFICATION_OUTPUT_MISMATCH",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "SQL_VERIFICATION_OUTPUT_MISMATCH", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "verifier mismatch", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"audited": true, "audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "RESULT_AGGREGATION_FAILED",
+      "profile": "post_success",
+      "valid_overrides": {"status": "failed", "reason_code": "RESULT_AGGREGATION_FAILED", "error": "aggregation failed"},
+      "invalid_overrides": {"executed": false, "data": [], "columns": [], "rows_affected": 0, "execution": {"$replace": {}}, "audit": {"$replace": {}}, "audited": false, "persistence": {"$replace": {"status": "not_attempted"}}}
+    },
+    {
+      "reason_code": "RESULT_PERSISTENCE_FAILED",
+      "profile": "result_failure",
+      "valid_overrides": {"status": "failed", "reason_code": "RESULT_PERSISTENCE_FAILED", "error": "result persistence failed", "persistence": {"$replace": {"status": "error", "error": "result persistence failed"}}},
+      "invalid_overrides": {"persistence": {"$replace": {"status": "not_attempted"}}}
+    },
+    {
+      "reason_code": "RESULT_RECONCILIATION_FAILED",
+      "profile": "result_failure",
+      "valid_overrides": {"status": "failed", "reason_code": "RESULT_RECONCILIATION_FAILED", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "result reconciliation failed", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "error", "error": "result reconciliation failed"}}},
+      "invalid_overrides": {"persistence": {"$replace": {"status": "not_attempted"}}}
+    },
+    {
+      "reason_code": "OUTPUT_RETRY_CHAIN_FAILED",
+      "profile": "execution_failure",
+      "valid_overrides": {
+        "status": "failed",
+        "reason_code": "OUTPUT_RETRY_CHAIN_FAILED",
+        "executed": true,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": "corrective retry chain failed",
+        "execution": {"success": false, "data": [], "columns": [], "rows_affected": 0, "error_message": "database unavailable"},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      },
+      "invalid_overrides": {"executed": false, "audited": false, "execution": {"$replace": {}}, "audit": {"$replace": {}}}
+    }
+  ]
+}

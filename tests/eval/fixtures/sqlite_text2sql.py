@@ -29,6 +29,29 @@ def create_sqlite_text2sql_fixture(path: str | Path) -> Path:
                 (1, 1, 100.0),
                 (2, 1, 25.0),
                 (3, 2, 50.0);
+            CREATE TABLE accounts (
+                tenant_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, account_id)
+            );
+            CREATE TABLE invoices (
+                id INTEGER PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                FOREIGN KEY (tenant_id, account_id)
+                    REFERENCES accounts(tenant_id, account_id)
+            );
+            INSERT INTO accounts(tenant_id, account_id, name) VALUES
+                (1, 10, 'alpha'),
+                (1, 20, 'beta'),
+                (2, 10, 'alpha');
+            INSERT INTO invoices(id, tenant_id, account_id, amount) VALUES
+                (1, 1, 10, 12.0),
+                (2, 1, 10, 18.0),
+                (3, 1, 20, 7.0),
+                (4, 2, 10, 11.0);
             """
         )
         conn.commit()

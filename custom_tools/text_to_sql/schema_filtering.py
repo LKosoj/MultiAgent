@@ -11,6 +11,7 @@ from .utils import (
     set_table_description,
 )
 from .schema_metadata import ColumnMetadataHelper
+from .schema_namespace import SchemaNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -232,6 +233,7 @@ class SchemaContextBuilder:
         joins: List[Dict[str, Any]], 
         full_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Строит контекст схемы только с релевантными таблицами и их отфильтрованными колонками."""
 
@@ -257,10 +259,16 @@ class SchemaContextBuilder:
                     entity_keywords.append(dimension['name'])
             
             if entity_keywords:
-                memory_relevant_tables = self.memory_manager.find_semantic_relevant_tables(
-                    entity_keywords,
-                    dsn=dsn,
-                )
+                if namespace is None:
+                    memory_relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                        entity_keywords,
+                        dsn=dsn,
+                    )
+                else:
+                    memory_relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                        entity_keywords,
+                        namespace=namespace,
+                    )
                 relevant_tables.update(memory_relevant_tables)
                 logger.info(f"Added {len(memory_relevant_tables)} semantically relevant tables from memory: {memory_relevant_tables}")
         

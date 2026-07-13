@@ -2,7 +2,7 @@
 End-to-end regression test for text_to_sql_pipeline.yaml.
 
 Tool- и agent-шаги мокаем на уровне `EnhancedWorkflowEngine._execute_tool_step` /
-`_execute_manager_with_preloaded_agents`, поэтому проверяется:
+`_execute_agent_step`, поэтому проверяется:
 - успешная загрузка YAML;
 - разрешение зависимостей между шагами (DAG);
 - проброс outputs предыдущих шагов в последующие;
@@ -19,7 +19,11 @@ from typing import Any
 import pytest
 
 from workflow.enhanced_engine import EnhancedWorkflowEngine
-from workflow.models import StepStatus, WorkflowStatus
+from workflow.models import (
+    StepStatus,
+    TextToSqlTerminalStatus,
+    WorkflowStatus,
+)
 
 
 PIPELINE_YAML = Path("workflow_pipelines/text_to_sql_pipeline.yaml")
@@ -39,6 +43,7 @@ _TOOL_OUTPUTS: dict[str, dict[str, Any]] = {
         },
     },
     "schema_linking_step": {
+        "namespace_version_key": "a" * 64,
         "linked_entities": {
             "metrics": [
                 {"name": "amount", "table": "orders", "column": "amount"}
@@ -60,24 +65,18 @@ _TOOL_OUTPUTS: dict[str, dict[str, Any]] = {
             }
         },
     },
-}
-
-
-_MANAGER_OUTPUT: dict[str, Any] = {
-    "sql_query": 'SELECT SUM("amount") AS total FROM "orders" LIMIT 10',
-    "execution": {
-        "success": True,
-        "executed": True,
-        "rows_affected": 1,
-        "data": [{"total": 383.8}],
+    "successful_sql_retrieval": {
+        "status": "EMPTY",
+        "examples": [],
+        "context_json": "[]",
+        "failed_ids": [],
+        "error_code": None,
     },
-    "summary": "E2E stub executed",
 }
 
 
-# EPIC 6.3: god-manager sql_pipeline декомпозирован на sql_generation /
-# sql_verification / db_audit. Каждый шаг — отдельный agent_type, поэтому
-# теперь мокаем _execute_agent_step, а не _execute_manager_with_preloaded_agents.
+# EPIC 6.3: god-manager sql_pipeline декомпозирован на два agent-шага
+# и детерминированный db_audit tool-шаг.
 _AGENT_OUTPUTS: dict[str, dict[str, Any]] = {
     "sql_generation": {
         "sql": 'SELECT SUM("amount") AS total FROM "orders" LIMIT 10',
@@ -89,7 +88,6 @@ _AGENT_OUTPUTS: dict[str, dict[str, Any]] = {
         "performance_check": {"plan": "seq scan orders", "estimated_cost": 1.0, "issues": []},
         "recommendations": [],
     },
-    "db_audit": dict(_MANAGER_OUTPUT),
 }
 
 
@@ -98,8 +96,59 @@ def engine_with_stubs(monkeypatch):
     """Engine с мокированными tool/agent шагами и in-memory state."""
 
     engine = EnhancedWorkflowEngine()
+    tool_calls: list[dict[str, Any]] = []
 
     async def _fake_tool_step(step, context, task):
+        tool_calls.append({
+            "step_id": step.id,
+            "tool_name": step.tool_name,
+            "run_id": context.variables.get("run_id"),
+            "sql_generation": context.step_outputs.get("sql_generation"),
+            "sql_verification": context.step_outputs.get("sql_verification"),
+        })
+        if step.id == "db_audit":
+            assert step.tool_name == "finalize_text_to_sql_run"
+            sql = context.step_outputs["sql_generation"]["sql"]
+            assert (
+                context.step_outputs["sql_verification"]["verification_status"]
+                == "Approved"
+            )
+            return {
+                "run_id": context.variables["run_id"],
+                "status": "succeeded",
+                "reason_code": "",
+                "sql": sql,
+                "generated": True,
+                "approved": True,
+                "executed": True,
+                "dry_run": False,
+                "audited": True,
+                "data": [{"total": 383.8}],
+                "columns": ["total"],
+                "rows_affected": 1,
+                "error": None,
+                "execution": {
+                    "success": True,
+                    "data": [{"total": 383.8}],
+                    "columns": ["total"],
+                    "rows_affected": 1,
+                    "execution_time_ms": 1,
+                    "error_message": None,
+                    "dry_run_only": False,
+                    "skipped_execution": False,
+                    "sql_query": sql,
+                    "applied_row_limit": 10,
+                },
+                "audit": {
+                    "status": "logged",
+                    "log_id": f"audit-{context.variables['run_id']}",
+                },
+                "persistence": {
+                    "status": "saved",
+                    "filename": "query.md",
+                    "path": "/tmp/query.md",
+                },
+            }
         if step.id not in _TOOL_OUTPUTS:
             raise AssertionError(f"unexpected tool step: {step.id}")
         return _TOOL_OUTPUTS[step.id]
@@ -124,13 +173,14 @@ def engine_with_stubs(monkeypatch):
     monkeypatch.setattr(
         engine.state_manager, "save_checkpoint", _noop_checkpoint
     )
+    engine._e2e_tool_calls = tool_calls
 
     return engine
 
 
 @pytest.mark.asyncio
 async def test_text_to_sql_pipeline_executes_all_steps(engine_with_stubs):
-    """Pipeline проходит все 4 шага и возвращает final.sql_query."""
+    """Pipeline проходит все шаги и возвращает terminal outcome."""
     result = await engine_with_stubs.execute_workflow_from_yaml(
         PIPELINE_YAML,
         query="Покажи сумму заказов",
@@ -143,7 +193,7 @@ async def test_text_to_sql_pipeline_executes_all_steps(engine_with_stubs):
     )
 
     assert result.status == WorkflowStatus.COMPLETED, (
-        f"workflow failed: status={result.status}, error={result.error_message}"
+        f"workflow failed: status={result.status}, error={result.error}"
     )
     assert result.failed_steps == 0
 
@@ -151,6 +201,7 @@ async def test_text_to_sql_pipeline_executes_all_steps(engine_with_stubs):
         "nlu_processing",
         "intent_extraction_step",
         "schema_linking_step",
+        "successful_sql_retrieval",
         # EPIC 6.3: god-manager sql_pipeline -> три декомпозированных шага
         "sql_generation",
         "sql_verification",
@@ -167,11 +218,26 @@ async def test_text_to_sql_pipeline_executes_all_steps(engine_with_stubs):
 
     final = result.final_output
     assert isinstance(final, dict)
-    sql_query = final.get("final", {}).get("sql_query", "")
-    assert "SELECT" in sql_query.upper(), f"final.sql_query missing: {final!r}"
-    execution = final["final"]["execution"]
-    assert execution["success"] is True
-    assert execution["executed"] is True
+    terminal = result.terminal_outcome
+    assert terminal is not None
+    assert terminal.status is TextToSqlTerminalStatus.SUCCEEDED
+    assert terminal.sql == _AGENT_OUTPUTS["sql_generation"]["sql"]
+    assert terminal.generated is True
+    assert terminal.approved is True
+    assert terminal.executed is True
+    assert terminal.dry_run is False
+    assert terminal.audited is True
+    assert terminal.error is None
+    assert terminal.execution["success"] is True
+    assert terminal.audit["status"] == "logged"
+    assert terminal.persistence["status"] == "saved"
+    assert final["final"] == terminal.to_mapping()
+    assert result.step_results["db_audit"].output == terminal.to_mapping()
+    assert any(
+        call["step_id"] == "db_audit"
+        and call["tool_name"] == "finalize_text_to_sql_run"
+        for call in engine_with_stubs._e2e_tool_calls
+    )
 
 
 @pytest.mark.asyncio
@@ -196,3 +262,15 @@ async def test_text_to_sql_pipeline_propagates_step_outputs(engine_with_stubs):
 
     intent = final.get("intent") or final.get("outputs", {}).get("intent")
     assert intent and intent["entities"]["metrics"] == ["amount"]
+
+    db_audit_call = next(
+        call
+        for call in engine_with_stubs._e2e_tool_calls
+        if call["step_id"] == "db_audit"
+    )
+    assert db_audit_call["run_id"] == "e2e-run-2"
+    assert db_audit_call["sql_generation"] == _AGENT_OUTPUTS["sql_generation"]
+    assert db_audit_call["sql_verification"] == _AGENT_OUTPUTS["sql_verification"]
+    terminal = result.terminal_outcome
+    assert terminal is not None
+    assert final["final"] == terminal.to_mapping()

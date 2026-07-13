@@ -189,8 +189,7 @@ def test_sqlglot_dialect_mapping_plugin_driven():
     assert mapping.get("sqlite") == "sqlite"
     assert mapping.get("duckdb") == "duckdb"
     assert mapping.get("impala") == "hive"
-    # sapiq имеет историческое значение "ansi" (а не "tsql").
-    assert mapping.get("sapiq") == "ansi"
+    assert mapping.get("sapiq") == "tsql"
 
     # Fallback-ключ "sql" → "ansi".
     assert mapping.get("sql") == "ansi"

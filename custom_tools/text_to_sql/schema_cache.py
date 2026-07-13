@@ -25,11 +25,12 @@ import logging
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
 
+from .schema_namespace import SchemaNamespace, SchemaScope
 from .utils import dsn_to_sanitized_name, get_runtime_context_dsn, get_schema_version
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_LINKING_LOGIC_VERSION = "2026-07-02-q3-dimension-id-disambiguation"
+SCHEMA_LINKING_LOGIC_VERSION = "2026-07-12-schema-budget-tristate"
 
 
 # W2-T4: явный контракт между «честный miss» и «сбой кэша».
@@ -69,6 +70,7 @@ LINKING_CACHE_ENV_PREFIXES: tuple = (
     "SCHEMA_MAX_",
     "SCHEMA_DESC_",
     "SCHEMA_AGGRESSIVE_",
+    "TEXT_TO_SQL_LLM_MODELS_",
 )
 
 
@@ -221,7 +223,11 @@ def _dsn_host_port_db(dsn: str) -> str:
         return dsn_to_sanitized_name(dsn)
 
 
-def _compute_env_fingerprint(dsn: Optional[str] = None) -> str:
+def _compute_env_fingerprint(
+    dsn: Optional[str] = None,
+    *,
+    include_dsn: bool = True,
+) -> str:
     """Возвращает sha256-хэш окружения, влияющего на schema cache.
 
     W8-T1: смена DB_DSN (host/port/db) или любого TEXT_TO_SQL_*_PROFILE env
@@ -233,7 +239,9 @@ def _compute_env_fingerprint(dsn: Optional[str] = None) -> str:
 
     Возвращает hex-строку длиной 64 (полный sha256).
     """
-    raw_dsn = dsn if (isinstance(dsn, str) and dsn.strip()) else os.getenv("DB_DSN", "")
+    raw_dsn = (
+        dsn if (isinstance(dsn, str) and dsn.strip()) else os.getenv("DB_DSN", "")
+    ) if include_dsn else ""
     fingerprint_input: Dict[str, str] = {
         "DB_DSN_IDENTITY": _dsn_host_port_db(raw_dsn),
     }
@@ -307,11 +315,27 @@ class SchemaCacheManager:
         self,
         entities: Any,
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
-        dsn: Optional[str] = None,
+        dsn: Optional[str] | SchemaNamespace = None,
         session_id: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Dict[str, str]:
         """Подготавливает информацию для кэширования."""
-        if isinstance(session_id, str) and session_id.strip():
+        if isinstance(dsn, SchemaNamespace):
+            if namespace is not None:
+                raise TypeError("namespace was provided twice")
+            namespace = dsn
+            dsn = None
+        if isinstance(namespace, SchemaScope):
+            raise TypeError(
+                "SchemaScope is unversioned; schema cache requires SchemaNamespace"
+            )
+        if namespace is not None and not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be a SchemaNamespace or null")
+
+        if namespace is not None:
+            session_id_cache = namespace.version_key
+            effective_dsn = None
+        elif isinstance(session_id, str) and session_id.strip():
             session_id_cache = session_id.strip()
             effective_dsn = (
                 dsn if (isinstance(dsn, str) and dsn.strip())
@@ -331,7 +355,11 @@ class SchemaCacheManager:
                 raise ValueError("DSN is required for schema cache namespace")
             session_id_cache = dsn_to_sanitized_name(effective_dsn)
         cache_kind = "schema_linking"
-        schema_version = get_schema_version(db_schema)
+        schema_version = (
+            namespace.schema_fingerprint
+            if namespace is not None
+            else get_schema_version(db_schema)
+        )
         linking_env = _collect_linking_cache_env()
         linking_env["__schema_linking_logic_version__"] = SCHEMA_LINKING_LOGIC_VERSION
         # BLAKE2b с session_id-солью изолирует cache_key между сессиями:
@@ -377,7 +405,10 @@ class SchemaCacheManager:
         # W8-T1: env-fingerprint включает DB_DSN identity (host:port:db) и
         # TEXT_TO_SQL_*_PROFILE env-vars. Меняем профиль scoring/nlu/significance
         # → cache_key меняется → load_from_cache возвращает None (miss, не corruption).
-        env_fingerprint = _compute_env_fingerprint(effective_dsn)
+        env_fingerprint = _compute_env_fingerprint(
+            effective_dsn,
+            include_dsn=namespace is None,
+        )
 
         # cache_key включает env_fingerprint, чтобы смена профиля/DSN
         # инвалидировала закэшированный linking-результат как miss.
@@ -386,7 +417,7 @@ class SchemaCacheManager:
             f"_{linking_env_hash}_{entities_hash}_{env_fingerprint[:16]}"
         )
 
-        return {
+        cache_info = {
             "session_id": session_id_cache,
             "cache_kind": cache_kind,
             "cache_key": cache_key,
@@ -397,6 +428,9 @@ class SchemaCacheManager:
             "linking_env_hash": linking_env_hash,
             "env_fingerprint": env_fingerprint,
         }
+        if namespace is not None:
+            cache_info["namespace_version_key"] = namespace.version_key
+        return cache_info
 
     def load_from_cache(self, cache_info: Dict[str, str]) -> Optional[Dict[str, Any]]:
         """Загружает результат из кэша.

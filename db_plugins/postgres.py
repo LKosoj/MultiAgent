@@ -4,7 +4,14 @@ import json
 import logging
 import time
 from typing import Any, Dict, Optional
-from .base import BaseDBPlugin
+from .base import (
+    BaseDBPlugin,
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    ForeignKeyRow,
+    PluginHealth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +19,73 @@ logger = logging.getLogger(__name__)
 class PostgresPlugin(BaseDBPlugin):
     dialect = "postgres"
     dialect_label = "PostgreSQL"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        capabilities = DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=Capability.supported(
+                EnforcementMode.DATABASE, "READ_ONLY_SESSION_ENFORCED"
+            ),
+            statement_timeout=Capability.supported(
+                EnforcementMode.DATABASE, "POSTGRES_STATEMENT_TIMEOUT"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.supported(
+                EnforcementMode.DATABASE, "ORDERED_COMPOSITE_FK_METADATA"
+            ),
+            parameter_binding=Capability.supported(
+                EnforcementMode.DRIVER, "DRIVER_PARAMETER_BINDING"
+            ),
+        )
+        if dsn and self.read_only_fail_open_enabled(dsn):
+            capabilities = capabilities.downgrade(
+                read_only=Capability.unsupported("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+            )
+        return capabilities
+
+    def probe_capabilities(self, conn=None, dsn: str | None = None) -> PluginHealth:
+        capabilities = self.get_capabilities(dsn)
+        if conn is None:
+            return PluginHealth(
+                self.dialect,
+                capabilities,
+                False,
+                ("CONNECTION_PROBE_REQUIRED",),
+            )
+        try:
+            with self._cursor(conn) as cur:
+                cur.execute("SHOW transaction_read_only")
+                row = cur.fetchone()
+                if not row or str(row[0]).strip().lower() not in {"on", "true", "1"}:
+                    raise RuntimeError("read-only session probe failed")
+                cur.execute("SHOW statement_timeout")
+                timeout_row = cur.fetchone()
+                if not timeout_row or not str(timeout_row[0]).strip():
+                    raise RuntimeError("statement timeout probe failed")
+        except Exception:
+            capabilities = capabilities.downgrade(
+                read_only=Capability.unverified(
+                    "CAPABILITY_PROBE_FAILED", EnforcementMode.DATABASE
+                ),
+                statement_timeout=Capability.unverified(
+                    "CAPABILITY_PROBE_FAILED", EnforcementMode.DATABASE
+                ),
+            )
+            return PluginHealth(
+                self.dialect,
+                capabilities,
+                False,
+                ("CAPABILITY_PROBE_FAILED",),
+            )
+        return PluginHealth(self.dialect, capabilities, True, ("PROBE_OK",))
 
     def connect(self, dsn: str):
         import psycopg  # type: ignore
@@ -89,7 +163,7 @@ class PostgresPlugin(BaseDBPlugin):
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
-    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Dict[str, str]]]:
+    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
         # Строим WHERE условия динамически
         where_conditions = []
         params = []
@@ -132,7 +206,10 @@ class PostgresPlugin(BaseDBPlugin):
                     WHEN fk.column_name IS NOT NULL THEN 
                         CONCAT(fk.foreign_table_schema, '.', fk.foreign_table_name, '.', fk.foreign_column_name)
                     ELSE ''
-                END AS references
+                END AS references,
+                fk.constraint_schema,
+                fk.constraint_name,
+                fk.ordinal_position
             FROM information_schema.columns c
             -- Primary keys
             LEFT JOIN (
@@ -150,6 +227,8 @@ class PostgresPlugin(BaseDBPlugin):
             LEFT JOIN (
                 SELECT 
                     kcu.table_schema, kcu.table_name, kcu.column_name,
+                    kcu.constraint_schema, kcu.constraint_name,
+                    kcu.ordinal_position,
                     ref_kcu.table_schema AS foreign_table_schema,
                     ref_kcu.table_name AS foreign_table_name,
                     ref_kcu.column_name AS foreign_column_name
@@ -189,17 +268,31 @@ class PostgresPlugin(BaseDBPlugin):
 
         # Формируем схему в новом формате
         schema_result: Dict[str, Dict[str, Any]] = {}
+        fk_rows: list[ForeignKeyRow] = []
         with self._cursor(conn) as cur:
             cur.execute(query, params)
 
-            for schema_name, table, col, dtype, comment, constraint_type, references in cur.fetchall():
+            for row in cur.fetchall():
+                (
+                    schema_name,
+                    table,
+                    col,
+                    dtype,
+                    comment,
+                    constraint_type,
+                    references,
+                    constraint_schema,
+                    constraint_name,
+                    ordinal_position,
+                ) = row
                 key = f"{schema_name}.{table}"
 
                 # Создаем таблицу если её нет
                 if key not in schema_result:
                     schema_result[key] = {
                         "description": "",  # Будет заполнено LLM
-                        "columns": {}
+                        "columns": {},
+                        "foreign_keys": {"complete": True, "constraints": []},
                     }
 
                 # Нормализуем информацию о колонке
@@ -211,6 +304,22 @@ class PostgresPlugin(BaseDBPlugin):
                 }
 
                 schema_result[key]["columns"][col] = self.normalize_column_info(col_info)
+
+                fk_rows.append(
+                    ForeignKeyRow(
+                        table_key=key,
+                        column=str(col),
+                        constraint_schema=constraint_schema,
+                        constraint_name=constraint_name,
+                        ordinal_position=ordinal_position,
+                        references=references,
+                    )
+                )
+
+        for key, constraints in self._group_foreign_key_rows(
+            fk_rows, dialect_label="PostgreSQL"
+        ).items():
+            schema_result[key]["foreign_keys"]["constraints"] = constraints
 
         return schema_result
 

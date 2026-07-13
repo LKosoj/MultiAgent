@@ -25,7 +25,11 @@ import logging
 import threading
 from typing import List, Dict, Any, FrozenSet, Iterable, Tuple
 
-from .safety_config import load_safety_profile, reload_safety_config
+from .safety_config import (
+    TextToSqlSafetyPolicy,
+    load_startup_safety_policy,
+    reload_safety_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1103,8 +1107,12 @@ class SQLSafetyValidator:
     (``core/_sql_generation_api.py``) и тесты.
     """
 
-    def __init__(self):
-        self._profile = load_safety_profile()
+    def __init__(self, policy: TextToSqlSafetyPolicy | None = None):
+        if policy is not None and not isinstance(policy, TextToSqlSafetyPolicy):
+            raise TypeError("policy must be a TextToSqlSafetyPolicy or null")
+        self._explicit_policy = policy is not None
+        self.policy = policy or load_startup_safety_policy()
+        self._profile = self.policy
         self.forbidden_keywords: List[str] = list(self._profile.forbidden_keywords)
         self.forbidden_functions: List[str] = list(
             getattr(self._profile, "forbidden_functions", []) or []
@@ -1180,8 +1188,11 @@ class SQLSafetyValidator:
         модульного загрузчика), затем повторяет логику ``__init__``,
         перезаполняя поля и пере-создавая internal helpers.
         """
-        reload_safety_config()
-        profile = load_safety_profile()
+        if self._explicit_policy:
+            profile = self.policy
+        else:
+            reload_safety_config()
+            profile = load_startup_safety_policy()
         forbidden_keywords = list(profile.forbidden_keywords)
         forbidden_functions = list(
             getattr(profile, "forbidden_functions", []) or []
@@ -1205,6 +1216,7 @@ class SQLSafetyValidator:
         # увидеть старый профиль (см. контракт в docstring: reload — только
         # admin/тесты; в production — restart процесса).
         with self._reload_lock:
+            self.policy = profile
             self._profile = profile
             self.forbidden_keywords = forbidden_keywords
             self.forbidden_functions = forbidden_functions
@@ -1235,35 +1247,29 @@ class SQLSafetyValidator:
             _regex = self._regex
             _sqlglot_v = self._sqlglot
             _max_query_length = self.max_query_length
+            policy = self.policy
 
         q = sql_query.strip()
 
-        safety_level = os.getenv("TEXT_TO_SQL_SAFETY_LEVEL", "strict").strip().lower()
-        if safety_level != "strict":
-            return {
-                "is_safe": False,
-                "issues": [{
-                    "issue_type": "UNSUPPORTED_SAFETY_LEVEL",
-                    "description": f"Unsupported SQL safety level '{safety_level}'. Only 'strict' is currently supported."
-                }]
-            }
-
         if self._sqlglot_available:
-            return self._validate_with_sqlglot(
+            result = self._validate_with_sqlglot(
                 q,
                 dsn=dsn,
                 _regex_snap=_regex,
                 _sqlglot_snap=_sqlglot_v,
                 _max_query_length_snap=_max_query_length,
             )
-
-        return {
-            "is_safe": False,
-            "issues": [{
-                "issue_type": "SQLGLOT_UNAVAILABLE",
-                "description": "SQLglot is not available. Strict SQL validation cannot run."
-            }]
-        }
+        else:
+            result = {
+                "is_safe": False,
+                "issues": [{
+                    "issue_type": "SQLGLOT_UNAVAILABLE",
+                    "description": "SQLglot is not available. Strict SQL validation cannot run."
+                }]
+            }
+        result["profile_name"] = policy.profile_name
+        result["policy_version"] = policy.policy_version
+        return result
 
     # ------------------------------------------------------------------
     # ORCHESTRATION (legacy + sqlglot paths)

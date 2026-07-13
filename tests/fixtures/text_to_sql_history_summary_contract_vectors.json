@@ -1,0 +1,142 @@
+{
+  "cases": [
+    {
+      "name": "succeeded",
+      "summary": {
+        "run_id": "history-succeeded",
+        "session_id": "session-contract",
+        "workflow_name": "text_to_sql_pipeline",
+        "timestamp": "2026-07-11T08:00:00",
+        "status": "succeeded",
+        "success": true,
+        "reason_code": "",
+        "generated": true,
+        "approved": true,
+        "executed": true,
+        "dry_run": false,
+        "audited": true,
+        "sql_query": "SELECT 1",
+        "row_count": 1,
+        "rows_affected": 1,
+        "column_count": 1,
+        "execution": {
+          "success": true,
+          "dry_run_only": false,
+          "skipped_execution": false,
+          "rows_affected": 1,
+          "execution_time_ms": 1
+        },
+        "audit": {
+          "status": "logged",
+          "log_id": "audit-1"
+        },
+        "persistence": {
+          "status": "saved",
+          "filename": "query.md",
+          "path": "/tmp/query.md"
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "failed_execution",
+      "summary": {
+        "run_id": "history-failed-execution",
+        "session_id": "session-contract",
+        "workflow_name": "text_to_sql_pipeline",
+        "timestamp": "2026-07-11T08:00:00",
+        "status": "failed",
+        "success": false,
+        "reason_code": "EXECUTION_FAILED",
+        "generated": true,
+        "approved": true,
+        "executed": true,
+        "dry_run": false,
+        "audited": true,
+        "sql_query": "SELECT 1",
+        "row_count": 0,
+        "rows_affected": 0,
+        "column_count": 0,
+        "execution": {
+          "success": false,
+          "dry_run_only": false,
+          "skipped_execution": false,
+          "rows_affected": 0,
+          "execution_time_ms": 2,
+          "error_message": "execution failed"
+        },
+        "audit": {
+          "status": "logged",
+          "log_id": "audit-failed"
+        },
+        "persistence": {
+          "status": "not_attempted"
+        },
+        "error": "execution failed"
+      }
+    },
+    {
+      "name": "dry_run",
+      "summary": {
+        "run_id": "history-dry-run",
+        "session_id": "session-contract",
+        "workflow_name": "text_to_sql_pipeline",
+        "timestamp": "2026-07-11T08:00:00",
+        "status": "succeeded",
+        "success": true,
+        "reason_code": "",
+        "generated": true,
+        "approved": true,
+        "executed": false,
+        "dry_run": true,
+        "audited": true,
+        "sql_query": "SELECT 1",
+        "row_count": 0,
+        "rows_affected": 0,
+        "column_count": 0,
+        "execution": {
+          "success": true,
+          "dry_run_only": true,
+          "skipped_execution": true,
+          "rows_affected": 0,
+          "execution_time_ms": 1
+        },
+        "audit": {
+          "status": "logged",
+          "log_id": "audit-dry"
+        },
+        "persistence": {
+          "status": "not_attempted"
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "abstained",
+      "summary": {
+        "run_id": "history-abstained",
+        "session_id": "session-contract",
+        "workflow_name": "text_to_sql_pipeline",
+        "timestamp": "2026-07-11T08:00:00",
+        "status": "abstained",
+        "success": false,
+        "reason_code": "VERIFIER_REJECTED",
+        "generated": true,
+        "approved": false,
+        "executed": false,
+        "dry_run": false,
+        "audited": false,
+        "sql_query": "SELECT 1",
+        "row_count": 0,
+        "rows_affected": 0,
+        "column_count": 0,
+        "execution": {},
+        "audit": {},
+        "persistence": {
+          "status": "not_attempted"
+        },
+        "error": "verification rejected"
+      }
+    }
+  ]
+}

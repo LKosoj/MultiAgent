@@ -6,319 +6,59 @@
 не изменяя существующую бизнес-логику workflow engine.
 """
 
-import asyncio
 import os
 import logging
 import uuid
 import signal
 import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Union, Callable, Tuple
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from contextlib import contextmanager
 import threading
 import json
 import sys
 import re
 import hashlib
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from collections.abc import Mapping
 
+from tool_runtime_context import SupervisorExecutionEvidence
+
+from ._result_common import _validate_private_claim
+from .deadline import DeadlineBudget
 from .models import (
-    WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
-    StepResult, StepStatus, WorkflowStep, WorkflowExecutionError
+    WorkflowDefinition, WorkflowContext, WorkflowStatus,
+    StepStatus, WorkflowExecutionError, TEXT_TO_SQL_WORKFLOW_CATEGORY,
+    is_text_to_sql_workflow_name,
+    TextToSqlTerminalResult as TextToSqlTerminalResult,
 )
-from custom_tools.text_to_sql.redaction import (
-    _is_sensitive_key,
-    _normalize_sensitive_key,
-    _redact_payload as _agui_redact_payload,
-    redact_pii_in_payload,
+from .result_repository import (
+    WorkflowResultCollisionError as WorkflowResultCollisionError,
 )
+from backend.fastapi_app.agui.errors import WorkflowRunAlreadyReservedError
+from custom_tools.text_to_sql.redaction import redact_pii_in_payload
 
 logger = logging.getLogger(__name__)
-_SENSITIVE_DSN_QUERY_KEYS = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "auth",
-    "key",
-    "password",
-    "passwd",
-    "pwd",
-    "secret",
-    "token",
-}
-_SENSITIVE_PAYLOAD_KEYS = {
-    "connection_string",
-    "database_dsn",
-    "database_url",
-    "db_dsn",
-    "db_url",
-    "dsn",
-}
-_SENSITIVE_SCALAR_KEYS = {
-    "access_token",
-    "api_key",
-    "apikey",
-    "auth",
-    "key",
-    "password",
-    "passwd",
-    "pwd",
-    "secret",
-    "token",
-}
-_URL_LIKE_PAYLOAD_KEYS = {"url"}
-_DSN_TEXT_RE = re.compile(r"(?P<dsn>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>]+)")
-_SECRET_KEY_PATTERN = r"[A-Za-z0-9_%+\-.\[\]]+"
-_SENSITIVE_TEXT_ASSIGNMENT_RE = re.compile(
-    rf"(?P<prefix>\b(?P<key>{_SECRET_KEY_PATTERN})\s*[:=]\s*)"
-    r"(?P<secret>[^\s,;&]+)",
-    re.IGNORECASE,
-)
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+def _validate_private_workflow_claim(
+    supervisor_id: Any,
+    attempt_generation: Any,
+) -> Tuple[Optional[str], Optional[int]]:
+    return _validate_private_claim(supervisor_id, attempt_generation)
 
 
-def _agui_event_store_path() -> Path:
-    return _project_root() / "data" / "agui_events.db"
-
-
-def _workflow_result_payload_from_store(
-    run_id: str,
-    *,
-    strict: bool = False,
-) -> Optional[Dict[str, Any]]:
-    try:
-        from backend.fastapi_app.agui.store import EventStore
-
-        db_path = _agui_event_store_path()
-        if not db_path.exists():
-            return None
-        store = EventStore(str(db_path))
-        latest_payload = None
-        for event in store.list_after(run_id, 0):
-            if event.event_type == "WORKFLOW_RESULT":
-                latest_payload = event.payload
-        return latest_payload
-    except Exception:
-        if strict:
-            raise
-        return None
-
-
-def _safe_serialize_result(value: Any) -> Any:
-    try:
-        return json.loads(json.dumps(value, ensure_ascii=False, default=str))
-    except Exception:
-        return str(value)
-
-
-def _dsn_fingerprint(dsn: str) -> str:
-    return hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:16]
-
-
-def _is_sensitive_dsn_query_key(key: Any) -> bool:
-    normalized = _normalize_sensitive_key(key)
-    return normalized == "odbc_connect" or normalized in _SENSITIVE_DSN_QUERY_KEYS or _is_sensitive_key(key)
-
-
-def _is_sensitive_dsn_payload_key(key: Any) -> bool:
-    return _normalize_sensitive_key(key) in _SENSITIVE_PAYLOAD_KEYS
-
-
-def _is_url_like_payload_key(key: Any) -> bool:
-    return _normalize_sensitive_key(key) in _URL_LIKE_PAYLOAD_KEYS
-
-
-def _redact_sensitive_assignment(match: re.Match[str]) -> str:
-    if not _is_sensitive_key(match.group("key")):
-        return match.group(0)
-    return f"{match.group('prefix')}***"
-
-
-def _redact_dsn(dsn: Any) -> Any:
-    if not isinstance(dsn, str):
-        return dsn
-    try:
-        parts = urlsplit(dsn)
-        if not parts.scheme:
-            return "<redacted>"
-        netloc = parts.netloc
-        if "@" in netloc:
-            userinfo, hostinfo = netloc.rsplit("@", 1)
-            netloc = f"***:***@{hostinfo}" if ":" in userinfo else f"***@{hostinfo}"
-        query_items = []
-        for key, value in parse_qsl(parts.query, keep_blank_values=True):
-            query_items.append((key, "***" if _is_sensitive_dsn_query_key(key) else value))
-        query = urlencode(query_items, doseq=True).replace("%2A%2A%2A", "***")
-        return urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
-    except Exception:
-        return "<redacted>"
-
-
-def _looks_like_dsn(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        parts = urlsplit(value)
-        return bool(parts.scheme and (parts.netloc or parts.scheme in {"sqlite", "duckdb"}))
-    except Exception:
-        return False
-
-
-def _redact_query_string(value: str) -> str:
-    try:
-        items = parse_qsl(value, keep_blank_values=True)
-    except Exception:
-        return value
-    if not items or not any(_is_sensitive_dsn_query_key(key) for key, _ in items):
-        return value
-    return urlencode(
-        [(key, "***" if _is_sensitive_dsn_query_key(key) else item) for key, item in items],
-        doseq=True,
+def _capture_active_yaml_config_versions() -> Dict[
+    str,
+    Dict[str, Optional[str]],
+]:
+    from custom_tools.text_to_sql._yaml_config_loader import (
+        get_active_yaml_config_versions,
     )
 
+    return get_active_yaml_config_versions()
 
-def _redact_text(value: str) -> str:
-    def replace(match: re.Match[str]) -> str:
-        candidate = match.group("dsn")
-        return _redact_dsn(candidate) if _looks_like_dsn(candidate) else candidate
-
-    redacted = _DSN_TEXT_RE.sub(replace, value)
-    return _SENSITIVE_TEXT_ASSIGNMENT_RE.sub(_redact_sensitive_assignment, redacted)
-
-
-def _redact_payload(value: Any) -> Any:
-    if isinstance(value, dict):
-        redacted = {}
-        for key, item in value.items():
-            if _is_sensitive_dsn_payload_key(key) or (_is_url_like_payload_key(key) and _looks_like_dsn(item)):
-                redacted[key] = _redact_dsn(item)
-                if isinstance(item, str):
-                    redacted.setdefault(f"{key}_fingerprint", _dsn_fingerprint(item))
-            elif _is_sensitive_key(key) or _normalize_sensitive_key(key) in _SENSITIVE_SCALAR_KEYS:
-                redacted[key] = "<redacted>"
-            else:
-                redacted[key] = _redact_payload(item)
-        return redacted
-    if isinstance(value, list):
-        return [_redact_payload(item) for item in value]
-    if isinstance(value, str):
-        return _redact_text(value)
-    return value
-
-
-def _redact_error_text(error: Any) -> str:
-    return str(redact_pii_in_payload(_agui_redact_payload(str(error))))
-
-
-def _redact_public_payload(value: Any) -> Any:
-    return redact_pii_in_payload(_agui_redact_payload(value))
-
-
-def _append_workflow_result_event(
-    run_id: str,
-    result: Any,
-    status: str,
-    error: Optional[str] = None,
-    artifacts: Optional[Dict[str, Any]] = None,
-    snapshot: Optional[Dict[str, Any]] = None,
-) -> bool:
-    try:
-        from backend.fastapi_app.agui.store import EventStore
-
-        db_path = _agui_event_store_path()
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        store = EventStore(str(db_path))
-        payload = {
-            "run_id": run_id,
-            "thread_id": run_id,
-            "status": status,
-            "success": status == "completed",
-            "result": _redact_payload(_safe_serialize_result(result)),
-            "error": _redact_payload(error),
-            "artifacts": _redact_payload(_safe_serialize_result(artifacts or {})),
-            "snapshot": _redact_payload(_safe_serialize_result(snapshot or {})),
-        }
-        payload = redact_pii_in_payload(_agui_redact_payload(payload))
-        store.append(run_id, "WORKFLOW_RESULT", payload)
-        return True
-    except Exception as exc:
-        logger.warning(
-            "⚠️ Не удалось записать WORKFLOW_RESULT для workflow %s: %s",
-            run_id,
-            _redact_error_text(exc),
-        )
-        return False
-
-
-def _coerce_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
-def _text_to_sql_execution_state(parameters: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    # Контракт для downstream `db_audit` step: при dry_run_only=True
-    # execution_state должен явно сигнализировать о пропуске запуска и
-    # содержать `skip_audit=True`, чтобы аудит не писал запись о фантомном
-    # исполнении. Поля `executed`/`dry_run`/`status` потребляются UI и
-    # storage слоем.
-    if not isinstance(parameters, dict) or not _coerce_bool(parameters.get("dry_run_only")):
-        return None
-    return {
-        "dry_run_only": True,
-        "dry_run": True,
-        "executed": False,
-        "status": "skipped",
-        "reason": "dry_run_only=True",
-        "skip_audit": True,
-    }
-
-
-def _workflow_artifacts_from_run_data(run_data: Dict[str, Any]) -> Dict[str, Any]:
-    metadata = {
-        "workflow_id": run_data.get("workflow_id"),
-        "workflow_name": run_data.get("workflow_name"),
-    }
-    if run_data.get("execution") is not None:
-        metadata["execution"] = run_data.get("execution")
-    return {
-        "run_id": run_data.get("run_id"),
-        "final_output": run_data.get("final_output"),
-        "step_outputs": run_data.get("step_outputs") or {},
-        "step_results": run_data.get("step_results") or {},
-        "metadata": metadata,
-    }
-
-
-def _merge_workflow_result_payload(run_data: Dict[str, Any], payload: Dict[str, Any]) -> None:
-    artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), dict) else {}
-    snapshot = payload.get("snapshot") if isinstance(payload.get("snapshot"), dict) else {}
-    if payload.get("status"):
-        run_data["status"] = payload.get("status")
-    if payload.get("error") is not None:
-        run_data["error"] = payload.get("error")
-    if payload.get("result") is not None:
-        run_data["final_output"] = payload.get("result")
-    if artifacts.get("final_output") is not None:
-        run_data["final_output"] = artifacts.get("final_output")
-    if artifacts.get("step_outputs") is not None:
-        run_data["step_outputs"] = artifacts.get("step_outputs")
-    if artifacts.get("step_results") is not None:
-        run_data["step_results"] = artifacts.get("step_results")
-    metadata = artifacts.get("metadata") if isinstance(artifacts.get("metadata"), dict) else {}
-    if metadata.get("execution") is not None:
-        run_data["execution"] = metadata.get("execution")
-    if snapshot.get("workflow_name"):
-        run_data["workflow_name"] = snapshot.get("workflow_name")
-    if snapshot.get("parameters") is not None:
-        run_data["parameters"] = snapshot.get("parameters")
 
 def _setup_comprehensive_logging_from_env() -> None:
     try:
@@ -436,14 +176,40 @@ def _setup_process_run_log_capture(run_id: str) -> None:
 # Глобальный реестр активных запусков (разделяемый между всеми экземплярами)
 _GLOBAL_WORKFLOW_ACTIVE_RUNS = {}
 _GLOBAL_WORKFLOW_RUN_CALLBACKS = {}
-_GLOBAL_WORKFLOW_PROCESSES = {}
-# RLock: watchdog-поток и cancel-вызовы могут одновременно читать/менять реестр,
-# что без mutex даёт race condition (особенно pop+get на одном run_id).
-_GLOBAL_WORKFLOW_PROCESSES_LOCK = threading.RLock()
+_GLOBAL_WORKFLOW_PROCESS_SUPERVISOR = None
+_GLOBAL_WORKFLOW_PROCESS_SUPERVISOR_LOCK = threading.Lock()
 _GLOBAL_WORKFLOW_ENV_LOCK = threading.Lock()
 # RLock для _GLOBAL_WORKFLOW_ACTIVE_RUNS и _GLOBAL_WORKFLOW_RUN_CALLBACKS:
-# main-поток пишет, watchdog-поток читает/пишет, UI-поток отменяет — нужна синхронизация.
+# parent/worker threads and UI callbacks share these compatibility projections.
 _GLOBAL_WORKFLOW_RUNS_LOCK = threading.RLock()
+
+
+def configure_workflow_process_supervisor(store):
+    """Create the one parent supervisor used by all WorkflowManager instances."""
+    global _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR
+    with _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR_LOCK:
+        if _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR is None:
+            from .process_supervisor import SupervisorConfig, WorkflowProcessSupervisor
+
+            _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR = WorkflowProcessSupervisor(
+                store,
+                process_entrypoint=_workflow_supervisor_process_entry,
+                config=SupervisorConfig.from_environment(),
+                terminalizer=_terminalize_supervised_workflow,
+            )
+        return _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR
+
+
+def _default_workflow_process_supervisor():
+    global _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR
+    if _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR is None:
+        from backend.fastapi_app.agui.store import EventStore
+
+        store = EventStore(str(_agui_event_store_path()))
+        supervisor = configure_workflow_process_supervisor(store)
+        supervisor.start()
+    return _GLOBAL_WORKFLOW_PROCESS_SUPERVISOR
+
 
 # Типы для callbacks
 ProgressCallback = Callable[[str, str, Dict[str, Any]], None]  # (run_id, event_type, data)
@@ -451,7 +217,11 @@ LogCallback = Callable[[str, str, str, str], None]  # (run_id, level, message, t
 
 
 @contextmanager
-def _workflow_dsn_env(parameters: Dict[str, Any]):
+def _workflow_dsn_env(
+    parameters: Dict[str, Any],
+    *,
+    workflow_name: Any,
+):
     if not isinstance(parameters, dict):
         yield
         return
@@ -460,29 +230,35 @@ def _workflow_dsn_env(parameters: Dict[str, Any]):
     # ОТКЛОНЕНА — она ломает корректность. Держим мьютекс на всё время выполнения
     # (включая yield), чтобы гарантировать атомарность set→yield→restore для os.environ.
     # os.environ — process-global, а workflow исполняется ВНУТРИ этого процесса
-    # (loop.run_until_complete у вызывающего) и читает DB_DSN/лимиты/safety на ПРОТЯЖЕНИИ
+    # (loop.run_until_complete у вызывающего) и читает DB_DSN/лимиты на ПРОТЯЖЕНИИ
     # всего исполнения. Если отпустить лок на время yield, конкурентный запуск перезапишет
     # эти переменные посреди работы текущего — поэтому одновременные in-process запуски
     # обязаны сериализоваться. Это намеренный bottleneck ради корректности, а не упущение.
     with _GLOBAL_WORKFLOW_ENV_LOCK:
+        manage_text_to_sql_env = is_text_to_sql_workflow_name(workflow_name)
         dsn = parameters.get("dsn")
         row_limit = parameters.get("max_rows")
+        has_dry_run_only = manage_text_to_sql_env and "dry_run_only" in parameters
         dry_run_only = parameters.get("dry_run_only")
-        safety_level = parameters.get("safety_level")
         validate_schema = parameters.get("validate_schema")
+        effective_dry_run = None
+        if manage_text_to_sql_env:
+            if dry_run_only is not None and type(dry_run_only) is not bool:
+                raise ValueError("dry_run_only must be boolean")
+            from custom_tools.text_to_sql.utils import is_dry_run_only
+            effective_dry_run = is_dry_run_only(payload_flag=dry_run_only)
         previous_dsn = os.environ.get("DB_DSN")
         previous_row_limit = os.environ.get("DB_EXECUTOR_ROW_LIMIT")
         previous_dry_run = os.environ.get("TEXT_TO_SQL_DRY_RUN_ONLY")
-        previous_safety_level = os.environ.get("TEXT_TO_SQL_SAFETY_LEVEL")
         previous_validate_schema = os.environ.get("TEXT_TO_SQL_VALIDATE_SCHEMA")
         if dsn:
             os.environ["DB_DSN"] = str(dsn)
         if row_limit is not None:
             os.environ["DB_EXECUTOR_ROW_LIMIT"] = str(row_limit)
-        if dry_run_only is not None:
-            os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] = str(dry_run_only)
-        if safety_level is not None:
-            os.environ["TEXT_TO_SQL_SAFETY_LEVEL"] = str(safety_level)
+        if has_dry_run_only and dry_run_only is not None:
+            os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] = (
+                "true" if effective_dry_run else "false"
+            )
         if validate_schema is not None:
             os.environ["TEXT_TO_SQL_VALIDATE_SCHEMA"] = str(validate_schema)
         try:
@@ -498,16 +274,11 @@ def _workflow_dsn_env(parameters: Dict[str, Any]):
                     os.environ.pop("DB_EXECUTOR_ROW_LIMIT", None)
                 else:
                     os.environ["DB_EXECUTOR_ROW_LIMIT"] = previous_row_limit
-            if dry_run_only is not None:
+            if has_dry_run_only and dry_run_only is not None:
                 if previous_dry_run is None:
                     os.environ.pop("TEXT_TO_SQL_DRY_RUN_ONLY", None)
                 else:
                     os.environ["TEXT_TO_SQL_DRY_RUN_ONLY"] = previous_dry_run
-            if safety_level is not None:
-                if previous_safety_level is None:
-                    os.environ.pop("TEXT_TO_SQL_SAFETY_LEVEL", None)
-                else:
-                    os.environ["TEXT_TO_SQL_SAFETY_LEVEL"] = previous_safety_level
             if validate_schema is not None:
                 if previous_validate_schema is None:
                     os.environ.pop("TEXT_TO_SQL_VALIDATE_SCHEMA", None)
@@ -516,9 +287,36 @@ def _workflow_dsn_env(parameters: Dict[str, Any]):
 
 
 # === Точка входа дочернего процесса для запуска workflow (должна быть на верхнем уровне для spawn) ===
-def _workflow_process_entry(run_id: str, workflow_path: str, parameters: Dict[str, Any],
-                           session_id: str, client_id: Optional[str], use_enhanced: bool, enable_telemetry: bool):
+def _workflow_supervisor_process_entry(
+    run_id: str,
+    work_spec: Dict[str, Any],
+    claim_envelope: Mapping[str, Any],
+) -> None:
     """Точка входа для выполнения workflow в отдельном процессе"""
+    from .process_supervisor import validate_work_spec
+
+    spec = validate_work_spec(work_spec)
+    if not isinstance(claim_envelope, Mapping) or set(claim_envelope) != {
+        "supervisor_id",
+        "attempt_generation",
+    }:
+        raise ValueError("claim_envelope has an invalid shape")
+    supervisor_id, attempt_generation = _validate_private_workflow_claim(
+        claim_envelope.get("supervisor_id"),
+        claim_envelope.get("attempt_generation"),
+    )
+    if supervisor_id is None or attempt_generation is None:
+        raise ValueError("spawned workflow requires a claimed attempt")
+    workflow_path = str(spec["workflow_path"])
+    parameters = dict(spec["parameters"])
+    session_id = str(spec["session_id"])
+    client_id = spec["client_id"]
+    use_enhanced = bool(spec["use_enhanced"])
+    enable_telemetry = bool(spec["enable_telemetry"])
+    run_incarnation = str(spec["run_incarnation"])
+    deadline_budget = DeadlineBudget.from_deadline_at_ms(
+        int(spec["deadline_at_ms"])
+    )
     # Глобальные переменные в контексте процесса для доступа из signal handler
     _process_telemetry_manager = None
     _process_root_span = None
@@ -572,6 +370,14 @@ def _workflow_process_entry(run_id: str, workflow_path: str, parameters: Dict[st
         _process_root_span = span
 
     try:
+        if "safety_policy" in parameters:
+            from custom_tools.text_to_sql.validators import TextToSqlSafetyPolicy
+
+            parameters = dict(parameters)
+            parameters["safety_policy"] = TextToSqlSafetyPolicy.from_mapping(
+                parameters["safety_policy"]
+            )
+
         from telemetry import get_telemetry_manager
         # Use enable_telemetry parameter here
         _process_telemetry_manager = get_telemetry_manager(enabled=enable_telemetry)
@@ -579,7 +385,11 @@ def _workflow_process_entry(run_id: str, workflow_path: str, parameters: Dict[st
         child_manager._run_workflow_thread(
             run_id, Path(workflow_path), parameters, session_id, client_id,
             span_setter=span_setter,
-            enable_telemetry=enable_telemetry # Pass down the telemetry flag
+            enable_telemetry=enable_telemetry, # Pass down the telemetry flag
+            run_incarnation=run_incarnation,
+            deadline_budget=deadline_budget,
+            supervisor_id=supervisor_id,
+            attempt_generation=attempt_generation,
         )
     except SystemExit:
         raise
@@ -630,6 +440,7 @@ class WorkflowRunStatus:
     parameters: Dict[str, Any] = None
     use_enhanced_engine: bool = False # Added for monitoring
     enable_telemetry: bool = False # Added for monitoring
+    terminal_outcome: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.step_results is None:
@@ -646,6 +457,7 @@ class WorkflowArtifacts:
     metadata: Dict[str, Any] = None
     logs_path: Optional[str] = None
     traces_path: Optional[str] = None
+    terminal_outcome: Optional[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.step_outputs is None:
@@ -654,13 +466,88 @@ class WorkflowArtifacts:
             self.metadata = {}
 
 
+@dataclass(frozen=True)
+class WorkflowOwner:
+    """Immutable owner scope used for lifecycle and quota identity."""
+
+    subject: str
+    tenant_id: str
+    roles: frozenset[str]
+
+    @property
+    def quota_identity(self) -> str:
+        material = f"{self.tenant_id}\0{self.subject}".encode("utf-8")
+        return f"owner:{hashlib.sha256(material).hexdigest()}"
+
+
+def _require_owner_lifecycle(run_id: str, owner: WorkflowOwner) -> None:
+    from backend.fastapi_app.agui.store import EventStore
+
+    store = EventStore(str(_agui_event_store_path()))
+    try:
+        stored = store.get_run(run_id)
+        if (
+            stored is None
+            or stored.run_kind != "text_to_sql"
+            or stored.owner_subject != owner.subject
+            or stored.tenant_id != owner.tenant_id
+        ):
+            raise ValueError("run not found")
+        if stored.status not in {
+            "pending",
+            "queued",
+            "running",
+            "result_pending",
+        }:
+            raise ValueError(f"run is already terminal: {run_id}")
+    finally:
+        store.close()
+
+
+def _record_owner_worker_pid(
+    run_id: str,
+    owner: WorkflowOwner,
+    worker_pid: int,
+) -> None:
+    from backend.fastapi_app.agui.store import EventStore
+
+    store = EventStore(str(_agui_event_store_path()))
+    try:
+        stored = store.get_run(run_id)
+        if (
+            stored is None
+            or stored.owner_subject != owner.subject
+            or stored.tenant_id != owner.tenant_id
+            or not store.set_worker_pid(run_id, worker_pid)
+        ):
+            raise ValueError("worker lifecycle registration was rejected")
+    finally:
+        store.close()
+
+
+def _owner_primary_workflow_result(
+    run_id: str,
+    owner: WorkflowOwner,
+) -> Optional[Dict[str, Any]]:
+    return _authoritative_workflow_result_payload(
+        run_id,
+        owner_subject=owner.subject,
+        tenant_id=owner.tenant_id,
+    )
+
+
 class WorkflowManager:
     """
     Менеджер для управления workflow через Streamlit UI
     Предоставляет простой и стабильный API без изменения существующего кода
     """
 
-    def __init__(self, use_enhanced: bool = True, pipelines_dir: str = "workflow_pipelines"):
+    def __init__(
+        self,
+        use_enhanced: bool = True,
+        pipelines_dir: str = "workflow_pipelines",
+        supervisor: Any = None,
+    ):
         """
         Args:
             use_enhanced: Использовать EnhancedWorkflowEngine или базовый WorkflowEngine
@@ -669,13 +556,20 @@ class WorkflowManager:
         self.pipelines_dir = Path(pipelines_dir)
         self.use_enhanced = use_enhanced
         self._engine = None
+        self._supervisor = supervisor
 
         # Используем глобальные переменные для разделения состояния между экземплярами
         global _GLOBAL_WORKFLOW_ACTIVE_RUNS, _GLOBAL_WORKFLOW_RUN_CALLBACKS
         self.active_runs = _GLOBAL_WORKFLOW_ACTIVE_RUNS
         self.run_callbacks = _GLOBAL_WORKFLOW_RUN_CALLBACKS
 
+        _schedule_workflow_result_outbox_drain()
         logger.info(f"🔧 WorkflowManager инициализирован с глобальным состоянием (enhanced={use_enhanced})")
+
+    def _process_supervisor(self):
+        if self._supervisor is None:
+            self._supervisor = _default_workflow_process_supervisor()
+        return self._supervisor
 
     @property
     def engine(self):
@@ -756,234 +650,242 @@ class WorkflowManager:
         logger.info(f"📋 Найдено {len(workflows)} пайплайнов")
         return workflows
 
-    def start_workflow(self,
-                      workflow_name: str,
-                      parameters: Optional[Dict[str, Any]] = None,
-                      session_id: Optional[str] = None,
-                      client_id: Optional[str] = None,
-                      progress_callback: Optional[ProgressCallback] = None,
-                      log_callback: Optional[LogCallback] = None,
-                      use_enhanced: bool = True,
-                      enable_telemetry: bool = False,
-                      run_id: Optional[str] = None
-                      ) -> str:
-        """
-        Запустить workflow асинхронно
+    def start_workflow(
+        self,
+        workflow_name: str,
+        parameters: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        client_id: Optional[str] = None,
+        progress_callback: Optional[ProgressCallback] = None,
+        log_callback: Optional[LogCallback] = None,
+        use_enhanced: bool = True,
+        enable_telemetry: bool = False,
+        run_id: Optional[str] = None,
+        owner: Optional[WorkflowOwner] = None,
+    ) -> str:
+        """Durably enqueue one workflow for the process supervisor."""
+        from backend.fastapi_app.agui.auth import Principal
+        from backend.fastapi_app.agui.store import EventStore
 
-        Args:
-            workflow_name: Имя пайплайна (из YAML файла)
-            parameters: Параметры для пайплайна
-            session_id: ID сессии (если None, генерируется автоматически)
-            client_id: ID клиента для квотирования
-            progress_callback: Функция для получения уведомлений о прогрессе
-            log_callback: Функция для получения логов
-            use_enhanced: Использовать EnhancedWorkflowEngine
-            enable_telemetry: Включить телеметрию для этого запуска
-            run_id: ID конкретного запуска. Если None, сохраняется старое поведение:
-                run_id совпадает с session_id.
+        explicit_run_id = run_id is not None
+        if explicit_run_id and (
+            not isinstance(run_id, str) or not run_id or run_id != run_id.strip()
+        ):
+            raise ValueError("run_id must be a non-empty canonical string")
+        session_id = session_id or f"session-{uuid.uuid4().hex}"
+        parameters = {} if parameters is None else dict(parameters)
 
-        Returns:
-            run_id для отслеживания выполнения
-        """
-        if session_id is None:
-            session_id = f"run-{uuid.uuid4().hex[:16]}"
-        if run_id is None:
-            run_id = session_id
-
-        # T3.1: legacy вызовы (без явного run_id) приводят к совпадению
-        # AG-UI run_id и workflow run_id. Логируем для постепенной миграции.
-        if run_id == session_id:
-            logger.debug(
-                "start_workflow: legacy call detected (run_id == session_id=%s, workflow=%s)",
-                session_id,
-                workflow_name,
-            )
-
-        # Пробрасываем RUN_ID для всего запуска (наследуется потоками)
-        try:
-            os.environ["RUN_ID"] = run_id
-        except Exception:
-            pass
-
-        if parameters is None:
-            parameters = {}
-
-        # Ищем YAML файл пайплайна
-        workflow_file = None
-        matched_workflow_def: Optional[WorkflowDefinition] = None
+        workflow_file: Optional[Path] = None
+        workflow_definition: Optional[WorkflowDefinition] = None
         load_errors: List[str] = []
         for yaml_file in self.pipelines_dir.glob("*.yaml"):
             try:
-                workflow_def = WorkflowDefinition.from_yaml(yaml_file)
-                if workflow_def.name == workflow_name:
-                    workflow_file = yaml_file
-                    matched_workflow_def = workflow_def
-                    break
+                candidate = WorkflowDefinition.from_yaml(yaml_file)
             except Exception as exc:
                 load_errors.append(f"{yaml_file.name}: {exc}")
                 continue
-
-        if workflow_file is None or matched_workflow_def is None:
+            if candidate.name == workflow_name:
+                workflow_file = yaml_file.resolve()
+                workflow_definition = candidate
+                break
+        if workflow_file is None or workflow_definition is None:
             if load_errors:
                 raise ValueError(
                     f"Пайплайн '{workflow_name}' не найден. Ошибки загрузки YAML: "
                     + "; ".join(load_errors)
                 )
             raise ValueError(f"Пайплайн '{workflow_name}' не найден")
-
-        # Enforce контракта `pipeline.requires_enhanced_engine`: пайплайны с
-        # output_retry_policy и прочими enhanced-фичами не должны молча
-        # деградировать на базовом WorkflowEngine. Fail-fast до старта процесса.
-        if matched_workflow_def.requires_enhanced_engine and not use_enhanced:
+        if workflow_definition.requires_enhanced_engine and not use_enhanced:
             raise ValueError(
                 f"Pipeline '{workflow_name}' requires EnhancedWorkflowEngine "
-                f"(pipeline.requires_enhanced_engine=true), but use_enhanced=False"
+                "(pipeline.requires_enhanced_engine=true), but use_enhanced=False"
+            )
+        limits = getattr(workflow_definition, "global_resource_limits", None)
+        duration_seconds = (
+            getattr(limits, "max_duration_seconds", None)
+            if limits is not None
+            else None
+        )
+        if duration_seconds is None:
+            duration_seconds = 300
+        if (
+            isinstance(duration_seconds, bool)
+            or not isinstance(duration_seconds, int)
+            or duration_seconds <= 0
+        ):
+            raise ValueError(
+                "global_resource_limits.max_duration_seconds must be positive"
             )
 
-        # Регистрируем callbacks
-        if progress_callback or log_callback:
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                self.run_callbacks[run_id] = []
-                if progress_callback:
-                    self.run_callbacks[run_id].append(('progress', progress_callback))
-                if log_callback:
-                    self.run_callbacks[run_id].append(('log', log_callback))
+        caller_supplied_owner = owner is not None
+        if owner is None:
+            owner = WorkflowOwner(
+                subject="legacy-workflow",
+                tenant_id="legacy",
+                roles=frozenset({"legacy"}),
+            )
+        elif not explicit_run_id:
+            raise ValueError("owner-scoped workflow requires an explicit run_id")
+        # client_id всегда выводится сервером из owner: доверять переданному
+        # значению нельзя (например, forwardedProps.client_id из runner.py
+        # позволил бы обходить per-client квоты произвольными идентификаторами).
+        client_id = owner.quota_identity
 
-        # Запускаем в отдельном процессе для возможности реальной отмены
+        store = EventStore(str(_agui_event_store_path()))
         try:
-            from multiprocessing import Process
-
-            proc = Process(
-                target=_workflow_process_entry,
-                args=(run_id, str(workflow_file), parameters, session_id, client_id, use_enhanced, enable_telemetry), # Pass new args
-                daemon=True,
-            )
-            proc.start()
-
-            # Регистрируем запуск в активных с PID
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                self.active_runs[run_id] = {
-                    "run_id": run_id,
-                    "workflow_name": matched_workflow_def.name,
-                    "status": "running",
-                    "start_time": datetime.now(),
-                    "parameters": _redact_public_payload(parameters),
-                    "session_id": session_id,
-                    "client_id": client_id,
-                    "pid": proc.pid,
-                    "use_enhanced_engine": use_enhanced, # Store options for monitoring
-                    "enable_telemetry": enable_telemetry, # Store options for monitoring
-                }
-
-            # Сохраняем процесс в глобальном реестре и запускаем наблюдатель
-            with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
-                _GLOBAL_WORKFLOW_PROCESSES[run_id] = proc
-
-            def _watchdog(_rid: str):
-                with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
-                    p = _GLOBAL_WORKFLOW_PROCESSES.get(_rid)
-                if not p:
-                    return
-                p.join()
-                # Ранний выход под локом, если процесс уже отмечен терминально.
-                # run_data НЕ удерживаем через медленный I/O — после него re-fetch
-                # из реестра, чтобы не писать в осиротевший/заменённый dict.
-                with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                    rd = self.active_runs.get(_rid)
-                    if not rd:
-                        return
-                    if rd.get("status") in ["completed", "failed", "cancelled"]:
-                        return
-                try:
-                    exit_code = p.exitcode
-                    stored_payload = _workflow_result_payload_from_store(_rid, strict=True)
-                    stored_status = stored_payload.get("status") if stored_payload else None
-                    stored_error = stored_payload.get("error") if stored_payload else None
-                    if not stored_payload and exit_code == 0:
-                        stored_status = "failed"
-                        stored_error = "Workflow process exited successfully without terminal WORKFLOW_RESULT"
-                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                        # Re-fetch + перепроверка терминального статуса под локом: за время
-                        # медленного I/O (_workflow_result_payload_from_store) другой поток
-                        # мог выставить completed/failed/cancelled или убрать запись —
-                        # не затираем его и не воскрешаем удалённый run.
-                        run_data = self.active_runs.get(_rid)
-                        if run_data and run_data.get("status") not in ["completed", "failed", "cancelled"]:
-                            if stored_payload:
-                                _merge_workflow_result_payload(run_data, stored_payload)
-                            run_data.update({
-                                "end_time": datetime.now(),
-                                "status": stored_status or "failed",
-                                "error": stored_error if stored_payload else (stored_error or f"Процесс завершился с кодом {exit_code}"),
-                            })
-                except Exception as exc:
-                    safe_error = _redact_error_text(exc)
-                    logger.warning(
-                        "⚠️ Не удалось обработать завершение workflow-процесса %s: %s",
-                        _rid,
-                        safe_error,
+            if caller_supplied_owner:
+                assert run_id is not None
+                stored = store.get_run(run_id)
+                if (
+                    stored is None
+                    or stored.owner_subject != owner.subject
+                    or stored.tenant_id != owner.tenant_id
+                    or stored.status
+                    not in {"pending", "queued", "running", "result_pending"}
+                ):
+                    raise ValueError("run not found")
+                invocation = store.get_workflow_run_invocation(run_id)
+                if invocation is None:
+                    run_incarnation = uuid.uuid4().hex
+                    if not store.reserve_workflow_run(
+                        run_id,
+                        run_incarnation,
+                        session_id,
+                        workflow_definition.name,
+                    ):
+                        raise WorkflowRunAlreadyReservedError(
+                            f"run_id is already reserved: {run_id}"
+                        )
+                else:
+                    if (
+                        invocation.workflow_name != workflow_definition.name
+                        or invocation.session_id != session_id
+                    ):
+                        raise WorkflowRunAlreadyReservedError(
+                            f"run_id is already reserved: {run_id}"
+                        )
+                    run_incarnation = invocation.run_incarnation
+                    existing_spec = store.load_work_spec(run_id)
+                    if stored.status in {
+                        "queued",
+                        "running",
+                        "result_pending",
+                    } and existing_spec:
+                        return run_id
+                    if stored.status != "pending" or existing_spec is not None:
+                        raise WorkflowRunAlreadyReservedError(
+                            f"run_id is already reserved: {run_id}"
+                        )
+            else:
+                if run_id is None:
+                    run_id = f"run-{uuid.uuid4().hex}"
+                elif store.get_run(run_id) is not None:
+                    raise ValueError(f"run_id already exists: {run_id}")
+                run_incarnation = uuid.uuid4().hex
+                if not store.reserve_workflow_run(
+                    run_id,
+                    run_incarnation,
+                    session_id,
+                    workflow_definition.name,
+                ):
+                    raise WorkflowRunAlreadyReservedError(
+                        f"run_id is already reserved: {run_id}"
                     )
-                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                        run_data = self.active_runs.get(_rid)
-                        if run_data and run_data.get("status") not in ["completed", "failed", "cancelled"]:
-                            run_data.update({
-                                "end_time": datetime.now(),
-                                "status": "failed",
-                                "error": f"Не удалось обработать результат workflow-процесса: {safe_error}",
-                            })
+                store.create_run(
+                    run_id,
+                    session_id,
+                    Principal(owner.subject, owner.tenant_id, owner.roles),
+                    run_kind="legacy",
+                )
+        finally:
+            store.close()
 
-            watcher = threading.Thread(target=_watchdog, args=(run_id,), daemon=True)
-            watcher.start()
-        except Exception as e:
-            error_message = f"Не удалось запустить workflow в отдельном процессе: {_redact_error_text(e)}"
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                self.active_runs[run_id] = {
-                    "run_id": run_id,
-                    "workflow_name": matched_workflow_def.name,
-                    "status": "failed",
-                    "start_time": datetime.now(),
-                    "end_time": datetime.now(),
-                    "parameters": _redact_public_payload(parameters),
-                    "session_id": session_id,
-                    "client_id": client_id,
-                    "error": error_message,
-                    "use_enhanced_engine": use_enhanced,
-                    "enable_telemetry": enable_telemetry,
-                }
-            result_appended = _append_workflow_result_event(
-                run_id,
-                None,
-                "failed",
-                error_message,
-                artifacts={"metadata": {"workflow_name": matched_workflow_def.name}},
-                snapshot={
-                    "workflow_name": matched_workflow_def.name,
-                    "parameters": parameters,
-                    "session_id": session_id,
-                    "client_id": client_id,
-                },
-            )
-            if not result_appended:
-                append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
-                error_message = f"{error_message}; {append_error}"
-                with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                    self.active_runs[run_id]["error"] = error_message
-            logger.error(error_message)
-            raise WorkflowExecutionError(error_message) from e
-
+        deadline_at_ms = int(time.time() * 1_000) + duration_seconds * 1_000
+        work_spec = {
+            "spec_version": 1,
+            "workflow_path": str(workflow_file),
+            "parameters": parameters,
+            "session_id": session_id,
+            "client_id": client_id,
+            "use_enhanced": use_enhanced,
+            "enable_telemetry": enable_telemetry,
+            "run_incarnation": run_incarnation,
+            "deadline_at_ms": deadline_at_ms,
+        }
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            existing = self.active_runs.get(run_id)
+            if existing is not None and existing.get("run_incarnation") != (
+                run_incarnation
+            ):
+                raise ValueError(f"run_id collision with live invocation: {run_id}")
+            self.active_runs[run_id] = {
+                "run_id": run_id,
+                "run_incarnation": run_incarnation,
+                "workflow_name": workflow_definition.name,
+                "status": "pending",
+                "start_time": datetime.now(),
+                "parameters": _public_workflow_parameters(parameters),
+                "session_id": session_id,
+                "client_id": client_id,
+                "owner_subject": owner.subject,
+                "tenant_id": owner.tenant_id,
+                "use_enhanced_engine": use_enhanced,
+                "enable_telemetry": enable_telemetry,
+            }
+            callbacks = []
+            if progress_callback is not None:
+                callbacks.append(("progress", progress_callback))
+            if log_callback is not None:
+                callbacks.append(("log", log_callback))
+            if callbacks:
+                self.run_callbacks[run_id] = callbacks
         try:
-            from unified_logging import get_run_logger
-            _rlog = get_run_logger(run_id, __name__)
-            _rlog.info(f"🚀 Запущен workflow '{workflow_name}'")
+            submission = self._process_supervisor().submit(
+                run_id,
+                work_spec,
+                deadline_at_ms=deadline_at_ms,
+            )
+            if str(getattr(submission, "state", "")) != "queued":
+                raise WorkflowExecutionError(
+                    "supervisor did not return queued admission"
+                )
         except Exception:
-            logger.info(f"🚀 Запущен workflow '{workflow_name}' с run_id: {run_id}")
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                live = self.active_runs.get(run_id)
+                if live is not None and live.get("run_incarnation") == (
+                    run_incarnation
+                ):
+                    self.active_runs.pop(run_id, None)
+                    self.run_callbacks.pop(run_id, None)
+            raise
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            live = self.active_runs.get(run_id)
+            if live is not None and live.get("run_incarnation") == run_incarnation:
+                live["status"] = "queued"
+        logger.info("Workflow '%s' queued with run_id=%s", workflow_name, run_id)
         return run_id
 
     def _run_workflow_thread(self, run_id: str, workflow_file: Path,
                            parameters: Dict[str, Any], session_id: str, client_id: Optional[str],
                            span_setter: Optional[Callable] = None,
-                           enable_telemetry: bool = False): # New parameter
+                           enable_telemetry: bool = False,
+                           run_incarnation: Optional[str] = None,
+                           deadline_budget: Optional[DeadlineBudget] = None,
+                           supervisor_id: Optional[str] = None,
+                           attempt_generation: Optional[int] = None):
         """Выполнение workflow в отдельном потоке"""
+        supervisor_id, attempt_generation = _validate_private_workflow_claim(
+            supervisor_id,
+            attempt_generation,
+        )
+        claim_kwargs = (
+            {
+                "supervisor_id": supervisor_id,
+                "attempt_generation": attempt_generation,
+            }
+            if supervisor_id is not None
+            else {}
+        )
         try:
             # Используем thread-safe run_id_context для workflow
             try:
@@ -1021,9 +923,27 @@ class WorkflowManager:
                         if root_span is not None:
                             from opentelemetry import trace
                             with trace.use_span(root_span):
-                                result = self._execute_workflow_in_context(run_id, workflow_file, parameters, session_id, client_id)
+                                result = self._execute_workflow_in_context(
+                                    run_id,
+                                    workflow_file,
+                                    parameters,
+                                    session_id,
+                                    client_id,
+                                    run_incarnation=run_incarnation,
+                                    deadline_budget=deadline_budget,
+                                    **claim_kwargs,
+                                )
                         else:
-                            result = self._execute_workflow_in_context(run_id, workflow_file, parameters, session_id, client_id)
+                            result = self._execute_workflow_in_context(
+                                run_id,
+                                workflow_file,
+                                parameters,
+                                session_id,
+                                client_id,
+                                run_incarnation=run_incarnation,
+                                deadline_budget=deadline_budget,
+                                **claim_kwargs,
+                            )
 
                         if root_span is not None:
                             # Сохраняем результат workflow в корневой span перед завершением
@@ -1054,24 +974,72 @@ class WorkflowManager:
         except Exception as e:
             # Обработка ошибок workflow
             safe_error = _redact_error_text(e)
+            current_invocation = False
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
                 # Guard: run_id мог не успеть зарегистрироваться в active_runs, если
                 # исключение возникло до инициализации записи — не падаем KeyError'ом
                 # (консистентно с защищённым except в _execute_workflow_in_context).
-                if run_id in self.active_runs:
-                    self.active_runs[run_id].update({
+                live_run = self.active_runs.get(run_id)
+                current_invocation = bool(
+                    isinstance(live_run, dict)
+                    and (
+                        run_incarnation is None
+                        or live_run.get("run_incarnation") == run_incarnation
+                    )
+                )
+                terminal_already_resolved = bool(
+                    current_invocation
+                    and live_run.get("workflow_result_event_appended") is True
+                )
+                if current_invocation and not terminal_already_resolved:
+                    live_run.update({
                         "status": "failed",
                         "end_time": datetime.now(),
                         "error": safe_error
                     })
-            self._notify_progress(run_id, "failed", {"error": safe_error})
+            if current_invocation and not terminal_already_resolved:
+                self._notify_progress(run_id, "failed", {"error": safe_error})
             logger.error("❌ Ошибка выполнения workflow %s: %s", run_id, safe_error)
             raise
 
     def _execute_workflow_in_context(self, run_id: str, workflow_file: Path,
                                     parameters: Dict[str, Any], session_id: str,
-                                    client_id: Optional[str] = None) -> Any:
+                                    client_id: Optional[str] = None,
+                                    run_incarnation: Optional[str] = None,
+                                    deadline_budget: Optional[DeadlineBudget] = None,
+                                    supervisor_id: Optional[str] = None,
+                                    attempt_generation: Optional[int] = None) -> Any:
         """Выполнение workflow в контексте run_id"""
+        worker_config_versions: Optional[
+            Dict[str, Dict[str, Optional[str]]]
+        ] = None
+        supervisor_id, attempt_generation = _validate_private_workflow_claim(
+            supervisor_id,
+            attempt_generation,
+        )
+        supervisor_evidence = (
+            SupervisorExecutionEvidence(supervisor_id, attempt_generation)
+            if supervisor_id is not None and attempt_generation is not None
+            else None
+        )
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            preexisting_run = self.active_runs.get(run_id)
+            if (
+                run_incarnation is not None
+                and isinstance(preexisting_run, dict)
+                and preexisting_run.get("run_incarnation") not in {
+                    None,
+                    run_incarnation,
+                }
+            ):
+                raise WorkflowExecutionError(
+                    f"Stale workflow result incarnation for run_id {run_id}"
+                )
+            effective_incarnation = run_incarnation or (
+                preexisting_run.get("run_incarnation")
+                if isinstance(preexisting_run, dict)
+                else None
+            )
         try:
             # Загружаем workflow definition до входа в лок (медленный from_yaml вне лока)
             workflow_def = WorkflowDefinition.from_yaml(workflow_file)
@@ -1081,11 +1049,21 @@ class WorkflowManager:
                 if run_id not in self.active_runs:
                     self.active_runs[run_id] = {
                         "run_id": run_id,
+                        "run_incarnation": effective_incarnation,
                         "workflow_name": "",
                         "status": "running",
                         "start_time": datetime.now(),
                     }
                 run_data = self.active_runs[run_id]
+                if run_data.get("run_incarnation") not in {
+                    None,
+                    effective_incarnation,
+                }:
+                    raise WorkflowExecutionError(
+                        f"Stale workflow result incarnation for run_id {run_id}"
+                    )
+                if effective_incarnation is not None:
+                    run_data["run_incarnation"] = effective_incarnation
                 run_data["status"] = "running"
                 run_data["start_time"] = datetime.now()
                 run_data["workflow_name"] = workflow_def.name
@@ -1103,7 +1081,14 @@ class WorkflowManager:
                     client_id=client_id,
                     variables=parameters,
                 )
-                with _workflow_dsn_env(parameters):
+                if deadline_budget is not None:
+                    context._deadline_budget = deadline_budget
+                if supervisor_evidence is not None:
+                    context._supervisor_evidence = supervisor_evidence
+                with _workflow_dsn_env(
+                    parameters,
+                    workflow_name=workflow_def.name,
+                ):
                     result = loop.run_until_complete(
                         self.engine.execute_workflow_from_yaml(
                             workflow_file,
@@ -1112,6 +1097,7 @@ class WorkflowManager:
                             **parameters
                         )
                     )
+                worker_config_versions = _capture_active_yaml_config_versions()
                 
                 result_status = getattr(result, "status", WorkflowStatus.COMPLETED)
                 if hasattr(result_status, "value"):
@@ -1126,37 +1112,70 @@ class WorkflowManager:
                 # Explicit identification of text-to-sql workflows for failure-policy.
                 # name — authoritative identifier (стабильный контракт пайплайна),
                 # category — secondary signal. Drift между ними логируется как bug.
-                is_text_to_sql_by_name = workflow_def.name == "text_to_sql_pipeline"
-                is_text_to_sql_by_category = workflow_def.metadata.get("category") == "text_to_sql"
+                is_text_to_sql_by_name = is_text_to_sql_workflow_name(
+                    workflow_def.name
+                )
+                is_text_to_sql_by_category = (
+                    workflow_def.metadata.get("category")
+                    == TEXT_TO_SQL_WORKFLOW_CATEGORY
+                )
                 if is_text_to_sql_by_name != is_text_to_sql_by_category:
                     logger.warning(
                         f"text_to_sql identification drift: name={workflow_def.name}, category={workflow_def.metadata.get('category')}"
                     )
                 is_text_to_sql = is_text_to_sql_by_name  # name — authoritative
-                is_success = (
-                    result_status_value == WorkflowStatus.COMPLETED.value
-                    and not (is_text_to_sql and failed_step_ids)
+                terminal_outcome = _terminal_outcome_mapping(
+                    getattr(result, "terminal_outcome", None)
                 )
-                error_message = None
-                if not is_success:
-                    if failed_step_ids:
-                        error_message = "Workflow failed steps: " + ", ".join(failed_step_ids)
+                if is_text_to_sql:
+                    if terminal_outcome is None:
+                        run_status = "failed"
+                        is_success = False
+                        error_message = "Text-to-SQL result is missing terminal_outcome"
                     else:
-                        error_message = f"Workflow завершился со статусом {result_status_value}"
-                execution_state = _text_to_sql_execution_state(parameters)
+                        run_status, is_success = _terminal_legacy_fields(terminal_outcome)
+                        error_message = None if is_success else str(
+                            terminal_outcome.get("error")
+                            or terminal_outcome.get("reason_code")
+                            or "Text-to-SQL terminal gate failed"
+                        )
+                else:
+                    is_success = result_status_value == WorkflowStatus.COMPLETED.value
+                    run_status = "completed" if is_success else "failed"
+                    error_message = None
+                    if not is_success:
+                        if failed_step_ids:
+                            error_message = "Workflow failed steps: " + ", ".join(failed_step_ids)
+                        else:
+                            error_message = f"Workflow завершился со статусом {result_status_value}"
 
-                # M16: финальная запись статуса/результата конкурирует с watchdog-потоком
-                # и cancel_workflow — пишем под локом, как и остальные блоки в этом методе.
+                # Build the terminal projection off-registry. Durable resolution
+                # must happen before the shared run is published terminal.
                 with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                    run_data.update({
+                    live_run = self.active_runs.get(run_id)
+                    if (
+                        live_run is not run_data
+                        or (
+                            effective_incarnation is not None
+                            and run_data.get("run_incarnation")
+                            != effective_incarnation
+                        )
+                    ):
+                        raise WorkflowExecutionError(
+                            f"Stale workflow result incarnation for run_id {run_id}"
+                        )
+                    candidate_run = dict(run_data)
+                    candidate_run.update({
                         "run_id": run_id,
-                        "status": "completed" if is_success else "failed",
+                        "status": run_status,
                         "end_time": datetime.now(),
                         "current_step": None,
                         "progress_percentage": 100.0 if is_success else run_data.get("progress_percentage", 0.0),
                         "workflow_id": getattr(result, "workflow_id", None),
                         "final_output": getattr(result, "final_output", None),
                         "error": error_message,
+                        "terminal_outcome": terminal_outcome,
+                        "config_versions": worker_config_versions,
                         "step_outputs": {
                             step_id: result.step_results[step_id].output
                             for step_id in result.step_results.keys()
@@ -1166,16 +1185,13 @@ class WorkflowManager:
                             "output": str(result.step_results[step_id].output)[:500] if result.step_results[step_id].output else None
                         } for step_id in result.step_results.keys()} if result.step_results else {}
                     })
-                    if execution_state:
-                        run_data["execution"] = execution_state
-                    # Снимок под локом: status/error/artifacts читаем здесь же, а не
-                    # после release — иначе watchdog мог бы переписать run_data между
-                    # выходом из лока и чтением ниже.
-                    _status_snap = run_data["status"]
-                    _error_snap = run_data.get("error")
-                    _artifacts_snap = _workflow_artifacts_from_run_data(run_data)
+                    if terminal_outcome is not None:
+                        candidate_run["execution"] = terminal_outcome.get("execution")
+                    _status_snap = candidate_run["status"]
+                    _error_snap = candidate_run.get("error")
+                    _artifacts_snap = _workflow_artifacts_from_run_data(candidate_run)
 
-                result_appended = _append_workflow_result_event(
+                result_resolution = _persist_workflow_result(
                     run_id,
                     getattr(result, "final_output", None),
                     _status_snap,
@@ -1183,61 +1199,218 @@ class WorkflowManager:
                     artifacts=_artifacts_snap,
                     snapshot={
                         "workflow_name": workflow_def.name,
-                        "parameters": parameters,
+                        "parameters": _public_workflow_parameters(parameters),
                         "session_id": session_id,
                         "client_id": client_id,
                     },
+                    terminal_outcome=terminal_outcome,
+                    run_incarnation=effective_incarnation,
+                    supervisor_id=supervisor_id,
+                    attempt_generation=attempt_generation,
                 )
-                if not result_appended:
+                if not result_resolution.persistence_succeeded:
                     append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
+                    persistence_run = dict(candidate_run)
+                    persistence_terminal = _apply_text_to_sql_terminal_failure(
+                        persistence_run,
+                        run_id=run_id,
+                        reason_code="RESULT_PERSISTENCE_FAILED",
+                        error=append_error,
+                        source_terminal=terminal_outcome,
+                    )
+                    persistence_output = persistence_run.get("final_output")
+                    persistence_artifacts = _workflow_artifacts_from_run_data(
+                        persistence_run
+                    )
+                    fallback_resolution = _persist_workflow_result(
+                        run_id,
+                        persistence_output,
+                        "failed",
+                        error=append_error,
+                        artifacts=persistence_artifacts,
+                        snapshot={
+                            "workflow_name": workflow_def.name,
+                            "parameters": _public_workflow_parameters(parameters),
+                            "session_id": session_id,
+                            "client_id": client_id,
+                        },
+                        terminal_outcome=persistence_terminal,
+                        run_incarnation=effective_incarnation,
+                        supervisor_id=supervisor_id,
+                        attempt_generation=attempt_generation,
+                    )
+                    resolved_fallback = fallback_resolution.resolved_payload
                     with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                        run_data.update({
-                            "status": "failed",
-                            "end_time": datetime.now(),
-                            "error": append_error,
-                        })
+                        live_run = self.active_runs.get(run_id)
+                        if (
+                            live_run is not run_data
+                            or (
+                                effective_incarnation is not None
+                                and run_data.get("run_incarnation")
+                                != effective_incarnation
+                            )
+                        ):
+                            raise WorkflowExecutionError(
+                                f"Stale workflow result incarnation for run_id {run_id}"
+                            )
+                        if resolved_fallback is not None:
+                            _merge_workflow_result_payload(run_data, resolved_fallback)
+                        else:
+                            run_data.update(persistence_run)
+                        run_data["workflow_result_append_failure_handled"] = True
+                        if fallback_resolution.persistence_succeeded:
+                            run_data["workflow_result_event_appended"] = True
+                    if (
+                        fallback_resolution.persistence_succeeded
+                        and not fallback_resolution.candidate_won
+                        and resolved_fallback is not None
+                    ):
+                        return resolved_fallback
                     self._notify_progress(run_id, "failed", {"error": append_error})
                     raise WorkflowExecutionError(append_error)
                 with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    live_run = self.active_runs.get(run_id)
+                    if (
+                        live_run is not run_data
+                        or (
+                            effective_incarnation is not None
+                            and run_data.get("run_incarnation")
+                            != effective_incarnation
+                        )
+                    ):
+                        raise WorkflowExecutionError(
+                            f"Stale workflow result incarnation for run_id {run_id}"
+                        )
+                    if result_resolution.resolved_payload is None:
+                        run_data["workflow_result_event_appended"] = True
+                        raise WorkflowExecutionError(
+                            "Terminal WORKFLOW_RESULT winner could not be resolved"
+                        )
+                    _merge_workflow_result_payload(
+                        run_data,
+                        result_resolution.resolved_payload,
+                    )
                     run_data["workflow_result_event_appended"] = True
                     _notify_status = run_data["status"]
                     _notify_error = run_data.get("error")
-                self._notify_progress(run_id, _notify_status, {"result": "success" if is_success else "failed", "error": _notify_error})
-                if not is_success:
-                    raise WorkflowExecutionError(error_message or "Workflow failed")
+                if result_resolution.candidate_won:
+                    self._notify_progress(
+                        run_id,
+                        _notify_status,
+                        {
+                            "result": "success" if is_success else "failed",
+                            "error": _notify_error,
+                        },
+                    )
+                if _notify_status == "failed":
+                    raise WorkflowExecutionError(_notify_error or "Workflow failed")
+                if not result_resolution.candidate_won:
+                    return result_resolution.resolved_payload
                 return result
                 
             finally:
                 loop.close()
                 
         except Exception as e:
-            # Обновляем статус при ошибке
+            if worker_config_versions is None:
+                worker_config_versions = _capture_active_yaml_config_versions()
             safe_error = _redact_error_text(e)
-            had_stored_result = False
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                if run_id in self.active_runs:
-                    existing_output = self.active_runs[run_id].get("final_output")
-                    had_stored_result = self.active_runs[run_id].get("workflow_result_event_appended") is True
-                    self.active_runs[run_id].update({
+                live_run = self.active_runs.get(run_id)
+                current_invocation = bool(
+                    isinstance(live_run, dict)
+                    and (
+                        effective_incarnation is None
+                        or live_run.get("run_incarnation")
+                        == effective_incarnation
+                    )
+                )
+                had_stored_result = bool(
+                    current_invocation
+                    and (
+                        live_run.get("workflow_result_event_appended") is True
+                        or live_run.get("workflow_result_append_failure_handled")
+                        is True
+                    )
+                )
+                if current_invocation and not had_stored_result:
+                    candidate_run = dict(live_run)
+                    candidate_run.update({
                         "status": "failed",
                         "end_time": datetime.now(),
-                        "error": safe_error
+                        "error": safe_error,
+                        "config_versions": worker_config_versions,
                     })
+                    existing_output = candidate_run.get("final_output")
+                    artifacts = _workflow_artifacts_from_run_data(candidate_run)
+                    candidate_terminal = candidate_run.get("terminal_outcome")
                 else:
                     existing_output = None
-            if not had_stored_result:
+                    artifacts = None
+                    candidate_terminal = None
+            if not current_invocation or had_stored_result:
+                raise
+
+            resolution = _persist_workflow_result(
+                run_id,
+                existing_output,
+                "failed",
+                error=safe_error,
+                artifacts=artifacts,
+                terminal_outcome=candidate_terminal,
+                run_incarnation=effective_incarnation,
+                supervisor_id=supervisor_id,
+                attempt_generation=attempt_generation,
+            )
+            if resolution.persistence_succeeded and resolution.resolved_payload is not None:
                 with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                    artifacts = _workflow_artifacts_from_run_data(self.active_runs[run_id]) if run_id in self.active_runs else None
-                result_appended = _append_workflow_result_event(run_id, existing_output, "failed", error=safe_error, artifacts=artifacts)
-                if not result_appended:
-                    append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
-                    with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                        if run_id in self.active_runs:
-                            self.active_runs[run_id]["error"] = append_error
-                    self._notify_progress(run_id, "failed", {"error": append_error})
-                    raise WorkflowExecutionError(append_error) from e
-            self._notify_progress(run_id, "failed", {"error": safe_error})
-            raise
+                    live_run = self.active_runs.get(run_id)
+                    if not isinstance(live_run, dict) or (
+                        effective_incarnation is not None
+                        and live_run.get("run_incarnation") != effective_incarnation
+                    ):
+                        raise WorkflowExecutionError(
+                            f"Stale workflow result incarnation for run_id {run_id}"
+                        ) from e
+                    _merge_workflow_result_payload(
+                        live_run,
+                        resolution.resolved_payload,
+                    )
+                    live_run["workflow_result_event_appended"] = True
+                    resolved_status = str(live_run.get("status") or "").lower()
+                    resolved_error = live_run.get("error")
+                if not resolution.candidate_won:
+                    if resolved_status in {"completed", "cancelled"}:
+                        return resolution.resolved_payload
+                    raise WorkflowExecutionError(
+                        resolved_error or "Workflow failed"
+                    ) from e
+                self._notify_progress(run_id, "failed", {"error": safe_error})
+                raise
+
+            if resolution.persistence_succeeded:
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    live_run = self.active_runs.get(run_id)
+                    if isinstance(live_run, dict) and (
+                        effective_incarnation is None
+                        or live_run.get("run_incarnation") == effective_incarnation
+                    ):
+                        live_run["workflow_result_event_appended"] = True
+                raise WorkflowExecutionError(
+                    "Terminal WORKFLOW_RESULT winner could not be resolved"
+                ) from e
+
+            append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
+            with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                live_run = self.active_runs.get(run_id)
+                if isinstance(live_run, dict) and (
+                    effective_incarnation is None
+                    or live_run.get("run_incarnation") == effective_incarnation
+                ):
+                    live_run.update(candidate_run)
+                    live_run["error"] = append_error
+            self._notify_progress(run_id, "failed", {"error": append_error})
+            raise WorkflowExecutionError(append_error) from e
 
     def _notify_progress(self, run_id: str, event_type: str, data: Dict[str, Any]):
         """Уведомление о прогрессе выполнения workflow"""
@@ -1285,32 +1458,113 @@ class WorkflowManager:
         Returns:
             Объект WorkflowRunStatus или None
         """
+        terminal_statuses = {"completed", "failed", "cancelled"}
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            if run_id not in self.active_runs:
-                stored_payload = _workflow_result_payload_from_store(run_id)
-                if not stored_payload:
-                    return None
-                artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
-                snapshot = stored_payload.get("snapshot") if isinstance(stored_payload.get("snapshot"), dict) else {}
-                return WorkflowRunStatus(
-                    run_id=run_id,
-                    workflow_name=snapshot.get("workflow_name", "unknown"),
-                    status=stored_payload.get("status", "unknown"),
-                    progress_percentage=100.0 if stored_payload.get("status") == "completed" else 0.0,
-                    error_message=_redact_error_text(stored_payload.get("error")) if stored_payload.get("error") else None,
-                    step_results=_redact_public_payload(artifacts.get("step_results") or {}),
-                    parameters=_redact_public_payload(snapshot.get("parameters") or {}),
-                )
+            initial_run = self.active_runs.get(run_id)
+            initial_version = (
+                _workflow_run_store_merge_version(initial_run)
+                if isinstance(initial_run, dict)
+                else None
+            )
+            initial_incarnation = (
+                initial_run.get("run_incarnation")
+                if isinstance(initial_run, dict)
+                else None
+            )
+            should_read_store = not isinstance(initial_run, dict) or str(
+                initial_run.get("status") or ""
+            ).lower() not in terminal_statuses
 
-            run_data = self.active_runs[run_id]
-            if run_data.get("status") not in ["completed", "failed", "cancelled"]:
-                stored_payload = _workflow_result_payload_from_store(run_id)
-                stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
-                if stored_status in {"completed", "failed", "cancelled"}:
-                    _merge_workflow_result_payload(run_data, stored_payload)
-                    if not run_data.get("end_time"):
-                        run_data["end_time"] = datetime.now()
-            run_data = dict(run_data)
+        stored_payload = (
+            _workflow_result_payload_from_store(
+                run_id,
+                **(
+                    {"run_incarnation": initial_incarnation}
+                    if initial_incarnation is not None
+                    else {}
+                ),
+            )
+            if should_read_store
+            else None
+        )
+
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            live_run = self.active_runs.get(run_id)
+            if isinstance(live_run, dict):
+                stored_status = (
+                    str(stored_payload.get("status") or "").lower()
+                    if stored_payload
+                    else ""
+                )
+                if (
+                    stored_payload
+                    and stored_status in terminal_statuses
+                    and live_run is initial_run
+                    and _workflow_run_store_merge_version(live_run) == initial_version
+                    and str(live_run.get("status") or "").lower()
+                    not in terminal_statuses
+                ):
+                    _merge_workflow_result_payload(live_run, stored_payload)
+                    if not live_run.get("end_time"):
+                        live_run["end_time"] = datetime.now()
+                run_data = dict(live_run)
+            else:
+                run_data = None
+
+        if run_data is None:
+            if not stored_payload:
+                return None
+            artifacts = (
+                stored_payload.get("artifacts")
+                if isinstance(stored_payload.get("artifacts"), dict)
+                else {}
+            )
+            snapshot = (
+                stored_payload.get("snapshot")
+                if isinstance(stored_payload.get("snapshot"), dict)
+                else {}
+            )
+            workflow_name = snapshot.get("workflow_name", "unknown")
+            terminal_candidate = (
+                stored_payload.get("terminal_outcome")
+                or artifacts.get("terminal_outcome")
+            )
+            terminal_outcome = _validated_terminal_outcome(terminal_candidate)
+            stored_status = stored_payload.get("status", "unknown")
+            if is_text_to_sql_workflow_name(workflow_name):
+                if terminal_outcome is None:
+                    stored_status = "unknown_legacy"
+                else:
+                    stored_status, _ = _terminal_legacy_fields(terminal_outcome)
+            snapshot_parameters = snapshot.get("parameters")
+            return WorkflowRunStatus(
+                run_id=run_id,
+                workflow_name=workflow_name,
+                status=stored_status,
+                progress_percentage=100.0 if stored_status == "completed" else 0.0,
+                error_message=(
+                    _redact_error_text(stored_payload.get("error"))
+                    if stored_payload.get("error")
+                    else None
+                ),
+                step_results=_redact_public_payload(
+                    artifacts.get("step_results") or {}
+                ),
+                parameters=(
+                    _public_workflow_parameters(snapshot_parameters)
+                    if isinstance(snapshot_parameters, dict)
+                    else {}
+                ),
+                terminal_outcome=_redact_public_payload(terminal_outcome),
+            )
+
+        terminal_candidate = run_data.get("terminal_outcome")
+        terminal_outcome = _validated_terminal_outcome(terminal_candidate)
+        if is_text_to_sql_workflow_name(run_data.get("workflow_name")):
+            if terminal_outcome is not None:
+                run_data["status"], _ = _terminal_legacy_fields(terminal_outcome)
+            elif run_data.get("status") in {"completed", "failed", "cancelled"}:
+                run_data["status"] = "unknown_legacy"
         
         # Вычисляем длительность
         duration = None
@@ -1324,6 +1578,7 @@ class WorkflowManager:
         progress_percentage = run_data.get("progress_percentage", 0.0)
         step_results = run_data.get("step_results", {})
         
+        run_parameters = run_data.get("parameters")
         return WorkflowRunStatus(
             run_id=run_id,
             workflow_name=run_data.get("workflow_name", "unknown"),
@@ -1337,46 +1592,139 @@ class WorkflowManager:
             duration_seconds=duration,
             error_message=_redact_error_text(run_data.get("error")) if run_data.get("error") else None,
             step_results=_redact_public_payload(step_results),
-            parameters=_redact_public_payload(run_data.get("parameters", {})),
+            parameters=(
+                _public_workflow_parameters(run_parameters)
+                if isinstance(run_parameters, dict)
+                else {}
+            ),
             use_enhanced_engine=run_data.get("use_enhanced_engine", False),
-            enable_telemetry=run_data.get("enable_telemetry", False)
+            enable_telemetry=run_data.get("enable_telemetry", False),
+            terminal_outcome=_redact_public_payload(terminal_outcome),
         )
 
     def get_workflow_artifacts(self, run_id: str) -> Optional[WorkflowArtifacts]:
         """Получить артефакты выполнения workflow."""
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            if run_id not in self.active_runs:
-                stored_payload = _workflow_result_payload_from_store(run_id)
-                if not stored_payload:
-                    return None
-                artifacts = stored_payload.get("artifacts") if isinstance(stored_payload.get("artifacts"), dict) else {}
-                return WorkflowArtifacts(
-                    run_id=run_id,
-                    final_output=_redact_public_payload(artifacts.get("final_output", stored_payload.get("result"))),
-                    step_outputs=_redact_public_payload(artifacts.get("step_outputs") or {}),
-                    metadata=_redact_public_payload(artifacts.get("metadata") or {}),
+            initial_run = self.active_runs.get(run_id)
+            initial_version = (
+                _workflow_run_store_merge_version(initial_run)
+                if isinstance(initial_run, dict)
+                else None
+            )
+            initial_incarnation = (
+                initial_run.get("run_incarnation")
+                if isinstance(initial_run, dict)
+                else None
+            )
+            should_read_store = not isinstance(initial_run, dict) or (
+                not initial_run.get("final_output")
+                and not initial_run.get("step_outputs")
+                and not initial_run.get("terminal_outcome")
+            )
+
+        stored_payload = (
+            _workflow_result_payload_from_store(
+                run_id,
+                **(
+                    {"run_incarnation": initial_incarnation}
+                    if initial_incarnation is not None
+                    else {}
+                ),
+            )
+            if should_read_store
+            else None
+        )
+
+        with _GLOBAL_WORKFLOW_RUNS_LOCK:
+            live_run = self.active_runs.get(run_id)
+            if isinstance(live_run, dict):
+                if (
+                    stored_payload
+                    and live_run is initial_run
+                    and _workflow_run_store_merge_version(live_run) == initial_version
+                    and not live_run.get("final_output")
+                    and not live_run.get("step_outputs")
+                    and not live_run.get("terminal_outcome")
+                ):
+                    _merge_workflow_result_payload(live_run, stored_payload)
+                run_data = dict(live_run)
+            else:
+                run_data = None
+
+        if run_data is None:
+            if not stored_payload:
+                return None
+            artifacts = (
+                stored_payload.get("artifacts")
+                if isinstance(stored_payload.get("artifacts"), dict)
+                else {}
+            )
+            terminal_outcome = _validated_terminal_outcome(
+                stored_payload.get("terminal_outcome")
+                or artifacts.get("terminal_outcome")
+            )
+            raw_metadata = artifacts.get("metadata") or {}
+            metadata = _redact_public_payload(raw_metadata)
+            if isinstance(raw_metadata, dict) and isinstance(
+                raw_metadata.get("parameters"),
+                dict,
+            ):
+                metadata["parameters"] = _public_workflow_parameters(
+                    raw_metadata["parameters"]
                 )
-            run_data = self.active_runs[run_id]
-            if not run_data.get("final_output") and not run_data.get("step_outputs"):
-                stored_payload = _workflow_result_payload_from_store(run_id)
-                if stored_payload:
-                    _merge_workflow_result_payload(run_data, stored_payload)
-            run_data = dict(run_data)
+            if (
+                isinstance(raw_metadata, dict)
+                and "config_versions" in raw_metadata
+            ):
+                metadata["config_versions"] = (
+                    _validated_config_versions_metadata(
+                        raw_metadata.get("config_versions")
+                    )
+                )
+            return WorkflowArtifacts(
+                run_id=run_id,
+                final_output=_redact_public_payload(
+                    artifacts.get("final_output", stored_payload.get("result"))
+                ),
+                step_outputs=_redact_public_payload(
+                    artifacts.get("step_outputs") or {}
+                ),
+                metadata=metadata,
+                terminal_outcome=_redact_public_payload(terminal_outcome),
+            )
+        terminal_outcome = _validated_terminal_outcome(run_data.get("terminal_outcome"))
+        metadata = {
+            "workflow_id": run_data.get("workflow_id"),
+            "workflow_name": run_data.get("workflow_name"),
+            "execution": run_data.get("execution"),
+        }
+        if run_data.get("config_versions") is not None:
+            metadata["config_versions"] = run_data.get("config_versions")
+        public_metadata = _redact_public_payload(metadata)
+        if "config_versions" in metadata:
+            public_metadata["config_versions"] = (
+                _validated_config_versions_metadata(
+                    metadata.get("config_versions")
+                )
+            )
         return WorkflowArtifacts(
             run_id=run_id,
             final_output=_redact_public_payload(run_data.get("final_output")),
             step_outputs=_redact_public_payload(run_data.get("step_outputs")),
-            metadata=_redact_public_payload({
-                "workflow_id": run_data.get("workflow_id"),
-                "workflow_name": run_data.get("workflow_name"),
-                "execution": run_data.get("execution"),
-            }),
+            metadata=public_metadata,
+            terminal_outcome=_redact_public_payload(terminal_outcome),
         )
 
     def get_active_run_snapshot(self, run_id: str) -> Dict[str, Any]:
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             run_data = self.active_runs.get(run_id)
-            return dict(run_data) if isinstance(run_data, dict) else {}
+            if not isinstance(run_data, dict):
+                return {}
+            snapshot = dict(run_data)
+            parameters = snapshot.get("parameters")
+            if isinstance(parameters, dict):
+                snapshot["parameters"] = _public_workflow_parameters(parameters)
+            return snapshot
 
     def update_active_run(self, run_id: str, updates: Dict[str, Any]) -> bool:
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
@@ -1388,11 +1736,18 @@ class WorkflowManager:
 
     def list_active_run_snapshots(self) -> List[Tuple[str, Dict[str, Any]]]:
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            return [
-                (run_id, dict(run_data))
-                for run_id, run_data in self.active_runs.items()
-                if isinstance(run_data, dict)
-            ]
+            snapshots: List[Tuple[str, Dict[str, Any]]] = []
+            for run_id, run_data in self.active_runs.items():
+                if not isinstance(run_data, dict):
+                    continue
+                snapshot = dict(run_data)
+                parameters = snapshot.get("parameters")
+                if isinstance(parameters, dict):
+                    snapshot["parameters"] = _public_workflow_parameters(
+                        parameters
+                    )
+                snapshots.append((run_id, snapshot))
+            return snapshots
 
     def cleanup_completed_runs(self, max_age_hours: float = 24) -> int:
         cutoff = datetime.now().timestamp() - max_age_hours * 3600
@@ -1446,175 +1801,82 @@ class WorkflowManager:
             return False, f"Ошибка удаления '{target_file}': {_redact_error_text(exc)}"
 
     def cancel_workflow(self, run_id: str) -> bool:
-        """
-        Отменить выполнение workflow
-        
-        Args:
-            run_id: Идентификатор запуска
-            
-        Returns:
-            True если отмена успешна
-        """
+        """Delegate durable cancellation and process ownership to the supervisor."""
+        result = self._process_supervisor().cancel(run_id)
+        accepted = bool(getattr(result, "accepted", False))
+        state = str(getattr(result, "state", ""))
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            if run_id not in self.active_runs:
-                logger.warning(f"Попытка отменить несуществующий workflow: {run_id}")
-                return False
-            run_data = self.active_runs[run_id]
-            # Снимок pid под локом, чтобы дальше не читать run_data вне лока
-            # (гонка с watchdog-потоком). Статус ниже перечитывается под локом в current_status.
-            pid = run_data.get("pid")
+            live = self.active_runs.get(run_id)
+            if live is not None:
+                if state == "cancelled":
+                    live.update({"status": "cancelled", "end_time": datetime.now()})
+                elif accepted:
+                    live["status"] = "cancelling"
+        return accepted
 
-        try:
-            stored_payload = _workflow_result_payload_from_store(run_id, strict=True)
-        except Exception as exc:
-            logger.warning(
-                "Отмена workflow %s остановлена: не удалось прочитать WORKFLOW_RESULT до остановки процесса: %s",
-                run_id,
-                _redact_error_text(exc),
-            )
-            return False
-        stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
-        if stored_status in {"completed", "failed", "cancelled"}:
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                _merge_workflow_result_payload(run_data, stored_payload)
-                if not run_data.get("end_time"):
-                    run_data["end_time"] = datetime.now()
-            logger.warning(
-                f"Попытка отменить workflow с уже сохранённым WORKFLOW_RESULT: {run_id} "
-                f"(статус: {stored_status})"
-            )
-            return False
 
-        with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            current_status = run_data["status"]
-        if current_status in ["completed", "failed", "cancelled"]:
-            logger.warning(f"Попытка отменить уже завершенный workflow: {run_id} (статус: {current_status})")
-            return False
-
-        # Пытаемся завершить дочерний процесс (pid взят из снимка под локом выше)
-        with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
-            proc = _GLOBAL_WORKFLOW_PROCESSES.get(run_id)
-        killed = False
-        
-        if proc is not None:
-            try:
-                # Мягкое завершение группы процессов
-                try:
-                    os.killpg(proc.pid, signal.SIGTERM)
-                except Exception:
-                    proc.terminate() # Fallback
-                
-                proc.join(timeout=5.0)
-                
-                if proc.is_alive():
-                    # Жёсткое завершение группы процессов
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except Exception:
-                        proc.kill() # Fallback
-                    proc.join(timeout=3.0)
-
-                killed = not proc.is_alive()
-                logger.info(f"Процесс workflow {run_id} (PID: {pid}) завершен: {'успешно' if killed else 'неуспешно'}")
-
-            except Exception as e:
-                logger.warning(
-                    "⚠️ Ошибка при завершении процесса workflow %s: %s",
-                    pid,
-                    _redact_error_text(e),
-                )
-
-        elif pid:
-            # Fallback на сигналы по PID, если нет объекта процесса
-            try:
-                os.kill(pid, signal.SIGTERM)
-                time.sleep(2) # Даем время на обработку
-                try:
-                    os.kill(pid, 0) # Проверяем жив ли процесс
-                except OSError:
-                    killed = True
-                
-                if not killed:
-                    os.kill(pid, signal.SIGKILL)
-                    time.sleep(0.5)
-                    try:
-                        os.kill(pid, 0)
-                    except OSError:
-                        killed = True
-                
-                logger.info(f"Процесс workflow {run_id} (PID: {pid}) завершен по fallback: {'успешно' if killed else 'неуспешно'}")
-            
-            except ProcessLookupError:
-                killed = True
-                logger.info(f"Процесс workflow {run_id} (PID: {pid}) уже не существует.")
-            except Exception as e:
-                logger.warning(
-                    "⚠️ Не удалось послать сигнал процессу %s (fallback): %s",
-                    pid,
-                    _redact_error_text(e),
-                )
-
-        try:
-            stored_payload = _workflow_result_payload_from_store(run_id, strict=True)
-        except Exception as exc:
-            logger.warning(
-                "Отмена workflow %s не записана как cancelled: не удалось перечитать WORKFLOW_RESULT после остановки процесса: %s",
-                run_id,
-                _redact_error_text(exc),
-            )
-            return False
-        stored_status = str(stored_payload.get("status") or "").lower() if stored_payload else ""
-        if stored_status in {"completed", "failed", "cancelled"}:
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                _merge_workflow_result_payload(run_data, stored_payload)
-                if not run_data.get("end_time"):
-                    run_data["end_time"] = datetime.now()
-            logger.warning(
-                f"Workflow {run_id} уже сохранил terminal WORKFLOW_RESULT во время cancel "
-                f"(статус: {stored_status})"
-            )
-            return False
-        if (proc is not None or pid) and not killed:
-            logger.warning(
-                f"Workflow {run_id} не помечен cancelled: процесс PID {pid} не завершён"
-            )
-            return False
-
-        # Обновляем статус (CAS: под тем же локом перепроверяем, что run не стал
-        # терминальным между check-after-kill и этой записью — иначе watchdog мог
-        # пометить completed/failed, и cancelled затёр бы реальный исход).
-        with _GLOBAL_WORKFLOW_RUNS_LOCK:
-            _live_status = str(run_data.get("status") or "").lower()
-            if _live_status in {"completed", "failed", "cancelled"}:
-                logger.warning(
-                    f"Workflow {run_id} стал терминальным ({_live_status}) во время cancel — cancelled не записан"
-                )
-                return False
-            run_data.update({
-                "status": "cancelled",
-                "end_time": datetime.now()
-            })
-        if not _append_workflow_result_event(run_id, None, "cancelled"):
-            error_message = "Не удалось записать terminal WORKFLOW_RESULT для отмененного workflow"
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                run_data.update({
-                    "status": "failed",
-                    "end_time": datetime.now(),
-                    "error": error_message,
-                })
-            self._notify_progress(run_id, "failed", {"error": error_message})
-            return False
-
-        # Удаляем из реестра процессов
-        with _GLOBAL_WORKFLOW_PROCESSES_LOCK:
-            if run_id in _GLOBAL_WORKFLOW_PROCESSES:
-                try:
-                    _GLOBAL_WORKFLOW_PROCESSES.pop(run_id)
-                except Exception:
-                    pass
-
-        # Уведомляем подписчиков
-        self._notify_progress(run_id, "cancelled", {})
-        
-        logger.info(f"🛑 Workflow {run_id} отменен.")
-        return True
+# Ре-экспорт слоя доставки результатов (T9: декомпозиция god-модуля).
+# Логика терминализации/доставки WORKFLOW_RESULT и durable outbox переехала
+# в .result_delivery; имена ниже сохранены на streamlit_api для обратной
+# совместимости внешних импортов и monkeypatch в тестах.
+from . import result_delivery  # noqa: E402  (нужен как якорь для monkeypatch)
+from .result_delivery import (  # noqa: E402
+    _OUTBOX_DRAIN_BATCH_LIMIT,
+    _OUTBOX_DRAIN_TIME_BUDGET_SECONDS,
+    _OUTBOX_DRAIN_RETRY_DELAY_SECONDS,
+    _OUTBOX_DRAIN_SCHEDULE_LOCK,
+    _OUTBOX_DRAIN_SCHEDULED,
+    _reset_outbox_drain_scheduler_after_fork,
+    _terminalize_supervised_workflow,
+    _is_retryable_outbox_error,
+    _SENSITIVE_DSN_QUERY_KEYS,
+    _SENSITIVE_PAYLOAD_KEYS,
+    _SENSITIVE_SCALAR_KEYS,
+    _URL_LIKE_PAYLOAD_KEYS,
+    _DSN_TEXT_RE,
+    _SECRET_KEY_PATTERN,
+    _SENSITIVE_TEXT_ASSIGNMENT_RE,
+    _project_root,
+    _agui_event_store_path,
+    _workflow_result_outbox_path,
+    _workflow_result_payload_from_store,
+    _authoritative_workflow_result_payload,
+    _safe_serialize_result,
+    _dsn_fingerprint,
+    _is_sensitive_dsn_query_key,
+    _is_sensitive_dsn_payload_key,
+    _is_url_like_payload_key,
+    _redact_sensitive_assignment,
+    _redact_dsn,
+    _looks_like_dsn,
+    _redact_query_string,
+    _redact_text,
+    _redact_payload,
+    _redact_error_text,
+    _redact_public_payload,
+    _public_workflow_parameters,
+    _terminal_outcome_mapping,
+    _validated_terminal_outcome,
+    _terminal_legacy_fields,
+    _apply_text_to_sql_terminal_failure,
+    _validated_config_versions_metadata,
+    _transform_workflow_result_event_payload,
+    _build_workflow_result_event_payload,
+    _build_text_to_sql_no_runtime_terminal,
+    _append_workflow_result_payload_to_primary,
+    _enqueue_workflow_result_payload,
+    _WorkflowResultResolution,
+    _coerce_workflow_result_resolution,
+    _append_workflow_result_event,
+    _persist_workflow_result,
+    _drain_workflow_result_outbox_batch,
+    _drain_workflow_result_outbox,
+    _workflow_result_outbox_pending_state,
+    _start_scheduled_workflow_result_outbox_drain,
+    _scheduled_workflow_result_outbox_drain,
+    _schedule_workflow_result_outbox_drain,
+    _reserve_workflow_run_invocation,
+    _workflow_artifacts_from_run_data,
+    _merge_workflow_result_payload,
+    _workflow_run_store_merge_version,
+)

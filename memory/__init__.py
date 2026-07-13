@@ -14,19 +14,31 @@
 """
 
 from .models import TacticalMemoryItem, StrategicGoal, SystemContext
-from .tools import (
-    save_memory, 
-    get_memory, 
-    get_memory_summary,
-    save_goal,
-    get_goals,
-    update_goal_status,
-    save_context,
-    get_context,
-    extract_keywords,
-    summary_agent_memory_step,
-    agent_list
+_TOOL_EXPORTS = frozenset(
+    {
+        "save_memory",
+        "get_memory",
+        "get_memory_summary",
+        "save_goal",
+        "get_goals",
+        "update_goal_status",
+        "save_context",
+        "get_context",
+        "extract_keywords",
+        "summary_agent_memory_step",
+        "agent_list",
+    }
 )
+
+
+def __getattr__(name):
+    if name not in _TOOL_EXPORTS:
+        raise AttributeError(name)
+    from . import tools
+
+    value = getattr(tools, name)
+    globals()[name] = value
+    return value
 
 __version__ = "2.0.0"
 __all__ = [

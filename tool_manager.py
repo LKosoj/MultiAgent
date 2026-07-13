@@ -194,6 +194,40 @@ def _redact_runtime_value(
     return redacted_tuple
 
 
+class _ToolRunRegistry(dict):
+    """Unique invocation records with read-only legacy correlation aliases."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._aliases: Dict[str, str] = {}
+
+    def set_alias(self, alias: Optional[str], invocation_id: str) -> None:
+        if alias:
+            self._aliases[alias] = invocation_id
+
+    def discard_aliases_for(self, invocation_id: str) -> None:
+        for alias, target in list(self._aliases.items()):
+            if target == invocation_id:
+                del self._aliases[alias]
+
+    def __getitem__(self, key):
+        if dict.__contains__(self, key):
+            return dict.__getitem__(self, key)
+        return dict.__getitem__(self, self._aliases[key])
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def __contains__(self, key):
+        return dict.__contains__(self, key) or (
+            key in self._aliases
+            and dict.__contains__(self, self._aliases[key])
+        )
+
+
 class ToolManager:
     """
     Менеджер для централизованного запуска инструментов с телеметрией
@@ -203,7 +237,7 @@ class ToolManager:
     _CLEANUP_INTERVAL = 100  # вызывать cleanup каждые N завершений
 
     def __init__(self):
-        self.active_runs: Dict[str, Dict[str, Any]] = {}
+        self.active_runs: _ToolRunRegistry = _ToolRunRegistry()
         self._runs_lock = threading.Lock()
         self._completion_counter = 0
 
@@ -227,6 +261,9 @@ class ToolManager:
                  tool_function: Callable,
                  task_description: str,
                  session_id: Optional[str] = None,
+                 workflow_run_id: Optional[str] = None,
+                 tool_invocation_id: Optional[str] = None,
+                 trace_run_id: Optional[str] = None,
                  **kwargs) -> Any:
         """
         Централизованный запуск инструмента с телеметрией
@@ -236,16 +273,20 @@ class ToolManager:
             tool_function: Функция инструмента для вызова
             task_description: Описание задачи
             session_id: Идентификатор сессии
+            workflow_run_id: Идентификатор конкретного workflow запуска
+            tool_invocation_id: Уникальный идентификатор этого вызова инструмента
+            trace_run_id: Устаревший alias для workflow_run_id
             **kwargs: Аргументы для передачи в функцию инструмента
             
         Returns:
             Результат выполнения инструмента
         """
         
-        # Используем session_id как run_id для единой системы идентификаторов
         if not session_id:
             session_id = f"run-{uuid.uuid4().hex[:16]}"
-        run_id = session_id
+        if workflow_run_id is None:
+            workflow_run_id = trace_run_id
+        run_id = tool_invocation_id or f"tool-{uuid.uuid4().hex}"
         
         span = None
         result = None
@@ -259,6 +300,8 @@ class ToolManager:
             # Регистрируем запуск
             with self._runs_lock:
                 self.active_runs[run_id] = {
+                    "tool_invocation_id": run_id,
+                    "workflow_run_id": workflow_run_id,
                     "tool_name": tool_name,
                     "status": "running",
                     "task": safe_task_description,
@@ -266,6 +309,8 @@ class ToolManager:
                     "start_time": datetime.now(),
                     "kwargs": safe_kwargs
                 }
+                self.active_runs.set_alias(session_id, run_id)
+                self.active_runs.set_alias(workflow_run_id, run_id)
             
             logger.info(f"🔧 Запуск инструмента {tool_name} с run_id: {run_id}")
             
@@ -278,6 +323,8 @@ class ToolManager:
                 profile_type="streamlit_tool",
                 session_id=session_id
             )
+            if span and workflow_run_id is not None:
+                span.set_attribute("workflow.run_id", workflow_run_id)
             
             tool_completed = False
             try:
@@ -462,7 +509,15 @@ class ToolManager:
         return filtered
     
     @contextmanager
-    def tool_context(self, tool_name: str, task_description: str, session_id: Optional[str] = None, **kwargs):
+    def tool_context(
+        self,
+        tool_name: str,
+        task_description: str,
+        session_id: Optional[str] = None,
+        workflow_run_id: Optional[str] = None,
+        tool_invocation_id: Optional[str] = None,
+        **kwargs,
+    ):
         """
         Контекстный менеджер для запуска инструментов
         Использование:
@@ -472,10 +527,9 @@ class ToolManager:
             ctx.add_metadata("images_generated", 3)
         """
         
-        # Используем session_id как run_id для единой системы идентификаторов
         if not session_id:
             session_id = f"run-{uuid.uuid4().hex[:16]}"
-        run_id = session_id
+        run_id = tool_invocation_id or f"tool-{uuid.uuid4().hex}"
         
         class ToolContext:
             def __init__(self, span, run_data):
@@ -502,6 +556,8 @@ class ToolManager:
 
             # Регистрируем запуск
             run_data = {
+                "tool_invocation_id": run_id,
+                "workflow_run_id": workflow_run_id,
                 "tool_name": tool_name,
                 "status": "running",
                 "task": safe_task_description,
@@ -511,6 +567,8 @@ class ToolManager:
             }
             with self._runs_lock:
                 self.active_runs[run_id] = run_data
+                self.active_runs.set_alias(session_id, run_id)
+                self.active_runs.set_alias(workflow_run_id, run_id)
             
             logger.info(f"🔧 Начало контекста инструмента {tool_name} с run_id: {run_id}")
             
@@ -522,6 +580,8 @@ class ToolManager:
                 profile_type="streamlit_tool",
                 session_id=session_id
             )
+            if span and workflow_run_id is not None:
+                span.set_attribute("workflow.run_id", workflow_run_id)
             
             try:
                 if span:
@@ -645,6 +705,7 @@ class ToolManager:
             ]
             for run_id in to_remove:
                 del self.active_runs[run_id]
+                self.active_runs.discard_aliases_for(run_id)
 
         if to_remove:
             logger.info(f"🧹 Очищено {len(to_remove)} завершенных запусков инструментов")

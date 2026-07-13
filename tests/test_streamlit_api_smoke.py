@@ -143,6 +143,20 @@ class TestWorkflowStreamlitAPI:
         raw_email = "person@example.com"
         raw_phone = "+7 (495) 123-45-67"
         raw_dsn = "postgresql://alice:secret@example.com/app?api_key=abc"
+        run_incarnation = "inc-persisted-result"
+
+        reservation_store = EventStore(
+            str(streamlit_api._agui_event_store_path())
+        )
+        try:
+            assert reservation_store.reserve_workflow_run(
+                run_id,
+                run_incarnation,
+                "session-persisted-result",
+                "generic_pipeline",
+            )
+        finally:
+            reservation_store.close()
 
         streamlit_api._append_workflow_result_event(
             run_id,
@@ -150,9 +164,10 @@ class TestWorkflowStreamlitAPI:
             "completed",
             artifacts={"dsn": raw_dsn},
             snapshot={"phone": raw_phone},
+            run_incarnation=run_incarnation,
         )
 
-        store = EventStore(str(tmp_path / "data" / "agui_events.db"))
+        store = EventStore(str(streamlit_api._agui_event_store_path()))
         events = list(store.list_after(run_id, 0))
         assert len(events) == 1
         serialized = json.dumps(events[0].payload, ensure_ascii=False)

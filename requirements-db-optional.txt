@@ -1,0 +1,7 @@
+# Optional Python driver for Apache Impala.
+impyla
+
+# Optional Python ODBC bridge for SAP IQ.
+# SAP IQ additionally requires a separately installed vendor ODBC driver;
+# installing pyodbc alone does not provide that vendor ODBC driver.
+pyodbc

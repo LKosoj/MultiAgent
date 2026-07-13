@@ -7,6 +7,7 @@ import mimetypes
 import threading
 import requests
 from pathlib import Path
+from time import monotonic as _monotonic, sleep as _sleep
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -691,13 +692,13 @@ def _wait_for_veo_operation(
     max_wait_time: int = 600,
     on_poll: Optional[Any] = None,
 ) -> Any:
-    start_time = time.time()
+    start_time = _monotonic()
     while not getattr(operation, "done", False):
-        if time.time() - start_time >= max_wait_time:
+        if _monotonic() - start_time >= max_wait_time:
             task_id = str(getattr(operation, "name", ""))
             logger.error(f"⏰ Превышено время ожидания Veo ({max_wait_time}s) для {task_id}")
             raise _VeoPollTimeoutError(f"Превышено время ожидания Veo ({max_wait_time}s)", task_id)
-        time.sleep(5)
+        _sleep(5)
         try:
             operation = client.operations.get(operation)
         except Exception as e:

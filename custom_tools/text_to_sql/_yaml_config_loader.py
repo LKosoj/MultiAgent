@@ -9,9 +9,9 @@
   * fail-fast при отсутствии файла (с упоминанием env-переменной и пути);
   * yaml.safe_load → проверка top-level mapping → инициализация ``T(raw,
     source_path=abs_key)``;
-  * thread-safe кэширование по абсолютному пути (или по
-    ``(абсолютный путь, профиль)`` для profile-aware конфигов);
-  * ``reset_cache()`` для тестов.
+  * thread-safe кэширование immutable object/SHA snapshot по абсолютному пути
+    (или по ``(абсолютный путь, профиль)`` для profile-aware конфигов);
+  * ``reset_cache()`` начинает новое поколение snapshot.
 
 Этот модуль вытаскивает общую обвязку. Каждый ``*_config.py`` остаётся
 сам по себе (публичный API сохранён, докстринги тоже): он только
@@ -23,14 +23,57 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Generic, Hashable, Mapping, Optional, TypeVar
 
 import yaml
 
 T = TypeVar("T")
+
+_ACTIVE_CONFIG_VERSIONS_LOCK = threading.Lock()
+_ACTIVE_CONFIG_VERSIONS: Dict[
+    str,
+    Dict["ConfigSnapshotVersion", int],
+] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigSnapshotVersion:
+    source_path: str
+    content_sha256: str
+    profile: Optional[str]
+
+    def to_mapping(self) -> Dict[str, Optional[str]]:
+        return {
+            "source_path": self.source_path,
+            "content_sha256": self.content_sha256,
+            "profile": self.profile,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfigSnapshot(Generic[T]):
+    config: T
+    version: ConfigSnapshotVersion
+
+
+def _version_registry_key(version: ConfigSnapshotVersion) -> str:
+    if version.profile is None:
+        return version.source_path
+    return f"{version.source_path}#profile={version.profile}"
+
+
+def get_active_yaml_config_versions() -> Dict[str, Dict[str, Optional[str]]]:
+    """Return detached, JSON-ready versions published in this process."""
+    with _ACTIVE_CONFIG_VERSIONS_LOCK:
+        return {
+            key: next(reversed(versions)).to_mapping()
+            for key, versions in sorted(_ACTIVE_CONFIG_VERSIONS.items())
+        }
 
 
 class YamlConfigLoader(Generic[T]):
@@ -83,7 +126,7 @@ class YamlConfigLoader(Generic[T]):
         self._mapping_error_message = mapping_error_message
         self._profile_extra = profile_extra
         self._lock = threading.Lock()
-        self._cache: Dict[Any, T] = {}
+        self._cache: Dict[Any, _ConfigSnapshot[T]] = {}
 
     def _resolve_path(self) -> Path:
         env_path = os.getenv(self._env_path_var)
@@ -110,33 +153,63 @@ class YamlConfigLoader(Generic[T]):
         abs_key = str(path.resolve(strict=False))
         cache_key = self._make_cache_key(abs_key)
 
-        cached = self._cache.get(cache_key)
-        if cached is not None:
-            return cached
-
         with self._lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                return cached
+            snapshot = self._cache.get(cache_key)
+            if snapshot is not None:
+                return snapshot.config
 
             if not path.is_file():
                 raise FileNotFoundError(
                     self._not_found_message(path, self._env_path_var)
                 )
 
-            with path.open("r", encoding="utf-8") as fh:
-                raw = yaml.safe_load(fh)
+            source_bytes = path.read_bytes()
+            raw = yaml.safe_load(source_bytes.decode("utf-8"))
             if not isinstance(raw, dict):
                 raise ValueError(self._mapping_error_message(path))
 
             config = self._parser(raw, abs_key)
-            self._cache[cache_key] = config
+            profile = None
+            if isinstance(cache_key, tuple):
+                profile = str(cache_key[1])
+            version = ConfigSnapshotVersion(
+                source_path=abs_key,
+                content_sha256=hashlib.sha256(source_bytes).hexdigest(),
+                profile=profile,
+            )
+            snapshot = _ConfigSnapshot(config=config, version=version)
+            with _ACTIVE_CONFIG_VERSIONS_LOCK:
+                self._cache[cache_key] = snapshot
+                registrations = _ACTIVE_CONFIG_VERSIONS.setdefault(
+                    _version_registry_key(version),
+                    {},
+                )
+                registrations[version] = registrations.get(version, 0) + 1
             return config
+
+    def active_version(self) -> Optional[ConfigSnapshotVersion]:
+        path = self._resolve_path()
+        abs_key = str(path.resolve(strict=False))
+        cache_key = self._make_cache_key(abs_key)
+        with self._lock:
+            snapshot = self._cache.get(cache_key)
+            return None if snapshot is None else snapshot.version
 
     def reset_cache(self) -> None:
         """Сброс кэша (для тестов, меняющих env-переменные)."""
         with self._lock:
-            self._cache.clear()
+            with _ACTIVE_CONFIG_VERSIONS_LOCK:
+                for snapshot in self._cache.values():
+                    registry_key = _version_registry_key(snapshot.version)
+                    registrations = _ACTIVE_CONFIG_VERSIONS[registry_key]
+                    references = registrations[snapshot.version]
+                    if references == 1:
+                        registrations.pop(snapshot.version)
+                    else:
+                        registrations[snapshot.version] = references - 1
+                    if not registrations:
+                        _ACTIVE_CONFIG_VERSIONS.pop(registry_key, None)
+                self._cache.clear()
 
 
 # ---------------------------------------------------------------------------

@@ -25,9 +25,11 @@ from .text_to_sql.core import (
     
     # Execution and Audit
     secure_db_executor,
+    finalize_text_to_sql_run,
     pii_masking,
     audit_logger,
-    save_successful_sql,
+    save_successful_sql as _save_successful_sql_trusted,
+    successful_sql_retrieval,
     
     # Cache Management
     purge_schema_linking_rag_cache,
@@ -38,7 +40,9 @@ __all__ = [
     'natural_language_processing', 'intent_extraction', 'vector_db_search',
     'schema_linking', 'sql_generation_plugin', 'code_formatter',
     'sql_safety_check', 'sql_explain', 'secure_db_executor',
+    'finalize_text_to_sql_run',
     'pii_masking', 'audit_logger', 'save_successful_sql',
+    'successful_sql_retrieval',
     'purge_schema_linking_rag_cache', 'get_distinct_values', 'schema_info'
 ]
 
@@ -56,6 +60,12 @@ from .text_to_sql.dialects import (
     get_current_dialect_label as _get_current_dialect_label,
     get_current_dialect_name as _get_current_dialect_name,
 )
+from .text_to_sql.core._db_exec import (
+    QueryExecutionRequest,
+    QueryExecutor,
+    QueryPurpose,
+)
+from workflow.deadline import WorkflowDeadlineExceeded
 
 # Настройка логирования
 import logging
@@ -75,6 +85,30 @@ def _redact_sql_tool_error(error: Exception) -> str:
 
 def _redact_sql_tool_value(value):
     return _redact_text_to_sql_value(value)
+
+
+def save_successful_sql(
+    sql_query: str,
+    user_query: str = "",
+    execution_result: str = "",
+    dsn: str | None = None,
+) -> dict:
+    """Сохраняет успешно выполненный SQL-запрос в базу примеров для дальнейшего использования в RAG.
+
+    Trust boundary: evidence-флаги (namespace_version_key, approved, executed,
+    execution_success, audited) недоступны через этот инструмент и устанавливаются
+    только доверенным terminal-путём (custom_tools/text_to_sql/core/_terminal.py).
+
+    Args:
+        sql_query: SQL-запрос для сохранения.
+        user_query: Исходный запрос пользователя на естественном языке.
+        execution_result: JSON-строка с результатом выполнения SQL-запроса.
+        dsn: DSN целевой БД; если не передан, берётся из runtime context.
+
+    Returns:
+        Словарь со статусом сохранения.
+    """
+    return _save_successful_sql_trusted(sql_query, user_query, execution_result, dsn=dsn)
 
 
 def get_distinct_values(table_name: str, column_name: str, limit: int = 500, dsn: str | None = None) -> dict:
@@ -103,54 +137,61 @@ def get_distinct_values(table_name: str, column_name: str, limit: int = 500, dsn
                 "error_message": "DSN is required: pass dsn parameter or provide workflow runtime context."
             }
         
-        # Создаем подключение через плагин
         plugin = get_plugin(effective_dsn)
-        conn = plugin.connect(effective_dsn)
-        
-        try:
-            if not hasattr(plugin, 'build_distinct_values_query'):
-                return {
-                    "success": False,
-                    "values": [],
-                    "count": 0,
-                    "error_message": "Database plugin does not support distinct values query generation."
-                }
-            if not hasattr(plugin, 'execute_select'):
-                return {
-                    "success": False,
-                    "values": [],
-                    "count": 0,
-                    "error_message": "Database plugin does not support SELECT execution."
-                }
+        if not hasattr(plugin, 'build_distinct_values_query'):
+            return {
+                "success": False,
+                "values": [],
+                "count": 0,
+                "error_message": "Database plugin does not support distinct values query generation."
+            }
+        if not hasattr(plugin, 'execute_select'):
+            return {
+                "success": False,
+                "values": [],
+                "count": 0,
+                "error_message": "Database plugin does not support SELECT execution."
+            }
 
-            sql_query = plugin.build_distinct_values_query(table_name, column_name, limit)
-            
-            logger.info(f"Executing SQL: {sql_query}")
-            
-            # Выполняем запрос через плагин
-            result = plugin.execute_select(conn, sql_query, row_limit=limit)
-            if result.get("success", False):
-                values = [str(_redact_sql_tool_value(str(row[0]))) for row in result.get("data", [])]
-                return {
-                    "success": True,
-                    "values": values,
-                    "count": len(values),
-                    "error_message": None
-                }
-            else:
-                safe_error = _redact_sql_tool_error(
-                    RuntimeError(result.get("error_message", "Unknown error during query execution"))
-                )
-                return {
-                    "success": False,
-                    "values": [],
-                    "count": 0,
-                    "error_message": safe_error
-                }
-                
-        finally:
-            plugin.close(conn)
-            
+        sql_query = plugin.build_distinct_values_query(
+            table_name,
+            column_name,
+            limit,
+        )
+        logger.info("Executing DISTINCT preparation read")
+        result = QueryExecutor(get_plugin=get_plugin).execute(
+            QueryExecutionRequest(
+                sql_query=sql_query,
+                purpose=QueryPurpose.DISTINCT,
+                row_limit=limit,
+                dsn=effective_dsn,
+            )
+        )
+        if result.success:
+            values = [
+                str(_redact_sql_tool_value(str(row[0])))
+                for row in result.data
+            ]
+            return {
+                "success": True,
+                "values": values,
+                "count": len(values),
+                "error_message": None
+            }
+
+        safe_error = _redact_sql_tool_error(
+            RuntimeError(
+                result.error_message or "Unknown error during query execution"
+            )
+        )
+        return {
+            "success": False,
+            "values": [],
+            "count": 0,
+            "error_message": safe_error
+        }
+    except WorkflowDeadlineExceeded:
+        raise
     except Exception as e:
         safe_error = _redact_sql_tool_error(e)
         logger.error("Error getting distinct values: %s", safe_error)

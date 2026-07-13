@@ -1,5 +1,6 @@
 # Text-to-SQL Eval Gold Sets
 
-JSONL files in this directory are reviewed gold cases. Generated candidates
-from `logs/sql_history.jsonl` must go to a separate file with `reviewed:false`
-and must not be treated as gold until manually checked.
+JSONL files in this directory use the strict versioned case schema and contain
+only cases with a complete `review.status: reviewed` record. Generated
+candidates from history stay outside this directory and are never release gold
+until they are converted to the current schema and independently reviewed.

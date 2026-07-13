@@ -22,7 +22,7 @@ from backend.fastapi_app.agui.events import EventType
 from backend.fastapi_app.agui.events import RunFinishedEvent
 from backend.fastapi_app.agui.encoder import EventEncoder
 from backend.fastapi_app.agui.models import RunAgentInput
-from backend.fastapi_app.agui.store import EventStore
+from backend.fastapi_app.agui.store import EventStore, workflow_result_event_key
 
 
 def _make_payload(run_id: str) -> dict:
@@ -42,13 +42,48 @@ def _make_payload(run_id: str) -> dict:
     }
 
 
-def _install_runner_stub(monkeypatch) -> None:
+def _append_terminal_workflow_result(store: EventStore, run_id: str) -> None:
+    incarnation = f"inc-{run_id}"
+    assert store.reserve_workflow_run(
+        run_id,
+        incarnation,
+        f"thread-{run_id}",
+        "generic_pipeline",
+    )
+    store.append(
+        run_id,
+        "WORKFLOW_RESULT",
+        {
+            "run_id": run_id,
+            "run_incarnation": incarnation,
+            "event_key": workflow_result_event_key(run_id, incarnation),
+            "status": "completed",
+            "artifacts": {"final_output": "ok"},
+        },
+    )
+
+
+def _install_runner_stub(monkeypatch, tmp_path) -> None:
     """Подменяет тяжёлые зависимости runner.py на лёгкие стабы.
 
     Зеркалит логику ``_load_runner_with_service_stub`` из test_ag_ui_gateway.py, но
     оставляет реальный runner.run_agent: нам нужны настоящие _stream_logs/
     _stream_progress, потому что мы проверяем именно их отмену.
     """
+    old_main = sys.modules.pop("backend.fastapi_app.main", None)
+    if old_main is not None:
+        old_store = getattr(old_main, "store", None)
+        if isinstance(old_store, EventStore):
+            old_store.close()
+    agui_package = importlib.import_module("backend.fastapi_app")
+    agui_package.__dict__.pop("main", None)
+    state_files = importlib.import_module("workflow.state_files")
+    monkeypatch.setattr(
+        state_files,
+        "default_state_database_path",
+        lambda *_args, **_kwargs: tmp_path / "gateway-main.db",
+    )
+
     stub_agent_system = types.ModuleType("agent_system")
 
     class DynamicAgentSystem:
@@ -130,7 +165,7 @@ def _install_runner_stub(monkeypatch) -> None:
 @pytest.mark.asyncio
 async def test_subscriber_count_decrements_after_aclose(tmp_path, monkeypatch):
     """После aclose у stream_live подписчик должен быть удалён из info.subscribers."""
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     manager = RunManager(EventStore(str(tmp_path / "agui.db")))
@@ -160,7 +195,7 @@ async def test_subscriber_count_decrements_after_aclose(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_gateway_disconnect_cancels_orphaned_run(tmp_path, monkeypatch):
     """Disconnect единственного live SSE-подписчика отменяет orphaned run."""
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
     from backend.fastapi_app import main as main_module
     import unified_logging as stub_logging
@@ -223,7 +258,7 @@ async def test_gateway_disconnect_cancels_orphaned_run(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_agent_stream_aclose_cancels_orphaned_run(tmp_path, monkeypatch):
     """ASGI close while awaiting more events still cancels the orphaned run."""
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
     from backend.fastapi_app import main as main_module
 
@@ -257,8 +292,11 @@ async def test_agent_stream_aclose_cancels_orphaned_run(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_agent_stream_aclose_after_terminal_event_does_not_cancel(monkeypatch):
-    _install_runner_stub(monkeypatch)
+async def test_agent_stream_aclose_after_terminal_event_does_not_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app import main as main_module
 
     class _Request:
@@ -266,7 +304,7 @@ async def test_agent_stream_aclose_after_terminal_event_does_not_cancel(monkeypa
             return False
 
     class _RunManager:
-        def stream_live(self, run_id):
+        def stream_live(self, run_id, after=0, request_view=None):
             async def _events():
                 yield RunFinishedEvent(
                     type=EventType.RUN_FINISHED,
@@ -297,8 +335,11 @@ async def test_agent_stream_aclose_after_terminal_event_does_not_cancel(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_agent_stream_aclose_after_terminal_workflow_progress_does_not_cancel(monkeypatch):
-    _install_runner_stub(monkeypatch)
+async def test_agent_stream_aclose_after_terminal_workflow_progress_does_not_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app import main as main_module
 
     class _Request:
@@ -306,7 +347,7 @@ async def test_agent_stream_aclose_after_terminal_workflow_progress_does_not_can
             return False
 
     class _RunManager:
-        def stream_live(self, run_id):
+        def stream_live(self, run_id, after=0, request_view=None):
             async def _events():
                 yield CustomEvent(
                     type=EventType.CUSTOM,
@@ -340,8 +381,11 @@ async def test_agent_stream_aclose_after_terminal_workflow_progress_does_not_can
 
 
 @pytest.mark.asyncio
-async def test_agent_stream_aclose_after_service_result_does_not_cancel(monkeypatch):
-    _install_runner_stub(monkeypatch)
+async def test_agent_stream_aclose_after_service_result_does_not_cancel(
+    monkeypatch,
+    tmp_path,
+):
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app import main as main_module
 
     class _Request:
@@ -349,7 +393,7 @@ async def test_agent_stream_aclose_after_service_result_does_not_cancel(monkeypa
             return False
 
     class _RunManager:
-        def stream_live(self, run_id):
+        def stream_live(self, run_id, after=0, request_view=None):
             async def _events():
                 yield CustomEvent(
                     type=EventType.CUSTOM,
@@ -379,8 +423,11 @@ async def test_agent_stream_aclose_after_service_result_does_not_cancel(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_replay_follow_aclose_does_not_cancel_detached_run(monkeypatch):
-    _install_runner_stub(monkeypatch)
+async def test_replay_follow_aclose_does_not_cancel_detached_run(
+    monkeypatch,
+    tmp_path,
+):
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app import main as main_module
 
     class _Request:
@@ -418,13 +465,18 @@ async def test_replay_follow_aclose_does_not_cancel_detached_run(monkeypatch):
     live_stream = _LiveStream()
 
     class _RunManager:
-        def can_access(self, run_id, principal):
+        store_executor = None
+
+        async def can_access(self, run_id, principal):
             return True
 
         def get_info(self, run_id):
             return object()
 
-        def stream_live(self, run_id, after=0):
+        async def durable_terminal_view(self, run_id):
+            return None
+
+        def stream_live(self, run_id, after=0, request_view=None):
             return live_stream
 
     cancelled: list[str] = []
@@ -449,7 +501,7 @@ async def test_replay_follow_aclose_does_not_cancel_detached_run(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancel_if_orphaned_skips_persisted_terminal_event(tmp_path, monkeypatch):
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
 
     store = EventStore(str(tmp_path / "agui.db"))
@@ -483,7 +535,7 @@ async def test_cancel_if_orphaned_skips_persisted_terminal_event(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_cancel_if_orphaned_skips_persisted_terminal_workflow_progress(tmp_path, monkeypatch):
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
 
     store = EventStore(str(tmp_path / "agui.db"))
@@ -521,7 +573,7 @@ async def test_cancel_if_orphaned_skips_persisted_terminal_workflow_progress(tmp
 
 @pytest.mark.asyncio
 async def test_cancel_if_orphaned_skips_persisted_terminal_workflow_result(tmp_path, monkeypatch):
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
 
     store = EventStore(str(tmp_path / "agui.db"))
@@ -530,11 +582,7 @@ async def test_cancel_if_orphaned_skips_persisted_terminal_workflow_result(tmp_p
     await manager.start_run(RunAgentInput(**_make_payload(run_id)))
     await asyncio.sleep(0.05)
 
-    store.append(
-        run_id,
-        "WORKFLOW_RESULT",
-        {"status": "completed", "artifacts": {"final_output": "ok"}},
-    )
+    _append_terminal_workflow_result(store, run_id)
 
     cancelled = await manager.cancel_if_orphaned(run_id)
 
@@ -555,7 +603,7 @@ async def test_cancel_if_orphaned_skips_persisted_terminal_workflow_result(tmp_p
 
 @pytest.mark.asyncio
 async def test_cancel_if_orphaned_skips_persisted_service_result(tmp_path, monkeypatch):
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
 
     store = EventStore(str(tmp_path / "agui.db"))
@@ -593,7 +641,7 @@ async def test_cancel_if_orphaned_skips_persisted_service_result(tmp_path, monke
 
 @pytest.mark.asyncio
 async def test_explicit_cancel_skips_persisted_terminal_workflow_result(tmp_path, monkeypatch):
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager, RunStatus
 
     store = EventStore(str(tmp_path / "agui.db"))
@@ -602,11 +650,7 @@ async def test_explicit_cancel_skips_persisted_terminal_workflow_result(tmp_path
     await manager.start_run(RunAgentInput(**_make_payload(run_id)))
     await asyncio.sleep(0.05)
 
-    store.append(
-        run_id,
-        "WORKFLOW_RESULT",
-        {"status": "completed", "artifacts": {"final_output": "ok"}},
-    )
+    _append_terminal_workflow_result(store, run_id)
 
     cancelled = await manager.cancel(run_id)
 
@@ -627,7 +671,7 @@ async def test_explicit_cancel_skips_persisted_terminal_workflow_result(tmp_path
 @pytest.mark.asyncio
 async def test_disconnect_with_other_subscriber_keeps_run_alive(tmp_path, monkeypatch):
     """Если после disconnect одного клиента остался другой подписчик, run жив."""
-    _install_runner_stub(monkeypatch)
+    _install_runner_stub(monkeypatch, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     manager = RunManager(EventStore(str(tmp_path / "agui.db")))

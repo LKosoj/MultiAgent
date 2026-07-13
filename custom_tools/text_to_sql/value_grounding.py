@@ -7,6 +7,13 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from workflow.deadline import WorkflowDeadlineExceeded
+
+from .core._db_exec import (
+    QueryExecutionRequest,
+    QueryExecutor,
+    QueryPurpose,
+)
 from .redaction import redact_text
 
 
@@ -93,6 +100,8 @@ def ground_linked_filter_values(
                 dsn=dsn,
                 limits=limits,
             )
+        except WorkflowDeadlineExceeded:
+            raise
         except Exception as exc:
             preserved = dict(filter_info)
             preserved["value_grounding"] = {
@@ -316,15 +325,18 @@ def _execute_lookup(dsn: str, build_sql, *, row_limit: int) -> list[Any]:
     from db_plugins import get_plugin
 
     plugin = get_plugin(dsn)
-    conn = plugin.connect(dsn)
-    try:
-        sql = build_sql(plugin)
-        result = plugin.execute_select(conn, sql, row_limit=row_limit)
-        if not result.get("success", False):
-            raise RuntimeError(result.get("error_message") or "lookup query failed")
-        return list(result.get("data") or [])
-    finally:
-        plugin.close(conn)
+    sql = build_sql(plugin)
+    result = QueryExecutor(get_plugin=get_plugin).execute(
+        QueryExecutionRequest(
+            sql_query=sql,
+            purpose=QueryPurpose.GROUNDING,
+            row_limit=row_limit,
+            dsn=dsn,
+        )
+    )
+    if not result.success:
+        raise RuntimeError(result.error_message or "lookup query failed")
+    return result.data
 
 
 def _candidate_label_columns(

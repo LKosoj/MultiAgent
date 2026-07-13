@@ -65,9 +65,11 @@ async def test_start_run_rejects_run_id_with_persisted_history(tmp_path, monkeyp
         },
     )
     manager = rm.RunManager(store, evict_ttl_seconds=0)
-
-    with pytest.raises(ValueError, match="run_id already exists"):
-        await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+    try:
+        with pytest.raises(ValueError, match="run_id already exists"):
+            await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+    finally:
+        manager.close()
 
 
 @pytest.mark.asyncio
@@ -87,13 +89,15 @@ async def test_start_run_rejects_when_max_concurrent_runs_reached(tmp_path, monk
 
     rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
     manager = rm.RunManager(EventStore(str(tmp_path / "agui_events.db")))
+    try:
+        first = await manager.start_run(RunAgentInput(**_make_payload("run-first")))
+        with pytest.raises(ValueError, match="too many active AG-UI runs"):
+            await manager.start_run(RunAgentInput(**_make_payload("run-second")))
 
-    first = await manager.start_run(RunAgentInput(**_make_payload("run-first")))
-    with pytest.raises(ValueError, match="too many active AG-UI runs"):
-        await manager.start_run(RunAgentInput(**_make_payload("run-second")))
-
-    release.set()
-    await first.task
+        release.set()
+        await first.task
+    finally:
+        manager.close()
 
 
 @pytest.mark.asyncio
@@ -125,32 +129,34 @@ async def test_short_run_subscribers_always_receive_finished(tmp_path, monkeypat
 
     rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
     manager = rm.RunManager(EventStore(str(tmp_path / "agui_events.db")))
+    try:
+        run_count = 100
 
-    run_count = 100
+        async def run_one(idx: int) -> list[str]:
+            run_id = f"run-{idx:03d}-{uuid.uuid4().hex[:8]}"
+            await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+            # Без явной паузы — подписка должна работать в любой момент гонки
+            # между публикацией событий и установкой терминального статуса.
+            return [event.type.value async for event in manager.stream_live(run_id)]
 
-    async def run_one(idx: int) -> list[str]:
-        run_id = f"run-{idx:03d}-{uuid.uuid4().hex[:8]}"
-        await manager.start_run(RunAgentInput(**_make_payload(run_id)))
-        # Без явной паузы — подписка должна работать в любой момент гонки
-        # между публикацией событий и установкой терминального статуса.
-        return [event.type.value async for event in manager.stream_live(run_id)]
-
-    results = await asyncio.wait_for(
-        asyncio.gather(*(run_one(i) for i in range(run_count))),
-        timeout=10,
-    )
-
-    assert len(results) == run_count
-    for idx, events in enumerate(results):
-        assert "RUN_FINISHED" in events, (
-            f"run #{idx} missed RUN_FINISHED, got events={events}"
+        results = await asyncio.wait_for(
+            asyncio.gather(*(run_one(i) for i in range(run_count))),
+            timeout=10,
         )
-        # Если RUN_FINISHED получен, перед ним должен идти CUSTOM,
-        # либо CUSTOM пришёл из buffered snapshot — оба варианта валидны,
-        # но RUN_FINISHED обязан быть последним полученным событием.
-        assert events[-1] == "RUN_FINISHED", (
-            f"run #{idx}: RUN_FINISHED must be terminal, got events={events}"
-        )
+
+        assert len(results) == run_count
+        for idx, events in enumerate(results):
+            assert "RUN_FINISHED" in events, (
+                f"run #{idx} missed RUN_FINISHED, got events={events}"
+            )
+            # Если RUN_FINISHED получен, перед ним должен идти CUSTOM,
+            # либо CUSTOM пришёл из buffered snapshot — оба варианта валидны,
+            # но RUN_FINISHED обязан быть последним полученным событием.
+            assert events[-1] == "RUN_FINISHED", (
+                f"run #{idx}: RUN_FINISHED must be terminal, got events={events}"
+            )
+    finally:
+        manager.close()
 
 
 @pytest.mark.asyncio
@@ -176,21 +182,94 @@ async def test_subscribe_after_terminal_status_drains_buffer(tmp_path, monkeypat
 
     rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
     manager = rm.RunManager(EventStore(str(tmp_path / "agui_events.db")))
+    try:
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+        info = await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+        # Дождёмся завершения run'а полностью.
+        await info.task
 
-    run_id = f"run-{uuid.uuid4().hex[:8]}"
-    info = await manager.start_run(RunAgentInput(**_make_payload(run_id)))
-    # Дождёмся завершения run'а полностью.
-    await info.task
+        assert info.status == rm.RunStatus.FINISHED
+        assert info.subscribers == set()  # subscribers очищены в finally
 
-    assert info.status == rm.RunStatus.FINISHED
-    assert info.subscribers == set()  # subscribers очищены в finally
-
-    events = await asyncio.wait_for(
-        _collect(manager.stream_live(run_id)),
-        timeout=2,
-    )
-    assert events == ["CUSTOM", "RUN_FINISHED"]
+        events = await asyncio.wait_for(
+            _collect(manager.stream_live(run_id)),
+            timeout=2,
+        )
+        assert events == ["CUSTOM", "RUN_FINISHED"]
+    finally:
+        manager.close()
 
 
 async def _collect(aiter) -> list[str]:
     return [event.type.value async for event in aiter]
+
+
+@pytest.mark.asyncio
+async def test_slow_store_call_does_not_block_event_loop(tmp_path, monkeypatch):
+    """T2: медленный вызов EventStore не должен блокировать event loop.
+
+    Патчим EventStore.append так, чтобы держать store._lock под time.sleep(0.3)
+    (эмуляция медленной SQLite-транзакции). Параллельно крутится heartbeat-корутина
+    с шагом ~10ms. Если RunManager вызывает store-методы синхронно в потоке event
+    loop'а, heartbeat не может тикать, пока держится store._lock — счётчик не
+    продвинется за время медленного вызова (падает на коде без ThreadPoolExecutor-
+    диспетчеризации). Если store-вызовы уходят в выделенный executor, event loop
+    остаётся свободным и heartbeat продолжает тикать.
+    """
+    slow_delay = 0.3
+    heartbeat_step = 0.01
+
+    async def fake_run_agent(input_data):
+        yield RunFinishedEvent(
+            type=EventType.RUN_FINISHED,
+            thread_id=input_data.thread_id,
+            run_id=input_data.run_id,
+            result=None,
+            timestamp=int(time.time() * 1000),
+        )
+
+    rm = _load_run_manager_with_runner_stub(monkeypatch, fake_run_agent)
+    store = EventStore(str(tmp_path / "agui_events.db"))
+    real_append = store.append
+
+    def slow_append(*args, **kwargs):
+        with store._lock:
+            time.sleep(slow_delay)
+        return real_append(*args, **kwargs)
+
+    monkeypatch.setattr(store, "append", slow_append)
+
+    manager = rm.RunManager(store)
+
+    heartbeat_ticks = 0
+    stop_heartbeat = False
+
+    async def heartbeat() -> None:
+        nonlocal heartbeat_ticks
+        while not stop_heartbeat:
+            await asyncio.sleep(heartbeat_step)
+            heartbeat_ticks += 1
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    try:
+        run_id = f"run-{uuid.uuid4().hex[:8]}"
+        ticks_before = heartbeat_ticks
+        started_at = time.monotonic()
+        info = await manager.start_run(RunAgentInput(**_make_payload(run_id)))
+        await info.task
+        elapsed = time.monotonic() - started_at
+        ticks_during = heartbeat_ticks - ticks_before
+    finally:
+        stop_heartbeat = True
+        await heartbeat_task
+        manager.close()
+
+    assert elapsed >= slow_delay
+    # Если store-вызов блокирует event loop, heartbeat не может тикать, пока
+    # держится store._lock; при недиспетчеризованном (синхронном) вызове
+    # ticks_during останется около 0 за всё окно в slow_delay секунд.
+    assert ticks_during >= 10, (
+        f"heartbeat тикнул только {ticks_during} раз за {elapsed:.3f}s, пока "
+        f"выполнялся медленный ({slow_delay}s) store-вызов — event loop, "
+        "похоже, заблокирован"
+    )

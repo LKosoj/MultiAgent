@@ -16,6 +16,12 @@
 import pytest
 import sqlglot  # noqa: F401
 
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 from custom_tools.text_to_sql.sql_postprocess import (  # noqa: E402
     SQLPostprocessError,
     apply_dialect_quoting,
@@ -248,7 +254,35 @@ class _StubConn:
     closed = False
 
 
-class _StubPlugin:
+class _AdmittedPluginDouble:
+    dialect = "postgres"
+
+    def get_capabilities(self, _dsn=None):
+        native = Capability.supported(EnforcementMode.DRIVER, "TEST_NATIVE")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=native,
+            statement_timeout=native,
+            cancellation=native,
+            explain=native,
+            introspection=native,
+            composite_fk_introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+            parameter_binding=Capability.unsupported("TEST_NOT_REQUIRED"),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, _timeout_ms):
+        return None
+
+
+class _StubPlugin(_AdmittedPluginDouble):
     """Минимальный плагин: connect возвращает stub, execute_select даёт пустой результат."""
 
     def __init__(self, dsn_log):
@@ -302,7 +336,6 @@ def test_b4_secure_db_executor_no_dsn_no_env_raises(monkeypatch):
         secure_db_executor(
             "SELECT 1",
             sql_validator=_SafePassthrough(),
-            schema_limiter=None,
         )
     assert dsn_log == [], "Plugin не должен был быть получен без DSN"
 
@@ -317,7 +350,6 @@ def test_b4_secure_db_executor_no_dsn_with_env_default_raises(monkeypatch):
         secure_db_executor(
             "SELECT 1",
             sql_validator=_SafePassthrough(),
-            schema_limiter=None,
         )
     assert dsn_log == [], "Silent env-fallback на DB_DSN должен быть запрещён"
 
@@ -337,7 +369,6 @@ def test_b4_secure_db_executor_no_dsn_with_env_and_optin_warns_and_uses(
     result = secure_db_executor(
         "SELECT 1",
         sql_validator=_SafePassthrough(),
-        schema_limiter=None,
     )
     assert isinstance(result, dict)
     assert result.get("success") is True
@@ -357,7 +388,6 @@ def test_b4_secure_db_executor_explicit_dsn_wins_over_env(monkeypatch):
         "SELECT 1",
         dsn="postgresql://explicit@host/explicit_db",
         sql_validator=_SafePassthrough(),
-        schema_limiter=None,
     )
     assert result.get("success") is True
     assert dsn_log == ["postgresql://explicit@host/explicit_db"]
@@ -381,7 +411,6 @@ def test_b4_secure_db_executor_dry_run_no_dsn_does_not_pass_none_to_safety(monke
     result = secure_db_executor(
         "SELECT 1",
         sql_validator=_SafePassthrough(),
-        schema_limiter=None,
     )
 
     assert result["dry_run_only"] is True
@@ -420,7 +449,11 @@ def test_b5_sql_explain_no_dsn_with_env_default_does_not_use_db(monkeypatch):
 
 
 def test_b5_sql_explain_dry_run_no_dsn_does_not_pass_none_to_safety(monkeypatch):
-    """Dry-run без dsn не должен передавать None в dialect/safety layer."""
+    """T14: dry-run EXPLAIN без dsn — preparation read как и FINAL — не должен
+
+    открывать соединение с БД, и обязан передавать в safety/dialect layer
+    пустую строку (не None) в качестве dsn-сентинела.
+    """
     from custom_tools.text_to_sql.core import _sql_generation_api as sql_gen_mod
     from custom_tools.text_to_sql import core as core_facade
 
@@ -437,6 +470,8 @@ def test_b5_sql_explain_dry_run_no_dsn_does_not_pass_none_to_safety(monkeypatch)
 
     result = sql_gen_mod.sql_explain("SELECT 1", sql_validator=_SafePassthrough())
 
+    assert result["plan"] is None
+    assert result["issues"] == []
     assert result["dry_run_only"] is True
     assert dsn_log == []
-    assert safety_calls == [("SELECT 1", {"dsn": ""})]
+    assert safety_calls == [("EXPLAIN SELECT 1", {"dsn": ""})]

@@ -20,6 +20,7 @@ PUBLIC_FUNCTIONS = [
     "sql_safety_check",
     "sql_explain",
     "secure_db_executor",
+    "finalize_text_to_sql_run",
     "pii_masking",
     "audit_logger",
     "save_successful_sql",

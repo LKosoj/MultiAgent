@@ -104,6 +104,16 @@ def auth_mode() -> str:
     return mode
 
 
+def validate_auth_configuration() -> None:
+    mode = auth_mode()
+    configured_tokens = _configured_token_map()
+    if mode == "required" and not configured_tokens:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="AG_UI_AUTH_MODE=required requires at least one authentication token",
+        )
+
+
 def authenticate_request(request: Request) -> Principal:
     mode = auth_mode()
     if mode == "disabled":
@@ -181,13 +191,26 @@ def _has_configured_tokens() -> bool:
 def _configured_token_map() -> dict[str, Principal]:
     result: dict[str, Principal] = {}
     token_map_raw = os.getenv("AG_UI_AUTH_TOKEN_MAP")
-    if token_map_raw:
+    if token_map_raw is not None:
+        if not token_map_raw.strip():
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="AG_UI_AUTH_TOKEN_MAP must not be blank",
+            )
         try:
-            parsed = json.loads(token_map_raw)
+            parsed = json.loads(
+                token_map_raw,
+                object_pairs_hook=_reject_duplicate_json_keys,
+            )
         except json.JSONDecodeError as exc:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="invalid AG_UI_AUTH_TOKEN_MAP JSON",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=str(exc),
             ) from exc
         if not isinstance(parsed, dict):
             raise HTTPException(
@@ -195,14 +218,18 @@ def _configured_token_map() -> dict[str, Principal]:
                 detail="AG_UI_AUTH_TOKEN_MAP must be a JSON object",
             )
         for token, spec in parsed.items():
-            if not isinstance(token, str) or not token:
-                continue
+            token = _validated_token(token, "AG_UI_AUTH_TOKEN_MAP token")
             if not isinstance(spec, dict):
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail="AG_UI_AUTH_TOKEN_MAP values must be objects",
                 )
-            result[token] = _principal_from_spec(spec, default_subject=token)
+            if token in result:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="duplicate authentication token in AG_UI_AUTH_TOKEN_MAP",
+                )
+            result[token] = _principal_from_spec(spec)
 
     _add_env_token(
         result,
@@ -221,21 +248,67 @@ def _configured_token_map() -> dict[str, Principal]:
     return result
 
 
-def _principal_from_spec(spec: dict[str, object], default_subject: str) -> Principal:
-    roles_raw = spec.get("roles") or ["user"]
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate token or field in AG_UI_AUTH_TOKEN_MAP")
+        result[key] = value
+    return result
+
+
+def _validated_token(token: object, source: str) -> str:
+    if not isinstance(token, str) or not token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{source} must not be blank",
+        )
+    if token != token.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{source} must not contain surrounding whitespace",
+        )
+    return token
+
+
+def _principal_from_spec(spec: dict[str, object]) -> Principal:
+    subject_raw = spec.get("subject")
+    if not isinstance(subject_raw, str) or not subject_raw.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="principal subject must be a non-blank string",
+        )
+
+    tenant_raw = spec.get("tenant_id", "default")
+    if not isinstance(tenant_raw, str) or not tenant_raw.strip():
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="principal tenant_id must be a non-blank string",
+        )
+
+    roles_raw = spec.get("roles", ["user"])
     if isinstance(roles_raw, str):
-        roles = frozenset(role.strip() for role in roles_raw.split(",") if role.strip())
+        role_values = roles_raw.split(",")
     elif isinstance(roles_raw, list):
-        roles = frozenset(str(role) for role in roles_raw if str(role))
+        role_values = roles_raw
     else:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="principal roles must be a string or list",
         )
+    if not role_values or any(
+        not isinstance(role, str) or not role.strip()
+        for role in role_values
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="principal roles must contain non-blank strings",
+        )
+    roles = frozenset(role.strip() for role in role_values)
     return Principal(
-        subject=str(spec.get("subject") or default_subject),
-        tenant_id=str(spec.get("tenant_id") or "default"),
-        roles=roles or frozenset({"user"}),
+        subject=subject_raw.strip(),
+        tenant_id=tenant_raw.strip(),
+        roles=roles,
     )
 
 
@@ -246,8 +319,14 @@ def _add_env_token(
     roles: set[str],
 ) -> None:
     token = os.getenv(env_name)
-    if not token:
+    if token is None:
         return
+    token = _validated_token(token, env_name)
+    if token in token_map:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"duplicate authentication token configured by {env_name}",
+        )
     token_map[token] = Principal(
         subject=default_subject,
         tenant_id="default",

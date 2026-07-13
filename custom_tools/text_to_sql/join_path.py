@@ -43,7 +43,35 @@ def _edge_key(e: Dict[str, Any]) -> Tuple[Any, ...]:
     Используется ВЕЗДЕ (сортировка входа, adjacency, дедуп, MST), чтобы
     результат был детерминирован при равных весах.
     """
-    return (e["weight"], e["a"], e["b"], e["a_col"], e["b_col"])
+    return (
+        e["weight"],
+        e["a"],
+        e["b"],
+        str(e.get("constraint_id") or ""),
+        _column_pairs(e),
+    )
+
+
+def _column_pairs(e: Dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    raw_pairs = e.get("column_pairs")
+    if raw_pairs is None:
+        return ((e["a_col"], e["b_col"]),)
+    if not isinstance(raw_pairs, (list, tuple)) or not raw_pairs:
+        raise ValueError("column_pairs must be a non-empty sequence")
+    pairs: list[tuple[str, str]] = []
+    for pair in raw_pairs:
+        if not isinstance(pair, dict):
+            raise ValueError("column_pairs members must be mappings")
+        source = pair.get("from_column")
+        target = pair.get("to_column")
+        if not isinstance(source, str) or not source:
+            raise ValueError("column_pairs.from_column is required")
+        if not isinstance(target, str) or not target:
+            raise ValueError("column_pairs.to_column is required")
+        pairs.append((source, target))
+    if pairs[0] != (e["a_col"], e["b_col"]):
+        raise ValueError("scalar edge aliases must equal the first column pair")
+    return tuple(pairs)
 
 
 class _UnionFind:
@@ -78,9 +106,13 @@ def _undirected_pair(e: Dict[str, Any]) -> frozenset:
     return frozenset((e["a"], e["b"]))
 
 
-def _dedup_key(e: Dict[str, Any]) -> Tuple[frozenset, str, str]:
-    """Ключ дедупликации исходного ребра: (frozenset((a,b)), a_col, b_col)."""
-    return (_undirected_pair(e), e["a_col"], e["b_col"])
+def _dedup_key(e: Dict[str, Any]) -> Tuple[Any, ...]:
+    """Symmetric identity for one whole constraint edge."""
+    endpoints = tuple(
+        frozenset(((e["a"], source), (e["b"], target)))
+        for source, target in _column_pairs(e)
+    )
+    return (_undirected_pair(e), str(e.get("constraint_id") or ""), endpoints)
 
 
 def _build_adjacency(edges: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -149,7 +181,13 @@ def _mst(
     def _sort_key(e: Dict[str, Any]) -> Tuple[Any, ...]:
         u, v = e["a"], e["b"]
         lo, hi = (u, v) if u <= v else (v, u)
-        return (e["weight"], lo, hi, e["a_col"], e["b_col"])
+        return (
+            e["weight"],
+            lo,
+            hi,
+            str(e.get("constraint_id") or ""),
+            _column_pairs(e),
+        )
 
     uf = _UnionFind()
     for n in nodes:
@@ -201,37 +239,44 @@ def _emit_clause(
     """
     a, b = e["a"], e["b"]
     a_col, b_col = e["a_col"], e["b_col"]
+    pairs = _column_pairs(e)
     jt = e["jt"]
 
     def Q(x: str) -> str:
         return quote_identifier(x, dsn=dsn)
 
-    if parent == a:
-        # forward: подключаем b
-        clause = (
-            f"{jt} JOIN {Q(b)} ON {Q(a)}.{Q(a_col)} = {Q(b)}.{Q(b_col)}"
-        )
-        entry = {
+    predicates = " AND ".join(
+        f"{Q(a)}.{Q(source)} = {Q(b)}.{Q(target)}"
+        for source, target in pairs
+    )
+
+    def entry(join_type: str) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
             "from_table": a,
             "from_column": a_col,
             "to_table": b,
             "to_column": b_col,
-            "join_type": jt,
+            "join_type": join_type,
         }
+        if "column_pairs" in e:
+            if e.get("constraint_id"):
+                result["constraint_id"] = e["constraint_id"]
+            result["column_pairs"] = [
+                {"from_column": source, "to_column": target}
+                for source, target in pairs
+            ]
+        return result
+
+    if parent == a:
+        # forward: подключаем b
+        clause = f"{jt} JOIN {Q(b)} ON {predicates}"
+        join_entry = entry(jt)
     else:
         # reverse: parent==b, подключаем a — инвертируем jt
         effective_jt = _invert_join_type(jt)
-        clause = (
-            f"{effective_jt} JOIN {Q(a)} ON {Q(a)}.{Q(a_col)} = {Q(b)}.{Q(b_col)}"
-        )
-        entry = {
-            "from_table": a,
-            "from_column": a_col,
-            "to_table": b,
-            "to_column": b_col,
-            "join_type": effective_jt,
-        }
-    return clause, entry
+        clause = f"{effective_jt} JOIN {Q(a)} ON {predicates}"
+        join_entry = entry(effective_jt)
+    return clause, join_entry
 
 
 def build_join_path(
@@ -324,7 +369,7 @@ def build_join_path(
     t1 = _mst(connectable, meta_edges)
 
     # --- Шаг 3: разворот мета-рёбер в исходные + дедуп ---
-    best_by_key: Dict[Tuple[frozenset, str, str], Dict[str, Any]] = {}
+    best_by_key: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
     for me in t1:
         for orig in me["path"]:
             key = _dedup_key(orig)

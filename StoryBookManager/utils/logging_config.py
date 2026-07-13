@@ -31,6 +31,7 @@ def setup_logging():
     # Очищаем существующие handlers
     for handler in root_logger.handlers[:]:
         root_logger.removeHandler(handler)
+        handler.close()
     
     # Консольный handler
     console_handler = logging.StreamHandler()

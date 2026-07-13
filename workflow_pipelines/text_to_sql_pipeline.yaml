@@ -16,18 +16,22 @@ inputs:
   session_id: ""        # Стабильный идентификатор сессии/схемы
   run_id: ""            # Уникальный идентификатор конкретного запуска
   safety_level: strict
+  safety_policy: null
+  schema_scope: null
   include_explanation: true
   validate_schema: true
   dry_run_only: false
   use_schema_suggestions: true
   value_grounding: false
   allow_enhanced_fallback: false
+  sql_safety_check_feedback: {}
+  sql_execution_feedback: {}
 
 outputs:
   final:
     from_step: db_audit
     field: output
-    format: markdown
+    format: json
   sql_generation:
     from_step: sql_generation
     field: output
@@ -107,6 +111,7 @@ steps:
       entities: '{intent_extraction_step.entities}'
       dsn: '{dsn}'
       session_id: '{session_id}'
+      schema_scope: '{schema_scope}'
       value_grounding: '{value_grounding}'
     depends_on:
       - nlu_processing
@@ -121,8 +126,14 @@ steps:
           filters: {}
         joins: []
         join_success: false
-        sql_generation_allowed: true
+        decision: ABSTAIN
+        decision_reasons:
+          - SCHEMA_GROUNDING_DISABLED
+        terminal_reason_code: SCHEMA_GROUNDING_FAILED
+        sql_generation_allowed: false
         unlinked_entities: []
+        unresolved_entities: []
+        ambiguous_bindings: []
         schema_info: {}
     timeout: 60
     retry_policy:
@@ -130,7 +141,32 @@ steps:
       backoff_strategy: exponential
   
   # =====================================================================
-  # ЭТАП 4: SQL GENERATION (отдельный агент)
+  # ЭТАП 4: SUCCESSFUL SQL RETRIEVAL (прямой вызов тула)
+  # =====================================================================
+
+  - id: successful_sql_retrieval
+    step_type: tool
+    task: "Получить ограниченные успешные SQL-примеры для текущей версии схемы"
+    tool_name: successful_sql_retrieval
+    condition: '{schema_linking_step.sql_generation_allowed}'
+    tool_params:
+      namespace_version_key: '{schema_linking_step.namespace_version_key}'
+      user_query: '{query}'
+    depends_on:
+      - schema_linking_step
+    timeout: 30
+    retry_policy:
+      max_retries: 0
+    metadata:
+      skip_output:
+        status: EMPTY
+        examples: []
+        context_json: "[]"
+        failed_ids: []
+        error_code: null
+
+  # =====================================================================
+  # ЭТАП 5: SQL GENERATION (отдельный агент)
   # =====================================================================
 
   - id: sql_generation
@@ -167,6 +203,21 @@ steps:
       {schema_linking_step}
       ```
 
+      Feedback от предыдущих ограниченных попыток (может быть пустым):
+
+      4. Замечания SQL verifier:
+      ```json
+      {sql_safety_check_feedback}
+      ```
+
+      5. Ошибка исполнения предыдущего SQL:
+      ```json
+      {sql_execution_feedback}
+      ```
+
+      Если feedback непустой, исправь причину ошибки, но заново проверь SQL по
+      исходному запросу и схеме. Не копируй SQL из feedback как доверенный ввод.
+
       Параметры запуска:
       - session_id: {session_id}
       - run_id: {run_id}
@@ -177,7 +228,7 @@ steps:
 
       Используй инструмент sql_generation_plugin(context=..., user_query=..., session_id="{session_id}") для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
     depends_on:
-      - schema_linking_step
+      - successful_sql_retrieval
     timeout: 120
     retry_policy:
       max_retries: 2
@@ -188,8 +239,10 @@ steps:
       run_id: '{run_id}'
       max_rows: '{max_rows}'
       safety_level: '{safety_level}'
+      safety_policy: '{safety_policy}'
       use_schema_suggestions: '{use_schema_suggestions}'
       dsn: '{dsn}'
+      successful_sql_context_json: '{successful_sql_retrieval.context_json}'
       # skip_output применяется когда schema_linking_step.sql_generation_allowed=false.
       # Это fail-closed guard: генератор не должен галлюцинировать SQL по пустой
       # или несвязанной схеме.
@@ -201,7 +254,7 @@ steps:
           - "Проверьте, что schema_linking вернул связанные таблицы, колонки и sql_generation_allowed=true"
 
   # =====================================================================
-  # ЭТАП 5: SQL VERIFICATION (отдельный агент)
+  # ЭТАП 6: SQL VERIFICATION (отдельный агент)
   # =====================================================================
 
   - id: sql_verification
@@ -250,6 +303,7 @@ steps:
       session_id: '{session_id}'
       run_id: '{run_id}'
       safety_level: '{safety_level}'
+      safety_policy: '{safety_policy}'
       validate_schema: '{validate_schema}'
       dsn: '{dsn}'
       # Контрактный маркер для движка / документации: при verification_status=Rejected
@@ -279,53 +333,69 @@ steps:
       feedback_field: sql_safety_check_feedback
 
   # =====================================================================
-  # ЭТАП 6: DB AUDIT / EXECUTION (отдельный агент)
+  # ЭТАП 7: DETERMINISTIC DB EXECUTION / AUDIT
   # =====================================================================
 
   - id: db_audit
-    step_type: agent
-    agent_type: db_audit_agent
-    # Выполняем только при Approved. При Rejected step пропускается и
-    # подставляется skip_output (status=skipped_rejected_by_verifier).
+    step_type: tool
+    tool_name: finalize_text_to_sql_run
+    output_schema: json_object
+    output_schema_requirements:
+      required:
+        - run_id
+        - status
+        - reason_code
+        - sql
+        - generated
+        - approved
+        - executed
+        - dry_run
+        - audited
+        - data
+        - columns
+        - rows_affected
+        - error
+        - execution
+        - audit
+        - persistence
+      properties:
+        status:
+          enum:
+            - succeeded
+            - abstained
+            - failed
+            - cancelled
+            - timed_out
     condition: '{sql_verification.verification_status} == "Approved"'
-    task: |
-      Выполни одобренный SQL-запрос и верни результаты.
-
-      SQL-запрос (после генерации):
-      ```json
-      {sql_generation}
-      ```
-
-      Результат верификации:
-      ```json
-      {sql_verification}
-      ```
-
-      Параметры выполнения:
-      - dsn: передан инструментам через workflow runtime metadata
-      - session_id: {session_id}
-      - run_id: {run_id}
-      - max_rows: {max_rows}
-      - dry_run_only: {dry_run_only}
-      - include_explanation: {include_explanation}
-
-      Если dry_run_only=true — НЕ выполняй SQL в БД, верни SQL и статус выполнения executed=false, status=skipped.
-      Иначе выполни SQL с ограничением max_rows и верни:
-      - Постановку задачи (переформулированный запрос пользователя)
-      - Сгенерированный SQL-запрос (ОБЯЗАТЕЛЬНО!)
-      - Результаты выполнения запроса
-      - Анализ полученных данных
-      - Выводы и ограничения (если есть)
-      - Если выполнение упало, вернуло техническую ошибку или явно бессмысленный пустой результат, добавь структурный маркер retry_recommended=true и конкретные recommendations — workflow использует это как execution feedback для повторной генерации.
-
-      При сохранении успешного SQL в RAG вызывай save_successful_sql(...). DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструментам из metadata шага, чтобы файл попал в session_id целевой БД, а не в DB_DSN окружения.
-
-      Формат отчёта — структурированный текст на русском языке.
+    task: "Детерминированно завершить одобренный Text-to-SQL run"
+    tool_params:
+      sql_query: '{sql_generation.sql}'
+      user_query: '{query}'
+      verification_status: '{sql_verification.verification_status}'
+      dsn: '{dsn}'
+      row_limit: '{max_rows}'
+      dry_run_only: '{dry_run_only}'
+      session_id: '{session_id}'
+      run_id: '{run_id}'
+      safety_policy: '{safety_policy}'
+      namespace_version_key: '{schema_linking_step.namespace_version_key}'
     depends_on:
       - sql_verification
     timeout: 180
     retry_policy:
-      max_retries: 1
+      max_retries: 0
+    # Ровно одна детерминированно ограниченная попытка исправить SQL только
+    # после точного EXECUTION_FAILED. Сначала повторяются generation и
+    # verification, затем finalizer выполняется ещё раз. Audit/persistence и
+    # contract failures не запускают этот цикл.
+    output_retry_policy:
+      condition: '{db_audit.reason_code} == "EXECUTION_FAILED"'
+      rerun_step: sql_generation
+      rerun_chain:
+        - sql_generation
+        - sql_verification
+      max_iterations: 1
+      feedback_field: sql_execution_feedback
     metadata:
       pipeline_type: text_to_sql
       retryable: false
@@ -335,25 +405,32 @@ steps:
       session_id: '{session_id}'
       run_id: '{run_id}'
       safety_level: '{safety_level}'
+      safety_policy: '{safety_policy}'
       include_explanation: '{include_explanation}'
       validate_schema: '{validate_schema}'
       dry_run_only: '{dry_run_only}'
       use_schema_suggestions: '{use_schema_suggestions}'
       allow_enhanced_fallback: '{allow_enhanced_fallback}'
-      # skip_output применяется когда condition выше == false (verifier=Rejected)
+      # Полный terminal outcome для verifier rejection. Runtime executor и audit
+      # в этой ветке не вызываются.
       skip_output:
-        status: skipped_rejected_by_verifier
-        reason: SQL was rejected by verifier; db_audit not executed
+        run_id: '{run_id}'
+        status: abstained
+        reason_code: VERIFIER_REJECTED
+        sql: '{sql_generation.sql}'
+        generated: false
+        approved: false
         executed: false
-    output_retry_policy:
-      condition: '{db_audit.retry_recommended}'
-      rerun_step: sql_generation
-      rerun_chain:
-        - sql_generation
-        - sql_verification
-      max_iterations: 1
-      feedback_field: sql_execution_feedback
-
+        dry_run: false
+        audited: false
+        data: []
+        columns: []
+        rows_affected: 0
+        error: null
+        execution: {}
+        audit: {}
+        persistence:
+          status: not_attempted
 error_handling:
   on_failure: fail
   auto_retry_transient: true

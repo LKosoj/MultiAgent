@@ -13,7 +13,10 @@ import json
 import os
 import threading
 from contextlib import nullcontext
-from typing import Dict, List
+from dataclasses import dataclass
+from enum import Enum
+from time import monotonic
+from typing import Any, Dict
 from smolagents import tool
 
 from .chroma_text import extract_tactical_chroma_text
@@ -23,6 +26,49 @@ from .manager import memory_manager
 
 _SUPPORTED_CHROMA_METRICS = {"cosine", "l2", "ip"}
 _REBUILD_LOCK = threading.RLock()
+_PERMANENTLY_SKIPPED_REASONS = frozenset(
+    {
+        "MALFORMED_JSON",
+        "INVALID_PAYLOAD",
+        "INVALID_SEMANTIC_ID",
+        "CONFLICTING_SOURCE_ROWS",
+        "EMBEDDING_UNAVAILABLE",
+    }
+)
+
+
+class RebuildStatus(str, Enum):
+    COMPLETE = "complete"
+    DEGRADED = "degraded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class CollectionRebuildReport:
+    source_ids: tuple[str, ...]
+    expected_ids: tuple[str, ...]
+    indexed_ids: tuple[str, ...]
+    permanently_skipped: tuple[tuple[str, str], ...]
+    failed: tuple[tuple[str, str], ...]
+    missing_ids: tuple[str, ...]
+    unexpected_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class RebuildReport:
+    status: RebuildStatus
+    tactical: CollectionRebuildReport
+    strategic: CollectionRebuildReport
+    duration_ms: float
+    error_code: str | None = None
+
+
+@dataclass(frozen=True)
+class _PreparedCollection:
+    records: tuple[Dict[str, Any], ...]
+    source_ids: tuple[str, ...]
+    permanently_skipped: tuple[tuple[str, str], ...]
+    failed: tuple[tuple[str, str], ...]
 
 
 def _metric_from_collection(collection) -> str | None:
@@ -104,54 +150,67 @@ def _handler_lock_cm(handler):
     return lock
 
 
-def rebuild_chromadb_from_sqlite(db_handler=None) -> str:
-    """Пересоздает коллекции ChromaDB из данных в SQLite.
-    
-    Args:
-        db_handler: DatabaseHandler (если None, используется из memory_manager)
-    
-    Returns:
-        str: Статус операции и статистика восстановления
-    """
+def _empty_collection_report(
+    *,
+    failed: tuple[tuple[str, str], ...] = (),
+) -> CollectionRebuildReport:
+    return CollectionRebuildReport((), (), (), (), failed, (), ())
+
+
+def _failed_report(started_at: float, error_code: str) -> RebuildReport:
+    failed = (("__rebuild__", error_code),)
+    return RebuildReport(
+        status=RebuildStatus.FAILED,
+        tactical=_empty_collection_report(failed=failed),
+        strategic=_empty_collection_report(failed=failed),
+        duration_ms=round((monotonic() - started_at) * 1000, 3),
+        error_code=error_code,
+    )
+
+
+def _unwritten_collection_report(
+    prepared: _PreparedCollection,
+    error_code: str,
+) -> CollectionRebuildReport:
+    expected = tuple(sorted(record["id"] for record in prepared.records))
+    failed = set(prepared.failed)
+    failed.update((record_id, error_code) for record_id in expected)
+    return CollectionRebuildReport(
+        source_ids=prepared.source_ids,
+        expected_ids=expected,
+        indexed_ids=(),
+        permanently_skipped=prepared.permanently_skipped,
+        failed=tuple(sorted(failed)),
+        missing_ids=expected,
+        unexpected_ids=(),
+    )
+
+
+def rebuild_chromadb_from_sqlite(db_handler=None) -> RebuildReport:
+    """Recreate Chroma from SQLite and return exact typed coverage."""
+    started_at = monotonic()
     handler = db_handler or memory_manager.db_handler
-    
     if not handler.chroma_client or not handler.embedding_model:
-        return "❌ ChromaDB или модель эмбеддингов не инициализированы."
+        return _failed_report(started_at, "CHROMA_BACKEND_UNAVAILABLE")
 
     with _REBUILD_LOCK, _handler_lock_cm(handler):
-        return _rebuild_chromadb_from_sqlite_locked(handler)
+        return _rebuild_chromadb_from_sqlite_locked(handler, started_at)
 
 
-def _rebuild_chromadb_from_sqlite_locked(handler) -> str:
-    chroma_metric = _resolve_rebuild_chroma_metric(handler)
-    print("🔎 Подготовка данных для пересборки ChromaDB...")
-    tactical_records, tactical_errors = _prepare_tactical_memory(handler)
-    strategic_records, strategic_errors = _prepare_strategic_memory(handler)
-
-    collections_touched = False
+def _rebuild_chromadb_from_sqlite_locked(handler, started_at: float) -> RebuildReport:
     try:
-        print("🗑️ Удаление существующих коллекций ChromaDB...")
-        collections_touched = True
-        try:
-            # Удаляем существующие коллекции
-            try:
-                handler.chroma_client.delete_collection("strategic_memory")
-            except Exception:
-                pass  # Коллекция может не существовать
+        chroma_metric = _resolve_rebuild_chroma_metric(handler)
+        tactical_prepared = _prepare_tactical_memory(handler)
+        strategic_prepared = _prepare_strategic_memory(handler)
+    except Exception:
+        return _failed_report(started_at, "REBUILD_PREFLIGHT_FAILED")
 
+    try:
+        for collection_name in ("strategic_memory", "tactical_memory"):
             try:
-                handler.chroma_client.delete_collection("tactical_memory")
+                handler.chroma_client.delete_collection(collection_name)
             except Exception:
-                pass  # Коллекция может не существовать
-        except Exception as e:
-            print(f"⚠️ Предупреждение при удалении коллекций: {e}")
-
-        print("🔧 Создание новых коллекций...")
-        # Пересоздаем коллекции.
-        # W5-T1: явная метрика hnsw:space (default cosine), согласована с
-        # database.py:_init_chroma. Поскольку коллекции выше удалены через
-        # delete_collection, эта запись фактически применяется (в отличие от
-        # get_or_create_collection поверх существующей коллекции).
+                pass
         handler.strategic_collection = handler.chroma_client.get_or_create_collection(
             name="strategic_memory",
             metadata=_collection_metadata(
@@ -168,218 +227,272 @@ def _rebuild_chromadb_from_sqlite_locked(handler) -> str:
                 chroma_metric,
             ),
         )
-
-        # Восстанавливаем тактическую память из agent_memory
-        print("📊 Восстановление тактической памяти...")
-        tactical_count = _add_tactical_memory(handler, tactical_records)
-
-        # Восстанавливаем стратегическую память из strategic_memory
-        print("🎯 Восстановление стратегической памяти...")
-        strategic_count = _add_strategic_memory(handler, strategic_records)
     except Exception:
-        if collections_touched and hasattr(handler, "embedding_metadata_mismatch"):
+        if hasattr(handler, "embedding_metadata_mismatch"):
             handler.embedding_metadata_mismatch = True
-        raise
+        return RebuildReport(
+            status=RebuildStatus.FAILED,
+            tactical=_unwritten_collection_report(
+                tactical_prepared,
+                "COLLECTION_RECREATE_FAILED",
+            ),
+            strategic=_unwritten_collection_report(
+                strategic_prepared,
+                "COLLECTION_RECREATE_FAILED",
+            ),
+            duration_ms=round((monotonic() - started_at) * 1000, 3),
+            error_code="COLLECTION_RECREATE_FAILED",
+        )
 
+    # Collections were recreated successfully against the current embedding
+    # model/dimension, so the mismatch flag is cleared now regardless of any
+    # row-level write failures handled below.
     if hasattr(handler, "embedding_metadata_mismatch"):
         handler.embedding_metadata_mismatch = False
-    
-    # Выводим итоговую статистику
-    result = f"✅ ChromaDB успешно пересоздана из SQLite:\n"
-    result += f"📋 Тактическая память: {tactical_count} записей"
-    if tactical_errors > 0:
-        result += f" (ошибок: {tactical_errors})"
-    result += f"\n🎯 Стратегическая память: {strategic_count} записей"
-    if strategic_errors > 0:
-        result += f" (ошибок: {strategic_errors})"
-    result += f"\n🔍 Семантический поиск готов к использованию"
-    
-    print(result)
-    return result
+
+    tactical = _rebuild_collection(
+        handler.tactical_collection,
+        tactical_prepared,
+    )
+    strategic = _rebuild_collection(
+        handler.strategic_collection,
+        strategic_prepared,
+    )
+    has_technical_failure = any(
+        report.failed or report.missing_ids or report.unexpected_ids
+        for report in (tactical, strategic)
+    )
+    status = RebuildStatus.DEGRADED if has_technical_failure else RebuildStatus.COMPLETE
+    return RebuildReport(
+        status=status,
+        tactical=tactical,
+        strategic=strategic,
+        duration_ms=round((monotonic() - started_at) * 1000, 3),
+        error_code=None,
+    )
 
 
-def _prepare_tactical_memory(handler) -> tuple[List[Dict], int]:
-    """Читает SQLite и готовит embeddings до удаления старых Chroma коллекций.
-    
-    Args:
-        handler: DatabaseHandler
-        
-    Returns:
-        tuple: (prepared records, количество ошибок)
-    """
+def _prepare_tactical_memory(handler) -> _PreparedCollection:
+    from .index_consistency import (
+        SEMANTIC_CACHE_KINDS,
+        is_valid_semantic_id,
+        semantic_payload_fingerprint,
+    )
+
     conn = handler._get_connection()
     try:
-        cursor = conn.cursor()
-        # ChromaDB хранит ТОЛЬКО активные записи (valid_to IS NULL)
-        cursor.execute(
+        records = conn.execute(
             "SELECT session_id, agent_name, step, instance_step, run_id, data "
             "FROM agent_memory WHERE valid_to IS NULL ORDER BY session_id, agent_name, step"
-        )
-        
-        records = cursor.fetchall()
-        prepared: List[Dict] = []
-        errors_count = 0
-        
-        for session_id, agent_name, step, instance_step, run_id, data_json in records:
-            tactical_id = f"{session_id}-{agent_name}-{step}"
-            try:
-                # Парсим JSON данные
-                try:
-                    data_dict = json.loads(data_json)
-                except json.JSONDecodeError:
-                    errors_count += 1
-                    continue
-                
-                # Извлекаем текстовое содержимое
-                text_content = _extract_tactical_chroma_text(data_dict)
-                if not text_content or len(text_content.strip()) < 10:
-                    continue  # Пропускаем слишком короткий контент
-                
-                # Создаем эмбеддинг
-                embedding = memory_manager._create_embedding(
-                    text_content,
-                    purpose="passage",
-                    allow_metadata_mismatch=True,
-                )
-                if not embedding:
-                    continue
-                
-                # Добавляем в ChromaDB
-                metadata = {
-                    "session_id": session_id,
-                    "agent_name": agent_name,
-                    "step": step,
-                    "tactical_id": tactical_id,
-                }
-                key_fields = [
-                    "cache_kind", "cache_key", "cache_source", "schema_version",
-                    "filename", "table_fqn", "auto_loaded", "source",
-                    "artifact_type", "file_hash", "topic", "category", "tags",
-                    "is_global", "saved_by", "saved_at", "memory_source",
-                ]
-                for field in key_fields:
-                    if field in data_dict and data_dict[field] is not None:
-                        metadata[field] = str(data_dict[field])
-                if run_id:
-                    metadata["run_id"] = str(run_id)
-                if instance_step is not None:
-                    metadata["instance_step"] = int(instance_step)
-
-                prepared.append(
-                    {
-                        "embedding": embedding,
-                        "document": text_content,
-                        "metadata": metadata,
-                        "id": tactical_id,
-                    }
-                )
-                    
-            except Exception as e:
-                errors_count += 1
-                if errors_count <= 3:  # Показываем только первые 3 ошибки
-                    print(f"   ⚠️ Ошибка подготовки тактической памяти {tactical_id}: {e}")
-        
-        return prepared, errors_count
-        
+        ).fetchall()
     finally:
         conn.close()
 
+    prepared: dict[str, Dict[str, Any]] = {}
+    fingerprints: dict[str, str] = {}
+    source_ids: set[str] = set()
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    for session_id, agent_name, step, instance_step, run_id, data_json in records:
+        legacy_id = f"{session_id}-{agent_name}-{step}"
+        try:
+            data_dict = json.loads(data_json)
+        except (TypeError, json.JSONDecodeError):
+            source_ids.add(legacy_id)
+            failed.append((legacy_id, "MALFORMED_JSON"))
+            continue
+        if not isinstance(data_dict, dict):
+            source_ids.add(legacy_id)
+            failed.append((legacy_id, "INVALID_PAYLOAD"))
+            continue
+        cache_kind = data_dict.get("cache_kind")
+        semantic_source = data_dict.get("semantic_id") is not None
+        if semantic_source:
+            semantic_id = data_dict.get("semantic_id")
+            if cache_kind not in SEMANTIC_CACHE_KINDS or not is_valid_semantic_id(
+                cache_kind,
+                semantic_id,
+            ):
+                source_ids.add(legacy_id)
+                failed.append((legacy_id, "INVALID_SEMANTIC_ID"))
+                continue
+            tactical_id = semantic_id
+        elif cache_kind == "successful_sql_example":
+            source_ids.add(legacy_id)
+            failed.append((legacy_id, "INVALID_SEMANTIC_ID"))
+            continue
+        else:
+            tactical_id = legacy_id
+        source_ids.add(tactical_id)
 
-def _add_tactical_memory(handler, records: List[Dict]) -> int:
-    synced_count = 0
-    for record in records:
-        handler.tactical_collection.add(
-            embeddings=[record["embedding"]],
-            documents=[record["document"]],
-            metadatas=[record["metadata"]],
-            ids=[record["id"]],
+        text_content = _extract_tactical_chroma_text(data_dict)
+        if not text_content or len(text_content.strip()) < 10:
+            skipped.append((tactical_id, "CONTENT_TOO_SHORT"))
+            continue
+        try:
+            embedding = memory_manager._create_embedding(
+                text_content,
+                purpose="passage",
+                allow_metadata_mismatch=True,
+            )
+        except Exception:
+            failed.append((tactical_id, "EMBEDDING_FAILED"))
+            continue
+        if not embedding:
+            failed.append((tactical_id, "EMBEDDING_UNAVAILABLE"))
+            continue
+
+        metadata = {
+            "session_id": session_id,
+            "agent_name": agent_name,
+            "step": step,
+            "tactical_id": tactical_id,
+        }
+        for field in (
+            "cache_kind", "cache_key", "cache_source", "schema_version",
+            "filename", "table_fqn", "auto_loaded", "source",
+            "artifact_type", "file_hash", "topic", "category", "tags",
+            "is_global", "saved_by", "saved_at", "memory_source", "semantic_id",
+            "dialect",
+        ):
+            if data_dict.get(field) is not None:
+                metadata[field] = str(data_dict[field])
+        if run_id:
+            metadata["run_id"] = str(run_id)
+        if instance_step is not None:
+            metadata["instance_step"] = int(instance_step)
+        record = {
+            "embedding": embedding,
+            "document": text_content,
+            "metadata": metadata,
+            "id": tactical_id,
+        }
+        fingerprint = (
+            semantic_payload_fingerprint(data_dict)
+            if semantic_source
+            else json.dumps(
+                {"document": text_content, "metadata": metadata},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
         )
-        synced_count += 1
-        if synced_count % 20 == 0:
-            print(f"   Синхронизировано: {synced_count} записей")
-    print(f"   ✅ Тактическая память: {synced_count} записей")
-    return synced_count
+        if tactical_id in fingerprints and fingerprints[tactical_id] != fingerprint:
+            prepared.pop(tactical_id, None)
+            failed.append((tactical_id, "CONFLICTING_SOURCE_ROWS"))
+            continue
+        if not any(item_id == tactical_id for item_id, _ in failed):
+            fingerprints[tactical_id] = fingerprint
+            prepared.setdefault(tactical_id, record)
+    permanently_skipped = tuple(
+        sorted(
+            set(skipped)
+            | {item for item in failed if item[1] in _PERMANENTLY_SKIPPED_REASONS}
+        )
+    )
+    failed = tuple(
+        sorted({item for item in failed if item[1] not in _PERMANENTLY_SKIPPED_REASONS})
+    )
+    return _PreparedCollection(
+        records=tuple(prepared[key] for key in sorted(prepared)),
+        source_ids=tuple(sorted(source_ids)),
+        permanently_skipped=permanently_skipped,
+        failed=failed,
+    )
 
 
-def _rebuild_tactical_memory(handler) -> tuple[int, int]:
-    records, errors_count = _prepare_tactical_memory(handler)
-    return _add_tactical_memory(handler, records), errors_count
-
-
-def _prepare_strategic_memory(handler) -> tuple[List[Dict], int]:
-    """Читает strategic_memory и готовит embeddings до удаления Chroma.
-    
-    Args:
-        handler: DatabaseHandler
-        
-    Returns:
-        tuple: (prepared records, количество ошибок)
-    """
+def _prepare_strategic_memory(handler) -> _PreparedCollection:
     conn = handler._get_connection()
     try:
-        cursor = conn.cursor()
-        # ChromaDB хранит ТОЛЬКО активные записи (valid_to IS NULL)
-        cursor.execute("SELECT memory_id, session_id, type, content FROM strategic_memory WHERE valid_to IS NULL ORDER BY memory_id")
-        
-        records = cursor.fetchall()
-        prepared: List[Dict] = []
-        errors_count = 0
-        
-        for memory_id, session_id, memory_type, content in records:
-            try:
-                if not content or len(content.strip()) < 10:
-                    continue  # Пропускаем слишком короткий контент
-                
-                # Создаем эмбеддинг
-                embedding = memory_manager._create_embedding(
-                    content,
-                    purpose="passage",
-                    allow_metadata_mismatch=True,
-                )
-                if not embedding:
-                    continue
-                
-                prepared.append(
-                    {
-                        "embedding": embedding,
-                        "document": content,
-                        "metadata": {
-                            "session_id": session_id,
-                            "type": memory_type,
-                            "memory_id": memory_id,
-                        },
-                        "id": str(memory_id),
-                    }
-                )
-                
-            except Exception as e:
-                errors_count += 1
-                if errors_count <= 3:
-                    print(f"   ⚠️ Ошибка подготовки стратегической памяти {memory_id}: {e}")
-        
-        return prepared, errors_count
-        
+        records = conn.execute(
+            "SELECT memory_id, session_id, type, content FROM strategic_memory "
+            "WHERE valid_to IS NULL ORDER BY memory_id"
+        ).fetchall()
     finally:
         conn.close()
 
-
-def _add_strategic_memory(handler, records: List[Dict]) -> int:
-    synced_count = 0
-    for record in records:
-        handler.strategic_collection.add(
-            embeddings=[record["embedding"]],
-            documents=[record["document"]],
-            metadatas=[record["metadata"]],
-            ids=[record["id"]],
+    prepared: list[Dict[str, Any]] = []
+    source_ids: list[str] = []
+    skipped: list[tuple[str, str]] = []
+    failed: list[tuple[str, str]] = []
+    for memory_id, session_id, memory_type, content in records:
+        record_id = str(memory_id)
+        source_ids.append(record_id)
+        if not isinstance(content, str) or len(content.strip()) < 10:
+            skipped.append((record_id, "CONTENT_TOO_SHORT"))
+            continue
+        try:
+            embedding = memory_manager._create_embedding(
+                content,
+                purpose="passage",
+                allow_metadata_mismatch=True,
+            )
+        except Exception:
+            failed.append((record_id, "EMBEDDING_FAILED"))
+            continue
+        if not embedding:
+            failed.append((record_id, "EMBEDDING_UNAVAILABLE"))
+            continue
+        prepared.append(
+            {
+                "embedding": embedding,
+                "document": content,
+                "metadata": {
+                    "session_id": session_id,
+                    "type": memory_type,
+                    "memory_id": memory_id,
+                },
+                "id": record_id,
+            }
         )
-        synced_count += 1
-    print(f"   ✅ Стратегическая память: {synced_count} записей")
-    return synced_count
+    return _PreparedCollection(
+        records=tuple(prepared),
+        source_ids=tuple(sorted(set(source_ids))),
+        permanently_skipped=tuple(sorted(set(skipped))),
+        failed=tuple(sorted(set(failed))),
+    )
 
 
-def _rebuild_strategic_memory(handler) -> tuple[int, int]:
-    records, errors_count = _prepare_strategic_memory(handler)
-    return _add_strategic_memory(handler, records), errors_count
+def _collection_ids(collection) -> set[str]:
+    result = collection.get()
+    if not isinstance(result, dict):
+        raise TypeError("Chroma get() must return an object")
+    raw_ids = result.get("ids") or []
+    if raw_ids and isinstance(raw_ids[0], list):
+        raw_ids = raw_ids[0]
+    return {value for value in raw_ids if isinstance(value, str)}
+
+
+def _rebuild_collection(
+    collection,
+    prepared: _PreparedCollection,
+) -> CollectionRebuildReport:
+    expected = {record["id"] for record in prepared.records}
+    failed = list(prepared.failed)
+    for record in prepared.records:
+        try:
+            collection.upsert(
+                embeddings=[record["embedding"]],
+                documents=[record["document"]],
+                metadatas=[record["metadata"]],
+                ids=[record["id"]],
+            )
+        except Exception:
+            failed.append((record["id"], "CHROMA_UPSERT_FAILED"))
+    try:
+        actual = _collection_ids(collection)
+    except Exception:
+        actual = set()
+        failed.append(("__reconcile__", "CHROMA_ID_READ_FAILED"))
+    return CollectionRebuildReport(
+        source_ids=prepared.source_ids,
+        expected_ids=tuple(sorted(expected)),
+        indexed_ids=tuple(sorted(expected & actual)),
+        permanently_skipped=tuple(sorted(set(prepared.permanently_skipped))),
+        failed=tuple(sorted(set(failed))),
+        missing_ids=tuple(sorted(expected - actual)),
+        unexpected_ids=tuple(sorted(actual - expected)),
+    )
 
 
 @tool
@@ -394,13 +507,25 @@ def rebuild_chromadb_tool() -> str:
     """
     try:
         print("🔄 Начинаем пересоздание ChromaDB из SQLite...")
-        result = rebuild_chromadb_from_sqlite()
-        return result
+        report = rebuild_chromadb_from_sqlite()
+        return format_rebuild_report(report)
         
     except Exception as e:
         error_msg = f"❌ Ошибка пересоздания ChromaDB: {str(e)}"
         print(error_msg)
         return error_msg
+
+
+def format_rebuild_report(report: RebuildReport) -> str:
+    """Format a typed report only for human-facing compatibility adapters."""
+    return (
+        f"status={report.status.value}; "
+        f"tactical={len(report.tactical.indexed_ids)}/{len(report.tactical.expected_ids)}; "
+        f"strategic={len(report.strategic.indexed_ids)}/{len(report.strategic.expected_ids)}; "
+        f"skipped={len(report.tactical.permanently_skipped) + len(report.strategic.permanently_skipped)}; "
+        f"failed={len(report.tactical.failed) + len(report.strategic.failed)}; "
+        f"duration_ms={report.duration_ms}"
+    )
 
 
 # Обновляем метод в memory_manager для использования новой логики

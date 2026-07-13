@@ -7,6 +7,7 @@ critical_description_keywords) вынесены в config/text_to_sql/significan
 в AGENTS.md: доменно-зависимые термины не должны быть вшиты в код.
 """
 import logging
+from collections.abc import Mapping
 from typing import Dict, List, Any, Optional, Set
 
 from .significance_config import load_significance_config
@@ -79,6 +80,166 @@ def normalize_constraint_type(constraint_type: str) -> str:
         "UNIQUE": "UNIQUE"
     }
     return constraint_map.get(normalized, "")
+
+
+def _resolve_mapping_name(name: object, candidates: Mapping[str, object]) -> str | None:
+    if not isinstance(name, str) or not name.strip():
+        return None
+    wanted = name.strip()
+    if wanted in candidates:
+        return wanted
+    matches = [candidate for candidate in candidates if candidate.casefold() == wanted.casefold()]
+    if len(matches) == 1:
+        return matches[0]
+    base_matches = [
+        candidate
+        for candidate in candidates
+        if candidate.rsplit(".", 1)[-1].casefold() == wanted.rsplit(".", 1)[-1].casefold()
+    ]
+    return base_matches[0] if len(base_matches) == 1 else None
+
+
+def _parse_reference(reference: object) -> tuple[str | None, str | None]:
+    if not isinstance(reference, str) or not reference.strip():
+        return None, None
+    value = reference.strip()
+    if "(" in value and value.endswith(")"):
+        table, column = value.split("(", 1)
+        return table.strip() or None, column[:-1].strip() or None
+    if "." in value:
+        table, column = value.rsplit(".", 1)
+        return table.strip() or None, column.strip() or None
+    return value, "id"
+
+
+def get_foreign_key_constraints(
+    source_table: str,
+    db_schema: Mapping[str, object],
+) -> list[dict[str, object]]:
+    """Return validated FK constraints for one source table.
+
+    An absent table-level envelope is the legacy scalar format. ``complete``
+    envelopes are authoritative; an unavailable or invalid envelope never
+    falls back to the per-column aliases.
+    """
+    if not isinstance(db_schema, Mapping):
+        raise TypeError("db_schema must be a mapping")
+    resolved_source = _resolve_mapping_name(source_table, db_schema)
+    if resolved_source is None:
+        raise ValueError(f"source table {source_table!r} does not resolve in schema")
+    source_body = db_schema[resolved_source]
+    if not isinstance(source_body, Mapping):
+        raise TypeError(f"schema table {resolved_source!r} must be a mapping")
+
+    from .utils import get_table_columns
+
+    source_columns = get_table_columns(source_body)
+    if "foreign_keys" not in source_body:
+        constraints: list[dict[str, object]] = []
+        for source_column, metadata in source_columns.items():
+            if not isinstance(metadata, dict) or not is_fk(metadata):
+                continue
+            target_name, target_column_name = _parse_reference(metadata.get("references"))
+            target_table = _resolve_mapping_name(target_name, db_schema)
+            if target_table is None:
+                continue
+            target_columns = get_table_columns(db_schema[target_table])
+            target_column = _resolve_mapping_name(target_column_name, target_columns)
+            if target_column is None:
+                continue
+            constraints.append(
+                {
+                    "constraint_id": f"{resolved_source}:legacy:{source_column}",
+                    "to_table": target_table,
+                    "column_pairs": [
+                        {
+                            "from_column": source_column,
+                            "to_column": target_column,
+                        }
+                    ],
+                }
+            )
+        return constraints
+
+    envelope = source_body["foreign_keys"]
+    if not isinstance(envelope, Mapping):
+        raise TypeError(f"foreign_keys for {resolved_source!r} must be a mapping")
+    complete = envelope.get("complete")
+    raw_constraints = envelope.get("constraints")
+    if not isinstance(complete, bool):
+        raise TypeError("foreign_keys.complete must be a boolean")
+    if not isinstance(raw_constraints, list):
+        raise TypeError("foreign_keys.constraints must be a list")
+    if not complete:
+        if raw_constraints:
+            raise ValueError("incomplete foreign_keys envelope cannot publish constraints")
+        return []
+
+    resolved_constraints: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for raw_constraint in raw_constraints:
+        if not isinstance(raw_constraint, Mapping):
+            raise TypeError("foreign key constraint must be a mapping")
+        constraint_id = raw_constraint.get("constraint_id")
+        if not isinstance(constraint_id, str) or not constraint_id.strip():
+            raise ValueError("foreign key constraint_id must be a non-empty string")
+        constraint_id = constraint_id.strip()
+        if constraint_id in seen_ids:
+            raise ValueError(f"duplicate foreign key constraint_id {constraint_id!r}")
+        seen_ids.add(constraint_id)
+
+        target_table = _resolve_mapping_name(raw_constraint.get("to_table"), db_schema)
+        if target_table is None:
+            logger.warning(
+                "foreign key %r target table %r does not resolve in schema; "
+                "skipping this constraint",
+                constraint_id,
+                raw_constraint.get("to_table"),
+            )
+            continue
+        target_body = db_schema[target_table]
+        if not isinstance(target_body, Mapping):
+            raise TypeError(f"schema table {target_table!r} must be a mapping")
+        target_columns = get_table_columns(target_body)
+
+        raw_pairs = raw_constraint.get("column_pairs")
+        if not isinstance(raw_pairs, list) or not raw_pairs:
+            raise ValueError(
+                f"foreign key {constraint_id!r} must contain at least one column pair"
+            )
+        pairs: list[dict[str, str]] = []
+        seen_source_columns: set[str] = set()
+        seen_target_columns: set[str] = set()
+        for raw_pair in raw_pairs:
+            if not isinstance(raw_pair, Mapping):
+                raise TypeError("foreign key column pair must be a mapping")
+            source_column = _resolve_mapping_name(
+                raw_pair.get("from_column"), source_columns
+            )
+            target_column = _resolve_mapping_name(
+                raw_pair.get("to_column"), target_columns
+            )
+            if source_column is None or target_column is None:
+                raise ValueError(
+                    f"foreign key {constraint_id!r} column pair does not resolve"
+                )
+            if source_column in seen_source_columns or target_column in seen_target_columns:
+                raise ValueError(
+                    f"foreign key {constraint_id!r} contains duplicate pair members"
+                )
+            seen_source_columns.add(source_column)
+            seen_target_columns.add(target_column)
+            pairs.append(
+                {"from_column": source_column, "to_column": target_column}
+            )
+        resolved_constraints.append(
+            {
+                "constraint_id": constraint_id,
+                "to_table": target_table,
+                "column_pairs": pairs,
+            }
+        )
+    return resolved_constraints
 
 
 # ========================================================================================
@@ -199,6 +360,16 @@ class ColumnMetadataHelper:
         
         # Из джойнов
         for join in joins:
+            pairs = join.get("column_pairs")
+            if isinstance(pairs, list):
+                for pair in pairs:
+                    if not isinstance(pair, dict):
+                        continue
+                    if join.get("from_table") == table_name and pair.get("from_column"):
+                        linked_columns.add(pair["from_column"])
+                    if join.get("to_table") == table_name and pair.get("to_column"):
+                        linked_columns.add(pair["to_column"])
+                continue
             if join.get('from_table') == table_name and 'from_column' in join:
                 linked_columns.add(join['from_column'])
             if join.get('to_table') == table_name and 'to_column' in join:

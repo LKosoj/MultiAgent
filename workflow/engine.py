@@ -24,12 +24,18 @@ from agent_system import DynamicAgentSystem
 from .models import (
     WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
     StepResult, StepStatus, WorkflowStep, RetryPolicy, ResourceLimits,
-    WorkflowExecutionError, WorkflowStepError, WorkflowNotFoundError
+    WorkflowExecutionError, WorkflowStepError, WorkflowNotFoundError,
+    TextToSqlTerminalResult, TextToSqlTerminalStatus, bound_text_to_sql_error,
+    is_text_to_sql_workflow_name,
 )
 from .state_manager import WorkflowStateManager
 from .retry_engine import RetryEngine
 from .resource_manager import ResourceManager
-from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context
+from tool_runtime_context import (
+    SupervisorExecutionEvidence,
+    reset_tool_runtime_context,
+    set_tool_runtime_context,
+)
 from workflow_redaction import _redact_workflow_log_value
 
 logger = logging.getLogger(__name__)
@@ -1120,6 +1126,7 @@ class WorkflowEngine(DynamicAgentSystem):
             for key in self._step_dotted_output_keys(context, step.id)
         }
         keep_current_output = False
+        restore_previous_output = True
         try:
             # W1-review: шаг уже помечен COMPLETED (мы попали сюда из ветки
             # status == COMPLETED). WorkflowStepError из _normalize_step_output
@@ -1183,14 +1190,46 @@ class WorkflowEngine(DynamicAgentSystem):
             else:
                 rerun_steps = [rerun_step]
 
-            # Готовим feedback: сериализуем output в JSON-строку для подстановки
-            # в task rerun_step (через context.variables[feedback_field]).
-            try:
-                feedback_payload = json.dumps(
-                    step_result.output, ensure_ascii=False, default=str
+            if is_text_to_sql_workflow_name(workflow_def.name):
+                generation_output = None
+                if step_results is not None:
+                    generation_result = step_results.get("sql_generation")
+                    generation_output = (
+                        generation_result.output
+                        if generation_result is not None
+                        else None
+                    )
+                if not isinstance(generation_output, dict):
+                    generation_output = context.step_outputs.get("sql_generation")
+                previous_sql = (
+                    generation_output.get("sql")
+                    if isinstance(generation_output, dict)
+                    else context.step_outputs.get("sql_generation.sql")
                 )
-            except (TypeError, ValueError):
-                feedback_payload = str(step_result.output)
+                from .text_to_sql_retry import build_corrective_feedback
+
+                try:
+                    feedback_payload = build_corrective_feedback(
+                        step_id=step.id,
+                        output=step_result.output,
+                        previous_sql=previous_sql,
+                        attempt_number=current_iter + 1,
+                    ).to_mapping()
+                except (TypeError, ValueError) as exc:
+                    logger.error(
+                        "Text-to-SQL output retry rejected invalid %s feedback: %s",
+                        step.id,
+                        bound_text_to_sql_error(exc),
+                    )
+                    keep_current_output = True
+                    return None
+            else:
+                try:
+                    feedback_payload = json.dumps(
+                        step_result.output, ensure_ascii=False, default=str
+                    )
+                except (TypeError, ValueError):
+                    feedback_payload = str(step_result.output)
 
             counters[step.id] = current_iter + 1
             context.variables[feedback_field] = feedback_payload
@@ -1215,13 +1254,58 @@ class WorkflowEngine(DynamicAgentSystem):
                 if rerun_status_value != StepStatus.COMPLETED.value:
                     logger.error(
                         "❌ output_retry_policy: rerun step '%s' завершился со статусом %s; "
-                        "оставляем исходный результат шага '%s'",
+                        "помечаем corrective chain шага '%s' как failed",
                         chain_step.id,
                         rerun_result.status,
                         step.id,
                     )
-                    keep_current_output = True
-                    return None
+                    retry_error = (
+                        f"Corrective output retry chain failed at {chain_step.id}: "
+                        f"{rerun_result.error or rerun_result.status}"
+                    )
+                    retained_output = None
+                    if (
+                        is_text_to_sql_workflow_name(workflow_def.name)
+                        and step.id == "db_audit"
+                    ):
+                        try:
+                            original_terminal = TextToSqlTerminalResult.from_mapping(
+                                step_result.output
+                            )
+                            if original_terminal.reason_code == "EXECUTION_FAILED":
+                                retained_output = original_terminal.to_mapping()
+                                retained_output.update({
+                                    "status": TextToSqlTerminalStatus.FAILED.value,
+                                    "reason_code": "OUTPUT_RETRY_CHAIN_FAILED",
+                                    "error": bound_text_to_sql_error(retry_error),
+                                })
+                                retained_output = TextToSqlTerminalResult.from_mapping(
+                                    retained_output
+                                ).to_mapping()
+                        except (TypeError, ValueError):
+                            retained_output = None
+                    failed_result = StepResult(
+                        step_id=step.id,
+                        status=StepStatus.FAILED,
+                        output=retained_output,
+                        error=retry_error,
+                        start_time=step_result.start_time,
+                        end_time=datetime.now(),
+                        error_class="output_retry_chain_failed",
+                        metadata={
+                            "failed_retry_step": chain_step.id,
+                            "reason_code": "OUTPUT_RETRY_CHAIN_FAILED",
+                        },
+                    )
+                    if step_results is not None:
+                        step_results[chain_step.id] = rerun_result
+                        step_results[step.id] = failed_result
+                    if retained_output is None:
+                        restore_previous_output = False
+                    else:
+                        self._write_step_output(context, step.id, retained_output)
+                        keep_current_output = True
+                    return failed_result
                 if step_results is not None:
                     step_results[chain_step.id] = rerun_result
                 # Сохраняем результат rerun step в context, чтобы зависящие от него
@@ -1245,19 +1329,23 @@ class WorkflowEngine(DynamicAgentSystem):
                 retried_step_result.status,
             )
             keep_current_output = retried_status_value == StepStatus.COMPLETED.value
+            if not keep_current_output:
+                restore_previous_output = False
+                if step_results is not None:
+                    step_results[step.id] = retried_step_result
             return retried_step_result
         finally:
-            # Восстанавливаем step_outputs только если retry не дошёл до
-            # финального успешного output текущего шага. Если condition не
-            # сработал или rerun_step не удался, текущий output остаётся
-            # финальным COMPLETED-результатом и должен быть виден downstream.
+            # При успешном retry context уже содержит свежий output. Если policy
+            # не сработала, восстанавливаем прежний output; при сбое corrective
+            # chain без валидного terminal evidence очищаем прежний output.
             if not keep_current_output:
                 self._clear_step_dotted_outputs(context, step.id)
-                if prev_output is _SENTINEL_MISSING:
+                if not restore_previous_output or prev_output is _SENTINEL_MISSING:
                     context.step_outputs.pop(step.id, None)
                 else:
                     context.step_outputs[step.id] = prev_output
-                context.step_outputs.update(prev_dotted)
+                if restore_previous_output:
+                    context.step_outputs.update(prev_dotted)
     
     async def _execute_agent_step(self, step: WorkflowStep, context: WorkflowContext, task: str) -> Any:
         """Выполнение шага через агента в thread pool"""
@@ -1273,7 +1361,27 @@ class WorkflowEngine(DynamicAgentSystem):
         # Выполняем агента в thread pool для разблокировки event loop
         def _execute_agent_sync():
             """Синхронное выполнение агента в отдельном потоке"""
-            token = set_tool_runtime_context(step.metadata or {})
+            runtime_metadata = dict(step.metadata or {})
+            deadline = getattr(context, "_deadline_budget", None)
+            if deadline is not None:
+                from .deadline import DeadlineBudget
+
+                if not isinstance(deadline, DeadlineBudget):
+                    raise TypeError(
+                        "context._deadline_budget must be a DeadlineBudget"
+                    )
+                runtime_metadata["deadline_budget"] = deadline
+            supervisor_evidence = getattr(context, "_supervisor_evidence", None)
+            if supervisor_evidence is not None and not isinstance(
+                supervisor_evidence,
+                SupervisorExecutionEvidence,
+            ):
+                raise TypeError(
+                    "context._supervisor_evidence must be a "
+                    "SupervisorExecutionEvidence"
+                )
+            runtime_metadata["supervisor_evidence"] = supervisor_evidence
+            token = set_tool_runtime_context(runtime_metadata)
             try:
                 # ПРЯМОЙ вызов указанного агента (без анализа задачи!)
                 # _enhanced_pipeline_type позволяет subclass'у передать pipeline_type
@@ -1367,6 +1475,7 @@ class WorkflowEngine(DynamicAgentSystem):
         
         # Удаляем session_id из tool_params, если он там есть, так как он передается отдельным параметром
         session_id = tool_params.pop('session_id', context.session_id)
+        workflow_run_id = str(context.variables.get("run_id") or context.workflow_id)
         
         logger.info(
             "📋 Финальные параметры для инструмента '%s': %s",
@@ -1378,6 +1487,27 @@ class WorkflowEngine(DynamicAgentSystem):
         # Выполняем инструмент в thread pool для разблокировки event loop
         def _execute_tool_sync():
             """Синхронное выполнение инструмента в отдельном потоке"""
+            runtime_metadata = dict(step.metadata or {})
+            deadline = getattr(context, "_deadline_budget", None)
+            if deadline is not None:
+                from .deadline import DeadlineBudget
+
+                if not isinstance(deadline, DeadlineBudget):
+                    raise TypeError(
+                        "context._deadline_budget must be a DeadlineBudget"
+                    )
+                runtime_metadata["deadline_budget"] = deadline
+            supervisor_evidence = getattr(context, "_supervisor_evidence", None)
+            if supervisor_evidence is not None and not isinstance(
+                supervisor_evidence,
+                SupervisorExecutionEvidence,
+            ):
+                raise TypeError(
+                    "context._supervisor_evidence must be a "
+                    "SupervisorExecutionEvidence"
+                )
+            runtime_metadata["supervisor_evidence"] = supervisor_evidence
+            token = set_tool_runtime_context(runtime_metadata)
             try:
                 # Используем ToolManager для выполнения инструмента с телеметрией
                 from tool_manager import get_tool_manager
@@ -1393,6 +1523,7 @@ class WorkflowEngine(DynamicAgentSystem):
                     tool_function=tool_function,
                     task_description=task,
                     session_id=session_id,
+                    workflow_run_id=workflow_run_id,
                     **tool_params
                 )
                 logger.info(f"✅ Инструмент '{step.tool_name}' завершился успешно")
@@ -1409,6 +1540,8 @@ class WorkflowEngine(DynamicAgentSystem):
                     _redact_workflow_log_value(str(e)),
                 )
                 raise
+            finally:
+                reset_tool_runtime_context(token)
         
         # Выполняем в thread pool текущего event loop
         loop = asyncio.get_running_loop()

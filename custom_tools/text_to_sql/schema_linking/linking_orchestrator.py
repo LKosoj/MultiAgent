@@ -22,6 +22,7 @@ from typing import Any, Callable, Dict, List, Optional
 from .heuristic_linker import HeuristicLinker
 from .join_validation import JoinValidator, compute_required_tables
 from .llm_linker import LLMLinker, _has_linked_entities
+from ..schema_namespace import SchemaNamespace
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +67,19 @@ class SchemaLinkingCore:
     # ------------------------------------------------------------------
     # Public heuristic-facade forwards
     # ------------------------------------------------------------------
-    def heuristic_linking(self, entities, db_schema, dsn: Optional[str] = None):
-        return self._heuristic.heuristic_linking(entities, db_schema, dsn=dsn)
+    def heuristic_linking(
+        self,
+        entities,
+        db_schema,
+        dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
+    ):
+        return self._heuristic.heuristic_linking(
+            entities,
+            db_schema,
+            dsn=dsn,
+            namespace=namespace,
+        )
 
     def find_main_table(self, db_schema, semantic_tables=None):
         return self._heuristic.find_main_table(db_schema, semantic_tables)
@@ -83,8 +95,19 @@ class SchemaLinkingCore:
     # ------------------------------------------------------------------
     # Public LLM-facade forwards
     # ------------------------------------------------------------------
-    def llm_linking(self, entities, db_schema, dsn: Optional[str] = None):
-        return self._llm.llm_linking(entities, db_schema, dsn=dsn)
+    def llm_linking(
+        self,
+        entities,
+        db_schema,
+        dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
+    ):
+        return self._llm.llm_linking(
+            entities,
+            db_schema,
+            dsn=dsn,
+            namespace=namespace,
+        )
 
     # ------------------------------------------------------------------
     # Public join-validator forwards
@@ -130,6 +153,7 @@ class SchemaLinkingCore:
         entities: Dict[str, Any],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Dict[str, Any]:
         """Выполняет связывание сущностей со схемой."""
         from ..schema_loader import SchemaFilter
@@ -140,6 +164,9 @@ class SchemaLinkingCore:
         linked_dimensions: List[Dict[str, Any]] = []
         linked_filters: Dict[str, Any] = {}
         unlinked: List[str] = []
+        ambiguous_bindings: List[Dict[str, Any]] = []
+        schema_budget: Dict[str, Any] = {}
+        reason_code: Optional[str] = None
 
         llm_joins: List[Dict[str, Any]] = []
         allow_fallbacks = os.getenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "0") == "1"
@@ -154,15 +181,25 @@ class SchemaLinkingCore:
         # точках, где это осмысленно, и только при allow_fallbacks=1.
         def _try_heuristic_fallback(reason: str) -> bool:
             nonlocal linked_metrics, linked_dimensions, linked_filters, unlinked
-            nonlocal heuristic_used
+            nonlocal ambiguous_bindings, heuristic_used
             if not allow_fallbacks:
                 return False
+            heuristic_diagnostics: Dict[str, Any] = {
+                "ambiguous_bindings": []
+            }
             (
                 linked_metrics,
                 linked_dimensions,
                 linked_filters,
                 unlinked,
-            ) = self.heuristic_linking(entities, db_schema, dsn=dsn)
+            ) = self._heuristic._heuristic_linking_with_diagnostics(
+                entities,
+                db_schema,
+                dsn=dsn,
+                diagnostics=heuristic_diagnostics,
+                namespace=namespace,
+            )
+            ambiguous_bindings = heuristic_diagnostics["ambiguous_bindings"]
             heuristic_used = True
             logger.info(
                 "Heuristic schema-linking fallback engaged after: %s", reason
@@ -172,7 +209,22 @@ class SchemaLinkingCore:
         if self._llm.active_llm_caller() and db_schema and os.getenv(
             "SCHEMA_LINKING_USE_LLM", "1"
         ) != "0":
-            llm_result = self.llm_linking(entities, db_schema, dsn=dsn)
+            if namespace is None:
+                llm_result = self.llm_linking(entities, db_schema, dsn=dsn)
+            else:
+                llm_result = self.llm_linking(
+                    entities,
+                    db_schema,
+                    namespace=namespace,
+                )
+            if llm_result:
+                reason_code = llm_result.get("reason_code")
+                llm_budget = llm_result.get("schema_budget")
+                if isinstance(llm_budget, dict):
+                    schema_budget = llm_budget
+                llm_ambiguities = llm_result.get("ambiguous_bindings")
+                if isinstance(llm_ambiguities, list):
+                    ambiguous_bindings = llm_ambiguities
             if not llm_result:
                 message = "LLM schema linking returned no result"
                 # HIGH #6: `unlinked` здесь содержит DIAGNOSTIC MESSAGE
@@ -389,6 +441,9 @@ class SchemaLinkingCore:
             "unconnected_tables": joins_info["unconnected_tables"],
             "main_table": joins_info["main_table"],
             "unlinked_entities": unlinked,
+            "ambiguous_bindings": ambiguous_bindings,
+            "schema_budget": schema_budget,
+            "reason_code": reason_code,
             "linking_strategy": linking_strategy,
             "error": error_value,
         }

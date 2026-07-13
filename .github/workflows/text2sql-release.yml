@@ -1,0 +1,540 @@
+name: text2sql-release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+    tags:
+      - text2sql-v*
+  workflow_dispatch:
+    inputs:
+      public_api_origin:
+        description: Public HTTPS origin embedded into the frontend candidate
+        required: true
+        type: string
+      model_id:
+        description: Immutable release model identifier
+        required: true
+        type: string
+      provider_id:
+        description: Immutable release provider identifier
+        required: true
+        type: string
+      model_config_digest:
+        description: Lowercase SHA-256 of the reviewed model configuration
+        required: true
+        type: string
+      repetitions:
+        description: Assertion matching the approved release policy
+        required: true
+        default: 3
+        type: number
+      previous_backend_image:
+        description: Digest-qualified previous backend image
+        required: true
+        type: string
+      previous_frontend_image:
+        description: Digest-qualified previous frontend image
+        required: true
+        type: string
+      backup_reference:
+        description: Durable backup reference for rollback
+        required: true
+        type: string
+      approved_backup_manifest_path:
+        description: Absolute runner-local path to the pre-created approved backup manifest
+        required: true
+        type: string
+      approved_backup_manifest_sha256:
+        description: Lowercase SHA-256 of the pre-created approved backup manifest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: text2sql-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12.3"
+  NODE_VERSION: "24.13.0"
+  NPM_VERSION: "11.6.2"
+  UV_VERSION: "0.10.10"
+
+jobs:
+  deterministic-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.lock
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/client/package-lock.json
+
+      - name: Install pinned build tools
+        run: |
+          python3 -m pip install "uv==${UV_VERSION}"
+          npm install --global "npm@${NPM_VERSION}"
+
+      - name: Reject dependency lock drift
+        run: sh deploy/check-locks.sh
+
+      - name: Install hash-locked Python environment
+        run: |
+          python3 -m pip install \
+            --no-deps \
+            --require-hashes \
+            --requirement requirements.lock
+
+      - name: Run backend contract suite without warnings
+        run: pytest -q -W error
+
+      - name: Run deterministic Text-to-SQL release contract
+        run: |
+          mkdir -p artifacts
+          python3 -m custom_tools.text_to_sql.eval.cli \
+            --gold tests/eval/gold \
+            --policy config/text_to_sql/eval_release.yaml \
+            --mode deterministic-contract \
+            --output artifacts/text2sql-eval-contract.json
+
+      - name: Verify state migrations
+        run: |
+          python3 scripts/migrate_text2sql_state.py \
+            --manifest config/text_to_sql/state_schema.yaml
+
+      - name: Compile Python sources
+        run: |
+          python3 -m compileall -q \
+            custom_tools/text_to_sql/eval \
+            backend/fastapi_app \
+            workflow \
+            db_plugins
+
+      - name: Install and test frontend from lock
+        run: |
+          npm ci --prefix frontend/client
+          npm --prefix frontend/client test -- --run
+          npm --prefix frontend/client run lint -- --max-warnings=0
+          NEXT_BUILD_ID="${GITHUB_SHA}" \
+            SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)" \
+            npm --prefix frontend/client run build
+
+      - name: Reject malformed diffs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = pull_request ]; then
+            git diff --check "${BASE_SHA}...${GITHUB_SHA}"
+          else
+            git show --check --oneline --no-renames "${GITHUB_SHA}" --
+          fi
+
+      - name: Upload deterministic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: text2sql-deterministic-${{ github.sha }}
+          path: artifacts/text2sql-eval-contract.json
+          if-no-files-found: error
+          retention-days: 30
+
+  protected-release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/text2sql-v')
+    needs: deterministic-contract
+    runs-on: [self-hosted, text2sql-release]
+    timeout-minutes: 180
+    environment:
+      name: text2sql-production-release
+    env:
+      TEXT2SQL_PUBLIC_API_URL: ${{ inputs.public_api_origin || vars.TEXT2SQL_PUBLIC_API_URL }}
+      MODEL_ID: ${{ inputs.model_id || vars.TEXT2SQL_RELEASE_MODEL_ID }}
+      PROVIDER_ID: ${{ inputs.provider_id || vars.TEXT2SQL_RELEASE_PROVIDER_ID }}
+      MODEL_CONFIG_DIGEST: ${{ inputs.model_config_digest || vars.TEXT2SQL_MODEL_CONFIG_DIGEST }}
+      RELEASE_REPETITIONS: ${{ inputs.repetitions || vars.TEXT2SQL_RELEASE_REPETITIONS || '3' }}
+      PREVIOUS_BACKEND_IMAGE: ${{ inputs.previous_backend_image || vars.TEXT2SQL_PREVIOUS_BACKEND_IMAGE }}
+      PREVIOUS_FRONTEND_IMAGE: ${{ inputs.previous_frontend_image || vars.TEXT2SQL_PREVIOUS_FRONTEND_IMAGE }}
+      BACKUP_REFERENCE: ${{ inputs.backup_reference || vars.TEXT2SQL_BACKUP_REFERENCE }}
+      TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH: ${{ inputs.approved_backup_manifest_path || vars.TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH }}
+      TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256: ${{ inputs.approved_backup_manifest_sha256 || vars.TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256 }}
+      TEXT_TO_SQL_ALLOWED_DB_SCHEMES: ${{ vars.TEXT_TO_SQL_ALLOWED_DB_SCHEMES }}
+      TEXT_TO_SQL_ALLOWED_DB_TARGETS: ${{ vars.TEXT_TO_SQL_ALLOWED_DB_TARGETS }}
+      TEXT_TO_SQL_ALLOWED_DB_CIDRS: ${{ vars.TEXT_TO_SQL_ALLOWED_DB_CIDRS }}
+      TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS: ${{ vars.TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS }}
+      EVAL_API_URL: http://127.0.0.1:8000
+    steps:
+      - name: Check out candidate
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+
+      - name: Install protected-lane Python locks
+        run: |
+          python3 -m pip install \
+            --no-deps \
+            --require-hashes \
+            --requirement requirements.lock
+          python3 -m pip install \
+            --no-deps \
+            --require-hashes \
+            --requirement requirements-db-optional.lock
+
+      - name: Prepare immutable candidate inputs
+        env:
+          TEXT2SQL_LATENCY_BASELINE_JSON: ${{ secrets.TEXT2SQL_LATENCY_BASELINE_JSON }}
+          TEXT2SQL_EVAL_API_TOKEN: ${{ secrets.TEXT2SQL_EVAL_API_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEY_DB: ${{ secrets.OPENAI_API_KEY_DB }}
+        run: |
+          set -eu
+          : "${TEXT2SQL_PUBLIC_API_URL:?approved public API origin is required}"
+          : "${MODEL_ID:?model id is required}"
+          : "${PROVIDER_ID:?provider id is required}"
+          : "${MODEL_CONFIG_DIGEST:?model config digest is required}"
+          : "${RELEASE_REPETITIONS:?release repetitions are required}"
+          : "${PREVIOUS_BACKEND_IMAGE:?previous backend image is required}"
+          : "${PREVIOUS_FRONTEND_IMAGE:?previous frontend image is required}"
+          : "${BACKUP_REFERENCE:?backup reference is required}"
+          : "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH:?approved backup manifest path is required}"
+          : "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256:?approved backup manifest SHA-256 is required}"
+          : "${TEXT2SQL_LATENCY_BASELINE_JSON:?approved latency baseline is required}"
+          : "${TEXT_TO_SQL_ALLOWED_DB_SCHEMES:?allowed database schemes are required}"
+          : "${TEXT_TO_SQL_ALLOWED_DB_TARGETS:?allowed database targets are required}"
+          : "${TEXT_TO_SQL_ALLOWED_DB_CIDRS:?allowed database CIDRs are required}"
+          : "${TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS:?allowed database file roots are required}"
+          : "${TEXT2SQL_EVAL_API_TOKEN:?evaluation API token is required}"
+          : "${HF_TOKEN:?model token is required}"
+          : "${OPENAI_API_KEY:?model API key is required}"
+          : "${OPENAI_API_KEY_DB:?database model API key is required}"
+          case "${TEXT2SQL_PUBLIC_API_URL}" in
+            https://*) ;;
+            *) echo "public API origin must use HTTPS" >&2; exit 2 ;;
+          esac
+          expected_model_config_digest=$(sha256sum config/text_to_sql/llm_models.yaml | cut -d ' ' -f 1)
+          test "${MODEL_CONFIG_DIGEST}" = "${expected_model_config_digest}"
+          printf '%s\n' "${PREVIOUS_BACKEND_IMAGE}" | grep -Eq '@sha256:[0-9a-f]{64}$'
+          printf '%s\n' "${PREVIOUS_FRONTEND_IMAGE}" | grep -Eq '@sha256:[0-9a-f]{64}$'
+          printf '%s\n' "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256}" \
+            | grep -Eq '^[0-9a-f]{64}$'
+          case "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH}" in
+            /*) ;;
+            *) echo "approved backup manifest path must be absolute" >&2; exit 2 ;;
+          esac
+          approved_backup_manifest_path=$(realpath -e -- \
+            "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH}") || {
+              echo "approved backup manifest path cannot be resolved" >&2
+              exit 2
+            }
+          workspace_path=$(realpath -e -- "${GITHUB_WORKSPACE}") || {
+            echo "GitHub workspace path cannot be resolved" >&2
+            exit 2
+          }
+          case "${approved_backup_manifest_path}" in
+            "${workspace_path}"|"${workspace_path}/"*)
+              echo "approved backup manifest must be outside GITHUB_WORKSPACE" >&2
+              exit 2
+              ;;
+          esac
+          test -f "${approved_backup_manifest_path}"
+          test -r "${approved_backup_manifest_path}"
+          test ! -w "${approved_backup_manifest_path}"
+          approved_backup_manifest_sha256=$(sha256sum -- \
+            "${approved_backup_manifest_path}" | cut -d ' ' -f 1)
+          test "${approved_backup_manifest_sha256}" = \
+            "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256}"
+          test -d "${BACKUP_REFERENCE}"
+          for database in agui_events.db smolagents_memory.db workflow_result_outbox.db; do
+            test -r "${BACKUP_REFERENCE}/${database}"
+          done
+          CANDIDATE_DIRTY_FLAG=false
+          if [ -n "$(git status --porcelain)" ]; then
+            CANDIDATE_DIRTY_FLAG=true
+          fi
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          NEXT_BUILD_ID="${GITHUB_SHA}"
+          {
+            printf 'CANDIDATE_DIRTY_FLAG=%s\n' "${CANDIDATE_DIRTY_FLAG}"
+            printf 'SOURCE_DATE_EPOCH=%s\n' "${SOURCE_DATE_EPOCH}"
+            printf 'NEXT_BUILD_ID=%s\n' "${NEXT_BUILD_ID}"
+            printf 'TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH=%s\n' \
+              "${approved_backup_manifest_path}"
+          } >> "${GITHUB_ENV}"
+          mkdir -p artifacts/protected deploy/secrets
+          python3 - <<'PY'
+          import os
+          from backend.fastapi_app.agui.connection_registry import (
+              write_connection_target_policy_artifact,
+          )
+
+          write_connection_target_policy_artifact(
+              "artifacts/build/target-policy.json",
+              os.environ,
+          )
+          PY
+          TEXT2SQL_TARGET_POLICY_SHA256=$(sha256sum artifacts/build/target-policy.json | cut -d ' ' -f 1)
+          printf 'TEXT2SQL_TARGET_POLICY_SHA256=%s\n' "${TEXT2SQL_TARGET_POLICY_SHA256}" >> "${GITHUB_ENV}"
+          umask 077
+          printf '%s' "${TEXT2SQL_LATENCY_BASELINE_JSON}" \
+            > artifacts/protected/latency-baseline.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          token = os.environ["TEXT2SQL_EVAL_API_TOKEN"]
+          token_map = {
+              token: {
+                  "subject": "text2sql-release-eval",
+                  "tenant_id": "text2sql-release",
+                  "roles": ["admin", "user"],
+              }
+          }
+          Path("deploy/secrets/ag_ui_auth_token_map").write_text(
+              json.dumps(token_map, sort_keys=True),
+              encoding="utf-8",
+          )
+          PY
+          printf '%s' "${HF_TOKEN}" > deploy/secrets/hf_token
+          printf '%s' "${OPENAI_API_KEY}" > deploy/secrets/openai_api_key
+          printf '%s' "${OPENAI_API_KEY_DB}" > deploy/secrets/openai_api_key_db
+          chmod 600 deploy/secrets/*
+
+      - name: Build and verify reproducible candidate images
+        run: sh deploy/build_reproducible_images.sh
+
+      - name: Validate and preserve approved backup manifest
+        run: |
+          set -eu
+          schema_ref="sha256:$(sha256sum config/text_to_sql/state_schema.yaml | cut -d ' ' -f 1)"
+          install --mode=0600 -- \
+            "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH}" \
+            artifacts/protected/backup-manifest.json
+          copied_backup_manifest_sha256=$(sha256sum -- \
+            artifacts/protected/backup-manifest.json | cut -d ' ' -f 1)
+          test "${copied_backup_manifest_sha256}" = \
+            "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256}"
+          python3 deploy/write_backup_manifest.py \
+            --backup-reference "${BACKUP_REFERENCE}" \
+            --candidate-digest "${CANDIDATE_DIGEST}" \
+            --schema-ref "${schema_ref}" \
+            --expected-sha256 "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256}" \
+            --validate artifacts/protected/backup-manifest.json
+
+      - name: Run deterministic release drills
+        env:
+          TEXT2SQL_DRILL_REPORT: artifacts/deterministic-drills.json
+        run: |
+          export TEXT2SQL_CANDIDATE_REF="${CANDIDATE_DIGEST}"
+          bash scripts/test_text2sql_release_drills.sh --deterministic
+
+      - name: Probe required real drivers
+        env:
+          TEXT2SQL_POSTGRES_DSN: ${{ secrets.TEXT2SQL_POSTGRES_DSN }}
+          TEXT2SQL_MYSQL_DSN: ${{ secrets.TEXT2SQL_MYSQL_DSN }}
+        run: |
+          set -eu
+          : > artifacts/protected/real-driver-evidence.json
+          chmod 0666 artifacts/protected/real-driver-evidence.json
+          docker run --rm --read-only \
+            --user 10001:10001 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=256m,uid=10001,gid=10001 \
+            --volume "${GITHUB_WORKSPACE}/artifacts/protected:/evidence" \
+            --env TEXT2SQL_POSTGRES_DSN \
+            --env TEXT2SQL_MYSQL_DSN \
+            --env TEXT2SQL_REQUIRED_REAL_DRIVER_LANES=postgres,mysql \
+            --env TEXT2SQL_REAL_DRIVER_EVIDENCE=/evidence/real-driver-evidence.json \
+            --env TEXT2SQL_EVAL_COMMIT="${GITHUB_SHA}" \
+            --env TEXT2SQL_EVAL_CANDIDATE_DIGEST="${CANDIDATE_DIGEST}" \
+            --env TEXT2SQL_EVAL_LOCK_DIGEST="${LOCK_DIGEST}" \
+            --entrypoint python3 \
+            "${BACKEND_IMAGE}" \
+            -m pytest -q -W error -p no:cacheprovider -m db_integration \
+            tests/integration/test_text_to_sql_real_drivers.py
+
+      - name: Start and verify exact candidate runtime
+        env:
+          TEXT2SQL_POSTGRES_DSN: ${{ secrets.TEXT2SQL_POSTGRES_DSN }}
+          TEXT2SQL_MYSQL_DSN: ${{ secrets.TEXT2SQL_MYSQL_DSN }}
+        run: |
+          set -eu
+          mkdir -p artifacts/runtime
+          docker compose -f deploy/compose.production.yml config --quiet
+          docker compose -f deploy/compose.production.yml up \
+            --detach --no-build --pull never --wait --wait-timeout 180
+          api_container=$(docker compose -f deploy/compose.production.yml ps -q api)
+          worker_container=$(docker compose -f deploy/compose.production.yml ps -q worker)
+          frontend_container=$(docker compose -f deploy/compose.production.yml ps -q frontend)
+          test "$(docker inspect --format '{{.Image}}' "${api_container}")" = "${BACKEND_IMAGE}"
+          test "$(docker inspect --format '{{.Image}}' "${worker_container}")" = "${BACKEND_IMAGE}"
+          test "$(docker inspect --format '{{.Image}}' "${frontend_container}")" = "${FRONTEND_IMAGE}"
+          curl --fail --silent --show-error \
+            "${EVAL_API_URL}/readyz" > artifacts/runtime/readiness.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          readiness_path = Path("artifacts/runtime/readiness.json")
+          runtime = {
+              "schema_version": 1,
+              "candidate_digest": os.environ["CANDIDATE_DIGEST"],
+              "backend_image": os.environ["BACKEND_IMAGE"],
+              "backend_oci_digest": os.environ["BACKEND_OCI_DIGEST"],
+              "frontend_image": os.environ["FRONTEND_IMAGE"],
+              "frontend_oci_digest": os.environ["FRONTEND_OCI_DIGEST"],
+              "readiness_sha256": hashlib.sha256(readiness_path.read_bytes()).hexdigest(),
+              "target_policy_sha256": os.environ["TEXT2SQL_TARGET_POLICY_SHA256"],
+          }
+          runtime_path = Path("artifacts/runtime/candidate-runtime.json")
+          runtime_path.write_text(
+              json.dumps(runtime, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Provision release fixture connections
+        env:
+          TEXT2SQL_FIXTURE_DSN_MAP_JSON: ${{ secrets.TEXT2SQL_FIXTURE_DSN_MAP_JSON }}
+          TEXT2SQL_EVAL_API_TOKEN: ${{ secrets.TEXT2SQL_EVAL_API_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          from streamlit_app.text_to_sql_client import TextToSqlApiClient
+
+          fixture_dsns = json.loads(os.environ["TEXT2SQL_FIXTURE_DSN_MAP_JSON"])
+          if not isinstance(fixture_dsns, dict) or not fixture_dsns:
+              raise SystemExit("fixture DSN map must be a non-empty object")
+          if not all(
+              isinstance(fixture, str)
+              and fixture.strip()
+              and isinstance(dsn, str)
+              and dsn.strip()
+              for fixture, dsn in fixture_dsns.items()
+          ):
+              raise SystemExit("fixture DSN map entries must be non-empty strings")
+          token = os.environ["TEXT2SQL_EVAL_API_TOKEN"]
+          client = TextToSqlApiClient(
+              base_url=os.environ["EVAL_API_URL"],
+              auth_headers=lambda: {"Authorization": f"Bearer {token}"},
+          )
+          connection_map = {}
+          for fixture in sorted(fixture_dsns):
+              connection = client.register_connection(
+                  display_name=f"release-{fixture}",
+                  dsn=fixture_dsns[fixture],
+                  owner_subject="text2sql-release-eval",
+                  tenant_id="text2sql-release",
+              )
+              connection_map[fixture] = connection.connection_ref
+          Path("artifacts/protected/connection-map.json").write_text(
+              json.dumps(connection_map, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Run canonical protected release evaluation
+        env:
+          TEXT2SQL_EVAL_API_TOKEN: ${{ secrets.TEXT2SQL_EVAL_API_TOKEN }}
+        run: |
+          python3 -m custom_tools.text_to_sql.eval.cli \
+            --gold tests/eval/gold \
+            --policy config/text_to_sql/eval_release.yaml \
+            --mode release \
+            --repetitions "${RELEASE_REPETITIONS}" \
+            --commit "${GITHUB_SHA}" \
+            --candidate-digest "${CANDIDATE_DIGEST}" \
+            --lock-digest "${LOCK_DIGEST}" \
+            --model-id "${MODEL_ID}" \
+            --provider-id "${PROVIDER_ID}" \
+            --model-config-digest "${MODEL_CONFIG_DIGEST}" \
+            --latency-baseline artifacts/protected/latency-baseline.json \
+            --target-policy artifacts/build/target-policy.json \
+            --protected-evidence artifacts/protected/real-driver-evidence.json \
+            --connection-map artifacts/protected/connection-map.json \
+            --api-url "${EVAL_API_URL}" \
+            --auth-token-env TEXT2SQL_EVAL_API_TOKEN \
+            --output artifacts/text2sql-eval-release.json
+
+      - name: Run release drills
+        env:
+          TEXT2SQL_PREVIOUS_BACKEND_IMAGE: ${{ env.PREVIOUS_BACKEND_IMAGE }}
+          TEXT2SQL_PREVIOUS_FRONTEND_IMAGE: ${{ env.PREVIOUS_FRONTEND_IMAGE }}
+          TEXT2SQL_BACKUP_REF: ${{ env.BACKUP_REFERENCE }}
+          TEXT2SQL_BACKUP_MANIFEST: artifacts/protected/backup-manifest.json
+          TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256: ${{ env.TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256 }}
+          TEXT2SQL_DRILL_REPORT: artifacts/protected-rollback.json
+        run: |
+          export TEXT2SQL_CANDIDATE_REF="${CANDIDATE_DIGEST}"
+          bash scripts/test_text2sql_release_drills.sh --protected-rollback
+
+      - name: Write release evidence index
+        if: always()
+        run: |
+          python3 deploy/write_release_evidence.py \
+            --artifacts artifacts \
+            --commit "${GITHUB_SHA}" \
+            --dirty-tree "${CANDIDATE_DIRTY_FLAG:-true}" \
+            --policy config/text_to_sql/eval_release.yaml \
+            --gold tests/eval/gold \
+            --lock requirements.lock \
+            --lock requirements-db-optional.lock \
+            --lock frontend/client/package-lock.json \
+            --migration-manifest config/text_to_sql/state_schema.yaml \
+            --model-id "${MODEL_ID}" \
+            --provider-id "${PROVIDER_ID}" \
+            --model-config-digest "${MODEL_CONFIG_DIGEST}" \
+            --latency-baseline artifacts/protected/latency-baseline.json \
+            --target-policy artifacts/build/target-policy.json \
+            --previous-backend-image "${PREVIOUS_BACKEND_IMAGE}" \
+            --previous-frontend-image "${PREVIOUS_FRONTEND_IMAGE}" \
+            --backup-reference "${BACKUP_REFERENCE}" \
+            --backup-manifest artifacts/protected/backup-manifest.json \
+            --output artifacts/protected-gates.json
+
+      - name: Stop candidate runtime
+        if: always()
+        run: |
+          docker compose -f deploy/compose.production.yml down --volumes || true
+
+      - name: Upload protected evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: text2sql-protected-${{ github.sha }}
+          path: artifacts
+          if-no-files-found: error
+          retention-days: 90

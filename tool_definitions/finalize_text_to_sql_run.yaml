@@ -1,0 +1,85 @@
+name: finalize_text_to_sql_run
+description: "Детерминированно завершает одобренный Text-to-SQL run: выполняет или dry-run проверяет SQL, пишет аудит и возвращает terminal outcome."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.finalize_text_to_sql_run
+parameters:
+  - name: sql_query
+    type: string
+    description: "Одобренный сгенерированный SQL."
+    required: true
+  - name: user_query
+    type: string
+    description: "Исходный запрос пользователя."
+    required: true
+  - name: verification_status
+    type: string
+    description: "Структурированный статус верификатора: Approved или Rejected."
+    required: true
+    enum:
+      - Approved
+      - Rejected
+  - name: dsn
+    type: string
+    description: "Явный DSN целевой базы данных."
+    required: true
+  - name: row_limit
+    type: integer
+    description: "Максимальное количество строк результата."
+    required: true
+  - name: dry_run_only
+    type: boolean
+    description: "Если true, сгенерированный SQL не исполняется."
+    required: true
+  - name: session_id
+    type: string
+    description: "Стабильный идентификатор сессии workflow."
+    required: true
+  - name: run_id
+    type: string
+    description: "Уникальный идентификатор запуска workflow."
+    required: true
+  - name: safety_policy
+    type: object
+    description: "Immutable request safety policy, rehydrated by the workflow worker."
+    required: false
+    nullable: true
+    default: null
+output:
+  type: object
+  properties:
+    run_id:
+      type: string
+    status:
+      type: string
+    reason_code:
+      type: string
+    sql:
+      type: string
+    generated:
+      type: boolean
+    approved:
+      type: boolean
+    executed:
+      type: boolean
+    dry_run:
+      type: boolean
+    audited:
+      type: boolean
+    data:
+      type: array
+    columns:
+      type: array
+      items:
+        type: string
+    rows_affected:
+      type: integer
+    error:
+      type: string
+      nullable: true
+    execution:
+      type: object
+    audit:
+      type: object
+    persistence:
+      type: object

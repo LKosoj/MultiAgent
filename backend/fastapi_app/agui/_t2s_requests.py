@@ -13,6 +13,9 @@ EPIC 7.23: единый source of truth для валидации payload — Py
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
@@ -21,19 +24,48 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 # с workflow.enhanced_engine._should_fallback_to_legacy.
 from custom_tools.text_to_sql.utils import coerce_strict_bool
 
+TEXT_TO_SQL_MAX_ROWS_MIN = 1
+TEXT_TO_SQL_MAX_ROWS_MAX = 10000
+TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS = frozenset({"strict"})
+_RAW_DSN_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[;\s])(?:database|dbname|driver|dsn|host|password|port|pwd|server|uid|user)\s*=",
+    flags=re.IGNORECASE,
+)
+_RAW_DSN_SCHEMES = frozenset(
+    {"duckdb", "file", "impala", "mysql", "postgres", "postgresql", "sapiq", "sqlite"}
+)
+_RAW_DSN_FILE_SUFFIXES = (".db", ".duckdb", ".sqlite", ".sqlite3")
+
+
+def _looks_like_raw_dsn(value: str) -> bool:
+    candidate = value.strip()
+    normalized = candidate.casefold()
+    scheme, separator, _ = normalized.partition(":")
+    if "://" in normalized or (
+        separator and scheme.split("+", 1)[0] in _RAW_DSN_SCHEMES
+    ):
+        return True
+    if _RAW_DSN_ASSIGNMENT_RE.search(candidate):
+        return True
+    if normalized == ":memory:" or candidate.startswith(("/", "./", "../", "~/", "\\")):
+        return True
+    if (
+        len(candidate) > 2
+        and candidate[0].isalpha()
+        and candidate[1] == ":"
+        and candidate[2] in "/\\"
+    ):
+        return True
+    path = normalized.split("?", 1)[0].split("#", 1)[0]
+    return path.endswith(_RAW_DSN_FILE_SUFFIXES)
+
 
 def _get_runtime_limits() -> tuple[int, int, frozenset[str]]:
-    """Читает runtime-лимиты из service.py — единый source of truth.
-
-    Lazy-import: ``service.py`` импортирует этот модуль, поэтому нельзя
-    делать top-level импорт (circular import). Значения статические,
-    но runtime-resolve упрощает их monkeypatch в тестах.
-    """
-    from . import service as _svc
+    """Return the immutable request limits without importing service runtime."""
     return (
-        _svc._TEXT_TO_SQL_MAX_ROWS_MIN,
-        _svc._TEXT_TO_SQL_MAX_ROWS_MAX,
-        frozenset(_svc._TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS),
+        TEXT_TO_SQL_MAX_ROWS_MIN,
+        TEXT_TO_SQL_MAX_ROWS_MAX,
+        TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS,
     )
 
 
@@ -56,16 +88,16 @@ def _coerce_soft_bool(value: Any, *, default: bool = False) -> bool:
 class TextToSqlGenerateRequest(BaseModel):
     """Валидированный payload для ``presets.text_to_sql.generate``.
 
-    ВНИМАНИЕ: модель ожидает уже зарезолвленный ``dsn`` — резолвинг
-    ``db_config:<name>`` остаётся в ``service.py`` (там есть side-effects:
-    чтение секретов, fallback на legacy config). Это снижает coupling
-    модели с infra-слоем и упрощает unit-тесты.
+    Модель валидирует только форму выбора подключения. Резолвинг reference и
+    principal-aware авторизация остаются в service-слое.
     """
 
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
     query: str = Field(..., min_length=1, description="NL-запрос пользователя")
-    dsn: str = Field(..., min_length=1, description="Резолвленный DSN")
+    connection_ref: Optional[str] = Field(default=None, description="Opaque connection reference")
+    dsn: Optional[str] = Field(default=None, min_length=1, description="Admin compatibility DSN")
+    admin_raw_dsn_compat: bool = Field(default=False)
     max_rows: int = Field(default=100)
     safety_level: str = Field(default="strict")
     include_explanation: bool = Field(default=True)
@@ -78,6 +110,7 @@ class TextToSqlGenerateRequest(BaseModel):
     client_id: Optional[str] = Field(default=None)
     use_enhanced: bool = Field(default=True)
     enable_telemetry: bool = Field(default=False)
+    idempotency_key: Optional[str] = Field(default=None)
 
     # === Валидаторы для строгих/мягких полей =================================
     @field_validator("query", mode="before")
@@ -92,12 +125,30 @@ class TextToSqlGenerateRequest(BaseModel):
             raise ValueError("query is required")
         return stripped
 
+    @field_validator("connection_ref", mode="before")
+    @classmethod
+    def _validate_connection_ref(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("connection_ref must be a non-empty string")
+        if _looks_like_raw_dsn(v):
+            raise ValueError("connection_ref must be an opaque reference, not a raw DSN")
+        return v
+
     @field_validator("dsn", mode="before")
     @classmethod
-    def _validate_dsn(cls, v: Any) -> str:
+    def _validate_dsn(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
         if not isinstance(v, str) or not v.strip():
             raise ValueError("dsn is required")
         return v
+
+    @field_validator("admin_raw_dsn_compat", mode="before")
+    @classmethod
+    def _coerce_admin_raw_dsn_compat(cls, v: Any) -> bool:
+        return coerce_strict_bool(v, default=False, field_name="admin_raw_dsn_compat")
 
     @field_validator("max_rows", mode="before")
     @classmethod
@@ -177,13 +228,34 @@ class TextToSqlGenerateRequest(BaseModel):
             raise ValueError("session_id/client_id must be a string")
         return v or None
 
+    @field_validator("idempotency_key", mode="before")
+    @classmethod
+    def _validate_idempotency_key(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        if not isinstance(v, str):
+            raise ValueError("idempotency_key must be a string")
+        if (
+            not v
+            or v != v.strip()
+            or len(v) > 128
+            or not all(character.isprintable() for character in v)
+        ):
+            raise ValueError(
+                "idempotency_key must be canonical printable text up to 128 characters"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def _validate_connection_input(self) -> "TextToSqlGenerateRequest":
+        if (self.connection_ref is None) == (self.dsn is None):
+            raise ValueError("exactly one of connection_ref or dsn is required")
+        return self
+
     @model_validator(mode="after")
     def _validate_schema_mode(self) -> "TextToSqlGenerateRequest":
-        if not self.use_schema_suggestions and self.validate_schema:
-            raise ValueError(
-                "use_schema_suggestions=false requires validate_schema=false "
-                "or an explicit schema-producing path"
-            )
+        if not self.use_schema_suggestions:
+            raise ValueError("schema grounding is required for Text-to-SQL")
         return self
 
 
@@ -205,6 +277,9 @@ def parse_text_to_sql_generate(payload: dict) -> TextToSqlGenerateRequest:
             # Pydantic выкладывает наше raise ValueError(msg) в ctx['error'].
             ctx_err = first.get("ctx", {}).get("error") if isinstance(first.get("ctx"), dict) else None
             msg = str(ctx_err) if ctx_err else first.get("msg") or "invalid payload"
+            location = first.get("loc") or ()
+            if first.get("type") == "missing" and location:
+                msg = f"{'.'.join(str(part) for part in location)} is required"
         else:
             msg = "invalid payload"
         # Дополнительно прокидываем агрегированный список всех ошибок —
@@ -215,6 +290,44 @@ def parse_text_to_sql_generate(payload: dict) -> TextToSqlGenerateRequest:
             if all_errs:
                 msg = f"{msg} (all: {all_errs})"
         raise ValueError(msg) from exc
+
+
+def parse_text_to_sql_start(payload: dict[str, Any]) -> TextToSqlGenerateRequest:
+    """Normalize the public query alias and validate one start request."""
+    if not isinstance(payload, dict):
+        raise ValueError("service_payload must be an object")
+    query = ""
+    for key in ("natural_query", "query"):
+        candidate = payload.get(key)
+        if candidate is None:
+            continue
+        if not isinstance(candidate, str):
+            raise ValueError(f"{key} must be a string")
+        if candidate.strip():
+            query = candidate.strip()
+            break
+    normalized = dict(payload)
+    normalized["query"] = query
+    return parse_text_to_sql_generate(normalized)
+
+
+def canonical_text_to_sql_start_fingerprint(payload: dict[str, Any]) -> str:
+    """Digest canonical validated semantics, excluding transport-only identity."""
+    request = parse_text_to_sql_start(payload)
+    excluded_fields = {"admin_raw_dsn_compat", "client_id", "idempotency_key"}
+    excluded_fields.add("dsn" if request.connection_ref is not None else "connection_ref")
+    canonical = request.model_dump(
+        exclude=excluded_fields,
+        mode="json",
+    )
+    encoded = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def parse_text_to_sql_pipeline_inputs(inputs: dict) -> TextToSqlGenerateRequest:

@@ -19,10 +19,19 @@ import re
 import threading
 import time
 from collections import OrderedDict
-from typing import Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
+
+if TYPE_CHECKING:
+    from ..validators import TextToSqlSafetyPolicy
 
 from ..prompts import build_sql_safety_prompt
 from ..utils import redact_text_to_sql_value
+from ._db_exec import (
+    MissingDSNError,
+    QueryExecutionRequest,
+    QueryExecutor,
+    QueryPurpose,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -213,26 +222,22 @@ def _clear_llm_safety_cache() -> None:
         _LLM_SAFETY_TIMEOUT_CACHE.clear()
 
 
-def _llm_safety_cache_key(sql_query: str, dsn: Optional[str] = None) -> str:
+def _llm_safety_cache_key(
+    sql_query: str,
+    dsn: Optional[str] = None,
+    *,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
+) -> str:
     from ..dialects import get_current_dialect_name
-    from ..validators.safety_config import load_safety_profile
+    from custom_tools.text_to_sql import core as _facade
 
     dialect_name = get_current_dialect_name(dsn, strict=bool(dsn and str(dsn).strip()))
-    profile = load_safety_profile()
+    policy = _facade._request_safety_policy(safety_policy, fallback_to_startup_policy=True)
     payload = json.dumps(
         {
             "dialect": dialect_name,
             "sql_query": sql_query,
-            "safety": {
-                "source_path": profile.source_path,
-                "profile_name": profile.profile_name,
-                "forbidden_keywords": profile.forbidden_keywords,
-                "forbidden_functions": profile.forbidden_functions,
-                "ast_forbidden_stmt_classes": profile.ast_forbidden_stmt_classes,
-                "ast_forbidden_command_words": sorted(profile.ast_forbidden_command_words),
-                "max_query_length": profile.max_query_length,
-                "max_in_list_size": profile.max_in_list_size,
-            },
+            "policy_version": policy.policy_version,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -404,6 +409,7 @@ def sql_generation_plugin(
     dsn: Optional[str] = None,
     session_id: Optional[str] = None,
     *,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
     sql_generator,
 ) -> Dict[str, str]:
     """LLM-генерация SQL из linked_entities с безопасными ограничениями и валидацией схемы.
@@ -430,18 +436,58 @@ def sql_generation_plugin(
         raise ValueError(
             "sql_generation_plugin requires explicit dsn or workflow runtime metadata"
         )
-    if session_id is None:
-        return sql_generator.generate_sql(
-            context,
-            user_query,
-            dsn=effective_dsn,
-        )
-    return sql_generator.generate_sql(
-        context,
-        user_query,
-        dsn=effective_dsn,
-        session_id=session_id,
+    from tool_runtime_context import get_tool_runtime_value
+
+    successful_context_json = get_tool_runtime_value(
+        "successful_sql_context_json",
+        None,
     )
+    if successful_context_json is not None:
+        from ..successful_sql_memory import MAX_SUCCESSFUL_SQL_CONTEXT_BYTES
+
+        if not isinstance(successful_context_json, str):
+            raise TypeError("successful_sql_context_json must be a JSON string")
+        if len(successful_context_json.encode("utf-8")) > MAX_SUCCESSFUL_SQL_CONTEXT_BYTES:
+            raise ValueError("successful_sql_context_json exceeds its byte limit")
+        try:
+            successful_examples = json.loads(successful_context_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError("successful_sql_context_json is invalid JSON") from exc
+        if not isinstance(successful_examples, list) or len(successful_examples) > 3:
+            raise ValueError("successful_sql_context_json must contain at most three examples")
+        for example in successful_examples:
+            if not isinstance(example, dict) or set(example) != {
+                "user_query",
+                "sql",
+                "dialect",
+            }:
+                raise ValueError("successful SQL context entry has an invalid shape")
+            if not all(isinstance(example[field], str) for field in example):
+                raise ValueError("successful SQL context fields must be strings")
+        if isinstance(context, dict):
+            structured_context = dict(context)
+        elif isinstance(context, str):
+            try:
+                structured_context = json.loads(context)
+            except json.JSONDecodeError as exc:
+                raise ValueError("generation context must be a JSON object") from exc
+            if not isinstance(structured_context, dict):
+                raise ValueError("generation context must be a JSON object")
+        else:
+            raise TypeError("generation context must be a JSON object or string")
+        structured_context["successful_sql_examples"] = successful_examples
+        context = json.dumps(
+            structured_context,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    generation_kwargs = {"dsn": effective_dsn}
+    if session_id is not None:
+        generation_kwargs["session_id"] = session_id
+    if safety_policy is not None:
+        generation_kwargs["safety_policy"] = safety_policy
+    return sql_generator.generate_sql(context, user_query, **generation_kwargs)
 
 
 def _mask_formatter_sql_for_keyword_scan(
@@ -685,6 +731,7 @@ def sql_safety_check(
     *,
     sql_validator,
     dsn: Optional[str] = None,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
 ) -> Dict[str, object]:
     """Orchestrator: статический слой + LLM-advisory (если static прошёл).
 
@@ -712,6 +759,13 @@ def sql_safety_check(
     # === STATIC LAYER ========================================================
     # Основная статическая проверка (regex + sqlglot AST). Слой автономен:
     # не зависит от LLM-доступности.
+    from custom_tools.text_to_sql import core as _facade
+
+    policy = _facade._request_safety_policy(
+        safety_policy,
+        sql_validator=sql_validator,
+        fallback_to_startup_policy=True,
+    )
     safety_result = sql_validator.validate(sql_query, dsn=effective_dsn)
     safety_result.setdefault("issues", [])
     advisory_issues = safety_result.setdefault("advisory_issues", [])
@@ -741,7 +795,11 @@ def sql_safety_check(
     # пропускает повторный LLM-аудит, но не regex/AST-валидацию: иначе старый
     # safe-ответ мог бы скрыть новый static-deny после reload конфигурации или
     # изменения валидатора.
-    cache_key = _llm_safety_cache_key(sql_query, dsn=effective_dsn)
+    cache_key = _llm_safety_cache_key(
+        sql_query,
+        dsn=effective_dsn,
+        safety_policy=policy,
+    )
 
     # M6: сначала проверяем positive cache — если успешный аудит уже есть
     # (в том числе после восстановления LLM), используем его, минуя negative-TTL.
@@ -840,6 +898,7 @@ def sql_explain(
     dsn: Optional[str] = None,
     *,
     sql_validator,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
 ) -> Dict[str, object]:
     """EXPLAIN/PLAN для разных СУБД.
 
@@ -854,103 +913,81 @@ def sql_explain(
     """
     logger.info("Explaining SQL query")
 
-    from ..utils import get_runtime_context_dsn, is_dry_run_only, mask_dsn
-    dry_run_only = is_dry_run_only()
+    from custom_tools.text_to_sql import core as _facade
 
-    # W1-T1: explicit dsn > explicit env opt-in. Вычисляем DSN ДО safety:
-    # dialect/safety layer умеет брать DB_DSN при dsn=None, а sql_explain не
-    # должен даже статически/LLM-аудировать запрос в режиме silent env-fallback.
-    effective_dsn = dsn if (isinstance(dsn, str) and dsn.strip()) else get_runtime_context_dsn()
-    if effective_dsn is None:
-        allow_env = os.getenv("SECURE_DB_EXECUTOR_ALLOW_ENV_DSN", "0") == "1"
-        env_dsn = os.getenv("DB_DSN")
-        if allow_env and env_dsn and env_dsn.strip():
-            logger.warning(
-                "sql_explain: dsn parameter MISSING; using DB_DSN env "
-                "(SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 opt-in)"
+    policy = _facade._request_safety_policy(
+        safety_policy,
+        sql_validator=sql_validator,
+        fallback_to_startup_policy=True,
+    )
+
+    def with_policy(result: Dict[str, object]) -> Dict[str, object]:
+        result = dict(result)
+        result["profile_name"] = policy.profile_name
+        result["policy_version"] = policy.policy_version
+        return result
+
+    explain_sql = (
+        sql_query
+        if re.match(r"^\s*EXPLAIN\b", sql_query, flags=re.IGNORECASE)
+        else f"EXPLAIN {sql_query}"
+    )
+    try:
+        result = QueryExecutor().execute(
+            QueryExecutionRequest(
+                sql_query=explain_sql,
+                purpose=QueryPurpose.EXPLAIN,
+                row_limit=1,
+                dsn=dsn,
+                safety_policy=safety_policy,
             )
-            effective_dsn = env_dsn
-
-    if not dry_run_only and not effective_dsn:
-        return {
+        )
+    except MissingDSNError as exc:
+        return with_policy({
             "plan": None,
             "estimated_cost": None,
             "rows_to_scan": None,
             "issues": [{
                 "issue_type": "EXPLAIN_ERROR",
-                "description": (
-                    "DSN required: pass dsn via parameter. Silent DB_DSN env "
-                    "fallback disabled — set SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 "
-                    "to opt-in (not recommended)."
-                ),
+                "description": str(_redact_sql_api_value(exc)),
             }],
-        }
+        })
 
-    # Сначала проверяем безопасность — через фасад, чтобы тесты могли
-    # monkeypatch'ить `core.sql_safety_check` (контракт идентичен _db_exec.py).
-    # Для dry-run без DSN передаём пустую строку, а не None: иначе dialect layer
-    # может использовать DB_DSN как legacy fallback.
-    from custom_tools.text_to_sql import core as _facade
-    safety = _facade.sql_safety_check(sql_query, dsn=effective_dsn or "")
-    if not isinstance(safety, dict):
-        # Fail-closed: structure-failure не приравниваем к safe.
-        return {
-            "plan": None,
-            "estimated_cost": None,
-            "rows_to_scan": None,
-            "issues": [{
-                "issue_type": "SAFETY_RESULT_INVALID",
-                "description": f"sql_safety_check returned {type(safety).__name__}, expected dict",
-            }],
-        }
-    if not safety.get("is_safe", False):
-        safety_issues = safety.get("issues") or []
-        unsafe_result: Dict[str, object] = {
-            "plan": None,
-            "estimated_cost": None,
-            "rows_to_scan": None,
-            "issues": [*safety_issues, {"issue_type": "UNSAFE", "description": "Query failed safety check."}],
-        }
-        if dry_run_only:
-            unsafe_result["dry_run_only"] = True
-            unsafe_result["skipped_execution"] = True
-            unsafe_result["sql_query"] = sql_query
-        return unsafe_result
-    if dry_run_only:
-        return {
-            "plan": None,
-            "estimated_cost": None,
-            "rows_to_scan": None,
-            "issues": [],
-            "dry_run_only": True,
-            "skipped_execution": True,
-            "sql_query": sql_query,
-        }
+    outcome = result.to_mapping()
+    if result.success:
+        if outcome.get("dry_run_only"):
+            # T14: EXPLAIN — это тоже preparation read; dry-run должен
+            # останавливаться до открытия соединения, как и FINAL.
+            return with_policy({
+                "plan": None,
+                "estimated_cost": None,
+                "rows_to_scan": None,
+                "issues": [],
+                "dry_run_only": True,
+                "skipped_execution": True,
+                "sql_query": sql_query,
+            })
+        explain_result = outcome.get("explain_result")
+        if isinstance(explain_result, dict):
+            return with_policy(explain_result)
 
-    try:
-        # Обращаемся к get_plugin через фасадный модуль (для monkeypatch).
-        # _facade уже импортирован выше (для sql_safety_check) — переиспользуем.
-        get_plugin = _facade.get_plugin
-
-        plugin = get_plugin(effective_dsn)
-        conn = plugin.connect(effective_dsn)
-        try:
-            return plugin.explain(conn, sql_query)
-        finally:
-            plugin.close(conn)
-    except Exception as e:
-        # Маскируем DSN/пароль в сообщении об ошибке — DSN не должен попадать
-        # в логи/трассы/AG-UI envelope (см. EPIC 7.24, переиспользует mask_dsn
-        # из EPIC 7.3 — общий helper для текстов с DSN-литералами).
-        error_message = mask_dsn(str(e))
-        error_result: Dict[str, object] = {
-            "plan": None,
-            "estimated_cost": None,
-            "rows_to_scan": None,
-            "issues": [{"issue_type": "EXPLAIN_ERROR", "description": error_message}],
-        }
-        if dry_run_only:
-            error_result["dry_run_only"] = True
-            error_result["skipped_execution"] = True
-            error_result["sql_query"] = sql_query
-        return error_result
+    safety_issues = outcome.get("safety_issues") or []
+    if safety_issues:
+        issues = [
+            *safety_issues,
+            {
+                "issue_type": "UNSAFE",
+                "description": "Query failed safety check.",
+            },
+        ]
+    else:
+        issues = [{
+            "issue_type": "EXPLAIN_ERROR",
+            "description": result.error_message or "EXPLAIN failed",
+        }]
+    return with_policy({
+        "plan": None,
+        "estimated_cost": None,
+        "rows_to_scan": None,
+        "issues": issues,
+    })

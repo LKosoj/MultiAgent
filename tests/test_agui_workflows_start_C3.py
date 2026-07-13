@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import sys
 import types
@@ -87,8 +88,22 @@ def _load_service_with_stubs(monkeypatch, wf_manager):
     monkeypatch.setitem(sys.modules, "unified_logging", logging_module)
 
     workflow_pkg = types.ModuleType("workflow")
+    workflow_pkg.__path__ = [str(Path(__file__).resolve().parents[1] / "workflow")]
     workflow_streamlit = types.ModuleType("workflow.streamlit_api")
     workflow_streamlit.WorkflowManager = lambda: wf_manager
+
+    class WorkflowOwner:
+        def __init__(self, subject, tenant_id, roles):
+            self.subject = subject
+            self.tenant_id = tenant_id
+            self.roles = roles
+
+        @property
+        def quota_identity(self):
+            material = f"{self.tenant_id}\0{self.subject}".encode("utf-8")
+            return f"owner:{hashlib.sha256(material).hexdigest()}"
+
+    workflow_streamlit.WorkflowOwner = WorkflowOwner
     monkeypatch.setitem(sys.modules, "workflow", workflow_pkg)
     monkeypatch.setitem(sys.modules, "workflow.streamlit_api", workflow_streamlit)
 
@@ -118,7 +133,7 @@ class _WorkflowManagerStub:
 
     def start_workflow(self, **kwargs):
         self.calls.append(kwargs)
-        return "run-stub-001"
+        return kwargs["run_id"]
 
     def list_workflows(self):
         return []
@@ -582,20 +597,34 @@ def test_forbidden_workflow_error_is_value_error(monkeypatch):
     assert issubclass(service.ForbiddenWorkflowNameError, ValueError)
 
 
-def test_workflows_start_allows_other_pipeline(monkeypatch):
+def test_workflows_start_allows_other_pipeline(monkeypatch, tmp_path):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
+    event_store = service.EventStore(str(tmp_path / "events.db"))
+    monkeypatch.setattr(service, "_AGUI_EVENT_STORE", event_store)
+    try:
+        result = service.handle_service_action(
+            "workflows.start",
+            {
+                "workflow_name": "some_other_pipeline",
+                "parameters": {"foo": "bar"},
+            },
+        )
 
-    result = service.handle_service_action(
-        "workflows.start",
-        {
-            "workflow_name": "some_other_pipeline",
-            "parameters": {"foo": "bar"},
-        },
-    )
-    assert result == {"run_id": "run-stub-001"}
-    assert len(wf_manager.calls) == 1
-    assert wf_manager.calls[0]["workflow_name"] == "some_other_pipeline"
+        assert len(wf_manager.calls) == 1
+        call = wf_manager.calls[0]
+        assert result == {"run_id": call["run_id"], "status": "queued"}
+        assert result["run_id"].startswith("run-")
+        assert call["workflow_name"] == "some_other_pipeline"
+        assert call["run_id"] == result["run_id"]
+        assert call["client_id"] == call["owner"].quota_identity
+        stored = event_store.get_run(result["run_id"])
+        assert stored is not None
+        assert call["owner"].subject == stored.owner_subject
+        assert call["owner"].tenant_id == stored.tenant_id
+        assert call["owner"].roles == stored.roles
+    finally:
+        event_store.close()
 
 
 def test_workflows_start_storybook_requires_explicit_task(monkeypatch):

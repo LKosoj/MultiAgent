@@ -10,6 +10,7 @@ RAG-память для smolagents с политиками доступа
 """
 
 import logging
+import importlib
 import json
 import os
 from datetime import datetime, timezone
@@ -20,13 +21,32 @@ from smolagents.models import ChatMessage, MessageRole
 
 from agent_command import model_summary, model_big
 
-from memory.manager import get_memory_manager
-
 logger = logging.getLogger(__name__)
-from memory.tools import (
-    save_memory, get_memory, get_memory_summary, 
-    clear_agent_memory, get_session_memory_stats, memory_requester_context
-)
+
+
+def _memory_tool(name: str):
+    memory_tools = importlib.import_module("memory.tools")
+    return getattr(memory_tools, name)
+
+
+def save_memory(*args, **kwargs):
+    return _memory_tool("save_memory")(*args, **kwargs)
+
+
+def get_memory(*args, **kwargs):
+    return _memory_tool("get_memory")(*args, **kwargs)
+
+
+def clear_agent_memory(*args, **kwargs):
+    return _memory_tool("clear_agent_memory")(*args, **kwargs)
+
+
+def get_session_memory_stats(*args, **kwargs):
+    return _memory_tool("get_session_memory_stats")(*args, **kwargs)
+
+
+def memory_requester_context(*args, **kwargs):
+    return _memory_tool("memory_requester_context")(*args, **kwargs)
 
 _ACTIVE_RAG_MEMORY: Dict[Tuple[str, str], "RagMemory"] = {}
 
@@ -107,7 +127,7 @@ class RagMemory(AgentMemory):
         self.session_id = session_id
         self.agent_name = agent_name
         self.policy = policy or MemoryPolicy()
-        self.memory_manager = get_memory_manager()
+        self._memory_manager = None
         self._instance_step = 0
         self._compressed_summary = ""
         self._compressed_steps_count = 0
@@ -120,6 +140,14 @@ class RagMemory(AgentMemory):
         if self.policy.enable_logging:
             logger.info(f"🧠 RagMemory инициализирована для {agent_name} с политикой: {self.policy}")
         _ACTIVE_RAG_MEMORY[(self.session_id, self.agent_name)] = self
+
+    @property
+    def memory_manager(self):
+        if self._memory_manager is None:
+            from memory.manager import get_memory_manager
+
+            self._memory_manager = get_memory_manager()
+        return self._memory_manager
 
     def _serialize_local_step(self, step: Any) -> str:
         if isinstance(step, dict):

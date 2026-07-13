@@ -19,12 +19,19 @@ import warnings
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 
+from workflow.deadline import WorkflowDeadlineExceeded
+
 from ..deprecations import TextToSQLDeprecationWarning
-from ..join_builder import JoinBuilder
+from ..join_builder import INVERSE_JOIN_TYPES, SYMMETRIC_JOIN_TYPES, JoinBuilder
 from ..join_config import resolve_max_terminals, resolve_path_algo
 from ..join_path import JoinPathTooManyTerminals, build_join_path
-from ..schema_metadata import ColumnMetadataHelper, get_type, is_fk
-from ..utils import get_runtime_context_dsn, get_table_columns
+from ..schema_metadata import (
+    ColumnMetadataHelper,
+    get_foreign_key_constraints,
+    get_type,
+    is_fk,
+)
+from ..utils import get_runtime_context_dsn
 from .resolution import (
     _resolve_column_name,
     _resolve_table_name,
@@ -248,33 +255,49 @@ class JoinValidator:
         """
         joins: List[Dict[str, Any]] = []
 
+        def constraint_join(
+            source_table: str,
+            constraint: Dict[str, object],
+            *,
+            legacy: bool,
+            via_bridge: bool = False,
+        ) -> Dict[str, Any]:
+            pairs = constraint["column_pairs"]
+            if not isinstance(pairs, list) or not pairs:
+                raise ValueError("validated foreign key has no column pairs")
+            first = pairs[0]
+            if not isinstance(first, dict):
+                raise TypeError("validated foreign key pair must be a mapping")
+            join: Dict[str, Any] = {
+                "from_table": source_table,
+                "from_column": first["from_column"],
+                "to_table": constraint["to_table"],
+                "to_column": first["to_column"],
+                "join_type": "INNER",
+            }
+            if not legacy:
+                join["constraint_id"] = constraint["constraint_id"]
+                join["column_pairs"] = [dict(pair) for pair in pairs]
+            if via_bridge:
+                join["via_bridge"] = True
+            return join
+
         # 1) Прямые FK от required-таблиц.
         for table_name in required_tables:
             resolved_table = _resolve_table_name(table_name, db_schema)
             if not resolved_table:
                 continue
 
-            table_columns = get_table_columns(db_schema[resolved_table])
-
-            for col_name, col_info in table_columns.items():
-                if isinstance(col_info, dict) and is_fk(col_info):
-                    references = col_info.get("references", "")
-                    if references:
-                        ref_table, ref_column = _parse_fk_reference(references)
-                        resolved_ref_table = _resolve_table_name(ref_table, db_schema)
-                        resolved_ref_column = (
-                            _resolve_column_name(ref_column, resolved_ref_table, db_schema)
-                            if resolved_ref_table
-                            else None
-                        )
-                        if resolved_ref_table and resolved_ref_column:
-                            joins.append({
-                                "from_table": resolved_table,
-                                "from_column": col_name,
-                                "to_table": resolved_ref_table,
-                                "to_column": resolved_ref_column,
-                                "join_type": "INNER",
-                            })
+            table_body = db_schema[resolved_table]
+            legacy = "foreign_keys" not in table_body
+            for constraint in get_foreign_key_constraints(resolved_table, db_schema):
+                joins.append(
+                    constraint_join(
+                        resolved_table,
+                        constraint,
+                        legacy=legacy,
+                    )
+                )
 
         # 2) 4.21: bridge-инференс. Для пары required-таблиц (A, B) без
         # прямого FK между ними ищем X в db_schema, у которой FK->A и
@@ -307,47 +330,21 @@ class JoinValidator:
                         # Bridge не должен быть одной из required — иначе
                         # ребро дублирует прямой FK / создаёт цикл.
                         continue
-                    x_columns = get_table_columns(x_body)
-                    # Mapping: ref_table -> [(x_col, x_ref_col)]
-                    fk_targets: Dict[str, List[Tuple[str, str]]] = {}
-                    for x_col, x_info in x_columns.items():
-                        if not (isinstance(x_info, dict) and is_fk(x_info)):
-                            continue
-                        x_references = x_info.get("references", "")
-                        if not x_references:
-                            continue
-                        x_ref_table, x_ref_col = _parse_fk_reference(x_references)
-                        resolved_x_ref_table = _resolve_table_name(x_ref_table, db_schema)
-                        resolved_x_ref_col = (
-                            _resolve_column_name(x_ref_col, resolved_x_ref_table, db_schema)
-                            if resolved_x_ref_table
-                            else None
+                    x_legacy = "foreign_keys" not in x_body
+                    fk_targets: Dict[str, List[Dict[str, Any]]] = {}
+                    for constraint in get_foreign_key_constraints(x_table, db_schema):
+                        join = constraint_join(
+                            x_table,
+                            constraint,
+                            legacy=x_legacy,
+                            via_bridge=True,
                         )
-                        if resolved_x_ref_table and resolved_x_ref_col:
-                            fk_targets.setdefault(resolved_x_ref_table, []).append(
-                                (x_col, resolved_x_ref_col)
-                            )
+                        fk_targets.setdefault(str(join["to_table"]), []).append(join)
 
                     for a, b in list(unconnected_pairs):
                         if a in fk_targets and b in fk_targets:
-                            for a_col, a_ref_col in fk_targets[a]:
-                                joins.append({
-                                    "from_table": x_table,
-                                    "from_column": a_col,
-                                    "to_table": a,
-                                    "to_column": a_ref_col,
-                                    "join_type": "INNER",
-                                    "via_bridge": True,
-                                })
-                            for b_col, b_ref_col in fk_targets[b]:
-                                joins.append({
-                                    "from_table": x_table,
-                                    "from_column": b_col,
-                                    "to_table": b,
-                                    "to_column": b_ref_col,
-                                    "join_type": "INNER",
-                                    "via_bridge": True,
-                                })
+                            joins.extend(fk_targets[a])
+                            joins.extend(fk_targets[b])
                             # Пара покрыта — больше не ищем bridge для неё.
                             unconnected_pairs.remove((a, b))
                             if not unconnected_pairs:
@@ -487,10 +484,26 @@ class JoinValidator:
             )
             warning = None
             if cardinality in {"one_to_many", "unknown"}:
+                raw_pairs = join.get("column_pairs")
+                pairs = (
+                    raw_pairs
+                    if isinstance(raw_pairs, list)
+                    else [
+                        {
+                            "from_column": join.get("from_column"),
+                            "to_column": join.get("to_column"),
+                        }
+                    ]
+                )
+                pair_text = " AND ".join(
+                    f"{join.get('from_table')}.{pair.get('from_column')} -> "
+                    f"{join.get('to_table')}.{pair.get('to_column')}"
+                    for pair in pairs
+                    if isinstance(pair, dict)
+                )
                 warning = (
-                    f"{join.get('from_table')}.{join.get('from_column')} -> "
-                    f"{join.get('to_table')}.{join.get('to_column')} has "
-                    f"{cardinality} cardinality; aggregation may fan out"
+                    f"{pair_text} has {cardinality} cardinality; "
+                    "aggregation may fan out"
                 )
             semantics.append({
                 "from_table": join.get("from_table"),
@@ -509,49 +522,70 @@ class JoinValidator:
     ) -> str:
         from_table = _resolve_table_name(join.get("from_table"), db_schema)
         to_table = _resolve_table_name(join.get("to_table"), db_schema)
-        from_column = (
-            _resolve_column_name(join.get("from_column"), from_table, db_schema)
-            if from_table
-            else None
-        )
-        to_column = (
-            _resolve_column_name(join.get("to_column"), to_table, db_schema)
-            if to_table
-            else None
-        )
-        if not all([from_table, to_table, from_column, to_column]):
+        if not from_table or not to_table:
             return "unknown"
-        if self._column_references(
-            from_table, from_column, to_table, to_column, db_schema
+        raw_pairs = join.get("column_pairs")
+        if raw_pairs is None:
+            raw_pairs = [
+                {
+                    "from_column": join.get("from_column"),
+                    "to_column": join.get("to_column"),
+                }
+            ]
+        if not isinstance(raw_pairs, list) or not raw_pairs:
+            return "unknown"
+        pairs: list[tuple[str, str]] = []
+        for pair in raw_pairs:
+            if not isinstance(pair, dict):
+                return "unknown"
+            from_column = _resolve_column_name(
+                pair.get("from_column"), from_table, db_schema
+            )
+            to_column = _resolve_column_name(
+                pair.get("to_column"), to_table, db_schema
+            )
+            if not from_column or not to_column:
+                return "unknown"
+            pairs.append((from_column, to_column))
+        if self._constraint_references(
+            from_table,
+            to_table,
+            pairs,
+            join.get("constraint_id"),
+            db_schema,
         ):
             return "many_to_one"
-        if self._column_references(
-            to_table, to_column, from_table, from_column, db_schema
+        if self._constraint_references(
+            to_table,
+            from_table,
+            [(target, source) for source, target in pairs],
+            join.get("constraint_id"),
+            db_schema,
         ):
             return "one_to_many"
         return "unknown"
 
-    def _column_references(
+    def _constraint_references(
         self,
         source_table: str,
-        source_column: str,
         target_table: str,
-        target_column: str,
+        pairs: list[tuple[str, str]],
+        constraint_id: object,
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
     ) -> bool:
-        from .resolution import _get_column_meta
-
-        meta = _get_column_meta(source_table, source_column, db_schema)
-        if not isinstance(meta, dict) or not is_fk(meta):
-            return False
-        ref_table, ref_column = _parse_fk_reference(meta.get("references", ""))
-        resolved_ref_table = _resolve_table_name(ref_table, db_schema)
-        resolved_ref_column = (
-            _resolve_column_name(ref_column, resolved_ref_table, db_schema)
-            if resolved_ref_table
-            else None
-        )
-        return resolved_ref_table == target_table and resolved_ref_column == target_column
+        authoritative = "foreign_keys" in db_schema[source_table]
+        for constraint in get_foreign_key_constraints(source_table, db_schema):
+            if constraint["to_table"] != target_table:
+                continue
+            if authoritative and constraint_id and constraint["constraint_id"] != constraint_id:
+                continue
+            constraint_pairs = [
+                (pair["from_column"], pair["to_column"])
+                for pair in constraint["column_pairs"]
+            ]
+            if constraint_pairs == pairs:
+                return True
+        return False
 
     # ------------------------------------------------------------------
     # Graph join-path (KMB Steiner) — opt-in через path_algo=graph
@@ -575,7 +609,7 @@ class JoinValidator:
             else:
                 source = "fk"
             jt = (j.get("join_type") or "LEFT").upper().strip()
-            edges.append({
+            edge = {
                 "a": j.get("from_table"),
                 "b": j.get("to_table"),
                 "a_col": j.get("from_column"),
@@ -583,7 +617,13 @@ class JoinValidator:
                 "jt": jt,
                 "weight": _BASE_WEIGHT.get(source, _BASE_WEIGHT["convention_legacy"]),
                 "source": source,
-            })
+            }
+            if "column_pairs" in j:
+                edge["column_pairs"] = [
+                    dict(pair) for pair in j.get("column_pairs", [])
+                ]
+                edge["constraint_id"] = j.get("constraint_id")
+            edges.append(edge)
         return edges
 
     def _apply_containment(
@@ -722,6 +762,17 @@ class JoinValidator:
         try:
             edges = self._to_candidate_edges(merged_joins)
             edges = self._apply_containment(edges)
+            parallel_edges: Dict[frozenset, List[Dict[str, Any]]] = defaultdict(list)
+            for edge in edges:
+                parallel_edges[frozenset((edge.get("a"), edge.get("b")))].append(edge)
+            for table_pair, candidates in parallel_edges.items():
+                if len(candidates) > 1:
+                    logger.warning(
+                        "Multiple FK edges between %s: graph path will choose one "
+                        "constraint deterministically; table aliases are required "
+                        "to use both",
+                        sorted(str(table) for table in table_pair),
+                    )
             result = build_join_path(
                 main_table,
                 required_tables,
@@ -761,6 +812,8 @@ class JoinValidator:
             return self.join_builder.build_joins(
                 main_table, required_tables, merged_joins
             )
+        except WorkflowDeadlineExceeded:
+            raise
         except Exception as e:
             logger.warning(
                 "Graph join-path failed (%s); falling back to greedy build_joins",
@@ -838,12 +891,146 @@ class JoinValidator:
             if not resolved_to_column:
                 return {"valid": False, "error": f"Column {to_column} not found in table {to_table}"}
 
-            # Локальный импорт, чтобы избежать циклической зависимости
-            # при импорте модуля.
             from .resolution import _get_column_meta
 
             from_meta = _get_column_meta(resolved_from_table, resolved_from_column, db_schema)
             to_meta = _get_column_meta(resolved_to_table, resolved_to_column, db_schema)
+
+            requested_pairs: list[tuple[str, str]] = []
+            if "column_pairs" in join:
+                raw_pairs = join.get("column_pairs")
+                if not isinstance(raw_pairs, list) or not raw_pairs:
+                    return {
+                        "valid": False,
+                        "error": "column_pairs must be a non-empty list",
+                    }
+                for pair in raw_pairs:
+                    if not isinstance(pair, dict):
+                        return {
+                            "valid": False,
+                            "error": "column_pairs members must be mappings",
+                        }
+                    source = _resolve_column_name(
+                        pair.get("from_column"), resolved_from_table, db_schema
+                    )
+                    target = _resolve_column_name(
+                        pair.get("to_column"), resolved_to_table, db_schema
+                    )
+                    if not source or not target:
+                        return {
+                            "valid": False,
+                            "error": "column_pairs contains a column not found in schema",
+                        }
+                    requested_pairs.append((source, target))
+            else:
+                requested_pairs.append((resolved_from_column, resolved_to_column))
+
+            candidates: list[tuple[str, Dict[str, object], bool]] = []
+            authoritative_sides = (
+                (resolved_from_table, resolved_to_table, False),
+                (resolved_to_table, resolved_from_table, True),
+            )
+            for source_table, target_table, reverse in authoritative_sides:
+                source_body = db_schema[source_table]
+                if "foreign_keys" not in source_body:
+                    continue
+                constraints = get_foreign_key_constraints(source_table, db_schema)
+                for constraint in constraints:
+                    if constraint["to_table"] != target_table:
+                        continue
+                    if (
+                        join.get("constraint_id")
+                        and constraint["constraint_id"] != join.get("constraint_id")
+                    ):
+                        continue
+                    canonical_pairs = [
+                        (pair["from_column"], pair["to_column"])
+                        for pair in constraint["column_pairs"]
+                    ]
+                    oriented_pairs = (
+                        [(target, source) for source, target in canonical_pairs]
+                        if reverse
+                        else canonical_pairs
+                    )
+                    if "column_pairs" in join:
+                        matches = requested_pairs == oriented_pairs
+                    else:
+                        matches = requested_pairs[0] in oriented_pairs
+                    if matches:
+                        candidates.append((source_table, constraint, reverse))
+
+            if len(candidates) > 1:
+                return {
+                    "valid": False,
+                    "error": "Join matches multiple authoritative foreign keys",
+                }
+            if "column_pairs" in join and not candidates:
+                return {
+                    "valid": False,
+                    "error": "column_pairs must equal one complete foreign key constraint",
+                }
+            if candidates:
+                source_table, constraint, reverse = candidates[0]
+                target_table = str(constraint["to_table"])
+                pairs = [dict(pair) for pair in constraint["column_pairs"]]
+                for pair in pairs:
+                    source_meta = _get_column_meta(
+                        source_table, pair["from_column"], db_schema
+                    )
+                    target_meta = _get_column_meta(
+                        target_table, pair["to_column"], db_schema
+                    )
+                    source_type = get_type(source_meta)
+                    target_type = get_type(target_meta)
+                    if not source_type or not target_type:
+                        return {
+                            "valid": False,
+                            "error": "Cannot validate foreign key with missing column type",
+                        }
+                    if not ColumnMetadataHelper.check_type_compatibility(
+                        source_type, target_type
+                    ):
+                        return {
+                            "valid": False,
+                            "error": f"Type mismatch: {source_type} vs {target_type}",
+                        }
+                join_type = str(join.get("join_type") or "LEFT").upper().strip()
+                if reverse:
+                    if join_type in INVERSE_JOIN_TYPES:
+                        join_type = INVERSE_JOIN_TYPES[join_type]
+                    elif join_type not in SYMMETRIC_JOIN_TYPES:
+                        return {
+                            "valid": False,
+                            "error": f"unsupported join_type: {join.get('join_type')!r}",
+                        }
+                normalized_join = dict(join)
+                normalized_join.update(
+                    {
+                        "from_table": source_table,
+                        "from_column": pairs[0]["from_column"],
+                        "to_table": target_table,
+                        "to_column": pairs[0]["to_column"],
+                        "join_type": join_type,
+                        "constraint_id": constraint["constraint_id"],
+                        "column_pairs": pairs,
+                    }
+                )
+                return {"valid": True, "join": normalized_join}
+
+            authoritative_selected_fk = (
+                "foreign_keys" in db_schema[resolved_from_table]
+                and isinstance(from_meta, dict)
+                and is_fk(from_meta)
+            ) or (
+                "foreign_keys" in db_schema[resolved_to_table]
+                and isinstance(to_meta, dict)
+                and is_fk(to_meta)
+            )
+            if authoritative_selected_fk:
+                return {
+                    "valid": False,
+                    "error": "FK column is absent from the authoritative foreign key envelope",
+                }
 
             if from_meta and to_meta:
                 from_type = get_type(from_meta)
@@ -884,18 +1071,34 @@ class JoinValidator:
     # Misc
     # ------------------------------------------------------------------
     @staticmethod
-    def _join_endpoints(join: Dict[str, Any]) -> frozenset:
+    def _join_endpoints(join: Dict[str, Any]) -> tuple[object, ...]:
         """Симметричный ключ для дедупа JOIN.
 
         4.20: пара (A.x, B.y) и пара (B.y, A.x) описывают один и тот же
         JOIN и должны считаться дубликатами.
         """
-        return frozenset(
-            (
-                (join.get("from_table"), join.get("from_column")),
-                (join.get("to_table"), join.get("to_column")),
+        raw_pairs = join.get("column_pairs")
+        if isinstance(raw_pairs, list):
+            pairs = tuple(
+                frozenset(
+                    (
+                        (join.get("from_table"), pair.get("from_column")),
+                        (join.get("to_table"), pair.get("to_column")),
+                    )
+                )
+                for pair in raw_pairs
+                if isinstance(pair, dict)
             )
-        )
+        else:
+            pairs = (
+                frozenset(
+                    (
+                        (join.get("from_table"), join.get("from_column")),
+                        (join.get("to_table"), join.get("to_column")),
+                    )
+                ),
+            )
+        return (str(join.get("constraint_id") or ""), pairs)
 
     @staticmethod
     def _is_duplicate_join(join: Dict[str, Any], existing_joins: List[Dict[str, Any]]) -> bool:

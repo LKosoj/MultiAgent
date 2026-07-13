@@ -1,9 +1,42 @@
 import sqlite3
 
+import pytest
+
 from custom_tools.text_to_sql.value_grounding import (
+    _execute_lookup,
     ground_linked_filter_values,
     value_grounding_enabled,
 )
+
+
+@pytest.fixture(autouse=True)
+def _admit_auxiliary_reads(monkeypatch):
+    from custom_tools.text_to_sql import core
+    from tool_runtime_context import (
+        SupervisorExecutionEvidence,
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+    from workflow.deadline import DeadlineBudget
+
+    monkeypatch.setattr(
+        core,
+        "sql_safety_check",
+        lambda sql_query, **kwargs: {"is_safe": True, "issues": []},
+    )
+    token = set_tool_runtime_context(
+        {
+            "deadline_budget": DeadlineBudget.from_duration(60),
+            "supervisor_evidence": SupervisorExecutionEvidence(
+                "value-grounding-test",
+                1,
+            ),
+        }
+    )
+    try:
+        yield
+    finally:
+        reset_tool_runtime_context(token)
 
 
 def _schema():
@@ -167,3 +200,60 @@ def test_value_grounding_lookup_errors_fail_open_and_mask_dsn(monkeypatch):
     assert "secret" not in error
     assert "person@example.com" not in error
     assert "+7 (495) 123-45-67" not in error
+
+
+def test_value_grounding_lookup_routes_read_through_query_executor(monkeypatch):
+    import db_plugins
+    from custom_tools.text_to_sql import value_grounding as grounding_module
+    from custom_tools.text_to_sql.core._db_exec import (
+        QueryExecutionResult,
+        QueryPurpose,
+    )
+
+    seen = {}
+
+    class BuilderPlugin:
+        def build_distinct_values_query(self, table, column, limit):
+            return f"SELECT DISTINCT {column} FROM {table} LIMIT {limit}"
+
+    class Executor:
+        def __init__(self, *, get_plugin=None):
+            seen["resolver"] = get_plugin
+
+        def execute(self, request):
+            seen["request"] = request
+            return QueryExecutionResult(
+                request.purpose,
+                {
+                    "success": True,
+                    "data": [["north"]],
+                    "columns": ["region"],
+                    "rows_affected": 1,
+                    "execution_time_ms": 1,
+                    "error_message": None,
+                    "dry_run_only": False,
+                    "skipped_execution": False,
+                    "sql_query": request.sql_query,
+                    "applied_row_limit": request.row_limit,
+                },
+            )
+
+    def resolver(_dsn):
+        return BuilderPlugin()
+
+    monkeypatch.setattr(db_plugins, "get_plugin", resolver)
+    monkeypatch.setattr(grounding_module, "QueryExecutor", Executor)
+
+    rows = _execute_lookup(
+        "sqlite:///tmp/app.db",
+        lambda plugin: plugin.build_distinct_values_query(
+            "orders",
+            "region",
+            5,
+        ),
+        row_limit=5,
+    )
+
+    assert rows == [["north"]]
+    assert seen["resolver"] is resolver
+    assert seen["request"].purpose is QueryPurpose.GROUNDING

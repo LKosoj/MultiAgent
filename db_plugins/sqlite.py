@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
-from .base import BaseDBPlugin
+from .base import BaseDBPlugin, Capability, DatabaseCapabilities, EnforcementMode
 
 logger = logging.getLogger(__name__)
 
@@ -13,6 +13,37 @@ logger = logging.getLogger(__name__)
 class SQLitePlugin(BaseDBPlugin):
     dialect = "sqlite"
     dialect_label = "SQLite"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        read_only = Capability.supported(
+            EnforcementMode.READ_ONLY_FILE, "READ_ONLY_FILE_ENFORCED"
+        )
+        if dsn and ":memory:" in dsn:
+            read_only = Capability.unsupported("IN_MEMORY_NOT_READ_ONLY")
+        elif dsn and self.read_only_fail_open_enabled(dsn):
+            read_only = Capability.unsupported("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=read_only,
+            statement_timeout=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.supported(
+                EnforcementMode.DATABASE, "ORDERED_COMPOSITE_FK_METADATA"
+            ),
+            parameter_binding=Capability.supported(
+                EnforcementMode.DRIVER, "DRIVER_PARAMETER_BINDING"
+            ),
+        )
 
     def connect(self, dsn: str):
         # dsn формата: sqlite:///abs/path/to.db или file:/path?mode=ro
@@ -76,8 +107,8 @@ class SQLitePlugin(BaseDBPlugin):
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
-    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Dict[str, str]]]:
-        schema_result: Dict[str, Dict[str, Dict[str, str]]] = {}
+    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
+        schema_result: Dict[str, Dict[str, Any]] = {}
         with self._cursor(conn) as cur:
             # Фильтруем таблицы по table_name если указан
             if table_name:
@@ -93,14 +124,101 @@ class SQLitePlugin(BaseDBPlugin):
                 cols = cur.fetchall()
 
                 # Информация о foreign keys
-                try:
-                    cur.execute(f"PRAGMA foreign_key_list({quoted_table_ident});")
-                    fks = cur.fetchall()
-                    fk_map = {fk[3]: f"{fk[2]}.{fk[4]}" for fk in fks}  # from_col -> to_table.to_col
-                except Exception:
-                    fk_map = {}
+                cur.execute(f"PRAGMA foreign_key_list({quoted_table_ident});")
+                fks = cur.fetchall()
 
-                schema_result[table] = {"description": "", "columns": {}}
+                grouped_fks: Dict[
+                    int, list[tuple[int, str, str, Optional[str]]]
+                ] = {}
+                for fk in fks:
+                    fk_id, sequence, target_table, source_column, target_column = fk[:5]
+                    if not isinstance(fk_id, int) or not isinstance(sequence, int):
+                        raise RuntimeError(
+                            f"SQLite FK identity/order is invalid for table {table}"
+                        )
+                    grouped_fks.setdefault(fk_id, []).append(
+                        (sequence, source_column, target_table, target_column)
+                    )
+
+                fk_map: Dict[str, str] = {}
+                constraints: list[Dict[str, Any]] = []
+                for fk_id, members in sorted(grouped_fks.items()):
+                    ordered = sorted(members)
+                    if [position for position, *_ in ordered] != list(
+                        range(len(ordered))
+                    ):
+                        raise RuntimeError(
+                            f"SQLite FK ordinals are not contiguous for {table}:sqlite-fk-{fk_id}"
+                        )
+                    target_tables = {
+                        target_table for _, _, target_table, _ in ordered
+                    }
+                    if len(target_tables) != 1:
+                        raise RuntimeError(
+                            f"SQLite FK target table is inconsistent for {table}:sqlite-fk-{fk_id}"
+                        )
+                    target_table = target_tables.pop()
+                    target_columns = [target for _, _, _, target in ordered]
+                    if any(target is None for target in target_columns):
+                        if not all(target is None for target in target_columns):
+                            raise RuntimeError(
+                                f"SQLite FK target columns are ambiguous for {table}:sqlite-fk-{fk_id}"
+                            )
+                        quoted_target = self.quote_identifier(target_table)
+                        cur.execute(f"PRAGMA table_info({quoted_target});")
+                        target_info = cur.fetchall()
+                        primary_key_columns = sorted(
+                            (row[5], row[1])
+                            for row in target_info
+                            if isinstance(row[5], int) and row[5] > 0
+                        )
+                        if [position for position, _ in primary_key_columns] != list(
+                            range(1, len(primary_key_columns) + 1)
+                        ) or len(primary_key_columns) != len(ordered):
+                            raise RuntimeError(
+                                f"SQLite implicit FK target cardinality/order is invalid "
+                                f"for {table}:sqlite-fk-{fk_id}"
+                            )
+                        target_columns = [
+                            column for _, column in primary_key_columns
+                        ]
+                    elif any(
+                        not isinstance(target, str) or not target
+                        for target in target_columns
+                    ):
+                        raise RuntimeError(
+                            f"SQLite FK target column is invalid for {table}:sqlite-fk-{fk_id}"
+                        )
+
+                    column_pairs = [
+                        {
+                            "from_column": source_column,
+                            "to_column": target_column,
+                        }
+                        for (_, source_column, _, _), target_column in zip(
+                            ordered, target_columns
+                        )
+                    ]
+                    constraints.append(
+                        {
+                            "constraint_id": f"{table}:sqlite-fk-{fk_id}",
+                            "to_table": target_table,
+                            "column_pairs": column_pairs,
+                        }
+                    )
+                    for pair in column_pairs:
+                        fk_map[pair["from_column"]] = (
+                            f"{target_table}.{pair['to_column']}"
+                        )
+
+                schema_result[table] = {
+                    "description": "",
+                    "columns": {},
+                    "foreign_keys": {
+                        "complete": True,
+                        "constraints": constraints,
+                    },
+                }
                 for c in cols:
                     col_name = c[1]
                     col_type = c[2]
@@ -110,13 +228,12 @@ class SQLitePlugin(BaseDBPlugin):
 
                     # Определяем constraint type
                     constraint_type = ""
-                    references = ""
+                    references = fk_map.get(col_name, "")
 
                     if is_pk:
                         constraint_type = "PRIMARY KEY"
-                    elif col_name in fk_map:
+                    elif references:
                         constraint_type = "FOREIGN KEY"
-                        references = fk_map[col_name]
 
                     col_info = {
                         "type": col_type,

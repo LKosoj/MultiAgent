@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from .manager import memory_manager
-from .rebuild import rebuild_chromadb_from_sqlite
+from .rebuild import RebuildStatus, rebuild_chromadb_from_sqlite
 from .database import DatabaseHandler
 from .models import TacticalMemoryItem, StrategicGoal
 
@@ -78,6 +78,7 @@ class MemoryRebuildResult:
     strategic_count: int = 0
     tactical_errors: int = 0
     strategic_errors: int = 0
+    permanently_skipped_count: int = 0
     rebuild_time_ms: float = 0.0
     error_message: Optional[str] = None
     warnings: List[str] = None
@@ -284,7 +285,6 @@ class MemoryRAGManager:
         Returns:
             Объект MemoryRebuildResult с результатами перестройки
         """
-        start_time = datetime.now()
         result = MemoryRebuildResult(success=False)
         
         try:
@@ -308,29 +308,38 @@ class MemoryRAGManager:
             logger.info("🔄 Начинаем перестройку ChromaDB из SQLite...")
             
             # Вызываем функцию перестройки
-            rebuild_message = rebuild_chromadb_from_sqlite(self.memory_manager.db_handler)
-            
-            # Парсим результат для извлечения статистики
-            result.success = "успешно" in rebuild_message.lower()
-            
-            # Попытка извлечь числовые данные из сообщения
-            import re
-            tactical_match = re.search(r'Тактическая память: (\d+) записей', rebuild_message)
-            strategic_match = re.search(r'Стратегическая память: (\d+) записей', rebuild_message)
-            
-            if tactical_match:
-                result.tactical_count = int(tactical_match.group(1))
-            if strategic_match:
-                result.strategic_count = int(strategic_match.group(1))
-            
-            # Время выполнения
-            rebuild_time = (datetime.now() - start_time).total_seconds() * 1000
-            result.rebuild_time_ms = round(rebuild_time, 2)
+            report = rebuild_chromadb_from_sqlite(self.memory_manager.db_handler)
+            result.success = report.status is RebuildStatus.COMPLETE
+            result.tactical_count = len(report.tactical.indexed_ids)
+            result.strategic_count = len(report.strategic.indexed_ids)
+            result.tactical_errors = (
+                len(report.tactical.failed)
+                + len(report.tactical.missing_ids)
+                + len(report.tactical.unexpected_ids)
+            )
+            result.strategic_errors = (
+                len(report.strategic.failed)
+                + len(report.strategic.missing_ids)
+                + len(report.strategic.unexpected_ids)
+            )
+            result.warnings.extend(
+                f"{record_id}: {reason}"
+                for record_id, reason in (
+                    *report.tactical.permanently_skipped,
+                    *report.strategic.permanently_skipped,
+                )
+            )
+            result.permanently_skipped_count = len(report.tactical.permanently_skipped) + len(
+                report.strategic.permanently_skipped
+            )
+            result.rebuild_time_ms = report.duration_ms
             
             if result.success:
                 logger.info(f"✅ Перестройка памяти завершена за {result.rebuild_time_ms}ms")
             else:
-                result.error_message = rebuild_message
+                result.error_message = report.error_code or (
+                    f"rebuild status: {report.status.value}"
+                )
                 
         except Exception as e:
             result.error_message = f"Ошибка перестройки памяти: {str(e)}"

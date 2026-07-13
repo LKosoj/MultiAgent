@@ -267,12 +267,21 @@ def test_save_successful_sql_requires_explicit_or_runtime_dsn(tmp_path, monkeypa
 def test_get_distinct_values_reads_runtime_dsn_when_argument_omitted(monkeypatch):
     import db_plugins
     from custom_tools import sql_tools
+    from custom_tools.text_to_sql import core
+    from db_plugins.base import (
+        Capability,
+        DatabaseCapabilities,
+        EnforcementMode,
+        PluginHealth,
+    )
     from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context
 
     dsn = "sapiq://user:pass@host:2638/runtime.analytics"
     seen = {}
 
     class Plugin:
+        dialect = "sapiq"
+
         def connect(self, dsn_arg):
             seen["connect_dsn"] = dsn_arg
             return object()
@@ -280,12 +289,55 @@ def test_get_distinct_values_reads_runtime_dsn_when_argument_omitted(monkeypatch
         def close(self, conn):
             pass
 
+        def get_capabilities(self, _dsn=None):
+            return DatabaseCapabilities(
+                dialect=self.dialect,
+                read_only=Capability.supported(
+                    EnforcementMode.DATABASE,
+                    "TEST_READ_ONLY",
+                ),
+                statement_timeout=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_DRIVER_TIMEOUT",
+                ),
+                cancellation=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_DRIVER_CANCELLATION",
+                ),
+                explain=Capability.unsupported("TEST_NOT_REQUIRED"),
+                introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+                composite_fk_introspection=Capability.unsupported(
+                    "TEST_NOT_REQUIRED"
+                ),
+                parameter_binding=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_PARAMETER_BINDING",
+                ),
+            )
+
+        def probe_capabilities(self, _conn=None, dsn=None):
+            return PluginHealth(
+                self.dialect,
+                self.get_capabilities(dsn),
+                True,
+                ("TEST_PROBE_OK",),
+            )
+
+        def set_statement_timeout(self, _conn, timeout_ms):
+            seen["timeout_ms"] = timeout_ms
+
         def build_distinct_values_query(self, table_name, column_name, limit):
             return f"SELECT DISTINCT {column_name} FROM {table_name} LIMIT {limit}"
 
         def execute_select(self, conn, sql, row_limit=500):
             seen["sql"] = sql
-            return {"success": True, "data": [("north",)], "error_message": None}
+            return {
+                "success": True,
+                "data": [("north",)],
+                "columns": ["region"],
+                "rows_affected": 1,
+                "error_message": None,
+            }
 
     monkeypatch.setenv("DB_DSN", "sapiq://user:pass@host:2638/stale.analytics")
 
@@ -294,6 +346,11 @@ def test_get_distinct_values_reads_runtime_dsn_when_argument_omitted(monkeypatch
         return Plugin()
 
     monkeypatch.setattr(db_plugins, "get_plugin", get_plugin)
+    monkeypatch.setattr(
+        core,
+        "sql_safety_check",
+        lambda sql_query, **kwargs: {"is_safe": True, "issues": []},
+    )
 
     token = set_tool_runtime_context({"dsn": dsn})
     try:
@@ -318,6 +375,150 @@ def test_get_distinct_values_without_runtime_dsn_does_not_use_env_dsn(monkeypatc
     assert result["success"] is False
     assert "DSN is required" in result["error_message"]
 
+
+def test_get_distinct_values_routes_read_through_query_executor(monkeypatch):
+    import db_plugins
+    from custom_tools import sql_tools
+    from custom_tools.text_to_sql.core._db_exec import (
+        QueryExecutionResult,
+        QueryPurpose,
+    )
+
+    seen = {}
+
+    class BuilderPlugin:
+        def build_distinct_values_query(self, table_name, column_name, limit):
+            return f"SELECT DISTINCT {column_name} FROM {table_name} LIMIT {limit}"
+
+        def execute_select(self, *args, **kwargs):
+            raise AssertionError("QueryExecutor owns execution")
+
+    class Executor:
+        def __init__(self, *, get_plugin=None):
+            seen["resolver"] = get_plugin
+
+        def execute(self, request):
+            seen["request"] = request
+            return QueryExecutionResult(
+                request.purpose,
+                {
+                    "success": True,
+                    "data": [["north"]],
+                    "columns": ["region"],
+                    "rows_affected": 1,
+                    "execution_time_ms": 1,
+                    "error_message": None,
+                    "dry_run_only": False,
+                    "skipped_execution": False,
+                    "sql_query": request.sql_query,
+                    "applied_row_limit": request.row_limit,
+                },
+            )
+
+    def resolver(_dsn):
+        return BuilderPlugin()
+
+    monkeypatch.setattr(db_plugins, "get_plugin", resolver)
+    monkeypatch.setattr(sql_tools, "QueryExecutor", Executor)
+
+    result = sql_tools.get_distinct_values(
+        "DBA.sales",
+        "region",
+        limit=5,
+        dsn="sqlite:///tmp/app.db",
+    )
+
+    assert result == {
+        "success": True,
+        "values": ["north"],
+        "count": 1,
+        "error_message": None,
+    }
+    assert seen["resolver"] is resolver
+    assert seen["request"].purpose is QueryPurpose.DISTINCT
+    assert seen["request"].row_limit == 5
+
+
+def test_runtime_deadline_stops_distinct_read_before_connection(monkeypatch):
+    import db_plugins
+    from custom_tools import sql_tools
+    from tool_runtime_context import (
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+    from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded
+
+    class Plugin:
+        def build_distinct_values_query(self, table_name, column_name, limit):
+            return f"SELECT DISTINCT {column_name} FROM {table_name} LIMIT {limit}"
+
+        def execute_select(self, *args, **kwargs):
+            raise AssertionError("expired deadline must not execute")
+
+        def connect(self, dsn):
+            raise AssertionError("expired deadline must not connect")
+
+    monkeypatch.setattr(db_plugins, "get_plugin", lambda _dsn: Plugin())
+    deadline = DeadlineBudget(
+        deadline_monotonic=10.0,
+        deadline_at_ms=1,
+        monotonic=lambda: 10.0,
+    )
+    token = set_tool_runtime_context({
+        "dsn": "sqlite:///tmp/app.db",
+        "deadline_budget": deadline,
+    })
+    try:
+        with pytest.raises(WorkflowDeadlineExceeded):
+            sql_tools.get_distinct_values("orders", "region", limit=5)
+    finally:
+        reset_tool_runtime_context(token)
+
+
+def test_runtime_context_exposes_only_typed_deadline_budget():
+    from tool_runtime_context import (
+        get_runtime_context_deadline,
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+    from workflow.deadline import DeadlineBudget
+
+    deadline = DeadlineBudget.from_duration(5)
+    token = set_tool_runtime_context({"deadline_budget": deadline})
+    try:
+        assert get_runtime_context_deadline() is deadline
+    finally:
+        reset_tool_runtime_context(token)
+
+    token = set_tool_runtime_context({"deadline_budget": "five seconds"})
+    try:
+        with pytest.raises(TypeError, match="DeadlineBudget"):
+            get_runtime_context_deadline()
+    finally:
+        reset_tool_runtime_context(token)
+
+
+def test_runtime_context_exposes_only_typed_supervisor_evidence():
+    from tool_runtime_context import (
+        SupervisorExecutionEvidence,
+        get_runtime_context_supervisor_evidence,
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+
+    evidence = SupervisorExecutionEvidence("supervisor-1", 1)
+    token = set_tool_runtime_context({"supervisor_evidence": evidence})
+    try:
+        assert get_runtime_context_supervisor_evidence() is evidence
+    finally:
+        reset_tool_runtime_context(token)
+
+    token = set_tool_runtime_context({"supervisor_evidence": True})
+    try:
+        with pytest.raises(TypeError, match="SupervisorExecutionEvidence"):
+            get_runtime_context_supervisor_evidence()
+    finally:
+        reset_tool_runtime_context(token)
 
 def test_schema_info_reads_runtime_dsn_when_argument_omitted(monkeypatch):
     from custom_tools import sql_tools
@@ -401,6 +602,290 @@ async def test_workflow_agent_step_exposes_metadata_to_tool_runtime_context(stub
     context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
 
     assert await engine._execute_agent_step(step, context, "generate") == dsn
+
+
+@pytest.mark.asyncio
+async def test_workflow_agent_step_exposes_deadline_to_tool_runtime_context(
+    stub_mcp_tools,
+):
+    from tool_runtime_context import get_runtime_context_deadline
+    from workflow.deadline import DeadlineBudget
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    deadline = DeadlineBudget.from_duration(5)
+
+    class Agent:
+        def run(self, task, stream=False):
+            return get_runtime_context_deadline()
+
+    class Factory:
+        def create_agent(self, **kwargs):
+            return Agent()
+
+    class ResourceManager:
+        def record_api_call(self, workflow_id):
+            pass
+
+    engine = object.__new__(WorkflowEngine)
+    engine.factory = Factory()
+    engine.resource_manager = ResourceManager()
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+    context._deadline_budget = deadline
+
+    result = await engine._execute_agent_step(step, context, "generate")
+
+    assert result is deadline
+
+
+@pytest.mark.asyncio
+async def test_workflow_direct_tool_exposes_metadata_and_same_deadline(
+    stub_mcp_tools,
+    monkeypatch,
+):
+    from tool_runtime_context import (
+        get_runtime_context_deadline,
+        get_tool_runtime_value,
+    )
+    from workflow.deadline import DeadlineBudget
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    deadline = DeadlineBudget.from_duration(5)
+    dsn = "sqlite:///tmp/runtime.db"
+
+    class ToolManager:
+        def run_tool(self, **kwargs):
+            return get_runtime_context_deadline(), get_tool_runtime_value("dsn")
+
+    class Factory:
+        tool_mapping = {"finalize_text_to_sql_run": object()}
+
+        def _create_tool(self, tool_name):
+            return lambda: None
+
+    engine = object.__new__(WorkflowEngine)
+    engine.factory = Factory()
+    engine.resource_manager = types.SimpleNamespace(
+        record_api_call=lambda *_args: None,
+    )
+    monkeypatch.setattr("tool_manager.get_tool_manager", lambda: ToolManager())
+    step = WorkflowStep(
+        id="db_audit",
+        task="finalize",
+        step_type="tool",
+        tool_name="finalize_text_to_sql_run",
+        metadata={"dsn": dsn},
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+    context._deadline_budget = deadline
+
+    observed_deadline, observed_dsn = await engine._execute_tool_step(
+        step,
+        context,
+        "finalize",
+    )
+
+    assert observed_deadline is deadline
+    assert observed_dsn == dsn
+
+
+@pytest.mark.asyncio
+async def test_workflow_step_metadata_cannot_forge_supervisor_evidence(
+    stub_mcp_tools,
+):
+    from tool_runtime_context import (
+        SupervisorExecutionEvidence,
+        get_runtime_context_supervisor_evidence,
+    )
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    forged = SupervisorExecutionEvidence("forged-supervisor", 1)
+
+    class Agent:
+        def run(self, task, stream=False):
+            return get_runtime_context_supervisor_evidence()
+
+    class Factory:
+        def create_agent(self, **kwargs):
+            return Agent()
+
+    class ResourceManager:
+        def record_api_call(self, workflow_id):
+            pass
+
+    engine = object.__new__(WorkflowEngine)
+    engine.factory = Factory()
+    engine.resource_manager = ResourceManager()
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+        metadata={"supervisor_evidence": forged},
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_agent_step(step, context, "generate")
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_workflow_direct_tool_resets_runtime_context_on_exception(
+    stub_mcp_tools,
+    monkeypatch,
+):
+    import workflow.engine as engine_module
+    from workflow.deadline import DeadlineBudget
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    deadline = DeadlineBudget.from_duration(5)
+    reset_tokens = []
+    real_reset = engine_module.reset_tool_runtime_context
+
+    def recording_reset(token):
+        reset_tokens.append(token)
+        real_reset(token)
+
+    class ToolManager:
+        def run_tool(self, **kwargs):
+            raise RuntimeError("tool failed")
+
+    class Factory:
+        tool_mapping = {"finalize_text_to_sql_run": object()}
+
+        def _create_tool(self, tool_name):
+            return lambda: None
+
+    engine = object.__new__(WorkflowEngine)
+    engine.factory = Factory()
+    engine.resource_manager = types.SimpleNamespace(
+        record_api_call=lambda *_args: None,
+    )
+    monkeypatch.setattr(engine_module, "reset_tool_runtime_context", recording_reset)
+    monkeypatch.setattr("tool_manager.get_tool_manager", lambda: ToolManager())
+    step = WorkflowStep(
+        id="db_audit",
+        task="finalize",
+        step_type="tool",
+        tool_name="finalize_text_to_sql_run",
+        metadata={"dsn": "sqlite:///tmp/runtime.db"},
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+    context._deadline_budget = deadline
+
+    with pytest.raises(RuntimeError, match="tool failed"):
+        await engine._execute_tool_step(step, context, "finalize")
+
+    assert len(reset_tokens) == 1
+
+
+@pytest.mark.asyncio
+async def test_workflow_direct_final_query_caps_timeout_to_remaining_deadline(
+    stub_mcp_tools,
+    monkeypatch,
+):
+    from custom_tools.text_to_sql import core
+    from db_plugins.base import PluginHealth
+    from db_plugins.postgres import PostgresPlugin
+    from tool_runtime_context import SupervisorExecutionEvidence
+    from workflow.deadline import DeadlineBudget
+    from workflow.engine import WorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    timeout_calls = []
+    dsn = "postgresql://user:password@host/db"
+
+    class Plugin(PostgresPlugin):
+        def connect(self, dsn_arg):
+            return "conn"
+
+        def close(self, conn):
+            return None
+
+        def set_statement_timeout(self, conn, timeout_ms):
+            timeout_calls.append(timeout_ms)
+
+        def probe_capabilities(self, conn=None, dsn=None):
+            return PluginHealth(
+                self.dialect,
+                self.get_capabilities(dsn),
+                True,
+                ("TEST_PROBE_OK",),
+            )
+
+        def execute_select(self, conn, sql, row_limit=500):
+            return {
+                "success": True,
+                "data": [[1]],
+                "columns": ["one"],
+                "rows_affected": 1,
+                "error_message": None,
+            }
+
+    def final_query():
+        return core.secure_db_executor(
+            "SELECT 1",
+            row_limit=5,
+            dsn=dsn,
+            dry_run_only=False,
+        )
+
+    class ToolManager:
+        def run_tool(self, *, tool_function, **kwargs):
+            return tool_function()
+
+    class Factory:
+        tool_mapping = {"finalize_text_to_sql_run": object()}
+
+        def _create_tool(self, tool_name):
+            return final_query
+
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "5000")
+    monkeypatch.delenv("TEXT_TO_SQL_DRY_RUN_ONLY", raising=False)
+    monkeypatch.setattr(core, "get_plugin", lambda _dsn: Plugin())
+    monkeypatch.setattr(
+        core,
+        "sql_safety_check",
+        lambda sql_query, **kwargs: {"is_safe": True, "issues": []},
+    )
+    engine = object.__new__(WorkflowEngine)
+    engine.factory = Factory()
+    engine.resource_manager = types.SimpleNamespace(
+        record_api_call=lambda *_args: None,
+    )
+    monkeypatch.setattr("tool_manager.get_tool_manager", lambda: ToolManager())
+    step = WorkflowStep(
+        id="db_audit",
+        task="finalize",
+        step_type="tool",
+        tool_name="finalize_text_to_sql_run",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+    context._deadline_budget = DeadlineBudget(
+        deadline_monotonic=10.25,
+        deadline_at_ms=1,
+        monotonic=lambda: 10.0,
+    )
+    context._supervisor_evidence = SupervisorExecutionEvidence(
+        "supervisor-1",
+        1,
+    )
+
+    result = await engine._execute_tool_step(step, context, "finalize")
+
+    assert result["success"] is True
+    assert timeout_calls == [250]
 
 
 @pytest.mark.asyncio

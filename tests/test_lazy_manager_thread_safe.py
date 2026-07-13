@@ -158,8 +158,7 @@ def test_service_factory_thread_safe_single_init(
 ):
     """Конкурентный вызов module-level фабрики не создаёт менеджер дважды.
 
-    Патчим класс через ``svc.<ClassName>`` (это и есть имя, которое
-    видит фабрика после ``from … import ClassName``), а module-level
+    Патчим класс там, откуда конкретная фабрика его разрешает, а module-level
     singleton-переменную сбрасываем в None.
     """
     from backend.fastapi_app.agui import service as svc
@@ -177,7 +176,12 @@ def test_service_factory_thread_safe_single_init(
             import time
             time.sleep(0.01)
 
-    monkeypatch.setattr(svc, svc_attr, _Stub)
+    if manager_factory_name == "_agent_manager":
+        import agent_streamlit_api
+
+        monkeypatch.setattr(agent_streamlit_api, svc_attr, _Stub)
+    else:
+        monkeypatch.setattr(svc, svc_attr, _Stub)
 
     factory = getattr(svc, manager_factory_name)
 

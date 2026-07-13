@@ -595,11 +595,9 @@ def test_find_main_table_numeric_includes_bigint_real(tmp_path, monkeypatch):
 # --------------------------------------------------------------------- #
 
 
-def test_dimension_linking_score_based_not_order_dependent(tmp_path, monkeypatch):
-    """T5-linking / #11 MEDIUM: выбор таблицы для dimension зависит от
-    score, а не от порядка ключей в db_schema. При одинаковом score
-    main_table предпочтительнее (tie-break).
-    """
+def test_equal_best_dimension_bindings_are_reported_as_ambiguous(
+    monkeypatch,
+):
     core = _make_core(relevant_tables=["orders"])
 
     db_schema = {
@@ -620,27 +618,29 @@ def test_dimension_linking_score_based_not_order_dependent(tmp_path, monkeypatch
         },
     }
 
-    # Запрашиваем dimension "status" — присутствует в обеих таблицах.
-    # После фикса: main_table предпочтительнее при tie-break.
     entities = {
         "metrics": ["amount"],
         "dimensions": ["status"],
         "filters": {},
     }
 
-    import os
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "0")
     monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "1")
 
     result = core.perform_linking(entities, db_schema)
     dims = result.get("linked_entities", {}).get("dimensions", [])
-    dim_status = next((d for d in dims if d.get("name") == "status"), None)
 
-    # Либо привязан к orders (main_table, tie-break), либо к regions
-    # (если score выше) — в любом случае должен быть привязан
-    assert dim_status is not None, (
-        f"dimension 'status' должен быть слинкован, но dims={dims}"
-    )
+    assert not any(item.get("name") == "status" for item in dims)
+    assert result["ambiguous_bindings"] == [
+        {
+            "entity_type": "dimension",
+            "name": "status",
+            "candidates": [
+                {"table": "orders", "column": "status", "score": 10},
+                {"table": "regions", "column": "status", "score": 10},
+            ],
+        }
+    ]
 
 
 # --------------------------------------------------------------------- #

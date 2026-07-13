@@ -4,7 +4,13 @@ import json
 import logging
 import time
 from typing import Any, Dict, Optional
-from .base import BaseDBPlugin
+from .base import (
+    BaseDBPlugin,
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    ForeignKeyRow,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +18,37 @@ logger = logging.getLogger(__name__)
 class MySQLPlugin(BaseDBPlugin):
     dialect = "mysql"
     dialect_label = "MySQL"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        capabilities = DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=Capability.supported(
+                EnforcementMode.DATABASE, "READ_ONLY_SESSION_ENFORCED"
+            ),
+            statement_timeout=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.supported(
+                EnforcementMode.DATABASE, "ORDERED_COMPOSITE_FK_METADATA"
+            ),
+            parameter_binding=Capability.supported(
+                EnforcementMode.DRIVER, "DRIVER_PARAMETER_BINDING"
+            ),
+        )
+        if dsn and self.read_only_fail_open_enabled(dsn):
+            return capabilities.downgrade(
+                read_only=Capability.unsupported("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+            )
+        return capabilities
 
     def connect(self, dsn: str):
         # dsn формат: mysql://user:pass@host:port/db
@@ -81,7 +118,7 @@ class MySQLPlugin(BaseDBPlugin):
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
-    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Dict[str, str]]]:
+    def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
         # Строим WHERE условия динамически
         where_conditions = []
         params = []
@@ -118,7 +155,10 @@ class MySQLPlugin(BaseDBPlugin):
                     WHEN fk.COLUMN_NAME IS NOT NULL THEN 
                         CONCAT(fk.REFERENCED_TABLE_SCHEMA, '.', fk.REFERENCED_TABLE_NAME, '.', fk.REFERENCED_COLUMN_NAME)
                     ELSE ''
-                END AS references
+                END AS references,
+                fk.CONSTRAINT_SCHEMA,
+                fk.CONSTRAINT_NAME,
+                fk.ORDINAL_POSITION
             FROM INFORMATION_SCHEMA.COLUMNS c
             -- Primary Keys
             LEFT JOIN (
@@ -135,6 +175,8 @@ class MySQLPlugin(BaseDBPlugin):
             LEFT JOIN (
                 SELECT 
                     kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME,
+                    kcu.CONSTRAINT_SCHEMA, kcu.CONSTRAINT_NAME,
+                    kcu.ORDINAL_POSITION,
                     kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME
                 FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
                 JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
@@ -161,17 +203,33 @@ class MySQLPlugin(BaseDBPlugin):
 
         # Формируем схему в новом формате
         schema_result: Dict[str, Dict[str, Any]] = {}
+        fk_rows: list[ForeignKeyRow] = []
         with self._cursor(conn) as cur:
             cur.execute(query, params)
 
-            for schema_name, table, col, dtype, comment, is_nullable, default_val, constraint_type, references in cur.fetchall():
+            for row in cur.fetchall():
+                (
+                    schema_name,
+                    table,
+                    col,
+                    dtype,
+                    comment,
+                    is_nullable,
+                    default_val,
+                    constraint_type,
+                    references,
+                    constraint_schema,
+                    constraint_name,
+                    ordinal_position,
+                ) = row
                 key = f"{schema_name}.{table}"
 
                 # Создаем таблицу если её нет
                 if key not in schema_result:
                     schema_result[key] = {
                         "description": "",  # Будет заполнено LLM
-                        "columns": {}
+                        "columns": {},
+                        "foreign_keys": {"complete": True, "constraints": []},
                     }
 
                 # Нормализуем информацию о колонке
@@ -185,6 +243,22 @@ class MySQLPlugin(BaseDBPlugin):
                 }
 
                 schema_result[key]["columns"][col] = self.normalize_column_info(col_info)
+
+                fk_rows.append(
+                    ForeignKeyRow(
+                        table_key=key,
+                        column=str(col),
+                        constraint_schema=constraint_schema,
+                        constraint_name=constraint_name,
+                        ordinal_position=ordinal_position,
+                        references=references,
+                    )
+                )
+
+        for key, constraints in self._group_foreign_key_rows(
+            fk_rows, dialect_label="MySQL"
+        ).items():
+            schema_result[key]["foreign_keys"]["constraints"] = constraints
 
         return schema_result
     

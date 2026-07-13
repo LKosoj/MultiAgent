@@ -10,6 +10,63 @@ from ..deprecations import TextToSQLDeprecationWarning
 
 logger = logging.getLogger(__name__)
 
+_ENTITY_LIST_TYPES = (("metrics", "metric"), ("dimensions", "dimension"))
+
+
+def _canonical_entity_name(value: object) -> Optional[str]:
+    if isinstance(value, str):
+        name = value.strip()
+        return name or None
+    if isinstance(value, dict):
+        for key in ("name", "column"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
+def _unresolved_entities(
+    entities: Dict[str, object],
+    linked_entities: object,
+) -> List[Dict[str, str]]:
+    linked = linked_entities if isinstance(linked_entities, dict) else {}
+    resolved: set[tuple[str, str]] = set()
+    for key, entity_type in _ENTITY_LIST_TYPES:
+        items = linked.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            name = _canonical_entity_name(item)
+            if name:
+                resolved.add((entity_type, name.casefold()))
+    linked_filters = linked.get("filters")
+    if isinstance(linked_filters, dict):
+        resolved.update(("filter", str(name).casefold()) for name in linked_filters)
+
+    unresolved: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for key, entity_type in _ENTITY_LIST_TYPES:
+        values = entities.get(key)
+        if not isinstance(values, list):
+            continue
+        for value in values:
+            name = _canonical_entity_name(value)
+            if not name:
+                continue
+            identity = (entity_type, name.casefold())
+            if identity not in resolved and identity not in seen:
+                unresolved.append({"entity_type": entity_type, "name": name})
+                seen.add(identity)
+    filters = entities.get("filters")
+    if isinstance(filters, dict):
+        for value in filters:
+            name = str(value)
+            identity = ("filter", name.casefold())
+            if identity not in resolved and identity not in seen:
+                unresolved.append({"entity_type": "filter", "name": name})
+                seen.add(identity)
+    return unresolved
+
 
 def _normalize_schema_linking_entities(entities: Dict[str, object]) -> tuple[Dict[str, object], List[str]]:
     """Возвращает canonical payload metrics/dimensions/filters для schema_linking."""
@@ -53,6 +110,7 @@ def schema_linking(
     dsn: Optional[str] = None,
     value_grounding: Optional[bool] = None,
     *,
+    schema_scope: Optional[Dict[str, object]] = None,
     schema_limiter,
 ) -> Dict[str, object]:
     """LLM-схемный линкинг с авто-интроспекцией через плагины БД и кэшированием.
@@ -102,6 +160,7 @@ def schema_linking(
         schema_info = {}
 
     from ..schema_linker import SchemaLinker
+    from ..schema_namespace import SchemaScope
     from ..utils import get_runtime_context_dsn
 
     effective_dsn = dsn or get_runtime_context_dsn()
@@ -114,6 +173,8 @@ def schema_linking(
             "join_success": False,
             "sql_generation_allowed": False,
             "unlinked_entities": [],
+            "unresolved_entities": [],
+            "ambiguous_bindings": [],
             "schema_info": {},
             "input_warnings": input_warnings,
         }
@@ -122,18 +183,24 @@ def schema_linking(
         result.update(schema_linking_quality(result))
         return result
     linker = SchemaLinker.with_defaults(schema_limiter)
-    result = linker.link_entities_to_schema(
-        entities,
-        schema_info,
-        dsn=effective_dsn,
-        session_id=session_id,
-        value_grounding=value_grounding,
-    )
+    link_kwargs = {
+        "dsn": effective_dsn,
+        "session_id": session_id,
+        "value_grounding": value_grounding,
+    }
+    if schema_scope is not None:
+        link_kwargs["schema_scope"] = SchemaScope.from_mapping(schema_scope)
+    result = linker.link_entities_to_schema(entities, schema_info, **link_kwargs)
     from ..quality import schema_linking_quality
 
+    result["unresolved_entities"] = _unresolved_entities(
+        entities,
+        result.get("linked_entities"),
+    )
+    if not isinstance(result.get("ambiguous_bindings"), list):
+        result["ambiguous_bindings"] = []
     quality = schema_linking_quality(result)
     result.update(quality)
-    result["sql_generation_allowed"] = bool(result.get("join_success")) and not bool(quality.get("abstain"))
     if input_warnings:
         result["input_warnings"] = input_warnings
     return result

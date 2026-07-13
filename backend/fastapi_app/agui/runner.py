@@ -10,8 +10,6 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional, Tuple
 
-from agent_system import DynamicAgentSystem
-
 from .events import (
     EventType,
     CustomEvent,
@@ -45,6 +43,10 @@ _WORKFLOW_POLL_INTERVAL_SECONDS = 1.0
 # SIGTERM(+SIGKILL) с собственными join'ами; этот таймаут — финальная проверка
 # что процесс действительно мёртв.
 _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS = 5.0
+_WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS = 2.0
+_WORKFLOW_CANCEL_OBSERVE_SECONDS = 5.0
+_WORKFLOW_START_HANDOFF_SECONDS = 0.25
+_WORKFLOW_FOLLOW_MAX_RETRY_SECONDS = 5.0
 
 
 def _now_ms() -> int:
@@ -127,7 +129,7 @@ _TIMEOUT_SAFE_SERVICE_ACTIONS = frozenset(
 class TextToSqlServiceActionRequiredError(ValueError):
     """Поднимается, когда forwardedProps обходит text-to-sql service action."""
 
-    pass
+    error_code = "text_to_sql_service_action_required"
 
 
 def _normalize_service_payload(raw_payload: Any) -> dict[str, Any]:
@@ -424,6 +426,18 @@ async def _run_workflow(
             None, manager.cancel_workflow, workflow_run_id
         )
         final_status_after_cancel = manager.get_workflow_status(workflow_run_id)
+        # cancel_workflow может лишь пометить run как "cancelling" (принято,
+        # но супервизор ещё не подтвердил терминальное состояние дочернего
+        # процесса). Поллим статус до терминала в пределах общего бюджета
+        # _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS, не блокируя event loop.
+        cancel_poll_deadline = time.monotonic() + _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS
+        while (
+            final_status_after_cancel is not None
+            and final_status_after_cancel.status == "cancelling"
+            and time.monotonic() < cancel_poll_deadline
+        ):
+            await asyncio.sleep(_WORKFLOW_POLL_INTERVAL_SECONDS)
+            final_status_after_cancel = manager.get_workflow_status(workflow_run_id)
         if (
             final_status_after_cancel is not None
             and final_status_after_cancel.status in {"completed", "failed"}
@@ -442,28 +456,6 @@ async def _run_workflow(
             and final_status_after_cancel.status == "cancelled"
         ):
             raise RuntimeError("workflow cancel was not accepted")
-        # Финальная проверка: cancel_workflow обязан был дождаться завершения
-        # дочернего процесса и снять его из реестра. Если процесс всё ещё жив —
-        # это баг (SIGKILL не сработал); поднимаем исключение, не глотаем.
-        try:
-            from workflow.streamlit_api import _GLOBAL_WORKFLOW_PROCESSES
-
-            proc = _GLOBAL_WORKFLOW_PROCESSES.get(workflow_run_id)
-        except Exception:
-            proc = None
-        if proc is not None and proc.is_alive():
-            # Дадим ещё один shot на join через executor (не блокируем loop).
-            await loop.run_in_executor(
-                None, proc.join, _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS
-            )
-            if proc.is_alive():
-                logger.warning(
-                    "workflow child process %s still alive after cancel_workflow",
-                    workflow_run_id,
-                )
-                raise RuntimeError(
-                    f"workflow child process {workflow_run_id} did not terminate"
-                )
         # T3.3: envelope для cancelled workflow. RunFinishedEvent в этой ветке
         # не достигается (run_manager поймает CancelledError и эмитит
         # RunErrorEvent), поэтому кладём envelope в CustomEvent service.result,
@@ -583,6 +575,455 @@ async def _stream_progress(
             logging_manager.unsubscribe_run_progress(run_id, _callback)
 
 
+async def _run_text_to_sql_service_action(
+    input_data: RunAgentInput,
+    payload: dict[str, Any],
+) -> AsyncIterator[Any]:
+    """Start and follow one owner-scoped Text-to-SQL lifecycle."""
+    from .auth import current_principal
+    from .service import ServiceTransportContext, handle_service_action
+
+    principal = current_principal()
+    transport_context = ServiceTransportContext(
+        run_id=input_data.run_id,
+        principal=principal,
+    )
+    request_id = payload.get("__request_id")
+
+    async def call_service(
+        action: str,
+        action_payload: dict[str, Any],
+        *,
+        include_transport: bool = False,
+    ) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {"principal": principal}
+        if include_transport:
+            kwargs["transport_context"] = transport_context
+        value = await asyncio.to_thread(
+            handle_service_action,
+            action,
+            action_payload,
+            **kwargs,
+        )
+        if not isinstance(value, dict):
+            raise ValueError(f"service action '{action}' returned a non-object")
+        return value
+
+    def status_payload(response: dict[str, Any]) -> dict[str, Any]:
+        value = response.get("status")
+        if not isinstance(value, dict):
+            raise ValueError("workflows.status returned an invalid status")
+        if value.get("run_id") != input_data.run_id:
+            raise ValueError("workflows.status returned another run_id")
+        return value
+
+    def terminal_ready(value: dict[str, Any]) -> bool:
+        status = str(value.get("status") or "").lower()
+        if status not in {"completed", "failed", "cancelled"}:
+            return False
+        return value.get("result_seq") is not None or (
+            value.get("terminal_reason") == "SERVER_RESTARTED"
+        )
+
+    async def final_events(
+        result: Optional[dict[str, Any]] = None,
+    ) -> tuple[CustomEvent, RunFinishedEvent | RunErrorEvent, str]:
+        if result is None:
+            result = await call_service(
+                "workflows.result",
+                {"run_id": input_data.run_id},
+            )
+        terminal = result.get("terminal_outcome")
+        terminal_status = (
+            str(terminal.get("status") or "failed").lower()
+            if isinstance(terminal, dict)
+            else "failed"
+        )
+        result_event = CustomEvent(
+            type=EventType.CUSTOM,
+            name="workflow.result",
+            value=redact_pii_in_payload(_redact_payload(result)),
+            timestamp=_now_ms(),
+        )
+        if terminal_status in {"succeeded", "abstained"}:
+            terminal_event: RunFinishedEvent | RunErrorEvent = RunFinishedEvent(
+                type=EventType.RUN_FINISHED,
+                thread_id=input_data.thread_id,
+                run_id=input_data.run_id,
+                result=result,
+                timestamp=_now_ms(),
+            )
+        else:
+            reason = (
+                terminal.get("reason_code")
+                if isinstance(terminal, dict)
+                else result.get("error")
+            )
+            terminal_event = RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message=str(reason or f"Text-to-SQL terminal status: {terminal_status}"),
+                code=f"text_to_sql_{terminal_status}",
+                timestamp=_now_ms(),
+            )
+        return result_event, terminal_event, terminal_status
+
+    def result_terminal_ready(result: dict[str, Any]) -> bool:
+        terminal = result.get("terminal_outcome")
+        return isinstance(terminal, dict) and str(
+            terminal.get("status") or ""
+        ).lower() in {
+            "succeeded",
+            "abstained",
+            "failed",
+            "cancelled",
+            "timed_out",
+        }
+
+    async def bounded_lifecycle_call(
+        action: str,
+        *,
+        timeout: float = _WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        return await asyncio.wait_for(
+            call_service(action, {"run_id": input_data.run_id}),
+            timeout=max(timeout, 0.001),
+        )
+
+    cancel_dispatch: Optional[asyncio.Task[dict[str, Any]]] = None
+
+    def consume_cancel_dispatch(task: asyncio.Task[dict[str, Any]]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug(
+                "Detached Text-to-SQL cancel completed with an error for %s",
+                input_data.run_id,
+                exc_info=True,
+            )
+
+    async def cancel_and_wait_for_terminal() -> tuple[bool, Optional[dict[str, Any]]]:
+        nonlocal cancel_dispatch
+
+        try:
+            current = status_payload(
+                await bounded_lifecycle_call(
+                    "workflows.status",
+                    timeout=_WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS,
+                )
+            )
+        except Exception:
+            current = None
+        if current is not None and terminal_ready(current):
+            return True, None
+
+        if cancel_dispatch is not None and cancel_dispatch.done():
+            if cancel_dispatch.cancelled():
+                cancel_dispatch = None
+            else:
+                try:
+                    completed_response = cancel_dispatch.result()
+                except Exception:
+                    cancel_dispatch = None
+                else:
+                    if completed_response.get("cancelled") is False:
+                        cancel_dispatch = None
+
+        if cancel_dispatch is None:
+            cancel_dispatch = asyncio.create_task(
+                call_service(
+                    "workflows.cancel",
+                    {"run_id": input_data.run_id},
+                )
+            )
+            cancel_dispatch.add_done_callback(consume_cancel_dispatch)
+
+        if not cancel_dispatch.done():
+            try:
+                cancel_response = await asyncio.wait_for(
+                    asyncio.shield(cancel_dispatch),
+                    timeout=max(_WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS, 0.001),
+                )
+            except asyncio.TimeoutError:
+                cancel_response = None
+            except Exception:
+                cancel_dispatch = None
+                cancel_response = None
+            else:
+                if cancel_response.get("cancelled") is False:
+                    cancel_dispatch = None
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(_WORKFLOW_CANCEL_OBSERVE_SECONDS, 0.0)
+        while loop.time() < deadline:
+            remaining = deadline - loop.time()
+            try:
+                current = status_payload(
+                    await bounded_lifecycle_call(
+                        "workflows.status",
+                        timeout=min(
+                            remaining,
+                            _WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS,
+                        ),
+                    )
+                )
+                if terminal_ready(current):
+                    return True, None
+            except Exception:
+                pass
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                result = await bounded_lifecycle_call(
+                    "workflows.result",
+                    timeout=min(
+                        remaining,
+                        _WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS,
+                    ),
+                )
+                if result_terminal_ready(result):
+                    return True, result
+            except Exception:
+                pass
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(
+                min(max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001), remaining)
+            )
+        return False, None
+
+    async def start_side_effects_status() -> Optional[dict[str, Any]]:
+        for _attempt in range(2):
+            try:
+                current = status_payload(
+                    await bounded_lifecycle_call(
+                        "workflows.status",
+                    )
+                )
+                if bool(
+                    current.get("invocation_registered")
+                    or current.get("worker_pid") is not None
+                    or current.get("result_seq") is not None
+                ):
+                    return current
+            except Exception:
+                await asyncio.sleep(max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001))
+        return None
+
+    def informational_start_result(status: dict[str, Any]) -> dict[str, Any]:
+        parameters = status.get("parameters")
+        if not isinstance(parameters, dict):
+            parameters = {}
+        workflow_name = status.get("workflow_name") or payload.get("workflow_name")
+        if not isinstance(workflow_name, str) or not workflow_name:
+            workflow_name = "text_to_sql_pipeline"
+        session_id = (
+            status.get("session_id")
+            or parameters.get("session_id")
+            or payload.get("session_id")
+            or input_data.thread_id
+        )
+        return {
+            "run_id": input_data.run_id,
+            "workflow_name": workflow_name,
+            "session_id": session_id,
+        }
+
+    async def confirmed_final_events(
+        result: Optional[dict[str, Any]],
+    ) -> Optional[tuple[CustomEvent, RunFinishedEvent | RunErrorEvent, str]]:
+        if result is None:
+            try:
+                result = await bounded_lifecycle_call("workflows.result")
+            except Exception:
+                return None
+        if not result_terminal_ready(result):
+            return None
+        return await final_events(result)
+
+    async def adopt_failed_start() -> Optional[
+        tuple[
+            dict[str, Any],
+            Optional[tuple[CustomEvent, RunFinishedEvent | RunErrorEvent, str]],
+        ]
+    ]:
+        status = await start_side_effects_status()
+        if status is None:
+            return None
+        terminal_confirmed, terminal_result = await cancel_and_wait_for_terminal()
+        terminal_events = (
+            await confirmed_final_events(terminal_result)
+            if terminal_confirmed
+            else None
+        )
+        return informational_start_result(status), terminal_events
+
+    def consume_detached_start(task: asyncio.Task[dict[str, Any]]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.debug(
+                "Detached Text-to-SQL start completed with an error for %s",
+                input_data.run_id,
+                exc_info=True,
+            )
+
+    def observe_detached_start(task: asyncio.Task[dict[str, Any]]) -> None:
+        if not task.done():
+            task.add_done_callback(consume_detached_start)
+
+    start_task = asyncio.create_task(
+        call_service(
+            _TEXT_TO_SQL_SERVICE_ACTION,
+            payload,
+            include_transport=True,
+        )
+    )
+    try:
+        start_result = await asyncio.shield(start_task)
+        if start_result.get("run_id") != input_data.run_id:
+            raise ValueError("Text-to-SQL start returned another run_id")
+    except asyncio.CancelledError as cancelled:
+        try:
+            start_result = await asyncio.wait_for(
+                asyncio.shield(start_task),
+                timeout=max(_WORKFLOW_START_HANDOFF_SECONDS, 0.001),
+            )
+            if start_result.get("run_id") != input_data.run_id:
+                raise ValueError("Text-to-SQL start returned another run_id")
+        except asyncio.TimeoutError:
+            observe_detached_start(start_task)
+            adopted = await adopt_failed_start()
+            if adopted is None:
+                raise cancelled
+        except Exception:
+            observe_detached_start(start_task)
+            adopted = await adopt_failed_start()
+            if adopted is None:
+                raise cancelled
+        else:
+            terminal_confirmed, terminal_result = await cancel_and_wait_for_terminal()
+            terminal_events = (
+                await confirmed_final_events(terminal_result)
+                if terminal_confirmed
+                else None
+            )
+            if terminal_events is not None:
+                result_event, terminal_event, terminal_status = terminal_events
+                yield result_event
+                if terminal_status == "cancelled":
+                    raise cancelled
+                yield terminal_event
+                return
+            adopted = None
+        if adopted is not None:
+            start_result, terminal_events = adopted
+            if terminal_events is not None:
+                result_event, terminal_event, terminal_status = terminal_events
+                yield result_event
+                if terminal_status == "cancelled":
+                    raise cancelled
+                yield terminal_event
+                return
+    except Exception:
+        observe_detached_start(start_task)
+        adopted = await adopt_failed_start()
+        if adopted is None:
+            raise
+        start_result, terminal_events = adopted
+        if terminal_events is not None:
+            result_event, terminal_event, _terminal_status = terminal_events
+            yield result_event
+            yield terminal_event
+            return
+    start_envelope = redact_pii_in_payload(
+        _redact_payload(
+            _service_result_envelope(
+                _TEXT_TO_SQL_SERVICE_ACTION,
+                True,
+                start_result,
+                request_id,
+            )
+        )
+    )
+    yield CustomEvent(
+        type=EventType.CUSTOM,
+        name="service.result",
+        value=start_envelope,
+        timestamp=_now_ms(),
+    )
+
+    last_progress: Optional[tuple[Any, Any, Any]] = None
+    max_follow_retry_seconds = max(_WORKFLOW_FOLLOW_MAX_RETRY_SECONDS, 0.001)
+    follow_retry_seconds = min(
+        max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001),
+        max_follow_retry_seconds,
+    )
+    while True:
+        try:
+            current = status_payload(
+                await call_service(
+                    "workflows.status",
+                    {"run_id": input_data.run_id},
+                )
+            )
+            progress = (
+                current.get("status"),
+                current.get("current_step"),
+                current.get("progress_percentage"),
+            )
+            if progress != last_progress:
+                yield CustomEvent(
+                    type=EventType.CUSTOM,
+                    name="workflow.progress",
+                    value={
+                        "run_id": input_data.run_id,
+                        "status": progress[0],
+                        "current_step": progress[1],
+                        "progress_percentage": progress[2],
+                    },
+                    timestamp=_now_ms(),
+                )
+                last_progress = progress
+            if terminal_ready(current):
+                result_event, terminal_event, _terminal_status = await final_events()
+                yield result_event
+                yield terminal_event
+                return
+            follow_retry_seconds = min(
+                max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001),
+                max_follow_retry_seconds,
+            )
+            await asyncio.sleep(max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001))
+        except asyncio.CancelledError:
+            terminal_confirmed, terminal_result = await cancel_and_wait_for_terminal()
+            if not terminal_confirmed:
+                continue
+            result_event, terminal_event, terminal_status = await final_events(
+                terminal_result
+            )
+            yield result_event
+            if terminal_status == "cancelled":
+                raise
+            yield terminal_event
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "Transient Text-to-SQL status/result read failed for %s; retrying",
+                input_data.run_id,
+            )
+            await asyncio.sleep(follow_retry_seconds)
+            follow_retry_seconds = min(
+                follow_retry_seconds * 2,
+                max_follow_retry_seconds,
+            )
+
+
 async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
     task = _extract_task(input_data)
     forwarded = input_data.forwarded_props if isinstance(input_data.forwarded_props, dict) else {}
@@ -645,6 +1086,13 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                         result=None,
                         timestamp=_now_ms(),
                     )
+                    return
+                if service_action == _TEXT_TO_SQL_SERVICE_ACTION:
+                    async for event in _run_text_to_sql_service_action(
+                        input_data,
+                        payload,
+                    ):
+                        yield event
                     return
                 from .service import handle_service_action
 
@@ -744,6 +1192,8 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
                     model_key=forwarded.get("dialog_model_key"),
                 )
             else:
+                from agent_system import DynamicAgentSystem
+
                 system = DynamicAgentSystem()
                 result = await system.coordinate(initial_task=task, session_id=input_data.thread_id, show=False)
             message_id = str(uuid.uuid4())
@@ -802,10 +1252,14 @@ async def run_agent(input_data: RunAgentInput) -> AsyncIterator[Any]:
             code = "execution_error"
             # W1-review: error message → DSN+PII redact перед emit.
             message = redact_pii_in_payload(_redact_payload(str(exc)))
-            if isinstance(exc, TextToSqlServiceActionRequiredError):
+            if (
+                isinstance(exc, TextToSqlServiceActionRequiredError)
+                or getattr(exc, "error_code", None)
+                == "text_to_sql_service_action_required"
+            ):
                 # T3.4: стабильный код для клиента — переключиться на
                 # service action `presets.text_to_sql.generate`.
-                code = "text_to_sql_must_use_service_action"
+                code = "text_to_sql_service_action_required"
             elif isinstance(exc, ForbiddenWorkflowNameError):
                 code = "forbidden_workflow_name"
             elif isinstance(exc, ValueError) and message.startswith("workflow_name not found"):

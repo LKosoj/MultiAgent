@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import logging
 import time
+import importlib.util
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
-from .base import BaseDBPlugin
+from .base import (
+    BaseDBPlugin,
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -17,11 +24,69 @@ class SAPIQReadOnlyEnforcementError(RuntimeError):
 class SAPIQPlugin(BaseDBPlugin):
     dialect = "sapiq"
     dialect_label = "SAP IQ"
-    # Public source of truth для маппинга в sqlglot. Историческое значение
-    # "ansi" сохраняется (protected helper отдаёт "tsql" для quoting, но
-    # для глобального dialect mapping используется ANSI как наиболее
-    # безопасный общий парсер).
-    sqlglot_dialect = "ansi"
+    # SAP IQ uses TOP syntax, which sqlglot parses through its T-SQL dialect.
+    # Keep this public mapping aligned with the plugin's existing protected
+    # dialect helper so runtime classification and row limiting agree.
+    sqlglot_dialect = "tsql"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        del dsn
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=Capability.unsupported("READ_ONLY_ENFORCEMENT_UNAVAILABLE"),
+            statement_timeout=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.unsupported(
+                "COMPOSITE_FK_GROUPING_UNAVAILABLE"
+            ),
+            parameter_binding=Capability.unverified(
+                "DRIVER_PARAMETER_BINDING_UNVERIFIED", EnforcementMode.DRIVER
+            ),
+        )
+
+    def _python_driver_available(self) -> bool:
+        return importlib.util.find_spec("pyodbc") is not None
+
+    def _vendor_driver_available(self) -> bool:
+        if not self._python_driver_available():
+            return False
+        try:
+            import pyodbc  # type: ignore
+
+            available = {name.casefold() for name in pyodbc.drivers()}
+        except Exception:
+            return False
+        return any(
+            candidate.casefold() in available
+            for candidate in ("SQL Anywhere 17", "SQL Anywhere 16", "SAP IQ", "Sybase IQ")
+        )
+
+    def probe_capabilities(self, conn=None, dsn: str | None = None) -> PluginHealth:
+        del conn
+        reasons = []
+        if not self._python_driver_available():
+            reasons.append("OPTIONAL_DRIVER_MISSING")
+        elif not self._vendor_driver_available():
+            reasons.append("VENDOR_ODBC_DRIVER_MISSING")
+        if dsn and self.read_only_fail_open_enabled(dsn):
+            reasons.append("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+        reasons.append("READ_ONLY_ENFORCEMENT_UNAVAILABLE")
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            False,
+            tuple(dict.fromkeys(reasons)),
+        )
 
     def _odbc_value(self, value: object) -> str:
         text = str(value or "")
@@ -220,6 +285,8 @@ class SAPIQPlugin(BaseDBPlugin):
                     }
 
                     schema_result[key]["columns"][col] = self.normalize_column_info(col_info)
+            for table in schema_result.values():
+                table["foreign_keys"] = {"complete": False, "constraints": []}
             return schema_result
         except Exception as e:
             raise RuntimeError("SAP IQ schema introspection failed") from e

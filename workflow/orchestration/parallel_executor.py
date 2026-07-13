@@ -8,6 +8,7 @@ from datetime import datetime
 from collections import defaultdict, deque
 import inspect
 
+from ..deadline import DeadlineBudget, WorkflowDeadlineExceeded
 from ..models import WorkflowStep, StepResult, StepStatus, WorkflowContext
 
 logger = logging.getLogger(__name__)
@@ -68,7 +69,32 @@ class ParallelWorkflowExecutor:
             "failed": 0
         }
     
-    async def execute_steps_parallel(self, 
+    async def execute_steps_parallel(self,
+                                   steps: List[WorkflowStep],
+                                   context: WorkflowContext,
+                                   step_executor: Callable,
+                                   dependency_checker: Callable,
+                                   condition_checker: Callable,
+                                   stop_checker: Optional[Callable] = None,
+                                   stop_on_failure: bool = False,
+                                   initial_step_results: Optional[Dict[str, StepResult]] = None) -> Dict[str, StepResult]:
+        """Run the graph and reap all siblings when its deadline wins."""
+        try:
+            return await self._execute_steps_parallel(
+                steps,
+                context,
+                step_executor,
+                dependency_checker,
+                condition_checker,
+                stop_checker,
+                stop_on_failure,
+                initial_step_results,
+            )
+        except (WorkflowDeadlineExceeded, asyncio.CancelledError):
+            await self._cancel_active_tasks()
+            raise
+
+    async def _execute_steps_parallel(self,
                                    steps: List[WorkflowStep],
                                    context: WorkflowContext,
                                    step_executor: Callable,
@@ -104,6 +130,7 @@ class ParallelWorkflowExecutor:
         logger.info(f"🚀 Начинаем параллельное выполнение {len(steps)} шагов (max_concurrent: {self.max_concurrent})")
         
         while len(completed_steps) < len(steps):
+            self._require_deadline(context, "parallel step scheduling")
             if stop_on_failure and any(
                 r.status == StepStatus.FAILED for r in step_results.values()
             ):
@@ -209,6 +236,7 @@ class ParallelWorkflowExecutor:
                     break
                 
                 step = dependency_graph.steps[step_id]
+                self._require_deadline(context, f"parallel step '{step_id}' scheduling")
                 
                 # Дополнительная проверка зависимостей не нужна - 
                 # граф зависимостей уже обеспечивает корректный порядок
@@ -277,6 +305,8 @@ class ParallelWorkflowExecutor:
             
             return result
             
+        except WorkflowDeadlineExceeded:
+            raise
         except Exception as e:
             logger.error(f"❌ Ошибка выполнения шага {step.id}: {e}")
             self.execution_stats["failed"] += 1
@@ -316,6 +346,8 @@ class ParallelWorkflowExecutor:
                     completed_steps.add(step_id)
                     logger.debug(f"📝 Шаг {step_id} завершен и записан в результаты")
                     
+                except WorkflowDeadlineExceeded:
+                    raise
                 except Exception as e:
                     logger.error(f"❌ Ошибка в задаче {step_id}: {e}")
                     step_results[step_id] = StepResult(
@@ -330,6 +362,24 @@ class ParallelWorkflowExecutor:
                 
                 # Удаляем завершенную задачу
                 del self.active_tasks[step_id]
+
+    async def _cancel_active_tasks(self) -> None:
+        tasks = list(self.active_tasks.values())
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.active_tasks.clear()
+
+    @staticmethod
+    def _require_deadline(context: WorkflowContext, boundary: str) -> None:
+        deadline = getattr(context, "_deadline_budget", None)
+        if deadline is None:
+            return
+        if not isinstance(deadline, DeadlineBudget):
+            raise TypeError("context._deadline_budget must be a DeadlineBudget")
+        deadline.require_remaining(boundary)
     
     def get_execution_stats(self) -> Dict[str, Any]:
         """Получить статистику выполнения"""

@@ -21,6 +21,7 @@ profiles:
   default:
     schema_linking:
       max_tokens: 20000
+      schema_prompt_hard_max_chars: 32000
     sql_generation:
       max_tokens: 20000
     nlu:
@@ -35,6 +36,7 @@ profiles:
   muni_ru:
     schema_linking:
       max_tokens: 20000
+      schema_prompt_hard_max_chars: 32000
     sql_generation:
       max_tokens: 20000
     nlu:

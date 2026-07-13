@@ -7,6 +7,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 from custom_tools import sql_tools
 from custom_tools.text_to_sql import core as core_module
 from custom_tools.text_to_sql.core import audit_logger, purge_schema_linking_rag_cache, schema_linking
@@ -19,6 +25,38 @@ from custom_tools.text_to_sql.schema_linker import SchemaLinker
 from custom_tools.text_to_sql.schema_memory import SchemaCacheManager, SchemaMemoryManager
 from custom_tools.text_to_sql.sql_generator import SQLGenerator
 from custom_tools.text_to_sql.validators import SchemaLimiter, SQLSchemaValidator
+from backend.fastapi_app.agui._t2s_requests import (
+    parse_text_to_sql_generate,
+    parse_text_to_sql_pipeline_inputs,
+)
+
+
+class _AdmittedPluginDouble:
+    dialect = "sqlite"
+
+    def get_capabilities(self, _dsn=None):
+        native = Capability.supported(EnforcementMode.DRIVER, "TEST_NATIVE")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=native,
+            statement_timeout=native,
+            cancellation=native,
+            explain=native,
+            introspection=native,
+            composite_fk_introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+            parameter_binding=Capability.unsupported("TEST_NOT_REQUIRED"),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, _timeout_ms):
+        return None
 
 
 class _FakeMemory:
@@ -51,6 +89,22 @@ class _FkPreviewPlugin:
             "data": [(1, "Alice")],
             "columns": ["user_id", "name"],
         }
+
+
+@pytest.mark.parametrize("validate_schema", [True, False])
+def test_text_to_sql_public_and_pipeline_inputs_require_schema_grounding(
+    validate_schema,
+):
+    payload = {
+        "query": "show revenue",
+        "dsn": "sqlite:///tmp/app.db",
+        "use_schema_suggestions": False,
+        "validate_schema": validate_schema,
+    }
+
+    for parser in (parse_text_to_sql_generate, parse_text_to_sql_pipeline_inputs):
+        with pytest.raises(ValueError, match="schema grounding is required"):
+            parser(payload)
 
 
 def _raw_pyodbc_dsn() -> str:
@@ -360,7 +414,7 @@ def test_search_examples_passes_sqlrag_example_cache_kind(monkeypatch):
     assert result == [{"sql_example": "SELECT amount FROM orders;"}]
 
 
-def test_llm_linking_uses_entity_values_for_semantic_search():
+def test_llm_linking_uses_entity_names_for_semantic_search():
     memory = _FakeMemory(["orders"])
 
     def fake_call_openai_api(**kwargs):
@@ -381,7 +435,7 @@ def test_llm_linking_uses_entity_values_for_semantic_search():
         {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
     )
 
-    assert memory.terms == ["revenue", "region", "year", "2024"]
+    assert memory.terms == ["revenue", "region", "year"]
     assert result["linked_entities"]["metrics"][0]["column"] == "amount"
 
 
@@ -1727,12 +1781,14 @@ def test_secure_db_executor_rejects_non_positive_row_limit_before_dry_run(monkey
     result = secure_db_executor("SELECT 1")
 
     assert result["success"] is False
-    assert result["dry_run_only"] is False
+    assert result["dry_run_only"] is True
     assert "row_limit must be a positive integer" in result["error_message"]
 
 
 def test_secure_db_executor_describe_resolves_unique_short_table(monkeypatch):
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
+        dialect = "postgres"
+
         def connect(self, dsn):
             return object()
 
@@ -1758,7 +1814,9 @@ def test_secure_db_executor_describe_resolves_unique_short_table(monkeypatch):
 
 
 def test_secure_db_executor_describe_reports_ambiguous_short_table(monkeypatch):
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
+        dialect = "postgres"
+
         def connect(self, dsn):
             return object()
 
@@ -1784,7 +1842,9 @@ def test_secure_db_executor_describe_reports_ambiguous_short_table(monkeypatch):
 
 
 def test_secure_db_executor_describe_qualified_table_not_ambiguous(monkeypatch):
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
+        dialect = "postgres"
+
         def connect(self, dsn):
             return object()
 
@@ -1812,7 +1872,7 @@ def test_secure_db_executor_describe_qualified_table_not_ambiguous(monkeypatch):
 
 
 def test_secure_db_executor_explain_requires_plugin_support(monkeypatch):
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
         def connect(self, dsn):
             return object()
 
@@ -1831,7 +1891,7 @@ def test_secure_db_executor_explain_requires_plugin_support(monkeypatch):
 
 
 def test_secure_db_executor_select_normalizes_output_contract(monkeypatch):
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
         def connect(self, dsn):
             return object()
 
@@ -2016,30 +2076,36 @@ def test_schema_memory_returns_true_for_already_indexed_schema(monkeypatch, tmp_
 
 
 def test_sql_explain_dry_run_skips_database_connection(monkeypatch):
+    """T14: dry-run EXPLAIN — preparation read, как и FINAL — не должен
+
+    открывать соединение с БД, даже когда валидный DSN доступен.
+    """
+    dsn = "sqlite:///tmp/app.db"
     monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
     monkeypatch.setenv("USE_SQLGLOT", "1")
-    monkeypatch.delenv("DB_DSN", raising=False)
-    # EPIC 1.9: чтобы проверять именно dry-run shortcut (а не cascade unsafe
-    # из-за упавшего LLM-аудита), stub call_openai_api на валидный JSON.
+    # EPIC 1.9: LLM-аудит fail-fast. Stub call_openai_api на пустой issues-набор,
+    # иначе sql_safety_check вернёт is_safe=False и executor не дойдёт до dry-run.
     monkeypatch.setattr(
         "custom_tools.text_to_sql.core.call_openai_api",
         lambda **kwargs: '{"issues": []}',
     )
     monkeypatch.setattr(
         "custom_tools.text_to_sql.core.get_plugin",
-        lambda dsn: (_ for _ in ()).throw(AssertionError("database must not be opened in dry run")),
+        lambda _dsn: (_ for _ in ()).throw(AssertionError("database must not be opened in dry run")),
     )
 
-    result = sql_explain("SELECT 1")
+    result = sql_explain("SELECT 1", dsn=dsn)
 
+    assert result["plan"] is None
+    assert result["issues"] == []
     assert result["dry_run_only"] is True
     assert result["skipped_execution"] is True
-    assert result["plan"] is None
 
 
 def test_sql_explain_dry_run_passes_empty_dsn_sentinel(monkeypatch):
     monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
     monkeypatch.setenv("DB_DSN", "postgresql://env_user:env_pass@db.example.com/env_db")
+    monkeypatch.delenv("SECURE_DB_EXECUTOR_ALLOW_ENV_DSN", raising=False)
     seen = {}
 
     def fake_safety(sql_query, dsn=None):
@@ -2049,13 +2115,14 @@ def test_sql_explain_dry_run_passes_empty_dsn_sentinel(monkeypatch):
     monkeypatch.setattr("custom_tools.text_to_sql.core.sql_safety_check", fake_safety)
     monkeypatch.setattr(
         "custom_tools.text_to_sql.core.get_plugin",
-        lambda dsn: (_ for _ in ()).throw(AssertionError("database must not be opened in dry run")),
+        lambda dsn: (_ for _ in ()).throw(AssertionError("missing DSN must not connect")),
     )
 
     result = sql_explain("SELECT 1")
 
+    assert result["plan"] is None
+    assert result["issues"] == []
     assert result["dry_run_only"] is True
-    assert result["skipped_execution"] is True
     assert seen["dsn"] == ""
 
 
@@ -2265,6 +2332,7 @@ def test_sql_safety_check_llm_success_marks_audit_ok(monkeypatch):
 
 def test_sql_explain_cascades_llm_audit_failure(monkeypatch):
     monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
+    dsn = "sqlite:///tmp/app.db"
 
     def boom(**kwargs):
         raise RuntimeError("audit down")
@@ -2275,7 +2343,7 @@ def test_sql_explain_cascades_llm_audit_failure(monkeypatch):
         lambda dsn: (_ for _ in ()).throw(AssertionError("DB must not be opened on audit failure")),
     )
 
-    result = sql_explain("SELECT 1")
+    result = sql_explain("SELECT 1", dsn=dsn)
 
     assert result["plan"] is None
     issue_types = {issue.get("issue_type") for issue in result.get("issues", [])}

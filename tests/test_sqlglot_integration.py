@@ -135,8 +135,8 @@ class TestSQLGlotIntegration:
         assert "WHERE" in formatted
         assert formatted.endswith(";")  # Должна быть точка с запятой
 
-    def test_ansi_dialect_formatter_and_describe_do_not_fallback(self):
-        """Default/SAP IQ ansi mapping must not call sqlglot with unsupported read='ansi'."""
+    def test_sapiq_tsql_formatter_and_describe_do_not_fallback(self):
+        """SAP IQ's T-SQL mapping must parse formatter and DESCRIBE inputs."""
         reset_sqlglot_metrics()
         with patch('custom_tools.text_to_sql.dialects.get_current_dialect_name') as mock_dialect:
             mock_dialect.return_value = 'sapiq'
@@ -175,7 +175,7 @@ class TestSQLGlotIntegration:
         ("sqlite", "sqlite"),
         ("duckdb", "duckdb"),
         ("impala", "hive"),
-        ("sapiq", "ansi"),
+        ("sapiq", "tsql"),
         ("unknown", "ansi")
     ])
     def test_dialect_mapping_parametrized(self, dialect, expected):

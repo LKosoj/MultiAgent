@@ -59,8 +59,10 @@ export function useToast() {
   }, [dismiss]);
 
   useEffect(() => {
+    const activeTimers = timers.current;
     return () => {
-      timers.current.forEach((t) => window.clearTimeout(t));
+      activeTimers.forEach((t) => window.clearTimeout(t));
+      activeTimers.clear();
     };
   }, []);
 

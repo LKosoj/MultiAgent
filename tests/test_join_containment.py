@@ -2,6 +2,12 @@ import logging
 
 import pytest
 
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 from custom_tools.text_to_sql.join_containment import (
     _clear_containment_cache,
     estimate_join_containment,
@@ -9,7 +15,14 @@ from custom_tools.text_to_sql.join_containment import (
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    from custom_tools.text_to_sql import core
+
+    monkeypatch.setattr(
+        core,
+        "sql_safety_check",
+        lambda sql_query, **kwargs: {"is_safe": True, "issues": []},
+    )
     _clear_containment_cache()
     yield
     _clear_containment_cache()
@@ -48,6 +61,30 @@ class FakePlugin:
             raise RuntimeError("connect boom")
         return object()
 
+    def get_capabilities(self, _dsn=None):
+        native = Capability.supported(EnforcementMode.DRIVER, "TEST_NATIVE")
+        return DatabaseCapabilities(
+            dialect="postgresql",
+            read_only=native,
+            statement_timeout=native,
+            cancellation=native,
+            explain=native,
+            introspection=native,
+            composite_fk_introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+            parameter_binding=Capability.unsupported("TEST_NOT_REQUIRED"),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            "postgresql",
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, _timeout_ms):
+        return None
+
     def close(self, conn):
         self.close_calls += 1
 
@@ -62,7 +99,7 @@ class FakePlugin:
             (table_name, column_name, tuple(str(v) for v in values))
         )
         self._pending_membership = (table_name, column_name, {str(v) for v in values})
-        return f"SELECT DISTINCT {column_name} FROM {table_name} WHERE {column_name} IN (...)"
+        return f"SELECT DISTINCT {column_name} FROM {table_name} WHERE {column_name} IN (1)"
 
     def execute_select(self, conn, sql, row_limit=None):
         self.exec_calls += 1
@@ -79,12 +116,32 @@ class FakePlugin:
                 for v in self.column_values.get((table, column), [])
                 if str(v) in values
             ]
-            return {"success": True, "data": [(v,) for v in matches[:limit]]}
+            data = [(v,) for v in matches[:limit]]
+            return {
+                "success": True,
+                "data": data,
+                "columns": [column],
+                "rows_affected": len(data),
+                "error_message": None,
+            }
         # Определяем какие данные вернуть по тексту SQL (table/column в нём есть).
         for (table, column), values in self.column_values.items():
             if f"FROM {table}" in sql and column in sql:
-                return {"success": True, "data": [(v,) for v in values[:limit]]}
-        return {"success": True, "data": []}
+                data = [(v,) for v in values[:limit]]
+                return {
+                    "success": True,
+                    "data": data,
+                    "columns": [column],
+                    "rows_affected": len(data),
+                    "error_message": None,
+                }
+        return {
+            "success": True,
+            "data": [],
+            "columns": ["value"],
+            "rows_affected": 0,
+            "error_message": None,
+        }
 
 
 class PluginNoBuildDistinct:
@@ -188,6 +245,7 @@ def test_empty_a_returns_none():
         DSN, "a", "col_a", "b", "col_b", get_plugin=_di(plugin)
     )
     assert result is None
+    assert plugin.connect_calls == plugin.exec_calls == plugin.close_calls == 1
 
 
 def test_empty_b_returns_zero():
@@ -216,6 +274,8 @@ def test_fail_connect_returns_none_and_warning(caplog):
     assert "fail-open" in caplog.text
     # error-уровня быть не должно.
     assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+    assert plugin.connect_calls == 1
+    assert plugin.exec_calls == plugin.close_calls == 0
 
 
 def test_fail_exec_timeout_returns_none_and_warning(caplog):
@@ -225,7 +285,7 @@ def test_fail_exec_timeout_returns_none_and_warning(caplog):
             DSN, "a", "col_a", "b", "col_b", get_plugin=_di(plugin)
         )
     assert result is None
-    assert "TimeoutError" in caplog.text
+    assert "RuntimeError" in caplog.text
     # conn должен быть закрыт даже при ошибке execute_select.
     assert plugin.close_calls == 1
 
@@ -238,8 +298,8 @@ def test_plugin_without_build_distinct_returns_none_and_warning(caplog):
         )
     assert result is None
     assert "fail-open" in caplog.text
-    # connect случился, close в finally тоже.
-    assert plugin.close_calls == 1
+    # Builder capability is checked before the shared executor opens a connection.
+    assert plugin.close_calls == 0
 
 
 def test_plugin_without_membership_query_returns_none_and_warning(monkeypatch, caplog):
@@ -262,6 +322,7 @@ def test_execute_select_success_false_returns_none_and_warning(caplog):
         )
     assert result is None
     assert "fail-open" in caplog.text
+    assert plugin.connect_calls == plugin.exec_calls == plugin.close_calls == 1
 
 
 # --- Кэш -------------------------------------------------------------------
@@ -410,3 +471,60 @@ def test_monkeypatch_get_plugin_works(monkeypatch):
     # get_plugin=None → ленивый импорт из db_plugins → попадает в monkeypatch.
     result = estimate_join_containment(DSN, "a", "col_a", "b", "col_b")
     assert result == 0.5
+
+
+def test_containment_routes_reads_through_query_executor(monkeypatch):
+    from custom_tools.text_to_sql import join_containment as containment_module
+    from custom_tools.text_to_sql.core._db_exec import (
+        QueryExecutionResult,
+        QueryPurpose,
+    )
+
+    seen = []
+
+    class BuilderPlugin:
+        def build_distinct_values_query(self, table, column, limit):
+            return f"SELECT DISTINCT {column} FROM {table} LIMIT {limit}"
+
+        def build_values_membership_query(self, table, column, values):
+            return f"SELECT DISTINCT {column} FROM {table} WHERE {column} IN (...)"
+
+    class Executor:
+        def __init__(self, *, get_plugin=None):
+            self.get_plugin = get_plugin
+
+        def execute(self, request):
+            seen.append(request)
+            data = [["1"], ["2"]] if len(seen) == 1 else [["1"]]
+            return QueryExecutionResult(
+                request.purpose,
+                {
+                    "success": True,
+                    "data": data,
+                    "columns": ["value"],
+                    "rows_affected": len(data),
+                    "execution_time_ms": 1,
+                    "error_message": None,
+                    "dry_run_only": False,
+                    "skipped_execution": False,
+                    "sql_query": request.sql_query,
+                    "applied_row_limit": request.row_limit,
+                },
+            )
+
+    monkeypatch.setattr(containment_module, "QueryExecutor", Executor)
+
+    result = estimate_join_containment(
+        DSN,
+        "a",
+        "col_a",
+        "b",
+        "col_b",
+        get_plugin=lambda _dsn: BuilderPlugin(),
+    )
+
+    assert result == 0.5
+    assert [request.purpose for request in seen] == [
+        QueryPurpose.CONTAINMENT,
+        QueryPurpose.CONTAINMENT,
+    ]

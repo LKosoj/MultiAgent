@@ -18,7 +18,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from agent_factory import AgentFactory
-from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
 from agent_command import AGENT_PROFILES, model_search, model_lite, model_code, model_hard, model_summary
 from smolagents import CodeAgent, DuckDuckGoSearchTool, LiteLLMModel, tool, OpenAIServerModel
 from smolagents.models import ChatMessage, MessageRole
@@ -29,6 +28,13 @@ matplotlib.use("Agg")
 
 # Настройка логгера для этого модуля
 logger = logging.getLogger(__name__)
+
+
+class TextToSqlServiceActionRequiredError(ValueError):
+    """Generic agent routing cannot own Text-to-SQL execution."""
+
+    error_code = "text_to_sql_service_action_required"
+
 
 class DynamicAgentSystem:
     """Система с динамическим созданием и управлением агентами"""
@@ -221,14 +227,6 @@ researcher --> agent3
                 # Автоматический анализ задачи для определения нужных агентов
                 agent_types, pipeline_type = await self.analyze_task(initial_task)
 
-                # Корректируем session_id для Text-to-SQL согласно документации:
-                # использовать единый санитизированный DSN без user/password
-                if pipeline_type == 'text_to_sql':
-                    db_dsn = os.getenv("DB_DSN", None)
-                    # if db_dsn:
-                    #     session_id = dsn_to_sanitized_name(db_dsn)
-                    # else:
-                    #     raise Exception("DB_DSN не установлен")
                 # Для общих задач добавляем базовых агентов исследования/аналитики и генерации диаграмм
                 if pipeline_type != 'text_to_sql':
                     agent_types.append('researcher') if 'researcher' not in agent_types else agent_types
@@ -365,6 +363,8 @@ researcher --> agent3
             
             return "\n".join(report)
                     
+        except TextToSqlServiceActionRequiredError:
+            raise
         except Exception as e:
             print(f"Критическая ошибка в координации: {str(e)}")
             return f"Ошибка: {str(e)}"
@@ -411,21 +411,10 @@ researcher --> agent3
             task_type = response.content.strip().lower()
             print(f"Тип задачи: '{task_type}'")
 
-            db_dsn = os.getenv("DB_DSN", None)
             if task_type == 'text_to_sql':
-                if not db_dsn:
-                    raise ValueError("DB_DSN обязателен для задач Text-to-SQL.")
-                print("Активация пайплайна Text-to-SQL.")
-                sql_pipeline = [
-                    'nlu_agent',
-                    'schema_rag_agent',
-                    'sql_generator_agent',
-                    'sql_verifier_agent',
-                    'db_audit_agent'
-                ]
-                if 'manager' not in sql_pipeline:
-                    sql_pipeline.append('manager')
-                return sql_pipeline, 'text_to_sql'
+                raise TextToSqlServiceActionRequiredError(
+                    "Use presets.text_to_sql.generate service action for Text-to-SQL requests."
+                )
 
             # Этап 2: Выбор пайплайна или набора агентов
             print("Подбор релевантных агентов с помощью LLM.")

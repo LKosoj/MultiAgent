@@ -15,7 +15,12 @@ from .safety import (
     SQLGLOT_AVAILABLE,
     _SQLGLOT_METRICS,
 )
-from .safety_config import SafetyConfigMissing
+from .safety_config import (
+    SafetyConfigMissing,
+    TextToSqlSafetyPolicy,
+    load_startup_safety_policy,
+    resolve_safety_policy,
+)
 from .schema_limiter import SchemaLimiter
 from .schema_aware import SQLSchemaValidator
 
@@ -29,6 +34,9 @@ __all__ = [
     "SQLStaticSafetyValidator",  # W9-A10: явное имя static-слоя
     "SQLLLMAdvisor",             # W9-A10: LLM-advisory слой (non-blocking)
     "SafetyConfigMissing",
+    "TextToSqlSafetyPolicy",
+    "load_startup_safety_policy",
+    "resolve_safety_policy",
     "SchemaLimiter",
     "SQLSchemaValidator",
     "get_sqlglot_metrics",

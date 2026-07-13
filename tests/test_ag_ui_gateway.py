@@ -7,7 +7,9 @@ import types
 import urllib.parse
 import uuid
 
+import anyio.from_thread
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend.fastapi_app.agui.events import (
@@ -807,6 +809,88 @@ def _read_sse_events(text: str) -> list[dict]:
     return events
 
 
+def _text_to_sql_result(
+    run_id: str,
+    incarnation: str,
+    *,
+    status: str,
+) -> dict:
+    from workflow.result_identity import workflow_result_event_key
+
+    succeeded = status == "succeeded"
+    failed = status == "failed"
+    reason = {
+        "succeeded": "",
+        "failed": "EXECUTION_FAILED",
+        "cancelled": "CANCELLED",
+    }[status]
+    execution = {}
+    audit = {}
+    if succeeded or failed:
+        execution = {
+            "success": succeeded,
+            "sql_query": "SELECT 1",
+            "data": [[1]] if succeeded else [],
+            "columns": ["value"] if succeeded else [],
+            "rows_affected": 1 if succeeded else 0,
+            "execution_time_ms": 1,
+            "dry_run_only": False,
+            "skipped_execution": False,
+            "applied_row_limit": 100,
+        }
+        if failed:
+            execution["error_message"] = "execution failed"
+        audit = {"status": "logged", "log_id": "audit-1"}
+    terminal = {
+        "run_id": run_id,
+        "status": status,
+        "reason_code": reason,
+        "sql": "SELECT 1",
+        "generated": True,
+        "approved": succeeded or failed,
+        "executed": succeeded or failed,
+        "dry_run": False,
+        "audited": succeeded or failed,
+        "data": [[1]] if succeeded else [],
+        "columns": ["value"] if succeeded else [],
+        "rows_affected": 1 if succeeded else 0,
+        "error": (
+            None
+            if succeeded
+            else "execution failed"
+            if failed
+            else "cancelled"
+        ),
+        "execution": execution,
+        "audit": audit,
+        "persistence": (
+            {
+                "status": "saved",
+                "filename": "query.md",
+                "path": "/tmp/query.md",
+            }
+            if succeeded
+            else {"status": "not_attempted"}
+        ),
+    }
+    return {
+        "run_id": run_id,
+        "run_incarnation": incarnation,
+        "event_key": workflow_result_event_key(run_id, incarnation),
+        "status": "completed" if succeeded else status,
+        "success": succeeded,
+        "terminal_outcome": terminal,
+    }
+
+
+def _failed_text_to_sql_result(run_id: str, incarnation: str) -> dict:
+    return _text_to_sql_result(
+        run_id,
+        incarnation,
+        status="failed",
+    )
+
+
 def _drop_imported_module(monkeypatch, module_name: str) -> None:
     monkeypatch.delitem(sys.modules, module_name, raising=False)
     parent_name, _, child_name = module_name.rpartition(".")
@@ -815,7 +899,18 @@ def _drop_imported_module(monkeypatch, module_name: str) -> None:
         monkeypatch.delattr(parent, child_name, raising=False)
 
 
-def _load_gateway_with_runner_stub(monkeypatch, run_agent):
+def _load_gateway_with_runner_stub(monkeypatch, run_agent, tmp_path):
+    old_gateway = sys.modules.get("backend.fastapi_app.main")
+    old_store = getattr(old_gateway, "store", None)
+    if isinstance(old_store, EventStore):
+        old_store.close()
+
+    state_files = importlib.import_module("workflow.state_files")
+    monkeypatch.setattr(
+        state_files,
+        "default_state_database_path",
+        lambda *_args, **_kwargs: tmp_path / "gateway-main.db",
+    )
     stub_runner = types.ModuleType("backend.fastapi_app.agui.runner")
     stub_runner.run_agent = run_agent
     monkeypatch.setitem(sys.modules, "backend.fastapi_app.agui.runner", stub_runner)
@@ -879,6 +974,13 @@ def _load_runner_with_service_stub(monkeypatch, handle_service_action):
     return importlib.import_module("backend.fastapi_app.agui.runner")
 
 
+def _install_service_action_stub(monkeypatch, handle_service_action) -> None:
+    module_name = "backend.fastapi_app.agui.service"
+    stub_service = types.ModuleType(module_name)
+    stub_service.handle_service_action = handle_service_action
+    monkeypatch.setitem(sys.modules, module_name, stub_service)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch) -> TestClient:
     monkeypatch.setenv("AG_UI_AUTH_MODE", "disabled")
@@ -887,17 +989,369 @@ def client(tmp_path, monkeypatch) -> TestClient:
         if False:
             yield None
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, stub_run_agent)
+    gateway = _load_gateway_with_runner_stub(monkeypatch, stub_run_agent, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     store = EventStore(str(tmp_path / "agui_events.db"))
     run_manager = RunManager(store)
     monkeypatch.setattr(gateway, "store", store)
     monkeypatch.setattr(gateway, "run_manager", run_manager)
-    return TestClient(gateway.app)
+    test_client = TestClient(gateway.app)
+    # Reuse a single persistent event loop/portal across every call this
+    # fixture's TestClient makes, instead of TestClient's default behaviour
+    # of spinning up (and immediately tearing down) a fresh loop per call.
+    # RunManager._execute_run now genuinely awaits store calls dispatched
+    # to a worker thread (T2 executor offload), so it must survive across
+    # the separate HTTP calls a test issues while polling for run
+    # completion; a per-call ephemeral loop would cancel the background
+    # run task before the executor's callback can land on it. This does
+    # not invoke the app's lifespan handlers (unlike using
+    # `with TestClient(...) as client:`), matching this fixture's existing
+    # behaviour of not exercising startup/shutdown.
+    with anyio.from_thread.start_blocking_portal(backend="asyncio") as portal:
+        test_client.portal = portal
+        yield test_client
+    run_manager.close()
 
 
-def test_agui_auth_defaults_to_required_without_tokens(tmp_path, monkeypatch):
+def test_text_to_sql_terminal_retry_stream_is_request_scoped_and_winner_consistent(
+    client,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+
+    def seed_terminal_run(
+        *,
+        run_id: str,
+        idempotency_key: str,
+        historical_terminal: EventType,
+    ) -> None:
+        service_payload = {
+            "query": "count orders",
+            "dsn": "sqlite:///example.db",
+            "idempotency_key": idempotency_key,
+        }
+        gateway.store.create_or_get_run(
+            principal=system_principal_for_disabled_mode(),
+            run_kind="text_to_sql",
+            idempotency_key=idempotency_key,
+            request_fingerprint=canonical_text_to_sql_start_fingerprint(
+                service_payload
+            ),
+            proposed_run_id=run_id,
+            thread_id=f"thread-{run_id}",
+        )
+        incarnation = f"inc-{run_id}"
+        assert gateway.store.reserve_workflow_run(
+            run_id,
+            incarnation,
+            f"thread-{run_id}",
+            "text_to_sql_pipeline",
+        )
+        result = _failed_text_to_sql_result(run_id, incarnation)
+        gateway.store.finalize_run_with_event(run_id, result)
+        if historical_terminal is EventType.RUN_ERROR:
+            event = RunErrorEvent(
+                type=EventType.RUN_ERROR,
+                message="historical failure",
+                code="historical_failure",
+                timestamp=1,
+            )
+        else:
+            event = RunFinishedEvent(
+                type=EventType.RUN_FINISHED,
+                thread_id=f"thread-{run_id}",
+                run_id=run_id,
+                result={"stale": "success"},
+                timestamp=1,
+            )
+        gateway.store.append(
+            run_id,
+            event.type.value,
+            event.model_dump(by_alias=True, exclude_none=True),
+        )
+
+    def retry(idempotency_key: str, request_id: str) -> list[dict]:
+        payload = _make_payload(f"proposal-{request_id}")
+        payload["forwardedProps"] = {
+            "service_action": "presets.text_to_sql.generate",
+            "service_payload": {
+                "query": "count orders",
+                "dsn": "sqlite:///example.db",
+                "idempotency_key": idempotency_key,
+                "__request_id": request_id,
+            },
+        }
+        response = client.post("/agent", json=payload)
+        assert response.status_code == 200
+        return _read_sse_events(response.text)
+
+    seed_terminal_run(
+        run_id="failed-run",
+        idempotency_key="failed-key",
+        historical_terminal=EventType.RUN_ERROR,
+    )
+    for request_id in ("request-a", "request-b"):
+        events = retry("failed-key", request_id)
+        assert [event["type"] for event in events] == [
+            "CUSTOM",
+            "CUSTOM",
+            "RUN_ERROR",
+        ]
+        assert events[0]["name"] == "service.result"
+        assert events[0]["value"]["__request_id"] == request_id
+        assert events[1]["name"] == "workflow.result"
+        assert events[1]["value"]["terminal_outcome"]["status"] == "failed"
+
+    seed_terminal_run(
+        run_id="mismatched-run",
+        idempotency_key="mismatched-key",
+        historical_terminal=EventType.RUN_FINISHED,
+    )
+    mismatched = retry("mismatched-key", "request-c")
+    assert [event["type"] for event in mismatched] == [
+        "CUSTOM",
+        "CUSTOM",
+        "RUN_ERROR",
+    ]
+    assert all(event["type"] != "RUN_FINISHED" for event in mismatched)
+
+
+def test_terminal_text_to_sql_get_replay_survives_run_manager_cache_loss(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    run_id = "primary-only-terminal"
+    service_payload = {
+        "query": "count orders",
+        "dsn": "sqlite:///example.db",
+        "idempotency_key": "primary-only-key",
+    }
+    gateway.store.create_or_get_run(
+        principal=system_principal_for_disabled_mode(),
+        run_kind="text_to_sql",
+        idempotency_key="primary-only-key",
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(
+            service_payload
+        ),
+        proposed_run_id=run_id,
+        thread_id="thread-primary-only",
+    )
+    incarnation = "inc-primary-only"
+    assert gateway.store.reserve_workflow_run(
+        run_id,
+        incarnation,
+        "thread-primary-only",
+        "text_to_sql_pipeline",
+    )
+    result = _failed_text_to_sql_result(run_id, incarnation)
+    result_seq = gateway.store.finalize_run_with_event(run_id, result)
+    assert result_seq == 1
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+
+    for path in (
+        f"/agent/{run_id}/events",
+        f"/v1/runs/{run_id}/events",
+    ):
+        response = client.get(path, params={"after": 0, "follow": True})
+        assert response.status_code == 200
+        events = _read_sse_events(response.text)
+        assert [event["type"] for event in events] == ["CUSTOM", "RUN_ERROR"]
+        assert events[0]["name"] == "workflow.result"
+        assert events[0]["value"] == result
+        assert events[1]["code"] == "text_to_sql_failed"
+
+        after_result = client.get(
+            path,
+            params={"after": result_seq, "follow": True},
+        )
+        assert after_result.status_code == 200
+        assert _read_sse_events(after_result.text) == []
+
+    workflow_projection = CustomEvent(
+        type=EventType.CUSTOM,
+        name="workflow.result",
+        value=result,
+        timestamp=2,
+    )
+    terminal_projection = RunErrorEvent(
+        type=EventType.RUN_ERROR,
+        message="EXECUTION_FAILED",
+        code="text_to_sql_failed",
+        timestamp=3,
+    )
+    projection_seqs = [
+        gateway.store.append(
+            run_id,
+            projection.type.value,
+            projection.model_dump(by_alias=True, exclude_none=True),
+        )
+        for projection in (workflow_projection, terminal_projection)
+    ]
+
+    persisted_after_winner = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": result_seq, "follow": True},
+    )
+    assert persisted_after_winner.status_code == 200
+    persisted_after_winner_events = _read_sse_events(
+        persisted_after_winner.text
+    )
+    assert [event["type"] for event in persisted_after_winner_events] == [
+        "CUSTOM",
+        "RUN_ERROR",
+    ]
+
+    persisted = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": 0, "follow": True},
+    )
+    assert persisted.status_code == 200
+    persisted_events = _read_sse_events(persisted.text)
+    assert [event["type"] for event in persisted_events] == [
+        "CUSTOM",
+        "RUN_ERROR",
+    ]
+    assert persisted_events[0]["value"] == result
+
+    after_workflow_projection = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": projection_seqs[0], "follow": True},
+    )
+    assert after_workflow_projection.status_code == 200
+    assert [
+        event["type"]
+        for event in _read_sse_events(after_workflow_projection.text)
+    ] == ["RUN_ERROR"]
+
+    after_terminal_projection = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": projection_seqs[1], "follow": True},
+    )
+    assert after_terminal_projection.status_code == 200
+    assert _read_sse_events(after_terminal_projection.text) == []
+
+
+def test_terminal_text_to_sql_get_replay_replaces_conflicting_transport_terminal(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    run_id = "conflicting-terminal"
+    service_payload = {
+        "query": "count orders",
+        "dsn": "sqlite:///example.db",
+        "idempotency_key": "conflicting-terminal-key",
+    }
+    gateway.store.create_or_get_run(
+        principal=system_principal_for_disabled_mode(),
+        run_kind="text_to_sql",
+        idempotency_key="conflicting-terminal-key",
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(
+            service_payload
+        ),
+        proposed_run_id=run_id,
+        thread_id="thread-conflicting",
+    )
+    incarnation = "inc-conflicting"
+    assert gateway.store.reserve_workflow_run(
+        run_id,
+        incarnation,
+        "thread-conflicting",
+        "text_to_sql_pipeline",
+    )
+    result = _failed_text_to_sql_result(run_id, incarnation)
+    gateway.store.finalize_run_with_event(run_id, result)
+    stale = RunFinishedEvent(
+        type=EventType.RUN_FINISHED,
+        thread_id="thread-conflicting",
+        run_id=run_id,
+        result={"stale": "success"},
+        timestamp=1,
+    )
+    gateway.store.append(
+        run_id,
+        stale.type.value,
+        stale.model_dump(by_alias=True, exclude_none=True),
+    )
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+
+    response = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": 0, "follow": False},
+    )
+    assert response.status_code == 200
+    events = _read_sse_events(response.text)
+    assert [event["type"] for event in events] == ["CUSTOM", "RUN_ERROR"]
+    assert events[0]["value"] == result
+    assert events[1]["code"] == "text_to_sql_failed"
+    assert all(event["type"] != "RUN_FINISHED" for event in events)
+
+
+def test_terminal_text_to_sql_get_replay_reports_resultless_restart_failure(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    run_id = "restart-without-result"
+    gateway.store.create_or_get_run(
+        principal=system_principal_for_disabled_mode(),
+        run_kind="text_to_sql",
+        idempotency_key="restart-without-result-key",
+        request_fingerprint="a" * 64,
+        proposed_run_id=run_id,
+        thread_id="thread-restart",
+    )
+    assert gateway.store.reconcile_non_terminal_runs() == 1
+    stored = gateway.store.get_run(run_id)
+    assert stored is not None
+    assert stored.status == "failed"
+    assert stored.terminal_reason == "SERVER_RESTARTED"
+    assert stored.result_seq is None
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+
+    response = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": 0, "follow": True},
+    )
+    assert response.status_code == 200
+    events = _read_sse_events(response.text)
+    assert [event["type"] for event in events] == ["RUN_ERROR"]
+    assert events[0]["code"] == "text_to_sql_server_restarted"
+
+    resumed = client.get(
+        f"/v1/runs/{run_id}/events",
+        params={"after": 7, "follow": True},
+    )
+    assert resumed.status_code == 200
+    resumed_events = _read_sse_events(resumed.text)
+    assert [event["type"] for event in resumed_events] == ["RUN_ERROR"]
+    assert resumed_events[0]["code"] == "text_to_sql_server_restarted"
+
+
+def test_agui_auth_defaults_to_required_and_fails_startup_without_tokens(
+    tmp_path,
+    monkeypatch,
+):
     for env_name in (
         "AG_UI_AUTH_MODE",
         "AG_UI_AUTH_TOKEN",
@@ -912,18 +1366,218 @@ def test_agui_auth_defaults_to_required_without_tokens(tmp_path, monkeypatch):
         if False:
             yield None
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
-    from backend.fastapi_app.agui.run_manager import RunManager
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_drain_workflow_results_before_reconcile",
+        lambda: pytest.fail("startup continued past invalid auth configuration"),
+    )
 
-    store = EventStore(str(tmp_path / "agui_events.db"))
-    monkeypatch.setattr(gateway, "store", store)
-    monkeypatch.setattr(gateway, "run_manager", RunManager(store))
-    local_client = TestClient(gateway.app)
+    with pytest.raises(HTTPException) as exc_info:
+        with TestClient(gateway.app):
+            pass
 
-    response = local_client.post("/v1/runs", json=_make_payload("client-run"))
+    assert exc_info.value.status_code == 500
+    assert "requires at least one authentication token" in exc_info.value.detail
 
-    assert response.status_code == 401
-    assert response.json()["detail"] == "AG-UI authentication token is required"
+
+def test_token_map_entry_without_subject_fails_configuration(monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv(
+        "AG_UI_AUTH_TOKEN_MAP",
+        json.dumps(
+            {
+                "browser-token": {
+                    "tenant_id": "tenant-1",
+                    "roles": ["user"],
+                }
+            }
+        ),
+    )
+
+    from backend.fastapi_app.agui.auth import validate_auth_configuration
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_auth_configuration()
+
+    assert exc_info.value.status_code == 500
+    assert "subject" in exc_info.value.detail
+
+
+def test_token_map_entry_with_blank_subject_fails_configuration(monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv(
+        "AG_UI_AUTH_TOKEN_MAP",
+        json.dumps(
+            {
+                "browser-token": {
+                    "subject": "   ",
+                    "tenant_id": "tenant-1",
+                    "roles": ["user"],
+                }
+            }
+        ),
+    )
+
+    from backend.fastapi_app.agui.auth import validate_auth_configuration
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_auth_configuration()
+
+    assert exc_info.value.status_code == 500
+    assert "subject" in exc_info.value.detail
+
+
+@pytest.mark.parametrize(
+    ("token_map", "extra_tokens", "expected_detail"),
+    (
+        (
+            json.dumps(
+                {
+                    "   ": {
+                        "subject": "alice",
+                        "tenant_id": "tenant-1",
+                        "roles": ["user"],
+                    }
+                }
+            ),
+            {},
+            "token must not be blank",
+        ),
+        (
+            json.dumps(
+                {
+                    "browser-token": {
+                        "subject": "alice",
+                        "tenant_id": "   ",
+                        "roles": ["user"],
+                    }
+                }
+            ),
+            {},
+            "tenant_id",
+        ),
+        (
+            json.dumps(
+                {
+                    "browser-token": {
+                        "subject": "alice",
+                        "tenant_id": "tenant-1",
+                        "roles": {"user": True},
+                    }
+                }
+            ),
+            {},
+            "roles must be a string or list",
+        ),
+        (
+            '{"shared":{"subject":"alice"},'
+            '"shared":{"subject":"bob"}}',
+            {},
+            "duplicate token",
+        ),
+        (
+            json.dumps({"shared": {"subject": "alice"}}),
+            {"AG_UI_AUTH_TOKEN": "shared"},
+            "duplicate authentication token",
+        ),
+    ),
+)
+def test_invalid_auth_token_configuration_fails_validation(
+    monkeypatch,
+    token_map,
+    extra_tokens,
+    expected_detail,
+):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN_MAP", token_map)
+    for env_name, token in extra_tokens.items():
+        monkeypatch.setenv(env_name, token)
+
+    from backend.fastapi_app.agui.auth import validate_auth_configuration
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_auth_configuration()
+
+    assert exc_info.value.status_code == 500
+    assert expected_detail in exc_info.value.detail
+
+
+def test_blank_environment_token_fails_auth_configuration(monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "optional")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN", "   ")
+
+    from backend.fastapi_app.agui.auth import validate_auth_configuration
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_auth_configuration()
+
+    assert exc_info.value.status_code == 500
+    assert "AG_UI_AUTH_TOKEN must not be blank" in exc_info.value.detail
+
+
+def test_invalid_auth_mode_fails_auth_configuration(monkeypatch):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "unexpected")
+    monkeypatch.setenv("AG_UI_AUTH_TOKEN", "browser-token")
+
+    from backend.fastapi_app.agui.auth import validate_auth_configuration
+
+    with pytest.raises(HTTPException) as exc_info:
+        validate_auth_configuration()
+
+    assert exc_info.value.status_code == 500
+    assert exc_info.value.detail == "invalid AG_UI_AUTH_MODE: unexpected"
+
+
+def test_whoami_accepts_valid_bearer_and_rejects_missing_or_bad_token(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv(
+        "AG_UI_AUTH_TOKEN_MAP",
+        json.dumps(
+            {
+                "browser-token": {
+                    "subject": "alice",
+                    "tenant_id": "tenant-1",
+                    "roles": ["user", "memory_archivist"],
+                }
+            }
+        ),
+    )
+
+    async def fake_run_agent(_input_data):
+        if False:
+            yield None
+
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
+    monkeypatch.setattr(
+        gateway,
+        "_drain_workflow_results_before_reconcile",
+        lambda: frozenset(),
+    )
+
+    with TestClient(gateway.app) as local_client:
+        missing = local_client.get("/v1/auth/me")
+        bad = local_client.get(
+            "/v1/auth/me",
+            headers={"Authorization": "Bearer wrong-token"},
+        )
+        valid = local_client.get(
+            "/v1/auth/me",
+            headers={"Authorization": "Bearer browser-token"},
+        )
+
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == "Bearer"
+    assert bad.status_code == 403
+    assert valid.status_code == 200
+    assert valid.json() == {
+        "subject": "alice",
+        "tenant_id": "tenant-1",
+        "roles": ["memory_archivist", "user"],
+    }
 
 
 def test_current_principal_without_context_is_anonymous_when_auth_required(monkeypatch):
@@ -1002,7 +1656,7 @@ def test_agui_auth_required_rejects_missing_and_bad_token(tmp_path, monkeypatch)
         if False:
             yield None
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     store = EventStore(str(tmp_path / "agui_events.db"))
@@ -1052,7 +1706,7 @@ def test_agui_run_access_is_bound_to_authenticated_principal(tmp_path, monkeypat
             timestamp=int(time.time() * 1000),
         )
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     store = EventStore(str(tmp_path / "agui_events.db"))
@@ -1101,7 +1755,7 @@ def test_generic_auth_token_is_not_admin_for_legacy_runs(tmp_path, monkeypatch):
         if False:
             yield None
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     store = EventStore(str(tmp_path / "agui_events.db"))
@@ -1133,7 +1787,7 @@ def test_optional_auth_missing_token_is_anonymous_not_admin(tmp_path, monkeypatc
         if False:
             yield None
 
-    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent)
+    gateway = _load_gateway_with_runner_stub(monkeypatch, fake_run_agent, tmp_path)
     from backend.fastapi_app.agui.run_manager import RunManager
 
     store = EventStore(str(tmp_path / "agui_events.db"))
@@ -1369,7 +2023,7 @@ async def test_timeout_safe_service_action_returns_explicit_error(monkeypatch):
 @pytest.mark.asyncio
 async def test_mutating_service_action_is_not_reported_timed_out_while_thread_continues(monkeypatch):
     def handle_service_action(action, _payload):
-        assert action == "presets.text_to_sql.generate"
+        assert action == "agents.run"
         time.sleep(0.02)
         return {"run_id": "workflow-run"}
 
@@ -1378,7 +2032,7 @@ async def test_mutating_service_action_is_not_reported_timed_out_while_thread_co
     run_id = f"run-{uuid.uuid4().hex[:8]}"
     payload = _make_payload(run_id)
     payload["forwardedProps"] = {
-        "service_action": "presets.text_to_sql.generate",
+        "service_action": "agents.run",
         "service_payload": {"__request_id": "req-mutating"},
     }
 
@@ -1706,6 +2360,314 @@ def test_v1_runs_cancel(client, monkeypatch):
         time.sleep(0.05)
 
     assert status["status"] == "cancelled"
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    ("/agent/{run_id}/cancel", "/v1/runs/{run_id}/cancel"),
+)
+@pytest.mark.parametrize(
+    ("outcome", "expected_cancelled"),
+    (("cancelled", True), ("completed", False), ("survives", False)),
+)
+def test_uncached_text_to_sql_cancel_alias_uses_one_owner_service_attempt(
+    client,
+    monkeypatch,
+    path_template,
+    outcome,
+    expected_cancelled,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+    import backend.fastapi_app.agui.run_manager as run_manager_module
+
+    run_id = f"uncached-{outcome}-{uuid.uuid4().hex[:8]}"
+    incarnation = f"inc-{run_id}"
+    service_payload = {
+        "query": "count orders",
+        "dsn": "sqlite:///example.db",
+        "idempotency_key": f"key-{run_id}",
+    }
+    gateway.store.create_or_get_run(
+        principal=system_principal_for_disabled_mode(),
+        run_kind="text_to_sql",
+        idempotency_key=service_payload["idempotency_key"],
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(
+            service_payload
+        ),
+        proposed_run_id=run_id,
+        thread_id=f"thread-{run_id}",
+    )
+    assert gateway.store.reserve_workflow_run(
+        run_id,
+        incarnation,
+        f"thread-{run_id}",
+        "text_to_sql_pipeline",
+    )
+    assert gateway.store.set_worker_pid(run_id, 54321)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+    monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 0.05)
+    calls = []
+
+    def fake_handle(action, payload, principal=None, **_kwargs):
+        calls.append((action, payload, principal))
+        if outcome in {"cancelled", "completed"}:
+            status = "cancelled" if outcome == "cancelled" else "succeeded"
+            gateway.store.finalize_run_with_event(
+                run_id,
+                _text_to_sql_result(
+                    run_id,
+                    incarnation,
+                    status=status,
+                ),
+            )
+        return {"cancelled": outcome == "cancelled"}
+
+    _install_service_action_stub(monkeypatch, fake_handle)
+
+    response = client.post(path_template.format(run_id=run_id))
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": expected_cancelled}
+    assert calls == [
+        (
+            "workflows.cancel",
+            {"run_id": run_id},
+            system_principal_for_disabled_mode(),
+        )
+    ]
+
+
+def test_uncached_cancel_skips_terminal_and_non_text_to_sql_runs(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    principal = system_principal_for_disabled_mode()
+    terminal_run = f"terminal-{uuid.uuid4().hex[:8]}"
+    incarnation = f"inc-{terminal_run}"
+    service_payload = {
+        "query": "count orders",
+        "dsn": "sqlite:///example.db",
+        "idempotency_key": f"key-{terminal_run}",
+    }
+    gateway.store.create_or_get_run(
+        principal=principal,
+        run_kind="text_to_sql",
+        idempotency_key=service_payload["idempotency_key"],
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(
+            service_payload
+        ),
+        proposed_run_id=terminal_run,
+        thread_id=f"thread-{terminal_run}",
+    )
+    assert gateway.store.reserve_workflow_run(
+        terminal_run,
+        incarnation,
+        f"thread-{terminal_run}",
+        "text_to_sql_pipeline",
+    )
+    gateway.store.finalize_run_with_event(
+        terminal_run,
+        _text_to_sql_result(
+            terminal_run,
+            incarnation,
+            status="succeeded",
+        ),
+    )
+    generic_run = f"generic-{uuid.uuid4().hex[:8]}"
+    gateway.store.create_run(
+        generic_run,
+        f"thread-{generic_run}",
+        principal,
+    )
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+    calls = []
+    _install_service_action_stub(
+        monkeypatch,
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    terminal_response = client.post(f"/agent/{terminal_run}/cancel")
+    generic_response = client.post(f"/v1/runs/{generic_run}/cancel")
+
+    assert terminal_response.status_code == 200
+    assert terminal_response.json() == {"cancelled": False}
+    assert generic_response.status_code == 200
+    assert generic_response.json() == {"cancelled": False}
+    assert calls == []
+
+
+def test_cached_text_to_sql_cancel_failure_does_not_use_uncached_fallback(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import system_principal_for_disabled_mode
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    run_id = f"cached-{uuid.uuid4().hex[:8]}"
+    service_payload = {
+        "query": "count orders",
+        "dsn": "sqlite:///example.db",
+        "idempotency_key": f"key-{run_id}",
+    }
+    stored, created = gateway.store.create_or_get_run(
+        principal=system_principal_for_disabled_mode(),
+        run_kind="text_to_sql",
+        idempotency_key=service_payload["idempotency_key"],
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(
+            service_payload
+        ),
+        proposed_run_id=run_id,
+        thread_id=f"thread-{run_id}",
+    )
+    assert created is True
+    manager = RunManager(gateway.store)
+    manager._runs[run_id] = manager._info_from_stored(stored)
+    monkeypatch.setattr(gateway, "run_manager", manager)
+    calls = []
+    _install_service_action_stub(
+        monkeypatch,
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    response = client.post(f"/agent/{run_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {"cancelled": False}
+    assert calls == []
+
+
+def test_uncached_text_to_sql_cancel_preserves_owner_and_admin_access(
+    client,
+    monkeypatch,
+):
+    from backend.fastapi_app import main as gateway
+    from backend.fastapi_app.agui._t2s_requests import (
+        canonical_text_to_sql_start_fingerprint,
+    )
+    from backend.fastapi_app.agui.auth import Principal
+    from backend.fastapi_app.agui.run_manager import RunManager
+
+    owner = Principal(
+        subject="alice",
+        tenant_id="tenant-1",
+        roles=frozenset({"user"}),
+    )
+    admin = Principal(
+        subject="admin",
+        tenant_id="other-tenant",
+        roles=frozenset({"admin", "user"}),
+    )
+    monkeypatch.setenv("AG_UI_AUTH_MODE", "required")
+    monkeypatch.setenv(
+        "AG_UI_AUTH_TOKEN_MAP",
+        json.dumps(
+            {
+                "owner-token": {
+                    "subject": "alice",
+                    "tenant_id": "tenant-1",
+                    "roles": ["user"],
+                },
+                "admin-token": {
+                    "subject": "admin",
+                    "tenant_id": "other-tenant",
+                    "roles": ["admin", "user"],
+                },
+                "other-token": {
+                    "subject": "bob",
+                    "tenant_id": "tenant-1",
+                    "roles": ["user"],
+                },
+            }
+        ),
+    )
+    incarnations = {}
+
+    def seed(run_id):
+        service_payload = {
+            "query": "count orders",
+            "dsn": "sqlite:///example.db",
+            "idempotency_key": f"key-{run_id}",
+        }
+        gateway.store.create_or_get_run(
+            principal=owner,
+            run_kind="text_to_sql",
+            idempotency_key=service_payload["idempotency_key"],
+            request_fingerprint=canonical_text_to_sql_start_fingerprint(
+                service_payload
+            ),
+            proposed_run_id=run_id,
+            thread_id=f"thread-{run_id}",
+        )
+        incarnation = f"inc-{run_id}"
+        incarnations[run_id] = incarnation
+        assert gateway.store.reserve_workflow_run(
+            run_id,
+            incarnation,
+            f"thread-{run_id}",
+            "text_to_sql_pipeline",
+        )
+
+    owner_run = f"owner-{uuid.uuid4().hex[:8]}"
+    admin_run = f"admin-{uuid.uuid4().hex[:8]}"
+    denied_run = f"denied-{uuid.uuid4().hex[:8]}"
+    for run_id in (owner_run, admin_run, denied_run):
+        seed(run_id)
+    monkeypatch.setattr(gateway, "run_manager", RunManager(gateway.store))
+    calls = []
+
+    def fake_handle(action, payload, principal=None, **_kwargs):
+        run_id = payload["run_id"]
+        calls.append((action, run_id, principal))
+        gateway.store.finalize_run_with_event(
+            run_id,
+            _text_to_sql_result(
+                run_id,
+                incarnations[run_id],
+                status="cancelled",
+            ),
+        )
+        return {"cancelled": True}
+
+    _install_service_action_stub(monkeypatch, fake_handle)
+
+    owner_response = client.post(
+        f"/agent/{owner_run}/cancel",
+        headers={"Authorization": "Bearer owner-token"},
+    )
+    admin_response = client.post(
+        f"/v1/runs/{admin_run}/cancel",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    denied_response = client.post(
+        f"/agent/{denied_run}/cancel",
+        headers={"Authorization": "Bearer other-token"},
+    )
+
+    assert owner_response.status_code == 200
+    assert owner_response.json() == {"cancelled": True}
+    assert admin_response.status_code == 200
+    assert admin_response.json() == {"cancelled": True}
+    assert denied_response.status_code == 404
+    assert calls == [
+        ("workflows.cancel", owner_run, owner),
+        ("workflows.cancel", admin_run, admin),
+    ]
 
 
 def test_v1_run_result_uses_workflow_result_event(client):

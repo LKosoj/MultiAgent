@@ -8,11 +8,16 @@
 
 import logging
 from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from urllib.parse import urlparse
 import re
 
-from .manager import get_plugin, _PLUGINS
+from .manager import (
+    _PLUGINS,
+    canonical_dialect,
+    get_plugin,
+    serialize_support_matrix,
+)
 from .base import DBPlugin
 
 logger = logging.getLogger(__name__)
@@ -27,12 +32,18 @@ class PluginInfo:
     description: str
     supported_features: List[str] = None
     dsn_examples: List[str] = None
+    capabilities: Dict[str, Any] = None
+    health: Dict[str, Any] = None
 
     def __post_init__(self):
         if self.supported_features is None:
             self.supported_features = []
         if self.dsn_examples is None:
             self.dsn_examples = []
+        if self.capabilities is None:
+            self.capabilities = {}
+        if self.health is None:
+            self.health = {}
 
 @dataclass
 class ConnectionTestResult:
@@ -102,6 +113,8 @@ class DBPluginManager:
                 
                 # Определяем поддерживаемые возможности
                 features = self._detect_plugin_features(plugin)
+                capabilities = plugin.get_capabilities()
+                health = plugin.probe_capabilities()
                 
                 # Примеры DSN для разных схем
                 examples = self._get_dsn_examples(scheme)
@@ -113,7 +126,9 @@ class DBPluginManager:
                     dialect_label=dialect_label,
                     description=self._get_plugin_description(scheme),
                     supported_features=features,
-                    dsn_examples=examples
+                    dsn_examples=examples,
+                    capabilities=capabilities.to_mapping(),
+                    health=health.to_mapping(),
                 )
                 plugin_infos.append(plugin_info)
                 
@@ -127,28 +142,18 @@ class DBPluginManager:
         return plugin_infos
 
     def _detect_plugin_features(self, plugin: DBPlugin) -> List[str]:
-        """Определить поддерживаемые возможности плагина"""
-        features = []
-        
-        # Проверяем наличие методов
-        if hasattr(plugin, 'introspect_schema'):
-            features.append("Schema Introspection")
-        if hasattr(plugin, 'explain'):
-            features.append("Query Explain")
-        if hasattr(plugin, 'execute_select'):
-            features.append("SELECT Execution")
-        if hasattr(plugin, 'estimate_row_count'):
-            features.append("Row Count Estimation")
-        if hasattr(plugin, 'sample_rows_smart'):
-            features.append("Smart Sampling")
-        if hasattr(plugin, 'get_fk_preview'):
-            features.append("Foreign Key Preview")
-        if hasattr(plugin, 'normalize_schema_names'):
-            features.append("Schema Normalization")
-        if hasattr(plugin, 'parse_schema_from_dsn'):
-            features.append("DSN Schema Parsing")
-            
-        return features
+        """Return supported canonical capability names."""
+        mapping = plugin.get_capabilities().to_mapping()
+        return sorted(
+            name
+            for name, value in mapping.items()
+            if name != "dialect"
+            and isinstance(value, dict)
+            and value.get("state") == "supported"
+        )
+
+    def get_capability_matrix(self) -> List[Dict[str, Any]]:
+        return serialize_support_matrix()
 
     def _get_dsn_examples(self, scheme: str) -> List[str]:
         """Получить примеры DSN для схемы"""
@@ -207,23 +212,28 @@ class DBPluginManager:
         Returns:
             Объект PluginInfo или None
         """
-        if scheme not in self.plugins:
+        try:
+            canonical = canonical_dialect(scheme)
+        except ValueError:
             return None
-            
-        plugin = self.plugins[scheme]
+        if canonical not in self.plugins:
+            return None
+        plugin = self.plugins[canonical]
         
         try:
             dialect = getattr(plugin, 'dialect', scheme)
             dialect_label = getattr(plugin, 'dialect_label', dialect.title())
             
             return PluginInfo(
-                scheme=scheme,
+                scheme=canonical,
                 name=f"{dialect_label} Plugin",
                 dialect=dialect,
                 dialect_label=dialect_label,
-                description=self._get_plugin_description(scheme),
+                description=self._get_plugin_description(canonical),
                 supported_features=self._detect_plugin_features(plugin),
-                dsn_examples=self._get_dsn_examples(scheme)
+                dsn_examples=self._get_dsn_examples(canonical),
+                capabilities=plugin.get_capabilities().to_mapping(),
+                health=plugin.probe_capabilities().to_mapping(),
             )
         except Exception as e:
             logger.error(f"❌ Ошибка получения информации о плагине {scheme}: {e}")
@@ -393,6 +403,13 @@ class DBPluginManager:
             if conn:
                 connection_time = (time.time() - start_time) * 1000  # ms
                 result.connection_time_ms = round(connection_time, 2)
+                health = plugin.probe_capabilities(conn, dsn)
+                result.metadata["capability_health"] = health.to_mapping()
+                if not health.production_ready:
+                    result.validation_warnings.append(
+                        "Database capability probe is not production-ready: "
+                        + ", ".join(health.reason_codes)
+                    )
 
                 try:
                     # Пытаемся выполнить простой запрос для проверки
@@ -466,10 +483,12 @@ class DBPluginManager:
         Returns:
             Словарь с ограничениями и возможностями
         """
+        scheme = canonical_dialect(scheme)
         if scheme not in self.plugins:
             return {}
         
         plugin = self.plugins[scheme]
+        capabilities = plugin.get_capabilities().to_mapping()
         
         # Получаем диалект из плагина (не хардкодим)
         dialect = getattr(plugin, 'dialect', scheme)
@@ -483,8 +502,11 @@ class DBPluginManager:
             "supports_top": False,
             "limit_syntax": "LIMIT",
             "max_rows_recommended": 1000,
-            "supports_explain": hasattr(plugin, 'explain'),
-            "supports_schema_introspection": hasattr(plugin, 'introspect_schema'),
+            "supports_explain": capabilities["explain"]["state"] == "supported",
+            "supports_schema_introspection": (
+                capabilities["introspection"]["state"] == "supported"
+            ),
+            "capabilities": capabilities,
             "quote_identifier_char": '"',
             "identifier_case_sensitive": True
         }
@@ -588,10 +610,12 @@ class DBPluginManager:
         Returns:
             Словарь с информацией о диалекте
         """
+        scheme = canonical_dialect(scheme)
         if scheme not in self.plugins:
             return {}
         
         plugin = self.plugins[scheme]
+        capabilities = plugin.get_capabilities().to_mapping()
         
         # Получаем диалект и лейбл из плагина (правило проекта - не хардкодить)
         dialect = getattr(plugin, 'dialect', scheme)
@@ -601,11 +625,14 @@ class DBPluginManager:
             "scheme": scheme,
             "dialect": dialect,
             "dialect_label": dialect_label,
-            "supports_schema_in_dsn": hasattr(plugin, 'parse_schema_from_dsn'),
-            "supports_explain": hasattr(plugin, 'explain'),
-            "supports_introspection": hasattr(plugin, 'introspect_schema'),
-            "supports_sampling": hasattr(plugin, 'sample_rows_smart'),
-            "plugin_class": plugin.__class__.__name__
+            "supports_schema_in_dsn": True,
+            "supports_explain": capabilities["explain"]["state"] == "supported",
+            "supports_introspection": (
+                capabilities["introspection"]["state"] == "supported"
+            ),
+            "supports_sampling": True,
+            "plugin_class": plugin.__class__.__name__,
+            "capabilities": capabilities,
         }
 
 

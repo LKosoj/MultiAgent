@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import time
 import os
 import logging
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlparse
-from .base import BaseDBPlugin
+from .base import (
+    BaseDBPlugin,
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +21,52 @@ logger = logging.getLogger(__name__)
 class ImpalaPlugin(BaseDBPlugin):
     dialect = "impala"
     dialect_label = "Impala"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        del dsn
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=Capability.unsupported("READ_ONLY_ENFORCEMENT_UNAVAILABLE"),
+            statement_timeout=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.unsupported(
+                "COMPOSITE_FK_GROUPING_UNAVAILABLE"
+            ),
+            parameter_binding=Capability.unverified(
+                "DRIVER_PARAMETER_BINDING_UNVERIFIED", EnforcementMode.DRIVER
+            ),
+        )
+
+    def _python_driver_available(self) -> bool:
+        try:
+            return importlib.util.find_spec("impala.dbapi") is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return False
+
+    def probe_capabilities(self, conn=None, dsn: str | None = None) -> PluginHealth:
+        del conn
+        reasons = []
+        if not self._python_driver_available():
+            reasons.append("OPTIONAL_DRIVER_MISSING")
+        if dsn and self.read_only_fail_open_enabled(dsn):
+            reasons.append("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+        reasons.append("READ_ONLY_ENFORCEMENT_UNAVAILABLE")
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            False,
+            tuple(dict.fromkeys(reasons)),
+        )
 
     def connect(self, dsn: str):
         # dsn: impala://user:pass@host:21050/db?auth_mechanism=GSSAPI
@@ -127,6 +180,8 @@ class ImpalaPlugin(BaseDBPlugin):
                         "references": ""  # Impala не поддерживает FK
                     }
                     result.setdefault(key, {"description": "", "columns": {}})["columns"][col] = self.normalize_column_info(col_info)
+            for table in result.values():
+                table["foreign_keys"] = {"complete": False, "constraints": []}
             return result
         except Exception as information_schema_error:
             try:
@@ -159,6 +214,8 @@ class ImpalaPlugin(BaseDBPlugin):
                                         "references": ""
                                     }
                                     result.setdefault(key, {"description": "", "columns": {}})["columns"][c[0]] = self.normalize_column_info(col_info)
+                for table in result.values():
+                    table["foreign_keys"] = {"complete": False, "constraints": []}
                 return result
             except Exception as describe_error:
                 raise RuntimeError(

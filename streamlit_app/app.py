@@ -8,6 +8,7 @@
 import streamlit as st
 import sys
 import warnings
+import os
 from pathlib import Path
 import time
 
@@ -21,6 +22,35 @@ sys.path.insert(0, str(project_root))
 from telemetry.helpers import is_trace_completed
 from _dashboard_common import show_recent_activities_common
 from _theme import inject_theme
+
+
+def _backend_auth_headers():
+    session_headers = st.session_state.get("api_auth_headers")
+    if isinstance(session_headers, dict) and session_headers:
+        return session_headers
+    token = (
+        st.session_state.get("api_token")
+        or os.getenv("MULTIAGENT_API_TOKEN")
+        or os.getenv("AG_UI_USER_TOKEN")
+        or os.getenv("AG_UI_AUTH_TOKEN")
+    )
+    return {"Authorization": f"Bearer {token.strip()}"} if isinstance(token, str) and token.strip() else {}
+
+
+def require_backend_api_session() -> bool:
+    from streamlit_app.text_to_sql_client import TextToSqlApiClient, TextToSqlApiError
+
+    client = TextToSqlApiClient(
+        base_url=os.getenv("MULTIAGENT_API_URL", "http://127.0.0.1:8000"),
+        auth_headers=_backend_auth_headers,
+    )
+    try:
+        st.session_state.backend_principal = dict(client.get_me())
+    except TextToSqlApiError as exc:
+        st.error(f"Требуется авторизованная сессия backend API: {exc}")
+        st.stop()
+        return False
+    return True
 
 def get_agent_manager():
     """Получить AgentManager с глобальным состоянием"""
@@ -50,6 +80,8 @@ def main():
         initial_sidebar_state="expanded"
     )
     inject_theme()
+    if not require_backend_api_session():
+        return
 
     # Проверяем состояние инициализации
     if "app_initialized" not in st.session_state:

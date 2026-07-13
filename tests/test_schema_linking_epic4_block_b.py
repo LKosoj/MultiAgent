@@ -17,6 +17,7 @@ from custom_tools.text_to_sql import (
     llm_models_config,
     main_table_scoring_config,
     nlu_config,
+    schema_cache,
 )
 from custom_tools.text_to_sql.schema_linking.join_validation import JoinValidator
 from custom_tools.text_to_sql.schema_linking.resolution import _resolve_table_name
@@ -102,6 +103,7 @@ def test_llm_models_config_loader(tmp_path, monkeypatch):
         "  default:\n"
         "    schema_linking:\n"
         "      max_tokens: 4242\n"
+        "      schema_prompt_hard_max_chars: 32000\n"
         "    sql_generation:\n"
         "      max_tokens: 8000\n"
         "    nlu:\n"
@@ -115,6 +117,7 @@ def test_llm_models_config_loader(tmp_path, monkeypatch):
     profile = llm_models_config.load_llm_models_config()
     assert profile.name == "default"
     assert profile.get("schema_linking", "max_tokens") == 4242
+    assert profile.get("schema_linking", "schema_prompt_hard_max_chars") == 32000
     assert profile.get("sql_generation", "max_tokens") == 8000
     assert profile.get("nlu", "intent_max_tokens") == 700
     assert profile.get("nlu", "nlp_max_tokens") == 1500
@@ -125,6 +128,17 @@ def test_llm_models_config_fails_fast_when_missing(tmp_path, monkeypatch):
     llm_models_config.reset_cache()
     with pytest.raises(FileNotFoundError):
         llm_models_config.load_llm_models_config()
+
+
+def test_linking_cache_hash_tracks_llm_model_profile_and_path(monkeypatch):
+    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PATH", "/tmp/models.yaml")
+
+    collected = schema_cache._collect_linking_cache_env()
+
+    assert collected["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == "muni_ru"
+    assert collected["TEXT_TO_SQL_LLM_MODELS_PATH"] == "/tmp/models.yaml"
+    assert "schema-budget" in schema_cache.SCHEMA_LINKING_LOGIC_VERSION
 
 
 # ---------------------------------------------------------------------- #
@@ -319,6 +333,7 @@ def test_max_tokens_from_llm_models_config(monkeypatch, tmp_path):
         "  default:\n"
         "    schema_linking:\n"
         "      max_tokens: 1234\n"
+        "      schema_prompt_hard_max_chars: 32000\n"
         "    sql_generation:\n"
         "      max_tokens: 9999\n"
         "    nlu:\n"
@@ -353,6 +368,54 @@ def test_max_tokens_from_llm_models_config(monkeypatch, tmp_path):
     )
 
     assert captured.get("max_tokens") == 1234
+
+
+def test_mandatory_schema_over_profile_hard_cap_skips_llm(monkeypatch, tmp_path):
+    cfg_path = tmp_path / "llm.yaml"
+    cfg_path.write_text(
+        "version: 1\n"
+        "profiles:\n"
+        "  default:\n"
+        "    schema_linking:\n"
+        "      max_tokens: 1234\n"
+        "      schema_prompt_hard_max_chars: 32\n"
+        "    sql_generation:\n"
+        "      max_tokens: 9999\n"
+        "    nlu:\n"
+        "      intent_max_tokens: 700\n"
+        "      nlp_max_tokens: 1500\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))
+    llm_models_config.reset_cache()
+    calls = []
+
+    def fake_llm(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("LLM must not be called after mandatory budget overflow")
+
+    core = _make_core(relevant_tables=["orders"], llm_caller=fake_llm)
+    schema = {
+        "orders": {
+            "columns": {
+                f"primary_key_{index}": {
+                    "type": "INTEGER",
+                    "constraint_type": "PK",
+                }
+                for index in range(5)
+            }
+        }
+    }
+
+    result = core.perform_linking(
+        {"metrics": ["primary_key_0"], "dimensions": [], "filters": {}},
+        schema,
+    )
+
+    assert calls == []
+    assert result["reason_code"] == "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
+    assert result["schema_budget"]["hard_limit_exceeded"] is True
+    assert result["schema_budget"]["hard_max_chars"] == 32
 
 
 # ---------------------------------------------------------------------- #

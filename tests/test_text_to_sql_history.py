@@ -13,9 +13,8 @@ import json
 import threading
 from pathlib import Path
 
-import pytest
-
 from custom_tools.text_to_sql.tool import SQLHistoryManager, _get_history_lock
+
 
 
 def test_history_append_creates_file(tmp_path: Path):

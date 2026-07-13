@@ -18,6 +18,7 @@ import yaml
 from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
 
 from ..schema_metadata import is_pk, is_fk, get_type
+from ..schema_namespace import SchemaNamespace
 from .join_validation import _parse_fk_reference_table
 
 logger = logging.getLogger(__name__)
@@ -171,7 +172,7 @@ class HeuristicLinker:
     # Entity term collection (shared with LLM linker)
     # ------------------------------------------------------------------
     def collect_entity_terms(self, entities: Dict[str, Any]) -> List[str]:
-        """Извлекает searchable terms из значений metrics/dimensions/filters."""
+        """Извлекает имена metrics/dimensions/filters для поиска схемы."""
         if not isinstance(entities, dict):
             return []
 
@@ -185,8 +186,7 @@ class HeuristicLinker:
                 if value:
                     terms.append(value)
             elif isinstance(value, dict):
-                for key in ("name", "description", "value", "column", "table"):
-                    add_term(value.get(key))
+                add_term(value.get("name") or value.get("column"))
             elif isinstance(value, (list, tuple, set)):
                 for item in value:
                     add_term(item)
@@ -198,9 +198,8 @@ class HeuristicLinker:
 
         filters = entities.get("filters", {})
         if isinstance(filters, dict):
-            for key, value in filters.items():
+            for key in filters:
                 add_term(key)
-                add_term(value)
         else:
             add_term(filters)
 
@@ -221,8 +220,25 @@ class HeuristicLinker:
         entities: Dict[str, Any],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Tuple[List, List, Dict, List]:
         """Эвристическое связывание сущностей со схемой."""
+        return self._heuristic_linking_with_diagnostics(
+            entities,
+            db_schema,
+            dsn=dsn,
+            diagnostics=None,
+            namespace=namespace,
+        )
+
+    def _heuristic_linking_with_diagnostics(
+        self,
+        entities: Dict[str, Any],
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        dsn: Optional[str],
+        diagnostics: Optional[Dict[str, Any]],
+        namespace: Optional[SchemaNamespace] = None,
+    ) -> Tuple[List, List, Dict, List]:
         linked_metrics: List[Dict[str, Any]] = []
         linked_dimensions: List[Dict[str, Any]] = []
         linked_filters: Dict[str, Any] = {}
@@ -241,10 +257,16 @@ class HeuristicLinker:
         # должна рушить heuristic-fallback: логируем (НЕ молча) и продолжаем
         # без семантической подсказки.
         try:
-            semantic_tables = self.memory_manager.find_semantic_relevant_tables(
-                self.collect_entity_terms(entities),
-                dsn=dsn,
-            )
+            if namespace is None:
+                semantic_tables = self.memory_manager.find_semantic_relevant_tables(
+                    self.collect_entity_terms(entities),
+                    dsn=dsn,
+                )
+            else:
+                semantic_tables = self.memory_manager.find_semantic_relevant_tables(
+                    self.collect_entity_terms(entities),
+                    namespace=namespace,
+                )
         except (EmbeddingUnavailableError, EmbeddingFailedError) as e:
             logger.warning(
                 "Семантическая подсказка main_table недоступна (эмбеддинги "
@@ -259,7 +281,13 @@ class HeuristicLinker:
 
         if main_table:
             for m in metrics_in:
-                col = self.best_column_for(m, main_table, db_schema.get(main_table, {}))
+                col = self._best_column_for_with_diagnostics(
+                    m,
+                    main_table,
+                    db_schema.get(main_table, {}),
+                    entity_type="metric",
+                    diagnostics=diagnostics,
+                )
                 if col:
                     linked_metrics.append({"name": m, "table": main_table, "column": col})
                 else:
@@ -274,16 +302,11 @@ class HeuristicLinker:
                 # main_table отдельно. Выбираем победителя по score DESC;
                 # tie-break: main_table предпочтительнее, иначе алфавитно.
                 # Это устраняет order-dependent поведение (баг #11).
-                other_candidates: list = []
+                candidates: List[Tuple[str, str, int]] = []
                 for t, table_schema in db_schema.items():
-                    if t == main_table:
-                        continue
-                    # T6: перебираем ранжированных кандидатов и берём первую НЕ-FK.
-                    # Раньше брали top-1 и отбрасывали если FK — теряя всю таблицу.
                     ranked = self._score_columns_for_name(d, table_schema)
                     if not ranked:
                         continue
-                    ranked.sort(key=lambda x: (-x[1], x[0]))
                     table_cols = get_table_columns(table_schema)
                     for candidate, cand_score in ranked:
                         col_meta = table_cols.get(candidate)
@@ -291,59 +314,25 @@ class HeuristicLinker:
                             continue
                         if _is_identifier_like_dimension_candidate(d, candidate):
                             continue
-                        other_candidates.append((t, candidate, cand_score))
-                        break
-                    # если все кандидаты FK — таблица не добавляется (поведение сохраняется)
+                        candidates.append((t, candidate, cand_score))
 
-                # Проверяем main_table как отдельного кандидата,
-                # также фильтруем FK-колонки (как для других таблиц).
-                # T6: перебираем ранжированных кандидатов и берём первую НЕ-FK.
-                main_candidate = None
-                main_tbl_schema = db_schema.get(main_table, {})
-                _main_ranked = self._score_columns_for_name(d, main_tbl_schema)
-                if _main_ranked:
-                    _main_ranked.sort(key=lambda x: (-x[1], x[0]))
-                    _main_tbl_cols = get_table_columns(main_tbl_schema)
-                    for _mc, _ms in _main_ranked:
-                        _mc_meta = _main_tbl_cols.get(_mc)
-                        if isinstance(_mc_meta, dict) and is_fk(_mc_meta):
-                            continue
-                        if _is_identifier_like_dimension_candidate(d, _mc):
-                            continue
-                        main_candidate = (_mc, _ms)
-                        break
-
-                if other_candidates or main_candidate:
-                    # Выбираем победителя: сначала по score DESC, при равенстве
-                    # main_table предпочтительнее (is_main=True), иначе алфавитно
-                    best_table = None
-                    best_col = None
-                    best_score = -1
-                    best_is_main = False
-
-                    for t, candidate, cand_score in other_candidates:
-                        if (
-                            cand_score > best_score
-                            or (cand_score == best_score and not best_is_main and t < (best_table or ""))
-                        ):
-                            best_table = t
-                            best_col = candidate
-                            best_score = cand_score
-                            best_is_main = False
-
-                    if main_candidate:
-                        main_col, main_score = main_candidate
-                        # main_table побеждает при равном score (tie-break)
-                        if main_score > best_score or (main_score == best_score):
-                            best_table = main_table
-                            best_col = main_col
-                            best_score = main_score
-                            best_is_main = True
-
+                top_candidates = self._top_candidates(candidates)
+                if len(top_candidates) > 1:
+                    self._record_ambiguity(
+                        diagnostics,
+                        entity_type="dimension",
+                        name=d,
+                        candidates=top_candidates,
+                    )
+                    unlinked.append(d)
+                elif top_candidates:
+                    best_table, best_col, _ = top_candidates[0]
                     if best_table and best_col:
                         linked_dimensions.append(
                             {"name": d, "table": best_table, "column": best_col}
                         )
+                else:
+                    unlinked.append(d)
         else:
             # W1-T5 (баг 1): раньше при main_table=None весь блок
             # metrics/dimensions молча пропускался — сущности «терялись»,
@@ -365,7 +354,13 @@ class HeuristicLinker:
             for d in dims_in:
                 unlinked.append(f"{d} (reason={reason})")
 
-        linked_filters = self.link_filters(filters_in, linked_dimensions, main_table, db_schema)
+        linked_filters = self._link_filters_with_diagnostics(
+            filters_in,
+            linked_dimensions,
+            main_table,
+            db_schema,
+            diagnostics,
+        )
 
         return linked_metrics, linked_dimensions, linked_filters, unlinked
 
@@ -517,6 +512,62 @@ class HeuristicLinker:
         )
         return best_column
 
+    def _best_column_for_with_diagnostics(
+        self,
+        name: str,
+        table: str,
+        table_schema: Dict[str, Dict[str, Any]],
+        *,
+        entity_type: str,
+        diagnostics: Optional[Dict[str, Any]],
+    ) -> Optional[str]:
+        candidates = self._score_columns_for_name(name, table_schema)
+        top_candidates = self._top_candidates(
+            [(table, column, score) for column, score in candidates]
+        )
+        if len(top_candidates) > 1:
+            self._record_ambiguity(
+                diagnostics,
+                entity_type=entity_type,
+                name=name,
+                candidates=top_candidates,
+            )
+            return None
+        return top_candidates[0][1] if top_candidates else None
+
+    @staticmethod
+    def _top_candidates(
+        candidates: List[Tuple[str, str, int]],
+    ) -> List[Tuple[str, str, int]]:
+        if not candidates:
+            return []
+        best_score = max(score for _, _, score in candidates)
+        return sorted(
+            (candidate for candidate in candidates if candidate[2] == best_score),
+            key=lambda candidate: (candidate[0], candidate[1]),
+        )
+
+    @staticmethod
+    def _record_ambiguity(
+        diagnostics: Optional[Dict[str, Any]],
+        *,
+        entity_type: str,
+        name: str,
+        candidates: List[Tuple[str, str, int]],
+    ) -> None:
+        if diagnostics is None:
+            return
+        diagnostics.setdefault("ambiguous_bindings", []).append(
+            {
+                "entity_type": entity_type,
+                "name": name,
+                "candidates": [
+                    {"table": table, "column": column, "score": score}
+                    for table, column, score in candidates
+                ],
+            }
+        )
+
     def _score_columns_for_name(
         self,
         name: str,
@@ -646,6 +697,22 @@ class HeuristicLinker:
         4.15: сравнение ``filter_name`` с ``dim["name"]`` идёт через
         column_aliases.yaml (активный профиль).
         """
+        return self._link_filters_with_diagnostics(
+            filters_in,
+            linked_dimensions,
+            main_table,
+            db_schema,
+            diagnostics=None,
+        )
+
+    def _link_filters_with_diagnostics(
+        self,
+        filters_in: Dict[str, Any],
+        linked_dimensions: List[Dict[str, Any]],
+        main_table: Optional[str],
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        diagnostics: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
         from ..column_aliases_config import get_active_profile
 
         linked_filters: Dict[str, Any] = {}
@@ -672,39 +739,32 @@ class HeuristicLinker:
             if found_in_dimensions:
                 continue
 
-            if main_table and main_table in db_schema:
-                col = self.best_column_for(filter_name, main_table, db_schema[main_table])
-                if col:
-                    linked_filters[filter_name] = {
-                        "table": main_table,
-                        "column": col,
-                        "value": filter_value,
-                        "source": "main_table",
-                    }
-                    continue
-
-            # W1-T5 (баг 4): ранее брали ПЕРВУЮ таблицу, для которой
-            # ``best_column_for`` вернёт что-то, без сравнения качества.
-            # Это давало недетерминированный fallback, зависящий от
-            # порядка ключей db_schema. Теперь собираем всех кандидатов,
-            # выбираем по score DESC, tie-break по table_name ASC.
-            other_candidates: List[Tuple[str, str, int]] = []
+            candidates: List[Tuple[str, str, int]] = []
             for table_name, table_schema in db_schema.items():
-                col_with_score = self._best_column_with_score(
-                    filter_name, table_name, table_schema
+                candidates.extend(
+                    (table_name, column, score)
+                    for column, score in self._score_columns_for_name(
+                        filter_name, table_schema
+                    )
                 )
-                if col_with_score is not None:
-                    col, score = col_with_score
-                    other_candidates.append((table_name, col, score))
 
-            if other_candidates:
-                other_candidates.sort(key=lambda x: (-x[2], x[0]))
-                best_table, best_col, _ = other_candidates[0]
+            top_candidates = self._top_candidates(candidates)
+            if len(top_candidates) > 1:
+                self._record_ambiguity(
+                    diagnostics,
+                    entity_type="filter",
+                    name=filter_name,
+                    candidates=top_candidates,
+                )
+            elif top_candidates:
+                best_table, best_col, _ = top_candidates[0]
                 linked_filters[filter_name] = {
                     "table": best_table,
                     "column": best_col,
                     "value": filter_value,
-                    "source": "other_table",
+                    "source": (
+                        "main_table" if best_table == main_table else "other_table"
+                    ),
                 }
 
         return linked_filters

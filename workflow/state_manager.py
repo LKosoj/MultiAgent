@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
@@ -68,12 +69,84 @@ _URL_LIKE_PAYLOAD_KEYS = {"url"}
 _DSN_TEXT_RE = re.compile(r"(?P<dsn>[a-zA-Z][a-zA-Z0-9+.-]*://[^\s'\"<>]+)")
 _SECRET_KEY_PATTERN = r"[A-Za-z0-9_%+\-.\[\]]+"
 _WORKFLOW_SECRET_REF_KEY = "__workflow_secret_ref__"
+_WORKFLOW_SECRET_STORE_VERSION_KEY = "__workflow_secret_store_version__"
+_WORKFLOW_SECRET_STORE_VERSION = 1
+_WORKFLOW_SECRET_LOCK_TIMEOUT_SECONDS = 30.0
 _SENSITIVE_TEXT_ASSIGNMENT_RE = re.compile(
     rf"(?P<prefix>\b(?P<key>{_SECRET_KEY_PATTERN})\s*[:=]\s*)"
     r"(?P<secret>[^\s,;&]+)",
     re.IGNORECASE,
 )
 _NO_REDACT_OVERRIDE = object()
+_MISSING_SECRET = object()
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on unsupported platforms
+    fcntl = None
+
+
+class CheckpointSecretStoreError(RuntimeError):
+    """The checkpoint sidecar cannot be read or mutated safely."""
+
+
+class CheckpointSecretReferenceMissingError(CheckpointSecretStoreError):
+    """A checkpoint references an entry absent from the sidecar."""
+
+    def __init__(self, reference: str, checkpoint_identity: str) -> None:
+        self.reference = reference
+        self.checkpoint_identity = checkpoint_identity
+        super().__init__(
+            "Missing workflow checkpoint secret: "
+            f"{reference} (checkpoint {checkpoint_identity})"
+        )
+
+
+class _CheckpointSecretFileLock:
+    def __init__(
+        self,
+        path: Path,
+        timeout_seconds: float = _WORKFLOW_SECRET_LOCK_TIMEOUT_SECONDS,
+    ) -> None:
+        self._path = path
+        self._timeout_seconds = timeout_seconds
+        self._fd: int | None = None
+
+    def __enter__(self) -> "_CheckpointSecretFileLock":
+        if fcntl is None:
+            raise CheckpointSecretStoreError(
+                "Inter-process checkpoint secret locking is unavailable"
+            )
+        fd = os.open(self._path, os.O_CREAT | os.O_RDWR, 0o600)
+        self._fd = fd
+        try:
+            os.fchmod(fd, 0o600)
+            deadline = time.monotonic() + self._timeout_seconds
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return self
+                except BlockingIOError as exc:
+                    if time.monotonic() >= deadline:
+                        raise CheckpointSecretStoreError(
+                            "Timed out acquiring checkpoint secret store lock"
+                        ) from exc
+                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        except BaseException:
+            self._fd = None
+            os.close(fd)
+            raise
+
+    def __exit__(self, *exc_info: Any) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _is_sensitive_dsn_query_key(key: Any) -> bool:
@@ -191,9 +264,16 @@ class SQLiteWorkflowStore:
     """SQLite хранилище для состояния workflow"""
     
     def __init__(self, db_path: str = "workflow_state.db"):
+        if fcntl is None:
+            raise CheckpointSecretStoreError(
+                "Inter-process checkpoint secret locking is unavailable"
+            )
         self.db_path = db_path
         db_path_obj = Path(db_path)
         self.secrets_path = db_path_obj.with_name(f"{db_path_obj.name}.secrets.json")
+        self.secrets_lock_path = self.secrets_path.with_name(
+            f"{self.secrets_path.name}.lock"
+        )
         self.init_database()
 
     def _load_secrets(self) -> Dict[str, Any]:
@@ -201,29 +281,79 @@ class SQLiteWorkflowStore:
             return {}
         try:
             data = json.loads(self.secrets_path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
-        except Exception:
-            return {}
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise CheckpointSecretStoreError(
+                f"Failed to read checkpoint secret store at {self.secrets_path}"
+            ) from exc
+        if not isinstance(data, dict):
+            raise CheckpointSecretStoreError(
+                f"Invalid checkpoint secret store at {self.secrets_path}"
+            )
+        version = data.get(_WORKFLOW_SECRET_STORE_VERSION_KEY)
+        if version is not None and (
+            type(version) is not int or version != _WORKFLOW_SECRET_STORE_VERSION
+        ):
+            raise CheckpointSecretStoreError(
+                f"Unsupported checkpoint secret store version at {self.secrets_path}"
+            )
+        return data
 
     def _save_secrets(self, secrets: Dict[str, Any]) -> None:
         self.secrets_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_name = tempfile.mkstemp(prefix=f".{self.secrets_path.name}.", suffix=".tmp", dir=str(self.secrets_path.parent), text=True)
+        with _CheckpointSecretFileLock(self.secrets_lock_path):
+            merged = self._load_secrets()
+            for reference, value in secrets.items():
+                if reference == _WORKFLOW_SECRET_STORE_VERSION_KEY:
+                    continue
+                existing = merged.get(reference, _MISSING_SECRET)
+                if existing is not _MISSING_SECRET and existing != value:
+                    raise CheckpointSecretStoreError(
+                        f"Conflicting checkpoint secret reference: {reference}"
+                    )
+                merged[reference] = value
+            merged[_WORKFLOW_SECRET_STORE_VERSION_KEY] = (
+                _WORKFLOW_SECRET_STORE_VERSION
+            )
+            self._write_secret_envelope(merged)
+
+    def _write_secret_envelope(self, secrets: Dict[str, Any]) -> None:
+        fd, temp_name = tempfile.mkstemp(
+            prefix=f".{self.secrets_path.name}.",
+            suffix=".tmp",
+            dir=str(self.secrets_path.parent),
+            text=True,
+        )
         try:
             os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
                 json.dump(secrets, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
             os.replace(temp_name, self.secrets_path)
-            self.secrets_path.chmod(0o600)
-        except Exception:
+            directory_fd = os.open(
+                self.secrets_path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
             try:
-                os.close(fd)
-            except OSError:
-                pass
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            self.secrets_path.chmod(0o600)
+        except Exception as exc:
             try:
                 Path(temp_name).unlink(missing_ok=True)
             except OSError:
                 pass
-            raise
+            raise CheckpointSecretStoreError(
+                f"Failed to write checkpoint secret store at {self.secrets_path}"
+            ) from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _store_secret(
         self,
@@ -262,16 +392,39 @@ class SQLiteWorkflowStore:
             )
         return value
 
-    def _restore_payload_from_checkpoint(self, value: Any, secrets: Dict[str, Any]) -> Any:
+    def _restore_payload_from_checkpoint(
+        self,
+        value: Any,
+        secrets: Dict[str, Any],
+        *,
+        checkpoint_identity: str,
+    ) -> Any:
         if isinstance(value, dict):
             ref = value.get(_WORKFLOW_SECRET_REF_KEY)
             if isinstance(ref, str):
                 if ref not in secrets:
-                    raise RuntimeError(f"Missing workflow checkpoint secret: {ref}")
+                    raise CheckpointSecretReferenceMissingError(
+                        ref,
+                        checkpoint_identity,
+                    )
                 return secrets[ref]
-            return {key: self._restore_payload_from_checkpoint(item, secrets) for key, item in value.items()}
+            return {
+                key: self._restore_payload_from_checkpoint(
+                    item,
+                    secrets,
+                    checkpoint_identity=checkpoint_identity,
+                )
+                for key, item in value.items()
+            }
         if isinstance(value, list):
-            return [self._restore_payload_from_checkpoint(item, secrets) for item in value]
+            return [
+                self._restore_payload_from_checkpoint(
+                    item,
+                    secrets,
+                    checkpoint_identity=checkpoint_identity,
+                )
+                for item in value
+            ]
         return value
 
     def _contains_unprotected_checkpoint_secret(self, value: Any) -> bool:
@@ -522,10 +675,19 @@ class SQLiteWorkflowStore:
                     metadata_raw,
                     secrets,
                 )
-                context_data = self._restore_payload_from_checkpoint(context_raw, secrets) if context_raw else {}
+                checkpoint_identity = f"{row['workflow_id']}@{row['timestamp']}"
+                context_data = self._restore_payload_from_checkpoint(
+                    context_raw,
+                    secrets,
+                    checkpoint_identity=checkpoint_identity,
+                ) if context_raw else {}
                 context = WorkflowContext(**context_data) if context_data else None
                 
-                step_results_data = self._restore_payload_from_checkpoint(step_results_raw, secrets) if step_results_raw else {}
+                step_results_data = self._restore_payload_from_checkpoint(
+                    step_results_raw,
+                    secrets,
+                    checkpoint_identity=checkpoint_identity,
+                ) if step_results_raw else {}
                 step_results = {
                     k: self._deserialize_step_result(v) for k, v in step_results_data.items()
                 } if step_results_data else {}
@@ -540,7 +702,11 @@ class SQLiteWorkflowStore:
                     context=context,
                     step_results=step_results,
                     resumable=bool(row['resumable']),
-                    metadata=self._restore_payload_from_checkpoint(metadata_raw, secrets)
+                    metadata=self._restore_payload_from_checkpoint(
+                        metadata_raw,
+                        secrets,
+                        checkpoint_identity=checkpoint_identity,
+                    )
                 )
                 
         except RuntimeError:
@@ -576,9 +742,18 @@ class SQLiteWorkflowStore:
                         metadata_raw,
                         secrets,
                     )
-                    context_data = self._restore_payload_from_checkpoint(context_raw, secrets) if context_raw else {}
+                    checkpoint_identity = f"{row['workflow_id']}@{row['timestamp']}"
+                    context_data = self._restore_payload_from_checkpoint(
+                        context_raw,
+                        secrets,
+                        checkpoint_identity=checkpoint_identity,
+                    ) if context_raw else {}
                     context = WorkflowContext(**context_data) if context_data else None
-                    step_results_data = self._restore_payload_from_checkpoint(step_results_raw, secrets) if step_results_raw else {}
+                    step_results_data = self._restore_payload_from_checkpoint(
+                        step_results_raw,
+                        secrets,
+                        checkpoint_identity=checkpoint_identity,
+                    ) if step_results_raw else {}
                     
                     checkpoints.append(WorkflowCheckpoint(
                         workflow_id=row['workflow_id'],
@@ -592,9 +767,15 @@ class SQLiteWorkflowStore:
                             k: self._deserialize_step_result(v) for k, v in step_results_data.items()
                         } if step_results_data else {},
                         resumable=bool(row['resumable']),
-                        metadata=self._restore_payload_from_checkpoint(metadata_raw, secrets)
+                        metadata=self._restore_payload_from_checkpoint(
+                            metadata_raw,
+                            secrets,
+                            checkpoint_identity=checkpoint_identity,
+                        )
                     ))
                     
+        except CheckpointSecretStoreError:
+            raise
         except Exception as e:
             logger.error("❌ Ошибка получения истории workflow: %s", _redact_checkpoint_error_text(e))
             

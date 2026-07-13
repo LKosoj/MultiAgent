@@ -9,10 +9,15 @@ from datetime import datetime
 import yaml
 
 from .engine import WorkflowEngine
+from .deadline import DeadlineBudget, WorkflowDeadlineExceeded, execute_step_attempt
 from .models import (
     WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
     StepResult, StepStatus, WorkflowStep, StepPlan, ValidationResult, Decision,
-    ResourceLimits, RetryPolicy, WorkflowExecutionError
+    ResourceLimits, RetryPolicy, TextToSqlTerminalResult,
+    TextToSqlTerminalStatus, WorkflowExecutionError,
+    TEXT_TO_SQL_WORKFLOW_CATEGORY, bound_text_to_sql_error,
+    is_text_to_sql_workflow_name,
+    _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS,
 )
 
 # Enhanced components
@@ -42,6 +47,15 @@ from .monitoring.analytics import AnalyticsEngine
 from .monitoring.dashboard import DashboardGenerator, ReportBuilder
 
 logger = logging.getLogger(__name__)
+
+
+def _step_status_value(status: Any) -> Any:
+    """Normalize a StepStatus (or already-plain value) to its `.value`.
+
+    Collapses the 13 repeated `getattr(status, "value", status)` call sites
+    across this module into one helper.
+    """
+    return getattr(status, "value", status)
 
 
 class FeatureManager:
@@ -169,10 +183,581 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         logger.info("🚀 Enhanced Workflow Engine initialized")
 
     def _is_text_to_sql_workflow(self, workflow_definition: WorkflowDefinition) -> bool:
-        return (
-            workflow_definition.name == "text_to_sql_pipeline"
-            or workflow_definition.metadata.get("category") == "text_to_sql"
+        by_name = is_text_to_sql_workflow_name(workflow_definition.name)
+        by_category = (
+            workflow_definition.metadata.get("category")
+            == TEXT_TO_SQL_WORKFLOW_CATEGORY
         )
+        if by_name != by_category:
+            logger.warning(
+                "Text-to-SQL identity drift: name=%r category=%r; exact name is authoritative",
+                workflow_definition.name,
+                workflow_definition.metadata.get("category"),
+            )
+        return by_name
+
+    @staticmethod
+    def _context_deadline(context: WorkflowContext) -> Optional[DeadlineBudget]:
+        deadline = getattr(context, "_deadline_budget", None)
+        if deadline is not None and not isinstance(deadline, DeadlineBudget):
+            raise TypeError("context._deadline_budget must be a DeadlineBudget")
+        return deadline
+
+    def _ensure_workflow_deadline(
+        self,
+        workflow_definition: WorkflowDefinition,
+        context: WorkflowContext,
+    ) -> Optional[DeadlineBudget]:
+        deadline = self._context_deadline(context)
+        if deadline is not None:
+            return deadline
+        limits = workflow_definition.global_resource_limits
+        duration = limits.max_duration_seconds if limits is not None else None
+        if duration is None:
+            return None
+        deadline = DeadlineBudget.from_duration(duration)
+        context._deadline_budget = deadline
+        return deadline
+
+    @staticmethod
+    def _require_deadline(
+        context: WorkflowContext,
+        boundary: str,
+    ) -> None:
+        deadline = EnhancedWorkflowEngine._context_deadline(context)
+        if deadline is not None:
+            deadline.require_remaining(boundary)
+
+    def _text_to_sql_failure_outcome(
+        self,
+        context: WorkflowContext,
+        step_results: Dict[str, StepResult],
+        reason_code: str,
+        error: str,
+    ) -> TextToSqlTerminalResult:
+        generation_result = step_results.get("sql_generation")
+        generation = (
+            generation_result.output
+            if generation_result is not None
+            and _step_status_value(generation_result.status)
+            == StepStatus.COMPLETED.value
+            else None
+        )
+        verification_result = step_results.get("sql_verification")
+        verification = (
+            verification_result.output
+            if verification_result is not None
+            and _step_status_value(verification_result.status)
+            == StepStatus.COMPLETED.value
+            else None
+        )
+        raw_sql = generation.get("sql", "") if isinstance(generation, dict) else ""
+        sql = raw_sql if isinstance(raw_sql, str) and raw_sql.strip() else ""
+        generated = bool(sql)
+        approved = generated and (
+            isinstance(verification, dict)
+            and verification.get("verification_status") == "Approved"
+        )
+        return TextToSqlTerminalResult.from_mapping({
+            "run_id": str(context.variables.get("run_id") or context.workflow_id),
+            "status": TextToSqlTerminalStatus.FAILED.value,
+            "reason_code": reason_code,
+            "sql": sql,
+            "generated": generated,
+            "approved": approved,
+            "executed": False,
+            "dry_run": False,
+            "audited": False,
+            "data": [],
+            "columns": [],
+            "rows_affected": 0,
+            "error": bound_text_to_sql_error(error),
+            "execution": {},
+            "audit": {},
+            "persistence": {"status": "not_attempted"},
+        })
+
+    def _derive_text_to_sql_terminal_outcome(
+        self,
+        workflow_definition: WorkflowDefinition,
+        context: WorkflowContext,
+        step_results: Dict[str, StepResult],
+    ) -> TextToSqlTerminalResult:
+        """Validate the deterministic finalizer output against actual step state."""
+        if not self._is_text_to_sql_workflow(workflow_definition):
+            raise WorkflowExecutionError(
+                "Text-to-SQL terminal derivation called for a generic workflow"
+            )
+
+        audit_result = step_results.get("db_audit")
+        if audit_result is None:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "DB_AUDIT_MISSING",
+                "Required db_audit step result is missing",
+            )
+
+        status_value = _step_status_value(audit_result.status)
+        if status_value == StepStatus.FAILED.value:
+            if audit_result.error_class == "output_retry_chain_failed":
+                try:
+                    retained = TextToSqlTerminalResult.from_mapping(
+                        audit_result.output
+                    )
+                except (TypeError, ValueError):
+                    retained = None
+                expected_run_id = str(
+                    context.variables.get("run_id") or context.workflow_id
+                )
+                if (
+                    retained is not None
+                    and retained.status is TextToSqlTerminalStatus.FAILED
+                    and retained.reason_code == "OUTPUT_RETRY_CHAIN_FAILED"
+                    and retained.run_id == expected_run_id
+                ):
+                    return retained
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "DB_AUDIT_OUTPUT_INVALID",
+                    "Corrective retry failed without valid retained terminal evidence",
+                )
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "DB_AUDIT_FAILED",
+                audit_result.error or "Required db_audit step failed",
+            )
+        if status_value not in {
+            StepStatus.COMPLETED.value,
+            StepStatus.SKIPPED.value,
+        }:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "DB_AUDIT_NOT_TERMINAL",
+                f"Required db_audit step has status {status_value!r}",
+            )
+
+        terminal_output = audit_result.output
+        if status_value == StepStatus.SKIPPED.value:
+            schema_result = step_results.get("schema_linking_step")
+            schema_output = (
+                schema_result.output
+                if schema_result is not None
+                else context.step_outputs.get("schema_linking_step")
+            )
+            schema_reason = (
+                schema_output.get("terminal_reason_code")
+                if isinstance(schema_output, dict)
+                else None
+            )
+            if (
+                schema_reason in _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS
+                and isinstance(terminal_output, dict)
+            ):
+                terminal_output = dict(terminal_output)
+                terminal_output.update({
+                    "status": TextToSqlTerminalStatus.ABSTAINED.value,
+                    "reason_code": schema_reason,
+                    "sql": "",
+                    "generated": False,
+                    "approved": False,
+                    "executed": False,
+                    "dry_run": False,
+                    "audited": False,
+                    "data": [],
+                    "columns": [],
+                    "rows_affected": 0,
+                    "error": None,
+                    "execution": {},
+                    "audit": {},
+                    "persistence": {"status": "not_attempted"},
+                })
+        if (
+            status_value == StepStatus.SKIPPED.value
+            and isinstance(terminal_output, dict)
+            and terminal_output.get("status")
+            == TextToSqlTerminalStatus.ABSTAINED.value
+            and terminal_output.get("reason_code") == "VERIFIER_REJECTED"
+        ):
+            generation_result = step_results.get("sql_generation")
+            generation_output = (
+                generation_result.output
+                if generation_result is not None
+                and _step_status_value(generation_result.status)
+                == StepStatus.COMPLETED.value
+                else None
+            )
+            generated_sql = (
+                generation_output.get("sql")
+                if isinstance(generation_output, dict)
+                else ""
+            )
+            if not isinstance(generated_sql, str):
+                generated_sql = ""
+            terminal_output = dict(terminal_output)
+            terminal_output.update({
+                "sql": generated_sql,
+                "generated": bool(generated_sql.strip()),
+                "approved": False,
+            })
+
+        try:
+            outcome = TextToSqlTerminalResult.from_mapping(terminal_output)
+        except (TypeError, ValueError) as exc:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "DB_AUDIT_OUTPUT_INVALID",
+                str(exc),
+            )
+
+        expected_run_id = str(context.variables.get("run_id") or context.workflow_id)
+        if outcome.run_id != expected_run_id:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "DB_AUDIT_RUN_ID_MISMATCH",
+                "db_audit terminal result belongs to a different run",
+            )
+
+        if status_value == StepStatus.SKIPPED.value:
+            if outcome.status is not TextToSqlTerminalStatus.ABSTAINED:
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "DB_AUDIT_SKIPPED_WITHOUT_ABSTENTION",
+                    "Skipped db_audit must provide an ABSTAINED terminal result",
+                )
+            if outcome.reason_code in _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS:
+                generation_result = step_results.get("sql_generation")
+                generation_output = (
+                    generation_result.output
+                    if generation_result is not None
+                    else None
+                )
+                generated_sql = (
+                    generation_output.get("sql")
+                    if isinstance(generation_output, dict)
+                    else ""
+                )
+                if isinstance(generated_sql, str) and generated_sql.strip():
+                    return self._text_to_sql_failure_outcome(
+                        context,
+                        step_results,
+                        "SQL_GENERATION_OUTPUT_MISMATCH",
+                        "Schema abstention cannot contain generated SQL",
+                    )
+                verification_result = step_results.get("sql_verification")
+                verification_output = (
+                    verification_result.output
+                    if verification_result is not None
+                    else None
+                )
+                if (
+                    isinstance(verification_output, dict)
+                    and verification_output.get("verification_status") == "Approved"
+                ):
+                    return self._text_to_sql_failure_outcome(
+                        context,
+                        step_results,
+                        "DB_AUDIT_SKIPPED_AFTER_APPROVAL",
+                        "Schema abstention cannot contain approved SQL",
+                    )
+                return outcome
+            generation_result = step_results.get("sql_generation")
+            generation_completed = (
+                generation_result is not None
+                and _step_status_value(generation_result.status)
+                == StepStatus.COMPLETED.value
+            )
+            if not generation_completed:
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "MANDATORY_STEP_NOT_COMPLETED",
+                    "Skipped db_audit requires a completed sql_generation step",
+                )
+            generation_output = (
+                generation_result.output
+                if generation_completed
+                else None
+            )
+            generated_sql = (
+                generation_output.get("sql")
+                if isinstance(generation_output, dict)
+                else ""
+            )
+            if not isinstance(generated_sql, str):
+                generated_sql = ""
+            verification_result = step_results.get("sql_verification")
+            verification_completed = (
+                verification_result is not None
+                and _step_status_value(verification_result.status)
+                == StepStatus.COMPLETED.value
+            )
+            if not verification_completed:
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "MANDATORY_STEP_NOT_COMPLETED",
+                    "Skipped db_audit requires a completed sql_verification step",
+                )
+            verification_output = (
+                verification_result.output
+                if verification_completed
+                else None
+            )
+            verification_status = (
+                verification_output.get("verification_status")
+                if isinstance(verification_output, dict)
+                else None
+            )
+            if verification_status == "Approved":
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "DB_AUDIT_SKIPPED_AFTER_APPROVAL",
+                    "Approved SQL cannot have a skipped db_audit step",
+                )
+            if verification_status != "Rejected":
+                return self._text_to_sql_failure_outcome(
+                    context,
+                    step_results,
+                    "SQL_VERIFICATION_OUTPUT_MISMATCH",
+                    "Skipped db_audit requires an exact Rejected verifier result",
+                )
+            canonical = outcome.to_mapping()
+            canonical.update({
+                "sql": generated_sql,
+                "generated": bool(generated_sql.strip()),
+                "approved": False,
+            })
+            return TextToSqlTerminalResult.from_mapping(canonical)
+
+        mandatory_steps = ("sql_generation", "sql_verification", "db_audit")
+        invalid_steps = [
+            step_id
+            for step_id in mandatory_steps
+            if _step_status_value(
+                getattr(step_results.get(step_id), "status", None)
+            )
+            != StepStatus.COMPLETED.value
+        ]
+        if invalid_steps:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "MANDATORY_STEP_NOT_COMPLETED",
+                "Mandatory Text-to-SQL steps not completed: "
+                + ", ".join(invalid_steps),
+            )
+
+        generation_output = step_results["sql_generation"].output
+        generated_sql = (
+            generation_output.get("sql")
+            if isinstance(generation_output, dict)
+            else None
+        )
+        expected_generated = bool(
+            isinstance(generated_sql, str) and generated_sql.strip()
+        )
+        if (
+            not isinstance(generated_sql, str)
+            or generated_sql != outcome.sql
+            or outcome.generated is not expected_generated
+        ):
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "SQL_GENERATION_OUTPUT_MISMATCH",
+                "Terminal SQL does not match the completed sql_generation output",
+            )
+
+        verification_output = step_results["sql_verification"].output
+        verification_status = (
+            verification_output.get("verification_status")
+            if isinstance(verification_output, dict)
+            else None
+        )
+        if verification_status == "Approved":
+            verifier_matches = outcome.approved is True
+        elif verification_status == "Rejected":
+            verifier_matches = (
+                outcome.approved is False
+                and outcome.status is TextToSqlTerminalStatus.ABSTAINED
+                and outcome.reason_code == "VERIFIER_REJECTED"
+            )
+        else:
+            verifier_matches = (
+                outcome.approved is False
+                and outcome.status is TextToSqlTerminalStatus.FAILED
+                and outcome.reason_code == "VERIFIER_CONTRACT_INVALID"
+            )
+        if not verifier_matches:
+            return self._text_to_sql_failure_outcome(
+                context,
+                step_results,
+                "SQL_VERIFICATION_OUTPUT_MISMATCH",
+                "Terminal verifier state does not match the completed verifier output",
+            )
+        return outcome
+
+    @staticmethod
+    def _db_audit_has_terminal_step_result(
+        step_results: Dict[str, StepResult],
+    ) -> bool:
+        audit_result = step_results.get("db_audit")
+        if audit_result is None:
+            return False
+        status_value = _step_status_value(audit_result.status)
+        return status_value in {
+            StepStatus.COMPLETED.value,
+            StepStatus.SKIPPED.value,
+            StepStatus.FAILED.value,
+        }
+
+    @staticmethod
+    def _text_to_sql_cancelled_outcome(
+        context: WorkflowContext,
+        workflow_id: str,
+    ) -> TextToSqlTerminalResult:
+        return TextToSqlTerminalResult.from_mapping({
+            "run_id": str(context.variables.get("run_id") or workflow_id),
+            "status": TextToSqlTerminalStatus.CANCELLED.value,
+            "reason_code": "CANCELLED",
+            "sql": "",
+            "generated": False,
+            "approved": False,
+            "executed": False,
+            "dry_run": False,
+            "audited": False,
+            "data": [],
+            "columns": [],
+            "rows_affected": 0,
+            "error": "Workflow was cancelled",
+            "execution": {},
+            "audit": {},
+            "persistence": {"status": "not_attempted"},
+        })
+
+    @staticmethod
+    def _text_to_sql_timed_out_outcome(
+        context: WorkflowContext,
+        workflow_id: str,
+        error: Exception,
+    ) -> TextToSqlTerminalResult:
+        return TextToSqlTerminalResult.from_mapping({
+            "run_id": str(context.variables.get("run_id") or workflow_id),
+            "status": TextToSqlTerminalStatus.TIMED_OUT.value,
+            "reason_code": "TIMED_OUT",
+            "sql": "",
+            "generated": False,
+            "approved": False,
+            "executed": False,
+            "dry_run": False,
+            "audited": False,
+            "data": [],
+            "columns": [],
+            "rows_affected": 0,
+            "error": bound_text_to_sql_error(error),
+            "execution": {},
+            "audit": {},
+            "persistence": {"status": "not_attempted"},
+        })
+
+    def _build_text_to_sql_timed_out_result(
+        self,
+        workflow_definition: WorkflowDefinition,
+        context: WorkflowContext,
+        step_results: Dict[str, StepResult],
+        start_time: datetime,
+        error: Exception,
+    ) -> WorkflowResult:
+        end_time = datetime.now()
+        outcome = self._text_to_sql_timed_out_outcome(
+            context,
+            context.workflow_id,
+            error,
+        )
+        return WorkflowResult(
+            workflow_id=context.workflow_id,
+            status=WorkflowStatus.FAILED,
+            start_time=start_time,
+            end_time=end_time,
+            duration_seconds=(end_time - start_time).total_seconds(),
+            total_steps=len(workflow_definition.steps),
+            completed_steps=sum(
+                result.status == StepStatus.COMPLETED
+                for result in step_results.values()
+            ),
+            failed_steps=sum(
+                result.status == StepStatus.FAILED
+                for result in step_results.values()
+            ),
+            step_results=step_results,
+            final_output=self._safe_text_to_sql_final_output(
+                workflow_definition,
+                outcome,
+            ),
+            error=outcome.error,
+            metadata={"timed_out": True},
+            terminal_outcome=outcome,
+        )
+
+    @staticmethod
+    def _text_to_sql_aggregation_failure_outcome(
+        outcome: TextToSqlTerminalResult,
+        error: Exception,
+    ) -> TextToSqlTerminalResult:
+        if outcome.status is not TextToSqlTerminalStatus.SUCCEEDED:
+            return outcome
+        mapping = outcome.to_mapping()
+        mapping.update({
+            "status": TextToSqlTerminalStatus.FAILED.value,
+            "reason_code": "RESULT_AGGREGATION_FAILED",
+            "error": bound_text_to_sql_error(error),
+        })
+        return TextToSqlTerminalResult.from_mapping(mapping)
+
+    @staticmethod
+    def _safe_text_to_sql_final_output(
+        workflow_definition: WorkflowDefinition,
+        outcome: TextToSqlTerminalResult,
+    ) -> Dict[str, Any]:
+        return {
+            "type": "workflow_outputs",
+            "workflow_name": workflow_definition.name,
+            "final": outcome.to_mapping(),
+            "outputs": {"final": outcome.to_mapping()},
+        }
+
+    @staticmethod
+    def _canonicalize_text_to_sql_final_output(
+        workflow_definition: WorkflowDefinition,
+        outcome: TextToSqlTerminalResult,
+        final_output: Any,
+    ) -> Dict[str, Any]:
+        """Publish only the derived terminal proof at both public final paths."""
+        if not isinstance(final_output, dict):
+            return EnhancedWorkflowEngine._safe_text_to_sql_final_output(
+                workflow_definition,
+                outcome,
+            )
+
+        canonical = dict(final_output)
+        raw_outputs = canonical.get("outputs")
+        outputs = dict(raw_outputs) if isinstance(raw_outputs, dict) else {}
+        canonical.update({
+            "type": "workflow_outputs",
+            "workflow_name": workflow_definition.name,
+            "final": outcome.to_mapping(),
+            "outputs": outputs,
+        })
+        outputs["final"] = outcome.to_mapping()
+        return canonical
 
     def _coerce_bool(self, value: Any, default: bool = False) -> bool:
         if value is None:
@@ -252,7 +837,9 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         try:
             logger.info(f"🧠 Starting enhanced execution of '{workflow_definition.name}'")
             return await self._execute_enhanced_workflow(workflow_definition, context, client_id)
-            
+
+        except WorkflowDeadlineExceeded:
+            raise
         except Exception as e:
             logger.error(f"❌ Enhanced execution failed: {e}")
             
@@ -298,7 +885,21 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         
         workflow_id = context.workflow_id
         start_time = datetime.now()
-        
+        is_text_to_sql = self._is_text_to_sql_workflow(workflow_def)
+        self._ensure_workflow_deadline(workflow_def, context)
+        try:
+            self._require_deadline(context, "workflow start")
+        except WorkflowDeadlineExceeded as exc:
+            if is_text_to_sql:
+                return self._build_text_to_sql_timed_out_result(
+                    workflow_def,
+                    context,
+                    dict(restored_step_results or {}),
+                    start_time,
+                    exc,
+                )
+            raise
+
         # Записываем начало workflow в метрики
         self.metrics_collector.record_workflow_start(workflow_id, workflow_def.name)
         
@@ -309,6 +910,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             
             # Сохраняем начальное состояние (используем базовый helper).
             # На resume пред-заполняем checkpoint восстановленными шагами.
+            self._require_deadline(context, "initial checkpoint")
             resource_lease = await self._on_workflow_started(
                 workflow_def, context, client_id, start_time,
                 step_results=restored_step_results,
@@ -321,34 +923,123 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 restored_step_results=restored_step_results,
             )
 
-            if await self._is_workflow_cancelled(workflow_id):
-                return await self._build_cancelled_workflow_result(
+            self._require_deadline(context, "terminalization")
+            terminal_outcome = None
+            if is_text_to_sql and self._db_audit_has_terminal_step_result(
+                step_results
+            ):
+                terminal_outcome = self._derive_text_to_sql_terminal_outcome(
+                    workflow_def,
+                    context,
+                    step_results,
+                )
+
+            is_cancelled = await self._is_workflow_cancelled(workflow_id)
+            if is_cancelled and (not is_text_to_sql or terminal_outcome is None):
+                cancelled_result = await self._build_cancelled_workflow_result(
                     workflow_def,
                     context,
                     step_results,
                     start_time,
                 )
-            
-            # Агрегируем финальный результат
-            final_output = await self.aggregator.aggregate_final_result(
-                step_results, workflow_def, context
-            )
-            
+                if is_text_to_sql:
+                    cancelled_result.terminal_outcome = (
+                        self._text_to_sql_cancelled_outcome(context, workflow_id)
+                    )
+                return cancelled_result
+
+            if is_cancelled and terminal_outcome is not None:
+                logger.info(
+                    "Cancellation observed after terminal db_audit for %s; "
+                    "preserving terminal outcome %s",
+                    workflow_id,
+                    terminal_outcome.status.value,
+                )
+
+            if is_text_to_sql and terminal_outcome is None:
+                terminal_outcome = self._derive_text_to_sql_terminal_outcome(
+                    workflow_def,
+                    context,
+                    step_results,
+                )
+
+            aggregation_failed = False
+            self._require_deadline(context, "result aggregation")
+            try:
+                final_output = await self.aggregator.aggregate_final_result(
+                    step_results, workflow_def, context
+                )
+            except Exception as exc:
+                if not is_text_to_sql or terminal_outcome is None:
+                    raise
+                aggregation_failed = True
+                terminal_outcome = self._text_to_sql_aggregation_failure_outcome(
+                    terminal_outcome,
+                    exc,
+                )
+                final_output = self._safe_text_to_sql_final_output(
+                    workflow_def,
+                    terminal_outcome,
+                )
+                logger.error(
+                    "Text-to-SQL result aggregation failed after terminalization: %s",
+                    bound_text_to_sql_error(exc),
+                )
+            if (
+                is_text_to_sql
+                and terminal_outcome is not None
+                and isinstance(final_output, dict)
+                and final_output.get("type") == "fallback_result"
+            ):
+                fallback_error = final_output.get("error") or (
+                    "FinalAggregator returned fallback_result"
+                )
+                aggregation_failed = True
+                terminal_outcome = self._text_to_sql_aggregation_failure_outcome(
+                    terminal_outcome,
+                    RuntimeError(bound_text_to_sql_error(fallback_error)),
+                )
+                final_output = self._safe_text_to_sql_final_output(
+                    workflow_def,
+                    terminal_outcome,
+                )
+                logger.error(
+                    "Text-to-SQL FinalAggregator returned fallback_result: %s",
+                    bound_text_to_sql_error(fallback_error),
+                )
+
+            self._require_deadline(context, "result finalization")
+            if is_text_to_sql and terminal_outcome is not None:
+                final_output = self._canonicalize_text_to_sql_final_output(
+                    workflow_def,
+                    terminal_outcome,
+                    final_output,
+                )
+
             # Завершаем workflow
             end_time = datetime.now()
             duration = (end_time - start_time).total_seconds()
-            
+
             # Подсчитываем статистику
             completed_steps = len([r for r in step_results.values() if r.status == StepStatus.COMPLETED])
             failed_steps = len([r for r in step_results.values() if r.status == StepStatus.FAILED])
             stop_on_failure = workflow_def.error_handling.get("on_failure", "continue") != "continue"
-            is_text_to_sql = (
-                workflow_def.name == "text_to_sql_pipeline"
-                or workflow_def.metadata.get("category") == "text_to_sql"
-            )
-            workflow_status = WorkflowStatus.FAILED if failed_steps and (stop_on_failure or is_text_to_sql) else WorkflowStatus.COMPLETED
+            if is_text_to_sql:
+                workflow_status = (
+                    WorkflowStatus.COMPLETED
+                    if not aggregation_failed
+                    and terminal_outcome.status is TextToSqlTerminalStatus.SUCCEEDED
+                    else WorkflowStatus.FAILED
+                )
+            else:
+                workflow_status = (
+                    WorkflowStatus.FAILED
+                    if failed_steps and stop_on_failure
+                    else WorkflowStatus.COMPLETED
+                )
 
             if workflow_status == WorkflowStatus.COMPLETED:
+                self._require_deadline(context, "completion checkpoint")
                 await self._on_workflow_completed(workflow_id, final_output)
             else:
                 await self.state_manager.save_checkpoint(
@@ -359,7 +1050,11 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     current_step=context.current_step,
                     metadata={
                         "workflow_name": workflow_def.name,
-                        "error": f"Workflow failed steps: {failed_steps}",
+                        "error": (
+                            terminal_outcome.error or terminal_outcome.reason_code
+                            if terminal_outcome is not None
+                            else f"Workflow failed steps: {failed_steps}"
+                        ),
                     },
                 )
             
@@ -373,12 +1068,43 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 completed_steps=completed_steps,
                 failed_steps=failed_steps,
                 step_results=step_results,
-                final_output=final_output
+                final_output=final_output,
+                error=(
+                    terminal_outcome.error or terminal_outcome.reason_code
+                    if terminal_outcome is not None
+                    and terminal_outcome.status is not TextToSqlTerminalStatus.SUCCEEDED
+                    else None
+                ),
+                terminal_outcome=terminal_outcome,
             )
             
             logger.info(f"✅ Enhanced workflow {workflow_id} finished with status {workflow_status.value} in {duration:.1f}s")
             return result
-            
+
+        except WorkflowDeadlineExceeded as exc:
+            logger.error("⏱️ Enhanced workflow %s timed out: %s", workflow_id, exc)
+            partial_results = dict(
+                getattr(context, "_workflow_step_results", None)
+                or restored_step_results
+                or {}
+            )
+            if 'resource_lease' in locals():
+                await self._on_workflow_failed(
+                    workflow_def,
+                    context,
+                    resource_lease,
+                    exc,
+                    step_results=partial_results,
+                )
+            if is_text_to_sql:
+                return self._build_text_to_sql_timed_out_result(
+                    workflow_def,
+                    context,
+                    partial_results,
+                    start_time,
+                    exc,
+                )
+            raise
         except Exception as e:
             logger.error(f"❌ Enhanced workflow {workflow_id} failed: {e}")
             if 'resource_lease' in locals():
@@ -415,11 +1141,13 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         """Последовательное выполнение с enhanced логикой"""
         # Resume: пред-заполняем результатами восстановленных шагов.
         step_results = dict(restored_step_results or {})
+        context._workflow_step_results = step_results
         # H-2 (part B): публикуем workflow_def на context, чтобы _execute_enhanced_step
         # мог прочитать retry-политику (в parallel-пути это делается отдельно).
         context._workflow_definition = workflow_def
 
         for step in workflow_def.steps:
+            self._require_deadline(context, f"step '{step.id}' scheduling")
             # Resume: пропускаем уже завершённые шаги (их результат уже в step_results).
             if skip_steps is not None and step.id in skip_steps:
                 logger.info("⏭️ Enhanced resume: пропускаем завершённый шаг %s", step.id)
@@ -461,7 +1189,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             step_result = await self._execute_enhanced_step(step, context, step_results)
             step_results[step.id] = step_result
 
-            if getattr(step_result.status, "value", step_result.status) == StepStatus.COMPLETED.value:
+            if _step_status_value(step_result.status) == StepStatus.COMPLETED.value:
                 step_result = await self._complete_enhanced_step_with_output_retry(
                     step, step_result, context, workflow_def, step_results
                 )
@@ -474,7 +1202,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     )
                     break
 
-            if getattr(step_result.status, "value", step_result.status) != StepStatus.COMPLETED.value:
+            if _step_status_value(step_result.status) != StepStatus.COMPLETED.value:
                 # Шаг провален - выполняем rollback если определен (используем метод из базового класса)
                 logger.error(f"❌ Enhanced: Шаг {step.id} провален: {step_result.error}")
                 
@@ -501,6 +1229,8 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         ``_execute_workflow_step``: пайплайны с ``requires_enhanced_engine`` не
         должны деградировать на base runtime.
         """
+        self._require_deadline(context, f"step '{step.id}' output retry")
+
         async def retry_executor(
             retry_step: WorkflowStep,
             retry_context: WorkflowContext,
@@ -509,7 +1239,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             retry_result = await self._execute_enhanced_step(
                 retry_step, retry_context, previous_results
             )
-            if getattr(retry_result.status, "value", retry_result.status) == StepStatus.COMPLETED.value:
+            if _step_status_value(retry_result.status) == StepStatus.COMPLETED.value:
                 previous_results[retry_step.id] = retry_result
                 completed_retry_result = await self._complete_enhanced_step_with_output_retry(
                     retry_step,
@@ -532,6 +1262,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             rerun_step_committed_by_executor=True,
         )
         if retried is None:
+            self._require_deadline(context, f"step '{step.id}' checkpoint")
             await self._on_step_completed(
                 context.workflow_id, step, step_result, context, previous_results
             )
@@ -573,7 +1304,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         step_result = await self._execute_enhanced_step(step, context, step_results)
         
         # Обрабатываем события шага с enhanced логикой
-        if getattr(step_result.status, "value", step_result.status) == StepStatus.COMPLETED.value:
+        if _step_status_value(step_result.status) == StepStatus.COMPLETED.value:
             workflow_def = getattr(context, "_workflow_definition", None)
             if workflow_def is not None:
                 step_results[step.id] = step_result
@@ -583,6 +1314,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 step_results[step.id] = step_result
             else:
                 step_results[step.id] = step_result
+                self._require_deadline(context, f"step '{step.id}' checkpoint")
                 await self._on_step_completed(context.workflow_id, step, step_result, context, step_results)
         elif step_result.status == StepStatus.FAILED:
             logger.error(f"❌ Enhanced: Шаг {step.id} провален: {step_result.error}")
@@ -596,7 +1328,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
     async def _execute_enhanced_step(self, step: WorkflowStep, context: WorkflowContext,
                                     previous_results: Dict[str, StepResult]) -> StepResult:
         """Выполнение одного шага с enhanced логикой включая resilience"""
-        
+        self._require_deadline(context, f"step '{step.id}' start")
         step_start_time = datetime.now()
         
         # Создаем бюджет для шага
@@ -664,9 +1396,15 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     max_delay=policy.max_delay,
                     backoff_multiplier=1.5,
                     retry_on_errors=policy.retry_on_errors,
+                    attempt_timeout=step.timeout,
+                    deadline=self._context_deadline(context),
                 )
             else:
-                step_result = await self._execute_single_step_attempt(retry_context)
+                step_result = await self._execute_non_retryable_attempt(
+                    step,
+                    retry_context,
+                    context,
+                )
             
             # Записываем выполнение в loop detector
             execution_data = {
@@ -687,6 +1425,8 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             
             return step_result
             
+        except WorkflowDeadlineExceeded:
+            raise
         except Exception as e:
             logger.error(f"❌ Enhanced step execution failed: {e}")
             return StepResult(
@@ -697,6 +1437,25 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 error=str(e),
                 error_class="execution_error"
             )
+
+    async def _execute_non_retryable_attempt(
+        self,
+        step: WorkflowStep,
+        retry_context: Dict[str, Any],
+        workflow_context: WorkflowContext,
+    ) -> StepResult:
+        # T13b: тонкая обёртка над общим helper'ом workflow.deadline.execute_step_attempt
+        # (раньше дублировался здесь и в AdaptiveRetryEngine._execute_attempt).
+        # Побочный эффект ужесточения: step.timeout теперь валидируется
+        # (validate_attempt_timeout) даже при deadline=None — раньше в этом
+        # non-retryable пути timeout при отсутствующем deadline не валидировался.
+        return await execute_step_attempt(
+            step.id,
+            self._execute_single_step_attempt,
+            retry_context,
+            attempt_timeout=step.timeout,
+            deadline=self._context_deadline(workflow_context),
+        )
 
     @staticmethod
     def _is_enhanced_step_retryable(step: WorkflowStep) -> bool:
@@ -799,7 +1558,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 step.id, BudgetType.TIME, duration, "step", 
                 f"Step execution time"
             )
-            if getattr(step_result.status, "value", step_result.status) == StepStatus.FAILED.value:
+            if _step_status_value(step_result.status) == StepStatus.FAILED.value:
                 return step_result
             
             # Post-step validation and decision.
@@ -887,10 +1646,27 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             if step.step_type == "tool":
                 # Прямой вызов инструмента через базовый метод
                 result = await self._execute_tool_step(step, context, task)
-                
+
+                valid_terminal_result = False
+                if step.tool_name == "finalize_text_to_sql_run":
+                    try:
+                        result = TextToSqlTerminalResult.from_mapping(
+                            result
+                        ).to_mapping()
+                        valid_terminal_result = True
+                    except (TypeError, ValueError) as exc:
+                        if self._is_tool_error_result(result):
+                            error_msg = self._extract_error_from_result(result)
+                        else:
+                            error_msg = f"invalid terminal result: {exc}"
+                        raise RuntimeError(
+                            f"Инструмент {step.tool_name} завершился "
+                            f"с ошибкой: {error_msg}"
+                        ) from exc
+
                 # Проверяем результат инструмента на наличие ошибок
                 # Если tool_manager перехватил исключение и вернул ошибку как строку
-                if self._is_tool_error_result(result):
+                if not valid_terminal_result and self._is_tool_error_result(result):
                     error_msg = self._extract_error_from_result(result)
                     raise RuntimeError(f"Инструмент {step.tool_name} завершился с ошибкой: {error_msg}")
                     

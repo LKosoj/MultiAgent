@@ -402,6 +402,7 @@ class ConfigurationManager:
             
             for handler in handlers_to_remove:
                 root_logger.removeHandler(handler)
+                handler.close()
             
             # Создаем span-aware форматтер
             class SpanAwareFormatter(logging.Formatter):

@@ -9,6 +9,8 @@
 """
 
 import os
+import tempfile
+from contextlib import contextmanager
 try:
     import fcntl
 except Exception:
@@ -17,10 +19,10 @@ import hashlib
 import json
 import re
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from collections import OrderedDict
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 import threading
 from queue import Queue
@@ -36,6 +38,9 @@ logger = logging.getLogger(__name__)
 _UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})|\\U([0-9a-fA-F]{8})")
 _MAX_URL_DECODE_DEPTH = 5
 _RUN_ID_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+_DEFAULT_MAX_TRACE_FILE_SIZE_BYTES = 10 * 1024 * 1024
+_TRUNCATE_TEXT_PREFIX_BYTES = 200
+_TRUNCATE_SUFFIX = "...(truncated)"
 
 
 def _decode_unicode_escapes(value: str) -> str:
@@ -123,6 +128,318 @@ def _trace_file_run_id(value: Any) -> str:
         raise ValueError("invalid trace run_id")
     return text
 
+
+def _max_trace_file_size_bytes(value: Optional[int]) -> int:
+    if value is None:
+        value = _DEFAULT_MAX_TRACE_FILE_SIZE_BYTES
+    if isinstance(value, bool) or int(value) <= 0:
+        raise ValueError("max_trace_file_size_bytes must be positive")
+    return int(value)
+
+
+def _max_trace_file_size_mb_to_bytes(value: float) -> int:
+    if isinstance(value, bool):
+        raise ValueError("max_trace_file_size_mb must be positive")
+    try:
+        size_mb = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_trace_file_size_mb must be positive") from exc
+    if not 0 < size_mb < float("inf"):
+        raise ValueError("max_trace_file_size_mb must be positive")
+    size_bytes = int(size_mb * 1024 * 1024)
+    if size_bytes <= 0:
+        raise ValueError("max_trace_file_size_mb is smaller than one byte")
+    return size_bytes
+
+
+@contextmanager
+def _trace_run_lock(
+    traces_dir: Path, run_id: str, *, exclusive: bool, ensure_dir: bool = True
+):
+    """Use one stable per-run flock while data files are renamed or replaced."""
+    safe_run_id = _trace_file_run_id(run_id)
+    if ensure_dir:
+        traces_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = traces_dir / f".{safe_run_id}.lock"
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        if fcntl is not None:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(fd, operation)
+        yield
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        os.close(fd)
+
+
+def _first_event_run_id(path: Path) -> Optional[str]:
+    try:
+        with path.open("r", encoding="utf-8") as trace_file:
+            for line in trace_file:
+                if not line.strip():
+                    continue
+                value = json.loads(line)
+                run_id = value.get("run_id") if isinstance(value, dict) else None
+                return _trace_file_run_id(run_id) if run_id else None
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    return None
+
+
+def _segment_number(path: Path, run_id: str) -> Optional[int]:
+    prefix = f"{run_id}."
+    stem = path.stem
+    if not stem.startswith(prefix):
+        return None
+    suffix = stem[len(prefix):]
+    if not suffix.isdigit() or int(suffix) < 1:
+        return None
+    return int(suffix)
+
+
+def _ordered_trace_paths(traces_dir: Path, run_id: str) -> List[Path]:
+    safe_run_id = _trace_file_run_id(run_id)
+    base_path = traces_dir / f"{safe_run_id}.jsonl"
+    segments = []
+    for candidate in traces_dir.glob(f"{safe_run_id}.*.jsonl"):
+        segment = _segment_number(candidate, safe_run_id)
+        if segment is None:
+            continue
+        event_run_id = _first_event_run_id(candidate)
+        if event_run_id == safe_run_id or (event_run_id is None and base_path.exists()):
+            segments.append((segment, candidate))
+    paths = [path for _, path in sorted(segments)]
+    if base_path.exists():
+        paths.append(base_path)
+    return paths
+
+
+def _read_trace_lines(paths: List[Path]) -> List[bytes]:
+    lines = []
+    for path in paths:
+        for line in path.read_bytes().splitlines(keepends=True):
+            lines.append(line if line.endswith(b"\n") else line + b"\n")
+    return lines
+
+
+def _chunk_trace_lines(lines: List[bytes], max_bytes: int) -> List[bytes]:
+    chunks: List[bytes] = []
+    current = bytearray()
+    for line in lines:
+        if current and len(current) + len(line) > max_bytes:
+            chunks.append(bytes(current))
+            current.clear()
+        current.extend(line)
+    if current:
+        chunks.append(bytes(current))
+    return chunks
+
+
+def _json_size(value: Any) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _truncate_trace_event_dict(
+    event_dict: Dict[str, Any], max_bytes: int
+) -> Optional[Dict[str, Any]]:
+    """Ensure a single trace event dict serializes within max_bytes.
+
+    Runs at most three whole-dict size checks (fast path, attributes/events
+    stripped, name/error_message capped) with no recursion or looping.
+    Returns the possibly-modified dict, or None if it still does not fit
+    after every stage - the caller must drop the record in that case.
+    """
+    if _json_size(event_dict) <= max_bytes:
+        return event_dict
+
+    # Stage 1: attributes/events are normally the bulk of the payload.
+    # Scalar fields (run_id/span_id/parent_span_id/name/start_time/end_time/
+    # duration_ms/status/error_message) are left untouched.
+    original_attributes = event_dict.get("attributes")
+    try:
+        original_attributes_bytes = _json_size(original_attributes)
+    except (TypeError, ValueError):
+        original_attributes_bytes = -1
+
+    stage1 = dict(event_dict)
+    stage1_attributes: Dict[str, Any] = {
+        "_truncated": True,
+        "_original_attributes_bytes": original_attributes_bytes,
+    }
+    # Preserve "openinference.span.kind" (a short enum such as "LLM"/"AGENT"/
+    # "TOOL") because get_trace_status()/_is_llm_span() in telemetry/helpers.py
+    # key off it to recognize LLM spans for recovered-error detection. Losing
+    # it here would make a truncated OK LLM span invisible to that check and
+    # could flip an otherwise-recovered trace's status to "error". We
+    # deliberately do NOT preserve "output.value" even though get_trace_status()
+    # also inspects it (to decide whether an OK LLM span "recovers" a later
+    # error) - it is typically the multi-KB attribute that triggered this
+    # truncation in the first place. Limitation: a truncated OK LLM span is
+    # still recognized as an LLM span, but will not count towards recovering a
+    # later error, since its output.value is gone.
+    if isinstance(original_attributes, dict):
+        span_kind = original_attributes.get("openinference.span.kind")
+        if isinstance(span_kind, str) and len(span_kind.encode("utf-8")) <= 64:
+            stage1_attributes["openinference.span.kind"] = span_kind
+    stage1["attributes"] = stage1_attributes
+    stage1["events"] = []
+    if _json_size(stage1) <= max_bytes:
+        return stage1
+
+    # Stage 2: cap name/error_message to a limited prefix.
+    stage2 = dict(stage1)
+    budget = max(0, _TRUNCATE_TEXT_PREFIX_BYTES - len(_TRUNCATE_SUFFIX))
+    for key in ("name", "error_message"):
+        value = stage2.get(key)
+        if isinstance(value, str) and value:
+            # budget is a byte budget (_TRUNCATE_TEXT_PREFIX_BYTES caps the
+            # serialized JSONL line and _json_size counts UTF-8 bytes), but
+            # slicing a Python str slices by *character*. Multi-byte text
+            # (e.g. Cyrillic, 2 bytes/char) would overshoot the byte budget
+            # by up to ~2-4x if sliced by character instead. Encode first,
+            # slice the bytes, then decode with errors="ignore" to drop a
+            # partial trailing multi-byte sequence left at the cut boundary.
+            stage2[key] = (
+                value.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+                + _TRUNCATE_SUFFIX
+            )
+    if _json_size(stage2) <= max_bytes:
+        return stage2
+
+    # Stage 3: even the minimal skeleton does not fit - drop the record.
+    logger.error(
+        f"❌ Событие трассы run_id={event_dict.get('run_id')} "
+        f"span_id={event_dict.get('span_id')} не помещается в лимит "
+        f"{max_bytes} байт даже после усечения, запись отброшена"
+    )
+    return None
+
+
+def _truncate_oversized_lines(
+    lines: List[bytes], max_bytes: int
+) -> Tuple[List[bytes], int, int]:
+    """Force every raw JSONL line to fit within max_bytes.
+
+    Returns (healed_lines, truncated_count, dropped_count).
+    """
+    healed: List[bytes] = []
+    truncated_count = 0
+    dropped_count = 0
+    for line in lines:
+        if len(line) <= max_bytes:
+            healed.append(line)
+            continue
+        try:
+            event_dict = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.error(f"❌ Не удалось разобрать строку трассы для усечения: {exc}")
+            dropped_count += 1
+            continue
+        truncated_dict = _truncate_trace_event_dict(event_dict, max_bytes)
+        if truncated_dict is None:
+            dropped_count += 1
+            continue
+        new_line = (json.dumps(truncated_dict, ensure_ascii=False) + "\n").encode("utf-8")
+        if len(new_line) > max_bytes:
+            logger.error(
+                f"❌ Событие трассы run_id={truncated_dict.get('run_id')} "
+                f"span_id={truncated_dict.get('span_id')} всё ещё превышает лимит "
+                "после усечения, запись отброшена"
+            )
+            dropped_count += 1
+            continue
+        healed.append(new_line)
+        truncated_count += 1
+    return healed, truncated_count, dropped_count
+
+
+def _stage_bytes(target: Path, data: bytes) -> Path:
+    fd, temporary_name = tempfile.mkstemp(
+        dir=target.parent,
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        offset = 0
+        while offset < len(data):
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                raise OSError("short write")
+            offset += written
+        os.fsync(fd)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+    finally:
+        os.close(fd)
+    return temporary_path
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _rewrite_trace_lines_locked(
+    traces_dir: Path,
+    run_id: str,
+    lines: List[bytes],
+    max_bytes: int,
+) -> List[Path]:
+    """Replace one logical trace with complete-line chunks; caller holds EX lock."""
+    safe_run_id = _trace_file_run_id(run_id)
+    old_paths = _ordered_trace_paths(traces_dir, safe_run_id)
+    chunks = _chunk_trace_lines(lines, max_bytes)
+    if not chunks:
+        return old_paths
+
+    old_path_set = set(old_paths)
+    targets: List[Path] = []
+    candidate_number = 1
+    for _ in chunks[:-1]:
+        while True:
+            candidate = traces_dir / f"{safe_run_id}.{candidate_number}.jsonl"
+            candidate_number += 1
+            if not candidate.exists() or candidate in old_path_set:
+                targets.append(candidate)
+                break
+    targets.append(traces_dir / f"{safe_run_id}.jsonl")
+
+    staged = [_stage_bytes(target, data) for target, data in zip(targets, chunks)]
+    try:
+        for temporary_path, target in zip(staged, targets):
+            os.replace(temporary_path, target)
+        for obsolete_path in old_path_set.difference(targets):
+            obsolete_path.unlink(missing_ok=True)
+        _fsync_directory(traces_dir)
+    finally:
+        for temporary_path in staged:
+            temporary_path.unlink(missing_ok=True)
+    return targets
+
+
+def _next_segment_path(traces_dir: Path, run_id: str) -> Path:
+    existing_numbers = [
+        number
+        for path in _ordered_trace_paths(traces_dir, run_id)
+        if (number := _segment_number(path, run_id)) is not None
+    ]
+    number = max(existing_numbers, default=0) + 1
+    while (candidate := traces_dir / f"{run_id}.{number}.jsonl").exists():
+        number += 1
+    return candidate
+
 # Опциональные импорты для телеметрии
 try:
     from opentelemetry import trace
@@ -203,26 +520,51 @@ class TraceEvent:
         }
 
 
+@dataclass
+class _RunWriteState:
+    """Cached per-run write bookkeeping to avoid a glob/stat on every span."""
+    base_size: int
+    next_segment_number: int
+    verified_clean: bool
+
+
 class LocalJSONLExporter(SpanExporter):
     """
     Локальный экспортер трасс в JSONL файлы
     """
-    
-    def __init__(self, traces_dir: str = "logs/traces"):
+
+    def __init__(
+        self,
+        traces_dir: str = "logs/traces",
+        max_trace_file_size_bytes: Optional[int] = None,
+    ):
         """
         Args:
             traces_dir: Директория для сохранения файлов трасс
         """
         self.traces_dir = Path(traces_dir)
         self.traces_dir.mkdir(parents=True, exist_ok=True)
+        self._dir_created = True
+        self.max_trace_file_size_bytes = _max_trace_file_size_bytes(
+            max_trace_file_size_bytes
+        )
         self._lock = threading.Lock()
         # Кэш соответствий trace_id -> run_id, чтобы наследники без явного run_id
         # попадали в тот же файл трассы, что и корневой span
         # Ограничен 10 000 записями для предотвращения утечки памяти при долгой работе
         self._trace_to_run: OrderedDict[int, str] = OrderedDict()
         self._trace_to_run_max = 10_000
-        
+        # Кэш write-state на run_id (base_size/next_segment_number/verified_clean),
+        # чтобы не дёргать glob+stat всех сегментов на каждый span одного рана.
+        self._run_states: "OrderedDict[str, _RunWriteState]" = OrderedDict()
+        self._run_states_max = 10_000
+
         logger.info(f"📊 LocalJSONLExporter инициализирован: {self.traces_dir}")
+
+    def invalidate_run_cache(self, run_id: str) -> None:
+        """Drop the cached write-state for run_id, forcing a full recompute."""
+        with self._lock:
+            self._run_states.pop(run_id, None)
 
     def export(self, spans: List[ReadableSpan]) -> None:
         """
@@ -361,16 +703,122 @@ class LocalJSONLExporter(SpanExporter):
         """Запись события в соответствующий JSONL файл"""
         try:
             safe_run_id = _trace_file_run_id(trace_event.run_id)
-            with self._lock:
+            event_dict = _truncate_trace_event_dict(
+                trace_event.to_dict(), self.max_trace_file_size_bytes
+            )
+            if event_dict is None:
+                return
+            line = json.dumps(event_dict, ensure_ascii=False) + "\n"
+            data = line.encode("utf-8")
+            try:
+                self._write_trace_line_locked(safe_run_id, data)
+            except FileNotFoundError:
+                # traces_dir was removed out from under a live exporter (e.g.
+                # an external cleanup process deleted it). _dir_created no
+                # longer reflects reality, so every future write would keep
+                # hitting the same FileNotFoundError forever - reset the flag
+                # and the cached write-state for this run, then retry exactly
+                # once with ensure_dir=True to recreate the directory. A
+                # second failure is handled like any other write error below.
+                self._dir_created = False
+                self.invalidate_run_cache(safe_run_id)
+                self._write_trace_line_locked(safe_run_id, data)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка записи трассы для {_redact_text(str(trace_event.run_id))}: {e}")
+
+    def _write_trace_line_locked(self, safe_run_id: str, data: bytes) -> None:
+        """Append one already-encoded JSONL line for safe_run_id under its lock."""
+        with self._lock:
+            with _trace_run_lock(
+                self.traces_dir,
+                safe_run_id,
+                exclusive=True,
+                ensure_dir=not self._dir_created,
+            ):
                 file_path = self.traces_dir / f"{safe_run_id}.jsonl"
-                line = json.dumps(trace_event.to_dict(), ensure_ascii=False) + "\n"
-                data = line.encode("utf-8")
-                fd = os.open(file_path, os.O_WRONLY | os.O_CREAT)
+                state = self._run_states.get(safe_run_id)
+                cache_hit = False
+                if state is not None and state.verified_clean:
+                    try:
+                        actual_size = file_path.stat().st_size
+                    except FileNotFoundError:
+                        actual_size = 0
+                    if actual_size == state.base_size:
+                        cache_hit = True
+                        size_before = actual_size
+                        next_segment_number = state.next_segment_number
+
+                if cache_hit:
+                    # Verified-clean cache hit: one stat of the known base
+                    # path, no glob/first-line/full-segment scan needed.
+                    if (
+                        size_before > 0
+                        and size_before + len(data) > self.max_trace_file_size_bytes
+                    ):
+                        # Do not trust the cached next_segment_number blindly:
+                        # another process (streamlit, agui service, workflow
+                        # worker) writing into the same traces_dir may have
+                        # already claimed that segment number since this
+                        # cache entry was populated. _next_segment_path()
+                        # re-checks existence on disk before returning, so
+                        # os.replace() below can never silently clobber a
+                        # segment file created by another writer.
+                        rotated_path = _next_segment_path(
+                            self.traces_dir, safe_run_id
+                        )
+                        os.replace(file_path, rotated_path)
+                        _fsync_directory(self.traces_dir)
+                        size_before = 0
+                        chosen_number = _segment_number(rotated_path, safe_run_id)
+                        next_segment_number = (
+                            chosen_number
+                            if chosen_number is not None
+                            else next_segment_number
+                        ) + 1
+                else:
+                    # Cache miss or drift: recompute the full picture from disk.
+                    paths = _ordered_trace_paths(self.traces_dir, safe_run_id)
+                    if any(
+                        path.stat().st_size > self.max_trace_file_size_bytes
+                        for path in paths
+                    ):
+                        healed_lines, _, _ = _truncate_oversized_lines(
+                            _read_trace_lines(paths),
+                            self.max_trace_file_size_bytes,
+                        )
+                        _rewrite_trace_lines_locked(
+                            self.traces_dir,
+                            safe_run_id,
+                            healed_lines,
+                            self.max_trace_file_size_bytes,
+                        )
+                        paths = _ordered_trace_paths(self.traces_dir, safe_run_id)
+
+                    size_before = file_path.stat().st_size if file_path.exists() else 0
+                    if (
+                        size_before > 0
+                        and size_before + len(data) > self.max_trace_file_size_bytes
+                    ):
+                        os.replace(
+                            file_path,
+                            _next_segment_path(self.traces_dir, safe_run_id),
+                        )
+                        _fsync_directory(self.traces_dir)
+                        size_before = 0
+                        paths = _ordered_trace_paths(self.traces_dir, safe_run_id)
+
+                    existing_numbers = [
+                        number
+                        for path in paths
+                        if (number := _segment_number(path, safe_run_id)) is not None
+                    ]
+                    next_segment_number = max(existing_numbers, default=0) + 1
+
+                fd = os.open(file_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
                 try:
                     if fcntl is not None:
                         fcntl.flock(fd, fcntl.LOCK_EX)
-                    os.lseek(fd, 0, os.SEEK_END)
-                    size_before = os.lseek(fd, 0, os.SEEK_CUR)
                     written = os.write(fd, data)
                     if written != len(data):
                         os.ftruncate(fd, size_before)
@@ -383,9 +831,15 @@ class LocalJSONLExporter(SpanExporter):
                         except Exception:
                             pass
                     os.close(fd)
-                    
-        except Exception as e:
-            logger.error(f"❌ Ошибка записи трассы для {_redact_text(str(trace_event.run_id))}: {e}")
+
+                self._run_states[safe_run_id] = _RunWriteState(
+                    base_size=size_before + len(data),
+                    next_segment_number=next_segment_number,
+                    verified_clean=True,
+                )
+                self._run_states.move_to_end(safe_run_id)
+                if len(self._run_states) > self._run_states_max:
+                    self._run_states.popitem(last=False)
 
     def shutdown(self) -> None:
         """Закрытие экспортера"""
@@ -460,7 +914,8 @@ class SmolagentsTelemetryManager:
     def __init__(self, 
                  traces_dir: str = "logs/traces",
                  service_name: str = "multiagent-system",
-                 enabled: bool = True):
+                 enabled: bool = True,
+                 max_trace_file_size_bytes: Optional[int] = None):
         """
         Args:
             traces_dir: Директория для сохранения трасс
@@ -469,9 +924,13 @@ class SmolagentsTelemetryManager:
         """
         self.traces_dir = traces_dir
         self.service_name = service_name
+        self.max_trace_file_size_bytes = _max_trace_file_size_bytes(
+            max_trace_file_size_bytes
+        )
         self.enabled = enabled and TELEMETRY_AVAILABLE
         self.instrumentor = None
         self.tracer_provider = None
+        self.exporter: Optional[LocalJSONLExporter] = None
         
         if self.enabled:
             self._setup_telemetry()
@@ -491,11 +950,14 @@ class SmolagentsTelemetryManager:
             self.tracer_provider = TracerProvider(resource=resource)
             
             # Создаем и добавляем наш локальный экспортер
-            exporter = LocalJSONLExporter(self.traces_dir)
+            self.exporter = LocalJSONLExporter(
+                self.traces_dir,
+                max_trace_file_size_bytes=self.max_trace_file_size_bytes,
+            )
             
             # Создаем простой SpanProcessor
             from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-            processor = SimpleSpanProcessor(exporter)
+            processor = SimpleSpanProcessor(self.exporter)
             self.tracer_provider.add_span_processor(processor)
 
             # Добавляем процессор, который проставляет run_id на каждом спане
@@ -596,10 +1058,15 @@ class SmolagentsTelemetryManager:
         except Exception as e:
             logger.error(f"❌ Ошибка завершения span: {e}")
 
-    def get_trace_files(self) -> List[Dict[str, Any]]:
+    def get_trace_files(self, *, include_events_count: bool = True) -> List[Dict[str, Any]]:
         """
         Получить список файлов трасс
-        
+
+        Args:
+            include_events_count: Если False, events_count не читается из файлов
+                (None в результате) - экономит чтение файлов для вызовов,
+                которым нужны только метаданные размера/времени.
+
         Returns:
             Список файлов с метаданными
         """
@@ -609,18 +1076,44 @@ class SmolagentsTelemetryManager:
         if not traces_path.exists():
             return trace_files
             
+        grouped_files: Dict[str, List[Path]] = {}
         for jsonl_file in traces_path.glob("*.jsonl"):
+            run_id = _first_event_run_id(jsonl_file) or jsonl_file.stem
             try:
-                stat = jsonl_file.stat()
+                run_id = _trace_file_run_id(run_id)
+            except ValueError:
+                logger.warning(f"⚠️ Некорректное имя файла трассы {jsonl_file}")
+                continue
+            grouped_files.setdefault(run_id, []).append(jsonl_file)
+
+        for run_id, physical_files in grouped_files.items():
+            try:
+                ordered_files = sorted(
+                    physical_files,
+                    key=lambda path: (
+                        _segment_number(path, run_id) is None,
+                        _segment_number(path, run_id) or 0,
+                    ),
+                )
+                stats = [path.stat() for path in ordered_files]
+                base_path = traces_path / f"{run_id}.jsonl"
                 trace_files.append({
-                    "file_path": str(jsonl_file),
-                    "run_id": jsonl_file.stem,
-                    "size_bytes": stat.st_size,
-                    "modified_time": datetime.fromtimestamp(stat.st_mtime),
-                    "events_count": self._count_lines(jsonl_file)
+                    "file_path": str(base_path if base_path in ordered_files else ordered_files[-1]),
+                    "file_paths": [str(path) for path in ordered_files],
+                    "run_id": run_id,
+                    "size_bytes": sum(stat.st_size for stat in stats),
+                    "modified_time": datetime.fromtimestamp(
+                        max(stat.st_mtime for stat in stats)
+                    ),
+                    "events_count": (
+                        sum(self._count_lines(path) for path in ordered_files)
+                        if include_events_count
+                        else None
+                    ),
+                    "segments_count": len(ordered_files),
                 })
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка чтения метаданных {jsonl_file}: {e}")
+                logger.warning(f"⚠️ Ошибка чтения метаданных трассы {run_id}: {e}")
         
         # Сортируем по времени модификации (новые сверху)
         trace_files.sort(key=lambda x: x["modified_time"], reverse=True)
@@ -631,7 +1124,7 @@ class SmolagentsTelemetryManager:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 return sum(1 for _ in f)
-        except:
+        except Exception:
             return 0
 
     def read_trace_events(self, run_id: str) -> List[TraceEvent]:
@@ -646,39 +1139,31 @@ class SmolagentsTelemetryManager:
         """
         events = []
         safe_run_id = _trace_file_run_id(run_id)
-        trace_file = Path(self.traces_dir) / f"{safe_run_id}.jsonl"
-        
-        if not trace_file.exists():
-            return events
-            
-        try:
-            with open(trace_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        event_data = json.loads(line)
-                        
-                        # Конвертируем обратно в TraceEvent
-                        event = TraceEvent(
-                            run_id=event_data["run_id"],
-                            span_id=event_data["span_id"],
-                            parent_span_id=event_data.get("parent_span_id"),
-                            name=event_data["name"],
-                            start_time=datetime.fromisoformat(event_data["start_time"]) if event_data["start_time"] else None,
-                            end_time=datetime.fromisoformat(event_data["end_time"]) if event_data["end_time"] else None,
-                            duration_ms=event_data.get("duration_ms"),
-                            status=event_data["status"],
-                            attributes=event_data["attributes"],
-                            events=event_data["events"],
-                            error_message=event_data.get("error_message")
-                        )
-                        events.append(event)
-                        
-        except Exception as e:
-            logger.error(f"❌ Ошибка чтения трассы {run_id}: {e}")
-        
-        # Сортируем по времени старта
-        events.sort(key=lambda x: x.start_time if x.start_time else datetime.min)
+        for event_data in self._read_raw_trace_events(safe_run_id):
+            try:
+                events.append(TraceEvent(
+                    run_id=event_data["run_id"],
+                    span_id=event_data["span_id"],
+                    parent_span_id=event_data.get("parent_span_id"),
+                    name=event_data["name"],
+                    start_time=datetime.fromisoformat(event_data["start_time"]) if event_data["start_time"] else None,
+                    end_time=datetime.fromisoformat(event_data["end_time"]) if event_data["end_time"] else None,
+                    duration_ms=event_data.get("duration_ms"),
+                    status=event_data["status"],
+                    attributes=event_data["attributes"],
+                    events=event_data["events"],
+                    error_message=event_data.get("error_message")
+                ))
+            except (KeyError, TypeError, ValueError) as e:
+                logger.error(f"❌ Ошибка чтения трассы {safe_run_id}: {e}")
+
+        def _sort_key(event: TraceEvent):
+            st = event.start_time
+            if st is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            return st if st.tzinfo is not None else st.replace(tzinfo=timezone.utc)
+
+        events.sort(key=_sort_key)
         return events
 
     def load_trace_file(self, run_id: str) -> Dict[str, Any]:
@@ -740,28 +1225,149 @@ class SmolagentsTelemetryManager:
         Args:
             max_age_days: Максимальный возраст файлов в днях
         """
+        return self.cleanup_old_traces_report(max_age_days=max_age_days)["deleted_count"]
+
+    def cleanup_old_traces_report(self, max_age_days: int = 7) -> Dict[str, Any]:
+        """Delete expired physical trace files and report exact outcomes."""
+        result = {
+            "deleted_files": [],
+            "deleted_count": 0,
+            "deleted_bytes": 0,
+            "failures": [],
+        }
         traces_path = Path(self.traces_dir)
-        
         if not traces_path.exists():
-            return
-            
-        current_time = datetime.now()
-        removed_count = 0
-        
-        for jsonl_file in traces_path.glob("*.jsonl"):
+            return result
+
+        cutoff = datetime.now().timestamp() - timedelta(days=max_age_days).total_seconds()
+        for trace_meta in self.get_trace_files(include_events_count=False):
+            run_id = trace_meta["run_id"]
+            attempted_deletion = False
             try:
-                file_age = current_time - datetime.fromtimestamp(jsonl_file.stat().st_mtime)
-                
-                if file_age.days > max_age_days:
-                    jsonl_file.unlink()
-                    removed_count += 1
-                    
+                with _trace_run_lock(traces_path, run_id, exclusive=True):
+                    trace_paths = _ordered_trace_paths(traces_path, run_id)
+                    if not trace_paths:
+                        continue
+                    path_stats = [(path, path.stat()) for path in trace_paths]
+                    if max(stat.st_mtime for _, stat in path_stats) >= cutoff:
+                        continue
+
+                    # A filesystem cannot unlink several files atomically. Holding
+                    # the run lock prevents writers/readers from observing an
+                    # interleaved partial deletion; every individual outcome is
+                    # still reported exactly below.
+                    attempted_deletion = True
+                    run_had_failure = False
+                    for trace_path, stat in path_stats:
+                        try:
+                            trace_path.unlink()
+                            result["deleted_files"].append(str(trace_path))
+                            result["deleted_count"] += 1
+                            result["deleted_bytes"] += stat.st_size
+                        except Exception as e:
+                            run_had_failure = True
+                            result["failures"].append({
+                                "file_path": str(trace_path),
+                                "error": str(e),
+                            })
+                            logger.warning(
+                                f"⚠️ Ошибка при удалении {trace_path}: {e}"
+                            )
+
+                    if not run_had_failure:
+                        safe_run_id = _trace_file_run_id(run_id)
+                        (traces_path / f".{safe_run_id}.lock").unlink(missing_ok=True)
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка при удалении {jsonl_file}: {e}")
-        
-        if removed_count > 0:
-            logger.info(f"🧹 Удалено {removed_count} старых файлов трасс")
-        return removed_count
+                result["failures"].append({
+                    "run_id": run_id,
+                    "error": str(e),
+                })
+                logger.warning(f"⚠️ Ошибка при удалении трассы {run_id}: {e}")
+            # Invalidate after releasing the run flock: LocalJSONLExporter's
+            # own lock ordering is self._lock -> flock, so acquiring
+            # self._lock while still holding the flock here would invert it.
+            if attempted_deletion and self.exporter is not None:
+                self.exporter.invalidate_run_cache(run_id)
+
+        result["deleted_files"].sort()
+        result["failures"].sort(
+            key=lambda failure: failure.get("file_path", failure.get("run_id", ""))
+        )
+
+        if result["deleted_count"]:
+            logger.info(f"🧹 Удалено {result['deleted_count']} старых файлов трасс")
+        return result
+
+    def enforce_trace_size_limit(self) -> Dict[str, Any]:
+        """Split oversized logical traces without breaking JSONL records."""
+        traces_path = Path(self.traces_dir)
+        result = {
+            "rotations": 0,
+            "files": [],
+            "bytes_before": 0,
+            "bytes_after": 0,
+            "failures": [],
+        }
+        if not traces_path.exists():
+            return result
+
+        result["bytes_before"] = sum(
+            path.stat().st_size for path in traces_path.glob("*.jsonl")
+        )
+        for trace_meta in self.get_trace_files(include_events_count=False):
+            run_id = trace_meta["run_id"]
+            rewrote = False
+            try:
+                with _trace_run_lock(traces_path, run_id, exclusive=True):
+                    paths = _ordered_trace_paths(traces_path, run_id)
+                    if not paths or not any(
+                        path.stat().st_size > self.max_trace_file_size_bytes
+                        for path in paths
+                    ):
+                        continue
+                    lines = _read_trace_lines(paths)
+                    healed_lines, truncated_count, dropped_count = _truncate_oversized_lines(
+                        lines, self.max_trace_file_size_bytes
+                    )
+                    target_paths = _rewrite_trace_lines_locked(
+                        traces_path,
+                        run_id,
+                        healed_lines,
+                        self.max_trace_file_size_bytes,
+                    )
+                    rewrote = True
+                    result["rotations"] += max(0, len(target_paths) - 1)
+                    result["files"].extend(str(path) for path in target_paths)
+                    if truncated_count:
+                        result["failures"].append({
+                            "run_id": run_id,
+                            "error": (
+                                f"{truncated_count} JSONL record(s) exceeded "
+                                "max_trace_file_size_bytes and were truncated"
+                            ),
+                        })
+                    if dropped_count:
+                        result["failures"].append({
+                            "run_id": run_id,
+                            "error": (
+                                f"{dropped_count} JSONL record(s) exceeded "
+                                "max_trace_file_size_bytes even after truncation "
+                                "and were dropped"
+                            ),
+                        })
+            except Exception as e:
+                result["failures"].append({"run_id": run_id, "error": str(e)})
+                logger.warning(f"⚠️ Ошибка ротации трассы {run_id}: {e}")
+            # Invalidate after releasing the run flock: LocalJSONLExporter's
+            # own lock ordering is self._lock -> flock, so acquiring
+            # self._lock while still holding the flock here would invert it.
+            if rewrote and self.exporter is not None:
+                self.exporter.invalidate_run_cache(run_id)
+
+        result["bytes_after"] = sum(
+            path.stat().st_size for path in traces_path.glob("*.jsonl")
+        )
+        return result
 
     def is_enabled(self) -> bool:
         """Проверить, включена ли телеметрия"""
@@ -845,6 +1451,21 @@ class SmolagentsTelemetryManager:
         return result
 
     def _mark_trace_as_error(self, run_id: str, error_reason: str) -> bool:
+        try:
+            safe_run_id = _trace_file_run_id(run_id)
+            with _trace_run_lock(Path(self.traces_dir), safe_run_id, exclusive=True):
+                marked = self._mark_trace_as_error_locked(safe_run_id, error_reason)
+            # Invalidate after releasing the run flock: LocalJSONLExporter's
+            # own lock ordering is self._lock -> flock, so acquiring
+            # self._lock while still holding the flock here would invert it.
+            if marked and self.exporter is not None:
+                self.exporter.invalidate_run_cache(safe_run_id)
+            return marked
+        except Exception as e:
+            logger.error(f"Ошибка при пометке трассы {_redact_text(str(run_id))}: {e}")
+            return False
+
+    def _mark_trace_as_error_locked(self, run_id: str, error_reason: str) -> bool:
         """
         Помечает трассу как содержащую ошибку путем изменения файла трассировки.
         
@@ -857,13 +1478,14 @@ class SmolagentsTelemetryManager:
         """
         try:
             safe_run_id = _trace_file_run_id(run_id)
-            trace_file = Path(self.traces_dir) / f"{safe_run_id}.jsonl"
-            
-            if not trace_file.exists():
+            traces_path = Path(self.traces_dir)
+            trace_paths = _ordered_trace_paths(traces_path, safe_run_id)
+
+            if not trace_paths:
                 return False
             
             # Читаем оригинальные события как есть
-            original_events = self._read_raw_trace_events(safe_run_id)
+            original_events = self._read_raw_trace_events_unlocked(safe_run_id)
             
             if not original_events:
                 return False
@@ -948,11 +1570,17 @@ class SmolagentsTelemetryManager:
             # Перезаписываем файл с обновленными событиями
             if modified:
                 original_events = _redact_payload(original_events)
-                with open(trace_file, 'w', encoding='utf-8') as f:
-                    for event in original_events:
-                        json.dump(event, f, ensure_ascii=False)
-                        f.write('\n')
-                
+                lines = [
+                    (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+                    for event in original_events
+                ]
+                _rewrite_trace_lines_locked(
+                    traces_path,
+                    safe_run_id,
+                    lines,
+                    self.max_trace_file_size_bytes,
+                )
+
                 logger.debug(
                     f"Трасса {safe_run_id} помечена как содержащая ошибку: {redacted_reason}"
                 )
@@ -981,21 +1609,22 @@ class SmolagentsTelemetryManager:
 
     def _read_raw_trace_events(self, run_id: str) -> List[Dict]:
         """Читает 'сырые' события из файла трассировки"""
+        safe_run_id = _trace_file_run_id(run_id)
+        with _trace_run_lock(Path(self.traces_dir), safe_run_id, exclusive=False):
+            return self._read_raw_trace_events_unlocked(safe_run_id)
+
+    def _read_raw_trace_events_unlocked(self, run_id: str) -> List[Dict]:
         events = []
         safe_run_id = _trace_file_run_id(run_id)
-        trace_file = Path(self.traces_dir) / f"{safe_run_id}.jsonl"
-        if not trace_file.exists():
-            return events
-        
-        try:
-            with open(trace_file, 'r', encoding='utf-8') as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        events.append(json.loads(line))
-        except (IOError, json.JSONDecodeError) as e:
-            logger.error(f"Ошибка чтения raw-трассы {run_id}: {e}")
-            
+        trace_paths = _ordered_trace_paths(Path(self.traces_dir), safe_run_id)
+        for trace_file in trace_paths:
+            try:
+                with trace_file.open("r", encoding="utf-8") as source:
+                    for line in source:
+                        if line.strip():
+                            events.append(json.loads(line))
+            except (OSError, UnicodeError, json.JSONDecodeError) as e:
+                logger.error(f"Ошибка чтения raw-трассы {safe_run_id}: {e}")
         return events
 
     def _convert_events_to_spans_for_check(self, events: List[Dict]) -> List[Dict]:
@@ -1017,7 +1646,9 @@ _telemetry_manager_lock = threading.Lock()
 
 def get_telemetry_manager(traces_dir: str = "logs/traces",
                          service_name: str = "multiagent-system",
-                         enabled: bool = True) -> SmolagentsTelemetryManager:
+                         enabled: bool = True,
+                         max_trace_file_size_mb: Optional[float] = None
+                         ) -> SmolagentsTelemetryManager:
     """
     Получить глобальный экземпляр менеджера телеметрии
 
@@ -1025,32 +1656,53 @@ def get_telemetry_manager(traces_dir: str = "logs/traces",
         traces_dir: Директория для сохранения трасс
         service_name: Имя сервиса
         enabled: Включена ли телеметрия
+        max_trace_file_size_mb: Явный максимальный размер trace-файла
 
     Returns:
         Экземпляр SmolagentsTelemetryManager
     """
     global _telemetry_manager
 
-    if _telemetry_manager is None:
-        with _telemetry_manager_lock:
-            if _telemetry_manager is None:
-                _telemetry_manager = SmolagentsTelemetryManager(
-                    traces_dir=traces_dir,
-                    service_name=service_name,
-                    enabled=enabled
+    explicit_max_bytes = (
+        _max_trace_file_size_mb_to_bytes(max_trace_file_size_mb)
+        if max_trace_file_size_mb is not None
+        else None
+    )
+    with _telemetry_manager_lock:
+        if _telemetry_manager is None:
+            _telemetry_manager = SmolagentsTelemetryManager(
+                traces_dir=traces_dir,
+                service_name=service_name,
+                enabled=enabled,
+                max_trace_file_size_bytes=explicit_max_bytes,
+            )
+        elif explicit_max_bytes is not None:
+            _telemetry_manager.max_trace_file_size_bytes = explicit_max_bytes
+            if _telemetry_manager.exporter is not None:
+                _telemetry_manager.exporter.max_trace_file_size_bytes = (
+                    explicit_max_bytes
                 )
 
     return _telemetry_manager
 
-def configure_telemetry(enabled: bool = True, traces_dir: str = "logs/traces"):
+def configure_telemetry(
+    enabled: bool = True,
+    traces_dir: str = "logs/traces",
+    max_trace_file_size_mb: Optional[float] = None,
+):
     """
     Настроить телеметрию smolagents
     
     Args:
         enabled: Включить/отключить телеметрию
         traces_dir: Директория для трасс
+        max_trace_file_size_mb: Явный максимальный размер trace-файла
     """
-    manager = get_telemetry_manager(traces_dir=traces_dir, enabled=enabled)
+    manager = get_telemetry_manager(
+        traces_dir=traces_dir,
+        enabled=enabled,
+        max_trace_file_size_mb=max_trace_file_size_mb,
+    )
     
     if enabled and not manager.is_enabled():
         manager.enable()

@@ -20,8 +20,28 @@ type DbTestConfig = {
   created_at?: string;
 };
 
+export type DbConnectionRecord = {
+  connection_ref: string;
+  display_name: string;
+  owner_subject: string | null;
+  tenant_id: string;
+  target_kind?: string;
+  dialect?: string;
+  target_description?: string;
+  created_at?: string;
+  enabled_for_user?: boolean;
+};
+
+type DbConnectionRegistrationInput = {
+  displayName: string;
+  dsn: string;
+  ownerSubject: string;
+  tenantId: string;
+};
+
 type Props = {
   isBusy: boolean;
+  runServiceAction?: (action: string, payload: Record<string, unknown>) => Promise<unknown>;
   dbTab: "plugins" | "test" | "configs" | "diagnostics";
   setDbTab: (tab: Props["dbTab"]) => void;
   dbPlugins: DbPlugin[];
@@ -57,6 +77,57 @@ type Props = {
   loadDbBenchmark: () => void;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  value !== null && typeof value === "object" && !Array.isArray(value)
+);
+
+export function dbConnectionEntries(payload: unknown): DbConnectionRecord[] {
+  const result = isRecord(payload) && isRecord(payload.result)
+    ? payload.result
+    : payload;
+  const values = Array.isArray(result)
+    ? result
+    : isRecord(result) && Array.isArray(result.connections)
+      ? result.connections
+      : [];
+
+  return values.flatMap((value): DbConnectionRecord[] => {
+    if (
+      !isRecord(value)
+      || typeof value.connection_ref !== "string"
+      || typeof value.display_name !== "string"
+      || !(typeof value.owner_subject === "string" || value.owner_subject === null)
+      || typeof value.tenant_id !== "string"
+    ) return [];
+    return [{
+      connection_ref: value.connection_ref,
+      display_name: value.display_name,
+      owner_subject: value.owner_subject,
+      tenant_id: value.tenant_id,
+      ...(typeof value.target_kind === "string" ? { target_kind: value.target_kind } : {}),
+      ...(typeof value.dialect === "string" ? { dialect: value.dialect } : {}),
+      ...(typeof value.target_description === "string"
+        ? { target_description: value.target_description }
+        : {}),
+      ...(typeof value.created_at === "string" ? { created_at: value.created_at } : {}),
+      ...(typeof value.enabled_for_user === "boolean"
+        ? { enabled_for_user: value.enabled_for_user }
+        : {}),
+    }];
+  });
+}
+
+export function buildDbConnectionRegistrationPayload(
+  input: DbConnectionRegistrationInput,
+): Record<string, unknown> {
+  return {
+    display_name: input.displayName.trim(),
+    dsn: input.dsn,
+    owner_subject: input.ownerSubject.trim() || null,
+    tenant_id: input.tenantId.trim(),
+  };
+}
+
 const toStringList = (value: unknown): string[] => {
   if (Array.isArray(value)) {
     return value.map((item) => String(item)).filter(Boolean);
@@ -72,6 +143,7 @@ const toStringList = (value: unknown): string[] => {
 
 export function DbSection({
   isBusy,
+  runServiceAction,
   dbTab,
   setDbTab,
   dbPlugins,
@@ -79,9 +151,6 @@ export function DbSection({
   dbPluginsError,
   dbTestForm,
   dbTestResult,
-  dbConfigs,
-  dbConfigsLoading,
-  dbConfigsError,
   dbConfigForm,
   dbDiagnostics,
   dbBenchmark,
@@ -89,21 +158,93 @@ export function DbSection({
   handleQuickTestPlugin,
   setDbTestForm,
   handleRunDbTest,
-  loadDbConfigs,
   setDbConfigForm,
-  handleSaveDbConfig,
-  handleDeleteDbConfig,
   setDbTestResult,
   loadDbDiagnostics,
   loadDbBenchmark,
 }: Props) {
   const [selectedPlugin, setSelectedPlugin] = React.useState("");
+  const [connections, setConnections] = React.useState<DbConnectionRecord[]>([]);
+  const [connectionsLoading, setConnectionsLoading] = React.useState(false);
+  const [connectionsError, setConnectionsError] = React.useState<string | null>(null);
+  const [ownerSubject, setOwnerSubject] = React.useState("");
+  const [tenantId, setTenantId] = React.useState("");
   const pluginOptions = dbPlugins.map((plugin) => ({
     label: `${plugin.scheme ?? "db"} - ${plugin.name ?? "plugin"}`,
     value: plugin.scheme ?? "",
   }));
   const activePlugin = dbPlugins.find((plugin) => plugin.scheme === selectedPlugin);
   const activePluginDsnExamples = toStringList(activePlugin?.dsn_examples);
+
+  const loadConnections = React.useCallback(async () => {
+    if (!runServiceAction) return;
+    setConnectionsLoading(true);
+    setConnectionsError(null);
+    try {
+      const result = await runServiceAction("db.connections.list", {});
+      setConnections(dbConnectionEntries(result));
+    } catch (error) {
+      setConnectionsError(
+        error instanceof Error ? error.message : "Не удалось загрузить подключения",
+      );
+    } finally {
+      setConnectionsLoading(false);
+    }
+  }, [runServiceAction]);
+
+  React.useEffect(() => {
+    if (dbTab === "configs" && runServiceAction) void loadConnections();
+  }, [dbTab, loadConnections, runServiceAction]);
+
+  const registerConnection = async () => {
+    if (!runServiceAction) {
+      setConnectionsError("Управление подключениями недоступно");
+      return;
+    }
+    if (
+      !dbConfigForm.name.trim()
+      || !dbConfigForm.dsn.trim()
+      || !tenantId.trim()
+    ) {
+      setConnectionsError("Имя, DSN и tenant обязательны");
+      return;
+    }
+    setConnectionsError(null);
+    try {
+      await runServiceAction(
+        "db.connections.register",
+        buildDbConnectionRegistrationPayload({
+          displayName: dbConfigForm.name,
+          dsn: dbConfigForm.dsn,
+          ownerSubject,
+          tenantId,
+        }),
+      );
+      setDbConfigForm({ name: "", dsn: "", description: "" });
+      setOwnerSubject("");
+      setTenantId("");
+      await loadConnections();
+    } catch (error) {
+      setConnectionsError(
+        error instanceof Error ? error.message : "Не удалось зарегистрировать подключение",
+      );
+    }
+  };
+
+  const deleteConnection = async (connectionRef: string) => {
+    if (!runServiceAction) return;
+    setConnectionsError(null);
+    try {
+      await runServiceAction("db.connections.delete", {
+        connection_ref: connectionRef,
+      });
+      await loadConnections();
+    } catch (error) {
+      setConnectionsError(
+        error instanceof Error ? error.message : "Не удалось удалить подключение",
+      );
+    }
+  };
 
   return (
     <div className="section" id="db">
@@ -119,7 +260,7 @@ export function DbSection({
           Тестирование
         </button>
         <button className={`segment-button${dbTab === "configs" ? " active" : ""}`} onClick={() => setDbTab("configs")}>
-          Конфиги
+          Подключения
         </button>
         <button className={`segment-button${dbTab === "diagnostics" ? " active" : ""}`} onClick={() => setDbTab("diagnostics")}>
           Диагностика
@@ -337,17 +478,17 @@ export function DbSection({
         <div className="stack">
           <div className="toolbar-row">
             <div className="inline">
-              <button className="button secondary" type="button" onClick={loadDbConfigs} disabled={isBusy}>
+              <button className="button secondary" type="button" onClick={loadConnections} disabled={isBusy || !runServiceAction}>
                 Обновить
               </button>
             </div>
-            {dbConfigsError ? <div className="card-description">Ошибка: {dbConfigsError}</div> : null}
+            {connectionsError ? <div className="card-description">Ошибка: {connectionsError}</div> : null}
           </div>
           <div className="card">
-            <div className="card-title">Сохранить конфигурацию</div>
+            <div className="card-title">Зарегистрировать подключение</div>
             <div className="form-grid">
               <label className="field">
-                <span className="label">Имя</span>
+                <span className="label">Отображаемое имя</span>
                 <input value={dbConfigForm.name} onChange={(event) => setDbConfigForm((prev) => ({ ...prev, name: event.target.value }))} />
               </label>
               <label className="field">
@@ -355,43 +496,65 @@ export function DbSection({
                 <input value={dbConfigForm.dsn} onChange={(event) => setDbConfigForm((prev) => ({ ...prev, dsn: event.target.value }))} />
               </label>
               <label className="field">
-                <span className="label">Описание</span>
+                <span className="label">Владелец (пусто — весь tenant)</span>
                 <input
-                  value={dbConfigForm.description}
-                  onChange={(event) => setDbConfigForm((prev) => ({ ...prev, description: event.target.value }))}
+                  value={ownerSubject}
+                  onChange={(event) => setOwnerSubject(event.target.value)}
+                  placeholder="owner subject"
+                />
+              </label>
+              <label className="field">
+                <span className="label">Tenant</span>
+                <input
+                  value={tenantId}
+                  onChange={(event) => setTenantId(event.target.value)}
+                  placeholder="tenant id"
                 />
               </label>
             </div>
             <div className="button-row">
-              <button className="button" type="button" onClick={handleSaveDbConfig} disabled={isBusy}>
-                Сохранить
+              <button
+                className="button"
+                type="button"
+                onClick={registerConnection}
+                disabled={
+                  isBusy
+                  || !runServiceAction
+                  || !dbConfigForm.name.trim()
+                  || !dbConfigForm.dsn.trim()
+                  || !tenantId.trim()
+                }
+              >
+                Зарегистрировать
               </button>
             </div>
           </div>
 
           <div className="cards">
-            {dbConfigsLoading ? <div className="card-description">Загрузка конфигов...</div> : null}
-            {dbConfigs.map((config) => (
-              <article key={config.name} className="card">
+            {connectionsLoading ? <div className="card-description">Загрузка подключений...</div> : null}
+            {connections.map((connection) => (
+              <article key={connection.connection_ref} className="card">
                 <div className="inline">
-                  <div className="card-title">{config.name}</div>
-                  <span className="app-subtitle">{config.created_at || ""}</span>
+                  <div className="card-title">{connection.display_name}</div>
+                  <span className="app-subtitle">{connection.created_at || ""}</span>
                 </div>
-                <div className="card-description">{config.description || "Описание отсутствует."}</div>
-                <div className="label">DSN</div>
-                <div className="meta-value" style={{ wordBreak: "break-all" }}>
-                  {config.dsn}
+                <div className="card-description">{connection.target_description || "Описание цели отсутствует."}</div>
+                <div className="profile-meta">
+                  <div>
+                    <span className="label">Владелец</span>
+                    <div className="meta-value">{connection.owner_subject ?? "tenant-wide"}</div>
+                  </div>
+                  <div>
+                    <span className="label">Tenant</span>
+                    <div className="meta-value">{connection.tenant_id}</div>
+                  </div>
+                  <div>
+                    <span className="label">Ссылка</span>
+                    <div className="meta-value">{connection.connection_ref}</div>
+                  </div>
                 </div>
                 <div className="button-row">
-                  <button
-                    className="button ghost"
-                    type="button"
-                    onClick={() => setDbTestForm((prev) => ({ ...prev, dsn: config.connection_ref ?? config.dsn }))}
-                    disabled={!config.connection_ref && (config.dsn.includes("***") || config.dsn.includes("<redacted>"))}
-                  >
-                    Подставить в тест
-                  </button>
-                  <button className="button secondary" type="button" onClick={() => handleDeleteDbConfig(config.name)} disabled={isBusy}>
+                  <button className="button secondary" type="button" onClick={() => deleteConnection(connection.connection_ref)} disabled={isBusy}>
                     Удалить
                   </button>
                 </div>

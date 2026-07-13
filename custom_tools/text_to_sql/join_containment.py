@@ -24,6 +24,13 @@ import time
 from collections import OrderedDict
 from typing import Optional, Tuple
 
+from workflow.deadline import WorkflowDeadlineExceeded
+
+from .core._db_exec import (
+    QueryExecutionRequest,
+    QueryExecutor,
+    QueryPurpose,
+)
 from .utils import mask_dsn_value
 
 logger = logging.getLogger(__name__)
@@ -146,7 +153,14 @@ def _cache_put(key, value: Optional[float]) -> None:
 # --- Основной хелпер -------------------------------------------------------
 
 
-def _distinct_sample(plugin, conn, table: str, column: str, limit: int) -> list:
+def _distinct_sample(
+    plugin,
+    executor: QueryExecutor,
+    dsn: str,
+    table: str,
+    column: str,
+    limit: int,
+) -> list:
     """Один DISTINCT-сэмпл через плагин → список ненулевых значений.
 
     Бросает наружу при любой проблеме (отсутствие методов, success=False,
@@ -154,30 +168,46 @@ def _distinct_sample(plugin, conn, table: str, column: str, limit: int) -> list:
     """
     if not hasattr(plugin, "build_distinct_values_query"):
         raise RuntimeError("plugin lacks build_distinct_values_query")
-    if not hasattr(plugin, "execute_select"):
-        raise RuntimeError("plugin lacks execute_select")
-
     sql = plugin.build_distinct_values_query(table, column, limit)
-    result = plugin.execute_select(conn, sql, row_limit=limit)
-    if not result.get("success", False):
-        raise RuntimeError("execute_select returned success=False")
+    result = executor.execute(
+        QueryExecutionRequest(
+            sql_query=sql,
+            purpose=QueryPurpose.CONTAINMENT,
+            row_limit=limit,
+            dsn=dsn,
+        )
+    )
+    if not result.success:
+        raise RuntimeError(result.error_message or "containment read failed")
     # NULL уже отфильтрован в build_distinct_values_query (WHERE IS NOT NULL),
     # но на всякий случай отсекаем None из данных.
-    return [row[0] for row in result.get("data", []) if row and row[0] is not None]
+    return [row[0] for row in result.data if row and row[0] is not None]
 
 
-def _parent_membership_values(plugin, conn, table: str, column: str, values: list, limit: int) -> set:
+def _parent_membership_values(
+    plugin,
+    executor: QueryExecutor,
+    dsn: str,
+    table: str,
+    column: str,
+    values: list,
+    limit: int,
+) -> set:
     """Parent DISTINCT по membership только для sampled child values."""
     if not hasattr(plugin, "build_values_membership_query"):
         raise RuntimeError("plugin lacks build_values_membership_query")
-    if not hasattr(plugin, "execute_select"):
-        raise RuntimeError("plugin lacks execute_select")
-
     sql = plugin.build_values_membership_query(table, column, values)
-    result = plugin.execute_select(conn, sql, row_limit=limit)
-    if not result.get("success", False):
-        raise RuntimeError("execute_select returned success=False")
-    return {str(row[0]) for row in result.get("data", []) if row and row[0] is not None}
+    result = executor.execute(
+        QueryExecutionRequest(
+            sql_query=sql,
+            purpose=QueryPurpose.CONTAINMENT,
+            row_limit=limit,
+            dsn=dsn,
+        )
+    )
+    if not result.success:
+        raise RuntimeError(result.error_message or "containment read failed")
+    return {str(row[0]) for row in result.data if row and row[0] is not None}
 
 
 def estimate_join_containment(
@@ -241,25 +271,37 @@ def _compute_join_containment(
             get_plugin = get_plugin_default
 
         plugin = get_plugin(dsn)
-        conn = plugin.connect(dsn)
-        try:
-            a_vals = _distinct_sample(plugin, conn, table_a, col_a, limit)
-            sampled_child_values = {str(value) for value in a_vals}
-            if not sampled_child_values:
-                # Знаменатель 0 — containment неопределим.
-                return None
+        executor = QueryExecutor(get_plugin=get_plugin)
+        a_vals = _distinct_sample(
+            plugin,
+            executor,
+            dsn,
+            table_a,
+            col_a,
+            limit,
+        )
+        sampled_child_values = {str(value) for value in a_vals}
+        if not sampled_child_values:
+            # Знаменатель 0 — containment неопределим.
+            return None
 
-            matched_parent_values = _parent_membership_values(
-                plugin, conn, table_b, col_b, a_vals, limit
-            )
-        finally:
-            plugin.close(conn)
+        matched_parent_values = _parent_membership_values(
+            plugin,
+            executor,
+            dsn,
+            table_b,
+            col_b,
+            a_vals,
+            limit,
+        )
 
         if not matched_parent_values:
             return 0.0
 
         intersection = len(sampled_child_values & matched_parent_values)
         return intersection / len(sampled_child_values)
+    except WorkflowDeadlineExceeded:
+        raise
     except Exception as e:
         logger.warning(
             "estimate_join_containment failed for dsn=%s %s.%s -> %s.%s: %s "

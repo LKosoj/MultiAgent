@@ -70,33 +70,42 @@ class JoinBuilder:
             progress = False
             for edge in norm_edges:
                 a, b, a_col, b_col, jt = edge["a"], edge["b"], edge["a_col"], edge["b_col"], edge["jt"]
+                predicates = " AND ".join(
+                    f"{quote_identifier(a, dsn=self.dsn)}.{quote_identifier(source, dsn=self.dsn)} = "
+                    f"{quote_identifier(b, dsn=self.dsn)}.{quote_identifier(target, dsn=self.dsn)}"
+                    for source, target in edge["pairs"]
+                )
+                join_entry = {
+                    "from_table": a,
+                    "from_column": a_col,
+                    "to_table": b,
+                    "to_column": b_col,
+                    "join_type": jt,
+                }
+                if edge["grouped"]:
+                    if edge["constraint_id"]:
+                        join_entry["constraint_id"] = edge["constraint_id"]
+                    join_entry["column_pairs"] = [
+                        {"from_column": source, "to_column": target}
+                        for source, target in edge["pairs"]
+                    ]
                 
                 # если одно из окончаний уже подключено, а другое требуется — подключаем
                 if a in used_tables and (b in (required_tables - used_tables)):
                     join_clauses.append(
-                        f"{jt} JOIN {quote_identifier(b, dsn=self.dsn)} ON {quote_identifier(a, dsn=self.dsn)}.{quote_identifier(a_col, dsn=self.dsn)} = {quote_identifier(b, dsn=self.dsn)}.{quote_identifier(b_col, dsn=self.dsn)}"
+                        f"{jt} JOIN {quote_identifier(b, dsn=self.dsn)} ON {predicates}"
                     )
-                    join_edges.append({
-                        "from_table": a,
-                        "from_column": a_col,
-                        "to_table": b,
-                        "to_column": b_col,
-                        "join_type": jt,
-                    })
+                    join_edges.append(join_entry)
                     used_tables.add(b)
                     progress = True
                 elif b in used_tables and (a in (required_tables - used_tables)):
                     effective_jt = self._invert_join_type(jt)
                     join_clauses.append(
-                        f"{effective_jt} JOIN {quote_identifier(a, dsn=self.dsn)} ON {quote_identifier(a, dsn=self.dsn)}.{quote_identifier(a_col, dsn=self.dsn)} = {quote_identifier(b, dsn=self.dsn)}.{quote_identifier(b_col, dsn=self.dsn)}"
+                        f"{effective_jt} JOIN {quote_identifier(a, dsn=self.dsn)} ON {predicates}"
                     )
-                    join_edges.append({
-                        "from_table": a,
-                        "from_column": a_col,
-                        "to_table": b,
-                        "to_column": b_col,
-                        "join_type": effective_jt,
-                    })
+                    reverse_entry = dict(join_entry)
+                    reverse_entry["join_type"] = effective_jt
+                    join_edges.append(reverse_entry)
                     used_tables.add(a)
                     progress = True
                 elif (
@@ -105,10 +114,10 @@ class JoinBuilder:
                     and (a in required_tables or b in required_tables)
                 ):
                     logger.warning(
-                        "Multiple FK edges between %s and %s: edge (%s.%s -> %s.%s) "
+                        "Multiple FK edges between %s and %s: constraint %s with pairs %s "
                         "skipped because both %s and %s are already joined; "
                         "join ambiguity may produce incorrect SQL",
-                        a, b, a, a_col, b, b_col, a, b,
+                        a, b, edge["constraint_id"], edge["pairs"], a, b,
                     )
         
         unconnected_tables = required_tables - used_tables
@@ -136,9 +145,36 @@ class JoinBuilder:
             jt = (j.get("join_type") or "LEFT").upper().strip()
             if jt not in VALID_JOIN_TYPES:
                 raise ValueError(f"unsupported join_type: {j.get('join_type')!r}")
+            grouped = "column_pairs" in j
+            if grouped:
+                raw_pairs = j.get("column_pairs")
+                if not isinstance(raw_pairs, list) or not raw_pairs:
+                    raise ValueError("column_pairs must be a non-empty list")
+                pairs: list[tuple[str, str]] = []
+                for pair in raw_pairs:
+                    if not isinstance(pair, dict):
+                        raise ValueError("column_pairs members must be mappings")
+                    source = pair.get("from_column")
+                    target = pair.get("to_column")
+                    if not isinstance(source, str) or not source:
+                        raise ValueError("column_pairs.from_column is required")
+                    if not isinstance(target, str) or not target:
+                        raise ValueError("column_pairs.to_column is required")
+                    pairs.append((source, target))
+                if a_col != pairs[0][0] or b_col != pairs[0][1]:
+                    raise ValueError("scalar join aliases must equal the first column pair")
+            else:
+                pairs = [(a_col, b_col)] if a_col and b_col else []
             if a and b and a_col and b_col:
                 norm_edges.append({
-                    "a": a, "a_col": a_col, "b": b, "b_col": b_col, "jt": jt
+                    "a": a,
+                    "a_col": a_col,
+                    "b": b,
+                    "b_col": b_col,
+                    "jt": jt,
+                    "pairs": tuple(pairs),
+                    "constraint_id": j.get("constraint_id"),
+                    "grouped": grouped,
                 })
         return norm_edges
 
@@ -189,6 +225,23 @@ class JoinBuilder:
                 continue
 
             table_a_fk_aware = self._table_has_fk_metadata(table_a)
+            authoritative_fk_columns: Optional[Set[str]] = None
+            table_body = self.db_schema[table_a]
+            if "foreign_keys" in table_body:
+                from .schema_metadata import get_foreign_key_constraints
+
+                envelope = table_body["foreign_keys"]
+                if not isinstance(envelope, dict):
+                    raise TypeError("foreign_keys must be a mapping")
+                if envelope.get("complete") is False:
+                    continue
+                authoritative_fk_columns = {
+                    pair["from_column"]
+                    for constraint in get_foreign_key_constraints(
+                        table_a, self.db_schema
+                    )
+                    for pair in constraint["column_pairs"]
+                }
             table_a_columns = get_table_columns(self.db_schema[table_a])
             for col_name, col_info in table_a_columns.items():
                 if col_name.lower().endswith("_id"):
@@ -196,7 +249,10 @@ class JoinBuilder:
                     # FK-колонка), convention-join разрешён только для
                     # колонок с is_fk(col_info)=True. Иначе molchanije
                     # ломает symbolic FK-валидацию (см. A11).
-                    if table_a_fk_aware:
+                    if authoritative_fk_columns is not None:
+                        if col_name not in authoritative_fk_columns:
+                            continue
+                    elif table_a_fk_aware:
                         if not (isinstance(col_info, dict) and is_fk(col_info)):
                             continue
                     base = col_name[:-3]  # убираем '_id'
@@ -247,6 +303,11 @@ class JoinBuilder:
         schema = db_schema if db_schema is not None else self.db_schema
         if not schema or table_name not in schema:
             return False
+        table_body = schema.get(table_name, {})
+        if "foreign_keys" in table_body:
+            from .schema_metadata import get_foreign_key_constraints
+
+            return bool(get_foreign_key_constraints(table_name, schema))
         columns = get_table_columns(schema.get(table_name, {}))
         for _, meta in columns.items():
             if isinstance(meta, dict) and is_fk(meta):

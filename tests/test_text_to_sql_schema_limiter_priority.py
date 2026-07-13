@@ -2,6 +2,9 @@
 import pytest
 
 from custom_tools.text_to_sql.validators import SchemaLimiter
+from custom_tools.text_to_sql.validators.schema_limiter import (
+    SchemaContextBudgetExceeded,
+)
 
 
 def _table(columns=None, **extra):
@@ -148,3 +151,180 @@ def test_priority_strategy_env_override(monkeypatch):
     limited = limiter.limit_schema_for_prompt(schema)
 
     assert list(limited.keys()) == ["hub"]
+
+
+def test_query_relevant_column_after_soft_prefix_is_retained(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "20")
+    columns = {
+        f"irrelevant_{index:02d}": {"type": "TEXT"}
+        for index in range(20)
+    }
+    columns["revenue"] = {
+        "type": "DECIMAL",
+        "description": "canonical revenue metric",
+    }
+    diagnostics = {}
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        {"orders": _table(columns)},
+        query_terms=["revenue"],
+        diagnostics=diagnostics,
+    )
+
+    selected = list(limited["orders"]["columns"])
+    assert "revenue" in selected
+    assert len(selected) == 20
+    assert "irrelevant_19" not in selected
+    assert diagnostics["selected_columns"] == 20
+    assert diagnostics["omitted_columns"] == 1
+
+
+def test_table_name_and_raw_substring_do_not_make_columns_mandatory(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    diagnostics = {}
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        {
+            "revenue": _table(
+                {
+                    "ordinary": {"type": "TEXT"},
+                    "prerevenue": {"type": "TEXT"},
+                    "tail": {"type": "TEXT"},
+                }
+            )
+        },
+        query_terms=["Revenue"],
+        diagnostics=diagnostics,
+    )
+
+    assert list(limited["revenue"]["columns"]) == ["ordinary"]
+    assert diagnostics["tables"]["revenue"]["mandatory_columns"] == 0
+    assert diagnostics["soft_limit_overflow"] is False
+
+
+def test_key_and_query_columns_overflow_soft_budget_explicitly(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "2")
+    schema = {
+        "orders": _table(
+            {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "customer_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "customers(id)",
+                },
+                "revenue": {
+                    "type": "DECIMAL",
+                    "description": "requested revenue metric",
+                },
+                "notes": {"type": "TEXT"},
+            }
+        )
+    }
+    diagnostics = {}
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        schema,
+        query_terms=["revenue"],
+        diagnostics=diagnostics,
+    )
+
+    assert list(limited["orders"]["columns"]) == [
+        "id",
+        "customer_id",
+        "revenue",
+    ]
+    table_diagnostics = diagnostics["tables"]["orders"]
+    assert table_diagnostics["mandatory_columns"] == 3
+    assert table_diagnostics["soft_limit_overflow"] == 1
+    assert diagnostics["soft_limit_overflow"] is True
+
+
+@pytest.mark.parametrize(
+    "key_metadata",
+    [
+        {"type": "INTEGER", "constraint_type": "PRIMARY KEY"},
+        {"type": "BIGINT", "is_primary_key": True},
+        {"type": "INTEGER", "references": "parent(id)"},
+    ],
+    ids=["postgres", "mysql", "sqlite"],
+)
+def test_normalized_database_key_shapes_survive_budget(
+    monkeypatch,
+    key_metadata,
+):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    schema = {
+        "records": _table(
+            {
+                "ordinary": {"type": "TEXT"},
+                "key_column": key_metadata,
+                "requested": {"type": "TEXT", "description": "target value"},
+            }
+        )
+    }
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        schema,
+        query_terms=["target"],
+    )
+
+    assert list(limited["records"]["columns"]) == ["key_column", "requested"]
+
+
+def test_mandatory_only_schema_over_hard_cap_raises_with_diagnostics(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    schema = {
+        "orders": _table(
+            {
+                f"primary_key_{index}": {
+                    "type": "INTEGER",
+                    "constraint_type": "PK",
+                    "description": "required key column with long description",
+                }
+                for index in range(4)
+            }
+        )
+    }
+    diagnostics = {}
+
+    with pytest.raises(SchemaContextBudgetExceeded) as exc_info:
+        SchemaLimiter(priority_strategy="insertion").build_schema_summary(
+            schema,
+            hard_max_chars=32,
+            diagnostics=diagnostics,
+        )
+
+    assert exc_info.value.reason_code == "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
+    assert diagnostics["hard_limit_exceeded"] is True
+    assert diagnostics["mandatory_chars"] > diagnostics["hard_max_chars"]
+
+
+def test_hard_cap_trim_recomputes_rendered_column_counts(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "20")
+    schema = {
+        "orders": _table(
+            {
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "notes": {"type": "TEXT"},
+                "status": {"type": "TEXT"},
+            }
+        )
+    }
+    diagnostics = {}
+    mandatory_summary = "orders(id:INTEGER)"
+
+    summary = SchemaLimiter(priority_strategy="insertion").build_schema_summary(
+        schema,
+        hard_max_chars=len(mandatory_summary),
+        diagnostics=diagnostics,
+    )
+
+    assert summary == mandatory_summary
+    assert diagnostics["hard_limit_exceeded"] is False
+    assert diagnostics["selected_columns"] == 1
+    assert diagnostics["omitted_columns"] == 2
+    assert diagnostics["tables"]["orders"]["selected_columns"] == 1
+    assert diagnostics["tables"]["orders"]["omitted_columns"] == 2
+    assert diagnostics["tables"]["orders"]["mandatory_columns"] == 1
+    assert diagnostics["tables"]["orders"]["soft_limit_overflow"] == 0

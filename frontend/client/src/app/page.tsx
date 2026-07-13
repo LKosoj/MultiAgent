@@ -21,6 +21,12 @@ import { CustomSection } from "./components/sections/CustomSection";
 import { Toast, useToast } from "./components/shared/Toast";
 import { KeyValueList } from "./components/shared/KeyValueList";
 import {
+  AuthGate,
+  shouldRenderAdminDbSection,
+  visibleSectionsForAuth,
+  type AuthPrincipal,
+} from "./components/shared/AuthGate";
+import {
   buildWorkflowParameters,
   initialWorkflowParams,
   type WorkflowParams,
@@ -29,8 +35,38 @@ import {
   buildStorybookReadinessPayload,
   extractStorybookReadiness,
 } from "./utils/storybookReadiness";
+import {
+  closeTextToSqlPendingActions,
+  createTextToSqlFollowRegistry,
+  ensureTextToSqlFollowRegistryOpen,
+  resolveTextToSqlStart,
+  resolvePendingRunFailureRequestId,
+  resolvePendingServiceResultRequestId,
+  selectServiceActionAgent,
+  stopTextToSqlFollows,
+  takeTextToSqlPendingAction,
+  trackTextToSqlFollow,
+  type TextToSqlFollowHandle,
+  type TextToSqlFollowRegistry,
+  type TextToSqlStartResponse,
+} from "./utils/textToSqlStart";
 
 const DEFAULT_BACKEND_URL = "http://localhost:8000/agent";
+
+const STUDIO_SECTIONS = [
+  { id: "dashboard", label: "Дашборд" },
+  { id: "agents", label: "Агенты" },
+  { id: "dynamic-agents", label: "Динамические агенты" },
+  { id: "workflows", label: "Workflow" },
+  { id: "text-to-sql", label: "Text-to-SQL" },
+  { id: "db", label: "DB плагины" },
+  { id: "memory", label: "Память/RAG" },
+  { id: "tools", label: "Инструменты" },
+  { id: "config", label: "Конфигурация" },
+  { id: "telemetry", label: "Телеметрия" },
+  { id: "system", label: "Система" },
+  { id: "custom", label: "Произвольные действия" },
+] as const;
 
 type ServiceResult = {
   id: string;
@@ -162,7 +198,13 @@ const getModelKey = (model: unknown) => {
   return stringifyValue(model);
 };
 
-function AguiStudio() {
+type AguiStudioProps = {
+  onForget: () => void;
+  principal: AuthPrincipal;
+  isAdmin: boolean;
+};
+
+function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
   const { agent } = useAgent({ agentId: "default" });
   const { copilotkit } = useCopilotKit();
   const { toasts, dismiss: dismissToast, notify } = useToast();
@@ -388,23 +430,13 @@ function AguiStudio() {
 
   const pendingMapRef = useRef<Map<string, PendingAction>>(new Map());
   const serviceActionQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const textToSqlFollowRef = useRef<TextToSqlFollowRegistry>(
+    createTextToSqlFollowRegistry(),
+  );
   const requestedRunResultsRef = useRef<Set<string>>(new Set());
   const workflowRunLogsInFlightRef = useRef<Set<string>>(new Set());
 
-  const sections = [
-    { id: "dashboard", label: "Дашборд" },
-    { id: "agents", label: "Агенты" },
-    { id: "dynamic-agents", label: "Динамические агенты" },
-    { id: "workflows", label: "Workflow" },
-    { id: "text-to-sql", label: "Text-to-SQL" },
-    { id: "db", label: "DB плагины" },
-    { id: "memory", label: "Память/RAG" },
-    { id: "tools", label: "Инструменты" },
-    { id: "config", label: "Конфигурация" },
-    { id: "telemetry", label: "Телеметрия" },
-    { id: "system", label: "Система" },
-    { id: "custom", label: "Произвольные действия" },
-  ];
+  const sections = visibleSectionsForAuth(STUDIO_SECTIONS, isAdmin);
 
   const appendResult = useCallback((entry: ServiceResult) => {
     setResults((prev) => [entry, ...prev].slice(0, 80));
@@ -412,6 +444,7 @@ function AguiStudio() {
 
   useEffect(() => {
     if (!agent) {
+      setServiceReady(false);
       return () => undefined;
     }
     const subscription = agent.subscribe({
@@ -419,34 +452,42 @@ function AguiStudio() {
         if (!event || typeof event !== "object") {
           return;
         }
+        const isOpen = !textToSqlFollowRef.current.closed;
         const name = (event as { name?: string }).name;
         const value = (event as { value?: unknown }).value;
         if (name === "service.result" && value && typeof value === "object") {
           const payload = value as { action?: string; ok?: boolean; data?: unknown; __request_id?: string };
           const requestId = payload.__request_id;
-          appendResult({
-            id: crypto.randomUUID(),
-            action: payload.action ?? "service.result",
-            status: payload.ok ? "ok" : "error",
-            data: payload.data ?? value,
-            timestamp: nowStamp(),
-          });
-          if (requestId && pendingMapRef.current.has(requestId)) {
-            const pending = pendingMapRef.current.get(requestId);
-            if (pending) {
-              if (payload.ok) {
-                pending.resolve(payload.data);
-              } else {
-                const errorData = payload.data as { error?: unknown } | undefined;
-                pending.reject(new Error(String(errorData?.error ?? `Service action failed: ${payload.action ?? "unknown"}`)));
-              }
-              if (pending.timeoutId) window.clearTimeout(pending.timeoutId);
+          const pendingRequestId = resolvePendingServiceResultRequestId(
+            pendingMapRef.current,
+            { action: payload.action, requestId },
+          );
+          const pending = takeTextToSqlPendingAction(
+            pendingMapRef.current,
+            pendingRequestId,
+            window.clearTimeout,
+          );
+          if (pending) {
+            if (payload.ok) {
+              pending.resolve(payload.data);
+            } else {
+              const errorData = payload.data as { error?: unknown } | undefined;
+              pending.reject(new Error(String(errorData?.error ?? `Service action failed: ${payload.action ?? "unknown"}`)));
             }
-            pendingMapRef.current.delete(requestId);
-            setPendingTick((tick) => tick + 1);
+          }
+          if (isOpen) {
+            appendResult({
+              id: crypto.randomUUID(),
+              action: payload.action ?? "service.result",
+              status: payload.ok ? "ok" : "error",
+              data: payload.data ?? value,
+              timestamp: nowStamp(),
+            });
+            if (pending) setPendingTick((tick) => tick + 1);
           }
           return;
         }
+        if (!isOpen) return;
         if (name === "service.log" || name === "service.progress") {
           appendResult({
             id: crypto.randomUUID(),
@@ -469,28 +510,33 @@ function AguiStudio() {
           }
         }
       },
-      onRunFailed: ({ error }) => {
-        if (pendingMapRef.current.size) {
-          pendingMapRef.current.forEach((pending) => {
-            pending.reject(error);
-            if (pending.timeoutId) window.clearTimeout(pending.timeoutId);
+      onRunFailed: ({ error, input }) => {
+        const isOpen = !textToSqlFollowRef.current.closed;
+        const requestId = resolvePendingRunFailureRequestId(
+          pendingMapRef.current,
+          input,
+        );
+        const pending = takeTextToSqlPendingAction(
+          pendingMapRef.current,
+          requestId,
+          window.clearTimeout,
+        );
+        pending?.reject(error);
+        if (isOpen) {
+          if (pending) setPendingTick((tick) => tick + 1);
+          appendResult({
+            id: crypto.randomUUID(),
+            action: "run.error",
+            status: "error",
+            data: { message: error.message },
+            timestamp: nowStamp(),
           });
-          pendingMapRef.current.clear();
-          setPendingTick((tick) => tick + 1);
         }
-        appendResult({
-          id: crypto.randomUUID(),
-          action: "run.error",
-          status: "error",
-          data: { message: error.message },
-          timestamp: nowStamp(),
-        });
       },
     });
 
     setServiceReady(true);
     return () => {
-      setServiceReady(false);
       subscription.unsubscribe();
     };
   }, [agent, appendResult]);
@@ -498,6 +544,14 @@ function AguiStudio() {
   type ServiceActionOptions = {
     trackPending?: boolean;
     timeoutMs?: number;
+    backgroundFollow?: (
+      followAgent: {
+        abortRun: () => void;
+        detachActiveRun?: () => Promise<void>;
+      },
+      follow: Promise<void>,
+      requestId: string,
+    ) => TextToSqlFollowHandle;
   };
 
   const runServiceAction = useCallback(
@@ -515,6 +569,7 @@ function AguiStudio() {
       const isStreamAction = action === "logs.stream" || action === "progress.stream";
       const timeoutMs = options?.timeoutMs ?? actionTimeouts[action] ?? (isStreamAction ? 30000 : 20000);
       const runQueuedAction = async () => {
+        ensureTextToSqlFollowRegistryOpen(textToSqlFollowRef.current);
         const previousProps = { ...copilotkit.properties };
         const promise = new Promise<unknown>((resolve, reject) => {
           pendingMapRef.current.set(requestId, {
@@ -525,19 +580,26 @@ function AguiStudio() {
             timeoutId:
               timeoutMs > 0
                 ? window.setTimeout(() => {
-                  const pending = pendingMapRef.current.get(requestId);
+                  const pending = takeTextToSqlPendingAction(
+                    pendingMapRef.current,
+                    requestId,
+                    window.clearTimeout,
+                  );
                   if (!pending) return;
-                    if (allowNoResult) {
-                      pending.resolve(null);
-                    } else {
-                      pending.reject(new Error(`Таймаут запроса: ${action}`));
-                    }
-                    pendingMapRef.current.delete(requestId);
+                  if (allowNoResult) {
+                    pending.resolve(null);
+                  } else {
+                    pending.reject(new Error(`Таймаут запроса: ${action}`));
+                  }
+                  if (!textToSqlFollowRef.current.closed) {
                     setPendingTick((tick) => tick + 1);
-                  }, timeoutMs)
+                  }
+                }, timeoutMs)
                 : undefined,
           });
-          setPendingTick((tick) => tick + 1);
+          if (!textToSqlFollowRef.current.closed) {
+            setPendingTick((tick) => tick + 1);
+          }
         });
         promise.catch(() => undefined);
 
@@ -547,8 +609,17 @@ function AguiStudio() {
           service_payload: enrichedPayload,
         });
 
-        const runAgentPromise = copilotkit.runAgent({ agent });
+        const actionAgent = selectServiceActionAgent(
+          agent,
+          Boolean(options?.backgroundFollow),
+        );
+        const runAgentPromise = copilotkit.runAgent({ agent: actionAgent });
         runAgentPromise.catch(() => undefined);
+        const backgroundFollow = options?.backgroundFollow?.(
+          actionAgent,
+          runAgentPromise.then(() => undefined),
+          requestId,
+        );
 
         try {
           if (allowNoResult) {
@@ -560,48 +631,70 @@ function AguiStudio() {
               await runAgentPromise;
               return outcome.value;
             }
-            const pending = pendingMapRef.current.get(requestId);
+            const pending = takeTextToSqlPendingAction(
+              pendingMapRef.current,
+              requestId,
+              window.clearTimeout,
+            );
             if (pending) {
               pending.resolve(null);
-              if (pending.timeoutId) window.clearTimeout(pending.timeoutId);
-              pendingMapRef.current.delete(requestId);
-              setPendingTick((tick) => tick + 1);
+              if (!textToSqlFollowRef.current.closed) {
+                setPendingTick((tick) => tick + 1);
+              }
             }
             await runAgentPromise;
             return await promise;
           }
-          const value = await promise;
+          const value = backgroundFollow
+            ? await resolveTextToSqlStart(
+              promise,
+              textToSqlFollowRef.current,
+              requestId,
+              backgroundFollow,
+            )
+            : await promise;
+          if (backgroundFollow) {
+            return value;
+          }
           await runAgentPromise;
           return value;
         } catch (err) {
           // Важно: если транспорт (fetch/SSE) упал до получения ответа,
           // нужно снять pending, иначе UI "зависнет" с незавершённым запросом.
-          const pending = pendingMapRef.current.get(requestId);
+          const pending = takeTextToSqlPendingAction(
+            pendingMapRef.current,
+            requestId,
+            window.clearTimeout,
+          );
           if (pending) {
             pending.reject(err instanceof Error ? err : new Error(String(err)));
-            if (pending.timeoutId) window.clearTimeout(pending.timeoutId);
-            pendingMapRef.current.delete(requestId);
-            setPendingTick((tick) => tick + 1);
+            if (!textToSqlFollowRef.current.closed) {
+              setPendingTick((tick) => tick + 1);
+            }
           }
 
           const message = err instanceof Error ? err.message : String(err);
-          appendResult({
-            id: crypto.randomUUID(),
-            action: "run.error",
-            status: "error",
-            data: {
-              message,
-              action,
-              request_id: requestId,
-              // Иногда это чисто сетевой сбой/blocked by CORS; URL помогает быстро диагностировать.
-              agent_url: (agent as any)?.url ?? null,
-            },
-            timestamp: nowStamp(),
-          });
+          if (!textToSqlFollowRef.current.closed) {
+            appendResult({
+              id: crypto.randomUUID(),
+              action: "run.error",
+              status: "error",
+              data: {
+                message,
+                action,
+                request_id: requestId,
+                // Иногда это чисто сетевой сбой/blocked by CORS; URL помогает быстро диагностировать.
+                agent_url: (agent as any)?.url ?? null,
+              },
+              timestamp: nowStamp(),
+            });
+          }
 
           throw err;
         } finally {
-          copilotkit.setProperties(previousProps);
+          if (!textToSqlFollowRef.current.closed) {
+            copilotkit.setProperties(previousProps);
+          }
         }
       };
 
@@ -614,6 +707,40 @@ function AguiStudio() {
     },
     [copilotkit, agent, appendResult],
   );
+
+  const startTextToSqlRun = useCallback(
+    async (payload: Record<string, unknown>): Promise<TextToSqlStartResponse> => (
+      await runServiceAction(
+        "presets.text_to_sql.generate",
+        payload,
+        {
+          timeoutMs: 30000,
+          backgroundFollow: (followAgent, follow, requestId) => trackTextToSqlFollow(
+            textToSqlFollowRef.current,
+            requestId,
+            followAgent,
+            follow,
+          ),
+        },
+      ) as TextToSqlStartResponse
+    ),
+    [runServiceAction],
+  );
+
+  useEffect(() => {
+    const registry = textToSqlFollowRef.current;
+    const pending = pendingMapRef.current;
+    registry.closed = false;
+    return () => {
+      closeTextToSqlPendingActions(
+        registry,
+        pending,
+        new Error("Service action cancelled: page disposed"),
+        window.clearTimeout,
+      );
+      void stopTextToSqlFollows(registry);
+    };
+  }, []);
 
   useEffect(() => {
     currentWorkflowRunIdRef.current = currentWorkflowRunId;
@@ -1336,9 +1463,14 @@ function AguiStudio() {
           <div className="app-title">MultiAgent Studio</div>
           <div className="app-subtitle">Центр управления запусками, сервисными функциями и мониторинга</div>
         </div>
-        <span className={`status-pill ${serviceReady ? "status-pill--online" : "status-pill--offline"}`}>
-          {serviceReady ? "Online" : "Offline"}
-        </span>
+        <div className="button-row">
+          <span className={`status-pill ${serviceReady ? "status-pill--online" : "status-pill--offline"}`}>
+            {serviceReady ? "Online" : "Offline"}
+          </span>
+          <button className="button ghost" type="button" onClick={onForget}>
+            Forget
+          </button>
+        </div>
       </header>
 
       <main className="app-grid">
@@ -1488,15 +1620,17 @@ function AguiStudio() {
           <div hidden={activeSection !== "text-to-sql"}>
             <TextToSqlSection
               runServiceAction={runServiceAction}
+              startTextToSqlRun={startTextToSqlRun}
               isBusy={isBusy}
               active={activeSection === "text-to-sql"}
               notify={notify}
             />
           </div>
 
-          {activeSection === "db" ? (
+          {shouldRenderAdminDbSection(activeSection, isAdmin) ? (
             <DbSection
               isBusy={isBusy}
+              runServiceAction={runServiceAction}
               dbTab={dbTab}
               setDbTab={setDbTab}
               dbPlugins={dbPlugins}
@@ -1788,14 +1922,49 @@ function AguiStudio() {
   );
 }
 
-export default function Page() {
-  const backendUrl = normalizeAgentUrl(process.env.NEXT_PUBLIC_AG_UI_URL || DEFAULT_BACKEND_URL);
-  const agent = useMemo(() => new HttpConnectAgent({ url: backendUrl }), [backendUrl]);
+type AuthenticatedStudioProps = {
+  backendUrl: string;
+  headers: Record<string, string>;
+  principal: AuthPrincipal;
+  isAdmin: boolean;
+  onForget: () => void;
+};
+
+function AuthenticatedStudio({
+  backendUrl,
+  headers,
+  principal,
+  isAdmin,
+  onForget,
+}: AuthenticatedStudioProps) {
+  const agent = useMemo(
+    () => new HttpConnectAgent({ url: backendUrl, headers }),
+    [backendUrl, headers],
+  );
 
   return (
     <CopilotKitProvider agents__unsafe_dev_only={{ default: agent as any }} renderToolCalls={[wildcardRenderer]} showDevConsole="auto">
-      <AguiStudio />
+      <AguiStudio principal={principal} isAdmin={isAdmin} onForget={onForget} />
     </CopilotKitProvider>
+  );
+}
+
+export default function Page() {
+  const backendUrl = normalizeAgentUrl(process.env.NEXT_PUBLIC_AG_UI_URL || DEFAULT_BACKEND_URL);
+  const authUrl = backendUrl.replace(/\/agent$/, "/v1/auth/me");
+
+  return (
+    <AuthGate authUrl={authUrl}>
+      {({ headers, principal, isAdmin, onForget }) => (
+        <AuthenticatedStudio
+          backendUrl={backendUrl}
+          headers={headers}
+          principal={principal}
+          isAdmin={isAdmin}
+          onForget={onForget}
+        />
+      )}
+    </AuthGate>
   );
 }
 

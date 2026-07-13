@@ -1,0 +1,170 @@
+name: multiagent-text2sql
+
+x-backend: &backend
+  image: ${BACKEND_IMAGE:?BACKEND_IMAGE is required}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.backend
+    args:
+      SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}
+  user: "10001:10001"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=512m,uid=10001,gid=10001
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_signal: SIGTERM
+  stop_grace_period: 60s
+  init: true
+  cpus: 4.0
+  mem_limit: 8g
+  environment:
+    AG_UI_AUTH_MODE: ${AG_UI_AUTH_MODE:-required}
+    AG_UI_AUTH_TOKEN_MAP_FILE: /run/secrets/ag_ui_auth_token_map
+    API_GRACEFUL_TIMEOUT_SECONDS: "45"
+    HF_TOKEN_FILE: /run/secrets/hf_token
+    OPENAI_API_KEY_DB_FILE: /run/secrets/openai_api_key_db
+    OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
+    SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}
+    TEXT_TO_SQL_ALLOWED_DB_CIDRS: ${TEXT_TO_SQL_ALLOWED_DB_CIDRS:?TEXT_TO_SQL_ALLOWED_DB_CIDRS is required}
+    TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS: ${TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS:?TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS is required}
+    TEXT_TO_SQL_ALLOWED_DB_SCHEMES: ${TEXT_TO_SQL_ALLOWED_DB_SCHEMES:?TEXT_TO_SQL_ALLOWED_DB_SCHEMES is required}
+    TEXT_TO_SQL_ALLOWED_DB_TARGETS: ${TEXT_TO_SQL_ALLOWED_DB_TARGETS:?TEXT_TO_SQL_ALLOWED_DB_TARGETS is required}
+    TEXT2SQL_ENABLED_PROBE_LANES: ${TEXT2SQL_ENABLED_PROBE_LANES:-postgres,mysql}
+    TEXT2SQL_PROBE_MYSQL_DSN: ${TEXT2SQL_MYSQL_DSN:?TEXT2SQL_MYSQL_DSN is required}
+    TEXT2SQL_PROBE_POSTGRES_DSN: ${TEXT2SQL_POSTGRES_DSN:?TEXT2SQL_POSTGRES_DSN is required}
+    TEXT2SQL_TARGET_POLICY_SHA256: ${TEXT2SQL_TARGET_POLICY_SHA256:?TEXT2SQL_TARGET_POLICY_SHA256 is required}
+    WEB_CONCURRENCY: "1"
+  secrets:
+    - ag_ui_auth_token_map
+    - hf_token
+    - openai_api_key
+    - openai_api_key_db
+  volumes:
+    - text2sql-data:/app/data
+    - text2sql-logs:/app/logs
+    - text2sql-memory:/var/lib/multiagent-memory
+    - text2sql-model-cache:/home/app/.cache/huggingface
+  deploy:
+    resources:
+      limits:
+        cpus: "4.0"
+        memory: 8g
+        pids: 512
+      reservations:
+        cpus: "0.5"
+        memory: 1g
+
+services:
+  migrate:
+    <<: *backend
+    command: ["migrate"]
+    restart: "no"
+
+  api:
+    <<: *backend
+    command: ["api"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - 127.0.0.1:${API_PORT:-8000}:8000
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - >-
+          import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=5)
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 30s
+
+  worker:
+    <<: *backend
+    command: ["worker"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import os; os.kill(1, 0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  frontend:
+    image: ${FRONTEND_IMAGE:?FRONTEND_IMAGE is required}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+      args:
+        NEXT_BUILD_ID: ${NEXT_BUILD_ID:?NEXT_BUILD_ID is required}
+        NEXT_PUBLIC_AG_UI_URL: ${TEXT2SQL_PUBLIC_API_URL:?TEXT2SQL_PUBLIC_API_URL is required}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,uid=10001,gid=10001
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_signal: SIGTERM
+    stop_grace_period: 30s
+    init: true
+    cpus: 1.0
+    mem_limit: 1g
+    environment:
+      PORT: "3000"
+      SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - 127.0.0.1:${FRONTEND_PORT:-5173}:3000
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000').then(response => {
+            if (!response.ok) process.exit(1)
+          }).catch(() => process.exit(1))
+      interval: 15s
+      timeout: 6s
+      retries: 8
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1g
+          pids: 128
+        reservations:
+          cpus: "0.25"
+          memory: 256m
+
+volumes:
+  text2sql-data:
+  text2sql-logs:
+  text2sql-memory:
+  text2sql-model-cache:
+
+secrets:
+  ag_ui_auth_token_map:
+    file: ${AG_UI_AUTH_TOKEN_MAP_FILE:-./secrets/ag_ui_auth_token_map}
+  hf_token:
+    file: ${HF_TOKEN_FILE:-./secrets/hf_token}
+  openai_api_key:
+    file: ${OPENAI_API_KEY_FILE:-./secrets/openai_api_key}
+  openai_api_key_db:
+    file: ${OPENAI_API_KEY_DB_FILE:-./secrets/openai_api_key_db}

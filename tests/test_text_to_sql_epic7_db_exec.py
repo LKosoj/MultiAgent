@@ -20,6 +20,9 @@ import pytest
 from custom_tools.text_to_sql import core as core_module
 from custom_tools.text_to_sql.core import secure_db_executor
 from custom_tools.text_to_sql.core._db_exec import (
+    QueryExecutionRequest,
+    QueryExecutor,
+    QueryPurpose,
     _build_failure_result,
     _classify_statement,
     _classify_statement_regex,
@@ -30,6 +33,61 @@ from custom_tools.text_to_sql.core._db_exec import (
     _parse_statement_timeout_ms,
     _parse_table_parts_from_describe,
 )
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
+from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded
+
+
+class _NativeDatabaseCapabilityDouble:
+    dialect = "sqlite"
+
+    def get_capabilities(self, _dsn=None):
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=Capability.supported(
+                EnforcementMode.READ_ONLY_FILE,
+                "TEST_READ_ONLY",
+            ),
+            statement_timeout=Capability.supported(
+                EnforcementMode.DATABASE,
+                "TEST_DATABASE_TIMEOUT",
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.DRIVER,
+                "TEST_DRIVER_CANCELLATION",
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE,
+                "TEST_EXPLAIN",
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE,
+                "TEST_INTROSPECTION",
+            ),
+            composite_fk_introspection=Capability.supported(
+                EnforcementMode.DATABASE,
+                "TEST_COMPOSITE_FK",
+            ),
+            parameter_binding=Capability.supported(
+                EnforcementMode.DRIVER,
+                "TEST_PARAMETER_BINDING",
+            ),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, timeout_ms):
+        self._test_timeout_ms = timeout_ms
 
 
 # === 7.8: _normalize_jsonable ===
@@ -82,6 +140,17 @@ def test_normalize_executor_result_preserves_data_columns_after_refactor():
     assert result["columns"] == ["a", "b"]
 
 
+def test_normalize_executor_result_rejects_unknown_pre_execution_code():
+    with pytest.raises(ValueError, match="pre_execution_error_code"):
+        _normalize_executor_result(
+            {"success": False},
+            start_time=time.time(),
+            sql_query="SELECT 1",
+            row_limit=None,
+            pre_execution_error_code="UNKNOWN",
+        )
+
+
 def test_parse_row_limit_rejects_explicit_value_above_max_cap(monkeypatch):
     monkeypatch.setenv("DB_EXECUTOR_MAX_ROW_LIMIT", "10")
 
@@ -90,6 +159,7 @@ def test_parse_row_limit_rejects_explicit_value_above_max_cap(monkeypatch):
     assert value is None
     assert failure["success"] is False
     assert "exceeds DB_EXECUTOR_MAX_ROW_LIMIT" in failure["error_message"]
+    assert failure["applied_row_limit"] == 11
 
 
 def test_parse_row_limit_rejects_env_value_above_max_cap(monkeypatch):
@@ -101,6 +171,18 @@ def test_parse_row_limit_rejects_env_value_above_max_cap(monkeypatch):
     assert value is None
     assert failure["success"] is False
     assert "exceeds DB_EXECUTOR_MAX_ROW_LIMIT" in failure["error_message"]
+    assert failure["applied_row_limit"] == 20
+
+
+def test_parse_row_limit_preserves_requested_limit_when_max_env_is_invalid(monkeypatch):
+    monkeypatch.setenv("DB_EXECUTOR_MAX_ROW_LIMIT", "invalid")
+
+    value, failure = _parse_row_limit(7, time.time(), "SELECT 1")
+
+    assert value is None
+    assert failure["success"] is False
+    assert "Invalid DB_EXECUTOR_MAX_ROW_LIMIT" in failure["error_message"]
+    assert failure["applied_row_limit"] == 7
 
 
 def test_parse_statement_timeout_rejects_invalid_env(monkeypatch):
@@ -111,6 +193,53 @@ def test_parse_statement_timeout_rejects_invalid_env(monkeypatch):
     assert value is None
     assert failure["success"] is False
     assert "DB_EXECUTOR_STATEMENT_TIMEOUT_MS must be a positive integer" in failure["error_message"]
+    assert failure["applied_row_limit"] is None
+    assert failure["pre_execution_error_code"] == "INVALID_STATEMENT_TIMEOUT"
+
+
+@pytest.mark.parametrize(
+    ("explicit_row_limit", "env_row_limit"),
+    [
+        ("invalid", None),
+        (0, None),
+        (None, "invalid"),
+        (None, "0"),
+    ],
+)
+def test_invalid_row_limit_has_explicit_pre_execution_code(
+    monkeypatch,
+    explicit_row_limit,
+    env_row_limit,
+):
+    if env_row_limit is not None:
+        monkeypatch.setenv("DB_EXECUTOR_ROW_LIMIT", env_row_limit)
+
+    value, failure = _parse_row_limit(
+        explicit_row_limit,
+        time.time(),
+        "SELECT 1",
+    )
+
+    assert value is None
+    assert failure["success"] is False
+    assert failure["applied_row_limit"] is None
+    assert failure["pre_execution_error_code"] == "INVALID_ROW_LIMIT"
+
+
+def test_secure_executor_timeout_config_failure_preserves_effective_row_limit(monkeypatch):
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "invalid")
+
+    result = secure_db_executor(
+        "SELECT 1",
+        row_limit=7,
+        dsn="sqlite:///unused.db",
+        dry_run_only=True,
+    )
+
+    assert result["success"] is False
+    assert "Invalid DB_EXECUTOR_STATEMENT_TIMEOUT_MS" in result["error_message"]
+    assert result["sql_query"] == "SELECT 1"
+    assert result["applied_row_limit"] == 7
 
 
 # === 7.25: _build_failure_result helper ===
@@ -192,7 +321,7 @@ def test_extract_explain_body_rejects_non_explain():
 def test_secure_executor_connect_failure_does_not_call_close(monkeypatch):
     close_calls = []
 
-    class Plugin:
+    class Plugin(_NativeDatabaseCapabilityDouble):
         def connect(self, dsn):
             raise RuntimeError("conn refused")
 
@@ -215,7 +344,7 @@ def test_secure_executor_connect_failure_does_not_call_close(monkeypatch):
 def test_secure_executor_select_failure_still_closes_conn(monkeypatch):
     close_calls = []
 
-    class Plugin:
+    class Plugin(_NativeDatabaseCapabilityDouble):
         def connect(self, dsn):
             return "the-conn"
 
@@ -241,7 +370,7 @@ def test_secure_executor_select_failure_still_closes_conn(monkeypatch):
 def test_secure_executor_applies_statement_timeout_before_select(monkeypatch):
     calls = []
 
-    class Plugin:
+    class Plugin(_NativeDatabaseCapabilityDouble):
         def connect(self, dsn):
             calls.append(("connect", dsn))
             return "the-conn"
@@ -285,7 +414,7 @@ def test_secure_executor_applies_statement_timeout_before_select(monkeypatch):
 
 
 def test_secure_executor_returns_failure_when_statement_timeout_hook_fails(monkeypatch):
-    class Plugin:
+    class Plugin(_NativeDatabaseCapabilityDouble):
         def connect(self, dsn):
             return "the-conn"
 
@@ -311,6 +440,7 @@ def test_secure_executor_returns_failure_when_statement_timeout_hook_fails(monke
 
     assert result["success"] is False
     assert "timeout setup failed" in result["error_message"]
+    assert result["timeout_enforcement_mode"] == "none"
 
 
 def test_postgres_plugin_sets_statement_timeout():
@@ -340,6 +470,198 @@ def test_postgres_plugin_sets_statement_timeout():
 
     assert conn.cursor_obj.statements == ["SET statement_timeout = 2500"]
     assert conn.cursor_obj.closed is True
+
+
+def test_query_executor_final_purpose_dry_run_skips_database_connection(monkeypatch):
+    monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setattr(
+        core_module,
+        "sql_safety_check",
+        lambda sql_query, dsn=None: {"is_safe": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        core_module,
+        "get_plugin",
+        lambda dsn: (_ for _ in ()).throw(
+            AssertionError("FINAL dry-run must not open the database")
+        ),
+    )
+
+    result = QueryExecutor().execute(
+        QueryExecutionRequest(
+            sql_query="SELECT 1",
+            purpose=QueryPurpose.FINAL,
+            row_limit=5,
+            dsn="sqlite:///tmp/app.db",
+        )
+    )
+
+    assert result.purpose is QueryPurpose.FINAL
+    assert result.success is True
+    assert result.executed is False
+    assert result.skipped_execution is True
+
+
+@pytest.mark.parametrize(
+    "purpose",
+    [
+        QueryPurpose.DISTINCT,
+        QueryPurpose.GROUNDING,
+        QueryPurpose.CONTAINMENT,
+    ],
+)
+def test_query_executor_preparation_reads_execute_during_dry_run(
+    monkeypatch,
+    purpose,
+):
+    calls = []
+
+    class Plugin(_NativeDatabaseCapabilityDouble):
+        def connect(self, dsn):
+            calls.append(("connect", dsn))
+            return "conn"
+
+        def close(self, conn):
+            calls.append(("close", conn))
+
+        def execute_select(self, conn, sql, row_limit=500):
+            calls.append(("execute", conn, sql, row_limit))
+            return {
+                "success": True,
+                "data": [[1]],
+                "columns": ["one"],
+                "rows_affected": 1,
+                "error_message": None,
+            }
+
+    dsn = "sqlite:///tmp/app.db"
+    monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setattr(core_module, "get_plugin", lambda _dsn: Plugin())
+    monkeypatch.setattr(
+        core_module,
+        "sql_safety_check",
+        lambda sql_query, dsn=None: {"is_safe": True, "issues": []},
+    )
+
+    result = QueryExecutor().execute(
+        QueryExecutionRequest(
+            sql_query="SELECT 1",
+            purpose=purpose,
+            row_limit=7,
+            dsn=dsn,
+        )
+    )
+
+    assert result.success is True
+    assert result.executed is True
+    assert result.skipped_execution is False
+    assert result.to_mapping()["dry_run_only"] is False
+    assert calls == [
+        ("connect", dsn),
+        ("execute", "conn", "SELECT 1", 7),
+        ("close", "conn"),
+    ]
+
+
+def test_query_executor_rejects_statement_outside_purpose_before_connect(
+    monkeypatch,
+):
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setattr(
+        core_module,
+        "get_plugin",
+        lambda dsn: (_ for _ in ()).throw(
+            AssertionError("invalid purpose must not connect")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="DISTINCT.*SELECT"):
+        QueryExecutor().execute(
+            QueryExecutionRequest(
+                sql_query="EXPLAIN SELECT 1",
+                purpose=QueryPurpose.DISTINCT,
+                row_limit=5,
+                dsn="sqlite:///tmp/app.db",
+            )
+        )
+
+
+def test_query_executor_expired_deadline_prevents_connection(monkeypatch):
+    monkeypatch.setattr(
+        core_module,
+        "get_plugin",
+        lambda dsn: (_ for _ in ()).throw(
+            AssertionError("expired deadline must not connect")
+        ),
+    )
+    deadline = DeadlineBudget(
+        deadline_monotonic=10.0,
+        deadline_at_ms=1,
+        monotonic=lambda: 10.0,
+    )
+
+    with pytest.raises(WorkflowDeadlineExceeded):
+        QueryExecutor().execute(
+            QueryExecutionRequest(
+                sql_query="SELECT 1",
+                purpose=QueryPurpose.GROUNDING,
+                row_limit=5,
+                dsn="sqlite:///tmp/app.db",
+                deadline=deadline,
+            )
+        )
+
+
+def test_query_executor_caps_statement_timeout_to_remaining_deadline(monkeypatch):
+    calls = []
+
+    class Plugin(_NativeDatabaseCapabilityDouble):
+        def connect(self, dsn):
+            return "conn"
+
+        def close(self, conn):
+            return None
+
+        def set_statement_timeout(self, conn, timeout_ms):
+            calls.append(timeout_ms)
+
+        def execute_select(self, conn, sql, row_limit=500):
+            return {
+                "success": True,
+                "data": [[1]],
+                "columns": ["one"],
+                "rows_affected": 1,
+                "error_message": None,
+            }
+
+    monkeypatch.setenv("USE_SQLGLOT", "1")
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "5000")
+    monkeypatch.setattr(core_module, "get_plugin", lambda _dsn: Plugin())
+    monkeypatch.setattr(
+        core_module,
+        "sql_safety_check",
+        lambda sql_query, dsn=None: {"is_safe": True, "issues": []},
+    )
+    deadline = DeadlineBudget(
+        deadline_monotonic=10.25,
+        deadline_at_ms=1,
+        monotonic=lambda: 10.0,
+    )
+
+    result = QueryExecutor().execute(
+        QueryExecutionRequest(
+            sql_query="SELECT 1",
+            purpose=QueryPurpose.CONTAINMENT,
+            row_limit=5,
+            dsn="sqlite:///tmp/app.db",
+            deadline=deadline,
+        )
+    )
+
+    assert result.success is True
+    assert calls == [250]
 
 
 # === 7.6/7.2: routing через sqlglot ===

@@ -338,6 +338,14 @@ def save_successful_sql(
     user_query: str = "",
     execution_result: str = "",
     dsn: str | None = None,
+    *,
+    namespace_version_key: str | None = None,
+    dialect: str | None = None,
+    run_id: str | None = None,
+    approved: bool | None = None,
+    executed: bool | None = None,
+    execution_success: bool | None = None,
+    audited: bool | None = None,
 ) -> Dict[str, str]:
     """Сохраняет успешно выполненный SQL-запрос в файл sqlrag/<sanitized>_<hash>.md.
 
@@ -361,6 +369,28 @@ def save_successful_sql(
         )
 
     try:
+
+        if namespace_version_key is not None:
+            from ..dialects import get_current_dialect_name
+            from ..successful_sql_memory import save_successful_sql_example
+            from memory.index_consistency import SemanticIndexStatus
+
+            receipt = save_successful_sql_example(
+                namespace_version_key=namespace_version_key,
+                user_query=user_query,
+                sql=sql_query,
+                dialect=dialect or get_current_dialect_name(effective_dsn, strict=True),
+                run_id=run_id,
+                approved=approved,
+                executed=executed,
+                execution_success=execution_success,
+                audited=audited,
+            )
+            if receipt.status is SemanticIndexStatus.FAILED:
+                return {
+                    "status": "error",
+                    "error": receipt.error_code or "successful SQL memory persistence failed",
+                }
 
         # Получаем санитизированный DSN.
         session_id = dsn_to_sanitized_name(effective_dsn) or "default"

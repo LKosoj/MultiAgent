@@ -335,6 +335,22 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                 return obj
         
         cleaned_data = clean_data_for_json(data)
+
+        from .index_consistency import (
+            SEMANTIC_CACHE_KINDS,
+            is_valid_semantic_id,
+        )
+
+        cache_kind = cleaned_data.get("cache_kind") if isinstance(cleaned_data, dict) else None
+        semantic_id = cleaned_data.get("semantic_id") if isinstance(cleaned_data, dict) else None
+        if semantic_id is not None:
+            if cache_kind not in SEMANTIC_CACHE_KINDS or not is_valid_semantic_id(
+                cache_kind,
+                semantic_id,
+            ):
+                return -1
+        elif cache_kind == "successful_sql_example":
+            return -1
         
         # Проверяем, что очищенные данные можно сериализовать в JSON.
         # 4.6: компактный стабильный формат (separators + sort_keys) — единая
@@ -362,9 +378,56 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
             next_step = None
             current_time = None
             max_attempts = 3
+            reused_semantic_row = False
             for attempt in range(1, max_attempts + 1):
                 try:
                     cursor.execute("BEGIN IMMEDIATE")
+                    if semantic_id is not None:
+                        ignored_semantic_fields = {
+                            "needs_reindex",
+                            "reindex_error",
+                            "reindex_updated_at",
+                        }
+                        if cache_kind == "successful_sql_example":
+                            ignored_semantic_fields.update({"run_id", "saved_at"})
+                        cursor.execute(
+                            """
+                            SELECT step, data
+                            FROM agent_memory
+                            WHERE session_id = ? AND agent_name = ? AND valid_to IS NULL
+                            ORDER BY step
+                            """,
+                            (session_id, agent_name),
+                        )
+                        expected_payload = {
+                            key: value
+                            for key, value in cleaned_data.items()
+                            if key not in ignored_semantic_fields
+                        }
+                        for existing_step, existing_json in cursor.fetchall():
+                            try:
+                                existing_payload = json.loads(existing_json)
+                            except (TypeError, json.JSONDecodeError):
+                                continue
+                            if not isinstance(existing_payload, dict):
+                                continue
+                            if existing_payload.get("semantic_id") != semantic_id:
+                                continue
+                            comparable = {
+                                key: value
+                                for key, value in existing_payload.items()
+                                if key not in ignored_semantic_fields
+                            }
+                            if comparable != expected_payload:
+                                conn.rollback()
+                                return -1
+                            cleaned_data = existing_payload
+                            next_step = int(existing_step)
+                            reused_semantic_row = True
+                            break
+                    if reused_semantic_row:
+                        conn.commit()
+                        break
                     cursor.execute("""
                         SELECT MAX(step)
                         FROM agent_memory
@@ -398,6 +461,7 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
             memory_manager.is_memory_updated = True
             
             # Сохраняем в ChromaDB для семантического поиска
+            index_error = None
             if memory_manager.db_handler.tactical_collection and memory_manager.db_handler.embedding_model:
                 try:
                     text_content = extract_tactical_chroma_text(
@@ -407,8 +471,13 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                     if text_content:
                         embedding = memory_manager._create_embedding(text_content, purpose="passage")
                         if embedding:
-                            # Создаем составной ID для связи с SQLite
-                            tactical_id = f"{session_id}-{agent_name}-{next_step}"
+                            # Semantic records use their canonical cross-store ID;
+                            # legacy records retain the historical step-derived ID.
+                            tactical_id = (
+                                str(semantic_id)
+                                if semantic_id is not None
+                                else f"{session_id}-{agent_name}-{next_step}"
+                            )
                             
                             # Извлекаем ключевые поля из data для метаданных ChromaDB
                             chroma_metadata = {
@@ -417,6 +486,8 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                                 "step": next_step,
                                 "tactical_id": tactical_id
                             }
+                            if semantic_id is not None:
+                                chroma_metadata["semantic_id"] = str(semantic_id)
 
                             # run_id нужен для режима scope_read=own_run (фильтрация на уровне Chroma)
                             if run_id:
@@ -439,41 +510,54 @@ def save_memory(session_id: str, agent_name: str, data: Dict,
                                         # Преобразуем в строку для совместимости с ChromaDB
                                         chroma_metadata[field] = str(cleaned_data[field])
                             
-                            memory_manager.db_handler.tactical_collection.add(
+                            write = (
+                                memory_manager.db_handler.tactical_collection.upsert
+                                if semantic_id is not None
+                                else memory_manager.db_handler.tactical_collection.add
+                            )
+                            write(
                                 embeddings=[embedding],
                                 documents=[text_content],
                                 metadatas=[chroma_metadata],
-                                ids=[tactical_id]
+                                ids=[tactical_id],
                             )
+                        elif semantic_id is not None:
+                            raise RuntimeError("semantic memory embedding is unavailable")
+                    elif semantic_id is not None:
+                        raise ValueError("semantic memory payload has no indexable text")
                 except Exception as e:
-                    if isinstance(cleaned_data, dict):
-                        marked_data = dict(cleaned_data)
-                        marked_data["needs_reindex"] = True
-                        marked_data["reindex_error"] = str(e)
-                        marked_data["reindex_updated_at"] = _utc_now_iso()
-                        cursor.execute(
-                            """
-                            UPDATE agent_memory
-                            SET data = ?, updated_at = ?
-                            WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
-                            """,
-                            (
-                                _json_dumps_memory_data(marked_data),
-                                marked_data["reindex_updated_at"],
-                                session_id,
-                                agent_name,
-                                next_step,
-                            ),
-                        )
-                        conn.commit()
-                    logger.warning(
-                        "Failed to save tactical memory row to ChromaDB; "
-                        "SQLite row marked needs_reindex (session=%s agent=%s step=%s): %s",
+                    index_error = e
+            elif semantic_id is not None:
+                index_error = RuntimeError("semantic memory index backend is unavailable")
+
+            if index_error is not None and isinstance(cleaned_data, dict):
+                marked_data = dict(cleaned_data)
+                marked_data["needs_reindex"] = True
+                marked_data["reindex_error"] = str(index_error)
+                marked_data["reindex_updated_at"] = _utc_now_iso()
+                cursor.execute(
+                    """
+                    UPDATE agent_memory
+                    SET data = ?, updated_at = ?
+                    WHERE session_id = ? AND agent_name = ? AND step = ? AND valid_to IS NULL
+                    """,
+                    (
+                        _json_dumps_memory_data(marked_data),
+                        marked_data["reindex_updated_at"],
                         session_id,
                         agent_name,
                         next_step,
-                        e,
-                    )
+                    ),
+                )
+                conn.commit()
+                logger.warning(
+                    "Failed to save tactical memory row to ChromaDB; "
+                    "SQLite row marked needs_reindex (session=%s agent=%s step=%s): %s",
+                    session_id,
+                    agent_name,
+                    next_step,
+                    index_error,
+                )
             
             return next_step  # Возвращаем глобальный номер шага
         except sqlite3.OperationalError as e:

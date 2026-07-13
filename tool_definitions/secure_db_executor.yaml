@@ -16,6 +16,12 @@ parameters:
     type: string
     description: "DSN для подключения к БД. Обязателен для реального выполнения: передавай dsn из контекста pipeline, чтобы выполнение шло на пользовательской БД. Без dsn допустим только dry-run режим TEXT_TO_SQL_DRY_RUN_ONLY/dry_run_only. Silent fallback на переменную окружения DB_DSN отключён по умолчанию (AGENTS.md). Чтобы временно разрешить env-fallback, выставь SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 (не рекомендуется)."
     required: false
+  - name: dry_run_only
+    type: boolean
+    description: "Необязательный keyword-only флаг запрета исполнения сгенерированного SQL. true запрещает исполнение; false разрешает его только если операторский TEXT_TO_SQL_DRY_RUN_ONLY не включён. Эффективный режим вычисляется fail-safe как payload OR env; null (default) полностью делегирует выбор env-флагу."
+    required: false
+    nullable: true
+    default: null
 output:
   type: object
   properties:
@@ -24,16 +30,18 @@ output:
     data:
       type: array
       items:
-        type: array
-        items:
-          oneOf:
-            - type: string
-            - type: integer
-            - type: number
-            - type: boolean
-            - type: object
-            - type: array
-            - type: "null"
+        oneOf:
+          - type: array
+            items:
+              oneOf:
+                - type: string
+                - type: integer
+                - type: number
+                - type: boolean
+                - type: object
+                - type: array
+                - type: "null"
+          - type: object
     columns:
       type: array
       items:
@@ -49,6 +57,45 @@ output:
       type: array
       items:
         type: object
+        properties:
+          issue_type:
+            type: string
+          description:
+            type: string
+        required:
+          - issue_type
+          - description
+        additionalProperties: false
+    explain_result:
+      type: object
+      properties:
+        plan:
+          type: string
+        estimated_cost:
+          type: number
+          nullable: true
+        rows_to_scan:
+          type: integer
+          nullable: true
+        issues:
+          type: array
+          items:
+            type: object
+            properties:
+              issue_type:
+                type: string
+              description:
+                type: string
+            required:
+              - issue_type
+              - description
+            additionalProperties: false
+      required:
+        - plan
+        - estimated_cost
+        - rows_to_scan
+        - issues
+      additionalProperties: false
     dry_run_only:
       type: boolean
     skipped_execution:
@@ -57,4 +104,24 @@ output:
       type: string
     applied_row_limit:
       type: integer
+      minimum: 1
       nullable: true
+    pre_execution_error_code:
+      type: string
+      description: "Machine-readable reason present only when validation fails before a positive row limit can be established."
+      enum:
+        - INVALID_ROW_LIMIT
+        - INVALID_ROW_LIMIT_CAP
+        - INVALID_STATEMENT_TIMEOUT
+    capability_error:
+      type: object
+      description: "Machine-readable reason present only when a required database capability is unavailable before execution."
+      properties:
+        capability:
+          type: string
+        reason_code:
+          type: string
+      required:
+        - capability
+        - reason_code
+      additionalProperties: false

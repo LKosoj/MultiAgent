@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 from utils import call_openai_api
 
 from .dialects import get_current_dialect_label
-from .validators import SQLSchemaValidator, SQLSafetyValidator
+from .validators import SQLSchemaValidator, SQLSafetyValidator, TextToSqlSafetyPolicy
 from .utils import dsn_to_sanitized_name, redact_text_to_sql_value
 from . import sql_builder
 from . import sql_postprocess
@@ -75,6 +75,7 @@ class SQLGenerator:
         self,
         sql_query: str,
         dsn: str | None = None,
+        safety_policy: TextToSqlSafetyPolicy | None = None,
     ) -> Optional[Dict[str, Any]]:
         """Прогоняет финальный SQL через SQLSafetyValidator.
 
@@ -83,10 +84,15 @@ class SQLGenerator:
         """
         if not sql_query:
             return None
+        validator = (
+            SQLSafetyValidator(policy=safety_policy)
+            if safety_policy is not None
+            else self.safety_validator
+        )
         if dsn is None:
-            safety_result = self.safety_validator.validate(sql_query)
+            safety_result = validator.validate(sql_query)
         else:
-            safety_result = self.safety_validator.validate(sql_query, dsn=dsn)
+            safety_result = validator.validate(sql_query, dsn=dsn)
         if safety_result.get("is_safe", False):
             return None
         safety_issues = safety_result.get("issues", [])
@@ -96,6 +102,8 @@ class SQLGenerator:
             "error": "Generated SQL failed safety validation",
             "safety_issues": safe_safety_issues,
             "sql_query": sql_query,
+            "profile_name": safety_result.get("profile_name"),
+            "policy_version": safety_result.get("policy_version"),
         }
 
     def _schema_validation_enabled(self) -> bool:
@@ -188,6 +196,8 @@ class SQLGenerator:
         user_query: str,
         dsn: str | None = None,
         session_id: str | None = None,
+        *,
+        safety_policy: TextToSqlSafetyPolicy | None = None,
     ) -> Dict[str, str]:
         """Генерирует SQL запрос из контекста и пользовательского запроса через прямой вызов LLM."""
         logger.info("Generating SQL query")
@@ -229,7 +239,11 @@ class SQLGenerator:
                     }
                 structured_sql = structured_result.get("sql_query")
                 if structured_sql and not structured_result.get("error"):
-                    safety_error = self._apply_safety_validation(structured_sql, dsn=effective_dsn)
+                    safety_error = self._apply_safety_validation(
+                        structured_sql,
+                        dsn=effective_dsn,
+                        safety_policy=safety_policy,
+                    )
                     if safety_error is not None:
                         return safety_error
                 elif structured_sql and structured_result.get("error"):
@@ -237,11 +251,19 @@ class SQLGenerator:
                     # schema validation). Прогоняем safety, чтобы safety_issues
                     # пробросились — не оставляем unsafe SQL в propagated ошибке
                     # без флага.
-                    safety_error = self._apply_safety_validation(structured_sql, dsn=effective_dsn)
+                    safety_error = self._apply_safety_validation(
+                        structured_sql,
+                        dsn=effective_dsn,
+                        safety_policy=safety_policy,
+                    )
                     if safety_error is not None:
                         merged = dict(structured_result)
                         merged.setdefault("safety_issues", safety_error.get("safety_issues", []))
                         return merged
+                if safety_policy is not None:
+                    structured_result = dict(structured_result)
+                    structured_result["profile_name"] = safety_policy.profile_name
+                    structured_result["policy_version"] = safety_policy.policy_version
                 return structured_result
             return {
                 "error": "Structured SQL builder is enabled, but structured context is missing or unsupported."
@@ -321,10 +343,18 @@ class SQLGenerator:
                         "SQL generation completed but no schema was available for validation — result may be invalid"
                     )
 
-                safety_error = self._apply_safety_validation(sql_query, dsn=effective_dsn)
+                safety_error = self._apply_safety_validation(
+                    sql_query,
+                    dsn=effective_dsn,
+                    safety_policy=safety_policy,
+                )
                 if safety_error is not None:
                     return safety_error
 
+                if safety_policy is not None:
+                    sql_result = dict(sql_result)
+                    sql_result["profile_name"] = safety_policy.profile_name
+                    sql_result["policy_version"] = safety_policy.policy_version
                 return sql_result
 
         logger.error("All LLM generation attempts failed")

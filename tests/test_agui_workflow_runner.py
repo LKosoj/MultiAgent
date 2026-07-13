@@ -148,8 +148,6 @@ def _load_runner_with_workflow_stub(monkeypatch, manager_holder: list):
         return manager
 
     workflow_streamlit.WorkflowManager = _factory
-    # Реестр процессов: runner импортирует его в ветке cancel.
-    workflow_streamlit._GLOBAL_WORKFLOW_PROCESSES = {}
     monkeypatch.setitem(sys.modules, "workflow", workflow_pkg)
     monkeypatch.setitem(sys.modules, "workflow.streamlit_api", workflow_streamlit)
 
@@ -268,7 +266,13 @@ async def test_run_workflow_emits_progress_events(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_run_workflow_cancel_calls_cancel_workflow_and_joins_child(monkeypatch):
-    """T3.2: при cancel runner должен вызвать cancel_workflow и дождаться завершения процесса."""
+    """T3.2: при cancel runner должен вызвать cancel_workflow и дождаться терминального статуса.
+
+    cancel_workflow может изначально принять отмену, но супервизор подтверждает
+    терминальное состояние ("cancelled") не сразу — runner обязан поллить
+    get_workflow_status, пока статус остаётся "cancelling", в пределах
+    _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS (см. Fix 1: T9).
+    """
     # Workflow «бесконечно» крутится в статусе running, пока не придёт cancel.
     _StubWorkflowManager.status_sequence = [
         _StubWorkflowStatus("running", current_step="step_loop", progress_percentage=10.0),
@@ -278,35 +282,17 @@ async def test_run_workflow_cancel_calls_cancel_workflow_and_joins_child(monkeyp
         runner = _load_runner_with_workflow_stub(monkeypatch, manager_holder)
         monkeypatch.setattr(runner, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0.01)
 
-        # Поддельный процесс с join()/is_alive() для проверки взаимодействия.
-        class _FakeProc:
-            def __init__(self) -> None:
-                self._alive = True
-                self.join_calls: list[float | None] = []
-
-            def is_alive(self) -> bool:
-                return self._alive
-
-            def join(self, timeout=None):
-                self.join_calls.append(timeout)
-                # Симулируем что cancel_workflow дождался выхода процесса.
-                self._alive = False
-
-        # Подменяем cancel_workflow так, чтобы он повторил контракт реального
-        # WorkflowManager: убил процесс через proc.join и удалил его из реестра.
-        from workflow.streamlit_api import _GLOBAL_WORKFLOW_PROCESSES
-
-        fake_proc = _FakeProc()
-
+        # cancel_workflow подтверждает приём отмены, но статус не переходит в
+        # "cancelled" сразу — сначала пара тиков "cancelling", доказывающих,
+        # что runner реально поллит, а не просто читает статус один раз.
         def _cancel_workflow(run_id: str):
-            proc = _GLOBAL_WORKFLOW_PROCESSES.get(run_id)
-            if proc is not None:
-                proc.join(timeout=5.0)
-                _GLOBAL_WORKFLOW_PROCESSES.pop(run_id, None)
-            # Записываем как делает существующий стаб.
             manager = manager_holder[0]
             manager.cancel_calls.append(run_id)
-            manager._status_iter = [_StubWorkflowStatus("cancelled")]
+            manager._status_iter = [
+                _StubWorkflowStatus("cancelling"),
+                _StubWorkflowStatus("cancelling"),
+                _StubWorkflowStatus("cancelled"),
+            ]
             return True
 
         agui_run_id = f"run-{uuid.uuid4().hex[:8]}"
@@ -324,12 +310,9 @@ async def test_run_workflow_cancel_calls_cancel_workflow_and_joins_child(monkeyp
             collected = []
             async for item in runner._run_workflow(input_data, "task", forwarded):
                 collected.append(item)
-                # После старта/первого прогресса регистрируем поддельный процесс
-                # и просим отмену.
+                # После старта/первого прогресса подменяем cancel_workflow и
+                # просим отмену.
                 if len(collected) == 1 and manager_holder:
-                    started = manager_holder[0].start_calls[0]
-                    _GLOBAL_WORKFLOW_PROCESSES[started["run_id"]] = fake_proc
-                    # Подменяем cancel_workflow на интрумент с join'ом
                     manager_holder[0].cancel_workflow = _cancel_workflow
                     task.cancel()
             return collected
@@ -343,10 +326,60 @@ async def test_run_workflow_cancel_calls_cancel_workflow_and_joins_child(monkeyp
         workflow_run_id = manager.start_calls[0]["run_id"]
         # cancel_workflow вызван
         assert workflow_run_id in manager.cancel_calls
-        # proc.join был вызван хотя бы один раз (в _cancel_workflow или повторно
-        # из runner'а на финальной проверке).
-        assert fake_proc.join_calls, "ожидался proc.join во время cancel"
-        assert not fake_proc.is_alive(), "процесс должен быть мёртв после cancel"
+        # runner дождался терминального статуса, пройдя через поллинг
+        # "cancelling" -> "cancelled", а не поднял RuntimeError.
+        assert manager._status_iter[0].status == "cancelled"
+    finally:
+        _StubWorkflowManager.status_sequence = None
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_cancel_raises_when_terminal_status_never_reached(monkeypatch):
+    """Fix 1 (T9), таймаут-ветка: если после cancel_workflow статус навсегда
+    остаётся "cancelling", по истечении _WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS
+    runner обязан поднять RuntimeError, а не зависнуть и не выдать
+    cancel-envelope за несуществующий терминал.
+    """
+    _StubWorkflowManager.status_sequence = [
+        _StubWorkflowStatus("running", current_step="step_loop", progress_percentage=10.0),
+    ]
+    try:
+        manager_holder: list[_StubWorkflowManager] = []
+        runner = _load_runner_with_workflow_stub(monkeypatch, manager_holder)
+        monkeypatch.setattr(runner, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0.01)
+        monkeypatch.setattr(runner, "_WORKFLOW_CANCEL_JOIN_TIMEOUT_SECONDS", 0.05)
+
+        def _cancel_workflow(run_id: str):
+            manager = manager_holder[0]
+            manager.cancel_calls.append(run_id)
+            # Терминал не наступает: статус застревает в "cancelling".
+            manager._status_iter = [_StubWorkflowStatus("cancelling")]
+            return True
+
+        agui_run_id = f"run-{uuid.uuid4().hex[:8]}"
+        payload = _make_payload(
+            agui_run_id,
+            {"workflow_name": "demo_pipeline", "execution_mode": "workflow"},
+        )
+        input_data = RunAgentInput(**payload)
+        forwarded = payload["forwardedProps"]
+
+        async def _collect():
+            collected = []
+            async for item in runner._run_workflow(input_data, "task", forwarded):
+                collected.append(item)
+                if len(collected) == 1 and manager_holder:
+                    manager_holder[0].cancel_workflow = _cancel_workflow
+                    task.cancel()
+            return collected
+
+        task = asyncio.create_task(_collect())
+        with pytest.raises(RuntimeError, match="did not reach terminal status"):
+            await task
+
+        manager = manager_holder[0]
+        workflow_run_id = manager.start_calls[0]["run_id"]
+        assert workflow_run_id in manager.cancel_calls
     finally:
         _StubWorkflowManager.status_sequence = None
 
@@ -531,7 +564,7 @@ async def test_run_workflow_rejects_text_to_sql_pipeline_via_forwarded_props(mon
 
     error_events = [event for event in events if event.type == EventType.RUN_ERROR]
     assert len(error_events) == 1, f"expected 1 RUN_ERROR, got {len(error_events)}"
-    assert error_events[0].code == "text_to_sql_must_use_service_action"
+    assert error_events[0].code == "text_to_sql_service_action_required"
     assert "presets.text_to_sql.generate" in error_events[0].message
     # WorkflowManager не должен создаваться/стартовать ничего.
     assert manager_holder == [] or manager_holder[0].start_calls == []

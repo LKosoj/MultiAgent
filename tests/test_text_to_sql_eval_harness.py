@@ -23,12 +23,20 @@ def test_sqlite_eval_harness_computes_execution_accuracy(tmp_path):
         run_sqlite_eval(
             case,
             db_path=db_path,
-            generate_sql=lambda c: c.expected_sql or "",
-            schema_linking_provider=lambda c: {
+            generate_sql=lambda request: {
+                "sqlite-region-sales": (
+                    "SELECT c.region, SUM(o.amount) AS total_amount "
+                    "FROM orders o JOIN customers c ON c.id = o.customer_id "
+                    "WHERE o.amount >= 50 "
+                    "GROUP BY c.region ORDER BY c.region"
+                )
+            }[request.case_id],
+            schema_linking_provider=lambda _request: {
                 "linked_entities": {
                     "metrics": [{"table": "orders", "column": "amount"}],
                     "dimensions": [{"table": "customers", "column": "region"}],
                     "filters": {},
+                    "columns": ["orders.customer_id", "customers.id"],
                 }
             },
         )
@@ -36,8 +44,8 @@ def test_sqlite_eval_harness_computes_execution_accuracy(tmp_path):
     ]
     summary = summarize_results(results)
 
-    assert summary.total == 1
-    assert summary.passed == 1
+    assert summary.total == len(cases)
+    assert summary.passed == len(cases)
     assert summary.failed == 0
     assert summary.execution_accuracy == 1.0
     assert summary.avg_duration_ms >= 0.0
@@ -54,12 +62,18 @@ def test_schema_linking_metrics_expose_precision_and_recall(tmp_path):
     result = run_sqlite_eval(
         case,
         db_path=db_path,
-        generate_sql=lambda c: c.expected_sql or "",
-        schema_linking_provider=lambda c: {
+        generate_sql=lambda _request: (
+            "SELECT c.region, SUM(o.amount) AS total_amount "
+            "FROM orders o JOIN customers c ON c.id = o.customer_id "
+            "WHERE o.amount >= 50 "
+            "GROUP BY c.region ORDER BY c.region"
+        ),
+        schema_linking_provider=lambda _request: {
             "linked_entities": {
                 "metrics": [{"table": "orders", "column": "amount"}],
                 "dimensions": [],
                 "filters": {"region": {"table": "wrong_table", "column": "region"}},
+                "columns": ["orders.customer_id"],
             }
         },
     )
@@ -68,8 +82,8 @@ def test_schema_linking_metrics_expose_precision_and_recall(tmp_path):
     assert result.schema_linking_metrics.expected_tables == 2
     assert result.schema_linking_metrics.matched_tables == 1
     assert result.schema_linking_metrics.table_recall == 0.5
-    assert result.schema_linking_metrics.expected_columns == 2
-    assert result.schema_linking_metrics.matched_columns == 1
+    assert result.schema_linking_metrics.expected_columns == 4
+    assert result.schema_linking_metrics.matched_columns == 2
     assert result.schema_linking_metrics.column_recall == 0.5
 
 
@@ -90,7 +104,12 @@ def test_sqlite_eval_harness_returns_failed_result_for_generation_error(tmp_path
 def test_gold_loader_rejects_unreviewed_cases(tmp_path):
     path = tmp_path / "candidate.jsonl"
     path.write_text(
-        '{"id":"candidate","question":"q","expected_sql":"SELECT 1","reviewed":false}\n',
+        '{"schema_version":1,"id":"candidate","question":"q",'
+        '"dialect":"sqlite","fixture":"sqlite_text2sql_v2",'
+        '"expected_outcome":"succeeded","comparison_mode":"exact",'
+        '"expected_rows":[{"value":1}],"slice_tags":["filter"],'
+        '"request_options":{},"review":{"status":"pending",'
+        '"reviewed_by":null,"reviewed_at":null,"reference":null}}\n',
         encoding="utf-8",
     )
 
@@ -121,8 +140,12 @@ def test_eval_observability_jsonl_exports_duration_and_linking_metrics(tmp_path)
     result = run_sqlite_eval(
         case,
         db_path=db_path,
-        generate_sql=lambda c: c.expected_sql or "",
-        schema_linking_provider=lambda c: c.expected_schema_links,
+        generate_sql=lambda _request: (
+            "SELECT c.region, SUM(o.amount) AS total_amount "
+            "FROM orders o JOIN customers c ON c.id = o.customer_id "
+            "GROUP BY c.region ORDER BY c.region"
+        ),
+        schema_linking_provider=lambda _request: case.expected_schema_links,
     )
     output = tmp_path / "observability" / "eval.jsonl"
 

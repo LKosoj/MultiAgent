@@ -1,14 +1,15 @@
 """
 Adaptive Retry Engine с ML-powered стратегиями восстановления
 """
-import logging
 import asyncio
-from typing import Dict, Any, List, Callable, Optional, Union
+import logging
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 from datetime import datetime, timedelta
 from enum import Enum
 import random
 
 from ..models import StepResult, StepStatus, ErrorClass
+from ..deadline import DeadlineBudget, WorkflowDeadlineExceeded, execute_step_attempt
 from ..policy.models import RetryStrategyType
 from ..retry_engine import classify_error
 
@@ -138,9 +139,16 @@ class RetryStrategy:
 class AdaptiveRetryEngine:
     """Adaptive Retry Engine с умным выбором стратегий"""
     
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[float, float], float] = random.uniform,
+    ):
         self.retry_history: Dict[str, List[Dict[str, Any]]] = {}
         self.strategy_effectiveness: Dict[str, Dict[str, float]] = {}
+        self._sleep = sleep
+        self._jitter = jitter
         
         # Базовые стратегии для разных типов ошибок
         self.error_strategies = {
@@ -174,7 +182,9 @@ class AdaptiveRetryEngine:
                                 base_delay: float = 1.0,
                                 max_delay: float = 60.0,
                                 backoff_multiplier: float = 2.0,
-                                retry_on_errors: Optional[List[str]] = None) -> StepResult:
+                                retry_on_errors: Optional[List[str]] = None,
+                                attempt_timeout: Optional[float] = None,
+                                deadline: Optional[DeadlineBudget] = None) -> StepResult:
         """Выполнить функцию с адаптивными повторами.
 
         retry_on_errors: если задан (список классов из classify_error), то при
@@ -192,14 +202,21 @@ class AdaptiveRetryEngine:
         }
         
         while attempt <= max_retries:
+            if deadline is not None:
+                deadline.require_remaining(f"retry attempt {attempt + 1} scheduling")
             attempt += 1
             attempt_start = datetime.now()
             
             try:
                 logger.info(f"🔄 Retry attempt {attempt}/{max_retries + 1} for step '{step_id}'")
                 
-                # Выполняем функцию
-                result = await step_func(context)
+                result = await execute_step_attempt(
+                    step_id,
+                    step_func,
+                    context,
+                    attempt_timeout=attempt_timeout,
+                    deadline=deadline,
+                )
                 
                 # Проверяем результат
                 if self._is_result_acceptable(result):
@@ -246,6 +263,8 @@ class AdaptiveRetryEngine:
                                 metadata={"retry_context": retry_context},
                             )
 
+            except WorkflowDeadlineExceeded:
+                raise
             except Exception as e:
                 safe_error = _redact_retry_error(e)
                 last_error = safe_error
@@ -286,16 +305,24 @@ class AdaptiveRetryEngine:
 
             # Если это не последняя попытка, применяем стратегию
             if attempt <= max_retries:
+                if deadline is not None:
+                    deadline.require_remaining("retry strategy")
                 await self._apply_retry_strategy(step_id, attempt, retry_context, context)
+                if deadline is not None:
+                    deadline.require_remaining("retry backoff")
                 
                 # Вычисляем задержку
                 delay = min(base_delay * (backoff_multiplier ** (attempt - 1)), max_delay)
                 # Добавляем jitter
-                jitter = random.uniform(0.1, 0.3) * delay
+                jitter = self._jitter(0.1, 0.3) * delay
                 total_delay = delay + jitter
+                if deadline is not None:
+                    total_delay = deadline.require_retry_delay(total_delay)
                 
                 logger.info(f"⏱️ Waiting {total_delay:.1f}s before retry #{attempt + 1}")
-                await asyncio.sleep(total_delay)
+                await self._sleep(total_delay)
+                if deadline is not None:
+                    deadline.require_remaining(f"retry attempt {attempt + 1} scheduling")
         
         # Все попытки исчерпаны
         await self._record_failure(step_id, max_retries + 1, retry_context)
@@ -309,7 +336,7 @@ class AdaptiveRetryEngine:
             retry_count=max_retries + 1,
             metadata={"retry_context": retry_context}
         )
-    
+
     def _is_result_acceptable(self, result: Any) -> bool:
         """Проверить приемлемость результата"""
         

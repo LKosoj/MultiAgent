@@ -18,9 +18,14 @@ AST-классов sqlglot, командных слов и числовых ли
 
 from __future__ import annotations
 
+import hashlib
+import json
+import logging
 import threading
+from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Tuple
 
 from .._yaml_config_loader import (
     YamlConfigLoader,
@@ -34,6 +39,8 @@ _DEFAULT_CONFIG_PATH = _REPO_ROOT / "config" / "text_to_sql" / "safety.yaml"
 _ENV_CONFIG_PATH = "TEXT_TO_SQL_SAFETY_CONFIG_PATH"
 _ENV_PROFILE = "TEXT_TO_SQL_SAFETY_PROFILE"
 _DEFAULT_PROFILE = "default"
+
+logger = logging.getLogger(__name__)
 
 
 class SafetyConfigMissing(FileNotFoundError):
@@ -67,6 +74,7 @@ class SafetyProfile:
         "max_in_list_size",
         "source_path",
         "profile_name",
+        "config_version",
     )
 
     def __init__(
@@ -74,9 +82,11 @@ class SafetyProfile:
         raw: Dict[str, Any],
         source_path: str,
         profile_name: str,
+        config_version: int,
     ) -> None:
         self.source_path = source_path
         self.profile_name = profile_name
+        self.config_version = config_version
 
         self.forbidden_keywords: List[str] = _coerce_nonempty_str_list(
             raw.get("forbidden_keywords"),
@@ -108,6 +118,200 @@ class SafetyProfile:
             raw.get("max_in_list_size"),
             f"profiles.{profile_name}.max_in_list_size",
         )
+
+
+@dataclass(frozen=True)
+class TextToSqlSafetyPolicy:
+    level: str
+    profile_name: str
+    source_path: str
+    config_version: int
+    policy_version: str
+    forbidden_keywords: Tuple[str, ...]
+    forbidden_functions: Tuple[str, ...]
+    ast_forbidden_stmt_classes: Tuple[str, ...]
+    ast_forbidden_command_words: FrozenSet[str]
+    max_query_length: int
+    max_in_list_size: int
+
+    def __post_init__(self) -> None:
+        _validate_policy_fields(self)
+        expected = _compute_policy_version(self.to_mapping())
+        if self.policy_version != expected:
+            raise ValueError(
+                "safety policy policy_version does not match its rule snapshot"
+            )
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return {
+            "level": self.level,
+            "profile_name": self.profile_name,
+            "source_path": self.source_path,
+            "config_version": self.config_version,
+            "policy_version": self.policy_version,
+            "forbidden_keywords": list(self.forbidden_keywords),
+            "forbidden_functions": list(self.forbidden_functions),
+            "ast_forbidden_stmt_classes": list(self.ast_forbidden_stmt_classes),
+            "ast_forbidden_command_words": sorted(self.ast_forbidden_command_words),
+            "max_query_length": self.max_query_length,
+            "max_in_list_size": self.max_in_list_size,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "TextToSqlSafetyPolicy":
+        if not isinstance(value, Mapping):
+            raise ValueError("safety policy must be a mapping")
+        expected_keys = {
+            "level",
+            "profile_name",
+            "source_path",
+            "config_version",
+            "policy_version",
+            "forbidden_keywords",
+            "forbidden_functions",
+            "ast_forbidden_stmt_classes",
+            "ast_forbidden_command_words",
+            "max_query_length",
+            "max_in_list_size",
+        }
+        if set(value) != expected_keys:
+            missing = sorted(expected_keys - set(value))
+            unknown = sorted(set(value) - expected_keys)
+            raise ValueError(
+                f"safety policy keys mismatch: missing={missing}, unknown={unknown}"
+            )
+        return cls(
+            level=_mapping_nonempty_string(value, "level"),
+            profile_name=_mapping_nonempty_string(value, "profile_name"),
+            source_path=_mapping_nonempty_string(value, "source_path"),
+            config_version=_mapping_positive_int(value, "config_version"),
+            policy_version=_mapping_nonempty_string(value, "policy_version"),
+            forbidden_keywords=_mapping_string_tuple(
+                value, "forbidden_keywords", allow_empty=False
+            ),
+            forbidden_functions=_mapping_string_tuple(
+                value, "forbidden_functions", allow_empty=True
+            ),
+            ast_forbidden_stmt_classes=_mapping_string_tuple(
+                value, "ast_forbidden_stmt_classes", allow_empty=False
+            ),
+            ast_forbidden_command_words=frozenset(
+                _mapping_string_tuple(
+                    value, "ast_forbidden_command_words", allow_empty=False
+                )
+            ),
+            max_query_length=_mapping_positive_int(value, "max_query_length"),
+            max_in_list_size=_mapping_positive_int(value, "max_in_list_size"),
+        )
+
+
+def _mapping_nonempty_string(value: Mapping[str, Any], field: str) -> str:
+    item = value[field]
+    if not isinstance(item, str) or not item:
+        raise ValueError(f"safety policy {field} must be a non-empty string")
+    return item
+
+
+def _mapping_positive_int(value: Mapping[str, Any], field: str) -> int:
+    item = value[field]
+    if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
+        raise ValueError(f"safety policy {field} must be a positive integer")
+    return item
+
+
+def _mapping_string_tuple(
+    value: Mapping[str, Any],
+    field: str,
+    *,
+    allow_empty: bool,
+) -> Tuple[str, ...]:
+    items = value[field]
+    if not isinstance(items, list) or (not allow_empty and not items):
+        qualifier = "a list" if allow_empty else "a non-empty list"
+        raise ValueError(f"safety policy {field} must be {qualifier} of strings")
+    if not all(isinstance(item, str) and item for item in items):
+        raise ValueError(
+            f"safety policy {field} must contain only non-empty strings"
+        )
+    return tuple(items)
+
+
+def _validate_policy_fields(policy: TextToSqlSafetyPolicy) -> None:
+    for field in ("level", "profile_name", "source_path", "policy_version"):
+        value = getattr(policy, field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"safety policy {field} must be a non-empty string")
+    for field in ("config_version", "max_query_length", "max_in_list_size"):
+        value = getattr(policy, field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"safety policy {field} must be a positive integer")
+    tuple_fields = (
+        ("forbidden_keywords", False),
+        ("forbidden_functions", True),
+        ("ast_forbidden_stmt_classes", False),
+    )
+    for field, allow_empty in tuple_fields:
+        value = getattr(policy, field)
+        if not isinstance(value, tuple) or (not allow_empty and not value):
+            raise ValueError(f"safety policy {field} must be an immutable tuple")
+        if not all(isinstance(item, str) and item for item in value):
+            raise ValueError(
+                f"safety policy {field} must contain only non-empty strings"
+            )
+    commands = policy.ast_forbidden_command_words
+    if not isinstance(commands, frozenset) or not commands:
+        raise ValueError(
+            "safety policy ast_forbidden_command_words must be a non-empty frozenset"
+        )
+    if not all(isinstance(item, str) and item for item in commands):
+        raise ValueError(
+            "safety policy ast_forbidden_command_words must contain only non-empty strings"
+        )
+
+
+def _compute_policy_version(policy: Mapping[str, Any]) -> str:
+    payload = {
+        "config_version": policy["config_version"],
+        "profile_name": policy["profile_name"],
+        "forbidden_keywords": sorted(set(policy["forbidden_keywords"])),
+        "forbidden_functions": sorted(set(policy["forbidden_functions"])),
+        "ast_forbidden_stmt_classes": sorted(
+            set(policy["ast_forbidden_stmt_classes"])
+        ),
+        "ast_forbidden_command_words": sorted(
+            policy["ast_forbidden_command_words"]
+        ),
+        "max_query_length": policy["max_query_length"],
+        "max_in_list_size": policy["max_in_list_size"],
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _policy_from_profile(level: str, profile: SafetyProfile) -> TextToSqlSafetyPolicy:
+    values = {
+        "level": level,
+        "profile_name": profile.profile_name,
+        "source_path": profile.source_path,
+        "config_version": profile.config_version,
+        "forbidden_keywords": tuple(profile.forbidden_keywords),
+        "forbidden_functions": tuple(profile.forbidden_functions),
+        "ast_forbidden_stmt_classes": tuple(profile.ast_forbidden_stmt_classes),
+        "ast_forbidden_command_words": frozenset(
+            profile.ast_forbidden_command_words
+        ),
+        "max_query_length": profile.max_query_length,
+        "max_in_list_size": profile.max_in_list_size,
+    }
+    return TextToSqlSafetyPolicy(
+        **values,
+        policy_version=_compute_policy_version(values),
+    )
 
 
 def _coerce_nonempty_str_list(value: Any, field: str) -> List[str]:
@@ -197,7 +401,13 @@ def _parse_profile(raw: Dict[str, Any], abs_key: str) -> "SafetyProfile":
             f"safety.yaml at {abs_key}: profiles.{profile_name} must be a mapping"
         )
 
-    return SafetyProfile(profile_raw, source_path=abs_key, profile_name=profile_name)
+    config_version = _coerce_positive_int(raw.get("version"), "version")
+    return SafetyProfile(
+        profile_raw,
+        source_path=abs_key,
+        profile_name=profile_name,
+        config_version=config_version,
+    )
 
 
 _loader: YamlConfigLoader["SafetyProfile"] = YamlConfigLoader["SafetyProfile"](
@@ -250,9 +460,34 @@ def load_safety_profile(profile: str | None = None) -> SafetyProfile:
         else:
             _current_profile.name = prev
 
+
+def resolve_safety_policy(level: str) -> TextToSqlSafetyPolicy:
+    if not isinstance(level, str) or not level.strip():
+        raise ValueError("safety level must be a non-empty string")
+    normalized = level.strip().lower()
+    if normalized != "strict":
+        raise ValueError("unsupported safety level; only 'strict' is supported")
+    return _policy_from_profile(normalized, load_safety_profile("strict"))
+
+
+@lru_cache(maxsize=1)
+def load_startup_safety_policy() -> TextToSqlSafetyPolicy:
+    profile_name = _resolve_profile_name(None)
+    policy = _policy_from_profile(
+        profile_name,
+        load_safety_profile(profile_name),
+    )
+    logger.info(
+        "Loaded Text-to-SQL startup safety policy profile=%s version=%s",
+        policy.profile_name,
+        policy.policy_version,
+    )
+    return policy
+
 def reset_cache() -> None:
     """Сброс кэша (нужен в тестах после подмены env-переменной)."""
     _loader.reset_cache()
+    load_startup_safety_policy.cache_clear()
 
 
 def reload_safety_config() -> None:
@@ -278,7 +513,7 @@ def reload_safety_config() -> None:
         что валидаторы пере-создаются после reload (например, через
         ``SQLSafetyValidator.reload()`` в admin handler-е).
     """
-    _loader.reset_cache()
+    reset_cache()
     from ..core._sql_generation_api import _clear_llm_safety_cache
 
     _clear_llm_safety_cache()

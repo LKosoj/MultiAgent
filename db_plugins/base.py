@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from dataclasses import dataclass, replace
+from enum import Enum
+from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
 # Константы для стратегий семплирования
 SMALL_TABLE_THRESHOLD = 100_000
@@ -13,11 +15,213 @@ _TRUE_QUERY_VALUES = {"1", "true", "yes", "on"}
 _RESERVED_WORD_CACHE: Dict[str, set[str]] = {}
 
 
+class CapabilityState(str, Enum):
+    SUPPORTED = "supported"
+    UNSUPPORTED = "unsupported"
+    UNVERIFIED = "unverified"
+
+
+class EnforcementMode(str, Enum):
+    DATABASE = "database"
+    DRIVER = "driver"
+    READ_ONLY_FILE = "read_only_file"
+    SUPERVISOR = "supervisor"
+    NONE = "none"
+
+
+@dataclass(frozen=True)
+class Capability:
+    state: CapabilityState
+    mode: EnforcementMode
+    reason_code: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, CapabilityState):
+            raise TypeError("capability state must be a CapabilityState")
+        if not isinstance(self.mode, EnforcementMode):
+            raise TypeError("capability mode must be an EnforcementMode")
+        if not isinstance(self.reason_code, str) or not self.reason_code:
+            raise ValueError("capability reason_code must be non-empty text")
+        if self.state is CapabilityState.SUPPORTED and self.mode is EnforcementMode.NONE:
+            raise ValueError("supported capability must declare an enforcement mode")
+
+    @classmethod
+    def supported(cls, mode: EnforcementMode, reason_code: str) -> "Capability":
+        return cls(CapabilityState.SUPPORTED, mode, reason_code)
+
+    @classmethod
+    def unsupported(cls, reason_code: str) -> "Capability":
+        return cls(CapabilityState.UNSUPPORTED, EnforcementMode.NONE, reason_code)
+
+    @classmethod
+    def unverified(
+        cls,
+        reason_code: str,
+        mode: EnforcementMode = EnforcementMode.NONE,
+    ) -> "Capability":
+        return cls(CapabilityState.UNVERIFIED, mode, reason_code)
+
+    def to_mapping(self) -> Dict[str, str]:
+        return {
+            "state": self.state.value,
+            "mode": self.mode.value,
+            "reason_code": self.reason_code,
+        }
+
+
+@dataclass(frozen=True)
+class DatabaseCapabilities:
+    dialect: str
+    read_only: Capability
+    statement_timeout: Capability
+    cancellation: Capability
+    explain: Capability
+    introspection: Capability
+    composite_fk_introspection: Capability
+    parameter_binding: Capability
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.dialect, str) or not self.dialect:
+            raise ValueError("database capability dialect must be non-empty text")
+        for field_name in _DATABASE_CAPABILITY_FIELDS:
+            if not isinstance(getattr(self, field_name), Capability):
+                raise TypeError(f"{field_name} must be a Capability")
+
+    def to_mapping(self) -> Dict[str, object]:
+        return {
+            "dialect": self.dialect,
+            **{
+                field_name: getattr(self, field_name).to_mapping()
+                for field_name in _DATABASE_CAPABILITY_FIELDS
+            },
+        }
+
+    def downgrade(self, **changes: Capability) -> "DatabaseCapabilities":
+        unknown = set(changes) - set(_DATABASE_CAPABILITY_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown capability fields: {sorted(unknown)}")
+        return replace(self, **changes)
+
+
+_DATABASE_CAPABILITY_FIELDS = (
+    "read_only",
+    "statement_timeout",
+    "cancellation",
+    "explain",
+    "introspection",
+    "composite_fk_introspection",
+    "parameter_binding",
+)
+
+
+@dataclass(frozen=True)
+class PluginHealth:
+    dialect: str
+    capabilities: DatabaseCapabilities
+    production_ready: bool
+    reason_codes: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.dialect != self.capabilities.dialect:
+            raise ValueError("health dialect must match capability dialect")
+        if type(self.production_ready) is not bool:
+            raise TypeError("production_ready must be a boolean")
+        if not isinstance(self.reason_codes, tuple) or not all(
+            isinstance(item, str) and item for item in self.reason_codes
+        ):
+            raise TypeError("reason_codes must be a tuple of non-empty strings")
+
+    def to_mapping(self) -> Dict[str, object]:
+        return {
+            "dialect": self.dialect,
+            "production_ready": self.production_ready,
+            "reason_codes": list(self.reason_codes),
+            "capabilities": self.capabilities.to_mapping(),
+        }
+
+
+@dataclass(frozen=True)
+class RequiredDatabaseCapabilities:
+    read_only: bool = True
+    statement_timeout: bool = True
+    cancellation: bool = True
+    explain: bool = False
+    introspection: bool = False
+    composite_fk_introspection: bool = False
+    parameter_binding: bool = False
+    allow_supervisor: bool = False
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            *_DATABASE_CAPABILITY_FIELDS,
+            "allow_supervisor",
+        ):
+            if type(getattr(self, field_name)) is not bool:
+                raise TypeError(f"required capability {field_name} must be boolean")
+
+
+class UnsupportedCapabilityError(RuntimeError):
+    """Raised when a plugin operation has no declared implementation."""
+
+
+class DatabaseCapabilityError(RuntimeError):
+    def __init__(self, capability: str, reason_code: str) -> None:
+        self.capability = capability
+        self.reason_code = reason_code
+        super().__init__(
+            f"required database capability {capability!r} is unavailable "
+            f"({reason_code})"
+        )
+
+
+def validate_required_capabilities(
+    capabilities: DatabaseCapabilities,
+    required: RequiredDatabaseCapabilities,
+) -> None:
+    if not isinstance(capabilities, DatabaseCapabilities):
+        raise TypeError("capabilities must be a DatabaseCapabilities instance")
+    if not isinstance(required, RequiredDatabaseCapabilities):
+        raise TypeError("required must be a RequiredDatabaseCapabilities instance")
+    for field_name in _DATABASE_CAPABILITY_FIELDS:
+        if not getattr(required, field_name):
+            continue
+        capability = getattr(capabilities, field_name)
+        if capability.state is not CapabilityState.SUPPORTED:
+            raise DatabaseCapabilityError(field_name, capability.reason_code)
+        if (
+            capability.mode is EnforcementMode.SUPERVISOR
+            and not required.allow_supervisor
+        ):
+            raise DatabaseCapabilityError(
+                field_name, "SUPERVISOR_ENFORCEMENT_DISALLOWED"
+            )
+
+
+@dataclass(frozen=True)
+class ForeignKeyRow:
+    """Одна column-row FK-метаданных, как её отдаёт драйвер БД."""
+
+    table_key: str
+    column: str
+    constraint_schema: Optional[str]
+    constraint_name: Optional[str]
+    ordinal_position: Any
+    references: Optional[str]
+
+
 class DBPlugin(Protocol):
     """Интерфейс плагина БД."""
 
     dialect: str
     dialect_label: str
+
+    def get_capabilities(self, dsn: Optional[str] = None) -> DatabaseCapabilities:
+        ...
+
+    def probe_capabilities(
+        self, conn=None, dsn: Optional[str] = None
+    ) -> PluginHealth:
+        ...
 
     def connect(self, dsn: str):
         """Открывает соединение и возвращает connection-объект курсорного типа."""
@@ -38,8 +242,8 @@ class DBPlugin(Protocol):
         """Sets per-statement execution timeout where supported."""
         ...
 
-    def introspect_schema(self, conn, schema: Optional[str] = None, table_name: Optional[str] = None) -> Dict[str, Dict[str, Dict[str, str]]]:
-        """Возвращает схему в новом формате {table: {description, columns: {column: {type, description, constraint_type, references}}}}.
+    def introspect_schema(self, conn, schema: Optional[str] = None, table_name: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+        """Возвращает схему с колонками и table-level ``foreign_keys`` envelope.
 
         schema: опционально ограничивает интроспекцию указанной схемой/базой там, где это поддерживается.
         Если не поддерживается СУБД — параметр игнорируется.
@@ -58,6 +262,17 @@ class DBPlugin(Protocol):
                         "constraint_type": "PK|FK|UNIQUE|" (пустая строка если нет ограничений),
                         "references": "referenced_table.referenced_column" (для FK, иначе пустая строка)
                     }
+                },
+                "foreign_keys": {
+                    "complete": True|False,
+                    "constraints": [{
+                        "constraint_id": "table:native_constraint",
+                        "to_table": "referenced_table",
+                        "column_pairs": [{
+                            "from_column": "source_column",
+                            "to_column": "referenced_column"
+                        }]
+                    }]
                 }
             }
         }
@@ -193,6 +408,52 @@ class BaseDBPlugin:
     dialect = "postgres"
     dialect_label = "Generic SQL"
 
+    def get_capabilities(self, dsn: Optional[str] = None) -> DatabaseCapabilities:
+        del dsn
+        unavailable = Capability.unsupported("CAPABILITY_NOT_DECLARED")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=unavailable,
+            statement_timeout=Capability.unsupported(
+                "DB_STATEMENT_TIMEOUT_UNSUPPORTED"
+            ),
+            cancellation=unavailable,
+            explain=unavailable,
+            introspection=unavailable,
+            composite_fk_introspection=unavailable,
+            parameter_binding=unavailable,
+        )
+
+    def probe_capabilities(
+        self, conn=None, dsn: Optional[str] = None
+    ) -> PluginHealth:
+        capabilities = self.get_capabilities(dsn)
+        if conn is None:
+            return PluginHealth(
+                dialect=self.dialect,
+                capabilities=capabilities,
+                production_ready=False,
+                reason_codes=("CONNECTION_PROBE_REQUIRED",),
+            )
+        try:
+            validate_required_capabilities(
+                capabilities,
+                RequiredDatabaseCapabilities(allow_supervisor=True),
+            )
+        except DatabaseCapabilityError as exc:
+            return PluginHealth(
+                dialect=self.dialect,
+                capabilities=capabilities,
+                production_ready=False,
+                reason_codes=(exc.reason_code,),
+            )
+        return PluginHealth(
+            dialect=self.dialect,
+            capabilities=capabilities,
+            production_ready=True,
+            reason_codes=("CONNECTION_CONTRACT_PROVEN",),
+        )
+
     @contextmanager
     def _cursor(self, conn):
         """Context-manager helper для безопасной работы с курсором.
@@ -208,6 +469,70 @@ class BaseDBPlugin:
                 cur.close()
             except Exception:
                 pass  # best-effort close
+
+    def _group_foreign_key_rows(
+        self, rows: Iterable[ForeignKeyRow], *, dialect_label: str
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Groups per-column FK rows into ordered composite constraints.
+
+        Shared port of the (formerly duplicated) PostgreSQL/MySQL FK-grouping
+        logic used by ``introspect_schema``.
+        """
+        fk_groups: Dict[Tuple[str, str, str], List[Tuple[int, str, str, str]]] = {}
+        for row in rows:
+            if row.constraint_name is None:
+                continue
+            if not row.constraint_schema or not row.constraint_name or not isinstance(
+                row.ordinal_position, int
+            ):
+                raise RuntimeError(
+                    f"{dialect_label} FK metadata is incomplete for {row.table_key}.{row.column}"
+                )
+            reference_table, separator, reference_column = str(
+                row.references
+            ).rpartition(".")
+            if not separator or not reference_table or not reference_column:
+                raise RuntimeError(
+                    f"{dialect_label} FK target is incomplete for {row.table_key}.{row.column}"
+                )
+            fk_groups.setdefault(
+                (row.table_key, str(row.constraint_schema), str(row.constraint_name)), []
+            ).append(
+                (
+                    row.ordinal_position,
+                    str(row.column),
+                    reference_table,
+                    reference_column,
+                )
+            )
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for (key, _constraint_schema, constraint_name), members in fk_groups.items():
+            ordered = sorted(members)
+            if [position for position, *_ in ordered] != list(
+                range(1, len(ordered) + 1)
+            ):
+                raise RuntimeError(
+                    f"{dialect_label} FK ordinals are not contiguous for {key}:{constraint_name}"
+                )
+            target_tables = {target_table for _, _, target_table, _ in ordered}
+            if len(target_tables) != 1:
+                raise RuntimeError(
+                    f"{dialect_label} FK target table is inconsistent for {key}:{constraint_name}"
+                )
+            grouped.setdefault(key, []).append(
+                {
+                    "constraint_id": f"{key}:{constraint_name}",
+                    "to_table": target_tables.pop(),
+                    "column_pairs": [
+                        {"from_column": source, "to_column": target}
+                        for _, source, _, target in ordered
+                    ],
+                }
+            )
+        for constraints in grouped.values():
+            constraints.sort(key=lambda constraint: constraint["constraint_id"])
+        return grouped
 
     def normalize_column_info(self, col_info: Dict[str, Any]) -> Dict[str, str]:
         """Нормализует информацию о колонке к единому формату.
@@ -423,10 +748,14 @@ class BaseDBPlugin:
         return limit
 
     def set_statement_timeout(self, conn, timeout_ms: int) -> None:
-        """Default no-op; dialect plugins can set DB-level statement timeout."""
+        """Reject inherited timeout handling; concrete plugins must override."""
+        del conn
         timeout = int(timeout_ms)
         if timeout <= 0:
             raise ValueError("timeout_ms must be a positive integer")
+        raise UnsupportedCapabilityError(
+            "statement timeout is unsupported by the base database plugin"
+        )
 
     def limit_select_sql(self, sql: str, row_limit: int) -> str:
         """Applies a top-level row cap while preserving top-level ORDER BY."""

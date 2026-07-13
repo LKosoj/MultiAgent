@@ -1,4 +1,5 @@
 import json
+import logging
 import sys
 import types as _pytypes
 from pathlib import Path
@@ -174,7 +175,7 @@ def _read_provider_jobs(shots_dir: Path):
 def _patch_common(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
     monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
-    monkeypatch.setattr(veo_module.time, "sleep", lambda *a, **k: None)
+    monkeypatch.setattr(veo_module, "_sleep", lambda *a, **k: None)
     monkeypatch.setattr(veo_module, "update_shots_with_descriptions", lambda *a, **k: False)
 
 
@@ -455,8 +456,9 @@ def test_veo_partial_failure_is_reported_as_error(tmp_path, monkeypatch):
 
 # --- M-10: polling has a deadline instead of looping forever -------------------------------------
 
-def test_veo_polling_times_out_after_deadline(tmp_path, monkeypatch):
+def test_veo_polling_times_out_after_deadline(tmp_path, monkeypatch, caplog):
     _patch_common(monkeypatch)
+    caplog.set_level(logging.INFO, logger=veo_module.__name__)
     project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
     item = _make_item(shots_dir)
     (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
@@ -468,7 +470,7 @@ def test_veo_polling_times_out_after_deadline(tmp_path, monkeypatch):
 
     _install_client(monkeypatch, resolver, poll_results=[])
     # start_time -> 0.0, затем проверка дедлайна -> 601.0 (> 600) -> timeout
-    monkeypatch.setattr(veo_module.time, "time", _FakeClock([0.0, 601.0]))
+    monkeypatch.setattr(veo_module, "_monotonic", _FakeClock([0.0, 601.0]))
 
     result = veo_module.video_generator_veo_tool(
         session_id="s", project_id=project_id, enable=True, max_concurrency=1,
@@ -477,3 +479,4 @@ def test_veo_polling_times_out_after_deadline(tmp_path, monkeypatch):
     assert result["status"] == "error"
     assert result["stats"] == {"total": 1, "successful": 0, "failed": 1}
     assert "время ожидания" in result["results"][0]["error"]
+    assert "Veo started" in caplog.text

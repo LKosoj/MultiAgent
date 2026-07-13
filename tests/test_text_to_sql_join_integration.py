@@ -177,6 +177,29 @@ def test_fallback_on_exception(monkeypatch, caplog):
     assert "falling back" in caplog.text
 
 
+def test_deadline_exceeded_propagates_not_swallowed_as_fallback(monkeypatch):
+    """T14: WorkflowDeadlineExceeded из build_join_path не должен тихо
+
+    проглатываться broad except'ом и подменяться greedy-fallback'ом — он
+    обязан всплыть наружу, как и другие deadline-guards в кодовой базе.
+    """
+    monkeypatch.setenv("TEXT_TO_SQL_JOIN_PATH_ALGO", "graph")
+    join_config.reset_cache()
+    schema = _chain_schema()
+    metrics = _entities("A", "B", "C")
+
+    import custom_tools.text_to_sql.schema_linking.join_validation as jv
+    from workflow.deadline import WorkflowDeadlineExceeded
+
+    def _boom(*args, **kwargs):
+        raise WorkflowDeadlineExceeded("deadline exceeded during join-path build")
+
+    monkeypatch.setattr(jv, "build_join_path", _boom)
+
+    with pytest.raises(WorkflowDeadlineExceeded):
+        JoinValidator().build_joins(metrics, [], {}, schema, main_table="A")
+
+
 # ---------------------------------------------------------------------------
 # 5. containment validate отбрасывает ложное convention-ребро
 #    (тестируем приватный _apply_containment напрямую — гранулярно)

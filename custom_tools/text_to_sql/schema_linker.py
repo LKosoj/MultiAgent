@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Union
 from .validators import SchemaLimiter
-from .schema_loader import SchemaLoader
+from .schema_loader import LoadedSchema, SchemaLoader
 from .schema_enricher import SchemaEnricher
 from .schema_memory import SchemaMemoryManager, SchemaCacheManager, SchemaCacheCorrupted
 from .schema_linking import SchemaLinkingCore
@@ -18,6 +18,11 @@ from .schema_linking.resolution import (
     _table_exists_in_schema,
 )
 from .schema_filtering import SchemaContextBuilder
+from .schema_namespace import (
+    SchemaFreshnessUnavailable,
+    SchemaNamespace,
+    SchemaScope,
+)
 from .utils import dsn_to_sanitized_name, get_runtime_context_dsn, get_schema_version, mask_dsn
 
 logger = logging.getLogger(__name__)
@@ -91,8 +96,11 @@ class SchemaLinker:
         dsn: Optional[str] = None,
         session_id: Optional[str] = None,
         value_grounding: Optional[bool] = None,
+        schema_scope: Optional[SchemaScope] = None,
     ) -> Dict[str, Any]:
         """Основная функция связывания сущностей со схемой."""
+        if schema_scope is not None and not isinstance(schema_scope, SchemaScope):
+            raise TypeError("schema_scope must be a SchemaScope or null")
         logger.info("Linking entities to database schema")
         effective_dsn = (
             dsn if (isinstance(dsn, str) and dsn.strip())
@@ -100,14 +108,28 @@ class SchemaLinker:
         )
         
         # Сначала убеждаемся, что схема готова
-        if session_id is None:
+        if schema_scope is not None:
+            self._ensure_initialized(
+                dsn=effective_dsn,
+                schema_scope=schema_scope,
+            )
+        elif session_id is None:
             self._ensure_initialized(dsn=effective_dsn)
         else:
             self._ensure_initialized(dsn=effective_dsn, session_id=session_id)
         
         # Получаем схему БД
+        namespace: Optional[SchemaNamespace] = None
         try:
-            if session_id is None:
+            if schema_scope is not None:
+                loaded_schema = self._get_scoped_database_schema(
+                    schema_info,
+                    dsn=effective_dsn,
+                    schema_scope=schema_scope,
+                )
+                db_schema = loaded_schema.schema
+                namespace = loaded_schema.namespace
+            elif session_id is None:
                 db_schema = self._get_database_schema(schema_info, dsn=effective_dsn)
             else:
                 db_schema = self._get_database_schema(
@@ -124,6 +146,18 @@ class SchemaLinker:
                     "unlinked_entities": list(entities.keys()) if isinstance(entities, dict) else [],
                     "schema_info": {}
                 }
+        except SchemaFreshnessUnavailable as e:
+            safe_error = mask_dsn(str(e))
+            logger.error("Schema freshness validation failed: %s", safe_error)
+            return {
+                "error": f"Schema freshness error: {safe_error}",
+                "reason_code": "SCHEMA_FRESHNESS_UNAVAILABLE",
+                "linked_entities": {"metrics": [], "dimensions": [], "filters": {}},
+                "joins": [],
+                "join_success": False,
+                "unlinked_entities": list(entities.keys()) if isinstance(entities, dict) else [],
+                "schema_info": {},
+            }
         except Exception as e:
             safe_error = mask_dsn(str(e))
             logger.error("Schema loading failed: %s", safe_error)
@@ -140,7 +174,13 @@ class SchemaLinker:
         logger.info(f"Loaded schema with {len(db_schema)} tables")
         
         # Проверяем кэш
-        if session_id is None:
+        if namespace is not None:
+            cache_info = self.cache_manager.prepare_cache_info(
+                entities,
+                db_schema,
+                namespace=namespace,
+            )
+        elif session_id is None:
             cache_info = self.cache_manager.prepare_cache_info(
                 entities,
                 db_schema,
@@ -174,14 +214,24 @@ class SchemaLinker:
                 cached_result = None
         if cached_result:
             # Добавляем актуальную схему к кэшированному результату
-            cached_result["schema_info"] = self.context_builder.build_relevant_schema_context(
+            context_args = (
                 cached_result.get("linked_entities", {}).get("metrics", []),
                 cached_result.get("linked_entities", {}).get("dimensions", []),
                 cached_result.get("linked_entities", {}).get("filters", {}),
                 cached_result.get("joins", []),
                 db_schema,
-                dsn=effective_dsn,
             )
+            if namespace is None:
+                cached_result["schema_info"] = self.context_builder.build_relevant_schema_context(
+                    *context_args,
+                    dsn=effective_dsn,
+                )
+            else:
+                cached_result["schema_info"] = self.context_builder.build_relevant_schema_context(
+                    *context_args,
+                    namespace=namespace,
+                )
+                cached_result["namespace_version_key"] = namespace.version_key
             return self._apply_value_grounding(
                 cached_result,
                 entities=entities,
@@ -191,17 +241,38 @@ class SchemaLinker:
             )
 
         # Выполняем связывание
-        result = self.linking_core.perform_linking(entities, db_schema, dsn=effective_dsn)
+        if namespace is None:
+            result = self.linking_core.perform_linking(
+                entities,
+                db_schema,
+                dsn=effective_dsn,
+            )
+        else:
+            result = self.linking_core.perform_linking(
+                entities,
+                db_schema,
+                namespace=namespace,
+            )
 
         # Добавляем контекст схемы
-        result["schema_info"] = self.context_builder.build_relevant_schema_context(
+        context_args = (
             result.get("linked_entities", {}).get("metrics", []),
             result.get("linked_entities", {}).get("dimensions", []),
             result.get("linked_entities", {}).get("filters", {}),
             result.get("joins", []),
             db_schema,
-            dsn=effective_dsn,
         )
+        if namespace is None:
+            result["schema_info"] = self.context_builder.build_relevant_schema_context(
+                *context_args,
+                dsn=effective_dsn,
+            )
+        else:
+            result["schema_info"] = self.context_builder.build_relevant_schema_context(
+                *context_args,
+                namespace=namespace,
+            )
+            result["namespace_version_key"] = namespace.version_key
 
         # Сохраняем только содержательные результаты, чтобы не закреплять временные ошибки линкинга.
         # При cache_corrupted save тоже пропускаем (backend нездоров).
@@ -293,11 +364,38 @@ class SchemaLinker:
                     ready_session_id, get_schema_version(db_schema)
                 )
         return db_schema
+
+    def _get_scoped_database_schema(
+        self,
+        schema_info: Dict[str, Any],
+        *,
+        dsn: Optional[str],
+        schema_scope: SchemaScope,
+    ) -> LoadedSchema:
+        if not isinstance(dsn, str) or not dsn.strip():
+            raise SchemaFreshnessUnavailable(
+                "DSN is required for live schema introspection"
+            )
+        loaded = self.loader.load_scoped_schema(schema_info, dsn, schema_scope)
+        if loaded.schema:
+            from .schema_metadata import SchemaStatsHelper
+
+            optimized_schema = SchemaStatsHelper.optimize_schema_for_storage(
+                loaded.schema
+            )
+            indexed = self.memory_manager.ensure_schema_indexed_in_memory(
+                loaded.namespace,
+                optimized_schema,
+            )
+            if indexed:
+                self.memory_manager.set_schema_ready_marker(loaded.namespace)
+        return loaded
     
     def _ensure_initialized(
         self,
         dsn: Optional[str] = None,
         session_id: Optional[str] = None,
+        schema_scope: Optional[SchemaScope] = None,
     ) -> None:
         """Убеждается, что компоненты инициализированы.
 
@@ -333,7 +431,11 @@ class SchemaLinker:
             logger.warning("DSN not set - schema operations limited")
             return
 
-        resolved_session_id = session_id or dsn_to_sanitized_name(effective_dsn)
+        resolved_session_id = (
+            schema_scope.scope_key
+            if schema_scope is not None
+            else session_id or dsn_to_sanitized_name(effective_dsn)
+        )
         logger.debug(f"Schema system initialized for session: {resolved_session_id}")
 
     def _check_type_compatibility(self, type1: str, type2: str) -> bool:
@@ -473,7 +575,14 @@ class SchemaLinker:
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
         session_id: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Dict[str, str]:
+        if namespace is not None:
+            return self.cache_manager.prepare_cache_info(
+                entities,
+                db_schema,
+                namespace=namespace,
+            )
         return self.cache_manager.prepare_cache_info(
             entities,
             db_schema,

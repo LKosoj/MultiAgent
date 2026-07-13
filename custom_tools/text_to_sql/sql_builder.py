@@ -173,6 +173,7 @@ def build_sql_from_linked_entities(
             from_col = join.get("from_column")
             to_table = join.get("to_table")
             to_col = join.get("to_column")
+            raw_pairs = join.get("column_pairs")
             # Для CROSS/NATURAL колонки не требуются — это валидно по контракту.
             join_type_preview = str(join.get("join_type") or "LEFT").strip().upper()
             joins_without_on_preview = {
@@ -184,11 +185,34 @@ def build_sql_from_linked_entities(
                     "error": "Structured SQL builder received join without from_table/to_table",
                     "join": join,
                 }
-            if requires_columns and (not from_col or not to_col):
+            if requires_columns and raw_pairs is None and (not from_col or not to_col):
                 return {
                     "error": "Structured SQL builder received join without from_column/to_column",
                     "join": join,
                 }
+            column_pairs: list[tuple[str, str]] = []
+            if raw_pairs is not None:
+                if not isinstance(raw_pairs, list) or not raw_pairs:
+                    return {
+                        "error": "Structured SQL builder received invalid column_pairs",
+                        "join": join,
+                    }
+                for pair in raw_pairs:
+                    if not isinstance(pair, dict):
+                        return {
+                            "error": "Structured SQL builder received invalid column_pairs",
+                            "join": join,
+                        }
+                    pair_from = pair.get("from_column")
+                    pair_to = pair.get("to_column")
+                    if not pair_from or not pair_to:
+                        return {
+                            "error": "Structured SQL builder received invalid column_pairs",
+                            "join": join,
+                        }
+                    column_pairs.append((str(pair_from), str(pair_to)))
+            elif requires_columns:
+                column_pairs.append((str(from_col), str(to_col)))
 
             from_join_table = str(from_join_table)
             to_table = str(to_table)
@@ -215,7 +239,11 @@ def build_sql_from_linked_entities(
             join_type = JOIN_TYPE_ALIASES[join_type_value]
             join_keyword = "JOIN" if join_type == "JOIN" else f"{join_type} JOIN"
             if join_type in JOINS_WITHOUT_ON:
-                if join.get("from_column") or join.get("to_column"):
+                if (
+                    join.get("from_column")
+                    or join.get("to_column")
+                    or "column_pairs" in join
+                ):
                     return {
                         "error": (
                             "Structured SQL builder received join columns for a "
@@ -228,10 +256,14 @@ def build_sql_from_linked_entities(
                     f"{join_keyword} {quote_identifier(join_target, dsn=effective_dsn)}"
                 )
             else:
+                predicates = " AND ".join(
+                    f"{quote_identifier(f'{from_join_table}.{pair_from}', dsn=effective_dsn)} = "
+                    f"{quote_identifier(f'{to_table}.{pair_to}', dsn=effective_dsn)}"
+                    for pair_from, pair_to in column_pairs
+                )
                 sql_parts.append(
                     f"{join_keyword} {quote_identifier(join_target, dsn=effective_dsn)} "
-                    f"ON {quote_identifier(f'{from_join_table}.{from_col}', dsn=effective_dsn)} = "
-                    f"{quote_identifier(f'{to_table}.{to_col}', dsn=effective_dsn)}"
+                    f"ON {predicates}"
                 )
             joined_tables.add(join_target)
             made_progress = True

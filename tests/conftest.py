@@ -35,6 +35,14 @@ def ensure_current_event_loop(request):
         yield
         return
 
+    # Python 3.12 public get_event_loop() creates and warns when none is set;
+    # inspect the policy slot so this fixture only closes an existing loop.
+    policy = asyncio.get_event_loop_policy()
+    policy_local = getattr(policy, "_local", None)
+    current_loop = getattr(policy_local, "_loop", None)
+    if current_loop is not None and not current_loop.is_closed():
+        current_loop.close()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:

@@ -20,14 +20,14 @@ import colorsys
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 import os
 import re
 import tempfile
 from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import quote, unquote, urlsplit
 
-from agent_streamlit_api import AgentManager, DynamicAgentDefinition
 from configuration_api import (
     ConfigurationManager,
     LLMConfig,
@@ -48,25 +48,53 @@ from telemetry import get_telemetry_manager
 from tool_manager import get_tool_manager
 from unified_logging import get_logging_manager
 from workflow.streamlit_api import WorkflowManager
+from workflow.models import is_text_to_sql_workflow_name
 from .auth import Principal, current_principal, normalize_session_id_for_principal
 from .redaction import (
     _dsn_fingerprint,
     _is_masked_dsn,
     _is_sensitive_query_key,
-    _looks_like_dsn,
     _redact_dsn,
     _redact_payload,
-    _redact_query_string,
     _redact_text,
-    _sanitize_report_b64_gzip,
     redact_pii_in_payload,
 )
 from .serialization import _serialize
-from .errors import ForbiddenWorkflowNameError
+from .errors import ForbiddenWorkflowNameError, WorkflowRunAlreadyReservedError
 from .workflow_metadata import workflow_agui_entrypoint
 from backend.fastapi_app.agui.store import EventStore
+from workflow.result_repository import load_reconciled_workflow_result
+from workflow.state_files import default_state_database_path
 import yaml
 from utils import call_openai_api_streaming
+from ._t2s_requests import (
+    TEXT_TO_SQL_MAX_ROWS_MAX,
+    TEXT_TO_SQL_MAX_ROWS_MIN,
+    TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS,
+)
+from custom_tools.text_to_sql.validators import resolve_safety_policy
+from custom_tools.text_to_sql.schema_namespace import SchemaScope
+from .connection_registry import (
+    ConnectionRecord,
+    ConnectionRef,
+    ConnectionRegistry,
+    ConnectionTargetKind,
+    ConnectionTargetPolicy,
+    ConnectionTargetValidation,
+)
+from .report_renderer import (
+    CodeSection,
+    RENDERER_VERSION,
+    REPORT_CONTENT_ENCODING,
+    REPORT_MIME_TYPE,
+    ReportTable,
+    TextSection,
+    render_static_report,
+)
+from .retention import OPERATIONAL_RETENTION_SCOPE
+
+if TYPE_CHECKING:
+    from agent_streamlit_api import AgentManager
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +125,10 @@ _ALL_SERVICE_ACTIONS = frozenset(
         "config.update_section",
         "db.benchmark",
         "db.comprehensive_test",
+        "db.connections.delete",
+        "db.connections.list",
+        "db.connections.migrate_legacy",
+        "db.connections.register",
         "db.diagnostics",
         "db.dialect_info",
         "db.generate_safe_sql",
@@ -168,6 +200,7 @@ _ALL_SERVICE_ACTIONS = frozenset(
         "telemetry.generate_report",
         "telemetry.list_traces",
         "telemetry.mark_incomplete",
+        "telemetry.retention.status",
         "telemetry.trace_events",
         "telemetry.trace_file",
         "text_to_sql.history.analytics",
@@ -213,10 +246,16 @@ _ALL_SERVICE_ACTIONS = frozenset(
 )
 _USER_ACTIONS = frozenset(
     {
+        "db.connections.list",
         "memory.search",
         "memory.status",
         "presets.text_to_sql.generate",
         "system.init_status",
+        "text_to_sql.history.analytics",
+        "text_to_sql.history.append",
+        "text_to_sql.history.clear",
+        "text_to_sql.history.list",
+        "text_to_sql.schema.load",
         "utils.base64.decode",
         "utils.base64.encode",
         "utils.color.convert",
@@ -231,8 +270,28 @@ _USER_ACTIONS = frozenset(
     }
 )
 _MEMORY_ARCHIVIST_ACTIONS = frozenset({"memory.export", "memory.import"})
-_ADMIN_ONLY_ACTIONS = _ALL_SERVICE_ACTIONS - _USER_ACTIONS - _MEMORY_ARCHIVIST_ACTIONS
+_OWNER_SCOPED_ACTIONS = frozenset(
+    {
+        "workflows.status",
+        "workflows.result",
+        "workflows.artifacts",
+        "workflows.cancel",
+        "workflows.generate_report",
+    }
+)
+_ADMIN_ONLY_ACTIONS = (
+    _ALL_SERVICE_ACTIONS
+    - _USER_ACTIONS
+    - _MEMORY_ARCHIVIST_ACTIONS
+    - _OWNER_SCOPED_ACTIONS
+)
 _DEFAULT_MAX_FILE_READ_BYTES = 1_000_000
+
+
+@dataclass(frozen=True)
+class ServiceTransportContext:
+    run_id: str
+    principal: Principal
 
 
 def _model_mapping_details(mapping: Any) -> Dict[str, Dict[str, str]]:
@@ -254,6 +313,8 @@ def _require_service_action_role(action: str, principal: Principal) -> None:
     if action not in _ALL_SERVICE_ACTIONS:
         raise PermissionError(f"service action '{action}' is not classified")
     if action in _USER_ACTIONS:
+        return
+    if action in _OWNER_SCOPED_ACTIONS:
         return
     if action in _ADMIN_ONLY_ACTIONS:
         _require_principal_role(principal, "admin", action)
@@ -334,13 +395,18 @@ def _workflow_agui_entrypoint(workflow_name: Any) -> Optional[str]:
 
 
 _AGUI_EVENT_STORE: EventStore | None = None
-_TEXT_TO_SQL_MAX_ROWS_MIN = 1
-_TEXT_TO_SQL_MAX_ROWS_MAX = 10000
+_TEXT_TO_SQL_MAX_ROWS_MIN = TEXT_TO_SQL_MAX_ROWS_MIN
+_TEXT_TO_SQL_MAX_ROWS_MAX = TEXT_TO_SQL_MAX_ROWS_MAX
 # Currently only "strict" is supported. To add new levels, update both this set AND
 # pipeline yaml's `safety_level` validation. Adding without yaml update will silently
 # fall back to strict.
-_TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS = frozenset({"strict"})
+_TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS = TEXT_TO_SQL_SUPPORTED_SAFETY_LEVELS
 _DB_TEST_CONFIG_REF_PREFIX = "db_config:"
+_CONNECTION_RECORD_TYPE = "connection_registry"
+_CONNECTION_REGISTRY: ConnectionRegistry | None = None
+_CONNECTION_TARGET_POLICY: ConnectionTargetPolicy | None = None
+_CONNECTION_REGISTRY_LOCK = threading.RLock()
+_ADMIN_RAW_DSN_EVENT_LOCK = threading.RLock()
 _MASKED_DSN_SECRET_ASSIGNMENT_RE = re.compile(
     r"(?P<prefix>^|[?&;\s])"
     r"(?P<key>[A-Za-z0-9_%+\-.\[\]]+)\s*=\s*"
@@ -352,10 +418,44 @@ _MASKED_DSN_SECRET_ASSIGNMENT_RE = re.compile(
 def _agui_event_store() -> EventStore:
     global _AGUI_EVENT_STORE
     if _AGUI_EVENT_STORE is None:
-        db_path = _project_root() / "data" / "agui_events.db"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        project_root = _project_root()
+        db_path = default_state_database_path(
+            project_root,
+            "agui_events.db",
+            legacy_path=project_root / "data" / "agui_events.db",
+        )
         _AGUI_EVENT_STORE = EventStore(str(db_path))
     return _AGUI_EVENT_STORE
+
+
+def _require_run_access(
+    run_id: Any,
+    principal: Principal,
+    store: EventStore,
+):
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_id is required")
+    stored = store.get_run(run_id)
+    if stored is None:
+        raise ValueError("run not found")
+    if principal.has_role("admin"):
+        return stored
+    if (
+        stored.run_kind != "text_to_sql"
+        or stored.owner_subject != principal.subject
+        or stored.tenant_id != principal.tenant_id
+    ):
+        raise ValueError("run not found")
+    return stored
+
+
+def _primary_workflow_result(store: EventStore, stored_run) -> Optional[Dict[str, Any]]:
+    if stored_run.result_seq is None:
+        return None
+    event = store.get_event(stored_run.run_id, stored_run.result_seq)
+    if event is None or event.event_type != "WORKFLOW_RESULT":
+        raise ValueError("run result_seq does not reference WORKFLOW_RESULT")
+    return event.payload
 
 
 def _ensure_within_root(path: Path) -> Path:
@@ -472,6 +572,10 @@ def _store_public_only_dsn(config: Dict[str, Any], dsn: str) -> bool:
     return changed
 
 
+def _is_connection_registry_config(config: Any) -> bool:
+    return isinstance(config, dict) and config.get("record_type") == _CONNECTION_RECORD_TYPE
+
+
 def _persist_legacy_db_test_config_secrets(configs: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     secrets = _load_db_test_config_secrets()
     changed_configs = False
@@ -481,6 +585,9 @@ def _persist_legacy_db_test_config_secrets(configs: Dict[str, Dict[str, Any]]) -
         if not isinstance(config, dict):
             continue
         next_config = dict(config)
+        if _is_connection_registry_config(next_config):
+            normalized[name] = next_config
+            continue
         dsn = next_config.get("dsn")
         if isinstance(dsn, str) and dsn:
             if _masked_dsn_requires_public_normalization(dsn):
@@ -520,6 +627,13 @@ def _persist_legacy_db_test_config_secrets(configs: Dict[str, Dict[str, Any]]) -
         normalized[name] = next_config
     for name, secret in list(secrets.items()):
         public_config = normalized.get(name)
+        if _is_connection_registry_config(public_config):
+            if (
+                public_config.get("connection_ref") == name
+                and isinstance(secret, str)
+                and bool(secret)
+            ):
+                continue
         public_dsn = public_config.get("dsn") if isinstance(public_config, dict) else None
         public_fingerprint = public_config.get("dsn_fingerprint") if isinstance(public_config, dict) else None
         if (
@@ -593,6 +707,7 @@ def _serialize_db_test_configs(configs: Dict[str, Dict[str, Any]]) -> list[Dict[
             "connection_ref": f"{_DB_TEST_CONFIG_REF_PREFIX}{quote(name, safe='')}",
         }
         for name, config in configs.items()
+        if not _is_connection_registry_config(config)
     ]
 
 
@@ -618,16 +733,13 @@ def _require_db_test_config_access(config: Dict[str, Any], principal: Principal)
     raise PermissionError("saved DB config is not accessible for current principal")
 
 
-def _resolve_dsn_reference(dsn: Any, principal: Optional[Principal] = None) -> Any:
-    if not isinstance(dsn, str) or not dsn.startswith(_DB_TEST_CONFIG_REF_PREFIX):
-        return dsn
-    principal = principal or current_principal()
+def _resolve_legacy_db_config_reference(reference: str, principal: Principal) -> str:
+    _require_principal_role(principal, "admin", "resolve legacy DB config")
     with _DB_TEST_CONFIGS_LOCK:
-        name = unquote(dsn[len(_DB_TEST_CONFIG_REF_PREFIX):])
+        name = unquote(reference[len(_DB_TEST_CONFIG_REF_PREFIX):])
         public_configs = _load_db_test_configs()
         secrets = _load_db_test_config_secrets()
         public_config = public_configs.get(name) or {}
-        _require_db_test_config_access(public_config, principal)
         resolved = secrets.get(name)
         if not resolved:
             legacy_dsn = public_config.get("dsn")
@@ -650,58 +762,303 @@ def _resolve_dsn_reference(dsn: Any, principal: Optional[Principal] = None) -> A
         return resolved
 
 
-def _t2s_history_path() -> Path:
-    logs_dir = _project_root() / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    return logs_dir / "sql_history.jsonl"
+def _connection_record_from_config(
+    storage_key: str,
+    config: Dict[str, Any],
+) -> ConnectionRecord:
+    reference = config.get("connection_ref")
+    if reference != storage_key:
+        raise ValueError("persisted connection reference does not match storage key")
+    created_at = config.get("created_at")
+    if not isinstance(created_at, str):
+        raise ValueError("persisted connection created_at must be a string")
+    try:
+        created = datetime.fromisoformat(created_at)
+        target_kind = ConnectionTargetKind(config.get("target_kind"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("persisted connection metadata is invalid") from exc
+    return ConnectionRecord(
+        connection_ref=ConnectionRef(reference),
+        display_name=config.get("display_name"),
+        owner_subject=config.get("owner_subject"),
+        tenant_id=config.get("tenant_id"),
+        target_kind=target_kind,
+        dialect=config.get("dialect"),
+        target_description=config.get("target_description"),
+        created_at=created,
+        enabled_for_user=config.get("enabled_for_user"),
+    )
 
 
-def _t2s_history_list(limit: int) -> list[Dict[str, Any]]:
-    path = _t2s_history_path()
-    if not path.exists():
-        return []
-    entries: list[Dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                entries.append(redact_pii_in_payload(_redact_payload(rec)))
-            except Exception:
-                continue
-    return entries[-limit:]
+def _connection_registry() -> ConnectionRegistry:
+    global _CONNECTION_REGISTRY, _CONNECTION_TARGET_POLICY
+    registry = _CONNECTION_REGISTRY
+    if registry is not None:
+        return registry
+    with _CONNECTION_REGISTRY_LOCK:
+        registry = _CONNECTION_REGISTRY
+        if registry is not None:
+            return registry
+        policy = _CONNECTION_TARGET_POLICY or ConnectionTargetPolicy.from_environment()
+        registry = ConnectionRegistry(
+            policy,
+            legacy_resolver=_resolve_legacy_db_config_reference,
+        )
+        with _DB_TEST_CONFIGS_LOCK:
+            configs = _load_db_test_configs()
+            secrets = _load_db_test_config_secrets()
+            for storage_key, config in configs.items():
+                if not _is_connection_registry_config(config):
+                    continue
+                secret = secrets.get(storage_key)
+                if not isinstance(secret, str) or not secret:
+                    raise ValueError("persisted connection secret is unavailable")
+                registry.restore(
+                    _connection_record_from_config(storage_key, config),
+                    secret,
+                )
+        _CONNECTION_TARGET_POLICY = policy
+        _CONNECTION_REGISTRY = registry
+        return registry
 
 
-def _t2s_history_append(entry: Dict[str, Any]) -> Dict[str, Any]:
-    path = _t2s_history_path()
-    entry = redact_pii_in_payload(_redact_payload(dict(entry)))
-    if "timestamp" not in entry:
-        entry["timestamp"] = datetime.now().isoformat()
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    return entry
+def _connection_target_policy() -> ConnectionTargetPolicy:
+    _connection_registry()
+    policy = _CONNECTION_TARGET_POLICY
+    if policy is None:
+        raise RuntimeError("connection target policy is unavailable")
+    return policy
 
 
-def _t2s_history_clear() -> None:
-    path = _t2s_history_path()
-    if path.exists():
-        path.unlink()
-
-
-def _t2s_history_analytics(entries: list[Dict[str, Any]]) -> Dict[str, Any]:
-    dialects = Counter()
-    success = Counter()
-    for entry in entries:
-        dialects[entry.get("dialect", "unknown")] += 1
-        success_key = "success" if entry.get("success") else "failed"
-        success[success_key] += 1
-    return {
-        "total": len(entries),
-        "dialects": [{"dialect": k, "count": v} for k, v in dialects.most_common()],
-        "success": dict(success),
+def _persist_connection_record(record: ConnectionRecord, dsn: str) -> None:
+    reference = str(record.connection_ref)
+    public_record = {
+        "record_type": _CONNECTION_RECORD_TYPE,
+        **record.to_public_dict(),
     }
+    with _DB_TEST_CONFIGS_LOCK:
+        configs = _load_db_test_configs()
+        secrets = _load_db_test_config_secrets()
+        if reference in configs or reference in secrets:
+            raise ValueError("connection reference already exists in persistence")
+        configs[reference] = public_record
+        secrets[reference] = dsn
+        _save_db_test_config_secrets(secrets)
+        try:
+            _save_db_test_configs(configs)
+        except BaseException:
+            secrets.pop(reference, None)
+            _save_db_test_config_secrets(secrets)
+            raise
+
+
+def _remove_persisted_connection(reference: str) -> None:
+    with _DB_TEST_CONFIGS_LOCK:
+        configs = _load_db_test_configs()
+        secrets = _load_db_test_config_secrets()
+        config = configs.get(reference)
+        if not _is_connection_registry_config(config):
+            raise ValueError("persisted connection record is unavailable")
+        configs.pop(reference, None)
+        secret = secrets.pop(reference, None)
+        _save_db_test_configs(configs)
+        try:
+            _save_db_test_config_secrets(secrets)
+        except BaseException:
+            configs[reference] = config
+            _save_db_test_configs(configs)
+            if isinstance(secret, str):
+                secrets[reference] = secret
+            raise
+
+
+def _register_connection(
+    principal: Principal,
+    *,
+    display_name: Any,
+    dsn: Any,
+    owner_subject: Any,
+    tenant_id: Any,
+    enabled_for_user: Any,
+) -> ConnectionRecord:
+    if not isinstance(dsn, str) or not dsn:
+        raise ValueError("dsn is required")
+    enabled = _coerce_strict_bool(
+        enabled_for_user,
+        default=True,
+        field_name="enabled_for_user",
+    )
+    registry = _connection_registry()
+    record = registry.register(
+        principal,
+        display_name=display_name,
+        dsn=dsn,
+        owner_subject=owner_subject,
+        tenant_id=tenant_id,
+        enabled_for_user=enabled,
+    )
+    try:
+        _persist_connection_record(record, dsn)
+    except BaseException:
+        registry.delete(record.connection_ref, principal)
+        raise
+    return record
+
+
+def _delete_connection(reference: Any, principal: Principal) -> ConnectionRecord:
+    if not isinstance(reference, str) or not reference:
+        raise ValueError("connection_ref is required")
+    registry = _connection_registry()
+    dsn = registry.resolve(reference, principal)
+    record = registry.delete(reference, principal)
+    try:
+        _remove_persisted_connection(reference)
+    except BaseException:
+        registry.restore(record, dsn)
+        raise
+    return record
+
+
+def _resolve_dsn_reference(dsn: Any, principal: Optional[Principal] = None) -> Any:
+    if not isinstance(dsn, str):
+        return dsn
+    principal = principal or current_principal()
+    registry = _connection_registry()
+    if dsn.startswith(_DB_TEST_CONFIG_REF_PREFIX):
+        return registry.resolve_legacy(dsn, principal)
+    if dsn.startswith("conn-"):
+        return registry.resolve(dsn, principal)
+    return dsn
+
+
+def _resolve_text_to_sql_connection_ref(
+    connection_ref: Any,
+    principal: Principal,
+) -> str:
+    _record, dsn = _resolve_text_to_sql_connection_with_record(
+        connection_ref,
+        principal,
+    )
+    return dsn
+
+
+def _resolve_text_to_sql_connection_with_record(
+    connection_ref: Any,
+    principal: Principal,
+) -> tuple[ConnectionRecord | None, str]:
+    if not isinstance(connection_ref, str):
+        raise ValueError("connection_ref must be a canonical generated reference")
+    try:
+        reference = ConnectionRef(connection_ref)
+    except (TypeError, ValueError) as exc:
+        if connection_ref.startswith(_DB_TEST_CONFIG_REF_PREFIX):
+            return (
+                None,
+                _connection_registry().resolve_legacy(connection_ref, principal),
+            )
+        raise ValueError(
+            "connection_ref must be a canonical generated reference"
+        ) from exc
+    return _connection_registry().resolve_with_record(reference, principal)
+
+
+def _admit_text_to_sql_connection(
+    request: Any,
+    principal: Principal,
+) -> tuple[
+    str,
+    str,
+    ConnectionTargetValidation | None,
+    ConnectionRecord | None,
+]:
+    if request.connection_ref is not None:
+        if request.admin_raw_dsn_compat:
+            raise ValueError("admin_raw_dsn_compat is valid only with raw dsn input")
+        record, resolved = _resolve_text_to_sql_connection_with_record(
+            request.connection_ref,
+            principal,
+        )
+        if not isinstance(resolved, str) or not resolved:
+            raise ValueError("connection_ref could not be resolved")
+        return resolved, request.connection_ref, None, record
+
+    if not principal.has_role("admin"):
+        raise PermissionError(
+            "ordinary Text-to-SQL users must provide an accessible connection_ref"
+        )
+    if not request.admin_raw_dsn_compat:
+        raise PermissionError(
+            "admin raw DSN input requires admin_raw_dsn_compat=true"
+        )
+    validation = _connection_target_policy().require_allowed(request.dsn)
+    return request.dsn, "admin_raw_dsn_compat", validation, None
+
+
+def _trusted_text_to_sql_schema_scope(
+    record: ConnectionRecord | None,
+    principal: Principal,
+    run_id: str,
+) -> dict[str, object]:
+    if record is None:
+        tenant_id = principal.tenant_id
+        access_scope_id = f"owner:{principal.subject}"
+        connection_view_id = f"compatibility-run:{run_id}"
+        transient = True
+    else:
+        tenant_id = record.tenant_id
+        access_scope_id = (
+            f"owner:{record.owner_subject}"
+            if record.owner_subject is not None
+            else "tenant-shared"
+        )
+        connection_view_id = f"registry:{record.connection_ref}"
+        transient = False
+    return SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": tenant_id,
+            "access_scope_id": access_scope_id,
+            "connection_view_id": connection_view_id,
+            "transient": transient,
+        }
+    ).to_mapping()
+
+
+def _admin_raw_dsn_event_payload(
+    validation: ConnectionTargetValidation,
+) -> Dict[str, Any]:
+    target = validation.canonical_target
+    if validation.kind is ConnectionTargetKind.FILE and isinstance(target, str):
+        target = Path(target).name
+    return {
+        "action": "presets.text_to_sql.generate",
+        "compatibility_mode": "admin_raw_dsn_compat",
+        "connection_ref": "admin_raw_dsn_compat",
+        "target_kind": validation.kind.value if validation.kind is not None else None,
+        "dialect": validation.scheme,
+        "target": target,
+    }
+
+
+def _append_admin_raw_dsn_event_once(
+    store: EventStore,
+    run_id: str,
+    validation: ConnectionTargetValidation,
+) -> None:
+    event_type = "TEXT_TO_SQL_ADMIN_RAW_DSN_COMPAT"
+    with _ADMIN_RAW_DSN_EVENT_LOCK:
+        if any(event.event_type == event_type for event in store.list_after(run_id, 0)):
+            return
+        store.append(run_id, event_type, _admin_raw_dsn_event_payload(validation))
+
+
+def _workflow_result_outbox_path() -> Path:
+    project_root = _project_root()
+    return default_state_database_path(
+        project_root,
+        "workflow_result_outbox.db",
+        legacy_path=project_root / "data" / "workflow_result_outbox.db",
+    )
 
 
 def _extract_query(payload: Dict[str, Any]) -> str:
@@ -1779,140 +2136,139 @@ def _telemetry_export(telemetry_manager: Any, trace_files: list[Dict[str, Any]],
     return {"format": "json", "data": export_rows, "count": len(export_rows)}
 
 
+def _valid_static_report(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
+    if (
+        value.get("renderer_version") != RENDERER_VERSION
+        or value.get("mime_type") != REPORT_MIME_TYPE
+        or value.get("content_encoding") != REPORT_CONTENT_ENCODING
+    ):
+        return None
+    digest = value.get("content_sha256")
+    payload = value.get("content_b64_gzip")
+    if not isinstance(digest, str) or not isinstance(payload, str):
+        return None
+    try:
+        rendered = gzip.decompress(base64.b64decode(payload, validate=True))
+    except (OSError, ValueError):
+        return None
+    if hashlib.sha256(rendered).hexdigest() != digest:
+        return None
+    return dict(value)
+
+
+def _structured_report_sections(
+    value: Any,
+) -> tuple[list[TextSection], list[CodeSection], list[ReportTable]]:
+    text_sections: list[TextSection] = []
+    code_sections: list[CodeSection] = []
+    tables: list[ReportTable] = []
+    if isinstance(value, str):
+        return [TextSection(text=value)], code_sections, tables
+    if not isinstance(value, dict):
+        return [TextSection(text=str(value))], code_sections, tables
+
+    sql = value.get("sql_query") or value.get("sql")
+    if isinstance(sql, str) and sql:
+        code_sections.append(CodeSection(code=sql, label="SQL", language="sql"))
+    explanation = value.get("explanation")
+    if isinstance(explanation, str) and explanation:
+        text_sections.append(TextSection(text=explanation, heading="Explanation"))
+    content = value.get("content")
+    if isinstance(content, str) and content:
+        text_sections.append(TextSection(text=content))
+
+    result = value.get("execution_result")
+    if not isinstance(result, dict):
+        result = value.get("execution")
+    if isinstance(result, dict):
+        columns = result.get("columns")
+        rows = result.get("data")
+        if (
+            isinstance(columns, list)
+            and isinstance(rows, list)
+            and all(isinstance(row, (list, tuple)) for row in rows)
+            and all(len(row) == len(columns) for row in rows)
+        ):
+            tables.append(ReportTable(columns=columns, rows=rows, title="Result"))
+
+    if not text_sections and not code_sections and not tables:
+        code_sections.append(
+            CodeSection(
+                code=json.dumps(value, ensure_ascii=False, indent=2, default=str),
+                label="Structured result",
+                language="json",
+            )
+        )
+    return text_sections, code_sections, tables
+
+
+def _render_structured_report(title: str, value: Any) -> Dict[str, Any]:
+    text_sections, code_sections, tables = _structured_report_sections(value)
+    return dict(
+        render_static_report(
+            title=title,
+            text_sections=text_sections,
+            code_sections=code_sections,
+            tables=tables,
+        ).to_mapping()
+    )
+
+
+def _cached_telemetry_report(spans: list[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    for span in spans:
+        for event in span.get("events") or []:
+            if not isinstance(event, dict) or str(event.get("name", "")).lower() != "report_generated":
+                continue
+            attributes = event.get("attributes")
+            if not isinstance(attributes, dict):
+                continue
+            cached = _valid_static_report(
+                {
+                    "renderer_version": attributes.get("report.renderer_version"),
+                    "content_sha256": attributes.get("report.content_sha256"),
+                    "mime_type": attributes.get("report.mime_type"),
+                    "content_encoding": attributes.get("report.content_encoding"),
+                    "content_b64_gzip": attributes.get("report.content_b64_gzip"),
+                }
+            )
+            if cached is not None:
+                return cached
+    return None
+
+
 def _telemetry_generate_report(telemetry_manager: Any, run_id: str, persist: bool = True) -> Dict[str, Any]:
-    from html_utils import html_visualizer
     from telemetry.helpers import get_trace_status
 
-    traces_dir = _project_root() / "logs" / "traces"
-    jsonl_path = traces_dir / f"{run_id}.jsonl"
     trace_content = telemetry_manager.load_trace_file(run_id)
     spans = trace_content.get("spans", [])
-    if not spans:
+    if not isinstance(spans, list) or not spans:
         raise ValueError("Trace is empty")
-    trace_status = get_trace_status(spans).get("status")
-    if trace_status == "running":
+    if get_trace_status(spans).get("status") == "running":
         raise ValueError("Trace is still running")
-
-    if jsonl_path.exists():
-        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
-        objs = []
-        for line in lines:
-            try:
-                objs.append(json.loads(line))
-            except Exception:
-                objs.append(line)
-        root_indices = [i for i, o in enumerate(objs) if isinstance(o, dict) and not o.get("parent_span_id")]
-        for i in root_indices:
-            o = objs[i]
-            for ev in (o.get("events") or []):
-                if (ev.get("name") or "").lower() == "report_generated":
-                    attrs = ev.get("attributes") or {}
-                    b64 = attrs.get("report.content_b64_gzip") or attrs.get("report_b64_gzip")
-                    if b64:
-                        sanitized_b64 = _sanitize_report_b64_gzip(b64)
-                        if sanitized_b64 != b64:
-                            if "report.content_b64_gzip" in attrs:
-                                attrs["report.content_b64_gzip"] = sanitized_b64
-                            if "report_b64_gzip" in attrs:
-                                attrs["report_b64_gzip"] = sanitized_b64
-                            temp_path = jsonl_path.with_suffix(f"{jsonl_path.suffix}.tmp")
-                            temp_path.write_text(
-                                "\n".join(
-                                    json.dumps(obj, ensure_ascii=False, default=str) if isinstance(obj, dict) else str(obj)
-                                    for obj in objs
-                                ) + "\n",
-                                encoding="utf-8",
-                            )
-                            os.replace(temp_path, jsonl_path)
-                        b64 = sanitized_b64
-                        session_id = attrs.get("report.session_id") or run_id
-                        filename = attrs.get("report.filename") or f"interactive_plots_{session_id}.html"
-                        _sanitize_existing_report_file(str(filename), str(session_id))
-                        return {
-                            "run_id": run_id,
-                            "session_id": session_id,
-                            "mime_type": attrs.get("report.mime_type") or "text/html",
-                            "filename": filename,
-                            "base64_gzip": b64,
-                        }
+    cached = _cached_telemetry_report(spans)
+    if cached is not None:
+        return cached
 
     final_answer = None
     for span in spans:
-        attrs = span.get("attributes", {})
-        if isinstance(attrs, dict) and attrs.get("output.value"):
-            final_answer = attrs.get("output.value")
+        attributes = span.get("attributes", {}) if isinstance(span, dict) else {}
+        if isinstance(attributes, dict) and attributes.get("output.value") is not None:
+            final_answer = attributes["output.value"]
             break
-
     if final_answer is None:
         raise ValueError("No output found in trace")
-
-    session_id = run_id
-    for span in spans:
-        attrs = span.get("attributes", {})
-        for key in ("session_id", "session.id", "sessionId", "session", "run_id", "run.id"):
-            if attrs.get(key):
-                session_id = attrs.get(key)
-                break
-
-    final_answer = _redact_payload(final_answer)
-    report_text = str(final_answer)
-    try:
-        parsed = json.loads(final_answer) if isinstance(final_answer, str) else None
-        if isinstance(parsed, dict) and "content" in parsed:
-            report_text = str(parsed.get("content"))
-        elif isinstance(final_answer, dict):
-            report_text = json.dumps(final_answer, ensure_ascii=False)
-    except Exception:
-        pass
-
-    path_to_html = html_visualizer.advanced_visualization(report_text, session_id, show=True)
-    html_path = Path(path_to_html)
-    html_content = redact_pii_in_payload(_redact_text(html_path.read_text(encoding="utf-8")))
-    html_path.write_text(html_content, encoding="utf-8")
-    gz = gzip.compress(html_content.encode("utf-8"))
-    b64 = base64.b64encode(gz).decode("ascii")
-
-    if jsonl_path.exists():
-        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
-        objs = []
-        for line in lines:
-            try:
-                objs.append(json.loads(line))
-            except Exception:
-                objs.append(line)
-        root_indices = [i for i, o in enumerate(objs) if isinstance(o, dict) and not o.get("parent_span_id")]
-        target_idx = None
-        for i in root_indices:
-            name = (objs[i].get("name") or "").lower()
-            if name.startswith("agent_run_"):
-                target_idx = i
-                break
-        if target_idx is None and root_indices:
-            target_idx = root_indices[0]
-        if persist and target_idx is not None and isinstance(objs[target_idx], dict):
-            events = objs[target_idx].get("events") or []
-            events = [e for e in events if (e.get("name") or "").lower() != "report_generated"]
-            events.append({
-                "name": "report_generated",
-                "attributes": {
-                    "report.mime_type": "text/html",
-                    "report.filename": f"interactive_plots_{session_id}.html",
-                    "report.generated_at": datetime.now().isoformat(),
-                    "report.size_bytes": len(html_content.encode("utf-8")),
-                    "report.session_id": session_id,
-                    "report.content_b64_gzip": b64,
-                },
-            })
-            objs[target_idx]["events"] = events
-            jsonl_path.write_text("\n".join(json.dumps(o, ensure_ascii=False) if isinstance(o, dict) else str(o) for o in objs) + "\n", encoding="utf-8")
-
-    return {
-        "run_id": run_id,
-        "session_id": session_id,
-        "mime_type": "text/html",
-        "filename": f"interactive_plots_{session_id}.html",
-        "base64_gzip": b64,
-    }
+    if isinstance(final_answer, str):
+        try:
+            final_answer = json.loads(final_answer)
+        except (TypeError, ValueError):
+            pass
+    del persist  # trace mutation remains owned by the telemetry subsystem
+    return _render_structured_report(
+        f"Telemetry report: {run_id}",
+        _redact_payload(final_answer),
+    )
 
 
 def _telemetry_extract_output(telemetry_manager: Any, run_id: str) -> Any:
@@ -1934,121 +2290,88 @@ def _telemetry_extract_output(telemetry_manager: Any, run_id: str) -> Any:
 
 
 def _workflow_result_from_store(run_id: str) -> Optional[Dict[str, Any]]:
+    store = _agui_event_store()
+    reconciled = load_reconciled_workflow_result(
+        run_id,
+        primary_store=store,
+        outbox_path=_workflow_result_outbox_path(),
+        strict=True,
+    )
+    if reconciled is not None:
+        return reconciled.payload
+
+    run_finished_payload = None
+    for event in store.list_after(run_id, 0):
+        if event.event_type != "RUN_FINISHED":
+            continue
+        candidate = (
+            event.payload.get("result")
+            if isinstance(event.payload, dict)
+            else None
+        )
+        if isinstance(candidate, dict) and (
+            candidate.get("type") == "workflow_outputs"
+            or "artifacts" in candidate
+            or "snapshot" in candidate
+        ):
+            run_finished_payload = candidate
+    return run_finished_payload
+
+
+def _validated_text_to_sql_terminal_outcome(value: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(value, dict):
+        return None
     try:
-        store = _agui_event_store()
-        workflow_payload = None
-        run_finished_payload = None
-        for event in store.list_after(run_id, 0):
-            if event.event_type == "WORKFLOW_RESULT":
-                workflow_payload = event.payload
-            elif event.event_type == "RUN_FINISHED" and workflow_payload is None:
-                candidate = event.payload.get("result") if isinstance(event.payload, dict) else None
-                if isinstance(candidate, dict) and (
-                    candidate.get("type") == "workflow_outputs"
-                    or "artifacts" in candidate
-                    or "snapshot" in candidate
-                ):
-                    run_finished_payload = candidate
-        return workflow_payload if workflow_payload is not None else run_finished_payload
-    except Exception:
+        from workflow.models import TextToSqlTerminalResult
+
+        return TextToSqlTerminalResult.from_mapping(value).to_mapping()
+    except (ImportError, TypeError, ValueError):
         return None
 
 
-def _workflow_report_text(final_output: Any) -> str:
-    if final_output is None:
-        raise ValueError("Workflow output is empty")
-    if isinstance(final_output, str):
-        return final_output
-    if isinstance(final_output, dict):
-        workflow_type = final_output.get("type")
-        if workflow_type == "workflow_outputs":
-            final_value = final_output.get("final")
-            if final_value is not None:
-                return _workflow_report_text(final_value)
-            outputs = final_output.get("outputs") or {}
-            if outputs:
-                lines = []
-                for key, value in outputs.items():
-                    lines.append(f"{key}\n{_workflow_report_text(value)}")
-                return "\n\n".join(lines)
-        if workflow_type == "workflow_result":
-            outputs = final_output.get("outputs") or {}
-            if outputs:
-                last_key = list(outputs.keys())[-1]
-                last_output = outputs[last_key].get("output")
-                return _workflow_report_text(last_output)
-        if workflow_type == "sql_result":
-            parts = []
-            if final_output.get("sql_query"):
-                parts.append(f"SQL\n{final_output.get('sql_query')}")
-            if final_output.get("explanation"):
-                parts.append(f"Пояснение\n{final_output.get('explanation')}")
-            if final_output.get("execution_result") is not None:
-                parts.append(f"Результаты\n{json.dumps(final_output.get('execution_result'), ensure_ascii=False, default=str)}")
-            if parts:
-                return "\n\n".join(parts)
-        if workflow_type in ("research_report", "analysis_report", "sql_generation"):
-            parts = []
-            summary = final_output.get("summary")
-            if summary:
-                parts.append(f"Резюме\n{summary}")
-            findings = final_output.get("key_findings") or []
-            if findings:
-                parts.append("Ключевые находки\n" + "\n".join(f"- {item}" for item in findings))
-            recommendations = final_output.get("recommendations") or []
-            if recommendations:
-                parts.append("Рекомендации\n" + "\n".join(f"- {item}" for item in recommendations))
-            if parts:
-                return "\n\n".join(parts)
-        if "content" in final_output:
-            return str(final_output.get("content"))
-        return json.dumps(final_output, ensure_ascii=False, default=str)
-    return str(final_output)
+def _text_to_sql_terminal_projection(
+    value: Any,
+    *,
+    fallback_error: Any = None,
+) -> tuple[str, bool, Optional[str], Optional[Dict[str, Any]]]:
+    terminal = _validated_text_to_sql_terminal_outcome(value)
+    if terminal is None:
+        error = str(fallback_error) if fallback_error else None
+        return "unknown_legacy", False, error, None
+
+    terminal_status = terminal["status"]
+    error = terminal.get("error") or terminal.get("reason_code") or fallback_error
+    if terminal_status == "succeeded":
+        return "completed", True, None, terminal
+    if terminal_status == "cancelled":
+        return "cancelled", False, str(error) if error else None, terminal
+    return "failed", False, str(error) if error else None, terminal
+
+
+_TEXT_TO_SQL_HISTORY_SUMMARY_TARGET_BYTES = 20 * 1024
+
 
 
 def _workflow_generate_report(wf_manager: Any, run_id: str) -> Dict[str, Any]:
-    from html_utils import html_visualizer
-
     if hasattr(wf_manager, "get_active_run_snapshot"):
         run_data = wf_manager.get_active_run_snapshot(run_id)
     else:
         run_data = dict(wf_manager.active_runs.get(run_id, {}))
     cached = run_data.get("report") if isinstance(run_data, dict) else None
-    if isinstance(cached, dict) and cached.get("base64_gzip"):
-        sanitized = _redact_payload(cached)
-        session_id = sanitized.get("session_id")
-        if not session_id and isinstance(run_data, dict):
-            session_id = run_data.get("session_id")
-        if not session_id:
-            session_id = run_id
-        filename = sanitized.get("filename") or f"interactive_plots_{session_id}.html"
-        _sanitize_existing_report_file(str(filename), str(session_id))
-        if hasattr(wf_manager, "update_active_run"):
-            wf_manager.update_active_run(run_id, {"report": sanitized})
-        return sanitized
+    trusted_cache = _valid_static_report(cached)
+    if trusted_cache is not None:
+        return trusted_cache
 
     artifacts = wf_manager.get_workflow_artifacts(run_id)
     if not artifacts:
         raise ValueError("Workflow not found")
     final_output = getattr(artifacts, "final_output", None)
-    report_text = _workflow_report_text(_redact_payload(final_output))
-    session_id = run_data.get("session_id") if isinstance(run_data, dict) else None
-    if not session_id:
-        session_id = run_id
-
-    path_to_html = html_visualizer.advanced_visualization(report_text, session_id, show=True)
-    html_path = Path(path_to_html)
-    html_content = redact_pii_in_payload(_redact_text(html_path.read_text(encoding="utf-8")))
-    html_path.write_text(html_content, encoding="utf-8")
-    gz = gzip.compress(html_content.encode("utf-8"))
-    b64 = base64.b64encode(gz).decode("ascii")
-    report = {
-        "run_id": run_id,
-        "session_id": session_id,
-        "mime_type": "text/html",
-        "filename": f"interactive_plots_{session_id}.html",
-        "base64_gzip": b64,
-    }
+    if final_output is None:
+        raise ValueError("Workflow output is empty")
+    report = _render_structured_report(
+        f"Workflow report: {run_id}",
+        _redact_payload(final_output),
+    )
     if hasattr(wf_manager, "update_active_run"):
         wf_manager.update_active_run(run_id, {"report": report})
     elif isinstance(run_data, dict):
@@ -2560,6 +2883,8 @@ def _agent_manager() -> AgentManager:
     if _AGENT_MANAGER is None:
         with _AGENT_MANAGER_LOCK:
             if _AGENT_MANAGER is None:
+                from agent_streamlit_api import AgentManager
+
                 _AGENT_MANAGER = AgentManager()
     return _AGENT_MANAGER
 
@@ -3077,12 +3402,19 @@ def handle_service_action(
     action: str,
     payload: Dict[str, Any],
     principal: Optional[Principal] = None,
+    *,
+    transport_context: Optional[ServiceTransportContext] = None,
 ) -> Dict[str, Any]:
     if payload is None:
         payload = {}
     if not isinstance(payload, dict):
         raise ValueError("service_payload must be an object")
-    principal = principal or current_principal()
+    if transport_context is not None:
+        if principal is not None and principal != transport_context.principal:
+            raise PermissionError("transport principal does not match caller")
+        principal = transport_context.principal
+    else:
+        principal = principal or current_principal()
     _require_service_action_role(action, principal)
 
     agent_manager = _LazyManager(_agent_manager)
@@ -3214,6 +3546,8 @@ def handle_service_action(
         definition_payload = payload.get("definition")
         if not definition_payload:
             raise ValueError("definition is required")
+        from agent_streamlit_api import DynamicAgentDefinition
+
         definition = DynamicAgentDefinition(**definition_payload)
         ok = agent_manager.register_dynamic_profile(definition.name, definition)
         return {"registered": ok, "name": definition.name}
@@ -3257,6 +3591,8 @@ def handle_service_action(
         definition_payload = payload.get("definition")
         if not definition_payload:
             raise ValueError("definition is required")
+        from agent_streamlit_api import DynamicAgentDefinition
+
         definition = DynamicAgentDefinition(**definition_payload)
         agent_id = agent_manager.create_dynamic_agent(definition, session_id=payload.get("session_id"))
         return {"agent_id": agent_id}
@@ -3286,7 +3622,6 @@ def handle_service_action(
         workflow_name = payload.get("workflow_name")
         parameters = payload.get("parameters") or {}
         session_id = payload.get("session_id")
-        client_id = payload.get("client_id")
         use_enhanced = _coerce_bool(payload.get("use_enhanced"), True)
         enable_telemetry = _coerce_bool(payload.get("enable_telemetry"), False)
         if not workflow_name:
@@ -3336,62 +3671,258 @@ def handle_service_action(
                     f"workflows.start parameters invalid for '{workflow_name}': {msg}"
                 ) from exc
             parameters = validated.model_dump()
+        session_id = session_id or f"session-{uuid.uuid4().hex}"
+        proposed_run_id = f"run-{uuid.uuid4().hex}"
+        event_store = _agui_event_store()
+        event_store.create_run(
+            proposed_run_id,
+            session_id,
+            principal,
+            run_kind="agui",
+        )
+        from workflow.streamlit_api import WorkflowOwner
+
+        workflow_owner = WorkflowOwner(
+            subject=principal.subject,
+            tenant_id=principal.tenant_id,
+            roles=principal.roles,
+        )
         run_id = wf_manager.start_workflow(
             workflow_name=workflow_name,
             parameters=parameters,
             session_id=session_id,
-            client_id=client_id,
+            client_id=workflow_owner.quota_identity,
             use_enhanced=use_enhanced,
             enable_telemetry=enable_telemetry,
+            run_id=proposed_run_id,
+            owner=workflow_owner,
         )
-        return {"run_id": run_id}
+        return {"run_id": run_id, "status": "queued"}
     if action == "workflows.status":
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
+        event_store = _agui_event_store()
+        stored_run = _require_run_access(run_id, principal, event_store)
         status_obj = wf_manager.get_workflow_status(run_id)
         if status_obj is None:
-            stored = _workflow_result_from_store(run_id) or {}
+            stored = (
+                _primary_workflow_result(event_store, stored_run) or {}
+                if stored_run.run_kind == "text_to_sql"
+                else _workflow_result_from_store(run_id) or {}
+            )
             if stored:
                 snapshot = stored.get("snapshot") if isinstance(stored.get("snapshot"), dict) else {}
+                artifacts = stored.get("artifacts") if isinstance(stored.get("artifacts"), dict) else {}
+                workflow_name = snapshot.get("workflow_name", "unknown")
+                stored_status = stored.get("status", "unknown")
+                stored_error = stored.get("error")
+                terminal_outcome = None
+                if is_text_to_sql_workflow_name(workflow_name):
+                    terminal_candidate = stored.get("terminal_outcome")
+                    if terminal_candidate is None:
+                        terminal_candidate = artifacts.get("terminal_outcome")
+                    (
+                        stored_status,
+                        _stored_success,
+                        projected_error,
+                        terminal_outcome,
+                    ) = _text_to_sql_terminal_projection(
+                        terminal_candidate,
+                        fallback_error=stored_error,
+                    )
+                    stored_error = projected_error
                 status_obj = {
                     "run_id": run_id,
-                    "workflow_name": snapshot.get("workflow_name", "unknown"),
-                    "status": stored.get("status", "unknown"),
-                    "progress_percentage": 100.0 if stored.get("status") == "completed" else 0.0,
-                    "error_message": stored.get("error"),
+                    "workflow_name": workflow_name,
+                    "status": stored_status,
+                    "progress_percentage": 100.0 if stored_status == "completed" else 0.0,
+                    "error_message": stored_error,
                     "parameters": snapshot.get("parameters") or {},
                 }
-        return _redact_payload({"status": _serialize(status_obj)})
+                if terminal_outcome is not None:
+                    status_obj["terminal_outcome"] = terminal_outcome
+        serialized_status = _serialize(status_obj)
+        if not isinstance(serialized_status, dict):
+            serialized_status = {
+                "run_id": run_id,
+                "workflow_name": "text_to_sql_pipeline",
+            }
+        if stored_run.status != "legacy":
+            status_view = {
+                "pending": "pending",
+                "queued": "queued",
+                "running": "running",
+                "result_pending": "running",
+                "succeeded": "completed",
+                "abstained": "failed",
+                "failed": "failed",
+                "cancelled": "cancelled",
+                "timed_out": "failed",
+            }[stored_run.status]
+            serialized_status.update(
+                {
+                    "run_id": stored_run.run_id,
+                    "status": status_view,
+                    "terminal_reason": stored_run.terminal_reason,
+                    "worker_pid": stored_run.worker_pid,
+                    "result_seq": stored_run.result_seq,
+                    "invocation_registered": (
+                        event_store.get_workflow_run_invocation(run_id)
+                        is not None
+                    ),
+                }
+            )
+            if stored_run.status in {
+                "pending",
+                "queued",
+                "running",
+                "result_pending",
+            }:
+                serialized_status.pop("terminal_outcome", None)
+                serialized_status.pop("error_message", None)
+            elif stored_run.run_kind == "text_to_sql" and stored_run.result_seq is not None:
+                primary_result = _primary_workflow_result(event_store, stored_run)
+                if primary_result is None:
+                    raise ValueError("terminal Text-to-SQL run has no primary result")
+                snapshot = (
+                    primary_result.get("snapshot")
+                    if isinstance(primary_result.get("snapshot"), dict)
+                    else {}
+                )
+                artifacts = (
+                    primary_result.get("artifacts")
+                    if isinstance(primary_result.get("artifacts"), dict)
+                    else {}
+                )
+                terminal_candidate = primary_result.get("terminal_outcome")
+                if terminal_candidate is None:
+                    terminal_candidate = artifacts.get("terminal_outcome")
+                (
+                    winner_status,
+                    _winner_success,
+                    winner_error,
+                    winner_terminal,
+                ) = _text_to_sql_terminal_projection(
+                    terminal_candidate,
+                    fallback_error=primary_result.get("error"),
+                )
+                if winner_terminal is None:
+                    raise ValueError(
+                        "primary Text-to-SQL result has invalid terminal_outcome"
+                    )
+                serialized_status.update(
+                    {
+                        "run_id": stored_run.run_id,
+                        "workflow_name": snapshot.get("workflow_name")
+                        or serialized_status.get("workflow_name")
+                        or "text_to_sql_pipeline",
+                        "status": winner_status,
+                        "progress_percentage": 100.0,
+                        "step_results": artifacts.get("step_results") or {},
+                        "parameters": snapshot.get("parameters") or {},
+                        "terminal_outcome": winner_terminal,
+                        "terminal_reason": winner_terminal.get("reason_code"),
+                        "worker_pid": stored_run.worker_pid,
+                        "result_seq": stored_run.result_seq,
+                    }
+                )
+                if winner_error is None:
+                    serialized_status.pop("error_message", None)
+                else:
+                    serialized_status["error_message"] = winner_error
+        return _redact_payload({"status": serialized_status})
     if action == "workflows.result":
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
-        result_payload = _workflow_result_from_store(run_id) or {}
+        event_store = _agui_event_store()
+        stored_run = _require_run_access(run_id, principal, event_store)
+        if stored_run.run_kind == "text_to_sql":
+            primary_result = _primary_workflow_result(event_store, stored_run)
+            if primary_result is None:
+                return {
+                    "result": None,
+                    "status": (
+                        "running"
+                        if stored_run.status == "result_pending"
+                        else stored_run.status
+                    ),
+                    "success": False,
+                    "error": None,
+                }
+            result_payload = primary_result
+        else:
+            result_payload = _workflow_result_from_store(run_id) or {}
         result_value = result_payload.get("result")
         status_value = result_payload.get("status")
         error_value = result_payload.get("error")
         success_value = result_payload.get("success")
         artifacts_value = result_payload.get("artifacts") if isinstance(result_payload.get("artifacts"), dict) else None
+        snapshot_value = result_payload.get("snapshot") if isinstance(result_payload.get("snapshot"), dict) else {}
+        workflow_name = snapshot_value.get("workflow_name")
+        terminal_candidate = result_payload.get("terminal_outcome")
+        if terminal_candidate is None and isinstance(artifacts_value, dict):
+            terminal_candidate = artifacts_value.get("terminal_outcome")
+        status_obj = None
 
-        if result_value is None:
+        if result_value is None and stored_run.run_kind != "text_to_sql":
             artifacts = wf_manager.get_workflow_artifacts(run_id)
             if artifacts:
                 result_value = getattr(artifacts, "final_output", None)
                 artifacts_value = _serialize(artifacts)
+                terminal_candidate = (
+                    terminal_candidate
+                    or getattr(artifacts, "terminal_outcome", None)
+                    or (
+                        artifacts_value.get("terminal_outcome")
+                        if isinstance(artifacts_value, dict)
+                        else None
+                    )
+                )
 
-        if result_value is None:
+        if result_value is None and stored_run.run_kind != "text_to_sql":
             result_value = _telemetry_extract_output(telemetry_manager, run_id)
 
-        if status_value is None:
+        if status_value is None and stored_run.run_kind != "text_to_sql":
             status_obj = wf_manager.get_workflow_status(run_id)
             status_value = getattr(status_obj, "status", None) if status_obj else None
+            error_value = getattr(status_obj, "error_message", None) if status_obj else error_value
+        if (
+            status_obj is None
+            and workflow_name is None
+            and stored_run.run_kind != "text_to_sql"
+            and hasattr(wf_manager, "get_workflow_status")
+        ):
+            status_obj = wf_manager.get_workflow_status(run_id)
+        if status_obj is not None:
+            workflow_name = workflow_name or getattr(status_obj, "workflow_name", None)
+            terminal_candidate = terminal_candidate or getattr(
+                status_obj,
+                "terminal_outcome",
+                None,
+            )
+
+        is_text_to_sql = (
+            stored_run.run_kind == "text_to_sql"
+            or is_text_to_sql_workflow_name(workflow_name)
+        )
+        if is_text_to_sql:
+            (
+                status_value,
+                success_value,
+                error_value,
+                terminal_outcome,
+            ) = _text_to_sql_terminal_projection(
+                terminal_candidate,
+                fallback_error=error_value,
+            )
+        else:
+            terminal_outcome = terminal_candidate
             if status_value is None and result_value is not None:
                 status_value = "completed"
-            error_value = getattr(status_obj, "error_message", None) if status_obj else error_value
-
-        if success_value is None:
-            success_value = status_value == "completed"
+            if success_value is None:
+                success_value = status_value == "completed"
 
         response = {
             "result": _serialize(result_value),
@@ -3399,10 +3930,14 @@ def handle_service_action(
             "success": bool(success_value),
             "error": error_value,
         }
+        if terminal_outcome is not None:
+            response["terminal_outcome"] = _serialize(terminal_outcome)
         if artifacts_value is not None:
             response["artifacts"] = _serialize(artifacts_value)
             metadata = artifacts_value.get("metadata") if isinstance(artifacts_value, dict) else None
-            if isinstance(metadata, dict) and metadata.get("execution") is not None:
+            if isinstance(terminal_outcome, dict):
+                response["execution"] = _serialize(terminal_outcome.get("execution"))
+            elif isinstance(metadata, dict) and metadata.get("execution") is not None:
                 response["execution"] = _serialize(metadata.get("execution"))
         persist_report = status_value in {"completed", "failed", "cancelled"}
         try:
@@ -3415,10 +3950,21 @@ def handle_service_action(
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
-        artifacts = wf_manager.get_workflow_artifacts(run_id)
-        if artifacts is None:
-            stored = _workflow_result_from_store(run_id) or {}
-            artifacts = stored.get("artifacts") if isinstance(stored.get("artifacts"), dict) else None
+        event_store = _agui_event_store()
+        stored_run = _require_run_access(run_id, principal, event_store)
+        if stored_run.run_kind == "text_to_sql":
+            primary_result = _primary_workflow_result(event_store, stored_run)
+            artifacts = (
+                primary_result.get("artifacts")
+                if isinstance(primary_result, dict)
+                and isinstance(primary_result.get("artifacts"), dict)
+                else None
+            )
+        else:
+            artifacts = wf_manager.get_workflow_artifacts(run_id)
+            if artifacts is None:
+                stored = _workflow_result_from_store(run_id) or {}
+                artifacts = stored.get("artifacts") if isinstance(stored.get("artifacts"), dict) else None
         return _redact_payload({"artifacts": _serialize(artifacts)})
     if action == "workflows.storybook_readiness":
         parameters = payload.get("parameters")
@@ -3479,11 +4025,25 @@ def handle_service_action(
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
+        _require_run_access(run_id, principal, _agui_event_store())
         return _redact_payload({"report": _serialize(_workflow_generate_report(wf_manager, run_id))})
     if action == "workflows.cancel":
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
+        stored_run = _require_run_access(
+            run_id,
+            principal,
+            _agui_event_store(),
+        )
+        if stored_run.status in {
+            "succeeded",
+            "abstained",
+            "failed",
+            "cancelled",
+            "timed_out",
+        }:
+            return {"cancelled": False}
         return {"cancelled": wf_manager.cancel_workflow(run_id)}
     if action == "workflows.cleanup":
         max_age_hours = float(payload.get("max_age_hours", 24))
@@ -3692,6 +4252,63 @@ def handle_service_action(
 
     if action == "db.list":
         return {"plugins": _serialize(db_manager.list_plugins())}
+    if action == "db.connections.list":
+        return {
+            "connections": [
+                record.to_public_dict()
+                for record in _connection_registry().list_for(principal)
+            ]
+        }
+    if action == "db.connections.register":
+        if "owner_subject" not in payload:
+            raise ValueError("owner_subject is required; use null for tenant-wide scope")
+        if not payload.get("tenant_id"):
+            raise ValueError("tenant_id is required")
+        display_name = payload.get("display_name") or payload.get("name")
+        if not display_name:
+            raise ValueError("display_name is required")
+        record = _register_connection(
+            principal,
+            display_name=display_name,
+            dsn=payload.get("dsn"),
+            owner_subject=payload.get("owner_subject"),
+            tenant_id=payload.get("tenant_id"),
+            enabled_for_user=payload.get("enabled_for_user", True),
+        )
+        return {"connection": record.to_public_dict()}
+    if action == "db.connections.delete":
+        record = _delete_connection(payload.get("connection_ref"), principal)
+        return {"deleted": True, "connection": record.to_public_dict()}
+    if action == "db.connections.migrate_legacy":
+        if "owner_subject" not in payload:
+            raise ValueError("owner_subject is required; use null for tenant-wide scope")
+        tenant_id = payload.get("tenant_id")
+        if not tenant_id:
+            raise ValueError("tenant_id is required")
+        legacy_reference = payload.get("connection_ref")
+        legacy_name = payload.get("name")
+        if legacy_reference is None and isinstance(legacy_name, str) and legacy_name:
+            legacy_reference = f"{_DB_TEST_CONFIG_REF_PREFIX}{quote(legacy_name, safe='')}"
+        if (
+            not isinstance(legacy_reference, str)
+            or not legacy_reference.startswith(_DB_TEST_CONFIG_REF_PREFIX)
+        ):
+            raise ValueError("legacy connection_ref is required")
+        decoded_name = unquote(legacy_reference[len(_DB_TEST_CONFIG_REF_PREFIX):])
+        display_name = payload.get("display_name") or decoded_name
+        dsn = _connection_registry().resolve_legacy(legacy_reference, principal)
+        record = _register_connection(
+            principal,
+            display_name=display_name,
+            dsn=dsn,
+            owner_subject=payload.get("owner_subject"),
+            tenant_id=tenant_id,
+            enabled_for_user=payload.get("enabled_for_user", True),
+        )
+        return {
+            "connection": record.to_public_dict(),
+            "legacy_connection_ref": legacy_reference,
+        }
     if action == "db.plugin_info":
         scheme = payload.get("scheme")
         if not scheme:
@@ -3771,9 +4388,54 @@ def handle_service_action(
             plugin.close(conn)
         return {"schema": _serialize(schema)}
     if action == "text_to_sql.schema.load":
-        dsn = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
-        if not dsn:
-            raise ValueError("dsn is required")
+        connection_ref = payload.get("connection_ref")
+        raw_dsn = payload.get("dsn")
+        if (connection_ref is None) == (raw_dsn is None):
+            raise ValueError("exactly one of connection_ref or dsn is required")
+        if connection_ref is not None:
+            dsn = _resolve_text_to_sql_connection_ref(connection_ref, principal)
+        else:
+            if not principal.has_role("admin"):
+                raise PermissionError(
+                    "text_to_sql.schema.load requires connection_ref for ordinary users"
+                )
+            if not isinstance(raw_dsn, str) or not raw_dsn:
+                raise ValueError("dsn is required")
+            _connection_target_policy().require_allowed(raw_dsn)
+            dsn = raw_dsn
+            _coerce_strict_bool(
+                payload.get("allow_db_schema_fallback"),
+                default=False,
+                field_name="allow_db_schema_fallback",
+            )
+            from custom_tools.text_to_sql.schema_loader import SchemaLoader
+
+            request_scope = SchemaScope.from_mapping(
+                {
+                    "serialization_version": 1,
+                    "tenant_id": principal.tenant_id,
+                    "access_scope_id": f"owner:{principal.subject}",
+                    "connection_view_id": (
+                        f"compatibility-request:{uuid.uuid4().hex}"
+                    ),
+                    "transient": True,
+                }
+            )
+            loaded_schema = SchemaLoader(_project_root()).load_scoped_schema(
+                {},
+                dsn,
+                request_scope,
+            )
+            schema = _filter_schema(
+                loaded_schema.schema,
+                schema=payload.get("schema"),
+                table_name=payload.get("table_name"),
+            )
+            return {
+                "schema": _serialize(schema),
+                "source": "db",
+                "warnings": [],
+            }
         schema_name = payload.get("schema")
         table_name = payload.get("table_name")
         warnings: list[str] = []
@@ -3817,8 +4479,11 @@ def handle_service_action(
                 or _is_partially_masked_dsn(resolved_dsn)
             ):
                 raise ValueError("valid raw dsn or connection_ref is required")
+            _connection_target_policy().require_allowed(resolved_dsn)
             configs = _load_db_test_configs()
             secrets = _load_db_test_config_secrets()
+            if _is_connection_registry_config(configs.get(name)):
+                raise ValueError("name conflicts with a generated connection reference")
             secrets[name] = resolved_dsn
             configs[name] = {
                 "dsn": _redact_dsn(resolved_dsn),
@@ -3840,6 +4505,9 @@ def handle_service_action(
         with _DB_TEST_CONFIGS_LOCK:
             configs = _load_db_test_configs()
             secrets = _load_db_test_config_secrets()
+            existing = configs.get(name)
+            if _is_connection_registry_config(existing):
+                raise ValueError("generated connections must be deleted by connection_ref")
             removed = configs.pop(name, None)
             secrets.pop(name, None)
             _save_db_test_configs(configs)
@@ -3909,6 +4577,49 @@ def handle_service_action(
     if action == "config.environment":
         return {"environment": _serialize(config_manager.get_environment_info())}
 
+    if action == "telemetry.retention.status":
+        state = _agui_event_store().get_operational_retention_state(
+            OPERATIONAL_RETENTION_SCOPE
+        )
+        if state is None:
+            return {
+                "retention": {
+                    "scope": OPERATIONAL_RETENTION_SCOPE,
+                    "status": "never_run",
+                    "never_run": True,
+                    "not_due": False,
+                    "last_attempt_at_ms": None,
+                    "last_success_at_ms": None,
+                    "next_due_at_ms": None,
+                    "counters": {},
+                    "error": None,
+                    "lease": {
+                        "owner_id": None,
+                        "generation": 0,
+                        "expires_at_ms": None,
+                    },
+                }
+            }
+        return {
+            "retention": {
+                "scope": OPERATIONAL_RETENTION_SCOPE,
+                "status": (
+                    "never_run" if state.status == "never" else state.status
+                ),
+                "never_run": state.last_attempt_at_ms is None,
+                "not_due": int(time.time() * 1000) < state.next_due_at_ms,
+                "last_attempt_at_ms": state.last_attempt_at_ms,
+                "last_success_at_ms": state.last_success_at_ms,
+                "next_due_at_ms": state.next_due_at_ms,
+                "counters": dict(state.counters),
+                "error": state.last_error,
+                "lease": {
+                    "owner_id": state.lease_owner,
+                    "generation": state.lease_generation,
+                    "expires_at_ms": state.lease_expires_at_ms,
+                },
+            }
+        }
     if action == "telemetry.list_traces":
         traces = telemetry_manager.get_trace_files()
         if traces:
@@ -4289,16 +5000,26 @@ def handle_service_action(
         # EPIC 7.23: единая Pydantic-валидация payload.
         # Резолвинг ``db_config:<name>`` остаётся снаружи модели — это
         # side-effect (чтение секретов), нагружать им модель нельзя.
-        from ._t2s_requests import parse_text_to_sql_generate
+        from ._t2s_requests import (
+            canonical_text_to_sql_start_fingerprint,
+            parse_text_to_sql_start,
+        )
 
-        merged_payload = dict(payload)
-        merged_payload["query"] = _extract_query(payload)  # natural_query → query
-        merged_payload["dsn"] = _resolve_dsn_reference(payload.get("dsn"), principal=principal)
-        req = parse_text_to_sql_generate(merged_payload)
+        req = parse_text_to_sql_start(payload)
+        request_fingerprint = canonical_text_to_sql_start_fingerprint(payload)
+        (
+            resolved_dsn,
+            safe_connection_ref,
+            raw_compat_validation,
+            connection_record,
+        ) = (
+            _admit_text_to_sql_connection(req, principal)
+        )
 
-        base_session_id = req.session_id or _compute_text_to_sql_session_id(req.dsn)
+        base_session_id = req.session_id or _compute_text_to_sql_session_id(
+            safe_connection_ref
+        )
         session_id = _scope_text_to_sql_session_id(base_session_id, principal)
-        run_id = f"run-{uuid.uuid4().hex[:16]}"
         agui_entrypoint = _workflow_agui_entrypoint(req.workflow_name)
         if agui_entrypoint != "presets.text_to_sql.generate":
             raise ForbiddenWorkflowNameError(
@@ -4307,37 +5028,117 @@ def handle_service_action(
                 f"Use {agui_entrypoint or 'workflows.start'} service action instead."
             )
 
+        safety_policy = resolve_safety_policy(req.safety_level)
+        safety_policy_mapping = safety_policy.to_mapping()
+
+        store = _agui_event_store()
+        if transport_context is not None:
+            run_id = transport_context.run_id
+            stored_run = store.get_run(run_id)
+            if (
+                stored_run is None
+                or stored_run.run_kind != "text_to_sql"
+                or stored_run.owner_subject != principal.subject
+                or stored_run.tenant_id != principal.tenant_id
+            ):
+                raise ValueError("run not found")
+            if stored_run.request_fingerprint != request_fingerprint:
+                raise ValueError("transport request fingerprint does not match run")
+            if stored_run.idempotency_key != req.idempotency_key:
+                raise ValueError("transport idempotency_key does not match run")
+        else:
+            proposed_run_id = f"run-{uuid.uuid4().hex[:16]}"
+            stored_run, _created = store.create_or_get_run(
+                principal=principal,
+                run_kind="text_to_sql",
+                idempotency_key=req.idempotency_key,
+                request_fingerprint=request_fingerprint,
+                proposed_run_id=proposed_run_id,
+                thread_id=session_id,
+            )
+            run_id = stored_run.run_id
+
+        schema_scope = _trusted_text_to_sql_schema_scope(
+            connection_record,
+            principal,
+            run_id,
+        )
         parameters = {
             "query": req.query,
-            "dsn": req.dsn,
+            "dsn": resolved_dsn,
+            "connection_ref": safe_connection_ref,
             "max_rows": req.max_rows,
             "session_id": session_id,
             "run_id": run_id,
             "safety_level": req.safety_level,
+            "safety_policy": safety_policy_mapping,
+            "schema_scope": schema_scope,
             "include_explanation": req.include_explanation,
             "validate_schema": req.validate_schema,
             "dry_run_only": req.dry_run_only,
             "use_schema_suggestions": req.use_schema_suggestions,
             "allow_enhanced_fallback": req.allow_enhanced_fallback,
         }
-        started_run_id = wf_manager.start_workflow(
-            workflow_name=req.workflow_name,
-            parameters=parameters,
-            session_id=session_id,
-            client_id=req.client_id,
-            use_enhanced=req.use_enhanced,
-            enable_telemetry=req.enable_telemetry,
-            run_id=run_id,
+        from workflow.streamlit_api import WorkflowOwner
+
+        owner = WorkflowOwner(
+            subject=principal.subject,
+            tenant_id=principal.tenant_id,
+            roles=principal.roles,
         )
-        if started_run_id != run_id:
-            raise ValueError(
-                f"WorkflowManager returned unexpected run_id: requested={run_id}, got={started_run_id}"
+        invocation = store.get_workflow_run_invocation(run_id)
+        if raw_compat_validation is not None:
+            _append_admin_raw_dsn_event_once(
+                store,
+                run_id,
+                raw_compat_validation,
             )
+        if invocation is None:
+            try:
+                started_run_id = wf_manager.start_workflow(
+                    workflow_name=req.workflow_name,
+                    parameters=parameters,
+                    session_id=session_id,
+                    client_id=owner.quota_identity,
+                    use_enhanced=req.use_enhanced,
+                    enable_telemetry=req.enable_telemetry,
+                    run_id=run_id,
+                    owner=owner,
+                )
+            except WorkflowRunAlreadyReservedError:
+                # A concurrent idempotent caller may have reserved the shared
+                # run after our first read. Accept only that exact invocation;
+                # unrelated startup failures still propagate.
+                invocation = store.get_workflow_run_invocation(run_id)
+                if (
+                    invocation is None
+                    or invocation.workflow_name != req.workflow_name
+                    or invocation.session_id != session_id
+                ):
+                    raise
+            else:
+                if started_run_id != run_id:
+                    raise ValueError(
+                        "WorkflowManager returned unexpected run_id: "
+                        f"requested={run_id}, got={started_run_id}"
+                    )
+        elif (
+            invocation.workflow_name != req.workflow_name
+            or invocation.session_id != session_id
+        ):
+            raise ValueError("stored workflow invocation does not match request")
+        # The durable invocation is the admission hand-off. PID attachment may
+        # legitimately lag process reservation; lifecycle observation belongs
+        # to RunManager and must not turn scheduler latency into another failure.
         return {
             "run_id": run_id,
             "workflow_name": req.workflow_name,
             "session_id": session_id,
-            "parameters": _redact_payload(parameters),
+            "parameters": _redact_payload({
+                key: value
+                for key, value in parameters.items()
+                if key not in {"dsn", "safety_policy", "schema_scope"}
+            }),
         }
     if action == "text_to_sql.history.list":
         limit = _coerce_int_range(
@@ -4347,28 +5148,30 @@ def handle_service_action(
             max_value=1000,
             field_name="limit",
         )
-        return {"entries": _serialize(_t2s_history_list(limit))}
+        offset = _coerce_int_range(
+            payload.get("offset"),
+            default=0,
+            min_value=0,
+            max_value=1_000_000,
+            field_name="offset",
+        )
+        entries = _agui_event_store().list_text_to_sql_history(
+            principal,
+            limit=limit,
+            offset=offset,
+        )
+        return {"entries": [_serialize(entry.to_mapping()) for entry in entries]}
     if action == "text_to_sql.history.append":
-        entry = payload.get("entry")
-        if not isinstance(entry, dict):
-            raise ValueError("entry is required")
-        return {"entry": _serialize(_t2s_history_append(entry))}
+        raise PermissionError("client history append is disabled")
     if action == "text_to_sql.history.clear":
         confirm = _coerce_bool(payload.get("confirm"), False)
         if not confirm:
             raise ValueError("confirm=true required")
-        _t2s_history_clear()
-        return {"cleared": True}
+        cleared = _agui_event_store().clear_text_to_sql_history(principal)
+        return {"cleared": cleared}
     if action == "text_to_sql.history.analytics":
-        limit = _coerce_int_range(
-            payload.get("limit"),
-            default=200,
-            min_value=1,
-            max_value=1000,
-            field_name="limit",
-        )
-        entries = _t2s_history_list(limit)
-        return {"result": _serialize(_t2s_history_analytics(entries))}
+        result = _agui_event_store().text_to_sql_history_analytics(principal)
+        return {"result": _serialize(result)}
 
     if action == "presets.diagram.generate":
         prompt = payload.get("prompt")

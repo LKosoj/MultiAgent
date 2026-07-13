@@ -1,0 +1,32 @@
+name: successful_sql_retrieval
+description: "Возвращает ограниченные успешные SQL-примеры для точной версии схемы."
+category: "SQL"
+source_type: custom_function
+implementation_source: custom_tools.sql_tools.successful_sql_retrieval
+parameters:
+  - name: namespace_version_key
+    type: string
+    description: "Opaque SchemaNamespace.version_key текущей схемы."
+    required: true
+  - name: user_query
+    type: string
+    description: "Исходный пользовательский запрос."
+    required: true
+output:
+  type: object
+  properties:
+    status:
+      type: string
+      enum:
+        - READY
+        - EMPTY
+        - DEGRADED
+    examples:
+      type: array
+    context_json:
+      type: string
+    failed_ids:
+      type: array
+    error_code:
+      type: string
+      nullable: true

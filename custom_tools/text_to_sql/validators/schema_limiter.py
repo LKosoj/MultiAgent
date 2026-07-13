@@ -4,9 +4,10 @@
 import logging
 import os
 import re
+import unicodedata
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..schema_metadata import is_fk
+from ..schema_metadata import is_fk, is_pk
 from ..utils import get_table_columns
 
 # Опциональный импорт sqlglot — для AST-пути enforce_row_limit.
@@ -26,6 +27,18 @@ from .safety import _parse_with_timeout, _ParseTimeoutError
 logger = logging.getLogger(__name__)
 
 _VALID_STRATEGIES = ("relevance", "fk_centrality", "insertion")
+
+
+class SchemaContextBudgetExceeded(RuntimeError):
+    """Mandatory schema context does not fit the configured prompt budget."""
+
+    reason_code = "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
+
+    def __init__(self, diagnostics: Dict[str, Any]):
+        self.diagnostics = diagnostics
+        super().__init__(
+            "Mandatory schema context exceeds schema_prompt_hard_max_chars"
+        )
 
 
 class SchemaLimiter:
@@ -211,8 +224,21 @@ class SchemaLimiter:
         self,
         db_schema: Dict[str, Dict[str, Dict[str, str]]],
         priority_strategy: Optional[str] = None,
+        *,
+        query_terms: Optional[List[str]] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Ограничивает схему для включения в LLM промпт."""
+        budget = diagnostics if diagnostics is not None else {}
+        budget.clear()
+        budget.update(
+            {
+                "selected_columns": 0,
+                "omitted_columns": 0,
+                "soft_limit_overflow": False,
+                "tables": {},
+            }
+        )
         if not db_schema:
             return {}
 
@@ -229,12 +255,64 @@ class SchemaLimiter:
             limited_columns = {}
             columns_items = list(get_table_columns(table_schema).items())
 
+            mandatory_names = {
+                col_name
+                for col_name, meta in columns_items
+                if isinstance(meta, dict)
+                and (
+                    is_pk(meta)
+                    or is_fk(meta)
+                    or self._column_matches_query(
+                        col_name,
+                        meta,
+                        query_terms or [],
+                    )
+                )
+            }
             if self.max_columns > 0:
-                columns_items = columns_items[:self.max_columns]
+                optional_slots = max(self.max_columns - len(mandatory_names), 0)
+                optional_names = [
+                    col_name
+                    for col_name, meta in columns_items
+                    if isinstance(meta, dict) and col_name not in mandatory_names
+                ]
+                selected_optional = set(optional_names[:optional_slots])
+                selected_names = mandatory_names | selected_optional
+            else:
+                selected_names = {
+                    col_name
+                    for col_name, meta in columns_items
+                    if isinstance(meta, dict)
+                }
+
+            valid_column_count = sum(
+                1 for _, meta in columns_items if isinstance(meta, dict)
+            )
+            soft_overflow = (
+                max(len(mandatory_names) - self.max_columns, 0)
+                if self.max_columns > 0
+                else 0
+            )
+            table_diagnostics = {
+                "selected_columns": len(selected_names),
+                "omitted_columns": max(valid_column_count - len(selected_names), 0),
+                "mandatory_columns": len(mandatory_names),
+                "mandatory_column_names": [
+                    name for name, _ in columns_items if name in mandatory_names
+                ],
+                "soft_limit_overflow": soft_overflow,
+            }
+            budget["tables"][table_name] = table_diagnostics
+            budget["selected_columns"] += table_diagnostics["selected_columns"]
+            budget["omitted_columns"] += table_diagnostics["omitted_columns"]
+            if soft_overflow:
+                budget["soft_limit_overflow"] = True
 
             for col_name, meta in columns_items:
                 if not isinstance(meta, dict):
                     # Пропускаем некорректную колонку
+                    continue
+                if col_name not in selected_names:
                     continue
                 limited_meta = dict(meta)
 
@@ -259,6 +337,38 @@ class SchemaLimiter:
                 limited_schema[table_name] = limited_columns
 
         return limited_schema
+
+    @staticmethod
+    def _column_matches_query(
+        column_name: str,
+        metadata: Dict[str, Any],
+        query_terms: List[str],
+    ) -> bool:
+        if not query_terms:
+            return False
+        normalized_column = SchemaLimiter._normalize_match_text(column_name)
+        normalized_description = SchemaLimiter._normalize_match_text(
+            metadata.get("description", "") or ""
+        )
+        for term in query_terms:
+            if not isinstance(term, str):
+                continue
+            normalized_term = SchemaLimiter._normalize_match_text(term)
+            if not normalized_term:
+                continue
+            if normalized_term == normalized_column:
+                return True
+            padded_term = f" {normalized_term} "
+            if padded_term in f" {normalized_column} ":
+                return True
+            if padded_term in f" {normalized_description} ":
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_match_text(value: Any) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value)).casefold()
+        return " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
 
     def enforce_row_limit(
         self,
@@ -395,23 +505,168 @@ class SchemaLimiter:
             return sql
         return f"{sql.rstrip(';').rstrip()} LIMIT {default_limit}"
 
-    def build_schema_summary(self, db_schema: Dict[str, Dict[str, Dict[str, str]]]) -> str:
-        """Строит краткое описание схемы для промпта."""
-        limited_schema = self.limit_schema_for_prompt(db_schema)
-        schema_summary = []
+    def build_schema_summary(
+        self,
+        db_schema: Dict[str, Dict[str, Dict[str, str]]],
+        *,
+        query_terms: Optional[List[str]] = None,
+        hard_max_chars: Optional[int] = None,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Строит краткое описание схемы, не удаляя обязательные колонки."""
+        budget = diagnostics if diagnostics is not None else {}
+        limited_schema = self.limit_schema_for_prompt(
+            db_schema,
+            query_terms=query_terms,
+            diagnostics=budget,
+        )
+        full_summary = self._render_schema_summary(limited_schema)
+        if hard_max_chars is None:
+            return full_summary
+        if not isinstance(hard_max_chars, int) or hard_max_chars <= 0:
+            raise ValueError("schema_prompt_hard_max_chars must be a positive integer")
 
+        budget["hard_max_chars"] = hard_max_chars
+        budget["hard_limit_exceeded"] = False
+        if len(full_summary) <= hard_max_chars:
+            budget["summary_chars"] = len(full_summary)
+            budget["mandatory_chars"] = self._mandatory_summary_chars(
+                limited_schema, budget
+            )
+            self._update_rendered_column_diagnostics(limited_schema, budget)
+            return full_summary
+
+        mandatory_schema = self._mandatory_schema(limited_schema, budget)
+        mandatory_summary = self._render_schema_summary(mandatory_schema)
+        budget["mandatory_chars"] = len(mandatory_summary)
+        if len(mandatory_summary) > hard_max_chars:
+            budget["hard_limit_exceeded"] = True
+            budget["summary_chars"] = len(mandatory_summary)
+            raise SchemaContextBudgetExceeded(budget)
+
+        fitted_schema = mandatory_schema
+        mandatory_names = {
+            (table_name, column_name)
+            for table_name, table_diag in budget["tables"].items()
+            for column_name in table_diag["mandatory_column_names"]
+        }
         for table_name, table_schema in limited_schema.items():
-            # Используем get_table_columns для правильного извлечения колонок
-            columns = get_table_columns(table_schema)
+            for column_name, metadata in get_table_columns(table_schema).items():
+                if (table_name, column_name) in mandatory_names:
+                    continue
+                candidate = self._copy_schema(fitted_schema)
+                self._add_column(candidate, table_name, table_schema, column_name, metadata)
+                candidate_summary = self._render_schema_summary(candidate)
+                if len(candidate_summary) <= hard_max_chars:
+                    fitted_schema = candidate
+
+        fitted_summary = self._render_schema_summary(fitted_schema)
+        budget["summary_chars"] = len(fitted_summary)
+        self._update_rendered_column_diagnostics(fitted_schema, budget)
+        return fitted_summary
+
+    @staticmethod
+    def _update_rendered_column_diagnostics(
+        rendered_schema: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+    ) -> None:
+        selected_total = 0
+        omitted_total = 0
+        for table_name, table_diagnostics in diagnostics["tables"].items():
+            original_total = (
+                table_diagnostics["selected_columns"]
+                + table_diagnostics["omitted_columns"]
+            )
+            rendered_columns = get_table_columns(
+                rendered_schema.get(table_name, {})
+            )
+            rendered_count = sum(
+                1 for metadata in rendered_columns.values() if isinstance(metadata, dict)
+            )
+            table_diagnostics["selected_columns"] = rendered_count
+            table_diagnostics["omitted_columns"] = max(
+                original_total - rendered_count,
+                0,
+            )
+            selected_total += table_diagnostics["selected_columns"]
+            omitted_total += table_diagnostics["omitted_columns"]
+        diagnostics["selected_columns"] = selected_total
+        diagnostics["omitted_columns"] = omitted_total
+
+    @staticmethod
+    def _copy_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        copied: Dict[str, Any] = {}
+        for table_name, table_schema in schema.items():
+            columns = {
+                name: dict(meta)
+                for name, meta in get_table_columns(table_schema).items()
+            }
+            copied[table_name] = {
+                "description": str(table_schema.get("description", "") or ""),
+                "columns": columns,
+            }
+        return copied
+
+    @staticmethod
+    def _add_column(
+        target: Dict[str, Any],
+        table_name: str,
+        table_schema: Dict[str, Any],
+        column_name: str,
+        metadata: Dict[str, Any],
+    ) -> None:
+        table = target.setdefault(
+            table_name,
+            {
+                "description": str(table_schema.get("description", "") or ""),
+                "columns": {},
+            },
+        )
+        table["columns"][column_name] = dict(metadata)
+
+    def _mandatory_schema(
+        self,
+        limited_schema: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        mandatory: Dict[str, Any] = {}
+        for table_name, table_schema in limited_schema.items():
+            names = set(
+                diagnostics["tables"][table_name]["mandatory_column_names"]
+            )
+            for column_name, metadata in get_table_columns(table_schema).items():
+                if column_name in names:
+                    self._add_column(
+                        mandatory,
+                        table_name,
+                        table_schema,
+                        column_name,
+                        metadata,
+                    )
+        return mandatory
+
+    def _mandatory_summary_chars(
+        self,
+        limited_schema: Dict[str, Any],
+        diagnostics: Dict[str, Any],
+    ) -> int:
+        return len(
+            self._render_schema_summary(
+                self._mandatory_schema(limited_schema, diagnostics)
+            )
+        )
+
+    @staticmethod
+    def _render_schema_summary(db_schema: Dict[str, Any]) -> str:
+        schema_summary = []
+        for table_name, table_schema in db_schema.items():
             col_parts = []
-            for col_name, meta in columns.items():
+            for col_name, meta in get_table_columns(table_schema).items():
                 col_type = meta.get("type", "")
                 col_desc = meta.get("description", "")
                 if col_desc:
                     col_parts.append(f"{col_name}:{col_type} '{col_desc}'")
                 else:
                     col_parts.append(f"{col_name}:{col_type}")
-            cols_str = ", ".join(col_parts)
-            schema_summary.append(f"{table_name}({cols_str})")
-
+            schema_summary.append(f"{table_name}({', '.join(col_parts)})")
         return ", ".join(schema_summary)

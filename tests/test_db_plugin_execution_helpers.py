@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from custom_tools import sql_tools
+from custom_tools.text_to_sql.core._db_exec import _classify_statement
 from db_plugins.base import BaseDBPlugin
 from db_plugins.duckdb import DuckDBPlugin
 from db_plugins.impala import ImpalaPlugin
@@ -342,6 +343,15 @@ def test_sapiq_distinct_values_query_uses_top_not_limit():
     assert "SELECT DISTINCT" in query
 
 
+def test_sapiq_tsql_classification_is_select_and_fail_closed() -> None:
+    dsn = "sapiq://user:pass@host:2638/sales.analytics"
+    query = SAPIQPlugin().build_distinct_values_query("DBA.sales", "region", 5)
+
+    assert _classify_statement(query, dsn=dsn) == "select"
+    assert _classify_statement("SELECT TOP nope FROM sales", dsn=dsn) == "unknown"
+    assert _classify_statement("SELECT 1; DELETE FROM sales", dsn=dsn) == "unknown"
+
+
 def test_build_lookup_values_query_quotes_identifiers_and_literals():
     query = BaseDBPlugin().build_lookup_values_query(
         "public.orders",
@@ -499,11 +509,20 @@ def test_duckdb_connect_falls_back_to_rw_only_with_explicit_fail_open(monkeypatc
 
 def test_get_distinct_values_uses_plugin_query_builder(monkeypatch):
     import db_plugins
+    from custom_tools.text_to_sql import core as core_facade
+    from db_plugins.base import (
+        Capability,
+        DatabaseCapabilities,
+        EnforcementMode,
+        PluginHealth,
+    )
 
     dsn = "sapiq://user:pass@host:2638/sales.analytics"
     seen = {}
 
     class FakePlugin:
+        dialect = SAPIQPlugin.dialect
+
         def __init__(self):
             self.executed_sql = None
 
@@ -513,6 +532,43 @@ def test_get_distinct_values_uses_plugin_query_builder(monkeypatch):
 
         def close(self, conn):
             pass
+
+        def get_capabilities(self, _dsn=None):
+            return DatabaseCapabilities(
+                dialect=self.dialect,
+                read_only=Capability.supported(
+                    EnforcementMode.DATABASE,
+                    "TEST_READ_ONLY",
+                ),
+                statement_timeout=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_DRIVER_TIMEOUT",
+                ),
+                cancellation=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_DRIVER_CANCELLATION",
+                ),
+                explain=Capability.unsupported("TEST_NOT_REQUIRED"),
+                introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+                composite_fk_introspection=Capability.unsupported(
+                    "TEST_NOT_REQUIRED"
+                ),
+                parameter_binding=Capability.supported(
+                    EnforcementMode.DRIVER,
+                    "TEST_PARAMETER_BINDING",
+                ),
+            )
+
+        def probe_capabilities(self, _conn=None, dsn=None):
+            return PluginHealth(
+                self.dialect,
+                self.get_capabilities(dsn),
+                True,
+                ("TEST_PROBE_OK",),
+            )
+
+        def set_statement_timeout(self, _conn, timeout_ms):
+            seen["timeout_ms"] = timeout_ms
 
         def build_distinct_values_query(self, table_name, column_name, limit):
             return SAPIQPlugin().build_distinct_values_query(table_name, column_name, limit)
@@ -534,6 +590,11 @@ def test_get_distinct_values_uses_plugin_query_builder(monkeypatch):
         return plugin
 
     monkeypatch.setattr(db_plugins, "get_plugin", get_plugin)
+    monkeypatch.setattr(
+        core_facade,
+        "sql_safety_check",
+        lambda *_args, **_kwargs: {"is_safe": True, "issues": []},
+    )
 
     result = sql_tools.get_distinct_values("DBA.sales", "region", limit=5, dsn=dsn)
 
@@ -735,6 +796,7 @@ def test_impala_introspection_returns_standard_schema_shape():
     assert schema == {
         "analytics.orders": {
             "description": "",
+            "foreign_keys": {"complete": False, "constraints": []},
             "columns": {
                 "id": {
                     "type": "INT",

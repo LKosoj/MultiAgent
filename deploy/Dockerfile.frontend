@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.7
+
+ARG NODE_IMAGE=node:24.13.0-bookworm-slim@sha256:46feb5752989c05b8606e6323fbbc3db667d14ade1c24f5d0d44d9ca9909d607
+
+FROM ${NODE_IMAGE} AS dependencies
+WORKDIR /app
+COPY frontend/client/package.json frontend/client/package-lock.json ./
+RUN test "$(node --version)" = "v24.13.0" \
+    && test "$(npm --version)" = "11.6.2" \
+    && npm ci --ignore-scripts
+
+FROM ${NODE_IMAGE} AS builder
+ARG NEXT_BUILD_ID
+ARG NEXT_PUBLIC_AG_UI_URL
+ARG SOURCE_DATE_EPOCH
+ENV NEXT_BUILD_ID=${NEXT_BUILD_ID} \
+    NEXT_PUBLIC_AG_UI_URL=${NEXT_PUBLIC_AG_UI_URL} \
+    NEXT_TELEMETRY_DISABLED=1 \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+WORKDIR /app
+COPY --from=dependencies /app/node_modules ./node_modules
+COPY frontend/client/ ./
+COPY deploy/next.config.production.mjs /tmp/next.config.production.mjs
+RUN test -n "${NEXT_BUILD_ID}" \
+    && test -n "${SOURCE_DATE_EPOCH}" \
+    && rm -f next.config.ts \
+    && cp /tmp/next.config.production.mjs next.config.mjs \
+    && mkdir -p public \
+    && npm run build
+
+FROM ${NODE_IMAGE} AS runtime
+ARG SOURCE_DATE_EPOCH
+LABEL org.opencontainers.image.source-date-epoch="${SOURCE_DATE_EPOCH}"
+ENV HOSTNAME=0.0.0.0 \
+    NODE_ENV=production \
+    NEXT_TELEMETRY_DISABLED=1 \
+    PORT=3000 \
+    SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
+RUN test -n "${SOURCE_DATE_EPOCH}" \
+    && groupadd --gid 10001 app \
+    && useradd --uid 10001 --gid 10001 --create-home app
+WORKDIR /app
+COPY --from=builder --chown=10001:10001 /app/public ./public
+COPY --from=builder --chown=10001:10001 /app/.next/standalone ./
+COPY --from=builder --chown=10001:10001 /app/.next/static ./.next/static
+USER 10001:10001
+EXPOSE 3000
+CMD ["node", "server.js"]
+

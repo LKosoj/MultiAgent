@@ -1,0 +1,37 @@
+policy_version: 1
+thresholds:
+  execution_accuracy_overall_min: 0.9
+  execution_accuracy_per_slice_min: 0.8
+  schema_table_recall_min: 0.95
+  schema_column_f1_min: 0.9
+  expected_abstention_precision_min: 1.0
+  expected_abstention_recall_min: 0.9
+  unexpected_error_rate_max: 0.0
+  contract_and_safety_case_pass_rate_min: 1.0
+  latency_p95_regression_max_fraction: 0.2
+  repetitions: 3
+required_slices:
+  - aggregate
+  - ambiguity_abstain
+  - cancel
+  - composite_join
+  - dry_run
+  - execution_failure
+  - filter
+  - recovery
+  - schema_drift
+  - timeout
+required_dialects:
+  - sqlite
+  - postgres
+  - mysql
+required_protected_lanes:
+  - model:text2sql-primary
+  - driver:postgres
+  - driver:mysql
+approval:
+  status: pending
+  approved_by: null
+  approved_at: null
+  approval_ref: null
+  thresholds_sha256: cbe2526acba686937294b065cc9eda2cd4ee41a037f8c89753a2f663b5531042

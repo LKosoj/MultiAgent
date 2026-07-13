@@ -10,8 +10,49 @@ from typing import Dict, List, Any, Optional, Union
 from datetime import datetime
 from enum import Enum
 import yaml
-import json
 from pathlib import Path
+
+# Реэкспорт контракта Text-to-SQL (T8: перенесено в text_to_sql_contract.py),
+# сохраняющий обратную совместимость для всех существующих импортёров
+# `from workflow.models import ...`.
+from .text_to_sql_contract import (  # noqa: F401
+    TEXT_TO_SQL_MAX_ERROR_LENGTH,
+    TEXT_TO_SQL_MAX_JSON_DEPTH,
+    TEXT_TO_SQL_MAX_JSON_NODES,
+    TEXT_TO_SQL_TERMINAL_REQUIRED_FIELDS,
+    TEXT_TO_SQL_WORKFLOW_CATEGORY,
+    TEXT_TO_SQL_WORKFLOW_NAME,
+    TextToSqlTerminalReasonCode,
+    TextToSqlTerminalResult,
+    TextToSqlTerminalStatus,
+    TextToSqlVerificationStatus,
+    bound_text_to_sql_error,
+    is_text_to_sql_workflow_name,
+    normalize_text_to_sql_json_value,
+    preflight_text_to_sql_json_value,
+    text_to_sql_executor_contract_error,
+    text_to_sql_type_name,
+    _TEXT_TO_SQL_ABSTAIN_REASONS,
+    _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS,
+    _TEXT_TO_SQL_NON_FAILED_REASONS,
+    _TEXT_TO_SQL_FAILURE_EVIDENCE_PROFILES,
+    _TEXT_TO_SQL_ENFORCEMENT_MODE_FIELDS,
+    _TEXT_TO_SQL_ENFORCEMENT_MODE_VALUES,
+    _TEXT_TO_SQL_EXECUTION_REQUIRED_FIELDS,
+    _TEXT_TO_SQL_EXECUTION_OPTIONAL_FIELDS,
+    _TEXT_TO_SQL_EXECUTOR_BOUNDARY_REQUIRED_FIELDS,
+    _TEXT_TO_SQL_EXECUTOR_BOUNDARY_OPTIONAL_FIELDS,
+    _TEXT_TO_SQL_ISSUE_FIELDS,
+    _TEXT_TO_SQL_EXPLAIN_FIELDS,
+    _TEXT_TO_SQL_CAPABILITY_ERROR_FIELDS,
+    _FrozenJsonList,
+    _FrozenJsonDict,
+    _json_values_equal,
+    _freeze_json_value,
+    _thaw_json_value,
+    _copy_text_to_sql_json_value,
+    _isolated_json_value,
+)
 
 SUPPORTED_STEP_OUTPUT_SCHEMAS = frozenset({"json_object"})
 
@@ -85,7 +126,7 @@ class WorkflowStep:
     timeout: Optional[int] = None  # секунды
     rollback_action: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Новые поля для поддержки разных типов шагов
     step_type: str = "agent"  # "agent" или "tool"
     agent_type: Optional[str] = None  # Для step_type="agent"
@@ -122,7 +163,7 @@ class WorkflowDefinition:
     error_handling: Dict[str, Any] = field(default_factory=dict)
     notifications: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Настройки параллельного выполнения
     parallel_execution: bool = False  # Включить параллельное выполнение шагов
     max_parallel_steps: int = 3  # Максимальное количество одновременно выполняемых шагов
@@ -139,13 +180,13 @@ class WorkflowDefinition:
         with open(yaml_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
         return cls.from_dict(data)
-    
+
     @classmethod
     def from_yaml_string(cls, yaml_string: str) -> 'WorkflowDefinition':
         """Загрузка workflow definition из YAML строки"""
         data = yaml.safe_load(yaml_string)
         return cls.from_dict(data)
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'WorkflowDefinition':
         """Создание WorkflowDefinition из словаря"""
@@ -165,7 +206,7 @@ class WorkflowDefinition:
                         "network_error", "rate_limit", "temporary_failure", "timeout"
                     ])
                 )
-            
+
             # Обработка resource_limits
             resource_limits = None
             if 'resource_limits' in step_data:
@@ -176,7 +217,7 @@ class WorkflowDefinition:
                     max_api_calls_per_minute=limit_data.get('max_api_calls_per_minute'),
                     max_concurrent_steps=limit_data.get('max_concurrent_steps', 1)
                 )
-            
+
             output_schema = step_data.get('output_schema')
             if output_schema is not None and output_schema not in SUPPORTED_STEP_OUTPUT_SCHEMAS:
                 raise ValueError(
@@ -189,13 +230,13 @@ class WorkflowDefinition:
             agent_type = step_data.get('agent_type')
             tool_name = step_data.get('tool_name')
             tool_params = step_data.get('tool_params', {})
-            
+
             # Для обратной совместимости: если agent_type указан, но step_type нет - это агент
             if agent_type and step_type == 'agent':
                 step_type = 'agent'
             elif tool_name and not agent_type:
                 step_type = 'tool'
-            
+
             step = WorkflowStep(
                 id=step_data['id'],
                 task=step_data['task'],
@@ -215,7 +256,7 @@ class WorkflowDefinition:
                 output_schema_requirements=step_data.get('output_schema_requirements'),
             )
             steps.append(step)
-        
+
         # Обработка global_retry_policy
         global_retry_policy = None
         if 'global_retry_policy' in data:
@@ -229,7 +270,7 @@ class WorkflowDefinition:
                     "network_error", "rate_limit", "temporary_failure", "timeout"
                 ])
             )
-        
+
         # Обработка global_resource_limits
         global_resource_limits = None
         if 'global_resource_limits' in data:
@@ -240,7 +281,7 @@ class WorkflowDefinition:
                 max_api_calls_per_minute=limit_data.get('max_api_calls_per_minute'),
                 max_concurrent_steps=limit_data.get('max_concurrent_steps', 1)
             )
-        
+
         # Опциональная секция `pipeline:` с контрактными флагами уровня всего
         # пайплайна. Сейчас поддерживается только `requires_enhanced_engine`.
         pipeline_section = data.get('pipeline', {}) or {}
@@ -265,16 +306,16 @@ class WorkflowDefinition:
             max_parallel_steps=data.get('max_parallel_steps', 3),
             requires_enhanced_engine=requires_enhanced_engine,
         )
-    
+
     def to_yaml(self, yaml_path: Union[str, Path]) -> None:
         """Сохранение workflow definition в YAML файл"""
         with open(yaml_path, 'w', encoding='utf-8') as f:
             yaml.dump(self.to_dict(), f, default_flow_style=False, allow_unicode=True, indent=2)
-    
+
     def to_yaml_string(self) -> str:
         """Конвертация workflow definition в YAML строку"""
         return yaml.dump(self.to_dict(), default_flow_style=False, allow_unicode=True, indent=2)
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Конвертация WorkflowDefinition в словарь"""
         data = {
@@ -287,18 +328,18 @@ class WorkflowDefinition:
         }
         if self.requires_enhanced_engine:
             data['pipeline'] = {'requires_enhanced_engine': True}
-        
+
         # Конвертация шагов
         for step in self.steps:
             step_data = {
                 'id': step.id,
                 'task': step.task
             }
-            
+
             # Добавляем поля в зависимости от типа шага
             if step.step_type != "agent":  # Указываем step_type только если он не по умолчанию
                 step_data['step_type'] = step.step_type
-                
+
             if step.step_type == "agent" and step.agent_type:
                 step_data['agent_type'] = step.agent_type
             elif step.step_type == "tool":
@@ -306,7 +347,7 @@ class WorkflowDefinition:
                     step_data['tool_name'] = step.tool_name
                 if step.tool_params:
                     step_data['tool_params'] = step.tool_params
-            
+
             if step.depends_on:
                 step_data['depends_on'] = step.depends_on
             if step.condition:
@@ -332,7 +373,7 @@ class WorkflowDefinition:
                     'max_delay': step.retry_policy.max_delay,
                     'retry_on_errors': step.retry_policy.retry_on_errors
                 }
-            
+
             if step.resource_limits:
                 limits = {}
                 if step.resource_limits.max_memory_mb:
@@ -345,9 +386,9 @@ class WorkflowDefinition:
                     limits['max_concurrent_steps'] = step.resource_limits.max_concurrent_steps
                 if limits:
                     step_data['resource_limits'] = limits
-            
+
             data['steps'].append(step_data)
-        
+
         # Добавление глобальных настроек
         if self.global_retry_policy:
             data['global_retry_policy'] = {
@@ -357,7 +398,7 @@ class WorkflowDefinition:
                 'max_delay': self.global_retry_policy.max_delay,
                 'retry_on_errors': self.global_retry_policy.retry_on_errors
             }
-        
+
         if self.global_resource_limits:
             limits = {}
             if self.global_resource_limits.max_memory_mb:
@@ -370,20 +411,20 @@ class WorkflowDefinition:
                 limits['max_concurrent_steps'] = self.global_resource_limits.max_concurrent_steps
             if limits:
                 data['global_resource_limits'] = limits
-        
+
         if self.error_handling:
             data['error_handling'] = self.error_handling
         if self.notifications:
             data['notifications'] = self.notifications
         if self.metadata:
             data['metadata'] = self.metadata
-        
+
         # Добавляем настройки параллельного выполнения только если они не по умолчанию
         if self.parallel_execution:
             data['parallel_execution'] = self.parallel_execution
         if self.max_parallel_steps != 3:
             data['max_parallel_steps'] = self.max_parallel_steps
-        
+
         return data
 
 
@@ -401,7 +442,7 @@ class StepResult:
     agent_name: Optional[str] = None
     resource_usage: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     # Enhanced fields for intelligent workflow management
     quality_score: float = 0.0
     decision: str = "proceed"  # proceed|retry|alternate|escalate|stop
@@ -425,18 +466,18 @@ class WorkflowContext:
     step_outputs: Dict[str, Any] = field(default_factory=dict)
     current_step: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
-    
+
     def __post_init__(self):
         """Автоматически генерируем workflow_id и session_id, если не указаны"""
         import uuid
         from datetime import datetime
-        
+
         if self.workflow_id is None:
             # Генерируем уникальный workflow_id
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:8]
             self.workflow_id = f"workflow_{timestamp}_{short_uuid}"
-        
+
         if self.session_id is None:
             # Используем workflow_id как session_id, если не указан
             self.session_id = self.workflow_id
@@ -473,6 +514,7 @@ class WorkflowResult:
     error: Optional[str] = None
     resource_usage_summary: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    terminal_outcome: Optional[TextToSqlTerminalResult] = None
 
 
 @dataclass
@@ -522,7 +564,7 @@ class StepPlan:
     fallback_strategies: List[str] = field(default_factory=list)
 
 
-@dataclass 
+@dataclass
 class ValidationResult:
     """Результат валидации от Post-Step Judge"""
     step_id: str
@@ -574,7 +616,7 @@ class DecisionType(Enum):
     """Типы решений Decision Engine"""
     PROCEED = "proceed"
     RETRY = "retry"
-    ALTERNATE = "alternate" 
+    ALTERNATE = "alternate"
     ESCALATE = "escalate"
     STOP = "stop"
     HUMAN_REQUIRED = "human_required"

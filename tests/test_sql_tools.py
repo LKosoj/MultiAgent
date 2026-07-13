@@ -6,7 +6,55 @@ import importlib
 import urllib.parse
 from types import SimpleNamespace
 
+import pytest
+from smolagents import tool
+
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 from custom_tools import sql_tools
+
+
+class _AdmittedPluginDouble:
+    dialect = "sql"
+
+    def get_capabilities(self, _dsn=None):
+        native = Capability.supported(EnforcementMode.DRIVER, "TEST_NATIVE")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=native,
+            statement_timeout=native,
+            cancellation=native,
+            explain=native,
+            introspection=native,
+            composite_fk_introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+            parameter_binding=Capability.unsupported("TEST_NOT_REQUIRED"),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, _timeout_ms):
+        return None
+
+
+@pytest.fixture(autouse=True)
+def _admit_sql_helper_reads(monkeypatch):
+    from custom_tools.text_to_sql import core
+
+    monkeypatch.setattr(
+        core,
+        "sql_safety_check",
+        lambda *_args, **_kwargs: {"is_safe": True, "issues": []},
+    )
 
 
 def test_dsn_sanitizer():
@@ -45,7 +93,7 @@ def test_get_distinct_values_redacts_exception_boundary(monkeypatch, caplog):
 def test_get_distinct_values_redacts_plugin_error_message(monkeypatch):
     raw_dsn = _raw_pyodbc_dsn()
 
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
         def connect(self, dsn):
             return object()
 
@@ -58,6 +106,10 @@ def test_get_distinct_values_redacts_plugin_error_message(monkeypatch):
         def execute_select(self, conn, sql_query, row_limit=None):
             return {
                 "success": False,
+                "data": [],
+                "columns": [],
+                "rows_affected": 0,
+                "execution_time_ms": 1,
                 "error_message": f"driver failed {raw_dsn} person@example.com",
             }
 
@@ -76,7 +128,7 @@ def test_get_distinct_values_redacts_plugin_error_message(monkeypatch):
 def test_get_distinct_values_redacts_success_values(monkeypatch):
     raw_dsn = _raw_pyodbc_dsn()
 
-    class Plugin:
+    class Plugin(_AdmittedPluginDouble):
         def connect(self, dsn):
             return object()
 
@@ -94,6 +146,10 @@ def test_get_distinct_values_redacts_success_values(monkeypatch):
                     ("+7 (495) 123-45-67",),
                     (raw_dsn,),
                 ],
+                "columns": ["email"],
+                "rows_affected": 3,
+                "execution_time_ms": 1,
+                "error_message": None,
             }
 
     monkeypatch.setattr("db_plugins.get_plugin", lambda dsn: Plugin())
@@ -274,3 +330,29 @@ def test_sql_generation_postgres_quotes(monkeypatch):
     )
     # Должны быть двойные кавычки
     assert '"orders"."created_at"' in out["sql_query"] or '"orders"."id"' in out["sql_query"]
+
+
+def test_save_successful_sql_tool_schema_excludes_trusted_evidence_flags():
+    # Trust boundary: агентский тул не должен экспонировать evidence-флаги,
+    # которые устанавливает только доверенный terminal-путь.
+    schema_tool = tool(sql_tools.save_successful_sql)
+    forbidden_keys = {
+        "namespace_version_key",
+        "approved",
+        "executed",
+        "execution_success",
+        "audited",
+    }
+    assert forbidden_keys.isdisjoint(schema_tool.inputs)
+
+
+def test_save_successful_sql_rejects_trusted_evidence_kwargs():
+    with pytest.raises(TypeError):
+        sql_tools.save_successful_sql(
+            "SELECT 1",
+            approved=True,
+            executed=True,
+            execution_success=True,
+            audited=True,
+            namespace_version_key="a" * 64,
+        )

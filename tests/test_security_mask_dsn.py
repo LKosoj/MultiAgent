@@ -16,6 +16,12 @@ import urllib.parse
 
 import pytest
 
+from db_plugins.base import (
+    Capability,
+    DatabaseCapabilities,
+    EnforcementMode,
+    PluginHealth,
+)
 from custom_tools.text_to_sql.utils import (
     coerce_strict_bool,
     dsn_to_sanitized_name,
@@ -23,6 +29,34 @@ from custom_tools.text_to_sql.utils import (
     mask_dsn,
     mask_dsn_value,
 )
+
+
+class _AdmittedPluginDouble:
+    dialect = "postgres"
+
+    def get_capabilities(self, _dsn=None):
+        native = Capability.supported(EnforcementMode.DRIVER, "TEST_NATIVE")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=native,
+            statement_timeout=native,
+            cancellation=native,
+            explain=native,
+            introspection=native,
+            composite_fk_introspection=Capability.unsupported("TEST_NOT_REQUIRED"),
+            parameter_binding=Capability.unsupported("TEST_NOT_REQUIRED"),
+        )
+
+    def probe_capabilities(self, _conn=None, dsn=None):
+        return PluginHealth(
+            self.dialect,
+            self.get_capabilities(dsn),
+            True,
+            ("TEST_PROBE_OK",),
+        )
+
+    def set_statement_timeout(self, _conn, _timeout_ms):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1541,7 +1575,7 @@ def test_sql_explain_error_masks_dsn(monkeypatch):
     monkeypatch.setenv("DB_DSN", leaked_dsn)
     monkeypatch.delenv("TEXT_TO_SQL_DRY_RUN_ONLY", raising=False)
 
-    class _FakePlugin:
+    class _FakePlugin(_AdmittedPluginDouble):
         def connect(self, dsn):
             raise RuntimeError(f"could not connect to {dsn}")
 
@@ -1566,7 +1600,10 @@ def test_sql_explain_error_masks_dsn(monkeypatch):
     monkeypatch.setattr(
         _sql_generation_api,
         "sql_safety_check",
-        lambda q, *, sql_validator, dsn=None: {"is_safe": True, "issues": []},
+        lambda q, *, sql_validator, dsn=None, safety_policy=None: {
+            "is_safe": True,
+            "issues": [],
+        },
     )
 
     result = _sql_generation_api.sql_explain(

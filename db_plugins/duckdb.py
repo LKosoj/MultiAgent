@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urlparse
-from .base import BaseDBPlugin
+from .base import BaseDBPlugin, Capability, DatabaseCapabilities, EnforcementMode
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +12,37 @@ logger = logging.getLogger(__name__)
 class DuckDBPlugin(BaseDBPlugin):
     dialect = "duckdb"
     dialect_label = "DuckDB"
+
+    def get_capabilities(self, dsn: str | None = None) -> DatabaseCapabilities:
+        read_only = Capability.supported(
+            EnforcementMode.READ_ONLY_FILE, "READ_ONLY_FILE_ENFORCED"
+        )
+        if dsn and ":memory:" in dsn:
+            read_only = Capability.unsupported("IN_MEMORY_NOT_READ_ONLY")
+        elif dsn and self.read_only_fail_open_enabled(dsn):
+            read_only = Capability.unsupported("READ_ONLY_FAIL_OPEN_FORBIDDEN")
+        return DatabaseCapabilities(
+            dialect=self.dialect,
+            read_only=read_only,
+            statement_timeout=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+            ),
+            cancellation=Capability.supported(
+                EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
+            ),
+            explain=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            introspection=Capability.supported(
+                EnforcementMode.DATABASE, "PLUGIN_IMPLEMENTED"
+            ),
+            composite_fk_introspection=Capability.unsupported(
+                "COMPOSITE_FK_GROUPING_UNAVAILABLE"
+            ),
+            parameter_binding=Capability.supported(
+                EnforcementMode.DRIVER, "DRIVER_PARAMETER_BINDING"
+            ),
+        )
 
     def connect(self, dsn: str):
         # dsn формат: duckdb:///abs/path/to.duckdb
@@ -219,6 +250,8 @@ class DuckDBPlugin(BaseDBPlugin):
             except Exception:
                 pass
 
+        for table in schema_result.values():
+            table["foreign_keys"] = {"complete": False, "constraints": []}
         return schema_result
     
 

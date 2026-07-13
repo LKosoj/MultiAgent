@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, List, Optional
 from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
 
 from ..prompts import build_schema_linking_prompt
+from ..schema_namespace import SchemaNamespace
 from ..utils import parse_llm_json_response
+from ..validators.schema_limiter import SchemaContextBudgetExceeded
 from .resolution import _resolve_column_name, _resolve_table_name
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,7 @@ class LLMLinker:
         entities: Dict[str, Any],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         dsn: Optional[str] = None,
+        namespace: Optional[SchemaNamespace] = None,
     ) -> Optional[Dict[str, Any]]:
         """LLM-связывание сущностей со схемой."""
         # Fail-fast ДО try/except ниже: иначе RuntimeError будет пойман
@@ -85,6 +88,7 @@ class LLMLinker:
                 "LLM caller is not configured for schema linking. "
                 "Check DI setup (pass llm_caller= to constructor)."
             )
+        schema_budget: Dict[str, Any] = {}
         try:
             entity_names = self._collect_entity_terms(entities)
             if not entity_names:
@@ -94,10 +98,16 @@ class LLMLinker:
                     "query_entities": [],
                 }
 
-            relevant_tables = self.memory_manager.find_semantic_relevant_tables(
-                entity_names,
-                dsn=dsn,
-            )
+            if namespace is None:
+                relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                    entity_names,
+                    dsn=dsn,
+                )
+            else:
+                relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                    entity_names,
+                    namespace=namespace,
+                )
             logger.info(
                 f"Found {len(relevant_tables)} relevant tables for LLM linking: {relevant_tables}"
             )
@@ -163,7 +173,19 @@ class LLMLinker:
                 f"(from {len(db_schema)} total)"
             )
 
-            schema_str = self.schema_limiter.build_schema_summary(filtered_schema)
+            from ..llm_models_config import load_llm_models_config
+
+            llm_profile = load_llm_models_config()
+            max_tokens = llm_profile.get("schema_linking", "max_tokens")
+            hard_max_chars = llm_profile.get(
+                "schema_linking", "schema_prompt_hard_max_chars"
+            )
+            schema_str = self.schema_limiter.build_schema_summary(
+                filtered_schema,
+                query_terms=entity_names,
+                hard_max_chars=hard_max_chars,
+                diagnostics=schema_budget,
+            )
             # L58: entities могут содержать PII (значения фильтров из
             # пользовательского запроса). LLM-линкеру нужны КЛЮЧИ фильтров
             # (имена колонок), а не фактические значения — редактируем значения
@@ -188,12 +210,6 @@ class LLMLinker:
             # active_llm_caller проверен в начале llm_linking (fail-fast).
             # Здесь дополнительной проверки не нужно: caller гарантированно callable.
             call_openai_api = self.active_llm_caller()
-            # max_tokens приходит из llm_models.yaml (4.17).
-            from ..llm_models_config import load_llm_models_config
-
-            llm_profile = load_llm_models_config()
-            max_tokens = llm_profile.get("schema_linking", "max_tokens")
-
             # system_prompt приходит из prompts.yaml (W6-T2): runtime-код не
             # содержит длинных промпт-текстов — единый source of truth.
             from ..prompts_config import load_prompts_config
@@ -224,12 +240,15 @@ class LLMLinker:
                         "linked_entities": linked_entities if isinstance(linked_entities, dict) else {},
                         "joins": joins_from_llm,
                         "unlinked_entities": parsed.get("unlinked_entities", []),
+                        "schema_budget": schema_budget,
                     }
 
                 return {
                     "linked_entities": linked_entities,
                     "joins": joins_from_llm,
                     "unlinked_entities": parsed.get("unlinked_entities", []),
+                    "ambiguous_bindings": parsed.get("ambiguous_bindings", []),
+                    "schema_budget": schema_budget,
                 }
             else:
                 logger.warning(
@@ -244,7 +263,21 @@ class LLMLinker:
                     "error": "LLM schema linking returned invalid response shape",
                     "suggestion": "Expected JSON object with linked_entities.",
                     "query_entities": _redact_linking_value(entity_names),
+                    "schema_budget": schema_budget,
                 }
+        except SchemaContextBudgetExceeded as e:
+            logger.warning(
+                "LLM schema linking skipped: mandatory schema context exceeds %s chars",
+                e.diagnostics.get("hard_max_chars"),
+            )
+            return {
+                "error": str(e),
+                "reason_code": e.reason_code,
+                "schema_budget": e.diagnostics,
+                "query_entities": _redact_linking_value(
+                    self._collect_entity_terms(entities)
+                ),
+            }
         except (EmbeddingUnavailableError, EmbeddingFailedError) as e:
             # T3: find_semantic_relevant_tables пробрасывает эти ошибки, когда
             # модель эмбеддингов не настроена/недоступна. Не маскируем их под

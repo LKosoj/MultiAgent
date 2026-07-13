@@ -178,6 +178,7 @@ def test_schema_linking_forwards_value_grounding_kwarg(monkeypatch):
             "linked_entities": {"metrics": [], "dimensions": [], "filters": {}},
             "joins": [],
             "join_success": True,
+            "schema_info": _schema(),
         }
 
     monkeypatch.setattr(
@@ -193,22 +194,135 @@ def test_schema_linking_forwards_value_grounding_kwarg(monkeypatch):
     )
 
     assert captured["value_grounding"] is True
-    assert out["sql_generation_allowed"] is True
+    assert out["decision"] == "ABSTAIN"
+    assert out["sql_generation_allowed"] is False
     assert out["confidence"] == 0.75
+    assert out["ambiguity"]["requires_clarification"] is False
+
+
+def test_partial_linking_requires_clarification_and_blocks_generation(monkeypatch):
+    def fake_link(self, entities, schema_info, **kwargs):
+        return {
+            "linked_entities": {
+                "metrics": [
+                    {"name": "revenue", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [],
+                "filters": {},
+            },
+            "joins": [],
+            "join_success": True,
+            "schema_info": _schema(),
+            "ambiguous_bindings": [],
+        }
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(_entities(), schema_info=_schema())
+
+    assert out["decision"] == "CLARIFY"
+    assert out["decision_reasons"] == ["UNRESOLVED_ENTITIES"]
+    assert out["unresolved_entities"] == [
+        {"entity_type": "dimension", "name": "region"}
+    ]
     assert out["ambiguity"]["requires_clarification"] is True
+    assert out["abstain"] is False
+    assert out["sql_generation_allowed"] is False
+    assert out["terminal_reason_code"] == "SCHEMA_CLARIFICATION_REQUIRED"
+
+
+def test_complete_single_table_linking_proceeds(monkeypatch):
+    def fake_link(self, entities, schema_info, **kwargs):
+        return {
+            "linked_entities": {
+                "metrics": [
+                    {"name": "revenue", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [
+                    {"name": "region", "table": "orders", "column": "region_id"}
+                ],
+                "filters": {},
+            },
+            "joins": [],
+            "join_success": True,
+            "schema_info": _schema(),
+            "ambiguous_bindings": [],
+        }
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(_entities(), schema_info=_schema())
+
+    assert out["decision"] == "PROCEED"
+    assert out["decision_reasons"] == []
+    assert out["unresolved_entities"] == []
+    assert out["abstain"] is False
+    assert out["sql_generation_allowed"] is True
+    assert out["terminal_reason_code"] == ""
+
+
+def test_equal_best_diagnostics_require_clarification(monkeypatch):
+    candidates = [
+        {"table": "orders", "column": "region", "score": 10},
+        {"table": "regions", "column": "region", "score": 10},
+    ]
+
+    def fake_link(self, entities, schema_info, **kwargs):
+        return {
+            "linked_entities": {
+                "metrics": [
+                    {"name": "revenue", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [],
+                "filters": {},
+            },
+            "joins": [],
+            "join_success": True,
+            "schema_info": _schema(),
+            "ambiguous_bindings": [
+                {
+                    "entity_type": "dimension",
+                    "name": "region",
+                    "candidates": candidates,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(_entities(), schema_info=_schema())
+
+    assert out["decision"] == "CLARIFY"
+    assert out["decision_reasons"] == [
+        "UNRESOLVED_ENTITIES",
+        "AMBIGUOUS_BINDINGS",
+    ]
+    assert out["ambiguous_bindings"][0]["candidates"] == candidates
+    assert out["sql_generation_allowed"] is False
 
 
 def test_schema_linking_confidence_threshold_can_abstain(monkeypatch):
     def fake_link(self, entities, schema_info, dsn=None, session_id=None, value_grounding=None):
         return {
             "linked_entities": {
-                "metrics": [{"table": "orders", "column": "amount"}],
+                "metrics": [
+                    {"name": "revenue", "table": "orders", "column": "amount"}
+                ],
                 "dimensions": [],
                 "filters": {},
             },
             "joins": [],
             "join_success": True,
-            "unlinked_entities": ["unknown_metric"],
+            "schema_info": _schema(),
         }
 
     monkeypatch.setenv("TEXT_TO_SQL_MIN_CONFIDENCE_TO_GENERATE", "0.95")
@@ -224,5 +338,17 @@ def test_schema_linking_confidence_threshold_can_abstain(monkeypatch):
     )
 
     assert out["confidence"] == 0.9
+    assert out["decision"] == "ABSTAIN"
     assert out["abstain"] is True
     assert out["sql_generation_allowed"] is False
+
+
+@pytest.mark.parametrize("value", ["bad", "nan", "-0.1", "1.1"])
+def test_schema_linking_confidence_threshold_rejects_invalid_override(
+    monkeypatch,
+    value,
+):
+    monkeypatch.setenv("TEXT_TO_SQL_MIN_CONFIDENCE_TO_GENERATE", value)
+
+    with pytest.raises(ValueError, match="TEXT_TO_SQL_MIN_CONFIDENCE_TO_GENERATE"):
+        schema_linking(_entities(), schema_info=_schema())

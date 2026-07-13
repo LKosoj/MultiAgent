@@ -7,10 +7,35 @@ Singletons передаются через keyword-only аргументы из 
 (`custom_tools.text_to_sql.core`), чтобы тесты могли подменять их monkeypatch'ем.
 """
 import logging
+import math
 import os
 import re
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional
+
+from db_plugins.base import (
+    CapabilityState,
+    DatabaseCapabilities,
+    DatabaseCapabilityError,
+    EnforcementMode,
+    PluginHealth,
+    RequiredDatabaseCapabilities,
+    validate_required_capabilities,
+)
+from tool_runtime_context import SupervisorExecutionEvidence
+
+if TYPE_CHECKING:
+    from ..validators import TextToSqlSafetyPolicy
+
+from workflow.models import (
+    bound_text_to_sql_error,
+    preflight_text_to_sql_json_value,
+    text_to_sql_executor_contract_error,
+    text_to_sql_type_name,
+)
+from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded
 
 logger = logging.getLogger(__name__)
 
@@ -29,9 +54,161 @@ class MissingDSNError(RuntimeError):
     """
 
 
+class QueryPurpose(str, Enum):
+    """Closed set of admitted Text-to-SQL database read purposes."""
+
+    FINAL = "FINAL"
+    EXPLAIN = "EXPLAIN"
+    DISTINCT = "DISTINCT"
+    GROUNDING = "GROUNDING"
+    CONTAINMENT = "CONTAINMENT"
+
+
+# Purposes for which dry_run_only short-circuits execution before any DB
+# connection is opened. EXPLAIN is a preparation read like FINAL — dry-run
+# must gate it too, not just FINAL (T14).
+_DRY_RUN_GATED_PURPOSES = frozenset({QueryPurpose.FINAL, QueryPurpose.EXPLAIN})
+
+
+@dataclass(frozen=True, slots=True)
+class QueryExecutionRequest:
+    """One purpose-bound database read submitted to :class:`QueryExecutor`."""
+
+    sql_query: str
+    purpose: QueryPurpose
+    row_limit: Optional[int] = None
+    dsn: Optional[str] = None
+    dry_run_only: Optional[bool] = None
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None
+    deadline: Optional[DeadlineBudget] = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sql_query, str):
+            raise TypeError("sql_query must be a string")
+        if not isinstance(self.purpose, QueryPurpose):
+            raise TypeError("purpose must be a QueryPurpose")
+        if self.dry_run_only is not None and type(self.dry_run_only) is not bool:
+            raise TypeError("dry_run_only must be a boolean or null")
+        if self.deadline is not None and not isinstance(
+            self.deadline,
+            DeadlineBudget,
+        ):
+            raise TypeError("deadline must be a DeadlineBudget or null")
+
+
+@dataclass(frozen=True, slots=True)
+class QueryExecutionResult:
+    """Typed view over the compatibility executor response mapping."""
+
+    purpose: QueryPurpose
+    outcome: Mapping[str, Any]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.purpose, QueryPurpose):
+            raise TypeError("purpose must be a QueryPurpose")
+        if not isinstance(self.outcome, Mapping):
+            raise TypeError("outcome must be a mapping")
+        object.__setattr__(self, "outcome", dict(self.outcome))
+
+    @property
+    def success(self) -> bool:
+        return self.outcome.get("success") is True
+
+    @property
+    def data(self) -> list[Any]:
+        value = self.outcome.get("data")
+        return list(value) if isinstance(value, (list, tuple)) else []
+
+    @property
+    def columns(self) -> list[Any]:
+        value = self.outcome.get("columns")
+        return list(value) if isinstance(value, (list, tuple)) else []
+
+    @property
+    def error_message(self) -> Optional[str]:
+        value = self.outcome.get("error_message")
+        return value if isinstance(value, str) else None
+
+    @property
+    def skipped_execution(self) -> bool:
+        return self.outcome.get("skipped_execution") is True
+
+    @property
+    def executed(self) -> bool:
+        return not self.skipped_execution
+
+    @property
+    def failure_code(self) -> Optional[str]:
+        if self.success:
+            return None
+        explicit = self.outcome.get("pre_execution_error_code")
+        if isinstance(explicit, str) and explicit:
+            return explicit
+        if self.outcome.get("safety_issues"):
+            return "SAFETY_REJECTED"
+        return "EXECUTION_FAILED"
+
+    def to_mapping(self) -> Dict[str, Any]:
+        return dict(self.outcome)
+
+
+class QueryExecutor:
+    """Purpose-aware entry point shared by final and preparation reads."""
+
+    def __init__(
+        self,
+        *,
+        get_plugin: Optional[Callable[[str], Any]] = None,
+    ) -> None:
+        self._get_plugin = get_plugin
+
+    def execute(self, request: QueryExecutionRequest) -> QueryExecutionResult:
+        if not isinstance(request, QueryExecutionRequest):
+            raise TypeError("request must be a QueryExecutionRequest")
+
+        from tool_runtime_context import (
+            get_runtime_context_deadline,
+            get_runtime_context_safety_policy,
+            get_runtime_context_supervisor_evidence,
+        )
+
+        deadline = request.deadline or get_runtime_context_deadline()
+        supervisor_evidence = get_runtime_context_supervisor_evidence()
+        safety_policy = (
+            request.safety_policy or get_runtime_context_safety_policy()
+        )
+        outcome = _secure_db_executor(
+            request.sql_query,
+            request.row_limit,
+            request.dsn,
+            dry_run_only=request.dry_run_only,
+            safety_policy=safety_policy,
+            purpose=request.purpose,
+            deadline=deadline,
+            supervisor_evidence=supervisor_evidence,
+            plugin_resolver=self._get_plugin,
+        )
+        return QueryExecutionResult(request.purpose, outcome)
+
+
 # Кортеж примитивных JSON-типов вынесен на уровень модуля, чтобы не создавать
 # новый объект при каждом вызове _normalize_jsonable с list/dict-значением.
 _JSONABLE_PRIMITIVES = (bool, int, float, str, type(None))
+_PRE_EXECUTION_ERROR_CODES = frozenset({
+    "INVALID_ROW_LIMIT",
+    "INVALID_ROW_LIMIT_CAP",
+    "INVALID_STATEMENT_TIMEOUT",
+})
+
+
+def _stringify_json_leaf(value: Any) -> str:
+    try:
+        return str(value)
+    except Exception as exc:
+        raise TypeError(
+            "executor result value cannot be converted to JSON text: "
+            f"{bound_text_to_sql_error(exc)}"
+        ) from None
 
 
 def _normalize_jsonable(value: Any) -> Any:
@@ -56,12 +233,15 @@ def _normalize_jsonable(value: Any) -> Any:
         # Быстрый путь: если все ключи str и все значения — примитивы
         if all(isinstance(k, str) and isinstance(v, _JSONABLE_PRIMITIVES) for k, v in value.items()):
             return dict(value)
-        return {str(k): _normalize_jsonable(v) for k, v in value.items()}
-    return str(value)
+        return {
+            _stringify_json_leaf(k): _normalize_jsonable(v)
+            for k, v in value.items()
+        }
+    return _stringify_json_leaf(value)
 
 
 def _normalize_executor_result(
-    result: Dict[str, Any],
+    result: Any,
     *,
     start_time: float,
     sql_query: str,
@@ -69,8 +249,28 @@ def _normalize_executor_result(
     safety_issues: Optional[List[Dict[str, Any]]] = None,
     dry_run_only: bool = False,
     skipped_execution: bool = False,
+    pre_execution_error_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    normalized = dict(result or {})
+    if (
+        pre_execution_error_code is not None
+        and pre_execution_error_code not in _PRE_EXECUTION_ERROR_CODES
+    ):
+        raise ValueError("unsupported pre_execution_error_code")
+    preflight_text_to_sql_json_value(
+        result,
+        field_name="executor strategy result",
+        allow_non_json_leaves=True,
+    )
+    if not isinstance(result, dict):
+        try:
+            dict(result)
+        except Exception as exc:
+            raise TypeError(bound_text_to_sql_error(exc)) from None
+        raise TypeError(
+            "executor strategy returned "
+            f"{text_to_sql_type_name(result)}, expected object"
+        )
+    normalized = dict(result)
     normalized.setdefault("success", False)
     normalized["data"] = _normalize_jsonable(normalized.get("data", []))
     normalized["columns"] = _normalize_jsonable(normalized.get("columns", []))
@@ -78,10 +278,12 @@ def _normalize_executor_result(
     normalized.setdefault("execution_time_ms", int((time.time() - start_time) * 1000))
     normalized.setdefault("error_message", None)
     normalized["safety_issues"] = safety_issues or normalized.get("safety_issues") or []
-    normalized["dry_run_only"] = bool(dry_run_only or normalized.get("dry_run_only", False))
-    normalized["skipped_execution"] = bool(skipped_execution or normalized.get("skipped_execution", False))
+    normalized["dry_run_only"] = bool(dry_run_only)
+    normalized["skipped_execution"] = bool(skipped_execution)
     normalized["sql_query"] = sql_query
     normalized["applied_row_limit"] = row_limit
+    if row_limit is None and pre_execution_error_code is not None:
+        normalized["pre_execution_error_code"] = pre_execution_error_code
     return normalized
 
 
@@ -172,7 +374,10 @@ def _parse_table_parts_from_describe(sql_query: str) -> list[str]:
         dialect = get_sqlglot_dialect()
         sqlglot.tokenize(sql_query, dialect=None if dialect == "ansi" else dialect)
     except Exception as e:
-        raise ValueError(f"sqlglot failed to parse DESCRIBE target: {e}") from e
+        raise ValueError(
+            "sqlglot failed to parse DESCRIBE target: "
+            f"{bound_text_to_sql_error(e)}"
+        ) from e
 
     return _describe_identifier_parts_from_text(sql_query)
 
@@ -314,6 +519,24 @@ def _build_failure_result(
     return result
 
 
+def _attempted_execution_failure(
+    *,
+    start_time: float,
+    sql_query: str,
+    row_limit: int,
+    error: Any,
+) -> Dict[str, Any]:
+    message = bound_text_to_sql_error(error) or "database execution failed"
+    return _normalize_executor_result(
+        _build_failure_result(start_time, message),
+        start_time=start_time,
+        sql_query=sql_query,
+        row_limit=row_limit,
+        dry_run_only=False,
+        skipped_execution=False,
+    )
+
+
 # === EPIC 7.5: вычленение тела EXPLAIN через regex (поддерживает скобки) ===
 _EXPLAIN_BODY_RE = re.compile(
     r"^\s*EXPLAIN\b\s*(?:\([^)]*\))?\s*(?P<body>.+)$",
@@ -379,11 +602,13 @@ def _classify_statement(sql_query: str, dsn: Optional[str] = None) -> _Statement
     from ..utils import parse_with_timeout
 
     try:
-        import sqlglot
         from sqlglot import exp
         from sqlglot import errors as sqlglot_errors
     except Exception as e:
-        logger.error("sqlglot import failed inside _classify_statement: %s", e)
+        logger.error(
+            "sqlglot import failed inside _classify_statement: %s",
+            bound_text_to_sql_error(e),
+        )
         return "unknown"
 
     dialect = get_sqlglot_dialect(dsn, strict=bool(dsn and str(dsn).strip()))
@@ -392,7 +617,10 @@ def _classify_statement(sql_query: str, dsn: Optional[str] = None) -> _Statement
     try:
         statements = parse_with_timeout(sql_query, read=read)
     except (TimeoutError, sqlglot_errors.ParseError, sqlglot_errors.TokenError) as e:
-        logger.warning("sqlglot parse failed in _classify_statement: %s", e)
+        logger.warning(
+            "sqlglot parse failed in _classify_statement: %s",
+            bound_text_to_sql_error(e),
+        )
         return "unknown"
 
     statements = [s for s in (statements or []) if s is not None]
@@ -448,8 +676,15 @@ def _describe_strategy(
         schema_info = plugin.introspect_schema(conn, schema=schema_name, table_name=table_name)
         resolved = _resolve_describe_table(schema_info, schema_name, table_name)
     except Exception as e:
-        logger.warning("Failed to parse DESCRIBE with introspect_schema: %s", e)
-        return _build_failure_result(start, f"DESCRIBE introspection failed: {e}")
+        logger.warning(
+            "Failed to parse DESCRIBE with introspect_schema: %s",
+            bound_text_to_sql_error(e),
+        )
+        return _build_failure_result(
+            start,
+            "DESCRIBE introspection failed: "
+            f"{bound_text_to_sql_error(e)}",
+        )
 
     if not resolved:
         return _build_failure_result(start, f"Table '{table_name}' not found")
@@ -468,7 +703,7 @@ def _explain_strategy(
         logger.warning(
             "_explain_strategy: plugin.explain() returned unexpected type %s; "
             "expected dict. Degrading to failure result.",
-            type(explain_result).__name__,
+            text_to_sql_type_name(explain_result),
         )
         return _build_failure_result(start, "EXPLAIN plugin returned invalid response format")
     # Проверяем наличие issues (например, EXPLAIN_UNSUPPORTED) и plan=None.
@@ -511,12 +746,57 @@ _STRATEGIES: Dict[str, Any] = {
     "show": _show_strategy,
 }
 
+_PREPARATION_PURPOSE_KINDS: Dict[QueryPurpose, frozenset[str]] = {
+    QueryPurpose.EXPLAIN: frozenset({"explain"}),
+    QueryPurpose.DISTINCT: frozenset({"select"}),
+    QueryPurpose.GROUNDING: frozenset({"select"}),
+    QueryPurpose.CONTAINMENT: frozenset({"select"}),
+}
+
+
+def _validate_query_purpose(
+    purpose: QueryPurpose,
+    statement_kind: _StatementKind,
+) -> None:
+    allowed = _PREPARATION_PURPOSE_KINDS.get(purpose)
+    if allowed is None:
+        return
+    if statement_kind not in allowed:
+        expected = "/".join(sorted(kind.upper() for kind in allowed))
+        raise ValueError(
+            f"{purpose.value} purpose requires {expected} statement, "
+            f"got {statement_kind.upper()}"
+        )
+
+
+def _require_query_deadline(
+    deadline: Optional[DeadlineBudget],
+    boundary: str,
+) -> Optional[float]:
+    if deadline is None:
+        return None
+    return deadline.require_remaining(boundary)
+
+
+def _deadline_statement_timeout_ms(
+    configured_timeout_ms: int,
+    deadline: Optional[DeadlineBudget],
+) -> int:
+    remaining = _require_query_deadline(deadline, "database query execution")
+    if remaining is None:
+        return configured_timeout_ms
+    remaining_ms = max(1, math.floor(remaining * 1000))
+    return min(configured_timeout_ms, remaining_ms)
+
 
 def _parse_positive_int_env(
     env_name: str,
     default: str,
     start: float,
     sql_query: str,
+    *,
+    evidence_row_limit: Optional[int] = None,
+    null_row_limit_error_code: Optional[str] = None,
 ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
     raw_value = os.getenv(env_name, default)
     try:
@@ -524,24 +804,36 @@ def _parse_positive_int_env(
     except (TypeError, ValueError):
         return None, _normalize_executor_result(
             _build_failure_result(start, f"Invalid {env_name}: {raw_value!r}"),
-            start_time=start, sql_query=sql_query, row_limit=None,
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=evidence_row_limit,
+            skipped_execution=True,
+            pre_execution_error_code=null_row_limit_error_code,
         )
     if parsed <= 0:
         return None, _normalize_executor_result(
             _build_failure_result(start, f"{env_name} must be a positive integer"),
-            start_time=start, sql_query=sql_query, row_limit=None,
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=evidence_row_limit,
+            skipped_execution=True,
+            pre_execution_error_code=null_row_limit_error_code,
         )
     return parsed, None
 
 
 def _parse_statement_timeout_ms(
-    start: float, sql_query: str
+    start: float,
+    sql_query: str,
+    row_limit: Optional[int] = None,
 ) -> tuple[Optional[int], Optional[Dict[str, Any]]]:
     return _parse_positive_int_env(
         "DB_EXECUTOR_STATEMENT_TIMEOUT_MS",
         "30000",
         start,
         sql_query,
+        evidence_row_limit=row_limit,
+        null_row_limit_error_code="INVALID_STATEMENT_TIMEOUT",
     )
 
 
@@ -556,7 +848,11 @@ def _parse_row_limit(
         except (TypeError, ValueError):
             return None, _normalize_executor_result(
                 _build_failure_result(start, f"Invalid DB_EXECUTOR_ROW_LIMIT: {raw_row_limit!r}"),
-                start_time=start, sql_query=sql_query, row_limit=None,
+                start_time=start,
+                sql_query=sql_query,
+                row_limit=None,
+                skipped_execution=True,
+                pre_execution_error_code="INVALID_ROW_LIMIT",
             )
     else:
         raw_row_limit = row_limit
@@ -565,13 +861,21 @@ def _parse_row_limit(
         except (TypeError, ValueError):
             return None, _normalize_executor_result(
                 _build_failure_result(start, f"Invalid row_limit: {raw_row_limit!r}"),
-                start_time=start, sql_query=sql_query, row_limit=None,
+                start_time=start,
+                sql_query=sql_query,
+                row_limit=None,
+                skipped_execution=True,
+                pre_execution_error_code="INVALID_ROW_LIMIT",
             )
 
     if parsed <= 0:
         return None, _normalize_executor_result(
             _build_failure_result(start, "row_limit must be a positive integer"),
-            start_time=start, sql_query=sql_query, row_limit=None,
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=None,
+            skipped_execution=True,
+            pre_execution_error_code="INVALID_ROW_LIMIT",
         )
 
     max_row_limit, cap_failure = _parse_positive_int_env(
@@ -579,6 +883,8 @@ def _parse_row_limit(
         "10000",
         start,
         sql_query,
+        evidence_row_limit=parsed,
+        null_row_limit_error_code="INVALID_ROW_LIMIT_CAP",
     )
     if cap_failure is not None:
         return None, cap_failure
@@ -589,7 +895,10 @@ def _parse_row_limit(
                 start,
                 f"row_limit {parsed} exceeds DB_EXECUTOR_MAX_ROW_LIMIT {max_row_limit}",
             ),
-            start_time=start, sql_query=sql_query, row_limit=None,
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=parsed,
+            skipped_execution=True,
         )
     return parsed, None
 
@@ -601,31 +910,112 @@ def _apply_statement_timeout(
     start: float,
     sql_query: str,
     row_limit: int,
-) -> Optional[Dict[str, Any]]:
+    *,
+    capabilities: DatabaseCapabilities,
+) -> tuple[Optional[Dict[str, Any]], EnforcementMode]:
+    timeout_capability = capabilities.statement_timeout
+    if timeout_capability.state is not CapabilityState.SUPPORTED:
+        failure = _normalize_executor_result(
+            _build_failure_result(
+                start,
+                "Statement timeout capability is unavailable "
+                f"({timeout_capability.reason_code})",
+            ),
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+            skipped_execution=True,
+        )
+        failure["capability_error"] = {
+            "capability": "statement_timeout",
+            "reason_code": timeout_capability.reason_code,
+        }
+        return failure, EnforcementMode.NONE
+    if timeout_capability.mode is EnforcementMode.SUPERVISOR:
+        return None, EnforcementMode.SUPERVISOR
+    if timeout_capability.mode not in {
+        EnforcementMode.DATABASE,
+        EnforcementMode.DRIVER,
+    }:
+        raise RuntimeError("invalid statement timeout enforcement mode")
     setter = getattr(plugin, "set_statement_timeout", None)
     if not callable(setter):
-        return None
+        failure = _normalize_executor_result(
+            _build_failure_result(
+                start,
+                "Declared statement timeout setter is unavailable",
+            ),
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+            skipped_execution=True,
+        )
+        failure["capability_error"] = {
+            "capability": "statement_timeout",
+            "reason_code": "DECLARED_TIMEOUT_SETTER_MISSING",
+        }
+        return failure, EnforcementMode.NONE
     try:
         setter(conn, timeout_ms)
     except Exception as e:
         from ..utils import mask_dsn
 
         return _normalize_executor_result(
-            _build_failure_result(start, mask_dsn(str(e))),
+            _build_failure_result(
+                start,
+                mask_dsn(bound_text_to_sql_error(e)),
+            ),
             start_time=start,
             sql_query=sql_query,
             row_limit=row_limit,
+            skipped_execution=True,
+        ), EnforcementMode.NONE
+    return None, timeout_capability.mode
+
+
+def _validate_probe_health(
+    declared: DatabaseCapabilities,
+    health: PluginHealth,
+) -> None:
+    if health.dialect != declared.dialect:
+        raise DatabaseCapabilityError(
+            "production_ready",
+            "CAPABILITY_PROBE_DIALECT_MISMATCH",
         )
-    return None
+    for capability_name in declared.to_mapping():
+        if capability_name == "dialect":
+            continue
+        declared_capability = getattr(declared, capability_name)
+        observed_capability = getattr(health.capabilities, capability_name)
+        if (
+            observed_capability.state is CapabilityState.SUPPORTED
+            and declared_capability.state is not CapabilityState.SUPPORTED
+        ):
+            raise DatabaseCapabilityError(
+                capability_name,
+                "CAPABILITY_PROBE_UPGRADE_FORBIDDEN",
+            )
+        if (
+            observed_capability.state is CapabilityState.SUPPORTED
+            and observed_capability.mode is not declared_capability.mode
+        ):
+            raise DatabaseCapabilityError(
+                capability_name,
+                "CAPABILITY_PROBE_MODE_CHANGE_FORBIDDEN",
+            )
 
 
-def secure_db_executor(
+def _secure_db_executor(
     sql_query: str,
     row_limit: Optional[int] = None,
     dsn: Optional[str] = None,
     *,
-    sql_validator,
-    schema_limiter,
+    dry_run_only: Optional[bool] = None,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
+    purpose: QueryPurpose = QueryPurpose.FINAL,
+    deadline: Optional[DeadlineBudget] = None,
+    supervisor_evidence: Optional[SupervisorExecutionEvidence] = None,
+    plugin_resolver: Optional[Callable[[str], Any]] = None,
 ) -> Dict[str, object]:
     """Безопасное выполнение SELECT и разрешённых команд (DESCRIBE/EXPLAIN/SHOW).
 
@@ -644,21 +1034,44 @@ def secure_db_executor(
       opt-in'ом использовать ``DB_DSN``.
     - Если оба источника пусты и это не dry-run — ``MissingDSNError`` без silent fallback.
     """
+    if dry_run_only is not None and type(dry_run_only) is not bool:
+        raise TypeError("dry_run_only must be a boolean or null")
+    if not isinstance(purpose, QueryPurpose):
+        raise TypeError("purpose must be a QueryPurpose")
+    if deadline is not None and not isinstance(deadline, DeadlineBudget):
+        raise TypeError("deadline must be a DeadlineBudget or null")
+    if supervisor_evidence is not None and not isinstance(
+        supervisor_evidence,
+        SupervisorExecutionEvidence,
+    ):
+        raise TypeError(
+            "supervisor_evidence must be a SupervisorExecutionEvidence or null"
+        )
+
     logger.info("Executing SQL query securely")
     start = time.time()
-
-    row_limit, failure = _parse_row_limit(row_limit, start, sql_query)
-    if failure is not None:
-        return failure
-    assert row_limit is not None  # для типчекеров
-    statement_timeout_ms, failure = _parse_statement_timeout_ms(start, sql_query)
-    if failure is not None:
-        return failure
-    assert statement_timeout_ms is not None
+    _require_query_deadline(deadline, "database query preparation")
 
     from ..utils import get_runtime_context_dsn, is_dry_run_only, mask_dsn
 
-    dry_run_only = is_dry_run_only()
+    dry_run_only = is_dry_run_only(payload_flag=dry_run_only)
+
+    row_limit, failure = _parse_row_limit(row_limit, start, sql_query)
+    if failure is not None:
+        failure["dry_run_only"] = dry_run_only
+        failure["skipped_execution"] = True
+        return failure
+    assert row_limit is not None  # для типчекеров
+    statement_timeout_ms, failure = _parse_statement_timeout_ms(
+        start,
+        sql_query,
+        row_limit,
+    )
+    if failure is not None:
+        failure["dry_run_only"] = dry_run_only
+        failure["skipped_execution"] = True
+        return failure
+    assert statement_timeout_ms is not None
 
     # Явный параметр имеет приоритет. ENV-fallback на DB_DSN считается silent
     # деградацией безопасности (AGENTS.md): он работает только при явном
@@ -673,7 +1086,8 @@ def secure_db_executor(
                 "(SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1 opt-in)"
             )
             effective_dsn = env_dsn
-    if not effective_dsn and not dry_run_only:
+    dry_run_gated = dry_run_only and purpose in _DRY_RUN_GATED_PURPOSES
+    if not effective_dsn and not dry_run_gated:
         raise MissingDSNError(
             "DSN required: pass dsn via parameter from pipeline context. "
             "Silent DB_DSN env fallback disabled — set "
@@ -681,27 +1095,43 @@ def secure_db_executor(
         )
     dsn = effective_dsn
 
+    statement_kind: Optional[_StatementKind] = None
+    if purpose is not QueryPurpose.FINAL:
+        statement_kind = _classify_statement(sql_query, dsn=dsn)
+        _validate_query_purpose(purpose, statement_kind)
+
     # Через фасад: тесты monkeypatch'ят core.sql_safety_check / core.get_plugin.
     from custom_tools.text_to_sql import core as _facade
 
-    safety = _facade.sql_safety_check(sql_query, dsn=dsn or "")
+    safety_kwargs: Dict[str, Any] = {"dsn": dsn or ""}
+    if safety_policy is not None:
+        safety_kwargs["safety_policy"] = safety_policy
+    safety = _facade.sql_safety_check(sql_query, **safety_kwargs)
     if not isinstance(safety, dict):
         return _normalize_executor_result(
             _build_failure_result(
                 start,
-                f"Invalid safety check result structure: expected dict, got {type(safety).__name__}",
+                "Invalid safety check result structure: expected dict, got "
+                f"{text_to_sql_type_name(safety)}",
             ),
-            start_time=start, sql_query=sql_query, row_limit=row_limit,
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+            dry_run_only=dry_run_only,
+            skipped_execution=True,
         )
     if not safety.get("is_safe", False):
         issues = safety.get("issues") or []
         return _normalize_executor_result(
             _build_failure_result(start, "Unsafe query.", safety_issues=issues),
             start_time=start, sql_query=sql_query, row_limit=row_limit,
+            dry_run_only=dry_run_only,
+            skipped_execution=True,
             safety_issues=issues,
         )
 
-    if dry_run_only:
+    _require_query_deadline(deadline, "database connection")
+    if dry_run_gated:
         return _normalize_executor_result({
             "success": True,
             "data": [],
@@ -718,57 +1148,269 @@ def secure_db_executor(
     plugin = None
     conn = None
     try:
-        plugin = _facade.get_plugin(dsn)
+        get_plugin = plugin_resolver or _facade.get_plugin
+        plugin = get_plugin(dsn)
+        capability_getter = getattr(plugin, "get_capabilities", None)
+        if not callable(capability_getter):
+            raise DatabaseCapabilityError(
+                "capability_contract",
+                "CAPABILITY_DECLARATION_MISSING",
+            )
+        capabilities = capability_getter(dsn)
+        if not isinstance(capabilities, DatabaseCapabilities):
+            raise TypeError("plugin capability declaration is invalid")
+        statement_kind = statement_kind or _classify_statement(sql_query, dsn=dsn)
+        _validate_query_purpose(purpose, statement_kind)
+        required_capabilities = RequiredDatabaseCapabilities(
+            explain=statement_kind == "explain",
+            introspection=statement_kind == "describe",
+            allow_supervisor=(
+                supervisor_evidence is not None and deadline is not None
+            ),
+        )
+        validate_required_capabilities(capabilities, required_capabilities)
+    except DatabaseCapabilityError as exc:
+        failure = _normalize_executor_result(
+            _build_failure_result(start, str(exc)),
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+            skipped_execution=True,
+        )
+        failure["capability_error"] = {
+            "capability": exc.capability,
+            "reason_code": exc.reason_code,
+        }
+        failure["timeout_enforcement_mode"] = "none"
+        failure["cancellation_enforcement_mode"] = "none"
+        return failure
+    except WorkflowDeadlineExceeded:
+        raise
+    except Exception as e:
+        return _normalize_executor_result(
+            _build_failure_result(
+                start,
+                mask_dsn(bound_text_to_sql_error(e)),
+            ),
+            start_time=start,
+            sql_query=sql_query,
+            row_limit=row_limit,
+            skipped_execution=True,
+        )
+
+    try:
         conn = plugin.connect(dsn)
+    except WorkflowDeadlineExceeded:
+        raise
     except Exception as e:
         # EPIC 7.7: если connect не открыл соединение — finally не должен звать close.
         # EPIC 7.3: маскируем DSN в тексте ошибки.
         return _normalize_executor_result(
-            _build_failure_result(start, mask_dsn(str(e))),
+            _build_failure_result(
+                start,
+                mask_dsn(bound_text_to_sql_error(e)),
+            ),
             start_time=start, sql_query=sql_query, row_limit=row_limit,
+            skipped_execution=True,
         )
 
+    strategy_started = False
+    execution_result: Dict[str, Any]
+    timeout_mode = EnforcementMode.NONE
+    cancellation_mode = EnforcementMode.NONE
     try:
-        kind = _classify_statement(sql_query, dsn=dsn)
-        strategy = _STRATEGIES.get(kind)
-        if strategy is None:
-            return _normalize_executor_result(
+        try:
+            probe = getattr(plugin, "probe_capabilities", None)
+            if not callable(probe):
+                raise DatabaseCapabilityError(
+                    "production_ready",
+                    "CAPABILITY_PROBE_MISSING",
+                )
+            health = probe(conn, dsn)
+            if not isinstance(health, PluginHealth):
+                raise TypeError("plugin capability probe returned an invalid result")
+            _validate_probe_health(capabilities, health)
+            validate_required_capabilities(
+                health.capabilities,
+                required_capabilities,
+            )
+            if not health.production_ready:
+                reason_code = (
+                    health.reason_codes[0]
+                    if health.reason_codes
+                    else "PLUGIN_NOT_PRODUCTION_READY"
+                )
+                raise DatabaseCapabilityError("production_ready", reason_code)
+        except DatabaseCapabilityError as exc:
+            execution_result = _normalize_executor_result(
+                _build_failure_result(start, str(exc)),
+                start_time=start,
+                sql_query=sql_query,
+                row_limit=row_limit,
+                skipped_execution=True,
+            )
+            execution_result["capability_error"] = {
+                "capability": exc.capability,
+                "reason_code": exc.reason_code,
+            }
+        except WorkflowDeadlineExceeded:
+            raise
+        except Exception as exc:
+            execution_result = _normalize_executor_result(
                 _build_failure_result(
                     start,
-                    f"Unsupported or unrecognised statement type (classified as '{kind}').",
+                    "Database capability probe failed: "
+                    f"{mask_dsn(bound_text_to_sql_error(exc))}",
                 ),
-                start_time=start, sql_query=sql_query, row_limit=row_limit,
+                start_time=start,
+                sql_query=sql_query,
+                row_limit=row_limit,
+                skipped_execution=True,
             )
-        timeout_failure = _apply_statement_timeout(
-            plugin,
-            conn,
-            statement_timeout_ms,
-            start,
-            sql_query,
-            row_limit,
-        )
-        if timeout_failure is not None:
-            return timeout_failure
-        try:
-            result = strategy(
-                sql_query=sql_query, plugin=plugin, conn=conn,
-                start=start, row_limit=row_limit,
-            )
-        except Exception as e:
-            return _normalize_executor_result(
-                _build_failure_result(start, mask_dsn(str(e))),
-                start_time=start, sql_query=sql_query, row_limit=row_limit,
-            )
-        return _normalize_executor_result(
-            result, start_time=start, sql_query=sql_query, row_limit=row_limit,
-        )
+            execution_result["capability_error"] = {
+                "capability": "production_ready",
+                "reason_code": "CAPABILITY_PROBE_FAILED",
+            }
+        else:
+            capabilities = health.capabilities
+            cancellation_mode = capabilities.cancellation.mode
+            kind = statement_kind
+            _validate_query_purpose(purpose, kind)
+            strategy = _STRATEGIES.get(kind)
+            if strategy is None:
+                execution_result = _normalize_executor_result(
+                    _build_failure_result(
+                        start,
+                        f"Unsupported or unrecognised statement type (classified as '{kind}').",
+                    ),
+                    start_time=start,
+                    sql_query=sql_query,
+                    row_limit=row_limit,
+                    skipped_execution=True,
+                )
+            else:
+                effective_statement_timeout_ms = _deadline_statement_timeout_ms(
+                    statement_timeout_ms,
+                    deadline,
+                )
+                timeout_failure, timeout_mode = _apply_statement_timeout(
+                    plugin,
+                    conn,
+                    effective_statement_timeout_ms,
+                    start,
+                    sql_query,
+                    row_limit,
+                    capabilities=capabilities,
+                )
+                if timeout_failure is not None:
+                    execution_result = timeout_failure
+                else:
+                    strategy_started = True
+                    try:
+                        raw_result = strategy(
+                            sql_query=sql_query,
+                            plugin=plugin,
+                            conn=conn,
+                            start=start,
+                            row_limit=row_limit,
+                        )
+                    except WorkflowDeadlineExceeded:
+                        raise
+                    except Exception as exc:
+                        execution_result = _attempted_execution_failure(
+                            start_time=start,
+                            sql_query=sql_query,
+                            row_limit=row_limit,
+                            error=mask_dsn(bound_text_to_sql_error(exc)),
+                        )
+                    else:
+                        try:
+                            normalized_result = _normalize_executor_result(
+                                raw_result,
+                                start_time=start,
+                                sql_query=sql_query,
+                                row_limit=row_limit,
+                            )
+                        except Exception as exc:
+                            detail = mask_dsn(bound_text_to_sql_error(exc))
+                            execution_result = _attempted_execution_failure(
+                                start_time=start,
+                                sql_query=sql_query,
+                                row_limit=row_limit,
+                                error=(
+                                    "Executor result normalization failed: "
+                                    f"{detail}"
+                                ),
+                            )
+                        else:
+                            contract_error = text_to_sql_executor_contract_error(
+                                normalized_result,
+                                expected_dry_run_only=False,
+                                expected_sql_query=sql_query,
+                                expected_row_limit=row_limit,
+                            )
+                            if contract_error is None:
+                                execution_result = normalized_result
+                            else:
+                                execution_result = _attempted_execution_failure(
+                                    start_time=start,
+                                    sql_query=sql_query,
+                                    row_limit=row_limit,
+                                    error=(
+                                        "Executor result contract invalid: "
+                                        f"{contract_error}"
+                                    ),
+                                )
     finally:
-        # EPIC 7.7: close зовётся только если conn реально открылся.
+        # Every admitted connection is closed, including probe rejection.
         if conn is not None and plugin is not None:
             try:
                 plugin.close(conn)
             except Exception as close_err:
+                close_error = mask_dsn(bound_text_to_sql_error(close_err))
                 logger.warning(
                     "Не удалось закрыть соединение plugin.close: %s",
-                    mask_dsn(str(close_err)),
+                    close_error,
                 )
+                if strategy_started:
+                    execution_result = _attempted_execution_failure(
+                        start_time=start,
+                        sql_query=sql_query,
+                        row_limit=row_limit,
+                        error=f"Database connection close failed: {close_error}",
+                    )
+    execution_result["timeout_enforcement_mode"] = timeout_mode.value
+    execution_result["cancellation_enforcement_mode"] = cancellation_mode.value
+    return execution_result
+
+
+def secure_db_executor(
+    sql_query: str,
+    row_limit: Optional[int] = None,
+    dsn: Optional[str] = None,
+    *,
+    dry_run_only: Optional[bool] = None,
+    safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
+    sql_validator,
+) -> Dict[str, object]:
+    from custom_tools.text_to_sql import core as _facade
+
+    policy = _facade._request_safety_policy(
+        safety_policy,
+        sql_validator=sql_validator,
+        fallback_to_startup_policy=True,
+    )
+
+    result = QueryExecutor().execute(
+        QueryExecutionRequest(
+            sql_query=sql_query,
+            purpose=QueryPurpose.FINAL,
+            row_limit=row_limit,
+            dsn=dsn,
+            dry_run_only=dry_run_only,
+            safety_policy=safety_policy,
+        )
+    ).to_mapping()
+    result["profile_name"] = policy.profile_name
+    result["policy_version"] = policy.policy_version
+    return result
