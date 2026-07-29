@@ -529,6 +529,69 @@ def test_fk_only_join_closure_rejects_ambiguous_paths():
     assert result["ambiguous_join_paths"] == ["events"]
 
 
+def test_fk_only_join_closure_deduplicates_identical_fk_relationships():
+    """Duplicate constraints on the same columns describe one SQL join path."""
+    db_schema = {
+        "yearmonth": {
+            "columns": {
+                "CustomerID": {"type": "INTEGER"},
+                "Consumption": {"type": "REAL"},
+            },
+            "foreign_keys": {
+                "complete": True,
+                "constraints": [
+                    {
+                        "constraint_id": "yearmonth:sqlite-fk-0",
+                        "to_table": "customers",
+                        "column_pairs": [
+                            {
+                                "from_column": "CustomerID",
+                                "to_column": "CustomerID",
+                            }
+                        ],
+                    },
+                    {
+                        "constraint_id": "yearmonth:sqlite-fk-1",
+                        "to_table": "customers",
+                        "column_pairs": [
+                            {
+                                "from_column": "CustomerID",
+                                "to_column": "CustomerID",
+                            }
+                        ],
+                    },
+                ],
+            },
+        },
+        "customers": {
+            "columns": {
+                "CustomerID": {"type": "INTEGER"},
+                "Segment": {"type": "TEXT"},
+            },
+            "foreign_keys": {"complete": True, "constraints": []},
+        },
+    }
+
+    result = JoinValidator().build_joins(
+        [
+            {
+                "name": "consumption",
+                "table": "yearmonth",
+                "column": "Consumption",
+            }
+        ],
+        [{"name": "segment", "table": "customers", "column": "Segment"}],
+        {},
+        db_schema,
+        main_table="yearmonth",
+        include_conventions=False,
+    )
+
+    assert result["success"] is True
+    assert result["unconnected_tables"] == []
+    assert len(result["joins"]) == 1
+
+
 def test_convention_join_blocked_for_unmarked_fk_column_in_fk_aware_schema():
     """W4-T4: в схеме с FK-аннотациями convention-fallback по суффиксу _id
     НЕ применяется для колонок без is_fk-маркера (silent fallback запрещён)."""

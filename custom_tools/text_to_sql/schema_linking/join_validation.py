@@ -469,6 +469,15 @@ class JoinValidator:
                     merged_joins.append(candidate)
 
         if not include_conventions:
+            unique_relationships: List[Dict[str, Any]] = []
+            seen_relationships: set[tuple[object, ...]] = set()
+            for join in merged_joins:
+                relationship = self._join_relationship_endpoints(join)
+                if relationship in seen_relationships:
+                    continue
+                seen_relationships.add(relationship)
+                unique_relationships.append(join)
+            merged_joins = unique_relationships
             ambiguous_targets = self._ambiguous_fk_targets(
                 main_table, requested_tables, merged_joins
             )
@@ -510,9 +519,12 @@ class JoinValidator:
         """Return required targets with more than one simple FK path."""
         adjacency: Dict[str, List[tuple[int, str]]] = {}
         unique_joins: List[Dict[str, Any]] = []
+        relationship_keys: set[tuple[object, ...]] = set()
         for join in joins:
-            if JoinValidator._is_duplicate_join(join, unique_joins):
+            relationship_key = JoinValidator._join_relationship_endpoints(join)
+            if relationship_key in relationship_keys:
                 continue
+            relationship_keys.add(relationship_key)
             unique_joins.append(join)
             left = join.get("from_table")
             right = join.get("to_table")
@@ -1147,12 +1159,10 @@ class JoinValidator:
     # Misc
     # ------------------------------------------------------------------
     @staticmethod
-    def _join_endpoints(join: Dict[str, Any]) -> tuple[object, ...]:
-        """Симметричный ключ для дедупа JOIN.
-
-        4.20: пара (A.x, B.y) и пара (B.y, A.x) описывают один и тот же
-        JOIN и должны считаться дубликатами.
-        """
+    def _join_relationship_endpoints(
+        join: Dict[str, Any],
+    ) -> tuple[object, ...]:
+        """Symmetric SQL relationship key, independent of constraint id."""
         raw_pairs = join.get("column_pairs")
         if isinstance(raw_pairs, list):
             pairs = tuple(
@@ -1174,6 +1184,16 @@ class JoinValidator:
                     )
                 ),
             )
+        return pairs
+
+    @staticmethod
+    def _join_endpoints(join: Dict[str, Any]) -> tuple[object, ...]:
+        """Симметричный ключ для дедупа JOIN.
+
+        4.20: пара (A.x, B.y) и пара (B.y, A.x) описывают один и тот же
+        JOIN и должны считаться дубликатами.
+        """
+        pairs = JoinValidator._join_relationship_endpoints(join)
         return (str(join.get("constraint_id") or ""), pairs)
 
     @staticmethod
