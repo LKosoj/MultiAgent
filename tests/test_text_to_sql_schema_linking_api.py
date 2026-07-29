@@ -376,6 +376,29 @@ def test_unresolved_entities_matches_linked_filter_identity_and_metadata():
     assert unresolved == [{"entity_type": "filter", "name": "unknown"}]
 
 
+def test_unresolved_filter_accepts_exact_physical_dimension_binding():
+    unresolved = _schema_linking_api._unresolved_entities(
+        {
+            "metrics": [],
+            "dimensions": [],
+            "filters": {"id": [6, 23]},
+        },
+        {
+            "metrics": [],
+            "dimensions": [
+                {
+                    "name": "id",
+                    "table": "main.Player_Attributes",
+                    "column": "id",
+                }
+            ],
+            "filters": {},
+        },
+    )
+
+    assert unresolved == []
+
+
 def test_unresolved_entities_does_not_guess_missing_filter_binding():
     unresolved = _schema_linking_api._unresolved_entities(
         {"metrics": [], "dimensions": [], "filters": {"RNP": "positive"}},

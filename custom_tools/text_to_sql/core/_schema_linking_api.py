@@ -89,15 +89,21 @@ def _unresolved_entities(
 ) -> List[Dict[str, str]]:
     linked = linked_entities if isinstance(linked_entities, dict) else {}
     resolved: set[tuple[str, str]] = set()
+    physical_bindings: set[str] = set()
     aggregate_bindings: set[tuple[str, str]] = set()
     for key, entity_type in _ENTITY_LIST_TYPES:
         items = linked.get(key)
         if not isinstance(items, list):
             continue
         for item in items:
-            resolved.update(
-                (entity_type, name) for name in _entity_identity_names(item)
-            )
+            identity_names = _entity_identity_names(item)
+            resolved.update((entity_type, name) for name in identity_names)
+            if (
+                isinstance(item, dict)
+                and isinstance(item.get("table"), str)
+                and isinstance(item.get("column"), str)
+            ):
+                physical_bindings.update(identity_names)
             table_name = _table_identity(item)
             if table_name:
                 resolved.add((entity_type, table_name))
@@ -111,10 +117,15 @@ def _unresolved_entities(
     if isinstance(linked_filters, dict):
         for name, value in linked_filters.items():
             resolved.add(("filter", str(name).casefold()))
-            resolved.update(
-                ("filter", identity)
-                for identity in _entity_identity_names(value)
-            )
+            identity_names = _entity_identity_names(value)
+            resolved.update(("filter", identity) for identity in identity_names)
+            if (
+                isinstance(value, dict)
+                and isinstance(value.get("table"), str)
+                and isinstance(value.get("column"), str)
+            ):
+                physical_bindings.add(str(name).casefold())
+                physical_bindings.update(identity_names)
             table_name = _table_identity(value)
             if table_name:
                 resolved.add(("filter", table_name))
@@ -159,7 +170,9 @@ def _unresolved_entities(
         for value, original_value in filters.items():
             name = str(value)
             identity = ("filter", name.casefold())
-            is_resolved = identity in resolved
+            is_resolved = (
+                identity in resolved or name.casefold() in physical_bindings
+            )
             if name.casefold() in _FILTER_QUERY_CONTROLS:
                 is_resolved = True
             metadata_values = linked_filter_metadata.get(name.casefold(), [])
