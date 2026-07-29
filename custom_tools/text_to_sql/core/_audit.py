@@ -357,6 +357,14 @@ def save_successful_sql(
     Returns:
         Словарь с результатом сохранения
     """
+    from ..successful_sql_memory import successful_sql_memory_enabled
+
+    if not successful_sql_memory_enabled():
+        return {
+            "status": "error",
+            "error": "successful SQL persistence disabled by runtime policy",
+        }
+
     logger.info("Saving successful SQL query to sqlrag file")
 
     # Явный dsn важен для multi-DB запусков: sqlrag examples должны

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -28,10 +29,16 @@ _MAX_CONTEXT_SQL_CHARS = 1200
 _MAX_DIALECT_CHARS = 32
 _NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIALECT_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+_SUCCESSFUL_SQL_MEMORY_ENV = "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED"
 
 
 class _SemanticSearchIncomplete(RuntimeError):
     pass
+
+
+def successful_sql_memory_enabled() -> bool:
+    """Return whether cross-run successful-SQL retrieval/persistence is enabled."""
+    return os.getenv(_SUCCESSFUL_SQL_MEMORY_ENV, "1") != "0"
 
 
 @dataclass(frozen=True)
@@ -514,6 +521,8 @@ def successful_sql_retrieval(
     user_query: str,
 ) -> dict[str, Any]:
     """Retrieve bounded, exact-namespace successful SQL examples."""
+    if not successful_sql_memory_enabled():
+        return SuccessfulSqlRetrieval("EMPTY", (), "[]").to_mapping()
     return retrieve_successful_sql_examples(
         namespace_version_key=namespace_version_key,
         user_query=user_query,
