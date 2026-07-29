@@ -40,6 +40,7 @@ TOKEN_ENV = "TEXT2SQL_BENCHMARK_TOKEN"
 @dataclass(frozen=True)
 class BenchmarkCase:
     ordinal: int
+    case_key: str
     case_id: str
     database_id: str
     database_path: Path
@@ -98,6 +99,7 @@ def load_bird_cases(dataset_root: Path) -> list[BenchmarkCase]:
         cases.append(
             BenchmarkCase(
                 ordinal=ordinal,
+                case_key=f"bird:{ordinal}",
                 case_id=str(row["question_id"]),
                 database_id=database_id,
                 database_path=database_path,
@@ -144,6 +146,7 @@ def load_spider_cases(
         cases.append(
             BenchmarkCase(
                 ordinal=len(cases),
+                case_key=case_id,
                 case_id=case_id,
                 database_id=database_id,
                 database_path=database_path,
@@ -192,17 +195,30 @@ def _git_revision() -> str:
     ).stdout.strip()
 
 
+def _observation_key(row: Mapping[str, Any]) -> str:
+    case_key = row.get("case_key")
+    if isinstance(case_key, str) and case_key:
+        return case_key
+    if row.get("benchmark") == "bird" and isinstance(row.get("ordinal"), int):
+        return f"bird:{row['ordinal']}"
+    case_id = row.get("case_id")
+    if isinstance(case_id, str) and case_id:
+        return case_id
+    raise ValueError("observation has no stable case identity")
+
+
 def _load_completed(path: Path) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     completed: dict[str, dict[str, Any]] = {}
     for row in _read_jsonl(path):
-        case_id = row.get("case_id")
-        if not isinstance(case_id, str) or not case_id:
-            raise ValueError(f"{path}: observation without case_id")
-        if case_id in completed:
-            raise ValueError(f"{path}: duplicate observation for {case_id}")
-        completed[case_id] = row
+        try:
+            case_key = _observation_key(row)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+        if case_key in completed:
+            raise ValueError(f"{path}: duplicate observation for {case_key}")
+        completed[case_key] = row
     return completed
 
 
@@ -309,7 +325,7 @@ def _run_case(
                 connection_ref=connection_ref,
                 idempotency_key=_idempotency_key(
                     benchmark_name,
-                    case.case_id,
+                    case.case_key,
                     prompt,
                     connection_ref,
                 ),
@@ -353,6 +369,7 @@ def _run_case(
         "schema_version": 1,
         "benchmark": benchmark_name,
         "ordinal": case.ordinal,
+        "case_key": case.case_key,
         "case_id": case.case_id,
         "database_id": case.database_id,
         "difficulty": case.difficulty,
@@ -388,7 +405,7 @@ def run_benchmark(args: argparse.Namespace) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     observations_path = output_dir / "observations.jsonl"
     completed = _load_completed(observations_path)
-    pending = [case for case in cases if case.case_id not in completed]
+    pending = [case for case in cases if case.case_key not in completed]
 
     client = _client(args.base_url, token)
     principal = dict(client.get_me())
@@ -528,15 +545,19 @@ def export_predictions(
     observations = _load_completed(observations_path)
     sql_by_id: dict[str, str] = {}
     for case in cases:
-        observation = observations.get(case.case_id, {})
+        observation = observations.get(case.case_key, {})
         outcome = observation.get("outcome")
         sql = outcome.get("sql") if isinstance(outcome, dict) else None
-        sql_by_id[case.case_id] = sql.strip() if isinstance(sql, str) and sql.strip() else EMPTY_PREDICTION
+        sql_by_id[case.case_key] = (
+            sql.strip()
+            if isinstance(sql, str) and sql.strip()
+            else EMPTY_PREDICTION
+        )
 
     if dataset == "bird":
         predictions = {
             str(case.ordinal): (
-                f"{sql_by_id[case.case_id]}\t----- bird -----\t{case.database_id}"
+                f"{sql_by_id[case.case_key]}\t----- bird -----\t{case.database_id}"
             )
             for case in cases
         }
@@ -550,7 +571,7 @@ def export_predictions(
     predictions_dir.mkdir(parents=True, exist_ok=True)
     for case in cases:
         (predictions_dir / f"{case.case_id}.sql").write_text(
-            sql_by_id[case.case_id] + "\n",
+            sql_by_id[case.case_key] + "\n",
             encoding="utf-8",
         )
 

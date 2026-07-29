@@ -9,6 +9,7 @@ import pytest
 from scripts.text2sql_public_benchmark import (
     EMPTY_PREDICTION,
     _idempotency_key,
+    _load_completed,
     benchmark_prompt,
     export_predictions,
     load_bird_cases,
@@ -44,6 +45,7 @@ def test_load_bird_cases_does_not_put_gold_sql_in_prompt(tmp_path: Path) -> None
     cases = load_bird_cases(root)
 
     assert len(cases) == 1
+    assert cases[0].case_key == "bird:0"
     assert cases[0].case_id == "7"
     assert "SELECT COUNT(*)" not in cases[0].prompt()
     assert cases[0].prompt() == benchmark_prompt(
@@ -89,6 +91,7 @@ def test_load_spider_cases_filters_non_local_and_loads_documents(
     cases = load_spider_cases(root, sqlite_root, database_map)
 
     assert [case.case_id for case in cases] == ["local001"]
+    assert [case.case_key for case in cases] == ["local001"]
     assert "Use the documented rule." in cases[0].prompt()
 
 
@@ -122,6 +125,8 @@ def test_export_predictions_is_stable_and_uses_failing_fallback(
     observations.write_text(
         json.dumps(
             {
+                "benchmark": "bird",
+                "ordinal": 1,
                 "case_id": "1",
                 "outcome": {"sql": "SELECT 2"},
             }
@@ -139,6 +144,38 @@ def test_export_predictions_is_stable_and_uses_failing_fallback(
     with sqlite3.connect(":memory:") as connection:
         with pytest.raises(sqlite3.OperationalError):
             connection.execute(EMPTY_PREDICTION)
+
+
+def test_load_completed_uses_bird_ordinal_when_question_ids_repeat(
+    tmp_path: Path,
+) -> None:
+    observations = tmp_path / "observations.jsonl"
+    observations.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "benchmark": "bird",
+                        "ordinal": 0,
+                        "case_id": "duplicate",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "benchmark": "bird",
+                        "ordinal": 1,
+                        "case_id": "duplicate",
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    completed = _load_completed(observations)
+
+    assert list(completed) == ["bird:0", "bird:1"]
 
 
 def test_idempotency_key_changes_when_connection_registration_changes() -> None:

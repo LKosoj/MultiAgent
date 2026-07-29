@@ -36,15 +36,18 @@ def _load_scores(path: Path | None) -> dict[str, dict[str, Any]]:
     for row in payload:
         if not isinstance(row, dict):
             raise ValueError(f"{path}: score item is not an object")
-        raw_case_id = row.get("case_id", row.get("instance_id"))
-        if raw_case_id is None and row.get("ordinal") is not None:
-            raw_case_id = row["ordinal"]
-        case_id = str(raw_case_id)
-        if not case_id or case_id == "None":
+        raw_case_key = row.get(
+            "case_key",
+            row.get("case_id", row.get("instance_id")),
+        )
+        if raw_case_key is None and row.get("ordinal") is not None:
+            raw_case_key = row["ordinal"]
+        case_key = str(raw_case_key)
+        if not case_key or case_key == "None":
             raise ValueError(f"{path}: score item has no case identity")
-        if case_id in scores:
-            raise ValueError(f"{path}: duplicate score for {case_id}")
-        scores[case_id] = row
+        if case_key in scores:
+            raise ValueError(f"{path}: duplicate score for {case_key}")
+        scores[case_key] = row
     return scores
 
 
@@ -236,7 +239,17 @@ def summarize(
         key=lambda row: int(row.get("ordinal", 0)),
     ):
         case_id = str(observation["case_id"])
-        score = scores.get(case_id)
+        raw_case_key = observation.get("case_key")
+        if isinstance(raw_case_key, str) and raw_case_key:
+            case_key = raw_case_key
+        elif (
+            observation.get("benchmark") == "bird"
+            and isinstance(observation.get("ordinal"), int)
+        ):
+            case_key = f"bird:{observation['ordinal']}"
+        else:
+            case_key = case_id
+        score = scores.get(case_key)
         checkpoint = checkpoints.get(str(observation.get("run_id") or ""), {})
         stage_data = _stage_diagnostics(checkpoint)
         outcome = observation.get("outcome")
@@ -245,6 +258,7 @@ def summarize(
         diagnostics.append(
             {
                 "ordinal": observation.get("ordinal"),
+                "case_key": case_key,
                 "case_id": case_id,
                 "database_id": observation.get("database_id"),
                 "difficulty": observation.get("difficulty"),

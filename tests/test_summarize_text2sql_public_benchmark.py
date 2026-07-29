@@ -87,3 +87,33 @@ def test_summarize_counts_official_scores_and_stage_reasons() -> None:
     assert diagnostics[0]["failure_class"] == "correct"
     assert summary["execution_accuracy"] == 1.0
     assert summary["schema_decision_reasons"] == {"ALL_ENTITIES_LINKED": 1}
+
+
+def test_summarize_uses_case_key_when_source_ids_repeat() -> None:
+    first = _observation(status="succeeded")
+    first.update(
+        case_key="bird:0",
+        case_id="duplicate",
+        ordinal=0,
+        run_id="run-1",
+    )
+    second = _observation(status="succeeded")
+    second.update(
+        case_key="bird:1",
+        case_id="duplicate",
+        ordinal=1,
+        run_id="run-2",
+    )
+
+    diagnostics, summary = summarize(
+        [first, second],
+        {
+            "bird:0": {"score": 1, "error_info": None},
+            "bird:1": {"score": 0, "error_info": "Result Error"},
+        },
+        {},
+    )
+
+    assert [row["case_key"] for row in diagnostics] == ["bird:0", "bird:1"]
+    assert summary["correct"] == 1
+    assert summary["execution_accuracy"] == 0.5
