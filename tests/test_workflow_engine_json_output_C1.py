@@ -213,6 +213,53 @@ def test_normalize_step_output_parses_single_line_fenced_json(engine, workflow_p
     assert normalized == {"verification_status": "Rejected", "n": 3}
 
 
+def test_normalize_step_output_recovers_json_from_unclosed_fence(engine, workflow_pkg):
+    step = _make_step(workflow_pkg, output_schema="json_object")
+
+    normalized, parsed = engine._normalize_step_output(
+        step, '```json\n{"verification_status": "Approved"}'
+    )
+
+    assert parsed is True
+    assert normalized == {"verification_status": "Approved"}
+
+
+def test_normalize_step_output_recovers_json_with_trailing_prose(engine, workflow_pkg):
+    step = _make_step(workflow_pkg, output_schema="json_object")
+
+    normalized, parsed = engine._normalize_step_output(
+        step,
+        'Result: {"verification_status": "Rejected", '
+        '"reason": "missing {filter}"}\nChecked against the request.',
+    )
+
+    assert parsed is True
+    assert normalized == {
+        "verification_status": "Rejected",
+        "reason": "missing {filter}",
+    }
+
+
+def test_normalize_step_output_rejects_multiple_json_objects(engine, workflow_pkg):
+    step = _make_step(workflow_pkg, output_schema="json_object")
+
+    with pytest.raises(workflow_pkg.models.WorkflowStepError):
+        engine._normalize_step_output(
+            step,
+            '{"verification_status": "Approved"} '
+            '{"verification_status": "Rejected"}',
+        )
+
+
+def test_normalize_step_output_rejects_unbalanced_json_object(engine, workflow_pkg):
+    step = _make_step(workflow_pkg, output_schema="json_object")
+
+    with pytest.raises(workflow_pkg.models.WorkflowStepError):
+        engine._normalize_step_output(
+            step, '```json\n{"verification_status": "Approved"'
+        )
+
+
 def test_normalize_step_output_raises_on_invalid_json_when_schema_declared(engine, workflow_pkg):
     step = _make_step(workflow_pkg, output_schema="json_object")
     with pytest.raises(workflow_pkg.models.WorkflowStepError) as ei:

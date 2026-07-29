@@ -83,6 +83,13 @@ def test_sql_verifier_task_template_requires_json():
     assert "Rejected" in task_template
 
 
+def test_sql_verifier_json_only_prompt_does_not_demonstrate_fences():
+    profile = _load_profile("sql_verifier_agent")
+
+    assert "```" not in profile.get("custom_task_template", "")
+    assert "```" not in profile.get("prompt_templates", "")
+
+
 # ---------------- 6.6 schema_rag_agent (prompt brevity) ----------------
 
 def test_schema_rag_prompt_under_limit():

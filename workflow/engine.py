@@ -66,6 +66,28 @@ def _json_candidate_from_fence(raw_output: str) -> str:
     return raw_output
 
 
+def _json_candidate_from_text(raw_output: str) -> str:
+    """Extract one unambiguous JSON object from an agent text response."""
+    fenced = _json_candidate_from_fence(raw_output)
+    if fenced != raw_output:
+        return fenced
+
+    start = raw_output.find("{")
+    if start < 0:
+        return raw_output
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(raw_output, start)
+    except json.JSONDecodeError:
+        return raw_output
+    if not isinstance(parsed, dict):
+        return raw_output
+
+    outside = raw_output[:start] + raw_output[end:]
+    if any(delimiter in outside for delimiter in "{}["):
+        return raw_output
+    return raw_output[start:end]
+
+
 def _strip_leading_sql_comments(sql_text: str) -> str:
     remaining = sql_text.lstrip()
     while True:
@@ -713,10 +735,10 @@ class WorkflowEngine(DynamicAgentSystem):
                 f"Step '{step.id}' declared unsupported output_schema={schema!r}"
             )
 
-        # W1-review: LLM-агенты иногда оборачивают JSON в ```json ... ```
-        # code-fence несмотря на инструкцию. Снимаем обёртку до json.loads,
-        # чтобы не зависеть только от prompt-discipline.
-        candidate = _json_candidate_from_fence(raw_output)
+        # LLM agents sometimes add a fence, short prefix, or trailing prose.
+        # Recover exactly one complete object; ambiguous/malformed output
+        # remains fail-closed and is rejected below.
+        candidate = _json_candidate_from_text(raw_output)
 
         try:
             parsed = json.loads(candidate)
