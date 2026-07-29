@@ -130,7 +130,7 @@ class SchemaLinkingCore:
 
     def build_joins(
         self, linked_metrics, linked_dimensions, linked_filters, db_schema,
-        main_table=None, *, include_conventions=True,
+        main_table=None, *, include_conventions=True, seed_joins=None,
     ):
         """W4-T1: ``main_table`` опциональный параметр (передаётся caller'ом).
 
@@ -141,6 +141,7 @@ class SchemaLinkingCore:
             linked_metrics, linked_dimensions, linked_filters, db_schema,
             main_table=main_table,
             include_conventions=include_conventions,
+            seed_joins=seed_joins,
         )
 
     # ------------------------------------------------------------------
@@ -328,6 +329,7 @@ class SchemaLinkingCore:
                     db_schema,
                     main_table=main_table,
                     include_conventions=allow_fallbacks,
+                    seed_joins=validated_joins,
                 )
                 for fallback_join in fallback_joins["joins"]:
                     if not JoinValidator._is_duplicate_join(

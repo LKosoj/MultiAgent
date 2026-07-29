@@ -592,6 +592,101 @@ def test_fk_only_join_closure_deduplicates_identical_fk_relationships():
     assert len(result["joins"]) == 1
 
 
+def test_fk_only_join_closure_combines_validated_seed_joins():
+    """Authoritative FK closure must complete an otherwise valid LLM graph."""
+    db_schema = {
+        "yearmonth": {
+            "columns": {
+                "CustomerID": {"type": "INTEGER"},
+                "Consumption": {"type": "REAL"},
+            },
+            "foreign_keys": {
+                "complete": True,
+                "constraints": [
+                    {
+                        "constraint_id": "yearmonth:sqlite-fk-0",
+                        "to_table": "customers",
+                        "column_pairs": [
+                            {
+                                "from_column": "CustomerID",
+                                "to_column": "CustomerID",
+                            }
+                        ],
+                    }
+                ],
+            },
+        },
+        "customers": {
+            "columns": {
+                "CustomerID": {"type": "INTEGER"},
+                "Segment": {"type": "TEXT"},
+            },
+            "foreign_keys": {"complete": True, "constraints": []},
+        },
+        "transactions_1k": {
+            "columns": {
+                "CustomerID": {"type": "INTEGER"},
+                "GasStationID": {"type": "INTEGER"},
+            },
+            "foreign_keys": {"complete": True, "constraints": []},
+        },
+        "gasstations": {
+            "columns": {
+                "GasStationID": {"type": "INTEGER"},
+                "Country": {"type": "TEXT"},
+            },
+            "foreign_keys": {"complete": True, "constraints": []},
+        },
+    }
+    seed_joins = [
+        {
+            "from_table": "customers",
+            "from_column": "CustomerID",
+            "to_table": "transactions_1k",
+            "to_column": "CustomerID",
+            "join_type": "LEFT",
+        },
+        {
+            "from_table": "transactions_1k",
+            "from_column": "GasStationID",
+            "to_table": "gasstations",
+            "to_column": "GasStationID",
+            "join_type": "LEFT",
+        },
+    ]
+
+    result = JoinValidator().build_joins(
+        [
+            {
+                "name": "consumption",
+                "table": "yearmonth",
+                "column": "Consumption",
+            }
+        ],
+        [
+            {
+                "name": "segment",
+                "table": "customers",
+                "column": "Segment",
+            },
+            {
+                "name": "region",
+                "table": "gasstations",
+                "column": "Country",
+            },
+        ],
+        {},
+        db_schema,
+        main_table="yearmonth",
+        include_conventions=False,
+        seed_joins=seed_joins,
+    )
+
+    assert result["success"] is True
+    assert result["unconnected_tables"] == []
+    assert len(result["joins"]) == 3
+
+
 def test_convention_join_blocked_for_unmarked_fk_column_in_fk_aware_schema():
     """W4-T4: в схеме с FK-аннотациями convention-fallback по суффиксу _id
     НЕ применяется для колонок без is_fk-маркера (silent fallback запрещён)."""

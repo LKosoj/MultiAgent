@@ -371,6 +371,7 @@ class JoinValidator:
         main_table: Optional[str] = None,
         *,
         include_conventions: bool = True,
+        seed_joins: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Строит JOIN связи между таблицами.
 
@@ -384,10 +385,15 @@ class JoinValidator:
         if self.join_builder is None:
             self.join_builder = JoinBuilder(db_schema)
 
-        required_tables: set = compute_required_tables(
+        requested_tables: set = compute_required_tables(
             linked_metrics, linked_dimensions, linked_filters
         )
-        requested_tables = set(required_tables)
+        required_tables: set = compute_required_tables(
+            linked_metrics,
+            linked_dimensions,
+            linked_filters,
+            validated_joins=seed_joins,
+        )
 
         # Backward-compat: если main_table не передан, берём первую metric
         # (исторический поведение JoinValidator.build_joins). Caller'у
@@ -431,7 +437,7 @@ class JoinValidator:
         if bridge_joins:
             required_tables = compute_required_tables(
                 linked_metrics, linked_dimensions, linked_filters,
-                validated_joins=bridge_joins,
+                validated_joins=list(seed_joins or []) + bridge_joins,
             )
         # W4-T4 / A11: convention-joins добавляются ТОЛЬКО для пар таблиц,
         # которые ещё не связаны FK-ребром. Иначе symbolic FK-валидация
@@ -443,6 +449,9 @@ class JoinValidator:
             if j.get("from_table") and j.get("to_table")
         }
         merged_joins: List[Dict[str, Any]] = list(joins_from_schema)
+        for seed_join in seed_joins or []:
+            if not self._is_duplicate_join(seed_join, merged_joins):
+                merged_joins.append(dict(seed_join))
         if include_conventions:
             convention_joins = self.join_builder.infer_joins_by_convention(
                 required_tables
