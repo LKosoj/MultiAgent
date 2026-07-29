@@ -33,7 +33,7 @@ from streamlit_app.text_to_sql_client import (  # noqa: E402
 )
 
 
-EMPTY_PREDICTION = "SELECT 1 WHERE 0"
+EMPTY_PREDICTION = "/* TEXT2SQL_NO_PREDICTION */ INVALID SQL"
 TOKEN_ENV = "TEXT2SQL_BENCHMARK_TOKEN"
 
 

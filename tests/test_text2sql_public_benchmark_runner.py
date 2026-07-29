@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
+
+import pytest
 
 from scripts.text2sql_public_benchmark import (
     EMPTY_PREDICTION,
@@ -89,7 +92,7 @@ def test_load_spider_cases_filters_non_local_and_loads_documents(
     assert "Use the documented rule." in cases[0].prompt()
 
 
-def test_export_predictions_is_stable_and_uses_executable_fallback(
+def test_export_predictions_is_stable_and_uses_failing_fallback(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "bird"
@@ -133,6 +136,9 @@ def test_export_predictions_is_stable_and_uses_executable_fallback(
     assert list(predictions) == ["0", "1"]
     assert predictions["0"].startswith(EMPTY_PREDICTION)
     assert predictions["1"].startswith("SELECT 2")
+    with sqlite3.connect(":memory:") as connection:
+        with pytest.raises(sqlite3.OperationalError):
+            connection.execute(EMPTY_PREDICTION)
 
 
 def test_idempotency_key_changes_when_connection_registration_changes() -> None:
