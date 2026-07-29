@@ -7435,6 +7435,30 @@ def test_sql_verification_step_has_condition_on_empty_sql():
     )
 
 
+def test_sql_verification_step_receives_semantic_context():
+    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
+    workflow = models.WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
+    verification_step = next(
+        step for step in workflow.steps if step.id == "sql_verification"
+    )
+    task = verification_step.task
+
+    assert "{query}" in task
+    assert "{intent_extraction_step}" in task
+    assert "{schema_linking_step}" in task
+    for required_check in (
+        "mandatory filters",
+        "aggregation",
+        "grouping",
+        "cardinality",
+        "ordering",
+        "limit",
+    ):
+        assert required_check in task.lower()
+
+
 def test_sql_generation_step_requires_successful_schema_linking():
     """P-2: join_success=False не должен пускать пайплайн в успешную генерацию SQL."""
     models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()

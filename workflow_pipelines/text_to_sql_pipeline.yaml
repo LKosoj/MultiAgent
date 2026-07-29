@@ -274,12 +274,31 @@ steps:
             - Rejected
     condition: '{sql_generation.sql} != ""'
     task: |
-      Проверь безопасность и корректность SQL-запроса, сгенерированного на предыдущем шаге.
+      Проверь безопасность, исполнимость и семантическое соответствие SQL
+      исходному пользовательскому запросу.
+
+      Исходный запрос:
+      {query}
+
+      Нормализованный intent:
+      {intent_extraction_step}
+
+      Связанные сущности, schema subset и validated joins:
+      {schema_linking_step}
 
       SQL-запрос от sql_generation (JSON с полями sql / description):
-      ```json
       {sql_generation}
-      ```
+
+      Выполни semantic check отдельно от safety check:
+      - все mandatory filters, literals и predicates из исходного запроса
+        должны иметь эквивалентное ограничение в SQL;
+      - aggregation, grouping и result cardinality должны соответствовать
+        тому, просит ли пользователь одно значение или список;
+      - ordering и limit должны соответствовать запросу;
+      - допустимы семантически эквивалентные диапазоны и формы SQL;
+      - description генератора не является доказательством корректности.
+      Отклоняй по семантике только при конкретном воспроизводимом
+      противоречии и указывай его в recommendations.
 
       Параметры:
       - safety_level: {safety_level}
