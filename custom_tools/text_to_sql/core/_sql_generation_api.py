@@ -164,7 +164,7 @@ def _llm_safety_timeout_cache_put(key: str) -> None:
 
 
 def _get_llm_safety_timeout_s() -> float:
-    raw = os.getenv("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_S", "30")
+    raw = os.getenv("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_S", "120")
     try:
         value = float(raw)
     except (TypeError, ValueError) as exc:

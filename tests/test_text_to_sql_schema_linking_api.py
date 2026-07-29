@@ -267,6 +267,44 @@ def test_complete_single_table_linking_proceeds(monkeypatch):
     assert out["terminal_reason_code"] == ""
 
 
+def test_complete_linking_accepts_entity_key_from_llm_strategy(monkeypatch):
+    def fake_link(self, entities, schema_info, **kwargs):
+        return {
+            "linked_entities": {
+                "metrics": [
+                    {
+                        "entity": "revenue",
+                        "table": "orders",
+                        "column": "amount",
+                    }
+                ],
+                "dimensions": [
+                    {
+                        "entity": "region",
+                        "table": "orders",
+                        "column": "region_id",
+                    }
+                ],
+                "filters": {},
+            },
+            "joins": [],
+            "join_success": True,
+            "schema_info": _schema(),
+            "ambiguous_bindings": [],
+        }
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.schema_linker.SchemaLinker.link_entities_to_schema",
+        fake_link,
+    )
+
+    out = schema_linking(_entities(), schema_info=_schema())
+
+    assert out["unresolved_entities"] == []
+    assert out["decision"] == "PROCEED"
+    assert out["sql_generation_allowed"] is True
+
+
 def test_equal_best_diagnostics_require_clarification(monkeypatch):
     candidates = [
         {"table": "orders", "column": "region", "score": 10},

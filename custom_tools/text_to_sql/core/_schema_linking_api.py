@@ -18,7 +18,7 @@ def _canonical_entity_name(value: object) -> Optional[str]:
         name = value.strip()
         return name or None
     if isinstance(value, dict):
-        for key in ("name", "column"):
+        for key in ("entity", "name", "column"):
             candidate = value.get(key)
             if isinstance(candidate, str) and candidate.strip():
                 return candidate.strip()
