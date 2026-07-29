@@ -166,6 +166,44 @@ def test_checkpoint_round_trip_preserves_rehydrated_policy(tmp_path):
     assert restored_policy == policy
 
 
+def test_checkpoint_serializes_nested_datetime_in_step_metadata(tmp_path):
+    from workflow.models import (
+        StepResult,
+        StepStatus,
+        WorkflowCheckpoint,
+        WorkflowContext,
+        WorkflowStatus,
+    )
+    from workflow.state_manager import SQLiteWorkflowStore
+
+    observed_at = datetime.now()
+    store = SQLiteWorkflowStore(str(tmp_path / "workflow.db"))
+    checkpoint = WorkflowCheckpoint(
+        workflow_id="workflow-datetime-round-trip",
+        timestamp=observed_at,
+        status=WorkflowStatus.FAILED,
+        context=WorkflowContext(
+            workflow_id="workflow-datetime-round-trip",
+            session_id="session-1",
+        ),
+        step_results={
+            "nlu": StepResult(
+                step_id="nlu",
+                status=StepStatus.FAILED,
+                metadata={"observed_at": observed_at},
+            )
+        },
+    )
+
+    asyncio.run(store.save_checkpoint(checkpoint))
+    restored = asyncio.run(
+        store.get_latest_checkpoint("workflow-datetime-round-trip")
+    )
+
+    assert restored is not None
+    assert restored.step_results["nlu"].metadata["observed_at"] == observed_at.isoformat()
+
+
 def test_pipeline_carries_one_policy_object_through_mandatory_stages():
     pipeline = yaml.safe_load(
         (Path(__file__).parents[1] / "workflow_pipelines/text_to_sql_pipeline.yaml").read_text(

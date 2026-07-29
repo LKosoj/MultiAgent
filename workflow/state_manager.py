@@ -380,6 +380,8 @@ class SQLiteWorkflowStore:
                     secrets,
                 )
             }
+        if isinstance(value, datetime):
+            return value.isoformat()
         if isinstance(value, dict):
             protected = {}
             for key, item in value.items():

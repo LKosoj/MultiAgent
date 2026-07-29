@@ -64,7 +64,7 @@ global_retry_policy:
     - timeout
 
 global_resource_limits:
-  max_duration_seconds: 300
+  max_duration_seconds: 900
   max_api_calls_per_minute: 20
   max_concurrent_steps: 2
 
@@ -79,7 +79,7 @@ steps:
     tool_name: natural_language_processing
     tool_params:
       text: '{query}'
-    timeout: 30
+    timeout: 120
     retry_policy:
       max_retries: 2
     
@@ -89,7 +89,7 @@ steps:
     tool_name: intent_extraction
     tool_params:
       text: '{query}'
-    timeout: 30
+    timeout: 120
     retry_policy:
       max_retries: 2
   
@@ -135,7 +135,7 @@ steps:
         unresolved_entities: []
         ambiguous_bindings: []
         schema_info: {}
-    timeout: 60
+    timeout: 180
     retry_policy:
       max_retries: 3
       backoff_strategy: exponential
@@ -229,7 +229,7 @@ steps:
       Используй инструмент sql_generation_plugin(context=..., user_query=..., session_id="{session_id}") для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
     depends_on:
       - successful_sql_retrieval
-    timeout: 120
+    timeout: 240
     retry_policy:
       max_retries: 2
       backoff_strategy: exponential
@@ -292,7 +292,7 @@ steps:
       Если статус "Rejected", в recommendations укажи конкретные шаги по исправлению — они будут переданы sql_generator_agent при перезапуске.
     depends_on:
       - sql_generation
-    timeout: 90
+    timeout: 180
     retry_policy:
       max_retries: 1
       backoff_strategy: fixed
