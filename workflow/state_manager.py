@@ -71,6 +71,7 @@ _SECRET_KEY_PATTERN = r"[A-Za-z0-9_%+\-.\[\]]+"
 _WORKFLOW_SECRET_REF_KEY = "__workflow_secret_ref__"
 _WORKFLOW_SECRET_STORE_VERSION_KEY = "__workflow_secret_store_version__"
 _WORKFLOW_SECRET_STORE_VERSION = 1
+_TEXT_TO_SQL_SAFETY_POLICY_KEY = "__text_to_sql_safety_policy__"
 _WORKFLOW_SECRET_LOCK_TIMEOUT_SECONDS = 30.0
 _SENSITIVE_TEXT_ASSIGNMENT_RE = re.compile(
     rf"(?P<prefix>\b(?P<key>{_SECRET_KEY_PATTERN})\s*[:=]\s*)"
@@ -370,6 +371,15 @@ class SQLiteWorkflowStore:
         }
 
     def _protect_payload_for_checkpoint(self, value: Any, secrets: Dict[str, Any]) -> Any:
+        from custom_tools.text_to_sql.validators import TextToSqlSafetyPolicy
+
+        if isinstance(value, TextToSqlSafetyPolicy):
+            return {
+                _TEXT_TO_SQL_SAFETY_POLICY_KEY: self._protect_payload_for_checkpoint(
+                    value.to_mapping(),
+                    secrets,
+                )
+            }
         if isinstance(value, dict):
             protected = {}
             for key, item in value.items():
@@ -400,6 +410,15 @@ class SQLiteWorkflowStore:
         checkpoint_identity: str,
     ) -> Any:
         if isinstance(value, dict):
+            if set(value) == {_TEXT_TO_SQL_SAFETY_POLICY_KEY}:
+                from custom_tools.text_to_sql.validators import TextToSqlSafetyPolicy
+
+                mapping = self._restore_payload_from_checkpoint(
+                    value[_TEXT_TO_SQL_SAFETY_POLICY_KEY],
+                    secrets,
+                    checkpoint_identity=checkpoint_identity,
+                )
+                return TextToSqlSafetyPolicy.from_mapping(mapping)
             ref = value.get(_WORKFLOW_SECRET_REF_KEY)
             if isinstance(ref, str):
                 if ref not in secrets:

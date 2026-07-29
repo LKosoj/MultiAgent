@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -129,6 +131,39 @@ def test_worker_rehydrates_policy_mapping_once(monkeypatch):
     assert isinstance(captured["policy"], TextToSqlSafetyPolicy)
     assert captured["supervisor_id"] == "test-supervisor"
     assert captured["attempt_generation"] == 1
+
+
+def test_checkpoint_round_trip_preserves_rehydrated_policy(tmp_path):
+    from workflow.models import (
+        WorkflowCheckpoint,
+        WorkflowContext,
+        WorkflowStatus,
+    )
+    from workflow.state_manager import SQLiteWorkflowStore
+
+    policy = resolve_safety_policy("strict")
+    store = SQLiteWorkflowStore(str(tmp_path / "workflow.db"))
+    checkpoint = WorkflowCheckpoint(
+        workflow_id="workflow-policy-round-trip",
+        timestamp=datetime.now(),
+        status=WorkflowStatus.RUNNING,
+        context=WorkflowContext(
+            workflow_id="workflow-policy-round-trip",
+            session_id="session-1",
+            variables={"safety_policy": policy},
+        ),
+    )
+
+    asyncio.run(store.save_checkpoint(checkpoint))
+    restored = asyncio.run(
+        store.get_latest_checkpoint("workflow-policy-round-trip")
+    )
+
+    assert restored is not None
+    assert restored.context is not None
+    restored_policy = restored.context.variables["safety_policy"]
+    assert isinstance(restored_policy, TextToSqlSafetyPolicy)
+    assert restored_policy == policy
 
 
 def test_pipeline_carries_one_policy_object_through_mandatory_stages():
