@@ -130,7 +130,7 @@ class SchemaLinkingCore:
 
     def build_joins(
         self, linked_metrics, linked_dimensions, linked_filters, db_schema,
-        main_table=None,
+        main_table=None, *, include_conventions=True,
     ):
         """W4-T1: ``main_table`` опциональный параметр (передаётся caller'ом).
 
@@ -140,6 +140,7 @@ class SchemaLinkingCore:
         return self._join_validator.build_joins(
             linked_metrics, linked_dimensions, linked_filters, db_schema,
             main_table=main_table,
+            include_conventions=include_conventions,
         )
 
     # ------------------------------------------------------------------
@@ -315,78 +316,65 @@ class SchemaLinkingCore:
                     f"Some LLM joins failed validation: "
                     f"{len(llm_joins) - len(validated_joins)} invalid"
                 )
-                if allow_fallbacks:
-                    # W4-T1: передаём main_table параметром — JoinValidator
-                    # не знает про scoring.
-                    fallback_joins = self.build_joins(
-                        linked_metrics, linked_dimensions, linked_filters,
-                        db_schema, main_table=main_table,
-                    )
-                    for fallback_join in fallback_joins["joins"]:
-                        if not JoinValidator._is_duplicate_join(fallback_join, validated_joins):
-                            validated_joins.append(fallback_join)
-                    joins_info["joins"] = validated_joins
-                    # W4-T2: после hybrid merge — пересчитываем required с учётом
-                    # новых bridge-таблиц.
-                    required_tables = compute_required_tables(
-                        linked_metrics, linked_dimensions, linked_filters,
-                        validated_joins=validated_joins,
-                    )
-                    joins_info["unconnected_tables"] = self._unconnected_tables_from_joins(
+
+            if joins_info["unconnected_tables"]:
+                # Authoritative FK closure is deterministic schema evidence,
+                # not a heuristic fallback. Convention-based joins remain
+                # gated by SCHEMA_LINKING_ALLOW_FALLBACKS.
+                fallback_joins = self.build_joins(
+                    linked_metrics,
+                    linked_dimensions,
+                    linked_filters,
+                    db_schema,
+                    main_table=main_table,
+                    include_conventions=allow_fallbacks,
+                )
+                for fallback_join in fallback_joins["joins"]:
+                    if not JoinValidator._is_duplicate_join(
+                        fallback_join, validated_joins
+                    ):
+                        validated_joins.append(fallback_join)
+                joins_info["joins"] = validated_joins
+                required_tables = compute_required_tables(
+                    linked_metrics,
+                    linked_dimensions,
+                    linked_filters,
+                    validated_joins=validated_joins,
+                )
+                joins_info["unconnected_tables"] = (
+                    self._unconnected_tables_from_joins(
                         main_table, required_tables, validated_joins
                     )
-                    # W4-T3: тот же единый критерий success.
-                    joins_info["success"] = (
-                        bool(main_table) and not joins_info["unconnected_tables"]
-                    )
-                    # MEDIUM #7: LLM-результат + heuristic build_joins для
-                    # восполнения отбракованных joins → реальный hybrid.
-                    # Без этого флага HIGH #5 "hybrid" был бы недостижим.
+                )
+                joins_info["success"] = (
+                    bool(main_table) and not joins_info["unconnected_tables"]
+                )
+                if allow_fallbacks:
                     heuristic_used = True
         else:
+            # W4-T1: вычисляем main_table через scoring в orchestrator и
+            # передаём в JoinValidator. Authoritative FK closure работает
+            # всегда; convention-инференс остаётся opt-in fallback.
+            pre_required = compute_required_tables(
+                linked_metrics, linked_dimensions, linked_filters
+            )
+            main_table = self._pick_main_table_from_linked(
+                linked_metrics, linked_dimensions, pre_required, db_schema
+            )
+            joins_info = self.build_joins(
+                linked_metrics,
+                linked_dimensions,
+                linked_filters,
+                db_schema,
+                main_table=main_table,
+                include_conventions=allow_fallbacks,
+            )
+            joins_info["success"] = (
+                bool(joins_info.get("main_table"))
+                and not joins_info.get("unconnected_tables")
+            )
             if allow_fallbacks:
-                # W4-T1: вычисляем main_table через scoring в orchestrator и
-                # передаём в JoinValidator. JoinValidator больше не выбирает
-                # main_table сам (раньше — первая metric).
-                pre_required = compute_required_tables(
-                    linked_metrics, linked_dimensions, linked_filters
-                )
-                main_table = self._pick_main_table_from_linked(
-                    linked_metrics, linked_dimensions, pre_required, db_schema
-                )
-                joins_info = self.build_joins(
-                    linked_metrics, linked_dimensions, linked_filters,
-                    db_schema, main_table=main_table,
-                )
-                # W4-T3: единый критерий success.
-                joins_info["success"] = (
-                    bool(joins_info.get("main_table"))
-                    and not joins_info.get("unconnected_tables")
-                )
-                # build_joins — это heuristic-движок join-валидатора;
-                # его явное использование тоже считается heuristic-вкладом.
                 heuristic_used = True
-            else:
-                linked_tables = compute_required_tables(
-                    linked_metrics, linked_dimensions, linked_filters
-                )
-                main_table = self._pick_main_table_from_linked(
-                    linked_metrics, linked_dimensions, linked_tables, db_schema
-                )
-                unconnected_tables = self._unconnected_tables_from_joins(
-                    main_table, linked_tables, []
-                )
-                # W4-T3: единый критерий success — main_table выбран и
-                # unconnected_tables пуст. Раньше тут было
-                # ``bool(linked_tables) and not unconnected_tables`` — это
-                # тот же критерий с учётом, что при main_table=None
-                # _unconnected_tables_from_joins возвращает все required.
-                joins_info = {
-                    "joins": [],
-                    "success": bool(main_table) and not unconnected_tables,
-                    "unconnected_tables": unconnected_tables,
-                    "main_table": main_table,
-                }
 
         # Определяем фактически использованную стратегию.
         # hybrid — LLM отдал результат И heuristic дополнительно подключался

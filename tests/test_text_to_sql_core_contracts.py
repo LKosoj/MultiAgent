@@ -1670,6 +1670,66 @@ def test_schema_linking_without_joins_reports_unconnected_filter_tables(monkeypa
     assert result["unconnected_tables"] == ["customers"]
 
 
+def test_schema_linking_uses_authoritative_fk_without_heuristic_fallback(monkeypatch):
+    memory = _FakeMemory(["orders", "customers"])
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "0")
+    fake_llm = lambda **kwargs: json.dumps({
+        "linked_entities": {
+            "metrics": [
+                {"name": "revenue", "table": "orders", "column": "amount"}
+            ],
+            "dimensions": [],
+            "filters": {
+                "segment": {
+                    "table": "customers",
+                    "column": "segment",
+                    "value": "SME",
+                }
+            },
+        },
+        "joins": [],
+        "unlinked_entities": [],
+    })
+
+    result = SchemaLinkingCore(
+        SchemaLimiter(), memory, llm_caller=fake_llm
+    ).perform_linking(
+        {
+            "metrics": ["revenue"],
+            "dimensions": [],
+            "filters": {"segment": "SME"},
+        },
+        {
+            "orders": {
+                "columns": {
+                    "amount": {"type": "DECIMAL"},
+                    "customer_id": {
+                        "type": "INTEGER",
+                        "constraint_type": "FK",
+                        "references": "customers(id)",
+                    },
+                }
+            },
+            "customers": {
+                "columns": {
+                    "id": {"type": "INTEGER", "constraint_type": "PK"},
+                    "segment": {"type": "TEXT"},
+                }
+            },
+        },
+    )
+
+    assert result["join_success"] is True
+    assert result["unconnected_tables"] == []
+    assert result["linking_strategy"] == "llm"
+    assert len(result["joins"]) == 1
+    assert {
+        result["joins"][0]["from_table"],
+        result["joins"][0]["to_table"],
+    } == {"orders", "customers"}
+
+
 def test_schema_info_is_cache_only_by_default(monkeypatch):
     dsn = "sqlite:///tmp/test.db"
     monkeypatch.setenv("DB_DSN", "sqlite:///tmp/stale.db")

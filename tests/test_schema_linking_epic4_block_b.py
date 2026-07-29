@@ -480,6 +480,55 @@ def test_fk_joins_union_with_convention():
     assert ("orders", "regions") in join_pairs or ("regions", "orders") in join_pairs
 
 
+def test_fk_only_join_closure_rejects_ambiguous_paths():
+    """Two equally authoritative FK paths must remain fail-closed."""
+    db_schema = {
+        "accounts": {"columns": {"id": {"type": "INTEGER"}}},
+        "events": {"columns": {"id": {"type": "INTEGER"}}},
+        "bridge_a": {
+            "columns": {
+                "account_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "accounts(id)",
+                },
+                "event_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "events(id)",
+                },
+            }
+        },
+        "bridge_b": {
+            "columns": {
+                "account_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "accounts(id)",
+                },
+                "event_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "events(id)",
+                },
+            }
+        },
+    }
+
+    result = JoinValidator().build_joins(
+        [{"name": "accounts", "table": "accounts", "column": "id"}],
+        [{"name": "events", "table": "events", "column": "id"}],
+        {},
+        db_schema,
+        main_table="accounts",
+        include_conventions=False,
+    )
+
+    assert result["success"] is False
+    assert result["joins"] == []
+    assert result["ambiguous_join_paths"] == ["events"]
+
+
 def test_convention_join_blocked_for_unmarked_fk_column_in_fk_aware_schema():
     """W4-T4: в схеме с FK-аннотациями convention-fallback по суффиксу _id
     НЕ применяется для колонок без is_fk-маркера (silent fallback запрещён)."""

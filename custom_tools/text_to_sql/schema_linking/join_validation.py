@@ -245,6 +245,8 @@ class JoinValidator:
         self,
         required_tables: set,
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        *,
+        include_all_bridges: bool = False,
     ) -> List[Dict[str, Any]]:
         """Извлекает возможные JOIN'ы на основе FK связей в схеме.
 
@@ -345,11 +347,14 @@ class JoinValidator:
                         if a in fk_targets and b in fk_targets:
                             joins.extend(fk_targets[a])
                             joins.extend(fk_targets[b])
-                            # Пара покрыта — больше не ищем bridge для неё.
-                            unconnected_pairs.remove((a, b))
-                            if not unconnected_pairs:
-                                break
-                    if not unconnected_pairs:
+                            if not include_all_bridges:
+                                # Legacy/fallback mode keeps its historical
+                                # first bridge. FK-only mode collects all
+                                # candidates so ambiguity can fail closed.
+                                unconnected_pairs.remove((a, b))
+                                if not unconnected_pairs:
+                                    break
+                    if not unconnected_pairs and not include_all_bridges:
                         break
 
         return joins
@@ -364,6 +369,8 @@ class JoinValidator:
         linked_filters: Dict[str, Any],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         main_table: Optional[str] = None,
+        *,
+        include_conventions: bool = True,
     ) -> Dict[str, Any]:
         """Строит JOIN связи между таблицами.
 
@@ -380,6 +387,7 @@ class JoinValidator:
         required_tables: set = compute_required_tables(
             linked_metrics, linked_dimensions, linked_filters
         )
+        requested_tables = set(required_tables)
 
         # Backward-compat: если main_table не передан, берём первую metric
         # (исторический поведение JoinValidator.build_joins). Caller'у
@@ -409,7 +417,11 @@ class JoinValidator:
         # дедуп (см. 4.20). Раньше convention использовался только когда
         # FK-список был пуст, и партиционная схема с частичными FK теряла
         # convention-ребра.
-        joins_from_schema = self._extract_fk_joins(required_tables, db_schema)
+        joins_from_schema = self._extract_fk_joins(
+            required_tables,
+            db_schema,
+            include_all_bridges=not include_conventions,
+        )
         # T5-linking / #6 HIGH: только bridge-таблицы (via_bridge=True) расширяют
         # required_tables. Прямые FK-цели (via_bridge отсутствует) намеренно
         # исключаются: они могут указывать на таблицы, которых исходный запрос
@@ -430,24 +442,44 @@ class JoinValidator:
             for j in joins_from_schema
             if j.get("from_table") and j.get("to_table")
         }
-        convention_joins = self.join_builder.infer_joins_by_convention(required_tables)
         merged_joins: List[Dict[str, Any]] = list(joins_from_schema)
-        for candidate in convention_joins:
-            pair = frozenset((candidate.get("from_table"), candidate.get("to_table")))
-            if pair in fk_pairs:
-                # Для этой пары уже есть FK-join — convention пропускаем.
-                continue
-            if not self._is_duplicate_join(candidate, merged_joins):
-                # Провенанс convention-ребра для графа: fk-aware таблица →
-                # convention_fk (вес 3), иначе legacy-convention (вес 5).
-                # greedy игнорирует лишний ключ `_source` (см. _normalize_edges).
-                candidate = dict(candidate)
-                candidate["_source"] = (
-                    "convention_fk"
-                    if self.join_builder._table_has_fk_metadata(candidate["from_table"])
-                    else "convention_legacy"
+        if include_conventions:
+            convention_joins = self.join_builder.infer_joins_by_convention(
+                required_tables
+            )
+            for candidate in convention_joins:
+                pair = frozenset(
+                    (candidate.get("from_table"), candidate.get("to_table"))
                 )
-                merged_joins.append(candidate)
+                if pair in fk_pairs:
+                    # Для этой пары уже есть FK-join — convention пропускаем.
+                    continue
+                if not self._is_duplicate_join(candidate, merged_joins):
+                    # Провенанс convention-ребра для графа: fk-aware таблица →
+                    # convention_fk (вес 3), иначе legacy-convention (вес 5).
+                    # greedy игнорирует лишний ключ `_source` (см. _normalize_edges).
+                    candidate = dict(candidate)
+                    candidate["_source"] = (
+                        "convention_fk"
+                        if self.join_builder._table_has_fk_metadata(
+                            candidate["from_table"]
+                        )
+                        else "convention_legacy"
+                    )
+                    merged_joins.append(candidate)
+
+        if not include_conventions:
+            ambiguous_targets = self._ambiguous_fk_targets(
+                main_table, requested_tables, merged_joins
+            )
+            if ambiguous_targets:
+                return {
+                    "joins": [],
+                    "success": False,
+                    "unconnected_tables": sorted(required_tables - {main_table}),
+                    "main_table": main_table,
+                    "ambiguous_join_paths": ambiguous_targets,
+                }
 
         # T4: развилка по path_algo (env > yaml). greedy = текущая цепочка
         # (verbatim), graph = KMB Steiner-tree с полным fallback-контуром.
@@ -468,6 +500,50 @@ class JoinValidator:
                 item["warning"] for item in join_semantics if item.get("warning")
             ],
         }
+
+    @staticmethod
+    def _ambiguous_fk_targets(
+        main_table: str,
+        required_tables: set,
+        joins: List[Dict[str, Any]],
+    ) -> List[str]:
+        """Return required targets with more than one simple FK path."""
+        adjacency: Dict[str, List[tuple[int, str]]] = {}
+        unique_joins: List[Dict[str, Any]] = []
+        for join in joins:
+            if JoinValidator._is_duplicate_join(join, unique_joins):
+                continue
+            unique_joins.append(join)
+            left = join.get("from_table")
+            right = join.get("to_table")
+            if not isinstance(left, str) or not isinstance(right, str):
+                continue
+            edge_id = len(unique_joins) - 1
+            adjacency.setdefault(left, []).append((edge_id, right))
+            adjacency.setdefault(right, []).append((edge_id, left))
+
+        def path_count(target: str) -> int:
+            count = 0
+
+            def visit(node: str, visited: set[str]) -> None:
+                nonlocal count
+                if count > 1:
+                    return
+                if node == target:
+                    count += 1
+                    return
+                for _, neighbor in adjacency.get(node, []):
+                    if neighbor not in visited:
+                        visit(neighbor, visited | {neighbor})
+
+            visit(main_table, {main_table})
+            return count
+
+        return sorted(
+            target
+            for target in required_tables
+            if target != main_table and path_count(target) > 1
+        )
 
     def _join_semantics(
         self,
