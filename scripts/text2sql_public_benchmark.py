@@ -551,7 +551,13 @@ def export_predictions(
     for case in cases:
         observation = observations.get(case.case_key, {})
         outcome = observation.get("outcome")
-        sql = outcome.get("sql") if isinstance(outcome, dict) else None
+        sql = (
+            outcome.get("sql")
+            if isinstance(outcome, dict)
+            and outcome.get("status") == "succeeded"
+            and outcome.get("executed") is True
+            else None
+        )
         sql_by_id[case.case_key] = (
             sql.strip()
             if isinstance(sql, str) and sql.strip()

@@ -132,7 +132,11 @@ def test_export_predictions_is_stable_and_uses_failing_fallback(
                 "benchmark": "bird",
                 "ordinal": 1,
                 "case_id": "1",
-                "outcome": {"sql": "SELECT 2"},
+                "outcome": {
+                    "status": "succeeded",
+                    "executed": True,
+                    "sql": "SELECT 2",
+                },
             }
         )
         + "\n",
@@ -148,6 +152,47 @@ def test_export_predictions_is_stable_and_uses_failing_fallback(
     with sqlite3.connect(":memory:") as connection:
         with pytest.raises(sqlite3.OperationalError):
             connection.execute(EMPTY_PREDICTION)
+
+
+def test_export_predictions_ignores_unexecuted_sql(tmp_path: Path) -> None:
+    root = tmp_path / "bird"
+    root.mkdir()
+    (root / "mini_dev_sqlite.json").write_text(
+        json.dumps(
+            [
+                {
+                    "question_id": 0,
+                    "db_id": "db",
+                    "question": "Count rows.",
+                    "SQL": "gold must stay unused",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    _sqlite_file(root / "dev_databases" / "db" / "db.sqlite")
+    observations = tmp_path / "observations.jsonl"
+    observations.write_text(
+        json.dumps(
+            {
+                "benchmark": "bird",
+                "ordinal": 0,
+                "case_id": "0",
+                "outcome": {
+                    "status": "failed",
+                    "executed": False,
+                    "sql": "SELECT COUNT(*) FROM items",
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    export_predictions("bird", load_bird_cases(root), observations, tmp_path)
+
+    predictions = json.loads((tmp_path / "bird_predictions.json").read_text())
+    assert predictions["0"].startswith(EMPTY_PREDICTION)
 
 
 def test_load_completed_uses_bird_ordinal_when_question_ids_repeat(
