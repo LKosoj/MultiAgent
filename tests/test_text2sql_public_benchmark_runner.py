@@ -13,6 +13,7 @@ from scripts.text2sql_public_benchmark import (
     _idempotency_key,
     _load_completed,
     _run_case,
+    _select_cases,
     _write_manifest,
     benchmark_prompt,
     export_predictions,
@@ -226,6 +227,32 @@ def test_load_completed_uses_bird_ordinal_when_question_ids_repeat(
     completed = _load_completed(observations)
 
     assert list(completed) == ["bird:0", "bird:1"]
+
+
+def test_select_cases_supports_disjoint_ordinal_ranges() -> None:
+    cases = [
+        benchmark_runner.BenchmarkCase(
+            ordinal=ordinal,
+            case_key=f"bird:{ordinal}",
+            case_id=str(ordinal),
+            database_id="db",
+            database_path=Path("/tmp/db.sqlite"),
+            question=f"Question {ordinal}",
+            external_knowledge="",
+            difficulty="simple",
+        )
+        for ordinal in range(5)
+    ]
+
+    selected = _select_cases(
+        cases,
+        limit=None,
+        case_ids=set(),
+        ordinal_start=1,
+        ordinal_stop=4,
+    )
+
+    assert [case.ordinal for case in selected] == [1, 2, 3]
 
 
 def test_idempotency_key_changes_when_connection_registration_changes() -> None:

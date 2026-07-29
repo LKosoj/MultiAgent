@@ -176,8 +176,16 @@ def _select_cases(
     *,
     limit: int | None,
     case_ids: set[str],
+    ordinal_start: int | None,
+    ordinal_stop: int | None,
 ) -> list[BenchmarkCase]:
-    selected = [case for case in cases if not case_ids or case.case_id in case_ids]
+    selected = [
+        case
+        for case in cases
+        if (not case_ids or case.case_id in case_ids)
+        and (ordinal_start is None or case.ordinal >= ordinal_start)
+        and (ordinal_stop is None or case.ordinal < ordinal_stop)
+    ]
     if case_ids:
         missing = sorted(case_ids - {case.case_id for case in selected})
         if missing:
@@ -412,6 +420,8 @@ def run_benchmark(args: argparse.Namespace) -> int:
         cases,
         limit=args.limit,
         case_ids=set(args.case_id),
+        ordinal_start=args.ordinal_start,
+        ordinal_stop=args.ordinal_stop,
     )
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -614,6 +624,13 @@ def _positive_int(raw: str) -> int:
     return value
 
 
+def _nonnegative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", choices=("bird", "spider"), required=True)
@@ -627,6 +644,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rows", type=_positive_int, default=100)
     parser.add_argument("--limit", type=_positive_int)
     parser.add_argument("--case-id", action="append", default=[])
+    parser.add_argument("--ordinal-start", type=_nonnegative_int)
+    parser.add_argument("--ordinal-stop", type=_positive_int)
     parser.add_argument(
         "--pipeline-revision",
         help="Revision deployed by the benchmark API server, if known.",
