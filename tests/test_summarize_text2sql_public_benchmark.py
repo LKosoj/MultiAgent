@@ -86,7 +86,10 @@ def test_summarize_counts_official_scores_and_stage_reasons() -> None:
 
     assert diagnostics[0]["failure_class"] == "correct"
     assert summary["execution_accuracy"] == 1.0
+    assert summary["execution_coverage"] == 1.0
+    assert summary["conditional_execution_accuracy"] == 1.0
     assert summary["schema_decision_reasons"] == {"ALL_ENTITIES_LINKED": 1}
+    assert summary["latency_seconds_by_failure_class"]["correct"]["mean"] == 10.0
 
 
 def test_summarize_uses_case_key_when_source_ids_repeat() -> None:
@@ -117,3 +120,30 @@ def test_summarize_uses_case_key_when_source_ids_repeat() -> None:
     assert [row["case_key"] for row in diagnostics] == ["bird:0", "bird:1"]
     assert summary["correct"] == 1
     assert summary["execution_accuracy"] == 0.5
+
+
+def test_summarize_reports_accuracy_conditioned_on_execution() -> None:
+    correct = _observation(status="succeeded")
+    correct.update(case_key="bird:0", ordinal=0, run_id="run-1")
+    wrong = _observation(status="succeeded")
+    wrong.update(case_key="bird:1", ordinal=1, run_id="run-2")
+    abstained = _observation(
+        status="abstained",
+        reason="SCHEMA_GROUNDING_FAILED",
+    )
+    abstained.update(case_key="bird:2", ordinal=2, run_id="run-3")
+
+    _, summary = summarize(
+        [correct, wrong, abstained],
+        {
+            "bird:0": {"score": 1, "error_info": None},
+            "bird:1": {"score": 0, "error_info": "Result Error"},
+            "bird:2": {"score": 0, "error_info": "Result Error"},
+        },
+        {},
+    )
+
+    assert summary["execution_accuracy"] == 0.333333
+    assert summary["execution_coverage"] == 0.666667
+    assert summary["conditional_execution_accuracy"] == 0.5
+    assert summary["latency_seconds_by_terminal_status"]["succeeded"]["mean"] == 10.0

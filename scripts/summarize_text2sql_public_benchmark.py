@@ -281,14 +281,29 @@ def summarize(
 
     evaluated = [row for row in diagnostics if row["official_score"] is not None]
     correct = sum(row["official_score"] == 1 for row in evaluated)
+    executed = [row for row in diagnostics if row["executed"] is True]
+    executed_evaluated = [row for row in evaluated if row["executed"] is True]
+    executed_correct = sum(
+        row["official_score"] == 1 for row in executed_evaluated
+    )
     latency_values = [
         float(row["elapsed_seconds"])
         for row in diagnostics
         if isinstance(row.get("elapsed_seconds"), (int, float))
     ]
+    latency_by_failure_class: dict[str, list[float]] = defaultdict(list)
+    latency_by_terminal_status: dict[str, list[float]] = defaultdict(list)
     schema_reasons: Counter[str] = Counter()
     step_durations: dict[str, list[float]] = defaultdict(list)
     for row in diagnostics:
+        elapsed_seconds = row.get("elapsed_seconds")
+        if isinstance(elapsed_seconds, (int, float)):
+            latency_by_failure_class[row["failure_class"]].append(
+                float(elapsed_seconds)
+            )
+            latency_by_terminal_status[str(row["terminal_status"])].append(
+                float(elapsed_seconds)
+            )
         for reason in row["schema_linking"]["decision_reasons"]:
             schema_reasons[str(reason)] += 1
         for step_id, stage in row["stages"].items():
@@ -305,6 +320,16 @@ def summarize(
         "execution_accuracy": (
             round(correct / len(evaluated), 6) if evaluated else None
         ),
+        "execution_coverage": (
+            round(len(executed_evaluated) / len(evaluated), 6)
+            if evaluated
+            else None
+        ),
+        "conditional_execution_accuracy": (
+            round(executed_correct / len(executed_evaluated), 6)
+            if executed_evaluated
+            else None
+        ),
         "terminal_statuses": dict(
             Counter(str(row["terminal_status"]) for row in diagnostics)
         ),
@@ -315,7 +340,7 @@ def summarize(
             Counter(row["failure_class"] for row in diagnostics)
         ),
         "generated": sum(row["generated"] is True for row in diagnostics),
-        "executed": sum(row["executed"] is True for row in diagnostics),
+        "executed": len(executed),
         "schema_decisions": dict(
             Counter(
                 str(row["schema_linking"].get("decision") or "missing")
@@ -324,6 +349,16 @@ def summarize(
         ),
         "schema_decision_reasons": dict(schema_reasons),
         "latency_seconds": _latency_summary(latency_values),
+        "latency_seconds_by_failure_class": {
+            failure_class: _latency_summary(values)
+            for failure_class, values in sorted(latency_by_failure_class.items())
+        },
+        "latency_seconds_by_terminal_status": {
+            terminal_status: _latency_summary(values)
+            for terminal_status, values in sorted(
+                latency_by_terminal_status.items()
+            )
+        },
         "step_latency_seconds": {
             step_id: _latency_summary(values)
             for step_id, values in sorted(step_durations.items())
