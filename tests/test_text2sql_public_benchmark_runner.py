@@ -13,6 +13,7 @@ from scripts.text2sql_public_benchmark import (
     _idempotency_key,
     _load_completed,
     _run_case,
+    _write_manifest,
     benchmark_prompt,
     export_predictions,
     load_bird_cases,
@@ -302,3 +303,47 @@ def test_run_case_fetches_terminal_outcome_after_transport_error(
     assert observation["observation_status"] == "completed"
     assert observation["runner_error"] is None
     assert observation["outcome"]["reason_code"] == "DB_AUDIT_OUTPUT_INVALID"
+
+
+def test_manifest_records_verifiable_pipeline_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    dataset_root = tmp_path / "bird"
+    dataset_root.mkdir()
+    source = dataset_root / "mini_dev_sqlite.json"
+    source.write_text("[]", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    monkeypatch.setattr(benchmark_runner, "_git_revision", lambda: "runner-revision")
+    args = SimpleNamespace(
+        dataset="bird",
+        dataset_root=dataset_root,
+        pipeline_revision="pipeline-revision",
+        base_url="http://example.invalid",
+        workers=4,
+        case_timeout=930.0,
+        max_rows=100,
+    )
+
+    _write_manifest(
+        args=args,
+        cases=[],
+        output_dir=output_dir,
+        principal={
+            "subject": "benchmark",
+            "tenant_id": "benchmark",
+            "roles": ["admin"],
+        },
+        completed_before=0,
+    )
+
+    manifest = json.loads((output_dir / "manifest.json").read_text())
+    assert manifest["repo_revision"] == "runner-revision"
+    assert manifest["pipeline_revision"] == "pipeline-revision"
+    assert manifest["model_configuration"]["reported_by_runtime"] is False
+    assert "model_id" not in manifest
+    assert "model_temperature" not in manifest
+    assert {
+        item["path"] for item in manifest["configuration_sources"]
+    } == {str(path) for path in benchmark_runner.CONFIGURATION_PATHS}

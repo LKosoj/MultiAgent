@@ -35,6 +35,14 @@ from streamlit_app.text_to_sql_client import (  # noqa: E402
 
 EMPTY_PREDICTION = "/* TEXT2SQL_NO_PREDICTION */ INVALID SQL"
 TOKEN_ENV = "TEXT2SQL_BENCHMARK_TOKEN"
+CONFIGURATION_PATHS = (
+    Path("workflow_pipelines/text_to_sql_pipeline.yaml"),
+    Path("config/text_to_sql/llm_models.yaml"),
+    Path("agent_profiles/nlu_agent.yaml"),
+    Path("agent_profiles/sql_generator_agent.yaml"),
+    Path("agent_profiles/sql_verifier_agent.yaml"),
+    Path("agent_profiles/db_audit_agent.yaml"),
+)
 
 
 @dataclass(frozen=True)
@@ -487,13 +495,26 @@ def _write_manifest(
         "case_count": len(cases),
         "completed_before": completed_before,
         "repo_revision": _git_revision(),
+        "pipeline_revision": args.pipeline_revision,
         "base_url": args.base_url,
         "workers": args.workers,
         "case_timeout": args.case_timeout,
         "max_rows": args.max_rows,
-        "model_route": "model_code",
-        "model_id": "llmgateway/qwen3.5",
-        "model_temperature": 0.7,
+        "model_configuration": {
+            "reported_by_runtime": False,
+            "note": (
+                "The API does not report resolved model IDs, sampling "
+                "parameters, or seeds for every pipeline stage."
+            ),
+        },
+        "configuration_sources": [
+            {
+                "path": str(path),
+                "sha256": _sha256(REPO_ROOT / path),
+                "size_bytes": (REPO_ROOT / path).stat().st_size,
+            }
+            for path in CONFIGURATION_PATHS
+        ],
         "successful_sql_memory_enabled": os.getenv(
             "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED",
             "1",
@@ -606,6 +627,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-rows", type=_positive_int, default=100)
     parser.add_argument("--limit", type=_positive_int)
     parser.add_argument("--case-id", action="append", default=[])
+    parser.add_argument(
+        "--pipeline-revision",
+        help="Revision deployed by the benchmark API server, if known.",
+    )
     return parser
 
 
