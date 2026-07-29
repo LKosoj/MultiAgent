@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts.text2sql_public_benchmark import (
     EMPTY_PREDICTION,
+    _idempotency_key,
     benchmark_prompt,
     export_predictions,
     load_bird_cases,
@@ -132,3 +133,11 @@ def test_export_predictions_is_stable_and_uses_executable_fallback(
     assert list(predictions) == ["0", "1"]
     assert predictions["0"].startswith(EMPTY_PREDICTION)
     assert predictions["1"].startswith("SELECT 2")
+
+
+def test_idempotency_key_changes_when_connection_registration_changes() -> None:
+    first = _idempotency_key("bird", "7", "show rows", "conn-first")
+    second = _idempotency_key("bird", "7", "show rows", "conn-second")
+
+    assert first != second
+    assert first == _idempotency_key("bird", "7", "show rows", "conn-first")

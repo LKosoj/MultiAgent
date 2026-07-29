@@ -243,6 +243,28 @@ def _sqlite_dsn(path: Path) -> str:
     return f"sqlite://{path.resolve()}"
 
 
+def _idempotency_key(
+    benchmark_name: str,
+    case_id: str,
+    prompt: str,
+    connection_ref: str,
+) -> str:
+    request_identity = hashlib.sha256(
+        json.dumps(
+            {
+                "benchmark": benchmark_name,
+                "case_id": case_id,
+                "prompt": prompt,
+                "connection_ref": connection_ref,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    return f"public-{benchmark_name}-{case_id}-{request_identity}"
+
+
 def _register_databases(
     client: TextToSqlApiClient,
     cases: Sequence[BenchmarkCase],
@@ -285,9 +307,11 @@ def _run_case(
             TextToSqlRunRequest(
                 query=prompt,
                 connection_ref=connection_ref,
-                idempotency_key=(
-                    f"public-{benchmark_name}-{case.case_id}-"
-                    f"{hashlib.sha256(prompt.encode('utf-8')).hexdigest()[:16]}"
+                idempotency_key=_idempotency_key(
+                    benchmark_name,
+                    case.case_id,
+                    prompt,
+                    connection_ref,
                 ),
                 max_rows=max_rows,
                 safety_level="strict",
