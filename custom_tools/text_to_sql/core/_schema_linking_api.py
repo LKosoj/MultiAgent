@@ -3,6 +3,7 @@
 Реализация schema_linking и _normalize_schema_linking_entities.
 """
 import logging
+import re
 import warnings as _warnings
 from typing import Dict, List, Optional
 
@@ -11,6 +12,28 @@ from ..deprecations import TextToSQLDeprecationWarning
 logger = logging.getLogger(__name__)
 
 _ENTITY_LIST_TYPES = (("metrics", "metric"), ("dimensions", "dimension"))
+_ENTITY_IDENTITY_KEYS = ("source_entity_id", "entity", "name", "column", "expression")
+_FILTER_QUERY_CONTROLS = {
+    "aggregation",
+    "distinct",
+    "limit",
+    "offset",
+    "order",
+    "order_by",
+}
+_FILTER_METADATA_KEYS = {
+    "comparison",
+    "condition",
+    "end",
+    "operator",
+    "start",
+    "value",
+    "values",
+}
+_AGGREGATE_EXPRESSION_RE = re.compile(
+    r"^\s*(count|sum|avg|min|max)\s*\(\s*(?:[^.()]+\.)?([^()]+)\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _canonical_entity_name(value: object) -> Optional[str]:
@@ -25,23 +48,82 @@ def _canonical_entity_name(value: object) -> Optional[str]:
     return None
 
 
+def _entity_identity_names(value: object) -> set[str]:
+    if isinstance(value, str):
+        name = value.strip()
+        return {name.casefold()} if name else set()
+    if not isinstance(value, dict):
+        return set()
+    return {
+        candidate.strip().casefold()
+        for key in _ENTITY_IDENTITY_KEYS
+        if isinstance((candidate := value.get(key)), str) and candidate.strip()
+    }
+
+
+def _table_identity(value: object) -> Optional[str]:
+    if not isinstance(value, dict):
+        return None
+    table = value.get("table")
+    if not isinstance(table, str) or not table.strip():
+        return None
+    unqualified = table.rsplit(".", 1)[-1].strip().strip('"`[]')
+    return unqualified.casefold() or None
+
+
+def _aggregate_binding(value: object) -> Optional[tuple[str, str]]:
+    if not isinstance(value, dict):
+        return None
+    aggregation = value.get("aggregation")
+    column = value.get("column")
+    if not isinstance(aggregation, str) or not aggregation.strip():
+        return None
+    if not isinstance(column, str) or not column.strip():
+        return None
+    return aggregation.strip().casefold(), column.strip().strip('"`[]').casefold()
+
+
 def _unresolved_entities(
     entities: Dict[str, object],
     linked_entities: object,
 ) -> List[Dict[str, str]]:
     linked = linked_entities if isinstance(linked_entities, dict) else {}
     resolved: set[tuple[str, str]] = set()
+    aggregate_bindings: set[tuple[str, str]] = set()
     for key, entity_type in _ENTITY_LIST_TYPES:
         items = linked.get(key)
         if not isinstance(items, list):
             continue
         for item in items:
-            name = _canonical_entity_name(item)
-            if name:
-                resolved.add((entity_type, name.casefold()))
+            resolved.update(
+                (entity_type, name) for name in _entity_identity_names(item)
+            )
+            table_name = _table_identity(item)
+            if table_name:
+                resolved.add((entity_type, table_name))
+            if entity_type == "metric":
+                aggregate = _aggregate_binding(item)
+                if aggregate:
+                    aggregate_bindings.add(aggregate)
+
     linked_filters = linked.get("filters")
+    linked_filter_metadata: Dict[str, List[object]] = {}
     if isinstance(linked_filters, dict):
-        resolved.update(("filter", str(name).casefold()) for name in linked_filters)
+        for name, value in linked_filters.items():
+            resolved.add(("filter", str(name).casefold()))
+            resolved.update(
+                ("filter", identity)
+                for identity in _entity_identity_names(value)
+            )
+            table_name = _table_identity(value)
+            if table_name:
+                resolved.add(("filter", table_name))
+            if isinstance(value, dict):
+                for metadata_key in _FILTER_METADATA_KEYS:
+                    if metadata_key in value:
+                        linked_filter_metadata.setdefault(
+                            metadata_key, []
+                        ).append(value[metadata_key])
 
     unresolved: List[Dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -54,15 +136,36 @@ def _unresolved_entities(
             if not name:
                 continue
             identity = (entity_type, name.casefold())
-            if identity not in resolved and identity not in seen:
+            is_resolved = any(
+                (entity_type, candidate) in resolved
+                for candidate in _entity_identity_names(value)
+            )
+            if not is_resolved and entity_type == "metric":
+                aggregate_match = _AGGREGATE_EXPRESSION_RE.match(name)
+                if aggregate_match:
+                    aggregation = aggregate_match.group(1).casefold()
+                    column = aggregate_match.group(2).strip().strip('"`[]').casefold()
+                    is_resolved = (aggregation, column) in aggregate_bindings
+                elif name.casefold() in {"count", "sum", "avg", "min", "max"}:
+                    is_resolved = any(
+                        aggregation == name.casefold()
+                        for aggregation, _ in aggregate_bindings
+                    )
+            if not is_resolved and identity not in seen:
                 unresolved.append({"entity_type": entity_type, "name": name})
                 seen.add(identity)
     filters = entities.get("filters")
     if isinstance(filters, dict):
-        for value in filters:
+        for value, original_value in filters.items():
             name = str(value)
             identity = ("filter", name.casefold())
-            if identity not in resolved and identity not in seen:
+            is_resolved = identity in resolved
+            if name.casefold() in _FILTER_QUERY_CONTROLS:
+                is_resolved = True
+            metadata_values = linked_filter_metadata.get(name.casefold(), [])
+            if any(candidate == original_value for candidate in metadata_values):
+                is_resolved = True
+            if not is_resolved and identity not in seen:
                 unresolved.append({"entity_type": "filter", "name": name})
                 seen.add(identity)
     return unresolved

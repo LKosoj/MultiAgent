@@ -305,6 +305,86 @@ def test_complete_linking_accepts_entity_key_from_llm_strategy(monkeypatch):
     assert out["sql_generation_allowed"] is True
 
 
+def test_unresolved_entities_accepts_linked_aggregate_expressions():
+    unresolved = _schema_linking_api._unresolved_entities(
+        {
+            "metrics": ["count", "sum(amount)", "avg(cost)", "ratio"],
+            "dimensions": [],
+            "filters": {},
+        },
+        {
+            "metrics": [
+                {"aggregation": "COUNT", "column": "member_id", "table": "member"},
+                {"aggregation": "SUM", "column": "amount", "table": "orders"},
+                {"aggregation": "AVG", "column": "cost", "table": "expense"},
+            ],
+            "dimensions": [],
+            "filters": {},
+        },
+    )
+
+    assert unresolved == [{"entity_type": "metric", "name": "ratio"}]
+
+
+def test_unresolved_entities_accepts_table_level_dimension_binding():
+    unresolved = _schema_linking_api._unresolved_entities(
+        {"metrics": [], "dimensions": ["event"], "filters": {}},
+        {
+            "metrics": [],
+            "dimensions": [{"table": "main.event", "column": "event_name"}],
+            "filters": {},
+        },
+    )
+
+    assert unresolved == []
+
+
+def test_unresolved_entities_matches_linked_filter_identity_and_metadata():
+    unresolved = _schema_linking_api._unresolved_entities(
+        {
+            "metrics": [],
+            "dimensions": [],
+            "filters": {
+                "RNP": "positive",
+                "start": "2012-01-01",
+                "end": "2012-12-31",
+                "operator": "BETWEEN",
+                "limit": 5,
+                "unknown": "must stay blocked",
+            },
+        },
+        {
+            "metrics": [],
+            "dimensions": [],
+            "filters": {
+                "date_range": {
+                    "column": "Date",
+                    "start": "2012-01-01",
+                    "end": "2012-12-31",
+                    "operator": "BETWEEN",
+                    "table": "yearmonth",
+                },
+                "anti_rnp": {
+                    "column": "RNP",
+                    "value": "positive",
+                    "table": "Laboratory",
+                },
+            },
+        },
+    )
+
+    assert unresolved == [{"entity_type": "filter", "name": "unknown"}]
+
+
+def test_unresolved_entities_does_not_guess_missing_filter_binding():
+    unresolved = _schema_linking_api._unresolved_entities(
+        {"metrics": [], "dimensions": [], "filters": {"RNP": "positive"}},
+        {"metrics": [], "dimensions": [], "filters": {}},
+    )
+
+    assert unresolved == [{"entity_type": "filter", "name": "RNP"}]
+
+
 def test_equal_best_diagnostics_require_clarification(monkeypatch):
     candidates = [
         {"table": "orders", "column": "region", "score": 10},
