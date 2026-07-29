@@ -1674,23 +1674,25 @@ def test_schema_linking_uses_authoritative_fk_without_heuristic_fallback(monkeyp
     memory = _FakeMemory(["orders", "customers"])
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
     monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "0")
-    fake_llm = lambda **kwargs: json.dumps({
-        "linked_entities": {
-            "metrics": [
-                {"name": "revenue", "table": "orders", "column": "amount"}
-            ],
-            "dimensions": [],
-            "filters": {
-                "segment": {
-                    "table": "customers",
-                    "column": "segment",
-                    "value": "SME",
-                }
+
+    def fake_llm(**kwargs):
+        return json.dumps({
+            "linked_entities": {
+                "metrics": [
+                    {"name": "revenue", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [],
+                "filters": {
+                    "segment": {
+                        "table": "customers",
+                        "column": "segment",
+                        "value": "SME",
+                    }
+                },
             },
-        },
-        "joins": [],
-        "unlinked_entities": [],
-    })
+            "joins": [],
+            "unlinked_entities": [],
+        })
 
     result = SchemaLinkingCore(
         SchemaLimiter(), memory, llm_caller=fake_llm
