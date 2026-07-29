@@ -52,34 +52,50 @@ def _load_scores(path: Path | None) -> dict[str, dict[str, Any]]:
 
 
 def _load_latest_checkpoints(
-    path: Path | None,
+    paths: Sequence[Path],
 ) -> dict[str, dict[str, Any]]:
-    if path is None:
-        return {}
     latest: dict[str, dict[str, Any]] = {}
-    with sqlite3.connect(f"file:{path.resolve()}?mode=ro", uri=True) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT timestamp, status, current_step, context, step_results
-            FROM workflow_checkpoints
-            ORDER BY timestamp
-            """
-        )
-        for row in rows:
-            context = json.loads(row["context"]) if row["context"] else {}
-            variables = context.get("variables") if isinstance(context, dict) else {}
-            run_id = variables.get("run_id") if isinstance(variables, dict) else None
-            if not isinstance(run_id, str) or not run_id:
-                continue
-            latest[run_id] = {
-                "checkpoint_timestamp": row["timestamp"],
-                "checkpoint_status": row["status"],
-                "current_step": row["current_step"],
-                "step_results": (
-                    json.loads(row["step_results"]) if row["step_results"] else {}
-                ),
-            }
+    for path in paths:
+        with sqlite3.connect(
+            f"file:{path.resolve()}?mode=ro",
+            uri=True,
+        ) as connection:
+            connection.row_factory = sqlite3.Row
+            rows = connection.execute(
+                """
+                SELECT timestamp, status, current_step, context, step_results
+                FROM workflow_checkpoints
+                ORDER BY timestamp
+                """
+            )
+            for row in rows:
+                context = json.loads(row["context"]) if row["context"] else {}
+                variables = (
+                    context.get("variables") if isinstance(context, dict) else {}
+                )
+                run_id = (
+                    variables.get("run_id")
+                    if isinstance(variables, dict)
+                    else None
+                )
+                if not isinstance(run_id, str) or not run_id:
+                    continue
+                checkpoint = {
+                    "checkpoint_timestamp": row["timestamp"],
+                    "checkpoint_status": row["status"],
+                    "current_step": row["current_step"],
+                    "step_results": (
+                        json.loads(row["step_results"])
+                        if row["step_results"]
+                        else {}
+                    ),
+                }
+                previous = latest.get(run_id)
+                if (
+                    previous is None
+                    or str(previous["checkpoint_timestamp"]) < row["timestamp"]
+                ):
+                    latest[run_id] = checkpoint
     return latest
 
 
@@ -388,7 +404,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--observations", type=Path, required=True)
     parser.add_argument("--scores", type=Path)
-    parser.add_argument("--workflow-state-db", type=Path)
+    parser.add_argument("--workflow-state-db", type=Path, action="append", default=[])
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser
 

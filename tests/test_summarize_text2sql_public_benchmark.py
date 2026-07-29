@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+import sqlite3
+
 from scripts.summarize_text2sql_public_benchmark import (
     _latency_summary,
+    _load_latest_checkpoints,
     classify_case,
     summarize,
 )
@@ -147,3 +152,40 @@ def test_summarize_reports_accuracy_conditioned_on_execution() -> None:
     assert summary["execution_coverage"] == 0.666667
     assert summary["conditional_execution_accuracy"] == 0.5
     assert summary["latency_seconds_by_terminal_status"]["succeeded"]["mean"] == 10.0
+
+
+def test_load_latest_checkpoints_merges_runtime_databases(
+    tmp_path: Path,
+) -> None:
+    paths = [tmp_path / "first.db", tmp_path / "second.db"]
+    for index, path in enumerate(paths, start=1):
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE workflow_checkpoints (
+                    timestamp TEXT,
+                    status TEXT,
+                    current_step TEXT,
+                    context TEXT,
+                    step_results TEXT
+                )
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO workflow_checkpoints
+                    (timestamp, status, current_step, context, step_results)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    f"2026-07-29T00:00:0{index}",
+                    "completed",
+                    "db_audit",
+                    json.dumps({"variables": {"run_id": f"run-{index}"}}),
+                    "{}",
+                ),
+            )
+
+    checkpoints = _load_latest_checkpoints(paths)
+
+    assert set(checkpoints) == {"run-1", "run-2"}
