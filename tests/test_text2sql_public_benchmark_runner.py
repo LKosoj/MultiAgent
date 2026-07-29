@@ -3,18 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
+import scripts.text2sql_public_benchmark as benchmark_runner
 from scripts.text2sql_public_benchmark import (
     EMPTY_PREDICTION,
     _idempotency_key,
     _load_completed,
+    _run_case,
     benchmark_prompt,
     export_predictions,
     load_bird_cases,
     load_spider_cases,
 )
+from streamlit_app.text_to_sql_client import TextToSqlResult
 
 
 def _sqlite_file(path: Path) -> None:
@@ -184,3 +188,72 @@ def test_idempotency_key_changes_when_connection_registration_changes() -> None:
 
     assert first != second
     assert first == _idempotency_key("bird", "7", "show rows", "conn-first")
+
+
+def test_run_case_fetches_terminal_outcome_after_transport_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "database" / "db.sqlite"
+    _sqlite_file(database_path)
+    case = benchmark_runner.BenchmarkCase(
+        ordinal=0,
+        case_key="bird:0",
+        case_id="7",
+        database_id="db",
+        database_path=database_path,
+        question="Count rows.",
+        external_knowledge="",
+        difficulty="simple",
+    )
+    result = TextToSqlResult(
+        run_id="run-1",
+        status="failed",
+        reason_code="DB_AUDIT_OUTPUT_INVALID",
+        sql="SELECT COUNT(*) FROM items",
+        generated=True,
+        approved=False,
+        executed=False,
+        dry_run=False,
+        audited=False,
+        rows=[],
+        columns=[],
+        rows_affected=0,
+        error="audit failed",
+        execution={},
+        audit={},
+        persistence={},
+    )
+
+    class FakeClient:
+        def start(self, request: object) -> SimpleNamespace:
+            return SimpleNamespace(run_id="run-1")
+
+        def get_run(self, run_id: str) -> SimpleNamespace:
+            assert run_id == "run-1"
+            return SimpleNamespace(status="errored", error="transport projection")
+
+        def get_result(self, run_id: str) -> TextToSqlResult:
+            assert run_id == "run-1"
+            return result
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_client",
+        lambda base_url, token: FakeClient(),
+    )
+
+    observation = _run_case(
+        case,
+        benchmark_name="bird",
+        base_url="http://example.invalid",
+        token="token",
+        connection_ref="connection",
+        timeout_seconds=1,
+        max_rows=100,
+    )
+
+    assert observation["workflow_status"] == "errored"
+    assert observation["observation_status"] == "completed"
+    assert observation["runner_error"] is None
+    assert observation["outcome"]["reason_code"] == "DB_AUDIT_OUTPUT_INVALID"

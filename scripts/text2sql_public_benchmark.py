@@ -349,11 +349,15 @@ def _run_case(
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"run exceeded {timeout_seconds:.0f}s")
             time.sleep(1.0)
-        if terminal_status != "finished":
-            raise RuntimeError(
-                f"workflow ended with status={terminal_status}: {status_error or ''}"
-            )
-        result = client.get_result(handle.run_id)
+        try:
+            result = client.get_result(handle.run_id)
+        except Exception as exc:
+            if terminal_status != "finished":
+                raise RuntimeError(
+                    f"workflow ended with status={terminal_status}: "
+                    f"{status_error or exc}"
+                ) from exc
+            raise
         outcome = asdict(result)
         outcome.pop("final_output", None)
         outcome.pop("raw", None)
