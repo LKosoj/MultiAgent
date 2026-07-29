@@ -283,6 +283,28 @@ def test_process_text_empty_string_no_llm(monkeypatch):
     assert result == {"tokens": [], "pos_tags": []}
 
 
+def test_process_text_is_local_and_deterministic(monkeypatch):
+    """Decorative token/POS output must not consume the LLM critical path."""
+    calls = []
+
+    def fail_if_called(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError("process_text must not call the LLM")
+
+    monkeypatch.setattr(nlu, "call_openai_api", fail_if_called)
+
+    result = NLUProcessor().process_text(
+        "Orders on 2026-07-29 above 12.5",
+        session_id="run-1",
+    )
+
+    assert result == {
+        "tokens": ["orders", "on", "2026-07-29", "above", "12.5"],
+        "pos_tags": ["OTHER", "OTHER", "DATE", "OTHER", "NUM"],
+    }
+    assert calls == []
+
+
 def test_relative_date_not_set_without_period_unit(_muni_ru_fallback_processor):
     """T10-nlu регресс: запрос с триггером 'последн*' без явной единицы периода
     НЕ должен устанавливать relative_date.

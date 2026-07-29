@@ -22,7 +22,7 @@ try:
 except Exception:
     call_openai_api = None  # type: ignore
 
-from .prompts import build_nlu_prompt, build_nlp_prompt
+from .prompts import build_nlu_prompt
 
 
 def _nlu_max_tokens(key: str) -> int:
@@ -73,9 +73,9 @@ class NLUProcessor:
             )
         return cfg
 
-    # NOTE (T10-nlu): tokens/pos_tags используются downstream декоративно;
-    # fallback-реализация (_fallback_tokenize) ориентирована на RU-текст.
-    # Поведение и внешний контракт не меняются — см. AGENTS.md.
+    # NOTE (T10-nlu): tokens/pos_tags используются downstream декоративно.
+    # Поэтому scored-путь не должен зависеть от отдельного LLM-вызова:
+    # локальная токенизация сохраняет внешний контракт детерминированно.
     def process_text(self, text: str, session_id: str | None = None) -> Dict[str, List[str]]:
         """Токенизация и POS-тегирование текста.
 
@@ -90,32 +90,16 @@ class NLUProcessor:
             logger.warning("process_text: пустой или пробельный ввод, пропускаем NLP")
             return {"tokens": [], "pos_tags": []}
 
-        if call_openai_api:
-            try:
-                prompt = build_nlp_prompt(text)
-                resp = call_openai_api(
-                    prompt=prompt,
-                    system_prompt="Ты NLP-пайплайн. Возвращай только JSON.",
-                    max_tokens=_nlu_max_tokens("nlp_max_tokens"),
-                    response_format={"type": "json_object"}
-                )
-                from .utils import parse_llm_json_response
-                obj = parse_llm_json_response(resp)
-                if isinstance(obj, dict):
-                    tokens = obj.get("tokens")
-                    pos_tags = obj.get("pos_tags")
-                    if isinstance(tokens, list) and isinstance(pos_tags, list):
-                        return {"tokens": tokens, "pos_tags": pos_tags}
-                raise ValueError("LLM NLP response must contain tokens and pos_tags lists")
-            except Exception as e:
-                logger.warning(f"LLM NLP processing failed: {e}")
-                if not self._allow_fallbacks():
-                    raise self._nlu_unavailable_error("NLP processing") from e
-        elif not self._allow_fallbacks():
-            raise self._nlu_unavailable_error("NLP processing")
-
-        # Opt-in fallback эвристика
-        return self._fallback_tokenize(text)
+        tokens = _TOKEN_PATTERN.findall(text.lower())
+        pos_tags: List[str] = []
+        for token in tokens:
+            if _DATE_TOKEN_PATTERN.fullmatch(token):
+                pos_tags.append("DATE")
+            elif _NUM_TOKEN_PATTERN.fullmatch(token):
+                pos_tags.append("NUM")
+            else:
+                pos_tags.append("OTHER")
+        return {"tokens": tokens, "pos_tags": pos_tags}
 
     def extract_intent(self, text: str, session_id: str | None = None) -> Dict[str, Any]:
         """Извлечение намерения и сущностей из текста.
