@@ -54,7 +54,7 @@ outputs:
     format: json
 
 global_retry_policy:
-  max_retries: 2
+  max_retries: 0
   backoff_strategy: exponential
   base_delay: 1.0
   max_delay: 60.0
@@ -79,9 +79,9 @@ steps:
     tool_name: natural_language_processing
     tool_params:
       text: '{query}'
-    timeout: 120
+    timeout: 10
     retry_policy:
-      max_retries: 2
+      max_retries: 0
     
   - id: intent_extraction_step
     step_type: tool
@@ -91,7 +91,7 @@ steps:
       text: '{query}'
     timeout: 120
     retry_policy:
-      max_retries: 2
+      max_retries: 0
   
   # =====================================================================
   # ЭТАП 3: SCHEMA LINKING (прямой вызов тула)
@@ -137,7 +137,7 @@ steps:
         schema_info: {}
     timeout: 180
     retry_policy:
-      max_retries: 3
+      max_retries: 0
       backoff_strategy: exponential
   
   # =====================================================================
@@ -231,7 +231,7 @@ steps:
       - successful_sql_retrieval
     timeout: 240
     retry_policy:
-      max_retries: 2
+      max_retries: 0
       backoff_strategy: exponential
     metadata:
       pipeline_type: text_to_sql
@@ -313,7 +313,7 @@ steps:
       - sql_generation
     timeout: 180
     retry_policy:
-      max_retries: 1
+      max_retries: 0
       backoff_strategy: fixed
     metadata:
       pipeline_type: text_to_sql
@@ -348,7 +348,7 @@ steps:
     output_retry_policy:
       condition: '{sql_verification.verification_status} == "Rejected"'
       rerun_step: sql_generation
-      max_iterations: 2
+      max_iterations: 1
       feedback_field: sql_safety_check_feedback
 
   # =====================================================================

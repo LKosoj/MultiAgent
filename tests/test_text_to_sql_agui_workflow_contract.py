@@ -7459,6 +7459,26 @@ def test_sql_verification_step_receives_semantic_context():
         assert required_check in task.lower()
 
 
+def test_text_to_sql_workflow_does_not_retry_timed_out_model_steps():
+    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
+    workflow = models.WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
+    steps = {step.id: step for step in workflow.steps}
+
+    assert workflow.global_retry_policy.max_retries == 0
+    for step_id in (
+        "nlu_processing",
+        "intent_extraction_step",
+        "schema_linking_step",
+        "sql_generation",
+        "sql_verification",
+    ):
+        assert steps[step_id].retry_policy.max_retries == 0
+    assert steps["nlu_processing"].timeout <= 10
+    assert steps["sql_verification"].output_retry_policy["max_iterations"] == 1
+
+
 def test_sql_generation_step_requires_successful_schema_linking():
     """P-2: join_success=False не должен пускать пайплайн в успешную генерацию SQL."""
     models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
