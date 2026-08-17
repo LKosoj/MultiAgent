@@ -1,0 +1,28 @@
+{
+  "id": "lp_boy",
+  "name": "Мальчик (low poly)",
+  "category": "character",
+  "tags": [
+    "boy",
+    "child",
+    "moscow",
+    "football",
+    "desc:Ребёнок для московской улицы: футболисты и убегающий школьник."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.9080058804683976,
+    0.42796126023504955,
+    1.7
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/d984291f35244621abdbbd7527d44b33",
+  "file_size_bytes": 99448,
+  "fetched_at": "2026-08-16T22:54:03Z",
+  "asset_version": 1
+}

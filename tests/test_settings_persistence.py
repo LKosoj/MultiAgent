@@ -101,7 +101,16 @@ class TestSettingsPersistence(unittest.TestCase):
     def test_main_window_apply_settings_rebinds_runtime_state(self):
         body = get_method_body(MAIN_WINDOW_PATH, "apply_settings")
 
-        self.assertIn("self.project_manager.projects_dir = app_settings.get_projects_directory()", body)
+        env_line = 'os.environ["STORYBOOK_PROJECTS_DIR"] = str(app_settings.get_projects_directory())'
+        rebind_line = "self.project_manager.projects_dir = storybook_projects_root()"
+        self.assertIn(env_line, body)
+        self.assertIn(rebind_line, body)
+        self.assertLess(
+            body.index(env_line),
+            body.index(rebind_line),
+            "STORYBOOK_PROJECTS_DIR должна выставляться ДО storybook_projects_root(), "
+            "иначе резолвер прочитает старое значение (раздел 18.0 ТЗ)",
+        )
         self.assertIn("self.project_manager.backup_dir = app_settings.get_backup_directory()", body)
         self.assertIn("logging.getLogger().setLevel", body)
         self.assertIn("self.refresh_projects()", body)

@@ -212,6 +212,9 @@ jobs:
         env:
           TEXT2SQL_LATENCY_BASELINE_JSON: ${{ secrets.TEXT2SQL_LATENCY_BASELINE_JSON }}
           TEXT2SQL_EVAL_API_TOKEN: ${{ secrets.TEXT2SQL_EVAL_API_TOKEN }}
+          TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH: ${{ secrets.TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH }}
+          TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION: ${{ secrets.TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION }}
+          TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256: ${{ secrets.TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256 }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_KEY_DB: ${{ secrets.OPENAI_API_KEY_DB }}
@@ -233,6 +236,9 @@ jobs:
           : "${TEXT_TO_SQL_ALLOWED_DB_CIDRS:?allowed database CIDRs are required}"
           : "${TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS:?allowed database file roots are required}"
           : "${TEXT2SQL_EVAL_API_TOKEN:?evaluation API token is required}"
+          : "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH:?protected hidden synthetic seed path is required}"
+          : "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION:?protected hidden synthetic seed pack version is required}"
+          : "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256:?protected hidden synthetic seed pack SHA-256 is required}"
           : "${HF_TOKEN:?model token is required}"
           : "${OPENAI_API_KEY:?model API key is required}"
           : "${OPENAI_API_KEY_DB:?database model API key is required}"
@@ -246,9 +252,16 @@ jobs:
           printf '%s\n' "${PREVIOUS_FRONTEND_IMAGE}" | grep -Eq '@sha256:[0-9a-f]{64}$'
           printf '%s\n' "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_SHA256}" \
             | grep -Eq '^[0-9a-f]{64}$'
+          test "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION}" = "v1"
+          printf '%s\n' "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256}" \
+            | grep -Eq '^[0-9a-f]{64}$'
           case "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH}" in
             /*) ;;
             *) echo "approved backup manifest path must be absolute" >&2; exit 2 ;;
+          esac
+          case "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH}" in
+            /*) ;;
+            *) echo "protected hidden synthetic seed path must be absolute" >&2; exit 2 ;;
           esac
           approved_backup_manifest_path=$(realpath -e -- \
             "${TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH}") || {
@@ -259,15 +272,32 @@ jobs:
             echo "GitHub workspace path cannot be resolved" >&2
             exit 2
           }
+          hidden_synthetic_seed_path=$(realpath -e -- \
+            "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH}") || {
+              echo "protected hidden synthetic seed path cannot be resolved" >&2
+              exit 2
+            }
           case "${approved_backup_manifest_path}" in
             "${workspace_path}"|"${workspace_path}/"*)
               echo "approved backup manifest must be outside GITHUB_WORKSPACE" >&2
               exit 2
               ;;
           esac
+          case "${hidden_synthetic_seed_path}" in
+            "${workspace_path}"|"${workspace_path}/"*)
+              echo "protected hidden synthetic seed pack must be outside GITHUB_WORKSPACE" >&2
+              exit 2
+              ;;
+          esac
           test -f "${approved_backup_manifest_path}"
           test -r "${approved_backup_manifest_path}"
           test ! -w "${approved_backup_manifest_path}"
+          test -f "${hidden_synthetic_seed_path}"
+          test -r "${hidden_synthetic_seed_path}"
+          hidden_synthetic_seed_sha256=$(sha256sum -- \
+            "${hidden_synthetic_seed_path}" | cut -d ' ' -f 1)
+          test "${hidden_synthetic_seed_sha256}" = \
+            "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256}"
           approved_backup_manifest_sha256=$(sha256sum -- \
             "${approved_backup_manifest_path}" | cut -d ' ' -f 1)
           test "${approved_backup_manifest_sha256}" = \
@@ -288,6 +318,12 @@ jobs:
             printf 'NEXT_BUILD_ID=%s\n' "${NEXT_BUILD_ID}"
             printf 'TEXT2SQL_APPROVED_BACKUP_MANIFEST_PATH=%s\n' \
               "${approved_backup_manifest_path}"
+            printf 'TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PATH=%s\n' \
+              "${hidden_synthetic_seed_path}"
+            printf 'TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION=%s\n' \
+              "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_PACK_VERSION}"
+            printf 'TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256=%s\n' \
+              "${TEXT2SQL_HIDDEN_SYNTHETIC_SEED_SHA256}"
           } >> "${GITHUB_ENV}"
           mkdir -p artifacts/protected deploy/secrets
           python3 - <<'PY'
@@ -328,6 +364,22 @@ jobs:
           printf '%s' "${OPENAI_API_KEY}" > deploy/secrets/openai_api_key
           printf '%s' "${OPENAI_API_KEY_DB}" > deploy/secrets/openai_api_key_db
           chmod 600 deploy/secrets/*
+
+      - name: Run protected hidden synthetic contract
+        env:
+          TEXT2SQL_REQUIRE_HIDDEN_SYNTHETIC_SEEDS: "1"
+        run: |
+          set -eu
+          python3 - <<'PY'
+          from tests.fixtures.text_to_sql_adaptive.perturbations import (
+              load_hidden_seed_pack,
+          )
+
+          load_hidden_seed_pack()
+          PY
+          python3 -m pytest -q -W error \
+            tests/test_text_to_sql_adaptive_synthetic.py \
+            --adaptive-repetitions=20
 
       - name: Build and verify reproducible candidate images
         run: sh deploy/build_reproducible_images.sh

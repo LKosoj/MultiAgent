@@ -14,6 +14,8 @@ semantic verification, structured output, NLU и retry policy. Затем оба
 | BIRD Mini-Dev SQLite | 500 | 195/500 = **39,00%** | 299/500 = **59,80%** | 195/299 = **65,22%** |
 | Spider 2.0-Lite SQLite subset | 135 | 2/135 = **1,48%** | 2/135 = **1,48%** | 2/2 = **100%** |
 
+Исторические artifacts зафиксированы в [baseline registry](text2sql_public_benchmark_baseline_2026-07-29.json). Это проверяемое историческое свидетельство, а не release evidence и не основание для production admission.
+
 Главный вывод:
 
 - на BIRD качество дошедшего до исполнения SQL уже существенно выше общего

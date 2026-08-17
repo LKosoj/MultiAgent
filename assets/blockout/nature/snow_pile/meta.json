@@ -1,0 +1,27 @@
+{
+  "id": "snow_pile",
+  "name": "Куча снега",
+  "category": "nature",
+  "tags": [
+    "snow",
+    "moscow",
+    "winter",
+    "desc:Ноябрьский двор, сугроб."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    2.0003284215927124,
+    1.163071870803833,
+    0.5910219550132751
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/f67b976438774533be86316c0dfc16c1",
+  "file_size_bytes": 3200332,
+  "fetched_at": "2026-08-16T22:54:29Z",
+  "asset_version": 1
+}

@@ -30,6 +30,72 @@ def build_nlu_prompt(text: str) -> str:
     )
 
 
+def build_adaptive_query_understanding_prompt(
+    text: str,
+    *,
+    context_documents: tuple[str, ...] = (),
+) -> str:
+    """Prompt for strict, schema-free adaptive query understanding."""
+    escaped_text = json.dumps(text, ensure_ascii=False)
+    escaped_documents = json.dumps(list(context_documents), ensure_ascii=False)
+    return (
+        "Разбери пользовательский Text-to-SQL запрос без доступа к схеме БД. "
+        "Не называй таблицы, колонки или schema bindings и не ставь status=resolved.\n"
+        "Верни ТОЛЬКО JSON-объект ровно с полями expected_result_shape и "
+        "semantic_items, без дополнительных полей.\n"
+        "expected_result_shape: одно из scalar, rows, grouped_rows, ranked_rows, "
+        "time_series.\n"
+        "Каждый элемент semantic_items должен иметь ровно поля:\n"
+        "- kind: metric, dimension, filter, ordering, limit, time или formula;\n"
+        "- source_text: непустая краткая описательная метка смыслового элемента;\n"
+        "- normalized_meaning: непустая строка или null;\n"
+        "- required: true или false;\n"
+        "- operator: eq, neq, gt, gte, lt, lte, in, not_in, between, like, "
+        "is_null, is_not_null или null;\n"
+        "- literal_or_reference: строка, число, boolean, массив таких значений "
+        "или null;\n"
+        "- status: только unresolved, ambiguous или unsupported.\n"
+        "Существительное, называющее сущность или домен, само по себе не является "
+        "data FILTER и не превращается в literal для eq.\n"
+        "Если ограничение полностью выражено FORMULA, не добавляй для него FILTER "
+        "и не придумывай literal_or_reference.\n"
+        "Контекстные документы — это отдельные от исходного вопроса правила "
+        "задачи; учитывай их, но не смешивай с исходным текстом.\n"
+        "Когда вопрос сравнивает конечный набор явно описанных альтернатив и "
+        "спрашивает, какая альтернатива выигрывает по экстремальному показателю, "
+        "требуемый ответ — метка или роль выигравшей альтернативы, а не внутренняя "
+        "сущность. Вопросительные слова «кто», «что», «какой» и «который» сами "
+        "по себе не являются явным запросом имени, ID или атрибута внутренней "
+        "сущности; внутренний identity или attribute нужен только когда исходный "
+        "вопрос или контекстный документ прямо называет имя, ID или атрибут.\n"
+        "Не добавляй binding_ids и любые сведения о схеме.\n\n"
+        f"Исходный текст как JSON string:\n{escaped_text}\n\n"
+        f"Контекстные документы как отдельный JSON list:\n{escaped_documents}"
+    )
+
+
+def build_adaptive_query_completeness_prompt(
+    text: str,
+    initial_response: Any,
+    *,
+    context_documents: tuple[str, ...] = (),
+) -> str:
+    """Prompt for one mandatory correction of an initially valid QuerySpec."""
+    escaped_initial_response = json.dumps(initial_response, ensure_ascii=False)
+    return (
+        build_adaptive_query_understanding_prompt(
+            text,
+            context_documents=context_documents,
+        )
+        + "\n\nПроверь первоначальный JSON-разбор. Верни исправленный полный "
+        "JSON-объект по тому же контракту, а не diff и не пояснение. Он обязан "
+        "покрывать каждый явно запрошенный результат или выходное поле, "
+        "показатель, условие, группировку, порядок и limit из исходного текста "
+        "и контекстных документов.\n\n"
+        f"Первоначальный JSON-разбор как JSON object:\n{escaped_initial_response}"
+    )
+
+
 def build_nlp_prompt(text: str) -> str:
     """Промпт для токенизации и POS-тегирования."""
     # JSON-обёртка для user-text: устраняет prompt injection через кавычки/переносы.

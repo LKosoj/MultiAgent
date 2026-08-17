@@ -34,7 +34,6 @@ _REQUEST_BOOLEAN_FIELDS = frozenset(
         "include_explanation",
         "validate_schema",
         "dry_run_only",
-        "use_schema_suggestions",
     }
 )
 _REQUEST_FIELDS = _REQUEST_BOOLEAN_FIELDS | {"max_rows", "safety_level"}
@@ -127,7 +126,6 @@ def _request_options(value: Any, *, source: str) -> dict[str, Any]:
         "include_explanation": True,
         "validate_schema": True,
         "dry_run_only": False,
-        "use_schema_suggestions": True,
     }
     options.update(value)
     max_rows = options["max_rows"]

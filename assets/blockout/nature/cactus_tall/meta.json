@@ -1,0 +1,25 @@
+{
+  "id": "cactus_tall",
+  "name": "Высокий кактус",
+  "category": "nature",
+  "tags": [
+    "cactus",
+    "desert"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.3962499499320984,
+    0.3390820622444153,
+    0.7499999888241291
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 8640,
+  "fetched_at": "2026-08-16T21:19:51Z",
+  "asset_version": 1
+}

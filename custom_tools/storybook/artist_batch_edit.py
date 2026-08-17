@@ -644,6 +644,338 @@ def _augment_negative_prompt_for_text_uniqueness(negative_prompt: str) -> str:
     return ", ".join(parts)
 
 
+# =============================================================================
+# Болванка как референс изображения (ТЗ раздел 11.2/11.2.1/11.2.2/11.2.3)
+# =============================================================================
+
+_BLOCKOUT_ROLE_BLOCK_TEMPLATE = (
+    "Reference {n} is a GEOMETRY LAYOUT (grey 3D blockout), not an art reference.\n"
+    "It defines ONLY: camera angle, framing, object placement, scale, overlap\n"
+    "and eyelines. Reproduce that geometry exactly.\n"
+    "Everything else is deliberately absent from it. Do NOT treat its emptiness\n"
+    "as the content of the shot: add full set dressing, props, materials,\n"
+    "textures, background depth and lighting that the scene description calls for.\n"
+    "Never copy its grey colour, flat shading, missing textures or simplified shapes.\n"
+    "The reference-role list written earlier in this prompt was numbered BEFORE this\n"
+    "layout was inserted at position {n}: every role it calls image K, for K >= {n}, now\n"
+    "refers to image K+1. Image {n} is this layout and nothing else."
+)
+
+# ТЗ §11.2.3: та же геометрическая роль, но БЕЗ инструкции "add full set dressing" из
+# _BLOCKOUT_ROLE_BLOCK_TEMPLATE — для shot_type: end и start/link_type: reference эта
+# инструкция заменяется (а не дополняется) ограничением сохранения деталей ниже,
+# иначе в промпте оказываются два взаимоисключающих указания про один и тот же кадр.
+_BLOCKOUT_ROLE_BLOCK_TEMPLATE_RESTRICTED = (
+    "Reference {n} is a GEOMETRY LAYOUT (grey 3D blockout), not an art reference.\n"
+    "It defines ONLY: camera angle, framing, object placement, scale, overlap\n"
+    "and eyelines. Reproduce that geometry exactly.\n"
+    "Everything else is deliberately absent from it.\n"
+    "Never copy its grey colour, flat shading, missing textures or simplified shapes.\n"
+    "The reference-role list written earlier in this prompt was numbered BEFORE this\n"
+    "layout was inserted at position {n}: every role it calls image K, for K >= {n}, now\n"
+    "refers to image K+1. Image {n} is this layout and nothing else."
+)
+
+_BLOCKOUT_END_FRAME_RESTRICTION = (
+    "This is the END frame of the shot. The set, props, materials and background\n"
+    "detail MUST stay exactly as in Reference 1 (the START frame of this shot).\n"
+    "Add nothing new and remove nothing, except the changes listed explicitly\n"
+    "in the shot description."
+)
+
+_BLOCKOUT_START_REFERENCE_RESTRICTION = (
+    "Reference 1 is the LAST frame of the PREVIOUS shot of the same scene.\n"
+    "The set, props, materials and background detail MUST stay exactly as in\n"
+    "Reference 1. Add nothing new and remove nothing, except the changes\n"
+    "listed explicitly in the shot description."
+)
+
+_IMAGE_ROLE_RE = re.compile(r"\b([Ii]mage)\s+(\d+)\b")
+
+
+def _build_blockout_role_block(item: Dict[str, Any]) -> str:
+    """Текст роли болванки для english_prompt (ТЗ §11.2.2/§11.2.3).
+
+    Пусто, если болванка не была подставлена в референсы этого элемента
+    (см. _apply_blockout_reference_to_item, ставит item["_blockout_ref_position"]).
+
+    ТЗ §11.2.3: "add full set dressing" из §11.2.2 применяется только к
+    shot_type: start с link_type: independent (обстановка создаётся впервые).
+    У shot_type: end и start/link_type: reference обстановка наследуется с
+    Reference 1, и эта инструкция ЗАМЕНЯЕТСЯ ограничением сохранения деталей,
+    а не дополняется им.
+    """
+    position = item.get("_blockout_ref_position")
+    if not position:
+        return ""
+
+    shot_type = item.get("shot_type")
+    link_type = item.get("link_type")
+
+    if shot_type == "end":
+        block = _BLOCKOUT_ROLE_BLOCK_TEMPLATE_RESTRICTED.format(n=position)
+        return f"{block}\n\n{_BLOCKOUT_END_FRAME_RESTRICTION}"
+    if shot_type == "start" and link_type == "reference":
+        block = _BLOCKOUT_ROLE_BLOCK_TEMPLATE_RESTRICTED.format(n=position)
+        return f"{block}\n\n{_BLOCKOUT_START_REFERENCE_RESTRICTION}"
+
+    return _BLOCKOUT_ROLE_BLOCK_TEMPLATE.format(n=position)
+
+
+def _augment_negative_prompt_for_blockout_reference(negative_prompt: str) -> str:
+    extras = [
+        "grey untextured geometry",
+        "flat shading",
+        "empty blockout surfaces",
+        "missing set dressing",
+    ]
+    parts: List[str] = []
+    seen = set()
+    for raw_part in str(negative_prompt or "").split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        normalized = part.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(part)
+    for extra in extras:
+        normalized = extra.lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        parts.append(extra)
+    return ", ".join(parts)
+
+
+def _renumber_image_roles_from(text: str, from_position: int) -> str:
+    """Сдвигает номера "image N" (N >= from_position) на +1 в свободном тексте.
+
+    Используется только для reference_roles_instruction (раздел 19.3: поле
+    существует только в памяти, ни модель его не читает, ни на диск оно не
+    пишется — правка нужна исключительно для трассируемости в отчётности).
+    """
+    if not text:
+        return text
+
+    def _bump(match: "re.Match[str]") -> str:
+        word, num_str = match.group(1), match.group(2)
+        num = int(num_str)
+        if num >= from_position:
+            return f"{word} {num + 1}"
+        return match.group(0)
+
+    return _IMAGE_ROLE_RE.sub(_bump, text)
+
+
+def _insert_blockout_role_into_instruction_text(text: str, position: int) -> str:
+    """Дополняет reference_roles_instruction упоминанием болванки (только для
+    отчётности, см. _renumber_image_roles_from)."""
+    renumbered = _renumber_image_roles_from(text or "", position)
+    blockout_note = (
+        f"image {position} as blockout geometry layout "
+        "(camera angle, framing, object placement only; not an art reference)."
+    )
+    if renumbered:
+        return f"{renumbered} {blockout_note}"
+    return blockout_note
+
+
+def _apply_blockout_reference_to_item(item: Dict[str, Any], blockout_ref_image: str) -> None:
+    """Вставляет опорный фрейм болванки в references элемента на позицию 2
+    (ТЗ §11.2.1). Мутирует item на месте. Ничего не делает (только лог
+    warning), если правило это запрещает: единственный референс в списке,
+    пустой список референсов или файл отсутствует на диске.
+    """
+    scene_number = item.get("scene_number")
+    shot_number = item.get("shot_number")
+
+    if not blockout_ref_image or not os.path.exists(blockout_ref_image):
+        logger.warning(
+            "⚠️ Опорный кадр болванки не найден на диске, референс не добавлен "
+            f"(scene={scene_number}, shot={shot_number}): {blockout_ref_image}"
+        )
+        item["_p18_reason"] = "blockout_ref_missing_file"
+        return
+
+    raw_refs = item.get("reference_image_paths")
+    if raw_refs is None:
+        raw_refs = item.get("references")
+    if isinstance(raw_refs, list):
+        existing_refs = list(raw_refs)
+    elif isinstance(raw_refs, str):
+        import ast
+        try:
+            parsed = ast.literal_eval(raw_refs) if raw_refs.startswith("[") else [raw_refs]
+            existing_refs = list(parsed) if isinstance(parsed, list) else [raw_refs]
+        except (ValueError, SyntaxError):
+            existing_refs = [raw_refs] if raw_refs else []
+    else:
+        existing_refs = []
+
+    if len(existing_refs) == 0:
+        logger.warning(
+            "⚠️ У элемента нет ни одного референса, опорный кадр болванки на позицию 1 не подставляется "
+            f"(scene={scene_number}, shot={shot_number})"
+        )
+        item["_p18_reason"] = "no_references"
+        return
+    if len(existing_refs) == 1:
+        logger.warning(
+            "⚠️ У элемента ровно один референс (правило масштабирования), опорный кадр болванки не добавлен "
+            f"(scene={scene_number}, shot={shot_number})"
+        )
+        # ТЗ раздел 11.2: осознанная потеря, фиксируется предупреждением в отчёте.
+        item["_p18_reason"] = "single_reference_exception"
+        return
+
+    existing_refs.insert(1, blockout_ref_image)
+    item["reference_image_paths"] = existing_refs
+    item["_blockout_ref_position"] = 2
+    item["reference_roles_instruction"] = _insert_blockout_role_into_instruction_text(
+        item.get("reference_roles_instruction") or "", 2
+    )
+
+
+def _blockout_cache_key(project_id: Any, scene_number: Any, shot_number: Any, shot_type: Any) -> Tuple[Any, Any, Any, Any]:
+    return (project_id, scene_number, shot_number, shot_type)
+
+
+def _load_blockout_ref_image_cache(items_data: List[Dict[str, Any]]) -> Dict[Tuple[Any, Any, Any, Any], str]:
+    """Читает 97_shots/shots.json один раз на проект (ТЗ §11.2 п.2 — не читать
+    файл на каждый элемент батча) и строит кэш
+    (project_id, scene_number, shot_number, shot_type) -> blockout_ref_image.
+    """
+    from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
+    project_ids = {
+        item.get("project_id")
+        for item in items_data
+        if isinstance(item, dict) and item.get("project_id")
+    }
+
+    cache: Dict[Tuple[Any, Any, Any, Any], str] = {}
+    for project_id in project_ids:
+        try:
+            project_dir = safe_storybook_project_dir(project_id)
+            shots_path = project_dir / "97_shots" / "shots.json"
+            if not shots_path.exists():
+                continue
+            with open(shots_path, "r", encoding="utf-8") as f:
+                shots_doc = json.load(f)
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось прочитать shots.json для блокаут-референсов проекта {project_id}: {e}")
+            continue
+
+        shots_list = shots_doc.get("items") if isinstance(shots_doc, dict) else None
+        if not isinstance(shots_list, list):
+            continue
+        for shot in shots_list:
+            if not isinstance(shot, dict):
+                continue
+            blockout_ref_image = shot.get("blockout_ref_image")
+            if not blockout_ref_image:
+                continue
+            try:
+                key = _blockout_cache_key(
+                    project_id,
+                    int(shot.get("scene_number")),
+                    int(shot.get("shot_number")),
+                    shot.get("shot_type"),
+                )
+            except (TypeError, ValueError):
+                continue
+            cache[key] = blockout_ref_image
+
+    return cache
+
+
+def _maybe_apply_blockout_reference(
+    item: Dict[str, Any],
+    blockout_cache: Dict[Tuple[Any, Any, Any, Any], str],
+    use_blockout_reference: bool,
+    generate_blockout: bool,
+) -> None:
+    """Проверяет флаги пайплайна и project_id перед обращением к кэшу (ТЗ §11.2
+    п.1 и п.3): если project_id пуст или в кэше нет записи для этого шота,
+    референс просто не подставляется, шаг не падает.
+    """
+    if not use_blockout_reference or not generate_blockout:
+        return
+
+    project_id = item.get("project_id")
+    if not project_id:
+        logger.warning("⚠️ Пустой project_id, опорный кадр болванки не может быть найден")
+        item["_p18_reason"] = "empty_project_id"
+        return
+
+    try:
+        key = _blockout_cache_key(
+            project_id,
+            int(item.get("scene_number")),
+            int(item.get("shot_number")),
+            item.get("shot_type"),
+        )
+    except (TypeError, ValueError):
+        return
+
+    blockout_ref_image = blockout_cache.get(key)
+    if not blockout_ref_image:
+        logger.warning(
+            f"⚠️ Опорный кадр болванки не найден в shots.json для проекта {project_id} "
+            f"(scene={item.get('scene_number')}, shot={item.get('shot_number')}, type={item.get('shot_type')})"
+        )
+        item["_p18_reason"] = "blockout_ref_not_found_in_shots_json"
+        return
+
+    _apply_blockout_reference_to_item(item, blockout_ref_image)
+
+
+def _check_p18_reference_order(item: Dict[str, Any], paths_list: List[str]) -> Optional[Dict[str, Any]]:
+    """ТЗ §20.2, код P18: сверяет фактически поданный в запрос список
+    референсов (``paths_list``) с правилом раздела 11.2.1. Не изобретает
+    второй источник истины о позиции — читает то же, что уже записали
+    ``_apply_blockout_reference_to_item``/``_maybe_apply_blockout_reference``
+    в сам ``item`` (``_blockout_ref_position`` при успехе, ``_p18_reason``
+    при любом из документированных исходов «болванка не подставлена»).
+
+    Возвращает None, если применение болванки к этому элементу не
+    ожидалось вовсе (флаги выключены либо позиция/причина не отмечены), а
+    иначе — если позиция болванки в ``paths_list`` не совпала с той, что
+    была назначена, — находку P18 с фактическим списком путей.
+    """
+    reason = item.get("_p18_reason")
+    position = item.get("_blockout_ref_position")
+    if not reason and not position:
+        return None
+
+    if not reason:
+        ref_list = item.get("reference_image_paths")
+        expected_path = (
+            ref_list[position - 1]
+            if isinstance(ref_list, list) and len(ref_list) >= position
+            else None
+        )
+        if (
+            expected_path is not None
+            and len(paths_list) >= position
+            and paths_list[position - 1] == expected_path
+        ):
+            return None
+        reason = "reference_dropped_or_reordered"
+
+    return {
+        "code": "P18",
+        "level": "warning",
+        "scene_number": item.get("scene_number"),
+        "shot_number": item.get("shot_number"),
+        "shot_type": item.get("shot_type"),
+        "message": "reference composition/order sent to the model diverged from раздел 11.2.1",
+        "details": {"reason": reason, "actual_reference_paths": list(paths_list)},
+    }
+
+
 def _build_image_generation_prompts(
     item: Dict[str, Any],
     scene_prompt: str,
@@ -705,6 +1037,10 @@ def _build_image_generation_prompts(
     english_prompt = f"{english_prompt}\n\n{single_illustration_block}".strip()
     if ensemble_balance_block:
         english_prompt = f"{english_prompt}\n\n{ensemble_balance_block}".strip()
+    blockout_role_block = _build_blockout_role_block(item)
+    if blockout_role_block:
+        english_prompt = f"{english_prompt}\n\n{blockout_role_block}".strip()
+        negative_prompt = _augment_negative_prompt_for_blockout_reference(negative_prompt)
 
     return english_prompt, negative_prompt
 
@@ -720,16 +1056,18 @@ def _handle_linked_shot(item: Dict[str, Any]) -> bool:
     """
     source_path = item.get("source_end_path")
     target_path = item.get("output_path")
-    
+
     if not source_path or not target_path:
         logger.warning("⚠️ Отсутствует source_end_path или output_path для связанного кадра")
+        item["link_copy_failed"] = True
         return False
-    
+
     # Проверяем существование source файла
     if not os.path.exists(source_path):
         logger.warning(f"⚠️ Source файл не найден: {source_path}")
+        item["link_copy_failed"] = True
         return False
-    
+
     # Проверяем, нужно ли копировать
     copy_needed = False
     if not os.path.exists(target_path):
@@ -738,15 +1076,16 @@ def _handle_linked_shot(item: Dict[str, Any]) -> bool:
     else:
         source_mtime = os.path.getmtime(source_path)
         target_mtime = os.path.getmtime(target_path)
-        
+
         if source_mtime > target_mtime:
             logger.info(f"🔄 Source файл новее, обновляем: {os.path.basename(target_path)}")
             copy_needed = True
         else:
             logger.info(f"✅ Target файл актуален: {os.path.basename(target_path)}")
             item["image_path"] = target_path
+            item["link_copy_failed"] = False
             return True  # файл актуален, пропускаем генерацию
-    
+
     # Выполняем копирование
     if copy_needed:
         try:
@@ -754,11 +1093,13 @@ def _handle_linked_shot(item: Dict[str, Any]) -> bool:
             shutil.copy2(source_path, target_path)
             item["image_path"] = target_path
             logger.info(f"✅ Файл успешно скопирован: {os.path.basename(source_path)} → {os.path.basename(target_path)}")
+            item["link_copy_failed"] = False
             return True
         except Exception as e:
             logger.error(f"❌ Ошибка копирования {source_path} → {target_path}: {e}")
+            item["link_copy_failed"] = True
             return False
-    
+
     return False
 
 
@@ -923,9 +1264,20 @@ def _build_edit_instruction(
     # Применяем умный отбор
     if len(reference_only_paths) > 10:
         logger.info(f"🎯 Применяем умный отбор из {len(reference_only_paths)} референсов для типа '{entity_type}'")
-        reference_only_paths = _smart_select_references_for_generation(
-            entity_type, entity_data, reference_only_paths, max_count=10
-        )
+        if item.get("_blockout_ref_position"):
+            # ТЗ §11.2.1: носитель обстановки (позиция 1) и опорный кадр болванки (позиция 2)
+            # закреплены и исключаются из отбора; лимит для остальных снижается до 8.
+            pinned_count = min(2, len(reference_only_paths))
+            pinned_refs = reference_only_paths[:pinned_count]
+            remaining_refs = reference_only_paths[pinned_count:]
+            selected_remaining = _smart_select_references_for_generation(
+                entity_type, entity_data, remaining_refs, max_count=max(0, 10 - pinned_count)
+            )
+            reference_only_paths = pinned_refs + selected_remaining
+        else:
+            reference_only_paths = _smart_select_references_for_generation(
+                entity_type, entity_data, reference_only_paths, max_count=10
+            )
     
     paths_list = reference_only_paths
     images_count = len(paths_list)
@@ -1740,6 +2092,65 @@ def _group_items_by_scenes(items_data: List[Dict[str, Any]], is_video: bool = Fa
     return scenes, []
 
 
+def _as_bool(value: Any) -> bool:
+    """Разбор булевых флагов пайплайна (строки вида "false"/"true" из YAML/AG-UI).
+
+    Тот же образец, что и в blockout_scene_builder.py/blockout_renderer.py/
+    blockout_preview.py/music_generator.py — без него непустая строка "false"
+    была бы истинной в Python и молча инвертировала бы гейт.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _write_artist_batch_report_section(
+    project_id: Optional[str],
+    items_data: List[Dict[str, Any]],
+    p12_findings: List[Dict[str, Any]],
+    p18_findings: List[Dict[str, Any]],
+) -> None:
+    """ТЗ раздел 20.3: секция ``artist_batch_shots`` (коды P12, P18) в
+    ``93_blockout/report.json``, под той же sidecar-блокировкой, что и у
+    остальных писателей отчёта.
+
+    Создатель файла — только ``blockout_scene_builder``: если файла ещё
+    нет, эта функция ничего не создаёт и не падает (тот же приём, что у
+    ``blockout_preview._report_write_summary``). Внутри секции запись идёт
+    слиянием по ключу шота (scene_number, shot_number, shot_type) — чужие
+    находки вне scope этого прогона не трогаются.
+    """
+    if not project_id:
+        return
+
+    from custom_tools.storybook.blockout_scene_builder import merge_write_report
+    from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
+    report_path = safe_storybook_project_dir(project_id) / "93_blockout" / "report.json"
+    if not report_path.is_file():
+        return
+
+    processed_keys = {
+        (item.get("scene_number"), item.get("shot_number"), item.get("shot_type"))
+        for item in items_data
+    }
+    new_checks = list(p12_findings) + list(p18_findings)
+
+    def _update(section: Dict[str, Any]) -> Dict[str, Any]:
+        section = dict(section)
+        checks = [
+            c for c in (section.get("checks") or [])
+            if (c.get("scene_number"), c.get("shot_number"), c.get("shot_type")) not in processed_keys
+        ]
+        checks.extend(new_checks)
+        section["checks"] = checks
+        return section
+
+    merge_write_report(report_path, "artist_batch_shots", _update)
+
+
 def artist_agent_batch_edit_tool(
     session_id: str,
     items: Any,
@@ -1747,7 +2158,9 @@ def artist_agent_batch_edit_tool(
     items_to_edit: Optional[Dict[int, Any]] = None,
     pipeline_type: str = "workflow",
     enable: bool = True,
-    language: str = 'en'
+    language: str = 'en',
+    use_blockout_reference: bool = False,
+    generate_blockout: bool = False,
 ) -> str:
     """
     Пакетное редактирование изображений с использованием агента artist_agent в параллельном режиме.
@@ -1784,6 +2197,11 @@ def artist_agent_batch_edit_tool(
         pipeline_type: Тип пайплайна для фабрики агентов.
         enable: Если True, выполняет генерацию изображений. Если False, пропускает выполнение и возвращает пустой результат.
         language: Язык генерации из пайплайна (для правильного перевода промптов).
+        use_blockout_reference: Если True (и generate_blockout True), опорный кадр болванки
+            подставляется как референс изображения (ТЗ раздел 11.2). По умолчанию False —
+            не влияет на вызовы этого инструмента из шага artist_batch (книжные иллюстрации).
+        generate_blockout: Флаг пайплайна "слой болванок включён" (раздел 10.4); должен быть
+            True одновременно с use_blockout_reference, иначе референс болванки не подставляется.
 
     Returns:
         JSON-строка со списком результатов по каждому элементу.
@@ -1791,7 +2209,10 @@ def artist_agent_batch_edit_tool(
 
     if not session_id:
         raise ValueError("session_id обязателен")
-    
+
+    use_blockout_reference = _as_bool(use_blockout_reference)
+    generate_blockout = _as_bool(generate_blockout)
+
     # Проверка параметра enable
     if not enable:
         logger.info("🚫 Генерация изображений отключена (enable=False), пропускаем выполнение")
@@ -1872,6 +2293,16 @@ def artist_agent_batch_edit_tool(
         )
 
     results: List[Dict[str, Any]] = []
+    # ТЗ §20.2/20.3, код P18: находки заполняются внутри _worker() при первой
+    # попытке сборки запроса (см. вызов _check_p18_reference_order ниже).
+    p18_findings: List[Dict[str, Any]] = []
+
+    # ТЗ §11.2 п.2: shots.json c полями болванки читается один раз на батч (не на элемент).
+    blockout_cache = (
+        _load_blockout_ref_image_cache(items_data)
+        if use_blockout_reference and generate_blockout
+        else {}
+    )
 
     def _generate_base_image(
         session_id: str, 
@@ -1972,6 +2403,7 @@ def artist_agent_batch_edit_tool(
 
     def _worker(index: int, item: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
         # Используем language из замыкания (переменная доступна из artist_agent_batch_edit_tool)
+        link_copy_failed_this_run = False
         try:
             # Проверяем, является ли это связанным кадром (из предыдущего end кадра)
             if item.get("copy_from_previous_end", False):
@@ -1982,11 +2414,15 @@ def artist_agent_batch_edit_tool(
                         "index": index,
                         "ok": True,
                         "output_path": item.get("output_path", ""),
-                        "raw_output": f"Файл скопирован из предыдущего end кадра: {item.get('source_end_path', '')}"
+                        "raw_output": f"Файл скопирован из предыдущего end кадра: {item.get('source_end_path', '')}",
+                        "link_copy_failed": item.get("link_copy_failed", False),
                     }
                 # Если копирование не удалось, продолжаем с обычной генерацией
                 logger.warning(f"⚠️ Fallback на генерацию для связанного кадра {index}")
-            
+                # П12 (раздел 20.2/Р4): оба исхода отката должны быть видны в возвращаемой записи —
+                # и переход к обычной генерации, и возврат уже лежащего на диске файла ниже.
+                link_copy_failed_this_run = item.get("link_copy_failed", False)
+
             # Проверяем, существует ли уже финальное изображение
             output_path = item.get("output_path", "")
             if output_path and os.path.exists(output_path):
@@ -1995,7 +2431,8 @@ def artist_agent_batch_edit_tool(
                     "index": index,
                     "ok": True,
                     "output_path": output_path,
-                    "raw_output": f"Файл уже существует: {output_path}"
+                    "raw_output": f"Файл уже существует: {output_path}",
+                    "link_copy_failed": link_copy_failed_this_run,
                 }
 
             spec_bs = item.get("_shot_frame_spec") or item.get("shot_frame_spec")
@@ -2015,8 +2452,9 @@ def artist_agent_batch_edit_tool(
                     "ok": True,
                     "output_path": out_bs,
                     "raw_output": "black_screen_local_png",
+                    "link_copy_failed": link_copy_failed_this_run,
                 }
-            
+
             # Проверяем, есть ли референсные изображения для работы
             reference_paths = item.get("reference_image_paths") or item.get("references") or []
             if reference_paths:
@@ -2040,12 +2478,22 @@ def artist_agent_batch_edit_tool(
                     item = dict(item)
                     item["image_path"] = base_image
 
+            _maybe_apply_blockout_reference(item, blockout_cache, use_blockout_reference, generate_blockout)
+
             # Механизм повторных попыток (до 3 раз)
             max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 try:
                     task, paths_list, scene_negative, english_prompt = _build_edit_instruction(session_id=session_id, item=item, seed=seed, language=language)
-                    
+
+                    if attempt == 1:
+                        # ТЗ §20.2, код P18: фактический список референсов этой
+                        # попытки не меняется от повтора к повтору (item тот
+                        # же) — проверяем его один раз, чтобы не задвоить находку.
+                        p18_finding = _check_p18_reference_order(item, paths_list)
+                        if p18_finding:
+                            p18_findings.append(p18_finding)
+
                     log_data = {
                         "🎨 Попытка": f"{attempt}/{max_attempts} - Элемент #{index}",
                         "📝 Промпт": english_prompt,
@@ -2093,7 +2541,8 @@ def artist_agent_batch_edit_tool(
                             "ok": True,
                             "output_path": file_path,
                             "raw_output": str(result)[:4000],
-                            "attempts": attempt
+                            "attempts": attempt,
+                            "link_copy_failed": link_copy_failed_this_run,
                         }
                     else:
                         logger.warning(f"⚠️ Попытка {attempt}/{max_attempts} не создала файл: {file_path}")
@@ -2106,24 +2555,26 @@ def artist_agent_batch_edit_tool(
                                 "output_path": file_path,
                                 "raw_output": str(result)[:4000],
                                 "error": f"Файл не создан после {max_attempts} попыток",
-                                "attempts": attempt
+                                "attempts": attempt,
+                                "link_copy_failed": link_copy_failed_this_run,
                             }
-                            
+
                 except Exception as e:
                     logger.error(f"❌ Ошибка на попытке {attempt}/{max_attempts} для элемента {index}: {e}")
                     if attempt < max_attempts:
                         continue  # Повторяем попытку
                     else:
                         return {
-                            "index": index, 
-                            "ok": False, 
+                            "index": index,
+                            "ok": False,
                             "error": f"Все {max_attempts} попытки неудачны. Последняя ошибка: {str(e)}",
-                            "attempts": attempt
+                            "attempts": attempt,
+                            "link_copy_failed": link_copy_failed_this_run,
                         }
-                        
+
         except Exception as e:
             logger.error(f"Критическая ошибка обработки элемента {index}: {e}")
-            return {"index": index, "ok": False, "error": str(e)}
+            return {"index": index, "ok": False, "error": str(e), "link_copy_failed": link_copy_failed_this_run}
 
     # Определяем, является ли это батчем видео-кадров
     is_video_batch = _is_video_batch(items_obj)
@@ -2257,6 +2708,7 @@ def artist_agent_batch_edit_tool(
         
         # Fallback: последовательное выполнение всех элементов
         results.clear()  # Очищаем частичные результаты
+        p18_findings.clear()  # ..и частичные находки P18 (иначе задвоятся при повторном проходе)
         all_items = illustration_items if not is_video_batch else [item for scene in video_scenes for item in scene]
         
         for item in all_items:
@@ -2271,6 +2723,32 @@ def artist_agent_batch_edit_tool(
 
     # Сортируем по index для стабильности
     results.sort(key=lambda x: x.get("index", 0))
+
+    # ТЗ раздел 20.3: секция artist_batch_shots (P12, P18) пишется только при
+    # включённом слое болванок — при generate_blockout=False (в т.ч. для
+    # вызовов этого же инструмента шагом artist_batch книжных иллюстраций)
+    # секция не формируется вовсе, P12 остаётся только в журнале выполнения.
+    if generate_blockout:
+        p12_findings = []
+        for result in results:
+            if not result.get("link_copy_failed"):
+                continue
+            idx = result.get("index")
+            src_item = items_data[idx] if isinstance(idx, int) and 0 <= idx < len(items_data) else {}
+            p12_findings.append({
+                "code": "P12",
+                "level": "warning",
+                "scene_number": src_item.get("scene_number"),
+                "shot_number": src_item.get("shot_number"),
+                "shot_type": src_item.get("shot_type"),
+                "message": "chain marked inconsistent: link copy from source_end_path failed, image continuity broken",
+                "details": {
+                    "output_path": result.get("output_path"),
+                    "source_end_path": src_item.get("source_end_path"),
+                },
+            })
+        _write_artist_batch_report_section(project_id, items_data, p12_findings, p18_findings)
+
     return json.dumps(results, ensure_ascii=False, indent=2)
 
 
@@ -2383,6 +2861,89 @@ def _generate_image_from_scratch(
         return os.path.exists(output_path)
     except Exception as e:
         logger.error(f"Ошибка генерации изображения с нуля для {name}: {e}")
+        return False
+
+
+def _generate_canon_reference_from_scratch(
+    session_id: str,
+    entity_type: str,
+    entity_data: Dict[str, Any],
+    output_path: str,
+    consistency_rules: List[Dict[str, Any]],
+    pipeline_type: str
+) -> bool:
+    """Генерирует канонический референс без опорных изображений."""
+    try:
+        _ensure_parent_dir(output_path)
+
+        prompt = build_canon_image_prompt(entity_type, entity_data, consistency_rules)
+        if not prompt.strip():
+            return False
+
+        if entity_type == "location":
+            negative_prompt = "people, person, character, human, man, woman, child, figure, watermark, text, logo"
+        elif entity_type == "character":
+            negative_prompt = (
+                "complex background, detailed background, scenery, landscape, watermark, text, logo, "
+                "nsfw, lowres, extra limbs, extra fingers, extra fingers, malformed hands"
+            )
+        else:
+            negative_prompt = "watermark, text, logo, nsfw, lowres, extra limbs, extra fingers, malformed hands"
+
+        from utils import translate_prompts_in_items
+        translated_item = translate_prompts_in_items({"prompt": prompt}, 'en')
+        english_prompt = translated_item.get('english_prompt', prompt)
+
+        task = f"""
+Ты — художник-иллюстратор (artist_agent). Твоя задача — СОЗДАТЬ новое изображение.
+
+СТРОГО СЛЕДУЙ ИНСТРУКЦИЯМ НИЖЕ:
+1) Используй инструмент generate_image_tool.
+2) Используй информацию для создания промпта для изображения. Переведи её на английский (проверь, что все слова переведены): "{english_prompt}"
+3) Обязательно укажи negative_prompt (английский, не пустой).
+4) Параметры вызова generate_image_tool должны быть ПЕРЕДАНЫ ЯВНО как именованные аргументы:
+   - prompt: "prompt_on_english"
+   - session_id: "{session_id}"
+   - number: 1
+   - negative_prompt: "{negative_prompt}"
+   - width: 1920
+   - height: 1080
+   - true_cfg_scale: 5.0
+   - num_inference_steps: 50
+   - output_path: "{output_path}"
+
+КРИТИЧЕСКИ ВАЖНО:
+- Язык описания изображения (prompt) — ТОЛЬКО английский.
+- В ответе НЕ выводи ничего лишнего, кроме результата вызова инструмента и финального пути к файлу.
+"""
+
+        logger.info(
+            f"🎨 Создаём канонический референс из описания для {entity_data.get('name', 'Unknown')} ({entity_type}) через generate_image_tool"
+        )
+        logger.info(f"📝 Промпт: {english_prompt[:220]}...")
+        logger.info(f"🚫 Негативный промпт: {negative_prompt}")
+
+        factory = AgentFactory()
+        agent = factory.create_agent(
+            profile_type='artist_agent',
+            session_id=session_id,
+            task=task.strip(),
+            pipeline_type=pipeline_type
+        )
+        output = agent.run(task.strip(), stream=False)
+        gen_path = _parse_output_path(str(output), session_id)
+        if gen_path and os.path.exists(gen_path):
+            if os.path.abspath(gen_path) != os.path.abspath(output_path):
+                _ensure_parent_dir(output_path)
+                shutil.move(gen_path, output_path)
+            return os.path.exists(output_path)
+        if os.path.exists(output_path):
+            return True
+        return False
+    except Exception as e:
+        logger.error(
+            f"Ошибка генерации канонического референса с нуля для {entity_data.get('name', 'Unknown')} ({entity_type}): {e}"
+        )
         return False
 
 
@@ -2548,6 +3109,34 @@ def _ensure_references_exist(
         logger.error(f"Ошибка при генерации протагониста: {e}")
 
     # 4. Последовательная генерация остальных недостающих референсов
+    if not existing_paths:
+        logger.warning("Нет существующих референсов для генерации через edit_image_vse_tool. Пробуем создать недостающие референсы из описаний.")
+        pending_paths: List[str] = []
+        for path_to_create in missing_paths:
+            entity_info = entities_by_full_path.get(path_to_create)
+            if not entity_info:
+                logger.warning(f"Не найдена информация о сущности для {os.path.basename(path_to_create)}. Пропуск.")
+                pending_paths.append(path_to_create)
+                continue
+
+            entity_type, entity_data = entity_info
+            if _generate_canon_reference_from_scratch(
+                session_id=session_id,
+                entity_type=entity_type,
+                entity_data=entity_data,
+                output_path=path_to_create,
+                consistency_rules=consistency_rules,
+                pipeline_type=pipeline_type,
+            ):
+                logger.info(f"Канонический референс создан без опорных изображений: {path_to_create}")
+                existing_paths.append(path_to_create)
+            else:
+                logger.error(f"Не удалось создать референс без опорных изображений: {path_to_create}")
+                pending_paths.append(path_to_create)
+        missing_paths = pending_paths
+        if not missing_paths:
+            return
+
     for path_to_create in missing_paths:
         if not existing_paths:
             logger.warning(f"Нет существующих референсов для создания {os.path.basename(path_to_create)}. Пропуск.")

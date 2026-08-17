@@ -18,7 +18,9 @@ import yaml
 
 from StoryBookManager.core.project_manager import Project
 from StoryBookManager.core.pipeline_runner import PipelineRunner, run_pipeline_sync
+from StoryBookManager.core.file_manager import FileManager
 from StoryBookManager.gui.step_tracker import StepTracker
+from StoryBookManager.utils.scroll_utils import bind_mousewheel_to_canvas_frame
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,7 @@ class GenerationPanel(ttk.Frame):
         self.supported_languages: List[str] = []
         self._cancel_event = threading.Event()
         self._is_paused = False
+        self._last_running_step_id: Optional[str] = None
         
         # Загружаем шаги из pipeline файла
         self.load_pipeline_steps()
@@ -164,6 +167,18 @@ class GenerationPanel(ttk.Frame):
         self.sample_shot_key_var = tk.StringVar()
         self.generate_music_var = tk.BooleanVar()
         self.final_allow_missing_audio_var = tk.BooleanVar()
+        self.blockout_enabled_var = tk.BooleanVar()
+        self.blockout_fps_var = tk.StringVar()
+        self.blockout_resolution_var = tk.StringVar()
+        self.blockout_scope_var = tk.StringVar()
+        self.blockout_jobs_var = tk.StringVar()
+        self.blockout_img_ref_var = tk.BooleanVar()
+        self.blockout_vid_ref_var = tk.BooleanVar()
+        self.blockout_burnin_var = tk.BooleanVar()
+        # Пятая точка правки (раздел 18.2): флажки длительностей строятся по
+        # 97_shots/video_model_caps.json конкретного проекта, а не из inputs —
+        # создаются здесь пустыми и пересобираются в load_project().
+        self.blockout_durations_vars: Dict[int, tk.BooleanVar] = {}
         self._reset_pipeline_settings_to_defaults()
 
     def _reset_pipeline_settings_to_defaults(self):
@@ -202,6 +217,22 @@ class GenerationPanel(ttk.Frame):
         )
         self.final_allow_missing_audio_var.set(
             self._to_bool(self.pipeline_inputs.get("final_allow_missing_audio", False))
+        )
+        self.blockout_enabled_var.set(
+            self._to_bool(self.pipeline_inputs.get("generate_blockout", False))
+        )
+        self.blockout_fps_var.set(str(self.pipeline_inputs.get("blockout_fps", "")))
+        self.blockout_resolution_var.set(str(self.pipeline_inputs.get("blockout_resolution", "")))
+        self.blockout_scope_var.set(str(self.pipeline_inputs.get("blockout_scope", "")))
+        self.blockout_jobs_var.set(str(self.pipeline_inputs.get("blockout_jobs", "")))
+        self.blockout_img_ref_var.set(
+            self._to_bool(self.pipeline_inputs.get("blockout_use_as_image_reference", False))
+        )
+        self.blockout_vid_ref_var.set(
+            self._to_bool(self.pipeline_inputs.get("blockout_use_as_video_reference", False))
+        )
+        self.blockout_burnin_var.set(
+            self._to_bool(self.pipeline_inputs.get("blockout_preview_burnin", False))
         )
 
     def _apply_project_pipeline_settings(self, brief_data: Dict[str, Any]):
@@ -250,6 +281,26 @@ class GenerationPanel(ttk.Frame):
             self.final_allow_missing_audio_var.set(
                 self._to_bool(brief_data.get("final_allow_missing_audio"))
             )
+        if "generate_blockout" in brief_data:
+            self.blockout_enabled_var.set(self._to_bool(brief_data.get("generate_blockout")))
+        if "blockout_fps" in brief_data and brief_data.get("blockout_fps") not in (None, ""):
+            self.blockout_fps_var.set(str(brief_data.get("blockout_fps")))
+        if "blockout_resolution" in brief_data and brief_data.get("blockout_resolution") not in (None, ""):
+            self.blockout_resolution_var.set(str(brief_data.get("blockout_resolution")))
+        if "blockout_scope" in brief_data:
+            self.blockout_scope_var.set(str(brief_data.get("blockout_scope") or "").strip())
+        if "blockout_jobs" in brief_data and brief_data.get("blockout_jobs") not in (None, ""):
+            self.blockout_jobs_var.set(str(brief_data.get("blockout_jobs")))
+        if "blockout_use_as_image_reference" in brief_data:
+            self.blockout_img_ref_var.set(
+                self._to_bool(brief_data.get("blockout_use_as_image_reference"))
+            )
+        if "blockout_use_as_video_reference" in brief_data:
+            self.blockout_vid_ref_var.set(
+                self._to_bool(brief_data.get("blockout_use_as_video_reference"))
+            )
+        if "blockout_preview_burnin" in brief_data:
+            self.blockout_burnin_var.set(self._to_bool(brief_data.get("blockout_preview_burnin")))
         self._sync_sample_shot_key_state()
 
     def _collect_pipeline_params(self) -> Dict[str, Any]:
@@ -300,7 +351,89 @@ class GenerationPanel(ttk.Frame):
             "sample_shot_key": sample_shot_key,
             "generate_music": bool(self.generate_music_var.get()),
             "final_allow_missing_audio": bool(self.final_allow_missing_audio_var.get()),
+            "generate_blockout": bool(self.blockout_enabled_var.get()),
+            "blockout_fps": int(self.blockout_fps_var.get()),
+            "blockout_resolution": self.blockout_resolution_var.get().strip(),
+            "blockout_allowed_durations": self._collect_blockout_allowed_durations(),
+            "blockout_scope": self.blockout_scope_var.get().strip(),
+            "blockout_jobs": int(self.blockout_jobs_var.get() or 0),
+            "blockout_use_as_image_reference": bool(self.blockout_img_ref_var.get()),
+            "blockout_use_as_video_reference": bool(self.blockout_vid_ref_var.get()),
+            "blockout_preview_burnin": bool(self.blockout_burnin_var.get()),
         }
+
+    def _collect_blockout_allowed_durations(self) -> List[int]:
+        """Раздел 18.2: список отмеченных длительностей болванки.
+
+        Пустой список — каноническая запись «весь набор модели»: получается и
+        когда отмечены все флажки, и когда не отмечен ни один (ограничения нет
+        в обоих случаях), и когда флажков ещё нет вовсе (проект без
+        `97_shots/video_model_caps.json`).
+        """
+        checked = sorted(
+            duration for duration, var in self.blockout_durations_vars.items() if bool(var.get())
+        )
+        if len(checked) == len(self.blockout_durations_vars):
+            return []
+        return checked
+
+    # Ключи настроек болванки в 00_brief.json — тот же набор, что собирает
+    # `_collect_pipeline_params()` (раздел 18.2), поэтому его результат годится
+    # как снимок для `_persist_blockout_settings()` без досбора значений.
+    _BLOCKOUT_SETTINGS_KEYS = (
+        "generate_blockout",
+        "blockout_fps",
+        "blockout_resolution",
+        "blockout_allowed_durations",
+        "blockout_scope",
+        "blockout_jobs",
+        "blockout_use_as_image_reference",
+        "blockout_use_as_video_reference",
+        "blockout_preview_burnin",
+    )
+
+    def _persist_blockout_settings(
+        self, project_id: str, blockout_settings: Dict[str, Any], overrides: Optional[dict] = None
+    ) -> bool:
+        """Раздел 18.2: дописывает настройки болванки в `00_brief.json`, не
+        затрагивая остальные поля брифа. Вызывается после успешной валидации
+        из всех точек запуска пайплайна панели (`run_full_pipeline()`,
+        `run_from_step()`, `_restart_pipeline_step_from_tracker()`).
+
+        `blockout_settings` — снимок значений виджетов болванки, собранный в
+        ГЛАВНОМ потоке ДО старта фонового потока (валидация и запись идут в
+        фоне). Метод сам больше не читает Tk-переменные: чтение
+        `tk.Variable.get()` из не-главного потока небезопасно, а флажки могли
+        измениться между стартом валидации и моментом записи — писать нужно
+        снимок на момент нажатия кнопки, а не текущее состояние виджетов.
+        На практике сюда передаётся уже собранный `pipeline_inputs`
+        (`_collect_pipeline_params()`) — набор его ключей совпадает с этим.
+
+        `overrides` перекрывает значения из `blockout_settings` — задел под
+        вкладку «Болванка» (раздел 18.4), которой нужен принудительный
+        `generate_blockout: True` независимо от снимка.
+
+        Не останавливает прогон при ошибке сохранения: параметры болванки уже
+        собраны в память и уходят в pipeline, теряется только их запись в
+        проект. Возвращает `True`/`False` — сохранены ли настройки.
+        """
+        blockout_settings = {key: blockout_settings[key] for key in self._BLOCKOUT_SETTINGS_KEYS}
+        if overrides:
+            blockout_settings.update(overrides)
+
+        file_manager = FileManager(project_id)
+        brief = file_manager.load_json_file("brief") or {}
+        brief.update(blockout_settings)
+        if not file_manager.save_json_file(brief, "brief"):
+            self.after(0, lambda: self.add_log(
+                "настройки болванки не сохранены в проект, при следующем открытии вернутся прежние",
+                "warning",
+            ))
+            return False
+
+        if self.current_project and self.current_project.project_id == project_id:
+            self.current_project.brief_data = brief
+        return True
 
     def _sync_sample_shot_key_state(self):
         """Включает поле sample-shot только для sample-before-batch режима."""
@@ -308,7 +441,86 @@ class GenerationPanel(ttk.Frame):
             return
         state = "normal" if bool(self.sample_before_batch_var.get()) else "disabled"
         self.sample_shot_key_combo.config(state=state)
-    
+
+    def _sync_blockout_group_state(self):
+        """Раздел 18.2: делает группу настроек болванки неактивной, пока снят
+        флажок «Генерировать болванку». Готового прецедента нет —
+        `_sync_sample_shot_key_state()` отключает только один виджет, здесь
+        нужно обойти все дочерние виджеты фрейма группы."""
+        if not hasattr(self, "blockout_settings_frame"):
+            return
+        enabled = bool(self.blockout_enabled_var.get())
+        state = "normal" if enabled else "disabled"
+        combo_state = "readonly" if enabled else "disabled"
+
+        def _apply(widget):
+            try:
+                widget.config(state=combo_state if isinstance(widget, ttk.Combobox) else state)
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                _apply(child)
+
+        for child in self.blockout_settings_frame.winfo_children():
+            _apply(child)
+
+    def _rebuild_blockout_duration_checkboxes(self, project: Project):
+        """Пятая точка правки (раздел 18.2). Флажки допустимых длительностей
+        болванки зависят только от `97_shots/video_model_caps.json`
+        конкретного проекта, а не от `inputs`/брифа, поэтому не укладываются
+        в четыре стандартных метода настроек pipeline и пересобираются здесь,
+        при выборе проекта — безусловно, независимо от наличия брифа. Заодно
+        показывает справочную строку P17 (раздел 6.1): сумму `duration_s` по
+        шотам против ориентира `screenplay_time`, если её записал
+        `screenplay_shots_generator`."""
+        if not hasattr(self, "blockout_durations_frame"):
+            return
+
+        for widget in self.blockout_durations_frame.winfo_children():
+            widget.destroy()
+        self.blockout_durations_vars = {}
+
+        caps_path = project.project_path / "97_shots" / "video_model_caps.json"
+        durations: List[int] = []
+        caps_warnings: List[Any] = []
+        if caps_path.exists():
+            try:
+                with open(caps_path, "r", encoding="utf-8") as f:
+                    caps = json.load(f)
+                raw_durations = caps.get("supported_durations") or []
+                durations = sorted({int(d) for d in raw_durations})
+                caps_warnings = caps.get("warnings") or []
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать video_model_caps.json: {e}")
+
+        if not durations:
+            ttk.Label(
+                self.blockout_durations_frame,
+                text="набор длительностей станет известен после шага screenplay_shots_generator",
+                foreground="gray",
+            ).pack(anchor="w")
+        else:
+            allowed = None
+            if project.brief_data and "blockout_allowed_durations" in project.brief_data:
+                allowed = project.brief_data.get("blockout_allowed_durations") or []
+            for duration in durations:
+                var = tk.BooleanVar()
+                var.set(True if not allowed else duration in allowed)
+                self.blockout_durations_vars[duration] = var
+                ttk.Checkbutton(
+                    self.blockout_durations_frame,
+                    text=f"{duration} с",
+                    variable=var,
+                ).pack(side="left", padx=(0, 8))
+
+        p17_message = ""
+        for warning in caps_warnings:
+            if isinstance(warning, dict) and warning.get("code") == "P17":
+                p17_message = str(warning.get("message") or "")
+                break
+        if hasattr(self, "blockout_p17_label"):
+            self.blockout_p17_label.config(text=p17_message)
+
     def create_ui(self):
         """Создание пользовательского интерфейса"""
         # Заголовок
@@ -339,11 +551,31 @@ class GenerationPanel(ttk.Frame):
         main_frame = ttk.Frame(self)
         main_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
-        # Левая панель - управление
-        left_frame = ttk.LabelFrame(main_frame, text="Операции генерации", padding=10)
-        left_frame.pack(side="left", fill="y", padx=(0, 5))
-        left_frame.config(width=300)
-        
+        # Левая панель - управление. Раздел 18.2 «Что проверить при
+        # внедрении»: девять новых элементов группы «Болванка» вытолкнули бы
+        # блоки «Частичная генерация»/«Регенерация»/«Валидация» за нижний
+        # край — переводим колонку на Canvas+Scrollbar по образцу
+        # StepTracker (gui/step_tracker.py, строки 51-63).
+        left_container = ttk.Frame(main_frame)
+        left_container.pack(side="left", fill="y", padx=(0, 5))
+        left_container.config(width=300)
+
+        left_canvas = tk.Canvas(left_container, width=300, highlightthickness=0)
+        left_scrollbar = ttk.Scrollbar(left_container, orient="vertical", command=left_canvas.yview)
+        left_frame = ttk.LabelFrame(left_canvas, text="Операции генерации", padding=10)
+
+        left_frame.bind(
+            "<Configure>",
+            lambda e: left_canvas.configure(scrollregion=left_canvas.bbox("all"))
+        )
+        left_canvas.create_window((0, 0), window=left_frame, anchor="nw")
+        left_canvas.configure(yscrollcommand=left_scrollbar.set)
+
+        left_canvas.pack(side="left", fill="both", expand=True)
+        left_scrollbar.pack(side="left", fill="y")
+
+        bind_mousewheel_to_canvas_frame(left_canvas, left_frame)
+
         self.create_generation_controls(left_frame)
         
         # Правая панель - логи и прогресс
@@ -501,7 +733,113 @@ class GenerationPanel(ttk.Frame):
         ttk.Button(pipeline_frame, text="🚀 Запустить полный pipeline",
                   command=self.run_full_pipeline,
                   style="Accent.TButton").pack(fill="x")
-        
+
+        # Болванка (3D-референс), раздел 18.2
+        blockout_frame = ttk.LabelFrame(parent, text="Болванка (3D-референс)", padding=10)
+        blockout_frame.pack(fill="x", pady=(0, 10))
+
+        self.blockout_enabled_checkbutton = ttk.Checkbutton(
+            blockout_frame,
+            text="Генерировать болванку",
+            variable=self.blockout_enabled_var,
+            command=self._sync_blockout_group_state,
+        )
+        self.blockout_enabled_checkbutton.pack(anchor="w")
+
+        self.blockout_settings_frame = ttk.Frame(blockout_frame)
+        self.blockout_settings_frame.pack(fill="x")
+
+        fps_frame = ttk.Frame(self.blockout_settings_frame)
+        fps_frame.pack(fill="x", pady=(6, 0))
+        ttk.Label(fps_frame, text="Частота кадров:").pack(side="left")
+        self.blockout_fps_combo = ttk.Combobox(
+            fps_frame,
+            textvariable=self.blockout_fps_var,
+            values=("24", "25", "30"),
+            state="readonly",
+            width=6,
+        )
+        self.blockout_fps_combo.pack(side="left", padx=(5, 0))
+
+        resolution_frame = ttk.Frame(self.blockout_settings_frame)
+        resolution_frame.pack(fill="x", pady=(6, 0))
+        ttk.Label(resolution_frame, text="Разрешение:").pack(side="left")
+        self.blockout_resolution_combo = ttk.Combobox(
+            resolution_frame,
+            textvariable=self.blockout_resolution_var,
+            values=("960x540", "1280x720", "1920x1080"),
+            state="readonly",
+            width=10,
+        )
+        self.blockout_resolution_combo.pack(side="left", padx=(5, 0))
+
+        ttk.Label(self.blockout_settings_frame, text="Допустимые длительности:").pack(
+            anchor="w", pady=(8, 0)
+        )
+        # Пятая точка правки (раздел 18.2): содержимое пересобирается в
+        # load_project() по 97_shots/video_model_caps.json выбранного проекта.
+        self.blockout_durations_frame = ttk.Frame(self.blockout_settings_frame)
+        self.blockout_durations_frame.pack(fill="x")
+        self.blockout_durations_hint_label = ttk.Label(
+            self.blockout_durations_frame,
+            text="набор длительностей станет известен после шага screenplay_shots_generator",
+            foreground="gray",
+        )
+        self.blockout_durations_hint_label.pack(anchor="w")
+        ttk.Label(
+            self.blockout_settings_frame,
+            text="Пусто или отмечено всё — разрешён весь набор модели",
+            foreground="gray",
+        ).pack(anchor="w")
+        self.blockout_p17_label = ttk.Label(self.blockout_settings_frame, text="")
+        self.blockout_p17_label.pack(anchor="w")
+
+        scope_frame = ttk.Frame(self.blockout_settings_frame)
+        scope_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(scope_frame, text="Область:").pack(side="left")
+        self.blockout_scope_combo = ttk.Combobox(
+            scope_frame,
+            textvariable=self.blockout_scope_var,
+            width=16,
+        )
+        self.blockout_scope_combo.pack(side="left", padx=(5, 0))
+        ttk.Label(scope_frame, text="all / scene_NN / scene_NN_shot_MM / chain_<id>").pack(
+            side="left", padx=(5, 0)
+        )
+
+        jobs_frame = ttk.Frame(self.blockout_settings_frame)
+        jobs_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(jobs_frame, text="Параллельных процессов (0 = авто):").pack(side="left")
+        self.blockout_jobs_spinbox = ttk.Spinbox(
+            jobs_frame,
+            from_=0,
+            to=sys.maxsize,
+            textvariable=self.blockout_jobs_var,
+            width=6,
+        )
+        self.blockout_jobs_spinbox.pack(side="left", padx=(5, 0))
+
+        self.blockout_img_ref_checkbutton = ttk.Checkbutton(
+            self.blockout_settings_frame,
+            text="Как референс для изображений",
+            variable=self.blockout_img_ref_var,
+        )
+        self.blockout_img_ref_checkbutton.pack(anchor="w", pady=(8, 0))
+        self.blockout_vid_ref_checkbutton = ttk.Checkbutton(
+            self.blockout_settings_frame,
+            text="Как референс для видео",
+            variable=self.blockout_vid_ref_var,
+        )
+        self.blockout_vid_ref_checkbutton.pack(anchor="w", pady=(2, 0))
+        self.blockout_burnin_checkbutton = ttk.Checkbutton(
+            self.blockout_settings_frame,
+            text="Подписи на превью",
+            variable=self.blockout_burnin_var,
+        )
+        self.blockout_burnin_checkbutton.pack(anchor="w", pady=(2, 0))
+
+        self._sync_blockout_group_state()
+
         # Частичная генерация
         partial_frame = ttk.LabelFrame(parent, text="Частичная генерация", padding=10)
         partial_frame.pack(fill="x", pady=(0, 10))
@@ -621,6 +959,7 @@ class GenerationPanel(ttk.Frame):
         """Загрузка проекта"""
         try:
             self.current_project = project
+            self._rebuild_blockout_duration_checkboxes(project)
             self._reset_pipeline_settings_to_defaults()
             
             # Загружаем описание из brief если есть
@@ -792,6 +1131,8 @@ class GenerationPanel(ttk.Frame):
         def _validate_then_run():
             try:
                 validation_result = self.pipeline_runner.validate_project_for_pipeline(project_id)
+                for warning in validation_result.get("warnings", []):
+                    self.after(0, lambda w=warning: self.add_log(f"⚠️ {w}", "warning"))
                 if not validation_result.get("valid", False):
                     msg = validation_result.get("message", "")
 
@@ -812,6 +1153,15 @@ class GenerationPanel(ttk.Frame):
                         with self._generation_lock:
                             self.is_generating = False
                         return
+
+                # Раздел 18.2: дозапись настроек болванки в 00_brief.json —
+                # строго после успешной валидации, а не сразу после сбора
+                # параметров (иначе валидация ещё старого брифа отработала бы
+                # по новому generate_blockout и выдала бы ложные ошибки).
+                # Снимок при этом берётся не сейчас, а из pipeline_inputs —
+                # он собран в главном потоке ДО старта этого фонового потока,
+                # ещё до нажатия кнопки виджеты не успели измениться.
+                self._persist_blockout_settings(project_id, pipeline_inputs)
 
                 # Валидация прошла — старт UI-состояния и потока в одном Tk-колбэке,
                 # чтобы гарантировать: start_generation (сброс cancel-event, кнопки)
@@ -854,6 +1204,13 @@ class GenerationPanel(ttk.Frame):
                                    step_error: str = None,
                                    step_error_class: str = None,
                                    step_traceback: str = None):
+                if step_status == "running" and step_id:
+                    # Раздел 18.4: вкладке «Болванка» нужно знать id последнего
+                    # запущенного шага (например, чтобы блокировать ручное
+                    # редактирование длительности, пока идёт
+                    # screenplay_shots_generator) — очистки нет намеренно, для
+                    # последовательного pipeline это и означает «текущий шаг».
+                    self._last_running_step_id = step_id
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
                 if step_status == "failed" and (step_error or step_error_class):
@@ -911,6 +1268,13 @@ class GenerationPanel(ttk.Frame):
                                    step_error: str = None,
                                    step_error_class: str = None,
                                    step_traceback: str = None):
+                if step_status == "running" and step_id:
+                    # Раздел 18.4: вкладке «Болванка» нужно знать id последнего
+                    # запущенного шага (например, чтобы блокировать ручное
+                    # редактирование длительности, пока идёт
+                    # screenplay_shots_generator) — очистки нет намеренно, для
+                    # последовательного pipeline это и означает «текущий шаг».
+                    self._last_running_step_id = step_id
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
                 if step_status == "failed" and (step_error or step_error_class):
@@ -975,6 +1339,13 @@ class GenerationPanel(ttk.Frame):
                                    step_error: str = None,
                                    step_error_class: str = None,
                                    step_traceback: str = None):
+                if step_status == "running" and step_id:
+                    # Раздел 18.4: вкладке «Болванка» нужно знать id последнего
+                    # запущенного шага (например, чтобы блокировать ручное
+                    # редактирование длительности, пока идёт
+                    # screenplay_shots_generator) — очистки нет намеренно, для
+                    # последовательного pipeline это и означает «текущий шаг».
+                    self._last_running_step_id = step_id
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
                 if step_status == "failed" and (step_error or step_error_class):
@@ -1036,6 +1407,13 @@ class GenerationPanel(ttk.Frame):
                                    step_error: str = None,
                                    step_error_class: str = None,
                                    step_traceback: str = None):
+                if step_status == "running" and step_id:
+                    # Раздел 18.4: вкладке «Болванка» нужно знать id последнего
+                    # запущенного шага (например, чтобы блокировать ручное
+                    # редактирование длительности, пока идёт
+                    # screenplay_shots_generator) — очистки нет намеренно, для
+                    # последовательного pipeline это и означает «текущий шаг».
+                    self._last_running_step_id = step_id
                 level = "error" if step_status == "failed" else "info"
                 _log(message, level)
                 if step_status == "failed" and (step_error or step_error_class):
@@ -1137,6 +1515,8 @@ class GenerationPanel(ttk.Frame):
                 validation_result = self.pipeline_runner.validate_project_for_pipeline(
                     project_id, start_step=step_id
                 )
+                for warning in validation_result.get("warnings", []):
+                    self.after(0, lambda w=warning: self.add_log(f"⚠️ {w}", "warning"))
                 if not validation_result.get("valid", False):
                     msg = validation_result.get("message", "")
 
@@ -1156,6 +1536,12 @@ class GenerationPanel(ttk.Frame):
                     if not user_said_yes[0]:
                         self.after(0, self.finish_generation)
                         return
+
+                # Раздел 18.2: та же дозапись, что и в run_full_pipeline() —
+                # после успешной валидации, не раньше, снимок — из
+                # pipeline_inputs, собранного в главном потоке до старта
+                # этого фонового потока.
+                self._persist_blockout_settings(project_id, pipeline_inputs)
 
                 self.generation_thread = threading.Thread(
                     target=self._run_from_step_thread,
@@ -1201,6 +1587,10 @@ class GenerationPanel(ttk.Frame):
             messagebox.showerror("Ошибка параметров pipeline", str(e))
             return
 
+        # Раздел 18.2: здесь валидации проекта нет вовсе, поэтому дозапись
+        # выполняется сразу после успешного сбора параметров.
+        self._persist_blockout_settings(self.current_project.project_id, pipeline_inputs)
+
         task = self.task_text.get("1.0", tk.END).strip() or None
 
         try:
@@ -1220,6 +1610,78 @@ class GenerationPanel(ttk.Frame):
         except Exception:
             self.is_generating = False
             raise
+
+    def run_blockout_scoped_step(
+        self, step_id: str, scope: str, extra_overrides: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Запуск одного шага болванки со вкладки «Болванка» (раздел 18.4).
+
+        Почти то же самое, что и `_restart_pipeline_step_from_tracker()` выше —
+        та же блокировка, тот же сбор параметров и тот же `_run_single_step_thread`,
+        без шага валидации проекта. Отличие в двух вещах, которые приходят от
+        вызывающей вкладки, а не из виджетов панели генерации: `blockout_scope`
+        (какие сцены/шоты/цепочки затронуть) и принудительный
+        `generate_blockout: True`. Форсировать `generate_blockout` обязательно:
+        rerun_single_step() снимает у шага depends_on/condition, но не enable, а
+        тот берётся из переменных сохранённого checkpoint — если оставить
+        значение флажка «Генерировать болванку» панели генерации (он мог быть
+        снят), шаг отработает по старому enable: false и ничего не сделает.
+        Та же дозапись уходит и в 00_brief.json через уже существующий
+        _persist_blockout_settings(overrides=...), не дублируем его логику.
+
+        Возвращает True, если поток запуска стартовал; False — если генерация
+        уже идёт или сбор параметров не прошёл (в обоих случаях сообщение уже
+        показано пользователю).
+        """
+        if not self.current_project:
+            messagebox.showwarning("Предупреждение", "Выберите проект")
+            return False
+
+        already_running = False
+        with self._generation_lock:
+            if self.is_generating:
+                already_running = True
+            else:
+                self.is_generating = True
+        if already_running:
+            messagebox.showwarning("Предупреждение", "Генерация уже выполняется")
+            return False
+
+        try:
+            pipeline_inputs = self._collect_pipeline_params()
+        except ValueError as e:
+            self.is_generating = False
+            messagebox.showerror("Ошибка параметров pipeline", str(e))
+            return False
+
+        pipeline_inputs["blockout_scope"] = scope
+        pipeline_inputs["generate_blockout"] = True
+        if extra_overrides:
+            pipeline_inputs.update(extra_overrides)
+
+        project_id = self.current_project.project_id
+        self._persist_blockout_settings(project_id, pipeline_inputs, overrides={"generate_blockout": True})
+
+        task = self.task_text.get("1.0", tk.END).strip() or None
+
+        try:
+            self.start_generation(f"Болванка: {step_id} ({scope})", {
+                "project_id": project_id,
+                "step_id": step_id,
+                **pipeline_inputs,
+                **({"task": task} if task else {}),
+            })
+
+            self.generation_thread = threading.Thread(
+                target=self._run_single_step_thread,
+                args=(project_id, step_id, task, pipeline_inputs),
+                daemon=True,
+            )
+            self.generation_thread.start()
+        except Exception:
+            self.is_generating = False
+            raise
+        return True
 
     def regenerate_image(self):
         """Регенерация изображения — не реализовано"""
@@ -1241,6 +1703,8 @@ class GenerationPanel(ttk.Frame):
         def _run():
             try:
                 result = self.pipeline_runner.validate_project_for_pipeline(project_id)
+                for warning in result.get("warnings", []):
+                    self.after(0, lambda w=warning: self.add_log(f"⚠️ {w}", "warning"))
                 if result.get("valid", False):
                     self.after(0, lambda: self.add_log("✅ Проект прошел валидацию", "success"))
                 else:
@@ -1277,8 +1741,13 @@ class GenerationPanel(ttk.Frame):
         """Исправление ошибок проекта — не реализовано"""
         messagebox.showinfo("Не реализовано", "Автоматическое исправление ошибок не реализовано")
 
-    def _resolve_project_path(self, project_id: str) -> Path:
-        """Возвращает путь проекта для чтения артефактов video pipeline."""
+    def _resolve_project_path(self, project_id: str) -> Optional[Path]:
+        """Возвращает путь проекта для чтения артефактов video pipeline.
+
+        None, если project_id не резолвится в безопасный путь внутри
+        каталога проектов (раздел 18.0 ТЗ) — вызывающий код обязан пропустить
+        сводку, а не работать с непроверенным путём.
+        """
         if (
             self.current_project
             and self.current_project.project_id == project_id
@@ -1288,7 +1757,12 @@ class GenerationPanel(ttk.Frame):
             if project_path.exists():
                 return project_path
 
-        return Path(__file__).parent.parent.parent / "plots" / "storybooks" / project_id
+        from custom_tools.storybook.project_paths import safe_storybook_project_dir
+        try:
+            return safe_storybook_project_dir(project_id)
+        except ValueError:
+            logger.warning("Не удалось безопасно определить путь проекта %s", project_id)
+            return None
 
     @staticmethod
     def _read_json_artifact(project_path: Path, relative_path: str) -> Optional[Dict[str, Any]]:
@@ -1312,6 +1786,16 @@ class GenerationPanel(ttk.Frame):
             if key in capabilities:
                 parts.append(f"{key}={'yes' if capabilities.get(key) else 'no'}")
         return ", ".join(parts) if parts else "неизвестно"
+
+    @staticmethod
+    def _pluralize_ru(n: int, one: str, few: str, many: str) -> str:
+        """Согласует существительное с числительным по правилам русского языка."""
+        n_abs = abs(int(n))
+        if n_abs % 10 == 1 and n_abs % 100 != 11:
+            return one
+        if 2 <= n_abs % 10 <= 4 and not (12 <= n_abs % 100 <= 14):
+            return few
+        return many
 
     @staticmethod
     def _format_workflow_actions(actions_contract: Dict[str, Any]) -> str:
@@ -1353,6 +1837,14 @@ class GenerationPanel(ttk.Frame):
             language=language or "ru",
             enable=bool(self.generate_screenplay_var.get()) if hasattr(self, "generate_screenplay_var") else True,
             generate_music=bool(self.generate_music_var.get()) if hasattr(self, "generate_music_var") else True,
+            # Раздел 18.3: панель передаёт текущие значения флажков, минуя
+            # 00_brief.json — в момент проверки готовности там ещё лежит
+            # состояние прошлого прогона, а не то, что человек только что
+            # выставил (запись в бриф идёт при запуске, после валидации).
+            generate_blockout=bool(self.blockout_enabled_var.get()) if hasattr(self, "blockout_enabled_var") else None,
+            blockout_use_as_video_reference=(
+                bool(self.blockout_vid_ref_var.get()) if hasattr(self, "blockout_vid_ref_var") else None
+            ),
         )
 
     def _format_provider_readiness_summary(self, readiness: Dict[str, Any]) -> List[tuple[str, str]]:
@@ -1403,6 +1895,53 @@ class GenerationPanel(ttk.Frame):
             f"ffprobe={render.get('ffprobe_path') or 'missing'}",
             "success" if render.get("configured") else "warning",
         ))
+
+        # Раздел 18.3: готовность Blender, библиотеки объектов и состояние
+        # слоя болванок — payload приходит из storybook_video_music_readiness().
+        blockout = video.get("blockout") if isinstance(video, dict) else {}
+        blockout = blockout if isinstance(blockout, dict) else {}
+        blender = blockout.get("blender")
+        blender = blender if isinstance(blender, dict) else {}
+        asset_library = blockout.get("asset_library")
+        asset_library = asset_library if isinstance(asset_library, dict) else {}
+
+        blender_available = blender.get("available")
+        blender_version = blender.get("version")
+        blender_path = blender.get("path")
+        if blender_available:
+            blender_text = f"Blender: ✅ {blender_version}"
+            if blender_path:
+                blender_text += f" ({blender_path})"
+            blender_level = "success"
+        else:
+            # Отсутствие/старая версия Blender при включённой болванке — error
+            # (раздел 18.3); версия ниже минимальной — error независимо от
+            # флажка, отсутствие при выключенной болванке — warning (не
+            # блокирует то, что и так не будет запущено).
+            blender_level = "error" if (blender_version is not None or blockout.get("enabled")) else "warning"
+            blender_text = f"Blender: ❌ {blender.get('message') or 'недоступен'}"
+        messages.append((blender_text, blender_level))
+
+        object_count = asset_library.get("object_count") or 0
+        fetch_enabled = asset_library.get("fetch_enabled")
+        asset_text = (
+            "Библиотека объектов: "
+            f"{'✅' if fetch_enabled else 'ℹ️'} "
+            f"{object_count} {self._pluralize_ru(object_count, 'объект', 'объекта', 'объектов')}, "
+            f"автоподбор {'включён' if fetch_enabled else 'выключен'}"
+        )
+        messages.append((asset_text, "success" if fetch_enabled else "info"))
+
+        blockout_enabled = bool(blockout.get("enabled"))
+        blockout_use_reference = bool(blockout.get("use_reference"))
+        if not blockout_enabled:
+            layer_text, layer_level = "Слой болванок: ℹ️ выключен", "info"
+        elif not blockout_use_reference:
+            layer_text, layer_level = "Слой болванок: ⚠️ включён, видео-референс не подан", "warning"
+        else:
+            layer_text, layer_level = "Слой болванок: ✅ включён, видео-референс будет подан", "success"
+        messages.append((layer_text, layer_level))
+
         messages.append((
             "Workflow actions: "
             f"{self._format_workflow_actions(workflow_actions or {})}",
@@ -1500,6 +2039,12 @@ class GenerationPanel(ttk.Frame):
         """Собирает краткую сводку video pipeline артефактов для UI-логов."""
         project_path = self._resolve_project_path(project_id)
         messages: List[tuple[str, str]] = []
+
+        if project_path is None:
+            return [(
+                f"Видео-артефакты недоступны: не удалось безопасно определить путь проекта {project_id}",
+                "warning",
+            )]
 
         if not project_path.exists():
             return [(

@@ -179,6 +179,8 @@ class SQLSchemaValidator:
 
                 if isinstance(stmt, exp.Select):
                     self._validate_select_scope(stmt, db_schema, issues)
+                elif isinstance(stmt, exp.Pivot):
+                    self._validate_root_transform(stmt, db_schema, issues)
                 else:
                     # Не-Select корень (например, EXPLAIN/DESCRIBE-обёртки или
                     # запрещённые DML, отсечённые ранее). Если у корня есть WITH,
@@ -209,6 +211,47 @@ class SQLSchemaValidator:
             "issues": issues
         }
 
+    def _validate_root_transform(self, transform, db_schema, issues) -> None:
+        source = getattr(transform, "this", None)
+        if not isinstance(source, exp.Table):
+            return
+        table_name = self._scope.get_real_table_name(source)
+        resolved = self._scope.resolve_table_name_detailed(table_name, db_schema)
+        if resolved.kind == "unknown":
+            issues.append({
+                "issue_type": "UNKNOWN_TABLE",
+                "description": f"Table '{table_name}' not found in schema",
+            })
+            return
+        if resolved.kind == "ambiguous":
+            issues.append({
+                "issue_type": "AMBIGUOUS_TABLE",
+                "description": f"Table '{table_name}' is ambiguous: matches {resolved.candidates}",
+            })
+            return
+        assert resolved.name is not None
+        source_alias = str(source.alias) if source.alias else table_name
+        for argument in ("expressions", "using", "group"):
+            value = transform.args.get(argument)
+            expressions = value.expressions if isinstance(value, exp.Expression) else value
+            for expression in expressions or ():
+                if not isinstance(expression, exp.Expression):
+                    continue
+                for column in expression.find_all(exp.Column):
+                    qualifier = str(column.table) if column.table else None
+                    if qualifier not in {None, source_alias, table_name}:
+                        issues.append({
+                            "issue_type": "UNKNOWN_TABLE_REFERENCE",
+                            "description": f"Column qualifier '{qualifier}' is not present in FROM/JOIN tables",
+                        })
+                    elif not self._columns.column_exists_in_schema(
+                        column.name, resolved.name, db_schema
+                    ):
+                        issues.append({
+                            "issue_type": "UNKNOWN_COLUMN",
+                            "description": f"Column '{column.name}' not found in table '{resolved.name}'",
+                        })
+
     def _validate_select_scope(
         self,
         scope,
@@ -222,6 +265,7 @@ class SQLSchemaValidator:
         current_row_sources, row_source_names = self._ctes.collect_current_row_sources(
             scope, available_ctes, db_schema
         )
+        declared_physical_aliases = self._ctes.declared_physical_alias_columns(scope)
         inherited_aliases = inherited_aliases or {}
         inherited_row_sources = inherited_row_sources or {}
 
@@ -236,16 +280,6 @@ class SQLSchemaValidator:
                 has_from_tables = True
                 continue
             if not real_table_name:
-                func_name = self._scope.get_table_func_name(table_node)
-                if func_name is not None:
-                    has_from_tables = True
-                    issues.append({
-                        "issue_type": "UNKNOWN_TABLE",
-                        "description": (
-                            f"Table function '{func_name}()' is not a recognised schema "
-                            f"source; only declared schema tables are allowed"
-                        ),
-                    })
                 continue
             has_from_tables = True
             resolved = self._scope.resolve_table_name_detailed(real_table_name, db_schema)
@@ -292,6 +326,13 @@ class SQLSchemaValidator:
             table_alias = str(column_node.table) if column_node.table else None
             real_table_name = None
             if table_alias:
+                if (
+                    table_alias in declared_physical_aliases
+                    and self._columns.row_source_has_column(
+                        column_name, declared_physical_aliases[table_alias]
+                    )
+                ):
+                    continue
                 if table_alias in current_row_sources:
                     if not self._columns.row_source_has_column(column_name, current_row_sources[table_alias]):
                         issues.append({

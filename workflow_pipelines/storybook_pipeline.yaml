@@ -16,6 +16,15 @@ inputs:
   generate_end_shots: true
   language: ru
   screenplay_time: 120
+  generate_blockout: true
+  blockout_fps: 24
+  blockout_resolution: '1280x720'
+  blockout_allowed_durations: []
+  blockout_jobs: 0                    # 0 = cpu_count - 1
+  blockout_scope: all
+  blockout_preview_burnin: true
+  blockout_use_as_image_reference: true
+  blockout_use_as_video_reference: true
   force_update_prompts: false
   skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
   sample_before_batch: false
@@ -201,6 +210,9 @@ steps:
     language: '{language}'
     generate_end_shots: '{generate_end_shots}'
     enable: '{generate_screenplay}'
+    generate_blockout: '{generate_blockout}'
+    allowed_durations: '{blockout_allowed_durations}'
+    screenplay_time: '{screenplay_time}'
     #enable: false
   depends_on:
   - screenplay_generator
@@ -218,6 +230,80 @@ steps:
     temperature: 0.1
   depends_on:
   - screenplay_shots_generator
+- id: blockout_scene_builder
+  step_type: tool
+  task: Build 3D blockout scene spec from shots and screenplay
+  timeout: 3600
+  tool_name: blockout_scene_builder_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - chains_total
+    - shots_total
+    - unmapped_assets
+    - artifact_path
+  metadata:
+    retryable: false
+    output_artifacts:
+    - 93_blockout/chains.json
+    - 93_blockout/scene_spec.json
+    - 93_blockout/asset_map.json
+    - 93_blockout/report.json
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    fps: '{blockout_fps}'
+    allowed_durations: '{blockout_allowed_durations}'
+    resolution: '{blockout_resolution}'
+    enable: '{generate_blockout}'
+  depends_on:
+  - shots_prompt_qa
+  condition: '{generate_screenplay}'
+- id: blockout_renderer
+  step_type: tool
+  task: Render blockout frames and reference videos with Blender Workbench
+  timeout: 9000
+  tool_name: blockout_renderer_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - shots_rendered
+    - frames_total
+    - junction_checks
+    - artifact_path
+  metadata:
+    retryable: true
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    fps: '{blockout_fps}'
+    resolution: '{blockout_resolution}'
+    jobs: '{blockout_jobs}'
+    scope: '{blockout_scope}'
+    enable: '{generate_blockout}'
+  depends_on:
+  - blockout_scene_builder
+  condition: '{generate_screenplay}'
+- id: blockout_preview
+  step_type: tool
+  task: Stitch blockout segments into a single preview video
+  timeout: 600
+  tool_name: blockout_preview_tool
+  metadata:
+    output_artifacts:
+    - 93_blockout/preview/blockout_all.mp4
+    - 93_blockout/preview/contact_sheet.png
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    burnin: '{blockout_preview_burnin}'
+    enable: '{generate_blockout}'
+  depends_on:
+  - blockout_renderer
+  condition: '{generate_screenplay}'
 - id: artist_batch_shots
   step_type: tool
   task: Parallel artist edits with references for final shots images
@@ -229,9 +315,12 @@ steps:
     language: '{language}'
     enable: '{generate_screenplay}'
     #enable: false
+    use_blockout_reference: '{blockout_use_as_image_reference}'
+    generate_blockout: '{generate_blockout}'
   depends_on:
   - shots_prompt_qa
   - artist_batch
+  - blockout_renderer
 - id: storybook_video_preflight
   step_type: tool
   task: Preflight storybook video/audio/render provider capabilities
@@ -250,6 +339,8 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
     enable: '{generate_screenplay}'
+    use_blockout_reference: '{blockout_use_as_video_reference}'
+    generate_blockout: '{generate_blockout}'
   depends_on:
   - shots_prompt_qa
 - id: storybook_video_delivery_promise
@@ -271,6 +362,8 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
     enable: '{generate_screenplay}'
+    use_blockout_reference: '{blockout_use_as_video_reference}'
+    generate_blockout: '{generate_blockout}'
   depends_on:
   - storybook_video_preflight
   - artist_batch_shots
@@ -295,6 +388,8 @@ steps:
     sample_before_batch: '{sample_before_batch}'
     sample_shot_key: '{sample_shot_key}'
     enable: '{generate_screenplay}'
+    use_blockout_reference: '{blockout_use_as_video_reference}'
+    generate_blockout: '{generate_blockout}'
   depends_on:
   - storybook_video_delivery_promise
   - artist_batch_shots

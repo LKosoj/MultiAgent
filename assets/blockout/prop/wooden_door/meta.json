@@ -1,0 +1,26 @@
+{
+  "id": "wooden_door",
+  "name": "Деревянная дверь",
+  "category": "prop",
+  "tags": [
+    "door",
+    "entrance",
+    "desc:Подъезд, из которого выбегает дворник."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    3.185464024543762,
+    0.759134829044342,
+    6.219295501708984
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/8726b6c219a54ed585e096f267c2a35e",
+  "file_size_bytes": 2605588,
+  "fetched_at": "2026-08-16T22:54:27Z",
+  "asset_version": 1
+}

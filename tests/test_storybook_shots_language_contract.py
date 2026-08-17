@@ -423,6 +423,13 @@ def test_screenplay_shots_generator_keeps_generation_language_and_skips_post_tra
     monkeypatch.setattr(shots_generator, "_generate_shot_prompt", fake_generate_shot_prompt)
     monkeypatch.setattr(shots_generator, "_generate_fcpxml", lambda *args, **kwargs: None)
     monkeypatch.setattr(shots_generator, "_generate_photo_fcpxml", lambda *args, **kwargs: None)
+    # Э0.3: этот файл не про нормализацию длительности видео — фиксируем набор
+    # supported_durations, чтобы новый блокирующий B15 (пустой набор + generate_blockout=True
+    # по умолчанию) не мешал существующим сценариям.
+    monkeypatch.setattr(
+        shots_generator, "resolve_video_model_capabilities",
+        lambda *a, **k: {"supported_durations": [1, 5, 10], "warnings": []},
+    )
     monkeypatch.setattr(utils, "translate_prompts_in_items", fail_translate, raising=True)
 
     result = shots_generator.screenplay_shots_generator_tool(
@@ -583,6 +590,13 @@ def test_screenplay_shots_generator_writes_checkpoint_before_late_scene_failure(
     )
     monkeypatch.setattr(shots_generator, "_generate_fcpxml", lambda *args, **kwargs: None)
     monkeypatch.setattr(shots_generator, "_generate_photo_fcpxml", lambda *args, **kwargs: None)
+    # Э0.3: этот файл не про нормализацию длительности видео — фиксируем набор
+    # supported_durations, чтобы новый блокирующий B15 (пустой набор + generate_blockout=True
+    # по умолчанию) не мешал существующим сценариям.
+    monkeypatch.setattr(
+        shots_generator, "resolve_video_model_capabilities",
+        lambda *a, **k: {"supported_durations": [1, 5, 10], "warnings": []},
+    )
 
     with pytest.raises(RuntimeError, match="Ошибка обработки сцены 2"):
         shots_generator.screenplay_shots_generator_tool(
@@ -722,6 +736,13 @@ def test_screenplay_shots_generator_writes_checkpoint_before_late_shot_failure(t
     monkeypatch.setattr(shots_generator, "_generate_transition_video_prompt", lambda **kwargs: "video prompt")
     monkeypatch.setattr(shots_generator, "_generate_fcpxml", lambda *args, **kwargs: None)
     monkeypatch.setattr(shots_generator, "_generate_photo_fcpxml", lambda *args, **kwargs: None)
+    # Э0.3: этот файл не про нормализацию длительности видео — фиксируем набор
+    # supported_durations, чтобы новый блокирующий B15 (пустой набор + generate_blockout=True
+    # по умолчанию) не мешал существующим сценариям.
+    monkeypatch.setattr(
+        shots_generator, "resolve_video_model_capabilities",
+        lambda *a, **k: {"supported_durations": [1, 5, 10], "warnings": []},
+    )
 
     with pytest.raises(RuntimeError, match="Ошибка обработки сцены 1"):
         shots_generator.screenplay_shots_generator_tool(
@@ -852,6 +873,13 @@ def test_screenplay_shots_generator_writes_checkpoint_before_transition_video_pr
     monkeypatch.setattr(shots_generator, "_generate_transition_video_prompt", lambda **kwargs: None)
     monkeypatch.setattr(shots_generator, "_generate_fcpxml", lambda *args, **kwargs: None)
     monkeypatch.setattr(shots_generator, "_generate_photo_fcpxml", lambda *args, **kwargs: None)
+    # Э0.3: этот файл не про нормализацию длительности видео — фиксируем набор
+    # supported_durations, чтобы новый блокирующий B15 (пустой набор + generate_blockout=True
+    # по умолчанию) не мешал существующим сценариям.
+    monkeypatch.setattr(
+        shots_generator, "resolve_video_model_capabilities",
+        lambda *a, **k: {"supported_durations": [1, 5, 10], "warnings": []},
+    )
 
     with pytest.raises(RuntimeError, match="Ошибка обработки сцены 1"):
         shots_generator.screenplay_shots_generator_tool(

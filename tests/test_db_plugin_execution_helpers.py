@@ -8,7 +8,7 @@ import pytest
 
 from custom_tools import sql_tools
 from custom_tools.text_to_sql.core._db_exec import _classify_statement
-from db_plugins.base import BaseDBPlugin
+from db_plugins.base import BaseDBPlugin, UnsupportedCapabilityError
 from db_plugins.duckdb import DuckDBPlugin
 from db_plugins.impala import ImpalaPlugin
 from db_plugins.mysql import MySQLPlugin
@@ -84,6 +84,199 @@ def test_execute_select_preserves_top_level_order_when_capping(plugin):
 
 
 @pytest.mark.parametrize(
+    ("plugin", "sql", "expected_sql"),
+    [
+        (
+            PostgresPlugin(),
+            'SELECT "?" AS "?", \'?\' AS literal FROM "t?" '
+            'WHERE "value" = ? /* ? */ -- ?\nLIMIT 1',
+            'SELECT "?" AS "?", \'?\' AS literal FROM "t?" '
+            'WHERE "value" = %s /* ? */ -- ?\nLIMIT 1',
+        ),
+        (
+            MySQLPlugin(),
+            "SELECT `?` AS `?`, '?' AS literal FROM `t?` "
+            "WHERE `value` = ? /* ? */ -- ?\nLIMIT 1",
+            "SELECT `?` AS `?`, '?' AS literal FROM `t?` "
+            "WHERE `value` = %s /* ? */ -- ?\nLIMIT 1",
+        ),
+    ],
+)
+def test_bound_select_rewrites_only_real_placeholders(plugin, sql, expected_sql):
+    cursor = RecordingCursor(rows=[(1,)])
+
+    plugin.execute_select_bound(
+        RecordingConn(cursor),
+        sql,
+        ("literal ? -- not SQL",),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [(expected_sql, ("literal ? -- not SQL",))]
+
+
+def test_bound_select_rejects_placeholder_count_mismatch_before_execute():
+    cursor = RecordingCursor(rows=[(1,)])
+
+    with pytest.raises(ValueError, match="placeholder count"):
+        PostgresPlugin().execute_select_bound(
+            RecordingConn(cursor),
+            "SELECT id FROM records WHERE value = ? LIMIT 1",
+            (),
+            row_limit=1,
+        )
+
+    assert cursor.executed == []
+
+
+def test_postgres_bound_select_preserves_question_mark_operator():
+    cursor = RecordingCursor(rows=[(1,)])
+
+    PostgresPlugin().execute_select_bound(
+        RecordingConn(cursor),
+        "SELECT id FROM records WHERE payload ? 'key' AND value = ? LIMIT 1",
+        ("needle",),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [
+        (
+            "SELECT id FROM records WHERE payload ? 'key' "
+            "AND value = %s LIMIT 1",
+            ("needle",),
+        )
+    ]
+
+
+@pytest.mark.parametrize("operator", ["#>", "#>>"])
+def test_postgres_bound_select_preserves_json_path_operators(operator):
+    cursor = RecordingCursor(rows=[(1,)])
+    sql = (
+        f"SELECT payload {operator} '{{a}}' FROM records "
+        "WHERE id = ? LIMIT 1"
+    )
+
+    PostgresPlugin().execute_select_bound(
+        RecordingConn(cursor),
+        sql,
+        (7,),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [
+        (
+            f"SELECT payload {operator} '{{a}}' FROM records "
+            "WHERE id = %s LIMIT 1",
+            (7,),
+        )
+    ]
+
+
+def test_mysql_bound_select_skips_hash_comment_question_marks():
+    cursor = RecordingCursor(rows=[(1,)])
+    sql = "SELECT id FROM records # ignored ?\nWHERE value = ? LIMIT 1"
+
+    MySQLPlugin().execute_select_bound(
+        RecordingConn(cursor),
+        sql,
+        ("needle",),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [
+        (
+            "SELECT id FROM records # ignored ?\nWHERE value = %s LIMIT 1",
+            ("needle",),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("plugin", "expected_sql"),
+    [
+        (
+            PostgresPlugin(),
+            "SELECT arr[%s] AS item FROM records WHERE id = %s LIMIT 1",
+        ),
+        (
+            DuckDBPlugin(),
+            "SELECT arr[?] AS item FROM records WHERE id = ? LIMIT 1",
+        ),
+    ],
+)
+def test_bound_select_rewrites_array_index_placeholders(plugin, expected_sql):
+    cursor = RecordingCursor(rows=[("item",)])
+
+    plugin.execute_select_bound(
+        RecordingConn(cursor),
+        "SELECT arr[?] AS item FROM records WHERE id = ? LIMIT 1",
+        (0, 7),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [(expected_sql, (0, 7))]
+
+
+def test_sqlite_bound_select_preserves_question_mark_in_bracket_identifier():
+    cursor = RecordingCursor(rows=[("item",)])
+    sql = "SELECT [odd?name] FROM records WHERE id = ? LIMIT 1"
+
+    SQLitePlugin().execute_select_bound(
+        RecordingConn(cursor),
+        sql,
+        (7,),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [(sql, (7,))]
+
+
+@pytest.mark.parametrize("plugin", [PostgresPlugin(), DuckDBPlugin()])
+def test_nested_array_index_placeholder_count_mismatch_fails_closed(plugin):
+    cursor = RecordingCursor(rows=[("item",)])
+
+    with pytest.raises(ValueError, match="placeholder count"):
+        plugin.execute_select_bound(
+            RecordingConn(cursor),
+            "SELECT matrix[?][?] AS item FROM records WHERE id = ? LIMIT 1",
+            (0, 1),
+            row_limit=1,
+        )
+
+    assert cursor.executed == []
+
+
+@pytest.mark.parametrize("plugin", [SQLitePlugin(), DuckDBPlugin()])
+def test_qmark_drivers_execute_bound_parameters_without_rewriting(plugin):
+    cursor = RecordingCursor(rows=[(1,)])
+    sql = "SELECT id FROM records WHERE value = ? LIMIT 1"
+
+    plugin.execute_select_bound(
+        RecordingConn(cursor),
+        sql,
+        ("needle",),
+        row_limit=1,
+    )
+
+    assert cursor.executed == [(sql, ("needle",))]
+
+
+@pytest.mark.parametrize("plugin", [BaseDBPlugin(), ImpalaPlugin(), SAPIQPlugin()])
+def test_unverified_bound_adapters_fail_closed(plugin):
+    cursor = RecordingCursor(rows=[(1,)])
+
+    with pytest.raises(UnsupportedCapabilityError, match="bound SELECT"):
+        plugin.execute_select_bound(
+            RecordingConn(cursor),
+            "SELECT id FROM records WHERE value = ? LIMIT 1",
+            ("needle",),
+            row_limit=1,
+        )
+
+    assert cursor.executed == []
+
+
+@pytest.mark.parametrize(
     ("sql", "row_limit", "expected_sql"),
     [
         ("SELECT * FROM big_table LIMIT 10", 500, "SELECT * FROM big_table LIMIT 10"),
@@ -148,6 +341,26 @@ def test_parse_schema_from_dsn_uses_explicit_schema_or_database_semantics():
     assert MySQLPlugin().parse_schema_from_dsn("mysql://user:pass@host:3306/sales.analytics") == "analytics"
     assert ImpalaPlugin().parse_schema_from_dsn("impala://user:pass@host:21050/default") == "default"
     assert ImpalaPlugin().parse_schema_from_dsn("impala://user:pass@host:21050/db.analytics") == "analytics"
+
+
+@pytest.mark.parametrize("slash_count", (3, 4))
+def test_sqlite_connect_accepts_absolute_path_dsn_and_stays_read_only(
+    tmp_path,
+    slash_count,
+):
+    database = tmp_path / "absolute.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE items (name TEXT NOT NULL)")
+        connection.execute("INSERT INTO items(name) VALUES ('one')")
+
+    dsn = "sqlite:" + "/" * slash_count + str(database).lstrip("/")
+    connection = SQLitePlugin().connect(dsn)
+    try:
+        assert connection.execute("SELECT name FROM items").fetchall() == [("one",)]
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute("INSERT INTO items(name) VALUES ('two')")
+    finally:
+        connection.close()
 
 
 def test_mysql_connect_uses_clean_database_target(monkeypatch):
@@ -333,6 +546,24 @@ def test_quote_identifier_quotes_reserved_and_case_sensitive_identifiers():
     assert MySQLPlugin().quote_identifier("order") == "`order`"
     assert MySQLPlugin().quote_identifier("CamelCase") == "`CamelCase`"
     assert ImpalaPlugin().quote_identifier("group") == "`group`"
+
+
+@pytest.mark.parametrize(
+    ("plugin", "expected_part", "expected_path"),
+    [
+        (SQLitePlugin(), '"a.b"', 'analytics."sales table"'),
+        (PostgresPlugin(), '"a.b"', 'analytics."sales table"'),
+        (DuckDBPlugin(), '"a.b"', 'analytics."sales table"'),
+        (MySQLPlugin(), "`a.b`", "analytics.`sales table`"),
+    ],
+)
+def test_identifier_part_quoting_does_not_split_qualified_paths(
+    plugin,
+    expected_part,
+    expected_path,
+):
+    assert plugin.quote_identifier_part("a.b") == expected_part
+    assert plugin.quote_identifier("analytics.sales table") == expected_path
 
 
 def test_sapiq_distinct_values_query_uses_top_not_limit():

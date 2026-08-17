@@ -379,6 +379,62 @@ def test_kling_partial_failure_is_reported_as_error(tmp_path, monkeypatch):
     assert Path(good["video_path"]).read_bytes() == b"kling-video-bytes"
 
 
+# --- M-6: hash carries the requested duration, request carries the snapped one -------------------
+
+def test_kling_snaps_duration_for_request_but_hashes_requested(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    _, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir, timing="00:00 - 00:07")  # 7s: в {5, 10} ближе к 5
+    captured = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del url, headers, timeout
+        captured["json"] = json
+        return _FakeResponse(200, {"data": {"task_id": "task-1"}})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if _STATUS_MARKER in url and url.endswith("task-1"):
+            return _FakeResponse(200, {"data": {
+                "task_status": "succeed",
+                "task_result": {"videos": [{"url": "https://cdn.kling.example/out.mp4"}]},
+            }})
+        return _FakeResponse(200, content=b"kling-video-bytes")
+
+    monkeypatch.setattr(kling_module.requests, "post", fake_post)
+    monkeypatch.setattr(kling_module.requests, "get", fake_get)
+
+    result = kling_module.video_generator_tool(
+        session_id="s", items={"items": [item]}, project_id="project-kling",
+        enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    # Провайдер получает длительность, подогнанную под supported_durations...
+    assert captured["json"]["duration"] == 5
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["resolved_duration"] == 5
+    assert job["hash_inputs_version"] == 3
+
+    # ...а в хеш входа идёт именно запрошенная длительность (M-6, раздел 6.1 ТЗ).
+    expected_hash = kling_module._build_input_hash(
+        model_name=f"{kling_module._KLING_MODEL_NAME}|{kling_module._KLING_MODE}|{kling_module._KLING_ASPECT_RATIO}",
+        prompt_hash=kling_module._hash_text(item["video_prompt"]),
+        source_image_hashes={
+            "start_image": kling_module._hash_source_image(str(shots_dir / f"img_final_start_{item['scene_number']:02d}_{item['shot_number']:02d}.png")),
+            "end_image": None,
+        },
+        requested_duration=7,
+        requested_width=0,
+        requested_height=0,
+        seed=None,
+        frame_types=["first_frame"],
+        provider_name="kling",
+    )
+    assert job["input_hash"] == expected_hash
+
+
 # --- L-4: non-200 status response is retried, not fatally returned -------------------------------
 
 def test_kling_retries_polling_on_non_200_status(tmp_path, monkeypatch, caplog):

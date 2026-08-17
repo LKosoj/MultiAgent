@@ -48,14 +48,8 @@ type Props = {
   setNaturalQuery: (value: string) => void;
   sessionId: string;
   setSessionId: (value: string) => void;
-  workflowName: string;
-  setWorkflowName: (value: string) => void;
   maxRows: string;
   setMaxRows: (value: string) => void;
-  useEnhanced: boolean;
-  setUseEnhanced: (value: boolean) => void;
-  allowEnhancedFallback: boolean;
-  setAllowEnhancedFallback: (value: boolean) => void;
   enableTelemetry: boolean;
   setEnableTelemetry: (value: boolean) => void;
   safetyLevel: string;
@@ -66,8 +60,6 @@ type Props = {
   setValidateSchema: (value: boolean) => void;
   dryRunOnly: boolean;
   setDryRunOnly: (value: boolean) => void;
-  useSchemaSuggestions: boolean;
-  setUseSchemaSuggestions: (value: boolean) => void;
   isSubmitting: boolean;
   setIsSubmitting: (value: boolean) => void;
 };
@@ -106,14 +98,8 @@ export function TextToSqlGenerateTab({
   setNaturalQuery,
   sessionId,
   setSessionId,
-  workflowName,
-  setWorkflowName,
   maxRows,
   setMaxRows,
-  useEnhanced,
-  setUseEnhanced,
-  allowEnhancedFallback,
-  setAllowEnhancedFallback,
   enableTelemetry,
   setEnableTelemetry,
   safetyLevel,
@@ -124,8 +110,6 @@ export function TextToSqlGenerateTab({
   setValidateSchema,
   dryRunOnly,
   setDryRunOnly,
-  useSchemaSuggestions,
-  setUseSchemaSuggestions,
   isSubmitting,
   setIsSubmitting,
 }: Props) {
@@ -153,16 +137,12 @@ export function TextToSqlGenerateTab({
       query: effectiveQuery,
       connectionRef,
       maxRows: normalizedMaxRows,
-      workflowName: workflowName || undefined,
       sessionId: sessionId || undefined,
-      useEnhanced,
-      allowEnhancedFallback,
       enableTelemetry,
       safetyLevel,
       includeExplanation,
       validateSchema,
       dryRunOnly,
-      useSchemaSuggestions,
     });
   };
 
@@ -193,10 +173,6 @@ export function TextToSqlGenerateTab({
           </select>
         </label>
         <label className="field">
-          <span className="label">Workflow</span>
-          <input value={workflowName} onChange={(e) => setWorkflowName(e.target.value)} />
-        </label>
-        <label className="field">
           <span className="label">Session ID</span>
           <input value={sessionId} onChange={(e) => setSessionId(e.target.value)} placeholder="опционально" />
         </label>
@@ -213,14 +189,6 @@ export function TextToSqlGenerateTab({
       </div>
       <div className="toggle-grid">
         <label className="toggle">
-          <input type="checkbox" checked={useEnhanced} onChange={(e) => setUseEnhanced(e.target.checked)} />
-          <span>Enhanced engine</span>
-        </label>
-        <label className="toggle">
-          <input type="checkbox" checked={allowEnhancedFallback} onChange={(e) => setAllowEnhancedFallback(e.target.checked)} />
-          <span>Enhanced fallback</span>
-        </label>
-        <label className="toggle">
           <input type="checkbox" checked={enableTelemetry} onChange={(e) => setEnableTelemetry(e.target.checked)} />
           <span>Телеметрия</span>
         </label>
@@ -235,10 +203,6 @@ export function TextToSqlGenerateTab({
         <label className="toggle">
           <input type="checkbox" checked={dryRunOnly} onChange={(e) => setDryRunOnly(e.target.checked)} />
           <span>Dry run</span>
-        </label>
-        <label className="toggle">
-          <input type="checkbox" checked={useSchemaSuggestions} onChange={(e) => setUseSchemaSuggestions(e.target.checked)} />
-          <span>Подсказки схемы</span>
         </label>
       </div>
       <div className="button-row">
@@ -366,10 +330,6 @@ export function TextToSqlGenerateTab({
             <div>
               <span className="label">Run ID</span>
               <div className="meta-value">{runId}</div>
-            </div>
-            <div>
-              <span className="label">Workflow</span>
-              <div className="meta-value">{workflowName}</div>
             </div>
             <div>
               <span className="label">Статус</span>

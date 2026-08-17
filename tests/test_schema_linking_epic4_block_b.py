@@ -7,6 +7,7 @@ issue). Pre-existing failures других тестов EPIC 4 не дублир
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from custom_tools.text_to_sql import (
 from custom_tools.text_to_sql.schema_linking.join_validation import JoinValidator
 from custom_tools.text_to_sql.schema_linking.resolution import _resolve_table_name
 from custom_tools.text_to_sql.schema_linking import SchemaLinkingCore
+from custom_tools.text_to_sql.quality import schema_linking_quality
 from custom_tools.text_to_sql.validators import SchemaLimiter
 
 
@@ -318,6 +320,102 @@ def test_main_table_via_scoring(monkeypatch):
     assert result["main_table"] == "orders"
 
 
+def test_no_main_table_skips_join_builder_and_blocks_generation(monkeypatch):
+    """No defensible main table is fail-closed without JoinValidator fallback."""
+    def fake_llm(**_kwargs):
+        return json.dumps({
+            "linked_entities": {
+                "metrics": [
+                    {"name": "amount", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [],
+                "filters": {},
+            },
+            "joins": [],
+            "unlinked_entities": [],
+        })
+
+    core = _make_core(relevant_tables=["orders"], llm_caller=fake_llm)
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+    monkeypatch.setattr(
+        core,
+        "_pick_main_table_from_linked",
+        lambda *_args: None,
+    )
+
+    def must_not_build_joins(*_args, **_kwargs):
+        raise AssertionError("build_joins must not run without a main table")
+
+    monkeypatch.setattr(core, "build_joins", must_not_build_joins)
+
+    result = core.perform_linking(
+        {"metrics": ["amount"], "dimensions": [], "filters": {}},
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert result["joins"] == []
+    assert result["join_success"] is False
+    assert result["main_table"] is None
+    assert result["unconnected_tables"] == ["orders"]
+    assert schema_linking_quality(result)["sql_generation_allowed"] is False
+
+
+def test_no_main_table_with_llm_joins_skips_join_builder(monkeypatch):
+    """Validated LLM joins remain diagnostic-only when no main table exists."""
+    llm_join = {
+        "from_table": "orders",
+        "from_column": "customer_id",
+        "to_table": "customers",
+        "to_column": "id",
+        "join_type": "LEFT",
+    }
+    def fake_llm(**_kwargs):
+        return json.dumps({
+            "linked_entities": {
+                "metrics": [
+                    {"name": "amount", "table": "orders", "column": "amount"}
+                ],
+                "dimensions": [
+                    {"name": "customer", "table": "customers", "column": "id"}
+                ],
+                "filters": {},
+            },
+            "joins": [llm_join],
+            "unlinked_entities": [],
+        })
+
+    core = _make_core(relevant_tables=["orders", "customers"], llm_caller=fake_llm)
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+    monkeypatch.setattr(core, "_pick_main_table_from_linked", lambda *_args: None)
+    monkeypatch.setattr(core, "validate_llm_joins", lambda *_args: [llm_join])
+
+    def must_not_build_joins(*_args, **_kwargs):
+        raise AssertionError("build_joins must not run without a main table")
+
+    monkeypatch.setattr(core, "build_joins", must_not_build_joins)
+
+    result = core.perform_linking(
+        {"metrics": ["amount"], "dimensions": ["customer"], "filters": {}},
+        {
+            "orders": {
+                "columns": {
+                    "amount": {"type": "DECIMAL"},
+                    "customer_id": {"type": "INTEGER"},
+                }
+            },
+            "customers": {"columns": {"id": {"type": "INTEGER"}}},
+        },
+    )
+
+    assert result["joins"] == [llm_join]
+    assert result["join_success"] is False
+    assert result["main_table"] is None
+    assert result["unconnected_tables"] == ["customers", "orders"]
+    assert schema_linking_quality(result)["sql_generation_allowed"] is False
+
+
 # ---------------------------------------------------------------------- #
 # 4.17 — max_tokens читается из llm_models.yaml
 # ---------------------------------------------------------------------- #
@@ -416,6 +514,55 @@ def test_mandatory_schema_over_profile_hard_cap_skips_llm(monkeypatch, tmp_path)
     assert result["reason_code"] == "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
     assert result["schema_budget"]["hard_limit_exceeded"] is True
     assert result["schema_budget"]["hard_max_chars"] == 32
+    assert result["schema_budget"]["model_calls"] == 0
+
+
+def test_schema_linking_reports_one_logical_model_call_on_provider_failure(
+    monkeypatch,
+):
+    def failing_llm(**_kwargs):
+        raise RuntimeError("provider failed")
+
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+    core = _make_core(relevant_tables=["orders"], llm_caller=failing_llm)
+
+    result = core.perform_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert result["schema_budget"]["model_calls"] == 1
+
+
+def test_schema_linking_reports_one_logical_model_call_on_provider_success(
+    monkeypatch,
+):
+    def successful_llm(**_kwargs):
+        return json.dumps(
+            {
+                "linked_entities": {
+                    "metrics": [
+                        {"name": "revenue", "table": "orders", "column": "amount"}
+                    ],
+                    "dimensions": [],
+                    "filters": {},
+                },
+                "joins": [],
+                "unlinked_entities": [],
+            }
+        )
+
+    monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "1")
+    monkeypatch.delenv("SCHEMA_LINKING_ALLOW_FALLBACKS", raising=False)
+    core = _make_core(relevant_tables=["orders"], llm_caller=successful_llm)
+
+    result = core.perform_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert result["schema_budget"]["model_calls"] == 1
 
 
 # ---------------------------------------------------------------------- #

@@ -156,7 +156,7 @@ def test_start_enqueues_exact_spec_without_direct_process(
         assert stored is not None
         assert stored.run_kind == "legacy"
         assert stored.owner_subject == "legacy-workflow"
-        assert stored.status == "pending"
+        assert stored.status == "queued"
     finally:
         store.close()
 
@@ -215,6 +215,8 @@ def test_spawn_wrapper_rehydrates_deadline_outside_public_parameters(
     claim = {
         "supervisor_id": "supervisor-a",
         "attempt_generation": 17,
+        "run_kind": "agui",
+        "workflow_name": "simple_research",
     }
     streamlit_api._workflow_supervisor_process_entry("run-1", spec, claim)
 
@@ -300,6 +302,52 @@ def test_owner_scoped_retry_keeps_one_durable_spec_and_quota_identity(
         assert verify.load_work_spec("run-1") is not None
     finally:
         verify.close()
+
+
+def test_ownerless_explicit_run_id_replay_is_rejected(
+    _isolated_workflow_globals: Path,
+) -> None:
+    manager = streamlit_api.WorkflowManager(supervisor=_FakeSupervisor())
+    manager.start_workflow(
+        "simple_research",
+        parameters={"topic": "legacy replay"},
+        session_id="legacy-session",
+        run_id="legacy-explicit-run",
+    )
+
+    with pytest.raises(streamlit_api.WorkflowRunAlreadyReservedError):
+        manager.start_workflow(
+            "simple_research",
+            parameters={"topic": "legacy replay"},
+            session_id="legacy-session",
+            run_id="legacy-explicit-run",
+        )
+
+
+def test_text_to_sql_admission_cannot_start_a_generic_workflow(
+    _isolated_workflow_globals: Path,
+) -> None:
+    from backend.fastapi_app.agui._t2s_requests import TextToSqlWorkflowAdmission
+
+    owner = streamlit_api.WorkflowOwner(
+        subject="alice",
+        tenant_id="tenant-a",
+        roles=frozenset({"user"}),
+    )
+    manager = streamlit_api.WorkflowManager(supervisor=_FakeSupervisor())
+
+    with pytest.raises(ValueError, match="text_to_sql_pipeline"):
+        manager.start_workflow(
+            "simple_research",
+            parameters={"topic": "must stay generic"},
+            session_id="session-1",
+            run_id="run-generic",
+            owner=owner,
+            text_to_sql_admission=TextToSqlWorkflowAdmission(
+                idempotency_key="internal-only",
+                request_fingerprint="a" * 64,
+            ),
+        )
 
 
 def test_service_workflow_start_passes_current_principal_owner(

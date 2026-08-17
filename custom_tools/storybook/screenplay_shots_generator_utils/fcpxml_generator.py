@@ -86,6 +86,10 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
             colorSpace="1-1-1 (Rec. 709)"
         )
         
+        # Длительность этого video-asset'а берём из уже вычисленной карты
+        # длительностей (раздел 6.2 ТЗ, Fix 2) вместо хардкода.
+        shot_duration = video_shot_durations.get(shot_key, 5.0)
+
         # Asset для видео
         asset_video = ET.SubElement(
             resources, "asset",
@@ -93,7 +97,7 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
             name=video_asset_name,
             uid=video_uid,
             start="0s",
-            duration="61956/12288s",  # Длительность видео, можно получить из timing
+            duration=f"{int(shot_duration * 12288)}/12288s",
             hasVideo="1",
             format=f"r{format_id}",
             hasAudio="1",
@@ -220,9 +224,14 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
     logger.info(f"📽️ FCPXML создан с {len(shots_by_key)} видеоклипами, общая длительность: {total_duration:.1f}s")
 
 
-def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_path: str) -> None:
+def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_path: str) -> bool:
     """
     Генерирует FCPXML файл для импорта в DaVinci Resolve с использованием изображений (как было раньше).
+
+    Возвращает ``True``, если файл был построен, и ``False``, если ни у
+    одного shot'а нет одновременно start и end (правило "нулевой суммы",
+    раздел 6.2 ТЗ, Fix 3) — в этом случае существующий файл на диске
+    удаляется и ничего не записывается.
     """
     import xml.etree.ElementTree as ET
     import os
@@ -285,7 +294,22 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             shots_by_key[shot_key]["start"] = shot_item
         elif shot_type == "end":
             shots_by_key[shot_key]["end"] = shot_item
-    
+
+    # Правило "нулевой суммы" (раздел 6.2 ТЗ, Fix 3): если ни у одного shot'а
+    # нет одновременно start И end — photo-timeline строить нельзя (ничего
+    # раскладывать). Удаляем возможный устаревший файл на диске и выходим,
+    # не записывая ничего нового.
+    has_paired_shot = any(
+        pair.get("start") and pair.get("end") for pair in shots_by_key.values()
+    )
+    if not has_paired_shot:
+        if os.path.exists(fcpxml_path):
+            os.remove(fcpxml_path)
+        logger.warning(
+            "📷 Photo FCPXML не построен: ни один shot не имеет одновременно start и end"
+        )
+        return False
+
     # Создаем карту длительностей кадров на основе разности timestamp'ов
     shot_durations = _calculate_shot_durations_from_timestamps(shots_by_key)
     
@@ -393,7 +417,7 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
     )
     
     # Рассчитываем общую длительность в новом формате (как в старой версии)
-    total_duration = _calculate_total_duration(shots_items)
+    total_duration = _calculate_total_duration(shots_items, shot_durations)
     total_duration_6000 = f"{int(total_duration * 6000)}/6000s"
     
     sequence = ET.SubElement(
@@ -423,14 +447,18 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
         
         # Разделяем время пополам между start и end
         half_duration = shot_duration / 2
-        
+
+        # Длительность перехода теперь укладывается ВНУТРЬ duration_s shot'а
+        # (раздел 6.2 ТЗ, Fix 1), а не добавляется поверх: T = min(1.0, duration_s/2).
+        transition_seconds = min(1.0, half_duration)
+
         scene_num = start_shot.get("scene_number", 1)
         shot_num = start_shot.get("shot_number", 1)
         start_video_name = f"img_final_start_{scene_num:02d}_{shot_num:02d}"
         end_video_name = f"img_final_end_{scene_num:02d}_{shot_num:02d}"
-        
+
         # Start видео в новом формате
-        start_duration_6000 = f"{int(half_duration * 6000)}/6000s"
+        start_duration_6000 = f"{int((half_duration - transition_seconds / 2) * 6000)}/6000s"
         
         video_start = ET.SubElement(
             spine, "video",
@@ -450,8 +478,8 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
         )
         
         # Transition в новом формате
-        transition_offset = current_offset + half_duration
-        transition_duration = f"{int(1.0 * 6000)}/6000s"  # 1 секунда
+        transition_offset = current_offset + half_duration - transition_seconds / 2
+        transition_duration = f"{int(transition_seconds * 6000)}/6000s"
         
         transition = ET.SubElement(
             spine, "transition",
@@ -483,9 +511,9 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             name="Audio Crossfade"
         )
         
-        # End видео в новом формате  
-        end_offset = current_offset + half_duration + 1.0  # +1 для transition
-        end_duration_6000 = f"{int(half_duration * 6000)}/6000s"
+        # End видео в новом формате
+        end_offset = current_offset + half_duration + transition_seconds / 2
+        end_duration_6000 = f"{int((half_duration - transition_seconds / 2) * 6000)}/6000s"
         
         video_end = ET.SubElement(
             spine, "video",
@@ -504,8 +532,9 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             value=f"scene_{scene_num:02d}_shot_{shot_num+1:02d}"
         )
         
-        # Обновляем offset для следующего shot
-        current_offset += shot_duration + 1.0  # +1 для transition
+        # Обновляем offset для следующего shot (переход укладывается внутрь
+        # shot_duration, отдельно больше не добавляется)
+        current_offset += shot_duration
     
     # Добавляем smart-collections как в примере
     smart_collection_projects = ET.SubElement(library, "smart-collection", name="Projects", match="all")
@@ -536,3 +565,4 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
         tree.write(f, encoding="utf-8", xml_declaration=False)
     
     logger.info(f"📷 Photo FCPXML создан с {len(shots_by_key)} shot парами, общая длительность: {total_duration:.1f}s")
+    return True

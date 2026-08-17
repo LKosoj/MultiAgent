@@ -16,7 +16,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from backend.fastapi_app.agui.store import WorkflowAdmissionRejected
+from backend.fastapi_app.agui.store import (
+    WORKFLOW_PROCESS_CANCELLATION_PROVENANCE,
+    WorkflowAdmissionRejected,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -38,6 +41,7 @@ _MAX_WORK_SPEC_BYTES = 256 * 1024
 _TERMINAL_STATES = frozenset(
     {"abstained", "cancelled", "failed", "succeeded", "timed_out"}
 )
+_SUPERVISOR_STOP_CANCELLATION_PROVENANCE = "workflow_supervisor_stop:v1"
 # Conservative public defaults preserve startup compatibility when the new
 # environment variables are absent.
 DEFAULT_WORKFLOW_PROCESS_GLOBAL_LIMIT = 4
@@ -100,7 +104,13 @@ class SupervisorStore(Protocol):
         worker_pid_started_at_ms: int | None = None,
     ) -> bool: ...
 
-    def request_cancel(self, run_id: str) -> str: ...
+    def request_cancel(
+        self,
+        run_id: str,
+        *,
+        cancellation_request_id: str | None = None,
+        cancellation_provenance: str | None = None,
+    ) -> object: ...
 
     def get_run(self, run_id: str) -> object | None: ...
 
@@ -222,6 +232,8 @@ class CancellationResult:
     state: str
     accepted: bool
     local: bool
+    cancellation_request_id: str | None = None
+    cancellation_provenance: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +270,8 @@ class _Claim:
     attempt_generation: int
     work_spec: dict[str, object] | None
     invalid_work_spec: bool
+    run_kind: str | None
+    workflow_name: str | None
 
 
 def _required_canonical_text(value: object, field_name: str) -> str:
@@ -274,7 +288,10 @@ def _required_canonical_text(value: object, field_name: str) -> str:
 
 def validate_work_spec(work_spec: object) -> dict[str, object]:
     """Validate and detach the primitive work specification used by spawn."""
-    if not isinstance(work_spec, Mapping) or set(work_spec) != _WORK_SPEC_KEYS:
+    if not isinstance(work_spec, Mapping) or not (
+        _WORK_SPEC_KEYS <= set(work_spec)
+        <= _WORK_SPEC_KEYS
+    ):
         raise ValueError("work_spec must contain the exact persisted fields")
     if work_spec.get("spec_version") != 1:
         raise ValueError("work_spec spec_version must be 1")
@@ -286,6 +303,7 @@ def validate_work_spec(work_spec: object) -> dict[str, object]:
     path = Path(workflow_path)
     if not path.is_absolute() or ".." in path.parts:
         raise ValueError("work_spec workflow_path must be canonical and absolute")
+    normalized_spec = dict(work_spec)
 
     _required_canonical_text(work_spec.get("session_id"), "session_id")
     _required_canonical_text(
@@ -310,7 +328,7 @@ def validate_work_spec(work_spec: object) -> dict[str, object]:
 
     try:
         encoded = json.dumps(
-            dict(work_spec),
+            normalized_spec,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -478,42 +496,131 @@ class WorkflowProcessSupervisor:
             run_ids = tuple(self._handles)
         for run_id in run_ids:
             try:
-                self._store.request_cancel(run_id)
+                self._store.request_cancel(
+                    run_id,
+                    cancellation_request_id=(
+                        f"cancel-supervisor-stop-{uuid.uuid4().hex}"
+                    ),
+                    cancellation_provenance=(
+                        _SUPERVISOR_STOP_CANCELLATION_PROVENANCE
+                    ),
+                )
             except Exception:
                 logger.exception("Failed to request cancellation during supervisor stop")
             self._cancel_local(run_id, reason="SUPERVISOR_STOPPED")
         return True
 
-    def cancel(self, run_id: str) -> CancellationResult:
+    def cancel(
+        self,
+        run_id: str,
+        *,
+        cancellation_request_id: str | None = None,
+        cancellation_provenance: str | None = None,
+    ) -> CancellationResult:
         run_identifier = self._validate_run_id(run_id)
-        state = self._store.request_cancel(run_identifier)
+        if cancellation_request_id is None and cancellation_provenance is not None:
+            raise ValueError(
+                "cancellation provenance requires a cancellation request identity"
+            )
+        if cancellation_request_id is not None:
+            cancellation_request_id = self._validate_run_id(cancellation_request_id)
+            provenance_value = self._validate_run_id(
+                cancellation_provenance
+                or WORKFLOW_PROCESS_CANCELLATION_PROVENANCE
+            )
+            request = self._store.request_cancel(
+                run_identifier,
+                cancellation_request_id=cancellation_request_id,
+                cancellation_provenance=provenance_value,
+            )
+            state = getattr(request, "state", None)
+            accepted = getattr(request, "accepted", None)
+            provenance = getattr(request, "provenance", None)
+            if (
+                type(state) is not str
+                or type(accepted) is not bool
+                or getattr(request, "cancellation_request_id", None)
+                != cancellation_request_id
+                or provenance != provenance_value
+            ):
+                raise RuntimeError("request_cancel returned an invalid canonical record")
+        else:
+            state = self._store.request_cancel(run_identifier)
+            accepted = None
+            provenance = None
         if not isinstance(state, str) or not state:
             raise RuntimeError("request_cancel returned an invalid state")
         normalized = state.lower()
+        if accepted is False:
+            return CancellationResult(
+                run_identifier,
+                normalized,
+                False,
+                False,
+                cancellation_request_id,
+                provenance,
+            )
         if normalized == "cancelled":
-            return CancellationResult(run_identifier, normalized, True, False)
+            return CancellationResult(
+                run_identifier,
+                normalized,
+                True,
+                False,
+                cancellation_request_id,
+                provenance,
+            )
         if normalized in _TERMINAL_STATES or normalized == "result_pending":
-            return CancellationResult(run_identifier, normalized, False, False)
+            return CancellationResult(
+                run_identifier,
+                normalized,
+                accepted is True,
+                False,
+                cancellation_request_id,
+                provenance,
+            )
         if normalized in {"missing", "not_found"}:
-            return CancellationResult(run_identifier, normalized, False, False)
+            return CancellationResult(
+                run_identifier,
+                normalized,
+                False,
+                False,
+                cancellation_request_id,
+                provenance,
+            )
         with self._handles_lock:
             local = run_identifier in self._handles
         if local:
             if self._cancel_local(run_identifier, reason="CANCEL_REQUESTED"):
-                return CancellationResult(run_identifier, "cancelled", True, True)
+                return CancellationResult(
+                    run_identifier,
+                    "cancelled",
+                    True,
+                    True,
+                    cancellation_request_id,
+                    provenance,
+                )
             winner = self._store.get_run(run_identifier)
             if winner is None:
-                return CancellationResult(run_identifier, "missing", False, False)
+                return CancellationResult(
+                    run_identifier,
+                    "missing",
+                    False,
+                    False,
+                    cancellation_request_id,
+                    provenance,
+                )
             winner_status = str(_field(winner, "status", "")).lower()
-            accepted = not (
+            winner_accepted = accepted is True or not (
                 winner_status in _TERMINAL_STATES
                 or winner_status == "result_pending"
             )
             return CancellationResult(
                 run_identifier,
                 winner_status,
-                accepted,
+                winner_accepted,
                 False,
+                cancellation_request_id,
+                provenance,
             )
         if normalized == "queued":
             self._terminalize(
@@ -522,8 +629,22 @@ class WorkflowProcessSupervisor:
                 expected_supervisor_id=None,
                 expected_attempt_generation=None,
             )
-            return CancellationResult(run_identifier, "cancelled", True, False)
-        return CancellationResult(run_identifier, normalized, True, False)
+            return CancellationResult(
+                run_identifier,
+                "cancelled",
+                True,
+                False,
+                cancellation_request_id,
+                provenance,
+            )
+        return CancellationResult(
+            run_identifier,
+            normalized,
+            True,
+            False,
+            cancellation_request_id,
+            provenance,
+        )
 
     def get_process_snapshot(self, run_id: str) -> ProcessSnapshot | None:
         with self._handles_lock:
@@ -745,6 +866,8 @@ class WorkflowProcessSupervisor:
         if type(invalid_work_spec) is not bool:
             raise ValueError("invalid_work_spec must be boolean")
         spec = None
+        run_kind = _field(run, "run_kind")
+        workflow_name = _field(claim_value, "workflow_name")
         if not invalid_work_spec:
             raw_spec = _field(claim_value, "work_spec")
             spec = validate_work_spec(_to_mapping(raw_spec))
@@ -757,6 +880,8 @@ class WorkflowProcessSupervisor:
             attempt_generation,
             spec,
             invalid_work_spec,
+            run_kind if isinstance(run_kind, str) else None,
+            workflow_name if isinstance(workflow_name, str) else None,
         )
 
     def _claim_run_id(self, claim_value: object) -> str:
@@ -769,6 +894,8 @@ class WorkflowProcessSupervisor:
         claim_envelope = {
             "supervisor_id": claim.supervisor_id,
             "attempt_generation": claim.attempt_generation,
+            "run_kind": claim.run_kind,
+            "workflow_name": claim.workflow_name,
         }
         try:
             process = self._process_context.Process(

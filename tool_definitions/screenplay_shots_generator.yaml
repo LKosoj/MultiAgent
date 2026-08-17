@@ -32,3 +32,15 @@ parameters:
     type: bool
     description: "Если True — игнорирует существующий shots.json и перегенерирует заново (полезно при частичной генерации)"
     required: false
+  - name: generate_blockout
+    type: bool
+    description: "Если True — при отсутствии/пустоте набора supported_durations модели генерация останавливается блокирующей ошибкой (B15) вместо тихого продолжения без нормализации длительности"
+    required: false
+  - name: allowed_durations
+    type: list[int]
+    description: "Ограничение набора длительностей модели значениями проекта (blockout_allowed_durations). Пустой список — берётся весь набор, поддерживаемый моделью"
+    required: false
+  - name: screenplay_time
+    type: int
+    description: "Целевая длительность сценария в секундах — используется для справочной строки предупреждений о нормализации длительности (P17)"
+    required: false

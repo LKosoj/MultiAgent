@@ -1,55 +1,35 @@
 name: text_to_sql_pipeline
-version: '1.0'
-description: 'Пайплайн генерации SQL из естественного языка с параллельной NLU обработкой и динамическим агентом'
-parallel_execution: true
-max_parallel_steps: 2
+version: '2.0'
+description: 'Typed Text-to-SQL: исследование схемы, решение и выполнение SQL'
+parallel_execution: false
 
-# Pipeline requires EnhancedWorkflowEngine for output_retry_policy support
-# (см. секцию sql_verification.output_retry_policy ниже).
 pipeline:
-  requires_enhanced_engine: true   # output_retry_policy не работает в базовом engine
+  requires_enhanced_engine: true
 
 inputs:
-  query: ""              # Пользовательский запрос на естественном языке
-  dsn: ""                # Database DSN для подключения
-  max_rows: 100         # Максимальное количество строк в результате
-  session_id: ""        # Стабильный идентификатор сессии/схемы
-  run_id: ""            # Уникальный идентификатор конкретного запуска
+  query: ''
+  dsn: ''
+  max_rows: 100
+  session_id: ''
+  run_id: ''
   safety_level: strict
   safety_policy: null
   schema_scope: null
   include_explanation: true
   validate_schema: true
   dry_run_only: false
-  use_schema_suggestions: true
-  value_grounding: false
-  allow_enhanced_fallback: false
-  sql_safety_check_feedback: {}
-  sql_execution_feedback: {}
 
 outputs:
   final:
     from_step: db_audit
     field: output
     format: json
-  sql_generation:
-    from_step: sql_generation
+  research:
+    from_step: schema_research
     field: output
     format: json
-  sql_verification:
-    from_step: sql_verification
-    field: output
-    format: json
-  schema_linking:
-    from_step: schema_linking_step
-    field: output
-    format: json
-  intent:
-    from_step: intent_extraction_step
-    field: output
-    format: json
-  nlu:
-    from_step: nlu_processing
+  sql:
+    from_step: sql_solving
     field: output
     format: json
 
@@ -64,362 +44,64 @@ global_retry_policy:
     - timeout
 
 global_resource_limits:
-  max_duration_seconds: 900
+  max_duration_seconds: 14400
   max_api_calls_per_minute: 20
-  max_concurrent_steps: 2
+  max_concurrent_steps: 1
 
 steps:
-  # =====================================================================
-  # ЭТАП 1-2: ПАРАЛЛЕЛЬНАЯ NLU ОБРАБОТКА (прямой вызов тулов)
-  # =====================================================================
-  
-  - id: nlu_processing
+  - id: schema_research
     step_type: tool
-    task: "Токенизация и POS-анализ пользовательского запроса на естественном языке"
-    tool_name: natural_language_processing
-    tool_params:
-      text: '{query}'
-    timeout: 10
+    tool_name: typed_schema_research
+    task: 'Исследовать структуру и данные базы до достаточного понимания запроса'
     retry_policy:
       max_retries: 0
-    
-  - id: intent_extraction_step
-    step_type: tool
-    task: "Извлечение интентов и сущностей из пользовательского запроса"
-    tool_name: intent_extraction
-    tool_params:
-      text: '{query}'
-    timeout: 120
-    retry_policy:
-      max_retries: 0
-  
-  # =====================================================================
-  # ЭТАП 3: SCHEMA LINKING (прямой вызов тула)
-  # =====================================================================
-  
-  - id: schema_linking_step
-    # OUTPUT CONTRACT (passed to sql_generation via {schema_linking_step}):
-    #   linked_entities: {metrics: [...], dimensions: [...], filters: [...]}
-    #   joins: [{from_table, to_table, from_column, to_column, join_type}, ...]
-    #   schema_info: {tables: {...}, columns: {...}, primary_keys: {...}}
-    #   linking_strategy: "llm" | "heuristic" | "hybrid" | "fallback" | "none"
-    step_type: tool
-    task: "Связывание извлеченных сущностей со схемой базы данных через RAG"
-    tool_name: schema_linking
-    condition: '{use_schema_suggestions}'
-    tool_params:
-      entities: '{intent_extraction_step.entities}'
-      dsn: '{dsn}'
-      session_id: '{session_id}'
-      schema_scope: '{schema_scope}'
-      value_grounding: '{value_grounding}'
-    depends_on:
-      - nlu_processing
-      - intent_extraction_step
-    metadata:
-      skip_output:
-        status: "skipped_disabled"
-        reason: "use_schema_suggestions=false"
-        linked_entities:
-          metrics: []
-          dimensions: []
-          filters: {}
-        joins: []
-        join_success: false
-        decision: ABSTAIN
-        decision_reasons:
-          - SCHEMA_GROUNDING_DISABLED
-        terminal_reason_code: SCHEMA_GROUNDING_FAILED
-        sql_generation_allowed: false
-        unlinked_entities: []
-        unresolved_entities: []
-        ambiguous_bindings: []
-        schema_info: {}
-    timeout: 180
-    retry_policy:
-      max_retries: 0
-      backoff_strategy: exponential
-  
-  # =====================================================================
-  # ЭТАП 4: SUCCESSFUL SQL RETRIEVAL (прямой вызов тула)
-  # =====================================================================
+    resource_limits:
+      max_duration_seconds: 14400
 
-  - id: successful_sql_retrieval
-    step_type: tool
-    task: "Получить ограниченные успешные SQL-примеры для текущей версии схемы"
-    tool_name: successful_sql_retrieval
-    condition: '{schema_linking_step.sql_generation_allowed}'
-    tool_params:
-      namespace_version_key: '{schema_linking_step.namespace_version_key}'
-      user_query: '{query}'
-    depends_on:
-      - schema_linking_step
-    timeout: 30
-    retry_policy:
-      max_retries: 0
-    metadata:
-      skip_output:
-        status: EMPTY
-        examples: []
-        context_json: "[]"
-        failed_ids: []
-        error_code: null
-
-  # =====================================================================
-  # ЭТАП 5: SQL GENERATION (отдельный агент)
-  # =====================================================================
-
-  - id: sql_generation
+  - id: sql_solving
     step_type: agent
-    agent_type: sql_generator_agent
+    agent_type: sql_solver_agent
     output_schema: json_object
     output_schema_requirements:
       required:
         - sql
         - description
-    condition: '{schema_linking_step.sql_generation_allowed}'
-    task: |
-      Сгенерируй SQL-запрос для задачи пользователя.
-
-      Исходный запрос пользователя:
-      ```
-      {query}
-      ```
-
-      Результаты предыдущих этапов:
-
-      1. NLU анализ:
-      ```json
-      {nlu_processing}
-      ```
-
-      2. Извлечённые интенты и сущности:
-      ```json
-      {intent_extraction_step}
-      ```
-
-      3. Schema Linking (КРИТИЧНО: передавай в инструменты БЕЗ ИЗМЕНЕНИЙ):
-      ```json
-      {schema_linking_step}
-      ```
-
-      Feedback от предыдущих ограниченных попыток (может быть пустым):
-
-      4. Замечания SQL verifier:
-      ```json
-      {sql_safety_check_feedback}
-      ```
-
-      5. Ошибка исполнения предыдущего SQL:
-      ```json
-      {sql_execution_feedback}
-      ```
-
-      Если feedback непустой, исправь причину ошибки, но заново проверь SQL по
-      исходному запросу и схеме. Не копируй SQL из feedback как доверенный ввод.
-
-      Параметры запуска:
-      - session_id: {session_id}
-      - run_id: {run_id}
-      - max_rows: {max_rows}
-      - safety_level: {safety_level}
-      - dry_run_only: {dry_run_only}
-      - dsn: передан инструментам через workflow runtime metadata
-
-      Используй инструмент sql_generation_plugin(context=..., user_query=..., session_id="{session_id}") для генерации, code_formatter для финального форматирования. DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструменту из metadata шага. Верни результат в виде JSON с полями "sql" и "description".
+    condition: '{schema_research.ready_for_sql}'
+    task: 'Построить и проверить SQL с помощью Typed solver loop'
     depends_on:
-      - successful_sql_retrieval
-    timeout: 240
+      - schema_research
     retry_policy:
       max_retries: 0
-      backoff_strategy: exponential
     metadata:
       pipeline_type: text_to_sql
-      session_id: '{session_id}'
-      run_id: '{run_id}'
       max_rows: '{max_rows}'
-      safety_level: '{safety_level}'
       safety_policy: '{safety_policy}'
-      use_schema_suggestions: '{use_schema_suggestions}'
-      dsn: '{dsn}'
-      successful_sql_context_json: '{successful_sql_retrieval.context_json}'
-      # skip_output применяется когда schema_linking_step.sql_generation_allowed=false.
-      # Это fail-closed guard: генератор не должен галлюцинировать SQL по пустой
-      # или несвязанной схеме.
       skip_output:
-        sql: ""
-        description: "SQL generation skipped: schema linking did not produce a valid join path"
-        error: "schema_linking_join_failed"
-        recommendations:
-          - "Проверьте, что schema_linking вернул связанные таблицы, колонки и sql_generation_allowed=true"
-
-  # =====================================================================
-  # ЭТАП 6: SQL VERIFICATION (отдельный агент)
-  # =====================================================================
-
-  - id: sql_verification
-    step_type: agent
-    agent_type: sql_verifier_agent
-    output_schema: json_object
-    output_schema_requirements:
-      required:
-        - verification_status
-        - safety_check
-        - performance_check
-        - recommendations
-      properties:
-        verification_status:
-          enum:
-            - Approved
-            - Rejected
-    condition: '{sql_generation.sql} != ""'
-    task: |
-      Проверь безопасность, исполнимость и семантическое соответствие SQL
-      исходному пользовательскому запросу.
-
-      Исходный запрос:
-      {query}
-
-      Нормализованный intent:
-      {intent_extraction_step}
-
-      Связанные сущности, schema subset и validated joins:
-      {schema_linking_step}
-
-      SQL-запрос от sql_generation (JSON с полями sql / description):
-      {sql_generation}
-
-      Выполни semantic check отдельно от safety check:
-      - все mandatory filters, literals и predicates из исходного запроса
-        должны иметь эквивалентное ограничение в SQL;
-      - aggregation, grouping и result cardinality должны соответствовать
-        тому, просит ли пользователь одно значение или список;
-      - ordering и limit должны соответствовать запросу;
-      - допустимы семантически эквивалентные диапазоны и формы SQL;
-      - description генератора не является доказательством корректности.
-      Отклоняй по семантике только при конкретном воспроизводимом
-      противоречии и указывай его в recommendations.
-
-      Параметры:
-      - safety_level: {safety_level}
-      - validate_schema: {validate_schema}
-      - dsn: передан инструментам через workflow runtime metadata
-
-      Используй sql_safety_check(sql_query=...) и sql_explain(sql_query=...). DSN не печатай и не вставляй в ответ: workflow runtime передаст его инструментам из metadata шага. Верни JSON со следующими полями:
-      verification_status (Approved/Rejected), safety_check, performance_check, recommendations.
-
-      Если статус "Rejected", в recommendations укажи конкретные шаги по исправлению — они будут переданы sql_generator_agent при перезапуске.
-    depends_on:
-      - sql_generation
-    timeout: 180
-    retry_policy:
-      max_retries: 0
-      backoff_strategy: fixed
-    metadata:
-      pipeline_type: text_to_sql
-      advisory_only: true
-      required_runtime_gate: db_audit
-      session_id: '{session_id}'
-      run_id: '{run_id}'
-      safety_level: '{safety_level}'
-      safety_policy: '{safety_policy}'
-      validate_schema: '{validate_schema}'
-      dsn: '{dsn}'
-      # Контрактный маркер для движка / документации: при verification_status=Rejected
-      # генератор перезапускается с feedback. См. 6.3 + sql_generator_agent.yaml
-      # (поле sql_safety_check_feedback в task).
-      rerun_on_reject: sql_generation
-      # skip_output применяется когда condition выше == false (sql_generation вернул пустой SQL)
-      skip_output:
-        verification_status: Rejected
-        safety_check:
-          status: skipped
-          reason: sql_generation returned empty SQL
-        performance_check:
-          status: skipped
-        recommendations:
-          - "SQL не был сгенерирован — проверьте запрос пользователя"
-    # Cross-step retry с feedback: при verification_status=Rejected движок
-    # пакует output этого шага в context.variables[feedback_field] и повторно
-    # запускает rerun_step. Затем перевыполняется сам verification.
-    # Loop guard: max_iterations. Реализация: workflow.engine._maybe_run_output_retry.
-    # NB: condition содержит ссылку на собственный output, поэтому это поле
-    # вынесено за пределы metadata (metadata подставляется заранее, fail-fast).
-    output_retry_policy:
-      condition: '{sql_verification.verification_status} == "Rejected"'
-      rerun_step: sql_generation
-      max_iterations: 1
-      feedback_field: sql_safety_check_feedback
-
-  # =====================================================================
-  # ЭТАП 7: DETERMINISTIC DB EXECUTION / AUDIT
-  # =====================================================================
+        sql: ''
+        description: 'Typed research did not authorize SQL solving'
 
   - id: db_audit
     step_type: tool
     tool_name: finalize_text_to_sql_run
     output_schema: json_object
-    output_schema_requirements:
-      required:
-        - run_id
-        - status
-        - reason_code
-        - sql
-        - generated
-        - approved
-        - executed
-        - dry_run
-        - audited
-        - data
-        - columns
-        - rows_affected
-        - error
-        - execution
-        - audit
-        - persistence
-      properties:
-        status:
-          enum:
-            - succeeded
-            - abstained
-            - failed
-            - cancelled
-            - timed_out
-    condition: '{sql_verification.verification_status} == "Approved"'
-    task: "Детерминированно завершить одобренный Text-to-SQL run"
+    condition: '{sql_solving.sql} != ""'
+    task: 'Проверить свежесть, безопасно выполнить SQL и сформировать результат'
     tool_params:
-      sql_query: '{sql_generation.sql}'
+      sql_query: '{sql_solving.sql}'
       user_query: '{query}'
-      verification_status: '{sql_verification.verification_status}'
       dsn: '{dsn}'
       row_limit: '{max_rows}'
       dry_run_only: '{dry_run_only}'
       session_id: '{session_id}'
       run_id: '{run_id}'
       safety_policy: '{safety_policy}'
-      namespace_version_key: '{schema_linking_step.namespace_version_key}'
+      namespace_version_key: '{schema_research.namespace_version_key}'
     depends_on:
-      - sql_verification
-    timeout: 180
+      - sql_solving
     retry_policy:
       max_retries: 0
-    # Ровно одна детерминированно ограниченная попытка исправить SQL только
-    # после точного EXECUTION_FAILED. Сначала повторяются generation и
-    # verification, затем finalizer выполняется ещё раз. Audit/persistence и
-    # contract failures не запускают этот цикл.
-    output_retry_policy:
-      condition: '{db_audit.reason_code} == "EXECUTION_FAILED"'
-      rerun_step: sql_generation
-      rerun_chain:
-        - sql_generation
-        - sql_verification
-      max_iterations: 1
-      feedback_field: sql_execution_feedback
     metadata:
       pipeline_type: text_to_sql
-      retryable: false
-      required_runtime_gate: secure_db_executor
-      max_rows: '{max_rows}'
       dsn: '{dsn}'
       session_id: '{session_id}'
       run_id: '{run_id}'
@@ -428,28 +110,7 @@ steps:
       include_explanation: '{include_explanation}'
       validate_schema: '{validate_schema}'
       dry_run_only: '{dry_run_only}'
-      use_schema_suggestions: '{use_schema_suggestions}'
-      allow_enhanced_fallback: '{allow_enhanced_fallback}'
-      # Полный terminal outcome для verifier rejection. Runtime executor и audit
-      # в этой ветке не вызываются.
-      skip_output:
-        run_id: '{run_id}'
-        status: abstained
-        reason_code: VERIFIER_REJECTED
-        sql: '{sql_generation.sql}'
-        generated: false
-        approved: false
-        executed: false
-        dry_run: false
-        audited: false
-        data: []
-        columns: []
-        rows_affected: 0
-        error: null
-        execution: {}
-        audit: {}
-        persistence:
-          status: not_attempted
+
 error_handling:
   on_failure: fail
   auto_retry_transient: true
@@ -462,11 +123,7 @@ metadata:
   forbid_workflows_start: true
   author: System
   category: text_to_sql
-  estimated_duration: 30-60 seconds
-  complexity: medium
   engine_type: enhanced
   tags:
     - text_to_sql
-    - sql_generation
-    - workflow
-    - parallel_processing
+    - typed

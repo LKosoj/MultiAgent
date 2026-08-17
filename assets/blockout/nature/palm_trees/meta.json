@@ -1,0 +1,26 @@
+{
+  "id": "palm_trees",
+  "name": "Пальмы",
+  "category": "nature",
+  "tags": [
+    "palm",
+    "cuba",
+    "desc:Дополнительная растительность Кубы."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    17.15501117706299,
+    4.375538110733032,
+    5.313905596733093
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/55690379305145488e20afb05fc687e6",
+  "file_size_bytes": 1709092,
+  "fetched_at": "2026-08-16T22:54:34Z",
+  "asset_version": 1
+}

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import base64
+import json
 import mimetypes
 from math import gcd
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
+
+from custom_tools.storybook.video_generator_common import _get_active_aitunnel_model_record
 
 
 _ASPECT_RATIO_BY_REDUCED_PAIR = {
@@ -54,8 +57,8 @@ def _resolve_model_and_size(
     requires_last_frame: bool,
     seed: Optional[int],
 ) -> Tuple[str, Dict[str, str], int]:
-    config = model_catalog.get(configured_model)
-    if not isinstance(config, dict):
+    config = _get_active_aitunnel_model_record(model_catalog, configured_model)
+    if config is None:
         raise ValueError(f"Модель AITUNNEL не найдена: {configured_model}")
 
     supported_frame_images = set(config.get("supported_frame_images") or [])
@@ -118,9 +121,11 @@ def _select_best_supported_duration(requested_duration: int, supported_durations
         raise ValueError("Для выбранной модели не опубликован список supported_durations")
 
     candidates = sorted({int(value) for value in supported_durations})
+    # Правило выбора длительности: ближайшее значение набора, при равном
+    # удалении — меньшее (раздел 6.1 ТЗ).
     return min(
         candidates,
-        key=lambda value: (abs(value - requested_duration), value < requested_duration, value),
+        key=lambda value: (abs(value - requested_duration), value > requested_duration, value),
     )
 
 
@@ -224,6 +229,103 @@ def _normalize_image_reference(image_ref: str) -> str:
     with path.open("rb") as image_file:
         encoded = base64.b64encode(image_file.read()).decode("utf-8")
     return f"data:{mime_type};base64,{encoded}"
+
+
+def _build_reference_video_payload(video_path: str) -> str:
+    """Э8 (раздел 11.3): значение для payload["reference_video"] — data-URL для
+    локального файла болванки или URL как есть, по образцу _normalize_image_reference."""
+    if not video_path:
+        raise ValueError("Пустой video reference")
+
+    if _is_url_or_data_url(video_path):
+        return video_path
+
+    path = Path(video_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Файл видео-референса не найден: {video_path}")
+
+    mime_type, _ = mimetypes.guess_type(path.name)
+    if mime_type not in {"video/mp4", "video/webm", "video/quicktime"}:
+        mime_type = "video/mp4"
+
+    with path.open("rb") as video_file:
+        encoded = base64.b64encode(video_file.read()).decode("utf-8")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def _payload_aspect_ratio(size_params: Optional[Dict[str, str]]) -> Optional[str]:
+    """Соотношение сторон, фактически уходящее в запрос — из size_params."""
+    if not size_params:
+        return None
+    if "aspect_ratio" in size_params:
+        return size_params["aspect_ratio"]
+    size = size_params.get("size")
+    if size:
+        parsed = _parse_size(size)
+        if parsed:
+            return _infer_aspect_ratio(*parsed)
+    return None
+
+
+def _read_blockout_manifest(blockout_video: str) -> Optional[Dict[str, Any]]:
+    """Читает manifest.json (сосед blockout_video, раздел 12) — тот же файл,
+    что содержит фактический resolution/duration_s согласованной болванки."""
+    manifest_path = Path(blockout_video).with_name("manifest.json")
+    try:
+        with manifest_path.open("r", encoding="utf-8") as manifest_file:
+            data = json.load(manifest_file)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _should_attach_blockout_reference(
+    item: Dict[str, Any],
+    generate_blockout: bool,
+    use_blockout_reference: bool,
+    resolved_duration: int,
+    size_params: Optional[Dict[str, str]],
+) -> Tuple[bool, Optional[str]]:
+    """Пять условий раздела 11.3 подачи видео-референса болванки.
+
+    Возвращает (True, путь_к_ролику) при выполнении всех условий, иначе
+    (False, код_причины_первого невыполненного условия).
+    """
+    if not (generate_blockout and use_blockout_reference):
+        return False, "condition_1_reference_disabled"
+
+    blockout_video = str(item.get("blockout_video") or "").strip()
+    if not blockout_video or not Path(blockout_video).exists():
+        return False, "condition_2_video_missing"
+
+    manifest = _read_blockout_manifest(blockout_video)
+    if manifest is None:
+        return False, "condition_3_manifest_missing"
+
+    try:
+        manifest_duration = int(manifest.get("duration_s"))
+    except (TypeError, ValueError):
+        manifest_duration = None
+    if manifest_duration != int(resolved_duration):
+        return False, "condition_3_duration_mismatch"
+
+    video_aspect = None
+    resolution = manifest.get("resolution")
+    if isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+        try:
+            video_aspect = _infer_aspect_ratio(int(resolution[0]), int(resolution[1]))
+        except (TypeError, ValueError):
+            video_aspect = None
+    payload_aspect = _payload_aspect_ratio(size_params)
+    # Раздел 11.3, условие 4: если запрос сведений о соотношении не несёт вовсе,
+    # сравнивать не с чем — условие считается выполненным.
+    if payload_aspect is not None and payload_aspect != video_aspect:
+        return False, "condition_4_aspect_mismatch"
+
+    if item.get("blockout_junction_failed"):
+        return False, "condition_5_junction_failed"
+
+    return True, blockout_video
 
 
 def _is_url_or_data_url(value: str) -> bool:

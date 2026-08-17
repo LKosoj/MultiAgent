@@ -1,0 +1,15 @@
+version: 1
+name: sample_rows
+description: Sample explicit columns from one exact table.
+implementation: sample_rows
+arguments:
+  - name: table
+    type: string
+    required: true
+  - name: columns
+    type: string_array
+    required: true
+  - name: limit
+    type: integer
+    required: true
+additional_properties: false

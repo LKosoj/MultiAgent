@@ -18,6 +18,7 @@ from test_text_to_sql_agui_workflow_contract import (
     _WorkflowManagerStub,
     _load_service_with_stubs,
 )
+from workflow.text_to_sql_contract import TEXT_TO_SQL_WORKFLOW_NAME
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +123,8 @@ def test_worker_rehydrates_policy_mapping_once(monkeypatch):
         {
             "supervisor_id": "test-supervisor",
             "attempt_generation": 1,
+            "run_kind": "text_to_sql",
+            "workflow_name": TEXT_TO_SQL_WORKFLOW_NAME,
         },
     )
 
@@ -214,8 +217,7 @@ def test_pipeline_carries_one_policy_object_through_mandatory_stages():
     placeholder = "{safety_policy}"
 
     assert pipeline["inputs"]["safety_policy"] is None
-    assert steps["sql_generation"]["metadata"]["safety_policy"] == placeholder
-    assert steps["sql_verification"]["metadata"]["safety_policy"] == placeholder
+    assert steps["sql_solving"]["metadata"]["safety_policy"] == placeholder
     assert steps["db_audit"]["metadata"]["safety_policy"] == placeholder
     assert steps["db_audit"]["tool_params"]["safety_policy"] == placeholder
 

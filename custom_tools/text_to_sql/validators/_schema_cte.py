@@ -73,11 +73,31 @@ class CTECollector:
             if table_expr.find_ancestor(exp.Select) is not scope:
                 continue
             real_name = self._scope.get_real_table_name(table_expr)
+            for pivot in table_expr.args.get("pivots") or ():
+                alias = getattr(pivot, "alias", None)
+                columns = {
+                    self._scope.clean_identifier(column)
+                    for column in pivot.args.get("columns") or ()
+                }
+                if alias and columns:
+                    row_sources[str(alias)] = columns
+            if table_expr.args.get("pivots"):
+                if real_name in available_ctes:
+                    alias = getattr(table_expr, "alias", None)
+                    visible_name = str(alias) if alias else real_name
+                    row_sources[visible_name] = (
+                        self.alias_column_names(table_expr)
+                        or available_ctes[real_name]
+                    )
+                    row_source_names.add(real_name)
+                continue
             if real_name not in available_ctes:
                 continue
             alias = getattr(table_expr, 'alias', None)
             visible_name = str(alias) if alias else real_name
-            row_sources[visible_name] = available_ctes[real_name]
+            row_sources[visible_name] = (
+                self.alias_column_names(table_expr) or available_ctes[real_name]
+            )
             row_source_names.add(real_name)
 
         for subquery in scope.find_all(exp.Subquery):
@@ -85,11 +105,49 @@ class CTECollector:
                 continue
             alias = getattr(subquery, "alias", None)
             select_expr = getattr(subquery, "this", None)
-            if alias and isinstance(select_expr, exp.Select):
+            select_like = (getattr(exp, "Select", type(None)),) + _set_operation_classes()
+            if alias and isinstance(select_expr, select_like):
                 row_sources[str(alias)] = self.row_source_columns(subquery, select_expr, db_schema)
                 row_source_names.add(str(alias))
+            for pivot in subquery.args.get("pivots") or ():
+                pivot_alias = getattr(pivot, "alias", None)
+                columns = {
+                    self._scope.clean_identifier(column)
+                    for column in pivot.args.get("columns") or ()
+                }
+                if pivot_alias and columns:
+                    row_sources[str(pivot_alias)] = columns
+
+        from_expr = scope.args.get("from") if hasattr(scope, "args") else None
+        sources = [getattr(from_expr, "this", None)]
+        sources.extend(
+            getattr(join, "this", None)
+            for join in (scope.args.get("joins") or ())
+            if isinstance(join, exp.Join)
+        )
+        for source in sources:
+            if not isinstance(source, exp.Expression):
+                continue
+            if isinstance(source, exp.Table) and isinstance(source.this, exp.Identifier):
+                continue
+            if isinstance(source, exp.Subquery):
+                continue
+            alias = getattr(source, "alias", None)
+            if alias:
+                row_sources[str(alias)] = {"*"}
 
         return row_sources, row_source_names
+
+    def declared_physical_alias_columns(self, scope) -> Dict[str, Set[str]]:
+        result: Dict[str, Set[str]] = {}
+        for table_expr in scope.find_all(exp.Table):
+            if (
+                table_expr.find_ancestor(exp.Select) is scope
+                and isinstance(table_expr.this, exp.Identifier)
+                and (columns := self.alias_column_names(table_expr))
+            ):
+                result[str(table_expr.alias)] = columns
+        return result
 
     def row_source_columns(
         self,
@@ -98,6 +156,8 @@ class CTECollector:
         db_schema: Dict[str, Dict[str, Dict[str, str]]],
     ) -> Set[str]:
         alias_columns = self.alias_column_names(source_expr)
+        while isinstance(select_expr, _set_operation_classes()):
+            select_expr = select_expr.this
         return alias_columns if alias_columns else self.projected_columns(select_expr, db_schema)
 
     def alias_column_names(self, source_expr) -> Set[str]:

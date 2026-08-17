@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 import subprocess
 import sys
@@ -135,6 +136,24 @@ def test_tool_registry_imports_only_requested_definition(
 
     with pytest.raises(ValueError, match="missing_tool.*researcher"):
         registry.resolve_many(["missing_tool"], profile_name="researcher")
+
+
+def test_sql_verifier_safety_tool_resolves_from_its_public_signature() -> None:
+    from agent_factory import ToolRegistry
+    from custom_tools import sql_tools
+
+    resolved = ToolRegistry().resolve_many(
+        ["sql_safety_check", "sql_explain"],
+        profile_name="sql_verifier_agent",
+    )
+
+    assert set(resolved) == {"sql_safety_check", "sql_explain"}
+    for tool_name, resolved_tool in resolved.items():
+        assert set(resolved_tool.inputs) == {"sql_query"}
+        assert all(
+            parameter.kind is not inspect.Parameter.VAR_KEYWORD
+            for parameter in inspect.signature(getattr(sql_tools, tool_name)).parameters.values()
+        )
 
 
 def test_rag_memory_import_and_constructor_do_not_initialize_manager() -> None:

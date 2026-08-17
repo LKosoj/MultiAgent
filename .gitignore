@@ -202,6 +202,8 @@ plots/.DS_Store
 !/docs/operations/
 /docs/operations/*
 !/docs/operations/text2sql-production.md
+!/docs/operations/text2sql-adaptive-research-rollout.md
+!/docs/operations/text2sql-benchmark-protocol.md
 /AGENTS.md
 /CLAUDE.md
 /GEMINI.md

@@ -41,10 +41,34 @@ def _read_json(path: str) -> Optional[Dict[str, Any]]:
 
 def _write_json_atomic(path: str, data: Dict[str, Any]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Fields this tool ever mutates on a shot item (mirrors `allowed_fields` in
+# _apply_repairs_to_items and the fields touched by _apply_global_repairs_to_items).
+# Used when merging the in-memory item back into the freshly re-read on-disk item:
+# only these are overlaid, so any field written concurrently by another writer
+# (blockout paths, duration_s/duration_source/duration_requested_s, etc.) between
+# this tool's initial read and its write survives instead of being reverted to
+# the stale in-memory snapshot.
+_QA_WRITABLE_ITEM_FIELDS = (
+    "english_prompt",
+    "video_prompt",
+    "negative_prompt",
+    "reference_image_paths",
+    "characters",
+    "locations",
+)
 
 
 def _safe_int(value: Any, default: int = -1) -> int:
@@ -1217,6 +1241,9 @@ def shots_prompt_qa_tool(
 
     Returns:
         Updated shots_data dict (items.json compatible). Also writes updated shots.json and a QA report to disk.
+        If the shots.json write itself fails, the dict carries a "_qa_persist_error" key (the repairs are
+        only in memory). A failure writing the QA report alone is logged but does not set this key, since
+        shots.json was already persisted successfully.
     """
     if not enable:
         logger.info("🧪 shots_prompt_qa_tool: отключено (enable=False)")
@@ -1923,7 +1950,8 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
     else:
         try:
             os.makedirs(os.path.dirname(shots_path), exist_ok=True)
-            with open(shots_path, "a+", encoding="utf-8") as lock_f:
+            lock_path = f"{shots_path}.lock"
+            with open(lock_path, "a+", encoding="utf-8") as lock_f:
                 fcntl.flock(lock_f, fcntl.LOCK_EX)
                 try:
                     # Reload latest file content (if any) and merge items by key to avoid stomping
@@ -1962,17 +1990,49 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
                             except Exception:
                                 merged_items.append(it)
                                 continue
-                            merged_items.append(updated_index.get(key, it))
+                            in_memory_it = updated_index.get(key)
+                            if in_memory_it is None:
+                                merged_items.append(it)
+                            else:
+                                # Merge by field (not wholesale replace): start from the
+                                # on-disk item so fields written concurrently by other
+                                # steps (e.g. blockout paths) survive, then overlay ONLY
+                                # the fields this tool itself can mutate
+                                # (_QA_WRITABLE_ITEM_FIELDS). Overlaying the whole
+                                # in-memory item would resurrect its stale copy of any
+                                # field a concurrent writer updated after this tool's
+                                # initial read (see docstring of _merge_write_shots in
+                                # screenplay_shots_generator.py for the protocol).
+                                merged = dict(it)
+                                for field in _QA_WRITABLE_ITEM_FIELDS:
+                                    if field in in_memory_it:
+                                        merged[field] = in_memory_it[field]
+                                merged_items.append(merged)
                         shots_data["items"] = merged_items
                     else:
                         shots_data["items"] = items
 
                     _write_json_atomic(shots_path, shots_data)
-                    _write_json_atomic(report_path, report)
+                    try:
+                        _write_json_atomic(report_path, report)
+                    except Exception as report_exc:
+                        # shots.json (the critical write) already succeeded above;
+                        # the report is a secondary artifact, so log and move on
+                        # instead of feeding this into the shots.json failure path below.
+                        logger.error(f"🧪 shots_prompt_qa_tool: не удалось сохранить report: {report_exc}")
                 finally:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
         except Exception as e:
-            logger.error(f"🧪 shots_prompt_qa_tool: не удалось сохранить shots.json/report: {e}")
+            logger.error(f"🧪 shots_prompt_qa_tool: не удалось сохранить shots.json: {e}")
+            # Правки применены только в памяти (atomic write либо пишет
+            # целиком, либо не трогает диск — см. _write_json_atomic), но
+            # вызывающий получает shots_data как обычно и не может отличить
+            # "сохранено" от "не сохранено". Тот же приём, что и у dry_run
+            # (`_qa_report` выше): маркер в самом возвращаемом словаре,
+            # а не смена status/raise — это не шаг с output_schema, и
+            # превращать проглоченную ошибку в исключение здесь опасно
+            # (money-path, шаг не должен падать там, где раньше продолжал).
+            shots_data["_qa_persist_error"] = str(e)
 
     # NOTE: We intentionally do NOT validate reference_image_paths against the filesystem here.
     # At this stage there may be zero generated images on disk; existence-based filtering is invalid and destructive.

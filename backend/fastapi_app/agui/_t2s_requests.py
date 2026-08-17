@@ -16,12 +16,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Literal, Optional
+from dataclasses import dataclass
+from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-# Импортируем общий strict-bool coercer (см. EPIC 7.22) — единая семантика
-# с workflow.enhanced_engine._should_fallback_to_legacy.
+# Общий strict-bool coercer используется для административного DSN-флага.
 from custom_tools.text_to_sql.utils import coerce_strict_bool
 
 TEXT_TO_SQL_MAX_ROWS_MIN = 1
@@ -92,9 +92,10 @@ class TextToSqlGenerateRequest(BaseModel):
     principal-aware авторизация остаются в service-слое.
     """
 
-    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     query: str = Field(..., min_length=1, description="NL-запрос пользователя")
+    context_documents: tuple[str, ...] = ()
     connection_ref: Optional[str] = Field(default=None, description="Opaque connection reference")
     dsn: Optional[str] = Field(default=None, min_length=1, description="Admin compatibility DSN")
     admin_raw_dsn_compat: bool = Field(default=False)
@@ -103,12 +104,8 @@ class TextToSqlGenerateRequest(BaseModel):
     include_explanation: bool = Field(default=True)
     validate_schema: bool = Field(default=True)
     dry_run_only: bool = Field(default=False)
-    use_schema_suggestions: bool = Field(default=True)
-    allow_enhanced_fallback: bool = Field(default=False)
-    workflow_name: str = Field(default="text_to_sql_pipeline", min_length=1)
     session_id: Optional[str] = Field(default=None)
     client_id: Optional[str] = Field(default=None)
-    use_enhanced: bool = Field(default=True)
     enable_telemetry: bool = Field(default=False)
     idempotency_key: Optional[str] = Field(default=None)
 
@@ -124,6 +121,18 @@ class TextToSqlGenerateRequest(BaseModel):
         if not stripped:
             raise ValueError("query is required")
         return stripped
+
+    @field_validator("context_documents", mode="before")
+    @classmethod
+    def _validate_context_documents(cls, value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("context_documents must be a list of text strings")
+        documents = tuple(value)
+        if any(not isinstance(item, str) or not item.strip() for item in documents):
+            raise ValueError("context_documents entries must be non-empty text strings")
+        return documents
 
     @field_validator("connection_ref", mode="before")
     @classmethod
@@ -187,8 +196,6 @@ class TextToSqlGenerateRequest(BaseModel):
         "include_explanation",
         "validate_schema",
         "dry_run_only",
-        "use_schema_suggestions",
-        "use_enhanced",
         "enable_telemetry",
         mode="before",
     )
@@ -196,28 +203,6 @@ class TextToSqlGenerateRequest(BaseModel):
     def _coerce_soft_bool_fields(cls, v: Any, info) -> bool:
         default = cls.model_fields[info.field_name].default
         return _coerce_soft_bool(v, default=bool(default))
-
-    @field_validator("allow_enhanced_fallback", mode="before")
-    @classmethod
-    def _coerce_strict_bool_field(cls, v: Any) -> bool:
-        return coerce_strict_bool(v, default=False, field_name="allow_enhanced_fallback")
-
-    @field_validator("workflow_name", mode="before")
-    @classmethod
-    def _validate_workflow_name(cls, v: Any) -> str:
-        if v is None or (isinstance(v, str) and not v.strip()):
-            v = "text_to_sql_pipeline"
-        if not isinstance(v, str):
-            raise ValueError("workflow_name must be a string")
-        name = v.strip()
-        # Fail-fast: пайплайн должен существовать на диске. Иначе ошибка
-        # вылезла бы глубоко внутри WorkflowManager (после стартовых
-        # сайд-эффектов: создания run_id, регистрации сессии и т.п.).
-        from pathlib import Path as _P
-        pipeline_dir = _P(__file__).resolve().parents[3] / "workflow_pipelines"
-        if not (pipeline_dir / f"{name}.yaml").exists():
-            raise ValueError(f"Pipeline '{name}' not found in workflow_pipelines/")
-        return name
 
     @field_validator("session_id", "client_id", mode="before")
     @classmethod
@@ -252,11 +237,12 @@ class TextToSqlGenerateRequest(BaseModel):
             raise ValueError("exactly one of connection_ref or dsn is required")
         return self
 
-    @model_validator(mode="after")
-    def _validate_schema_mode(self) -> "TextToSqlGenerateRequest":
-        if not self.use_schema_suggestions:
-            raise ValueError("schema grounding is required for Text-to-SQL")
-        return self
+@dataclass(frozen=True)
+class TextToSqlWorkflowAdmission:
+    """Trusted Text-to-SQL idempotency identity for WorkflowManager."""
+
+    idempotency_key: Optional[str]
+    request_fingerprint: str
 
 
 def parse_text_to_sql_generate(payload: dict) -> TextToSqlGenerateRequest:
@@ -293,27 +279,22 @@ def parse_text_to_sql_generate(payload: dict) -> TextToSqlGenerateRequest:
 
 
 def parse_text_to_sql_start(payload: dict[str, Any]) -> TextToSqlGenerateRequest:
-    """Normalize the public query alias and validate one start request."""
+    """Validate one public Text-to-SQL start request."""
     if not isinstance(payload, dict):
         raise ValueError("service_payload must be an object")
-    query = ""
-    for key in ("natural_query", "query"):
-        candidate = payload.get(key)
-        if candidate is None:
-            continue
-        if not isinstance(candidate, str):
-            raise ValueError(f"{key} must be a string")
-        if candidate.strip():
-            query = candidate.strip()
-            break
-    normalized = dict(payload)
-    normalized["query"] = query
-    return parse_text_to_sql_generate(normalized)
+    return parse_text_to_sql_generate(payload)
+
+
+def text_to_sql_request_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the Typed request without the AG-UI correlation field."""
+    if not isinstance(payload, dict):
+        raise ValueError("service_payload must be an object")
+    return {key: value for key, value in payload.items() if key != "__request_id"}
 
 
 def canonical_text_to_sql_start_fingerprint(payload: dict[str, Any]) -> str:
     """Digest canonical validated semantics, excluding transport-only identity."""
-    request = parse_text_to_sql_start(payload)
+    request = parse_text_to_sql_start(text_to_sql_request_payload(payload))
     excluded_fields = {"admin_raw_dsn_compat", "client_id", "idempotency_key"}
     excluded_fields.add("dsn" if request.connection_ref is not None else "connection_ref")
     canonical = request.model_dump(
@@ -388,6 +369,7 @@ PIPELINE_VALIDATORS: dict[str, type[BaseModel]] = {
 
 __all__ = [
     "TextToSqlGenerateRequest",
+    "TextToSqlWorkflowAdmission",
     "parse_text_to_sql_generate",
     "parse_text_to_sql_pipeline_inputs",
     "PIPELINE_VALIDATORS",

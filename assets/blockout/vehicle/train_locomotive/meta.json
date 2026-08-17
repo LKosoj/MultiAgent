@@ -1,0 +1,26 @@
+{
+  "id": "train_locomotive",
+  "name": "Паровоз",
+  "category": "vehicle",
+  "tags": [
+    "train",
+    "locomotive",
+    "western"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.4293325543403625,
+    2.6000001430511475,
+    1.6594994068145752
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/train-kit",
+  "file_size_bytes": 120320,
+  "fetched_at": "2026-08-16T21:48:00Z",
+  "asset_version": 2
+}

@@ -1,0 +1,26 @@
+{
+  "id": "wooden_windows",
+  "name": "Старые деревянные окна",
+  "category": "prop",
+  "tags": [
+    "window",
+    "glass",
+    "desc:Рама окна, которое разбивает мяч."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    7.630606174468994,
+    0.07771138846874237,
+    2.4338977932929993
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/c60a6fe181e1482d96f9412a20c4a390",
+  "file_size_bytes": 1738840,
+  "fetched_at": "2026-08-16T22:54:25Z",
+  "asset_version": 1
+}

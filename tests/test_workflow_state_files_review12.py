@@ -206,7 +206,11 @@ def test_ensure_private_directory_softens_benign_mode_with_warning(
     os.chmod(directory, 0o755)
 
     caplog.set_level("WARNING", logger="workflow.state_files")
-    result = state_files.ensure_private_directory(directory, create=False)
+    result = state_files.ensure_private_directory(
+        directory,
+        create=False,
+        tighten_existing=True,
+    )
 
     assert result == directory
     assert stat.S_IMODE(os.stat(directory).st_mode) == 0o700

@@ -472,7 +472,7 @@ describe("Text-to-SQL history result counts", () => {
       const malformed = boundedHistorySummary({ row_count });
       expect(textToSqlHistoryRowCount(malformed)).toBeNull();
       expect(textToSqlHistoryTerminalState(malformed)).toMatchObject({
-        status: "unknown_legacy",
+        status: "invalid_terminal",
         success: false,
       });
     },
@@ -512,7 +512,7 @@ describe("shared Text-to-SQL terminal contract vectors", () => {
       );
       const state = textToSqlHistoryTerminalState({ terminal_outcome });
 
-      expect(state.status).not.toBe("unknown_legacy");
+      expect(state.status).not.toBe("invalid_terminal");
     },
   );
 
@@ -525,16 +525,16 @@ describe("shared Text-to-SQL terminal contract vectors", () => {
       );
 
       expect(textToSqlHistoryTerminalState({ terminal_outcome: validOutcome }).status)
-        .not.toBe("unknown_legacy");
+        .not.toBe("invalid_terminal");
     },
   );
 });
 
 
 describe("textToSqlHistoryTerminalState", () => {
-  const expectUnknownLegacy = (terminal_outcome: unknown) => {
+  const expectInvalidTerminal = (terminal_outcome: unknown) => {
     expect(textToSqlHistoryTerminalState({ terminal_outcome })).toMatchObject({
-      status: "unknown_legacy",
+      status: "invalid_terminal",
       success: false,
       executed: false,
       dryRun: false,
@@ -546,7 +546,7 @@ describe("textToSqlHistoryTerminalState", () => {
     (status) => {
       expect(textToSqlHistoryTerminalState({
         status: "completed",
-        result: "non-empty legacy output",
+        result: "non-empty output",
         terminal_outcome: terminalOutcome(status),
       })).toMatchObject({ status, success: false });
     },
@@ -583,12 +583,12 @@ describe("textToSqlHistoryTerminalState", () => {
     });
   });
 
-  it("fails closed for legacy output without a terminal outcome", () => {
+  it("fails closed for output without a valid terminal outcome", () => {
     expect(textToSqlHistoryTerminalState({
       status: "completed",
-      result: "legacy output",
+      result: "unvalidated output",
     })).toMatchObject({
-      status: "unknown_legacy",
+      status: "invalid_terminal",
       success: false,
       executed: false,
       dryRun: false,
@@ -599,7 +599,7 @@ describe("textToSqlHistoryTerminalState", () => {
     { status: "succeeded" },
     { ...terminalOutcome("succeeded"), approved: "true" },
   ])("fails closed for partial or malformed terminal outcome", (terminal_outcome) => {
-    expectUnknownLegacy(terminal_outcome);
+    expectInvalidTerminal(terminal_outcome);
   });
 
   it.each(["reason", " "])(
@@ -816,7 +816,7 @@ describe("textToSqlHistoryTerminalState", () => {
   });
 
   it("still rejects a persistence path that is not finite JSON (NaN) via isJsonValue", () => {
-    expectUnknownLegacy(strictSuccessfulOutcome({
+    expectInvalidTerminal(strictSuccessfulOutcome({
       persistence: { status: "saved", filename: "query.md", path: NaN },
     }));
   });
@@ -964,7 +964,7 @@ describe("textToSqlHistoryTerminalState", () => {
   it.each([NaN, Infinity, -Infinity])(
     "rejects non-finite JSON evidence %#",
     (value) => {
-      expectUnknownLegacy(strictSuccessfulOutcome({
+      expectInvalidTerminal(strictSuccessfulOutcome({
         data: [[value]],
         execution: {
           ...terminalOutcome("succeeded").execution,
@@ -1069,14 +1069,14 @@ describe("textToSqlHistoryTerminalState", () => {
       ...terminalOutcome("succeeded").execution,
       execution_time_ms: NaN,
     };
-    expectUnknownLegacy({
+    expectInvalidTerminal({
       ...terminalOutcome("succeeded"),
       execution,
     });
   });
 
   it("still rejects an execution block with an explicit undefined error_message (isJsonValue rejects undefined)", () => {
-    expectUnknownLegacy(failedExecutionOutcome({ error_message: undefined }, {}));
+    expectInvalidTerminal(failedExecutionOutcome({ error_message: undefined }, {}));
   });
 
   it.each([
@@ -1257,7 +1257,7 @@ describe("textToSqlHistoryTerminalState", () => {
         error: "x".repeat(4096),
       },
     })).toMatchObject({ status: "failed", success: false });
-    expectUnknownLegacy({
+    expectInvalidTerminal({
       ...terminalOutcome("failed"),
       error: "x".repeat(4097),
     });
@@ -1376,7 +1376,7 @@ describe("softened contract constants and validators (T10-frontend)", () => {
 
 describe("Text-to-SQL status polling", () => {
   it.each([
-    ["unknown_legacy", { status: "unknown_legacy" }],
+    ["invalid_terminal", { status: "invalid_terminal" }],
     ["cancelled", { status: "cancelled", terminal_outcome: terminalOutcome("cancelled") }],
     ["timed_out", { status: "failed", terminal_outcome: terminalOutcome("timed_out") }],
   ])(

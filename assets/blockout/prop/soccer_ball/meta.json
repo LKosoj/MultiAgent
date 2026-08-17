@@ -1,0 +1,27 @@
+{
+  "id": "soccer_ball",
+  "name": "Футбольный мяч",
+  "category": "prop",
+  "tags": [
+    "ball",
+    "football",
+    "soccer",
+    "desc:Мяч, который летит в окно."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    2.104843020439148,
+    2.089207410812378,
+    2.114738702774048
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/46c91864ef384158b0078e20bdbfe3e9",
+  "file_size_bytes": 2536016,
+  "fetched_at": "2026-08-16T22:54:15Z",
+  "asset_version": 1
+}

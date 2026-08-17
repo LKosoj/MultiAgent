@@ -1,0 +1,24 @@
+{
+  "id": "desert_tree_detailed",
+  "name": "Дерево детальное",
+  "category": "nature",
+  "tags": [
+    "tree"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.8471150398254395,
+    0.7616024911403656,
+    1.3324170596897602
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 29572,
+  "fetched_at": "2026-08-16T21:19:52Z",
+  "asset_version": 1
+}

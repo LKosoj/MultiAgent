@@ -1,0 +1,26 @@
+{
+  "id": "cowboy_western",
+  "name": "Ковбой western 01",
+  "category": "character",
+  "tags": [
+    "cowboy",
+    "western",
+    "author:ALTEREGO (v.a.c.u.u.m.)"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    2.0090153217315674,
+    0.43992698192596436,
+    1.8768589496612549
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/cowboy-western-01-9df692aa75c24fbe9ec695f5626a1cb7",
+  "file_size_bytes": 2139316,
+  "fetched_at": "2026-08-16T22:08:19Z",
+  "asset_version": 1
+}

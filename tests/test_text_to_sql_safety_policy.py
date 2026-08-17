@@ -20,6 +20,15 @@ def _reset_safety_policy(monkeypatch):
     monkeypatch.delenv("TEXT2SQL_PROFILE", raising=False)
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_LEVEL", raising=False)
     safety_config.reset_cache()
+    terminal = __import__(
+        "custom_tools.text_to_sql.core._terminal",
+        fromlist=["_pre_execution_gate_allowed"],
+    )
+    monkeypatch.setattr(
+        terminal,
+        "_pre_execution_gate_allowed",
+        lambda **_kwargs: True,
+    )
     yield
     safety_config.reset_cache()
 
@@ -65,6 +74,18 @@ def test_pg_sleep_is_rejected_with_only_request_strict():
     )
     assert result["profile_name"] == policy.profile_name
     assert result["policy_version"] == policy.policy_version
+
+
+def test_root_duckdb_transform_is_readonly_but_dml_stays_rejected():
+    validator = SQLSafetyValidator()
+
+    root_transform = validator.validate(
+        "PIVOT sales ON category USING SUM(amount)", dsn="duckdb://"
+    )
+    insert = validator.validate("INSERT INTO sales VALUES (1)", dsn="duckdb://")
+
+    assert root_transform["is_safe"] is True, root_transform["issues"]
+    assert insert["is_safe"] is False
 
 
 def test_explicit_policy_does_not_read_request_safety_level_env(monkeypatch):
@@ -211,7 +232,6 @@ def test_generation_and_finalizer_forward_same_policy(monkeypatch):
     terminal = _terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         True,

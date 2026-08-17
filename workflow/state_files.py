@@ -105,8 +105,7 @@ def _validate_active_sqlite_bundle(
         raise RuntimeError("active SQLite bundle path changed") from exc
     if (
         _directory_signature(parent_stat) != entry.parent_signature
-        or _file_signature(file_stat, content_sensitive=False)
-        != entry.file_signature
+        or _file_signature(file_stat, content_sensitive=False) != entry.file_signature
     ):
         raise RuntimeError("active SQLite bundle path changed")
     if (
@@ -245,6 +244,7 @@ def _validate_or_soften_directory_mode(
     mode: int,
     *,
     description: object,
+    tighten_existing: bool,
 ) -> bool:
     """Reject group/other-writable directory modes; tighten benign ones.
 
@@ -252,10 +252,10 @@ def _validate_or_soften_directory_mode(
     umask) is not itself a security problem as long as nothing but the
     owner can write to the directory; only the write bits for group/other
     (0o022) are actually dangerous. Those are still a hard failure. A
-    benign mode is silently tightened back to 0700 and logged instead of
-    failing closed.
+    benign mode is tightened back to 0700 and logged only when the caller
+    explicitly opts in with ``tighten_existing=True``.
     """
-    if mode & 0o022:
+    if not tighten_existing or mode & 0o022:
         raise PermissionError(f"state directory mode must be 0700: {description}")
     os.fchmod(directory_fd, PRIVATE_DIRECTORY_MODE)
     logger.warning(
@@ -277,28 +277,26 @@ def ensure_private_directory(
     directory = Path(path)
     absolute = Path(os.path.abspath(os.fspath(directory)))
     is_root = absolute.parent == absolute
-    chain = _PinnedDirectoryChain.open(
-        absolute if is_root else absolute.parent
-    )
+    if is_root:
+        raise ValueError("state directory must not be the filesystem root")
+    chain = _PinnedDirectoryChain.open(absolute.parent)
     try:
-        if not is_root:
-            chain.open_child(
-                absolute.name,
-                create=create,
-                mode=PRIVATE_DIRECTORY_MODE,
-            )
+        chain.open_child(
+            absolute.name,
+            create=create,
+            mode=PRIVATE_DIRECTORY_MODE,
+        )
         fd_stat = os.fstat(chain.fd)
         expected_owner = _expected_owner(owner_uid)
         if fd_stat.st_uid != expected_owner:
-            raise PermissionError(
-                f"state directory owner mismatch: {directory}"
-            )
+            raise PermissionError(f"state directory owner mismatch: {directory}")
         mode = stat.S_IMODE(fd_stat.st_mode)
         if mode != PRIVATE_DIRECTORY_MODE:
             _validate_or_soften_directory_mode(
                 chain.fd,
                 mode,
                 description=directory,
+                tighten_existing=tighten_existing,
             )
             chain.refresh_last_signature()
         chain.revalidate()
@@ -397,11 +395,7 @@ def _directory_flags() -> int:
 
 def _regular_flags(*, writable: bool) -> int:
     access = os.O_RDWR if writable else os.O_RDONLY
-    return (
-        access
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
+    return access | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
 
 
 def _stat_at(directory_fd: int, name: str) -> os.stat_result:
@@ -451,9 +445,7 @@ def _validate_open_regular_at(
         ):
             raise _TransientStatePublication
         else:
-            raise ValueError(
-                f"state file must have exactly one hard link: {name}"
-            )
+            raise ValueError(f"state file must have exactly one hard link: {name}")
     if opened.st_uid != expected_owner:
         raise PermissionError(f"state file owner mismatch: {name}")
     if stat.S_IMODE(opened.st_mode) != PRIVATE_FILE_MODE:
@@ -527,9 +519,7 @@ def _open_regular_at(
             except FileNotFoundError:
                 if not create:
                     raise
-                temporary_name = (
-                    f".state-create-{os.getpid()}-{uuid.uuid4().hex}"
-                )
+                temporary_name = f".state-create-{os.getpid()}-{uuid.uuid4().hex}"
                 file_descriptor = os.open(
                     temporary_name,
                     flags | os.O_CREAT | os.O_EXCL,
@@ -545,9 +535,7 @@ def _open_regular_at(
                     raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), name)
         except OSError as exc:
             if exc.errno == errno.ELOOP:
-                raise ValueError(
-                    f"state path must not be a symlink: {name}"
-                ) from exc
+                raise ValueError(f"state path must not be a symlink: {name}") from exc
             raise
 
         try:
@@ -622,9 +610,7 @@ def _open_regular_at(
                 _inode_identity(published) != created_identity
                 or published.st_nlink != 1
             ):
-                raise RuntimeError(
-                    f"state file changed while publishing: {name}"
-                )
+                raise RuntimeError(f"state file changed while publishing: {name}")
             opened = _validate_open_regular_at(
                 directory_fd,
                 name,
@@ -658,6 +644,8 @@ def _open_regular_at(
 def _validate_private_parent(
     parent: _PinnedDirectoryChain,
     owner_uid: Optional[int],
+    *,
+    tighten_existing: bool,
 ) -> None:
     parent_stat = os.fstat(parent.fd)
     expected_owner = _expected_owner(owner_uid)
@@ -669,6 +657,7 @@ def _validate_private_parent(
             parent.fd,
             mode,
             description=parent.path,
+            tighten_existing=tighten_existing,
         )
         parent.refresh_last_signature()
 
@@ -697,7 +686,11 @@ def _prepare_explicit_sqlite_file(
     parent = _PinnedDirectoryChain.open(path.parent)
     opened_files: list[int] = []
     try:
-        _validate_private_parent(parent, owner_uid)
+        _validate_private_parent(
+            parent,
+            owner_uid,
+            tighten_existing=tighten_existing,
+        )
         file_descriptor, opened, _ = _open_regular_at(
             parent.fd,
             path.name,
@@ -730,10 +723,13 @@ def _validate_sqlite_sidecar_at(
             return
         if not stat.S_ISREG(sidecar.st_mode):
             raise ValueError(f"SQLite sidecar is not a regular file: {name}")
+        if sidecar.st_nlink == 0:
+            if attempt + 1 < _SQLITE_SIDECAR_MODE_RECHECK_ATTEMPTS:
+                os.sched_yield()
+                continue
+            raise RuntimeError(f"SQLite sidecar changed during validation: {name}")
         if sidecar.st_nlink != 1:
-            raise ValueError(
-                f"SQLite sidecar must have exactly one hard link: {name}"
-            )
+            raise ValueError(f"SQLite sidecar must have exactly one hard link: {name}")
         if sidecar.st_uid != _expected_owner(owner_uid):
             raise PermissionError(f"SQLite sidecar owner mismatch: {name}")
         if stat.S_IMODE(sidecar.st_mode) == PRIVATE_FILE_MODE:
@@ -752,7 +748,11 @@ def _secure_explicit_sqlite_bundle(
     parent = _PinnedDirectoryChain.open(path.parent)
     opened_files: list[int] = []
     try:
-        _validate_private_parent(parent, owner_uid)
+        _validate_private_parent(
+            parent,
+            owner_uid,
+            tighten_existing=tighten_existing,
+        )
         file_descriptor, opened, _ = _open_regular_at(
             parent.fd,
             path.name,
@@ -805,12 +805,9 @@ class _PinnedDirectoryChain:
             current_path = Path(os.sep)
             for name in absolute.parts[1:]:
                 before = _stat_at(entries[-1][1], name)
-                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(
-                    before.st_mode
-                ):
+                if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
                     raise ValueError(
-                        f"state ancestor is not a real directory: "
-                        f"{current_path / name}"
+                        f"state ancestor is not a real directory: {current_path / name}"
                     )
                 child_fd = os.open(
                     name,
@@ -825,18 +822,13 @@ class _PinnedDirectoryChain:
                 if _inode_identity(before) != _inode_identity(after):
                     _close_file_descriptors((child_fd,))
                     raise RuntimeError(
-                        f"state ancestor changed while opening: "
-                        f"{current_path / name}"
+                        f"state ancestor changed while opening: {current_path / name}"
                     )
                 current_path /= name
-                entries.append(
-                    (name, child_fd, _directory_signature(after))
-                )
+                entries.append((name, child_fd, _directory_signature(after)))
             return cls(absolute, entries)
         except BaseException:
-            _close_file_descriptors(
-                entry[1] for entry in reversed(entries)
-            )
+            _close_file_descriptors(entry[1] for entry in reversed(entries))
             raise
 
     @property
@@ -939,19 +931,20 @@ class _PinnedLegacyFile:
                 f"legacy state changed during migration: {self.display_path}"
             )
         digest = (
-            _read_fd_digest(self.file_descriptor)
-            if self.content_sensitive
-            else None
+            _read_fd_digest(self.file_descriptor) if self.content_sensitive else None
         )
         after = os.fstat(self.file_descriptor)
         signature = _file_signature(
             after,
             content_sensitive=self.content_sensitive,
         )
-        if _file_signature(
-            before,
-            content_sensitive=self.content_sensitive,
-        ) != signature:
+        if (
+            _file_signature(
+                before,
+                content_sensitive=self.content_sensitive,
+            )
+            != signature
+        ):
             raise RuntimeError(
                 f"legacy state changed during migration: {self.display_path}"
             )
@@ -968,9 +961,7 @@ class _PinnedLegacyFile:
                 f"legacy state changed during migration: {self.display_path}"
             )
         digest = (
-            _read_fd_digest(self.file_descriptor)
-            if self.content_sensitive
-            else None
+            _read_fd_digest(self.file_descriptor) if self.content_sensitive else None
         )
         opened_after = os.fstat(self.file_descriptor)
         if (
@@ -1072,9 +1063,7 @@ def _pin_optional_legacy_bundle(
             ):
                 parent.close()
                 return None
-            initial.append(
-                (candidate.name, suffix, candidate, candidate_stat)
-            )
+            initial.append((candidate.name, suffix, candidate, candidate_stat))
         for name, suffix, candidate, initial_stat in initial:
             try:
                 file_descriptor = os.open(
@@ -1114,9 +1103,7 @@ def _pin_optional_legacy_bundle(
         bundle.parent.revalidate()
         return bundle
     except BaseException:
-        _close_file_descriptors(
-            member.file_descriptor for member in reversed(members)
-        )
+        _close_file_descriptors(member.file_descriptor for member in reversed(members))
         members.clear()
         try:
             parent.close()
@@ -1288,17 +1275,13 @@ def _recover_and_collapse_private_copy(
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(connection_path, timeout=30)
-        busy = connection.execute(
-            "PRAGMA wal_checkpoint(TRUNCATE)"
-        ).fetchone()[0]
+        busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
         if busy != 0:
             raise LegacyDatabaseUnrecoverable(
                 "LEGACY_WAL_CHECKPOINT_BUSY",
                 display_path=display_path,
             )
-        journal_mode = connection.execute(
-            "PRAGMA journal_mode=DELETE"
-        ).fetchone()
+        journal_mode = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
         if journal_mode != ("delete",):
             raise LegacyDatabaseUnrecoverable(
                 "LEGACY_WAL_RECOVERY_FAILED",
@@ -1402,9 +1385,7 @@ def _migrate_legacy_database(
 
         source_path = f"/proc/self/fd/{state_directory.fd}/{main_snapshot_name}"
         source_uri = f"file:{quote(source_path, safe='/')}?mode=ro"
-        destination_path = (
-            f"/proc/self/fd/{state_directory.fd}/{temporary_name}"
-        )
+        destination_path = f"/proc/self/fd/{state_directory.fd}/{temporary_name}"
         source = sqlite3.connect(source_uri, timeout=30.0, uri=True)
         source.execute("PRAGMA query_only=ON")
         destination = sqlite3.connect(destination_path, timeout=30.0)
@@ -1413,9 +1394,7 @@ def _migrate_legacy_database(
         destination.commit()
         integrity = destination.execute("PRAGMA integrity_check").fetchone()
         if integrity != ("ok",):
-            raise sqlite3.DatabaseError(
-                "migration destination integrity check failed"
-            )
+            raise sqlite3.DatabaseError("migration destination integrity check failed")
         destination.close()
         destination = None
         source.close()
@@ -1582,9 +1561,7 @@ def _default_state_database_path_unlocked(
         state_directory.create_and_open_child("data", 0o755)
         data_stat = os.fstat(state_directory.fd)
         if data_stat.st_uid != os.geteuid():
-            raise PermissionError(
-                f"project data owner mismatch: {root / 'data'}"
-            )
+            raise PermissionError(f"project data owner mismatch: {root / 'data'}")
         state_directory.create_and_open_child(
             "multiagent_state",
             PRIVATE_DIRECTORY_MODE,
@@ -1600,6 +1577,7 @@ def _default_state_database_path_unlocked(
                 state_directory.fd,
                 state_mode,
                 description=target_path.parent,
+                tighten_existing=True,
             )
             state_directory.refresh_last_signature()
         lock_fd, _ = _open_or_create_private_at(

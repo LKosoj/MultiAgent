@@ -1,0 +1,15 @@
+version: 1
+name: inspect_relationships
+description: Inspect a bounded relationship graph for one table.
+implementation: inspect_relationships
+arguments:
+  - name: table
+    type: string
+    required: true
+  - name: top_k
+    type: integer
+    required: true
+  - name: depth
+    type: integer
+    required: true
+additional_properties: false

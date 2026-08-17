@@ -10,10 +10,22 @@ import types
 
 import pytest
 
-from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded, execute_step_attempt
-from workflow.models import StepResult, StepStatus, WorkflowContext, WorkflowStep
+from workflow.deadline import (
+    DeadlineBudget,
+    WorkflowDeadlineExceeded,
+    execute_step_attempt,
+)
+from workflow.models import (
+    ResourceLimits,
+    RetryPolicy,
+    StepResult,
+    StepStatus,
+    WorkflowContext,
+    WorkflowStep,
+)
 from workflow.orchestration.parallel_executor import ParallelWorkflowExecutor
 from workflow.resilience.retry import AdaptiveRetryEngine
+from workflow.retry_engine import RetryEngine
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -114,6 +126,19 @@ def test_queue_wait_is_consumed_when_rehydrating_wall_deadline() -> None:
     assert budget.deadline_at_ms == 1_003_000
 
 
+def test_remaining_time_is_monotonic_for_one_persisted_deadline() -> None:
+    clock = _Clock(monotonic=5.0, wall=1_000.0)
+    budget = DeadlineBudget.from_deadline_at_ms(
+        1_010_000,
+        monotonic=clock.monotonic,
+        wall_time=clock.wall,
+    )
+
+    assert budget.remaining_seconds() == 10.0
+    clock.monotonic_value += 3.0
+    assert budget.remaining_seconds() == 7.0
+
+
 def test_private_context_deadline_is_not_a_dataclass_field() -> None:
     clock = _Clock()
     context = WorkflowContext(workflow_id="wf-deadline")
@@ -156,6 +181,44 @@ def test_backoff_fails_before_sleep_that_would_exhaust_global_deadline() -> None
 
     assert calls == 1
     assert clock.sleeps == []
+
+
+def test_base_retry_does_not_sleep_past_the_shared_deadline(monkeypatch) -> None:
+    import workflow.retry_engine as retry_module
+
+    clock = _Clock()
+    budget = DeadlineBudget.from_duration(
+        1.0,
+        monotonic=clock.monotonic,
+        wall_time=clock.wall,
+    )
+    retry_engine = RetryEngine()
+    calls = 0
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    async def fail(_context: object) -> None:
+        nonlocal calls
+        calls += 1
+        raise ConnectionError("connection reset")
+
+    monkeypatch.setattr(retry_module.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(WorkflowDeadlineExceeded, match="retry backoff"):
+        asyncio.run(
+            retry_engine.execute_with_retry(
+                "base-step",
+                fail,
+                {},
+                retry_policy=RetryPolicy(max_retries=1, base_delay=2.0),
+                deadline=budget,
+            )
+        )
+
+    assert calls == 1
+    assert sleeps == []
 
 
 def test_retry_attempt_timeout_is_capped_by_remaining_budget(monkeypatch) -> None:
@@ -401,7 +464,40 @@ def test_parallel_deadline_cancels_and_gathers_sibling() -> None:
     asyncio.run(run())
 
 
-def test_non_retryable_step_timeout_is_capped_by_global_deadline(monkeypatch) -> None:
+def test_parallel_siblings_receive_the_same_absolute_deadline() -> None:
+    seen_deadlines: list[DeadlineBudget] = []
+
+    async def execute(step: WorkflowStep, context: WorkflowContext) -> StepResult:
+        seen_deadlines.append(context._deadline_budget)
+        return StepResult(step_id=step.id, status=StepStatus.COMPLETED)
+
+    async def run() -> None:
+        executor = ParallelWorkflowExecutor(max_concurrent=2)
+        context = WorkflowContext(workflow_id="wf-shared-deadline")
+        deadline = DeadlineBudget.from_duration(5.0)
+        context._deadline_budget = deadline
+        result = await executor.execute_steps_parallel(
+            [
+                WorkflowStep(id="left", task="left"),
+                WorkflowStep(id="right", task="right"),
+            ],
+            context,
+            step_executor=execute,
+            dependency_checker=lambda _step, _results: True,
+            condition_checker=lambda _step, _context: False,
+        )
+
+        assert set(result) == {"left", "right"}
+        assert seen_deadlines == [deadline, deadline]
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("step_timeout", [10, None])
+def test_non_retryable_step_uses_global_deadline(
+    monkeypatch,
+    step_timeout: int | None,
+) -> None:
     import workflow.deadline as deadline_module
 
     clock = _Clock()
@@ -418,7 +514,7 @@ def test_non_retryable_step_timeout_is_capped_by_global_deadline(monkeypatch) ->
         step = models.WorkflowStep(
             id="side-effect",
             task="run once",
-            timeout=10,
+            timeout=step_timeout,
             metadata={"retryable": False},
         )
         timeouts: list[float] = []
@@ -465,6 +561,7 @@ def test_expired_text_to_sql_budget_returns_authoritative_timed_out_result() -> 
         wall_time=clock.wall,
     )
     with _light_enhanced_engine() as (engine, _enhanced_module):
+        engine._install_text_to_sql_typed_runtime = lambda _context: None
         models = sys.modules["workflow.models"]
         workflow = models.WorkflowDefinition(
             name="text_to_sql_pipeline",
@@ -479,16 +576,37 @@ def test_expired_text_to_sql_budget_returns_authoritative_timed_out_result() -> 
         result = asyncio.run(engine._execute_enhanced_workflow(workflow, context))
 
         assert result.status is models.WorkflowStatus.FAILED
-        assert result.terminal_outcome.status is models.TextToSqlTerminalStatus.TIMED_OUT
+        assert (
+            result.terminal_outcome.status is models.TextToSqlTerminalStatus.TIMED_OUT
+        )
         assert result.terminal_outcome.reason_code == "TIMED_OUT"
         assert result.terminal_outcome.executed is False
         assert result.terminal_outcome.audited is False
         assert dict(result.terminal_outcome.execution) == {}
         assert dict(result.terminal_outcome.audit) == {}
+        assert dict(result.terminal_outcome.result_review) == {}
         assert result.final_output["final"] == result.terminal_outcome.to_mapping()
 
 
-def test_execute_step_attempt_distinguishes_step_raised_timeout_from_wait_for_cutoff() -> None:
+def test_text_to_sql_cancelled_outcome_has_no_ambiguity() -> None:
+    with _light_enhanced_engine() as (engine, _enhanced_module):
+        models = sys.modules["workflow.models"]
+        context = models.WorkflowContext(
+            workflow_id="wf-cancel",
+            variables={"run_id": "run-cancel"},
+        )
+
+        terminal = engine._text_to_sql_cancelled_outcome(context, "wf-cancel")
+
+        assert terminal.status is models.TextToSqlTerminalStatus.CANCELLED
+        assert terminal.executed is False
+        assert terminal.ambiguity is None
+        assert dict(terminal.result_review) == {}
+
+
+def test_execute_step_attempt_distinguishes_step_raised_timeout_from_wait_for_cutoff() -> (
+    None
+):
     """T13b: workflow.deadline.execute_step_attempt must tell apart a step
     raising its own TimeoutError (business-logic timeout, message preserved)
     from asyncio.wait_for cutting a hung step off at the attempt_timeout
@@ -543,3 +661,383 @@ def test_expired_generic_workflow_preserves_exception_semantics() -> None:
                     context,
                 )
             )
+
+
+def test_enhanced_engine_does_not_create_a_second_deadline_from_yaml_limits() -> None:
+    with _light_enhanced_engine() as (engine, _enhanced_module):
+        models = sys.modules["workflow.models"]
+        context = models.WorkflowContext(workflow_id="wf-persisted-only")
+        workflow = models.WorkflowDefinition(
+            name="generic",
+            global_resource_limits=ResourceLimits(max_duration_seconds=30),
+        )
+
+        assert engine._ensure_workflow_deadline(workflow, context) is None
+        assert not hasattr(context, "_deadline_budget")
+
+
+def test_enhanced_step_budget_uses_configured_step_duration_limit() -> None:
+    with _light_enhanced_engine() as (engine, _enhanced_module):
+        models = sys.modules["workflow.models"]
+        observed: dict[str, object] = {}
+
+        class BudgetManager:
+            def create_step_budget(self, step_id, limits=None):
+                observed["step_id"] = step_id
+                observed["limits"] = limits
+                return object()
+
+        class CircuitBreakerManager:
+            def is_agent_available(self, _agent_name):
+                return True
+
+        class LoopDetector:
+            def is_step_in_loop(self, _workflow_id, _step_id):
+                return False, None
+
+            def record_step_execution(self, _workflow_id, _step_id, _execution_data):
+                return False
+
+        class RetryEngine:
+            async def execute_with_retry(self, **_kwargs):
+                return models.StepResult(
+                    step_id="schema_research",
+                    status=models.StepStatus.COMPLETED,
+                )
+
+        engine.budget_manager = BudgetManager()
+        engine.circuit_breaker_manager = CircuitBreakerManager()
+        engine.loop_detector = LoopDetector()
+        engine.retry_engine = RetryEngine()
+
+        step = models.WorkflowStep(
+            id="schema_research",
+            task="research",
+            resource_limits=ResourceLimits(max_duration_seconds=14_400),
+        )
+        result = asyncio.run(
+            engine._execute_enhanced_step(
+                step,
+                models.WorkflowContext(workflow_id="wf-step-budget"),
+                {},
+            )
+        )
+
+        assert result.status is models.StepStatus.COMPLETED
+        assert observed["step_id"] == "schema_research"
+        assert {
+            budget_type.value: limit
+            for budget_type, limit in observed["limits"].items()
+        } == {"time": 14_400}
+
+
+def test_base_finalization_is_bounded_by_the_shared_deadline() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            models = sys.modules["workflow.models"]
+            context = models.WorkflowContext(workflow_id="wf-finalization-timeout")
+            context._deadline_budget = DeadlineBudget.from_duration(0.01)
+            engine.aggregator = types.SimpleNamespace(
+                aggregate_final_result=lambda *_args: asyncio.sleep(0.1),
+            )
+
+            async def not_cancelled(_workflow_id: str) -> bool:
+                return False
+
+            async def mark_completed(_workflow_id: str, _final_output: object) -> None:
+                return None
+
+            engine._is_workflow_cancelled = not_cancelled
+            engine._on_workflow_completed = mark_completed
+
+            with pytest.raises(WorkflowDeadlineExceeded, match="result aggregation"):
+                await engine._finalize_workflow_execution(
+                    models.WorkflowDefinition(name="generic"),
+                    context,
+                    {},
+                    models.datetime.now(),
+                    None,
+                )
+
+    asyncio.run(run())
+
+
+def test_legacy_retry_fallback_keeps_the_deadline_cap() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            models = sys.modules["workflow.models"]
+            context = models.WorkflowContext(workflow_id="wf-legacy-retry")
+            context._deadline_budget = DeadlineBudget.from_duration(0.01)
+            calls: list[bool] = []
+
+            class LegacyRetryEngine:
+                async def execute_with_retry(
+                    self,
+                    *,
+                    step_id,
+                    step_func,
+                    context,
+                    retry_policy,
+                ):
+                    calls.append(True)
+                    await asyncio.sleep(0.1)
+                    return models.StepResult(
+                        step_id="legacy-step",
+                        status=models.StepStatus.COMPLETED,
+                    )
+
+            engine.retry_engine = LegacyRetryEngine()
+            step = models.WorkflowStep(id="legacy-step", task="legacy")
+            workflow = models.WorkflowDefinition(name="generic")
+
+            with pytest.raises(WorkflowDeadlineExceeded):
+                await asyncio.wait_for(
+                    engine._execute_workflow_step(step, context, workflow),
+                    timeout=0.05,
+                )
+
+            assert calls == [True]
+
+    asyncio.run(run())
+
+
+def test_retry_engine_inner_type_error_is_not_replayed() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            models = sys.modules["workflow.models"]
+            context = models.WorkflowContext(workflow_id="wf-inner-type-error")
+            context._deadline_budget = DeadlineBudget.from_duration(1.0)
+            calls = 0
+
+            class RetryEngineWithInnerError:
+                async def execute_with_retry(self, **_kwargs):
+                    nonlocal calls
+                    calls += 1
+                    raise TypeError("unexpected keyword argument 'deadline'")
+
+            engine.retry_engine = RetryEngineWithInnerError()
+            step = models.WorkflowStep(id="side-effect-step", task="one call")
+
+            with pytest.raises(TypeError, match="unexpected keyword argument"):
+                await engine._execute_workflow_step(
+                    step,
+                    context,
+                    models.WorkflowDefinition(name="generic"),
+                )
+
+            assert calls == 1
+
+    asyncio.run(run())
+
+
+def test_checkpoint_and_final_state_writes_are_bounded_by_deadline() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            models = sys.modules["workflow.models"]
+            never = asyncio.Event()
+            context = models.WorkflowContext(workflow_id="wf-state-write")
+            context._deadline_budget = DeadlineBudget.from_duration(0.01)
+            engine.state_manager = types.SimpleNamespace(
+                save_checkpoint=lambda **_kwargs: never.wait(),
+                mark_workflow_completed=lambda *_args: never.wait(),
+            )
+            step = models.WorkflowStep(id="checkpoint-step", task="checkpoint")
+            result = models.StepResult(
+                step_id=step.id,
+                status=models.StepStatus.COMPLETED,
+            )
+
+            with pytest.raises(WorkflowDeadlineExceeded, match="checkpoint"):
+                await asyncio.wait_for(
+                    engine._on_step_completed(
+                        context.workflow_id,
+                        step,
+                        result,
+                        context,
+                        {step.id: result},
+                    ),
+                    timeout=0.05,
+                )
+
+            context._deadline_budget = DeadlineBudget.from_duration(0.01)
+            with pytest.raises(WorkflowDeadlineExceeded, match="completion checkpoint"):
+                await asyncio.wait_for(
+                    engine._on_workflow_completed(
+                        context.workflow_id,
+                        {},
+                        context=context,
+                    ),
+                    timeout=0.05,
+                )
+
+    asyncio.run(run())
+
+
+def test_workflow_definition_write_is_bounded_by_deadline() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            models = sys.modules["workflow.models"]
+            never = asyncio.Event()
+            context = models.WorkflowContext(workflow_id="wf-definition-write")
+            context._deadline_budget = DeadlineBudget.from_duration(0.01)
+            engine.state_manager = types.SimpleNamespace(
+                save_workflow_definition=lambda *_args: never.wait(),
+            )
+
+            with pytest.raises(WorkflowDeadlineExceeded, match="definition checkpoint"):
+                await asyncio.wait_for(
+                    engine._save_workflow_definition(
+                        context,
+                        models.WorkflowDefinition(name="generic"),
+                    ),
+                    timeout=0.05,
+                )
+
+    asyncio.run(run())
+
+
+def test_expiry_after_terminal_outcome_preserves_primary_text_to_sql_result() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            engine._install_text_to_sql_typed_runtime = lambda _context: None
+            models = sys.modules["workflow.models"]
+            context = models.WorkflowContext(
+                workflow_id="wf-terminal-before-expiry",
+                variables={"run_id": "run-terminal-before-expiry"},
+            )
+            context._deadline_budget = DeadlineBudget.from_duration(0.02)
+            workflow = models.WorkflowDefinition(
+                name="text_to_sql_pipeline",
+                metadata={"category": "text_to_sql"},
+            )
+            primary = engine._text_to_sql_failure_outcome(
+                context,
+                {},
+                "DB_AUDIT_FAILED",
+                "authoritative db audit result",
+            )
+            engine.metrics_collector = types.SimpleNamespace(
+                record_workflow_start=lambda *_args: None,
+            )
+            engine.budget_manager = types.SimpleNamespace(
+                create_workflow_budget=lambda *_args: object(),
+            )
+            engine._db_audit_has_terminal_step_result = lambda _results: True
+            engine._derive_text_to_sql_terminal_outcome = lambda *_args: primary
+
+            async def started(*_args, **_kwargs):
+                return None
+
+            async def steps(*_args, **_kwargs):
+                return {}
+
+            async def not_cancelled(_workflow_id):
+                return False
+
+            async def slow_aggregation(*_args):
+                await asyncio.sleep(0.1)
+
+            async def failed(*_args, **_kwargs):
+                return None
+
+            async def released(*_args, **_kwargs):
+                return None
+
+            engine._on_workflow_started = started
+            engine._execute_enhanced_steps = steps
+            engine._is_workflow_cancelled = not_cancelled
+            engine.aggregator = types.SimpleNamespace(
+                aggregate_final_result=slow_aggregation,
+            )
+            engine._on_workflow_failed = failed
+            engine._release_workflow_resources = released
+
+            result = await engine._execute_enhanced_workflow(workflow, context)
+
+            assert result.terminal_outcome == primary
+            assert result.terminal_outcome.reason_code == "DB_AUDIT_FAILED"
+            assert (
+                result.terminal_outcome.status
+                is not models.TextToSqlTerminalStatus.TIMED_OUT
+            )
+
+    asyncio.run(run())
+
+
+def test_terminal_evidence_is_derived_before_terminalization_deadline_gate() -> None:
+    async def run() -> None:
+        with _light_enhanced_engine() as (engine, _enhanced_module):
+            engine._install_text_to_sql_typed_runtime = lambda _context: None
+            models = sys.modules["workflow.models"]
+            clock = _Clock()
+            context = models.WorkflowContext(
+                workflow_id="wf-terminal-boundary",
+                variables={"run_id": "run-terminal-boundary"},
+            )
+            context._deadline_budget = DeadlineBudget(
+                deadline_monotonic=1.0,
+                deadline_at_ms=1_001_000,
+                monotonic=clock.monotonic,
+                wall_time=clock.wall,
+            )
+            workflow = models.WorkflowDefinition(
+                name="text_to_sql_pipeline",
+                metadata={"category": "text_to_sql"},
+            )
+            primary = engine._text_to_sql_failure_outcome(
+                context,
+                {},
+                "DB_AUDIT_FAILED",
+                "authoritative result at deadline boundary",
+            )
+            derived = False
+            engine.metrics_collector = types.SimpleNamespace(
+                record_workflow_start=lambda *_args: None,
+            )
+            engine.budget_manager = types.SimpleNamespace(
+                create_workflow_budget=lambda *_args: object(),
+            )
+            engine._db_audit_has_terminal_step_result = lambda _results: True
+
+            def derive(*_args):
+                nonlocal derived
+                derived = True
+                return primary
+
+            async def started(*_args, **_kwargs):
+                return None
+
+            async def steps(*_args, **_kwargs):
+                clock.monotonic_value = 1.0
+                return {}
+
+            async def released(*_args, **_kwargs):
+                return None
+
+            async def failed(*_args, **_kwargs):
+                return None
+
+            engine._derive_text_to_sql_terminal_outcome = derive
+            engine._on_workflow_started = started
+            engine._execute_enhanced_steps = steps
+            engine._on_workflow_failed = failed
+            engine._release_workflow_resources = released
+
+            result = await engine._execute_enhanced_workflow(workflow, context)
+
+            assert derived
+            assert result.terminal_outcome == primary
+
+    asyncio.run(run())
+
+
+def test_direct_text_to_sql_without_persisted_deadline_fails_before_work() -> None:
+    with _light_enhanced_engine() as (engine, _enhanced_module):
+        models = sys.modules["workflow.models"]
+        workflow = models.WorkflowDefinition(
+            name="text_to_sql_pipeline",
+            metadata={"category": "text_to_sql"},
+        )
+
+        with pytest.raises(models.WorkflowExecutionError, match="persisted deadline"):
+            asyncio.run(engine._execute_enhanced_workflow(workflow))

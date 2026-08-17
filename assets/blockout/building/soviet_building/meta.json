@@ -1,0 +1,27 @@
+{
+  "id": "soviet_building",
+  "name": "Советский жилой дом",
+  "category": "building",
+  "tags": [
+    "moscow",
+    "apartment",
+    "soviet",
+    "desc:Московский двор, фасад с окнами"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    34.58913993835449,
+    53.304739864054454,
+    18.332656860351562
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/cb5c1471b2ab4f12a308f6f8931af332",
+  "file_size_bytes": 8747092,
+  "fetched_at": "2026-08-16T23:00:45Z",
+  "asset_version": 2
+}

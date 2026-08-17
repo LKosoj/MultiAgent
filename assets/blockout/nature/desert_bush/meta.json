@@ -1,0 +1,24 @@
+{
+  "id": "desert_bush",
+  "name": "Куст",
+  "category": "nature",
+  "tags": [
+    "bush"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.3743099868297577,
+    0.3356877863407135,
+    0.2429330237209797
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 5812,
+  "fetched_at": "2026-08-16T21:19:55Z",
+  "asset_version": 1
+}

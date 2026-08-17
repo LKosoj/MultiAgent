@@ -7,6 +7,134 @@ from custom_tools.text_to_sql.validators import SQLSchemaValidator
 from custom_tools.text_to_sql.validators.schema_aware import _ResolveResult
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT g.value FROM generate_series(1, 3) AS g(value)",
+        "SELECT u.value FROM UNNEST(ARRAY[1, 2]) AS u(value)",
+        "SELECT o.x FROM orders AS o(x)",
+    ],
+)
+def test_generic_and_declared_row_source_outputs_are_schema_valid(sql: str) -> None:
+    result = SQLSchemaValidator().validate_sql_against_schema(
+        sql, {"orders": {"columns": {"id": {"type": "INTEGER"}}}}
+    )
+
+    assert result["is_valid"] is True, result["issues"]
+
+
+def test_generic_row_source_still_validates_its_physical_input_column() -> None:
+    result = SQLSchemaValidator().validate_sql_against_schema(
+        "SELECT u.value FROM orders o CROSS JOIN UNNEST(ARRAY[o.missing]) AS u(value)",
+        {"orders": {"columns": {"id": {"type": "INTEGER"}}}},
+    )
+
+    assert result["is_valid"] is False
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in result["issues"])
+
+
+def test_pivot_output_is_declared_while_its_physical_input_is_validated() -> None:
+    schema = {
+        "sales": {
+            "columns": {
+                "amount": {"type": "DECIMAL"},
+                "category": {"type": "TEXT"},
+            }
+        }
+    }
+    valid = SQLSchemaValidator().validate_sql_against_schema(
+        "SELECT p.a FROM sales PIVOT "
+        "(SUM(amount) FOR category IN ('A' AS a)) AS p",
+        schema,
+        dsn="duckdb://",
+    )
+    invalid = SQLSchemaValidator().validate_sql_against_schema(
+        "SELECT p.a FROM sales PIVOT "
+        "(SUM(missing) FOR category IN ('A' AS a)) AS p",
+        schema,
+        dsn="duckdb://",
+    )
+    cte = SQLSchemaValidator().validate_sql_against_schema(
+        "WITH source AS (SELECT category, amount FROM sales) "
+        "SELECT p.a FROM source AS s PIVOT "
+        "(SUM(s.amount) FOR s.category IN ('A' AS a)) AS p",
+        schema,
+        dsn="duckdb://",
+    )
+    derived = SQLSchemaValidator().validate_sql_against_schema(
+        "SELECT p.a FROM (SELECT category, amount FROM sales) AS s PIVOT "
+        "(SUM(s.amount) FOR s.category IN ('A' AS a)) AS p",
+        schema,
+        dsn="duckdb://",
+    )
+    derived_invalid = SQLSchemaValidator().validate_sql_against_schema(
+        "SELECT p.a FROM (SELECT s.amount, s.category FROM sales AS s) AS s PIVOT "
+        "(SUM(s.missing) FOR s.category IN ('A' AS a)) AS p",
+        schema,
+        dsn="duckdb://",
+    )
+
+    assert valid["is_valid"] is True, valid["issues"]
+    assert invalid["is_valid"] is False
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in invalid["issues"])
+    assert cte["is_valid"] is True, cte["issues"]
+    assert derived["is_valid"] is True, derived["issues"]
+    assert derived_invalid["is_valid"] is False
+    assert any(
+        issue["issue_type"] == "UNKNOWN_COLUMN" for issue in derived_invalid["issues"]
+    )
+
+
+def test_root_transform_validates_physical_input_but_not_dynamic_output() -> None:
+    schema = {
+        "sales": {
+            "columns": {
+                "amount": {"type": "DECIMAL"},
+                "category": {"type": "TEXT"},
+            }
+        }
+    }
+    valid = SQLSchemaValidator().validate_sql_against_schema(
+        "PIVOT sales ON category USING SUM(amount)", schema, dsn="duckdb://"
+    )
+    unknown_table = SQLSchemaValidator().validate_sql_against_schema(
+        "PIVOT missing ON category USING SUM(amount)", schema, dsn="duckdb://"
+    )
+    unknown_column = SQLSchemaValidator().validate_sql_against_schema(
+        "PIVOT sales ON missing USING SUM(amount)", schema, dsn="duckdb://"
+    )
+
+    assert valid["is_valid"] is True, valid["issues"]
+    assert any(issue["issue_type"] == "UNKNOWN_TABLE" for issue in unknown_table["issues"])
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in unknown_column["issues"])
+
+
+def test_root_unpivot_still_rejects_unknown_physical_input_column() -> None:
+    schema = {
+        "monthly_sales": {
+            "columns": {
+                "jan": {"type": "DECIMAL"},
+                "feb": {"type": "DECIMAL"},
+            }
+        }
+    }
+    valid = SQLSchemaValidator().validate_sql_against_schema(
+        "UNPIVOT monthly_sales ON jan, feb INTO NAME month VALUE sales",
+        schema,
+        dsn="duckdb://",
+    )
+    unknown_column = SQLSchemaValidator().validate_sql_against_schema(
+        "UNPIVOT monthly_sales ON jan, missing INTO NAME month VALUE sales",
+        schema,
+        dsn="duckdb://",
+    )
+
+    assert valid["is_valid"] is True, valid["issues"]
+    assert any(
+        issue["issue_type"] == "UNKNOWN_COLUMN" for issue in unknown_column["issues"]
+    )
+
+
 # ---------- 2.11: _clean_identifier ----------
 
 def test_clean_identifier_handles_mssql_brackets():
@@ -228,28 +356,28 @@ def test_two_validator_calls_share_no_state():
     assert r3 == r1
 
 
-# ---------- table-function detection (url/s3/file/remote) ----------
+# ---------- generic row sources (url/s3/file/remote) ----------
 
 _TF_SCHEMA = {"users": {"columns": {"id": {"type": "INTEGER"}, "name": {"type": "TEXT"}}}}
 
 
-@pytest.mark.parametrize("func_call", [
-    "url('https://example.com/data.csv', 'CSV', 'id UInt64, name String')",
-    "s3('s3://bucket/key', 'CSV', 'id UInt64')",
-    "file('/tmp/data.csv', 'CSV', 'id UInt64')",
-    "remote('host', db, tbl)",
-])
-def test_table_function_in_from_is_unknown_table(func_call):
-    """Табличные функции в FROM → is_valid False и issue_type UNKNOWN_TABLE."""
+@pytest.mark.parametrize(
+    ("func_call", "is_valid"),
+    [
+        ("url('https://example.com/data.csv', 'CSV', 'id UInt64, name String')", True),
+        ("s3('s3://bucket/key', 'CSV', 'id UInt64')", True),
+        ("file('/tmp/data.csv', 'CSV', 'id UInt64')", True),
+        ("remote('host', db, tbl)", False),
+    ],
+)
+def test_table_function_in_from_is_generic_row_source(func_call, is_valid):
+    """Табличные функции в FROM дают generic-набор строк без имени таблицы."""
     validator = SQLSchemaValidator()
     result = validator.validate_sql_against_schema(
         f"SELECT id FROM {func_call}",
         _TF_SCHEMA,
     )
-    assert result["is_valid"] is False, f"Expected invalid for {func_call}: {result}"
-    assert any(
-        issue["issue_type"] == "UNKNOWN_TABLE" for issue in result["issues"]
-    ), f"No UNKNOWN_TABLE in {result['issues']}"
+    assert result["is_valid"] is is_valid, result
 
 
 def test_known_schema_table_no_false_positive():
@@ -283,3 +411,29 @@ def test_subquery_in_from_does_not_crash():
     )
     # Подзапрос не таблица-функция; не должно быть UNKNOWN_TABLE
     assert not any(i["issue_type"] == "UNKNOWN_TABLE" for i in result["issues"]), result["issues"]
+
+
+def test_set_operation_subquery_in_from_is_a_row_source():
+    """Производная таблица с UNION даёт внешний alias и его projected column."""
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        "SELECT o.amount FROM orders AS o "
+        "JOIN (SELECT MAX(i.amount) AS amount FROM orders AS i "
+        "UNION SELECT MIN(j.amount) AS amount FROM orders AS j) AS extrema "
+        "ON o.amount = extrema.amount",
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert result["is_valid"] is True, result["issues"]
+
+
+def test_set_operation_subquery_rejects_unknown_projected_column():
+    validator = SQLSchemaValidator()
+    result = validator.validate_sql_against_schema(
+        "SELECT extrema.missing FROM (SELECT amount FROM orders "
+        "UNION SELECT amount FROM orders) AS extrema",
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert result["is_valid"] is False
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in result["issues"])

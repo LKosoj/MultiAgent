@@ -9,13 +9,26 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-import yaml
 
 from workflow.models import (
     TextToSqlTerminalReasonCode,
     TextToSqlTerminalResult,
     TextToSqlTerminalStatus,
 )
+from workflow.text_to_sql_contract import TEXT_TO_SQL_MAX_ERROR_LENGTH
+
+
+@pytest.fixture(autouse=True)
+def _isolate_epic6_light_workflow_helpers(monkeypatch):
+    epic6 = importlib.import_module("tests.test_workflow_engine_epic6")
+    with epic6._preserve_workflow_module_tree():
+        terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+        monkeypatch.setattr(
+            terminal,
+            "_pre_execution_gate_allowed",
+            lambda **_kwargs: True,
+        )
+        yield
 
 
 def _successful_payload(**overrides):
@@ -50,6 +63,8 @@ def _successful_payload(**overrides):
             "filename": "query.md",
             "path": "/tmp/query.md",
         },
+        "result_review": {},
+        "ambiguity": None,
     }
     payload.update(overrides)
     execution = payload.get("execution")
@@ -118,9 +133,15 @@ def test_terminal_contract_shared_cross_language_vectors(case):
 
 _NON_FAILED_REASON_CODES = {
     TextToSqlTerminalReasonCode.VERIFIER_REJECTED.value,
+    TextToSqlTerminalReasonCode.DETERMINISTIC_CHECK_REJECTED.value,
     TextToSqlTerminalReasonCode.SCHEMA_CLARIFICATION_REQUIRED.value,
     TextToSqlTerminalReasonCode.SCHEMA_GROUNDING_FAILED.value,
     TextToSqlTerminalReasonCode.SCHEMA_CONTEXT_BUDGET_EXCEEDED.value,
+    TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS.value,
+    TextToSqlTerminalReasonCode.RESEARCH_UNSUPPORTED.value,
+    TextToSqlTerminalReasonCode.RESEARCH_STAGNATED.value,
+    TextToSqlTerminalReasonCode.RESEARCH_BUDGET_EXHAUSTED.value,
+    TextToSqlTerminalReasonCode.STALE_REQUIRED_EVIDENCE.value,
     TextToSqlTerminalReasonCode.CANCELLED.value,
     TextToSqlTerminalReasonCode.TIMED_OUT.value,
 }
@@ -961,77 +982,12 @@ def test_finalizer_rejects_non_exact_dry_run_bool_before_side_effects(
         terminal.finalize_text_to_sql_run(
             "SELECT 1",
             "one",
-            "Approved",
             "sqlite:///unused.db",
             10,
             invalid,
             "session-1",
             "run-1",
         )
-
-
-def test_verifier_rejection_is_abstained_without_executor_call(monkeypatch):
-    core = importlib.import_module("custom_tools.text_to_sql.core")
-    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("rejected SQL must not invoke a runtime side effect")
-
-    monkeypatch.setattr(core, "secure_db_executor", forbidden)
-    monkeypatch.setattr(core, "audit_logger", forbidden)
-    monkeypatch.setattr(core, "save_successful_sql", forbidden)
-
-    result = terminal.finalize_text_to_sql_run(
-        "SELECT 1",
-        "one",
-        "Rejected",
-        "sqlite:///unused.db",
-        10,
-        False,
-        "session-1",
-        "run-1",
-    )
-
-    assert result["status"] == "abstained"
-    assert result["reason_code"] == "VERIFIER_REJECTED"
-    assert result["executed"] is False
-    assert result["audited"] is False
-
-
-@pytest.mark.parametrize("verification_status", ["approved", "Unknown", "Rejected ", ""])
-def test_unknown_verifier_status_fails_contract_without_side_effects(
-    monkeypatch,
-    verification_status,
-):
-    core = importlib.import_module("custom_tools.text_to_sql.core")
-    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("invalid verifier status must stop before side effects")
-
-    monkeypatch.setattr(core, "secure_db_executor", forbidden)
-    monkeypatch.setattr(core, "audit_logger", forbidden)
-    monkeypatch.setattr(core, "save_successful_sql", forbidden)
-
-    result = terminal.finalize_text_to_sql_run(
-        "SELECT 1",
-        "one",
-        verification_status,
-        "sqlite:///unused.db",
-        10,
-        False,
-        "session-1",
-        "run-1",
-    )
-
-    assert result["status"] == "failed"
-    assert result["reason_code"] == "VERIFIER_CONTRACT_INVALID"
-    assert result["generated"] is True
-    assert result["approved"] is False
-    assert result["executed"] is False
-    assert result["audited"] is False
-    assert result["error"]
-    assert len(result["error"]) <= 4096
 
 
 def test_real_executor_explicit_dry_run_never_opens_connection_or_mutates_env(
@@ -1153,7 +1109,6 @@ def test_dry_run_succeeds_with_executed_false_and_audited_true(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         True,
@@ -1202,7 +1157,6 @@ def test_successful_executor_allows_empty_error_message(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1245,7 +1199,7 @@ def test_finalizer_rejects_invalid_executor_execution_time(
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 10, False,
         "session-1", "run-1",
     )
 
@@ -1277,7 +1231,7 @@ def test_finalizer_caught_executor_exception_records_elapsed_without_execution_c
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 10, False,
         "session-1", "run-1",
     )
 
@@ -1309,7 +1263,7 @@ def test_finalizer_deadline_exceeded_propagates_not_swallowed(monkeypatch):
 
     with pytest.raises(WorkflowDeadlineExceeded):
         terminal.finalize_text_to_sql_run(
-            "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+            "SELECT 1", "one", "sqlite:///unused.db", 10, False,
             "session-1", "run-1",
         )
 
@@ -1346,7 +1300,6 @@ def test_executor_failure_with_partial_data_is_contract_invalid(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1383,7 +1336,6 @@ def test_requested_dry_run_rejects_executor_execution_claim(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         True,
@@ -1426,7 +1378,6 @@ def test_operator_dry_run_response_is_compatible_with_false_request(monkeypatch)
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1493,7 +1444,6 @@ def test_executor_success_error_and_dry_run_data_must_be_consistent(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1527,7 +1477,6 @@ def test_audit_error_is_failed_after_successful_execution(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1570,7 +1519,6 @@ def test_invalid_audit_evidence_is_normalized_to_audit_failure(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1663,7 +1611,7 @@ def test_hostile_executor_result_is_normalized_before_access_and_never_throws(
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 10, False,
         "session-1", "run-1",
     )
 
@@ -1740,7 +1688,7 @@ def test_executor_runtime_proof_mismatch_is_typed_before_audit_and_never_persist
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 1, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 1, False,
         "session-1", "run-1",
     )
 
@@ -1809,7 +1757,7 @@ def test_executor_runtime_proof_accepts_dry_run_and_empty_result_paths(
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 1,
+        "SELECT 1", "one", "sqlite:///unused.db", 1,
         dry_run_only, "session-1", "run-1",
     )
 
@@ -1854,7 +1802,7 @@ def test_audit_adapter_contract_violations_are_typed_and_never_throw(
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 10, False,
         "session-1", "run-1",
     )
 
@@ -1911,7 +1859,7 @@ def test_persistence_adapter_contract_violations_are_typed_after_side_effect(
     )
 
     result = terminal.finalize_text_to_sql_run(
-        "SELECT 1", "one", "Approved", "sqlite:///unused.db", 10, False,
+        "SELECT 1", "one", "sqlite:///unused.db", 10, False,
         "session-1", "run-1",
     )
 
@@ -1954,7 +1902,6 @@ def test_successful_real_execution_attempts_memory_write_only_after_success(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -1995,7 +1942,6 @@ def test_terminal_success_passes_trusted_namespace_and_evidence_to_writer(monkey
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -2046,7 +1992,6 @@ def test_audit_and_persistence_receive_same_bounded_execution_summary(monkeypatc
     result = terminal.finalize_text_to_sql_run(
         sql,
         user_query,
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -2107,7 +2052,6 @@ def test_finalizer_writes_real_query_and_bounded_summary_to_sqlrag_artifact(
     result = terminal.finalize_text_to_sql_run(
         sql,
         user_query,
-        "Approved",
         "sqlite:///artifact.db",
         10,
         False,
@@ -2177,7 +2121,6 @@ def test_malformed_executor_result_is_audited_and_fails_closed(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -2226,7 +2169,6 @@ def test_persistence_failure_is_visible_without_replacing_runtime_success(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -2304,10 +2246,7 @@ def test_enhanced_tool_step_preserves_valid_failed_terminal_evidence(
         workflow_id="workflow-1",
         session_id="session-1",
         variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT 1"},
-            "sql_verification": {"verification_status": "Approved"},
-        },
+        step_outputs={"sql_solving": {"sql": "SELECT 1"}},
     )
     engine.policy_engine = types.SimpleNamespace(get_budget=lambda *args: None)
     engine._step_with_substituted_metadata = lambda current, _context: current
@@ -2322,28 +2261,63 @@ def test_enhanced_tool_step_preserves_valid_failed_terminal_evidence(
     )
 
     assert step_result.status is models.StepStatus.COMPLETED
-    generation_result = models.StepResult(
-        step_id="sql_generation",
-        status=models.StepStatus.COMPLETED,
-        output={"sql": "SELECT 1"},
-    )
-    verification_result = models.StepResult(
-        step_id="sql_verification",
-        status=models.StepStatus.COMPLETED,
-        output={"verification_status": "Approved"},
-    )
     outcome = engine._derive_text_to_sql_terminal_outcome(
         models.WorkflowDefinition(name="text_to_sql_pipeline"),
         context,
-        {
-            "sql_generation": generation_result,
-            "sql_verification": verification_result,
-            "db_audit": step_result,
-        },
+        {"db_audit": step_result},
     )
     assert outcome.status is models.TextToSqlTerminalStatus.FAILED
     assert outcome.executed is expected_executed
     assert outcome.audited is expected_audited
+
+
+def test_invalid_db_audit_output_uses_empty_result_review() -> None:
+    engine, models = _light_enhanced_engine_and_models()
+    context = models.WorkflowContext(
+        workflow_id="workflow-invalid-audit",
+        session_id="session-1",
+        variables={"run_id": "run-invalid-audit"},
+    )
+    invalid_audit = models.StepResult(
+        step_id="db_audit",
+        status=models.StepStatus.COMPLETED,
+        output={"not": "a terminal result"},
+    )
+
+    outcome = engine._derive_text_to_sql_terminal_outcome(
+        models.WorkflowDefinition(name="text_to_sql_pipeline"),
+        context,
+        {"db_audit": invalid_audit},
+    )
+
+    assert outcome.reason_code == "DB_AUDIT_OUTPUT_INVALID"
+    assert dict(outcome.result_review) == {}
+
+
+def test_failed_sql_solving_without_db_audit_preserves_solver_failure() -> None:
+    engine, models = _light_enhanced_engine_and_models()
+    context = models.WorkflowContext(
+        workflow_id="workflow-solver-failure",
+        session_id="session-1",
+        variables={"run_id": "run-solver-failure"},
+    )
+    solver_error = "candidate semantic AST cannot be rebuilt: " + (
+        "x" * (TEXT_TO_SQL_MAX_ERROR_LENGTH + 1)
+    )
+    failed_solver = models.StepResult(
+        step_id="sql_solving",
+        status=models.StepStatus.FAILED,
+        error=solver_error,
+    )
+
+    outcome = engine._derive_text_to_sql_terminal_outcome(
+        models.WorkflowDefinition(name="text_to_sql_pipeline"),
+        context,
+        {"sql_solving": failed_solver},
+    )
+
+    assert outcome.reason_code == "MANDATORY_STEP_NOT_COMPLETED"
+    assert outcome.error == solver_error[:TEXT_TO_SQL_MAX_ERROR_LENGTH]
 
 
 @pytest.mark.parametrize(
@@ -2360,1071 +2334,6 @@ def test_text_to_sql_identity_is_exact_name_only(name, category, expected):
     workflow = models.WorkflowDefinition(name=name, metadata=metadata)
 
     assert engine._is_text_to_sql_workflow(workflow) is expected
-
-
-def test_skipped_verifier_gate_is_abstained_through_real_condition():
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    db_audit = next(step for step in workflow.steps if step.id == "db_audit")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT 1", "description": "one"},
-            "sql_generation.sql": "SELECT 1",
-            "sql_verification": {"verification_status": "Rejected"},
-            "sql_verification.verification_status": "Rejected",
-        },
-    )
-
-    assert engine._should_skip_step_by_condition(db_audit, context) is True
-    skipped = models.StepResult(
-        step_id="db_audit",
-        status=models.StepStatus.SKIPPED,
-        output=context.step_outputs["db_audit"],
-    )
-    outcome = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        {
-            "sql_generation": models.StepResult(
-                step_id="sql_generation",
-                status=models.StepStatus.COMPLETED,
-                output={"sql": "SELECT 1", "description": "one"},
-            ),
-            "sql_verification": models.StepResult(
-                step_id="sql_verification",
-                status=models.StepStatus.COMPLETED,
-                output={"verification_status": "Rejected"},
-            ),
-            "db_audit": skipped,
-        },
-    )
-
-    assert outcome.status.value == TextToSqlTerminalStatus.ABSTAINED.value
-    assert outcome.executed is False
-    assert outcome.audited is False
-
-
-@pytest.mark.parametrize(
-    ("sql", "expected_generated"),
-    [("", False), ("SELECT 1", True)],
-)
-def test_skipped_verifier_gate_derives_generation_from_actual_step(sql, expected_generated):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    db_audit = next(step for step in workflow.steps if step.id == "db_audit")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": sql, "description": "query"},
-            "sql_generation.sql": sql,
-            "sql_verification": {"verification_status": "Rejected"},
-            "sql_verification.verification_status": "Rejected",
-        },
-    )
-
-    assert engine._should_skip_step_by_condition(db_audit, context) is True
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": sql, "description": "query"},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": "Rejected"},
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.SKIPPED,
-            output=context.step_outputs["db_audit"],
-        ),
-    }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(workflow, context, steps)
-
-    assert outcome.status is models.TextToSqlTerminalStatus.ABSTAINED
-    assert outcome.sql == sql
-    assert outcome.generated is expected_generated
-    assert outcome.approved is False
-
-
-def test_missing_or_malformed_db_audit_cannot_complete():
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(
-        name="text_to_sql_pipeline",
-        metadata={"category": "text_to_sql"},
-    )
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-    )
-
-    missing = engine._derive_text_to_sql_terminal_outcome(workflow, context, {})
-    malformed = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        {
-            "db_audit": models.StepResult(
-                step_id="db_audit",
-                status=models.StepStatus.COMPLETED,
-                output="agent claims success",
-            )
-        },
-    )
-
-    assert missing.status.value == TextToSqlTerminalStatus.FAILED.value
-    assert malformed.status.value == TextToSqlTerminalStatus.FAILED.value
-
-
-@pytest.mark.parametrize("generated_sql", ["", "   ", None, 42])
-@pytest.mark.parametrize("audit_case", ["missing", "failed", "invalid"])
-def test_failure_derivation_never_throws_for_invalid_generated_sql(
-    generated_sql,
-    audit_case,
-):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(name="text_to_sql_pipeline")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": generated_sql},
-            "sql_verification": {"verification_status": "Approved"},
-        },
-    )
-    if audit_case == "missing":
-        steps = {}
-    elif audit_case == "failed":
-        steps = {
-            "db_audit": models.StepResult(
-                step_id="db_audit",
-                status=models.StepStatus.FAILED,
-                output=None,
-                error="audit step failed",
-            )
-        }
-    else:
-        steps = {
-            "db_audit": models.StepResult(
-                step_id="db_audit",
-                status=models.StepStatus.COMPLETED,
-                output={"forged": "terminal"},
-            )
-        }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        steps,
-    )
-
-    assert outcome.status is models.TextToSqlTerminalStatus.FAILED
-    assert outcome.generated is False
-    assert outcome.approved is False
-    assert outcome.sql == ""
-
-
-@pytest.mark.parametrize("audit_case", ["missing", "failed", "invalid"])
-def test_failure_derivation_uses_completed_step_results_not_forged_context(audit_case):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(name="text_to_sql_pipeline")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT forged"},
-            "sql_verification": {"verification_status": "Approved"},
-        },
-    )
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": "SELECT actual"},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": "Rejected"},
-        ),
-    }
-    if audit_case == "failed":
-        steps["db_audit"] = models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.FAILED,
-            output=None,
-            error="audit step failed",
-        )
-    elif audit_case == "invalid":
-        steps["db_audit"] = models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.COMPLETED,
-            output={"forged": "terminal"},
-        )
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(workflow, context, steps)
-
-    assert outcome.status is models.TextToSqlTerminalStatus.FAILED
-    assert outcome.sql == "SELECT actual"
-    assert outcome.generated is True
-    assert outcome.approved is False
-
-
-@pytest.mark.parametrize("verifier_case", ["missing", "failed", "invalid"])
-def test_skipped_abstention_requires_completed_exact_rejected_verifier(verifier_case):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(name="text_to_sql_pipeline")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT forged"},
-            "sql_verification": {"verification_status": "Rejected"},
-        },
-    )
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": "SELECT actual"},
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.SKIPPED,
-            output=_abstained_payload(),
-        ),
-    }
-    if verifier_case == "failed":
-        steps["sql_verification"] = models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.FAILED,
-            output={"verification_status": "Rejected"},
-            error="verifier failed",
-        )
-    elif verifier_case == "invalid":
-        steps["sql_verification"] = models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": "Banana"},
-        )
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(workflow, context, steps)
-
-    assert outcome.status is models.TextToSqlTerminalStatus.FAILED
-
-
-def test_skipped_abstention_ignores_forged_context_when_actual_verifier_rejected():
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(name="text_to_sql_pipeline")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT forged"},
-            "sql_verification": {"verification_status": "Approved"},
-        },
-    )
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": "SELECT actual"},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": "Rejected"},
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.SKIPPED,
-            output=_abstained_payload(),
-        ),
-    }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(workflow, context, steps)
-
-    assert outcome.status is models.TextToSqlTerminalStatus.ABSTAINED
-    assert outcome.sql == "SELECT actual"
-    assert outcome.approved is False
-
-
-@pytest.mark.parametrize(
-    ("generated_sql", "verification_status"),
-    [
-        ("SELECT 2", "Approved"),
-        ("SELECT 1", "Rejected"),
-    ],
-)
-def test_forged_succeeded_terminal_must_match_actual_step_outputs(
-    generated_sql,
-    verification_status,
-):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(
-        name="text_to_sql_pipeline",
-        metadata={"category": "text_to_sql"},
-    )
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-    )
-    terminal_output = _successful_payload()
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": generated_sql, "description": "query"},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={
-                "verification_status": verification_status,
-                "safety_check": {},
-                "performance_check": {},
-                "recommendations": [],
-            },
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.COMPLETED,
-            output=terminal_output,
-        ),
-    }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        steps,
-    )
-
-    assert outcome.status.value == "failed"
-    assert outcome.reason_code in {
-        "SQL_GENERATION_OUTPUT_MISMATCH",
-        "SQL_VERIFICATION_OUTPUT_MISMATCH",
-    }
-
-
-def _failed_execution_payload(**overrides):
-    payload = _successful_payload(
-        status="failed",
-        reason_code="EXECUTION_FAILED",
-        executed=True,
-        data=[],
-        columns=[],
-        rows_affected=0,
-        error="execution failed",
-        execution={
-            "success": False,
-            "data": [],
-            "columns": [],
-            "rows_affected": 0,
-            "execution_time_ms": 0,
-            "error_message": "execution failed",
-            "dry_run_only": False,
-            "skipped_execution": False,
-        },
-        persistence={"status": "not_attempted"},
-    )
-    payload.update(overrides)
-    return payload
-
-
-def _abstained_payload(**overrides):
-    payload = _successful_payload(
-        status="abstained",
-        reason_code="VERIFIER_REJECTED",
-        approved=False,
-        executed=False,
-        audited=False,
-        data=[],
-        columns=[],
-        rows_affected=0,
-        error=None,
-        execution={},
-        audit={},
-        persistence={"status": "not_attempted"},
-    )
-    payload.update(overrides)
-    return payload
-
-
-def _executor_contract_invalid_payload(**overrides):
-    payload = _failed_execution_payload(
-        reason_code="EXECUTOR_CONTRACT_INVALID",
-        executed=False,
-        error="executor contract invalid",
-        execution={"raw_success": "yes"},
-    )
-    payload.update(overrides)
-    return payload
-
-
-def _audit_failed_payload(**overrides):
-    payload = _successful_payload(
-        status="failed",
-        reason_code="AUDIT_FAILED",
-        audited=False,
-        error="audit failed",
-        audit={"status": "error", "error": "audit failed"},
-        persistence={"status": "not_attempted"},
-    )
-    payload.update(overrides)
-    return payload
-
-
-def _verifier_contract_invalid_payload(**overrides):
-    payload = _successful_payload(
-        status="failed",
-        reason_code="VERIFIER_CONTRACT_INVALID",
-        approved=False,
-        executed=False,
-        audited=False,
-        data=[],
-        columns=[],
-        rows_affected=0,
-        error="verification status is invalid",
-        execution={},
-        audit={},
-        persistence={"status": "not_attempted"},
-    )
-    payload.update(overrides)
-    return payload
-
-
-@pytest.mark.parametrize(
-    ("terminal_payload", "generated_sql", "verification_status", "expected_reason"),
-    [
-        (
-            _failed_execution_payload(),
-            "SELECT 2",
-            "Approved",
-            "SQL_GENERATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _failed_execution_payload(),
-            "SELECT 1",
-            "Rejected",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _abstained_payload(),
-            "SELECT 2",
-            "Rejected",
-            "SQL_GENERATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _abstained_payload(),
-            "SELECT 1",
-            "Approved",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _executor_contract_invalid_payload(),
-            "SELECT 2",
-            "Approved",
-            "SQL_GENERATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _executor_contract_invalid_payload(),
-            "SELECT 1",
-            "Rejected",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _verifier_contract_invalid_payload(),
-            "SELECT 1",
-            "Rejected",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _abstained_payload(),
-            "SELECT 1",
-            "Banana",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-    ],
-)
-def test_all_completed_terminal_outcomes_match_actual_generation_and_verifier(
-    terminal_payload,
-    generated_sql,
-    verification_status,
-    expected_reason,
-):
-    engine, models = _light_enhanced_engine_and_models()
-    workflow = models.WorkflowDefinition(name="text_to_sql_pipeline")
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": generated_sql},
-            "sql_verification": {"verification_status": verification_status},
-        },
-    )
-    steps = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": generated_sql},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": verification_status},
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.COMPLETED,
-            output=terminal_payload,
-        ),
-    }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(workflow, context, steps)
-
-    assert outcome.status is models.TextToSqlTerminalStatus.FAILED
-    assert outcome.reason_code == expected_reason
-
-
-def test_registered_finalizer_executes_through_real_engine_tool_path(
-    monkeypatch,
-):
-    epic6 = importlib.import_module("tests.test_workflow_engine_epic6")
-    engine = epic6._engine_instance()
-    models = epic6._workflow_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    step = next(item for item in workflow.steps if item.id == "db_audit")
-
-    definition = yaml.safe_load(
-        Path("tool_definitions/finalize_text_to_sql_run.yaml").read_text(
-            encoding="utf-8"
-        )
-    )
-    verification_parameter = next(
-        item for item in definition["parameters"]
-        if item["name"] == "verification_status"
-    )
-    assert verification_parameter["enum"] == ["Approved", "Rejected"]
-    module_name, function_name = definition["implementation_source"].rsplit(".", 1)
-    implementation = getattr(importlib.import_module(module_name), function_name)
-    wrapped_tool = importlib.import_module("smolagents").tool(implementation)
-    assert definition["name"] == step.tool_name == wrapped_tool.name
-
-    engine.factory = types.SimpleNamespace(
-        _create_tool=lambda name: wrapped_tool if name == step.tool_name else None
-    )
-    engine.resource_manager = types.SimpleNamespace(record_api_call=lambda run_id: None)
-
-    class _DirectToolManager:
-        def run_tool(self, *, tool_function, session_id=None, **kwargs):
-            kwargs.pop("tool_name", None)
-            kwargs.pop("task_description", None)
-            kwargs.pop("trace_run_id", None)
-            kwargs.pop("workflow_run_id", None)
-            if session_id is not None:
-                kwargs["session_id"] = session_id
-            return tool_function(**kwargs)
-
-    tool_manager = importlib.import_module("tool_manager")
-    monkeypatch.setattr(tool_manager, "get_tool_manager", lambda: _DirectToolManager())
-    core = importlib.import_module("custom_tools.text_to_sql.core")
-    monkeypatch.setattr(
-        core,
-        "secure_db_executor",
-        lambda *args, **kwargs: _executor_result(
-            data=[],
-            columns=[],
-            rows_affected=0,
-            execution_time_ms=0,
-            dry_run_only=True,
-            skipped_execution=True,
-        ),
-    )
-    monkeypatch.setattr(
-        core,
-        "audit_logger",
-        lambda entry: {"status": "logged", "log_id": "audit-1"},
-    )
-    monkeypatch.setattr(
-        core,
-        "save_successful_sql",
-        lambda *args, **kwargs: pytest.fail("dry-run must not persist"),
-    )
-    from custom_tools.text_to_sql.validators import resolve_safety_policy
-
-    safety_policy = resolve_safety_policy("strict")
-    namespace_version_key = "a" * 64
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={
-            **workflow.inputs,
-            "query": "one",
-            "dsn": "sqlite:///unused.db",
-            "max_rows": 10,
-            "dry_run_only": True,
-            "run_id": "run-1",
-            "session_id": "session-1",
-            "safety_policy": safety_policy,
-        },
-        step_outputs={
-            "schema_linking_step": {
-                "namespace_version_key": namespace_version_key,
-            },
-            "schema_linking_step.namespace_version_key": namespace_version_key,
-            "sql_generation": {"sql": "SELECT 1", "description": "one"},
-            "sql_generation.sql": "SELECT 1",
-            "sql_verification": {"verification_status": "Approved"},
-            "sql_verification.verification_status": "Approved",
-        },
-    )
-    step = engine._step_with_substituted_metadata(step, context)
-
-    result = asyncio.run(engine._execute_tool_step(step, context, step.task))
-
-    assert result["status"] == "succeeded"
-    assert result["dry_run"] is True
-    assert result["executed"] is False
-
-
-_USE_TERMINAL_PAYLOAD = object()
-
-
-def _run_enhanced_terminal_scenario(
-    terminal_payload,
-    *,
-    cancelled=False,
-    aggregation_error=None,
-    real_aggregator_fallback=False,
-    generated_sql="SELECT 1",
-    verification_status="Approved",
-    db_audit_status=None,
-    aggregated_final=_USE_TERMINAL_PAYLOAD,
-    workflow_name="text_to_sql_pipeline",
-):
-    engine, models = _light_enhanced_engine_and_models()
-    events = []
-    checkpoints = []
-    engine.metrics_collector = types.SimpleNamespace(
-        record_workflow_start=lambda *args: None
-    )
-    engine.budget_manager = types.SimpleNamespace(
-        create_workflow_budget=lambda *args: object()
-    )
-
-    async def started(*args, **kwargs):
-        return object()
-
-    async def released(*args, **kwargs):
-        events.append("released")
-
-    async def completed(*args, **kwargs):
-        events.append("completed")
-
-    engine._on_workflow_started = started
-    engine._release_workflow_resources = released
-    engine._on_workflow_completed = completed
-    context = models.WorkflowContext(
-        workflow_id="workflow-1",
-        session_id="session-1",
-        variables={"run_id": "run-1"},
-    )
-    step_results = {
-        "sql_generation": models.StepResult(
-            step_id="sql_generation",
-            status=models.StepStatus.COMPLETED,
-            output={"sql": generated_sql, "description": "one"},
-        ),
-        "sql_verification": models.StepResult(
-            step_id="sql_verification",
-            status=models.StepStatus.COMPLETED,
-            output={"verification_status": verification_status},
-        ),
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=(
-                models.StepStatus(db_audit_status)
-                if isinstance(db_audit_status, str)
-                else db_audit_status or models.StepStatus.COMPLETED
-            ),
-            output=copy.deepcopy(terminal_payload),
-        ),
-    }
-
-    async def execute_steps(*args, **kwargs):
-        events.append("steps")
-        context.step_outputs.update({
-            step_id: result.output for step_id, result in step_results.items()
-        })
-        return step_results
-
-    async def is_cancelled(*args, **kwargs):
-        events.append("cancel-check")
-        return cancelled
-
-    engine._execute_enhanced_steps = execute_steps
-    engine._is_workflow_cancelled = is_cancelled
-    original_derive = engine._derive_text_to_sql_terminal_outcome
-
-    def derive(*args, **kwargs):
-        events.append("derive")
-        return original_derive(*args, **kwargs)
-
-    engine._derive_text_to_sql_terminal_outcome = derive
-
-    class Aggregator:
-        async def aggregate_final_result(self, *args, **kwargs):
-            events.append("aggregate")
-            if aggregation_error is not None:
-                raise aggregation_error
-            raw_final = (
-                terminal_payload
-                if aggregated_final is _USE_TERMINAL_PAYLOAD
-                else aggregated_final
-            )
-            return {
-                "type": "workflow_outputs",
-                "workflow_name": workflow_name,
-                "final": copy.deepcopy(raw_final),
-                "outputs": {"final": copy.deepcopy(raw_final)},
-            }
-
-    class StateManager:
-        async def save_checkpoint(self, **kwargs):
-            checkpoints.append(kwargs)
-
-    if real_aggregator_fallback:
-        aggregator_module = importlib.import_module(
-            "workflow.intelligence.aggregator"
-        )
-        aggregator = aggregator_module.FinalAggregator()
-        real_aggregate = aggregator.aggregate_final_result
-
-        async def tracked_aggregate(*args, **kwargs):
-            events.append("aggregate")
-            return await real_aggregate(*args, **kwargs)
-
-        async def broken_outputs_mapping(*args, **kwargs):
-            raise RuntimeError("real aggregator exploded")
-
-        aggregator.aggregate_final_result = tracked_aggregate
-        aggregator._aggregate_outputs_mapping = broken_outputs_mapping
-        engine.aggregator = aggregator
-    else:
-        engine.aggregator = Aggregator()
-    engine.state_manager = StateManager()
-    workflow = models.WorkflowDefinition(
-        name=workflow_name,
-        outputs={"final": {"from_step": "db_audit", "field": "output"}},
-        steps=[
-            models.WorkflowStep(id="sql_generation", task="generate"),
-            models.WorkflowStep(id="sql_verification", task="verify"),
-            models.WorkflowStep(id="db_audit", task="finalize"),
-        ],
-    )
-    result = asyncio.run(
-        engine._execute_enhanced_workflow(workflow, context=context)
-    )
-    return result, events, checkpoints
-
-
-def test_terminal_is_derived_before_result_aggregation():
-    result, events, _ = _run_enhanced_terminal_scenario(_successful_payload())
-
-    assert result.status.value == "completed"
-    assert events.index("derive") < events.index("aggregate")
-    assert events.index("derive") < events.index("completed")
-
-
-def test_late_cancel_after_finalizer_preserves_actual_terminal_evidence():
-    result, events, _ = _run_enhanced_terminal_scenario(
-        _successful_payload(),
-        cancelled=True,
-    )
-
-    assert result.status.value == "completed"
-    assert result.terminal_outcome.status.value == "succeeded"
-    assert result.terminal_outcome.executed is True
-    assert result.terminal_outcome.audited is True
-    assert "aggregate" in events
-
-
-def test_text_to_sql_public_final_is_canonical_for_skipped_rejected_gate():
-    abstained = _successful_payload(
-        status="abstained",
-        reason_code="VERIFIER_REJECTED",
-        approved=False,
-        executed=False,
-        audited=False,
-        data=[],
-        columns=[],
-        rows_affected=0,
-        execution={},
-        audit={},
-        persistence={"status": "not_attempted"},
-    )
-    result, _, _ = _run_enhanced_terminal_scenario(
-        abstained,
-        verification_status="Rejected",
-        db_audit_status="skipped",
-        aggregated_final=_successful_payload(),
-    )
-
-    assert result.terminal_outcome.status.value == TextToSqlTerminalStatus.ABSTAINED.value
-    assert result.final_output["final"] == result.terminal_outcome.to_mapping()
-    assert result.final_output["outputs"]["final"] == result.terminal_outcome.to_mapping()
-
-
-@pytest.mark.parametrize(
-    "reason_code",
-    [
-        "SCHEMA_CLARIFICATION_REQUIRED",
-        "SCHEMA_GROUNDING_FAILED",
-        "SCHEMA_CONTEXT_BUDGET_EXCEEDED",
-    ],
-)
-def test_enhanced_engine_preserves_schema_abstention_reason(reason_code):
-    abstained = _successful_payload(
-        status="abstained",
-        reason_code=reason_code,
-        sql="",
-        generated=False,
-        approved=False,
-        executed=False,
-        audited=False,
-        data=[],
-        columns=[],
-        rows_affected=0,
-        execution={},
-        audit={},
-        persistence={"status": "not_attempted"},
-    )
-
-    result, _, _ = _run_enhanced_terminal_scenario(
-        abstained,
-        generated_sql="",
-        verification_status="Rejected",
-        db_audit_status="skipped",
-    )
-
-    assert (
-        result.terminal_outcome.status.value
-        == TextToSqlTerminalStatus.ABSTAINED.value
-    )
-    assert result.terminal_outcome.reason_code == reason_code
-
-
-@pytest.mark.parametrize(
-    ("terminal_payload", "generated_sql", "expected_reason"),
-    [
-        ("agent claims success", "SELECT 1", "DB_AUDIT_OUTPUT_INVALID"),
-        (_successful_payload(), "SELECT 2", "SQL_GENERATION_OUTPUT_MISMATCH"),
-    ],
-)
-def test_text_to_sql_public_final_replaces_malformed_or_forged_db_audit(
-    terminal_payload,
-    generated_sql,
-    expected_reason,
-):
-    result, _, _ = _run_enhanced_terminal_scenario(
-        terminal_payload,
-        generated_sql=generated_sql,
-        aggregated_final=_successful_payload(),
-    )
-
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.reason_code == expected_reason
-    assert result.final_output["final"] == result.terminal_outcome.to_mapping()
-    assert result.final_output["outputs"]["final"] == result.terminal_outcome.to_mapping()
-
-
-@pytest.mark.parametrize(
-    ("terminal_payload", "generated_sql", "verification_status", "expected_reason"),
-    [
-        (
-            _failed_execution_payload(),
-            "SELECT 2",
-            "Approved",
-            "SQL_GENERATION_OUTPUT_MISMATCH",
-        ),
-        (
-            _failed_execution_payload(),
-            "SELECT 1",
-            "Rejected",
-            "SQL_VERIFICATION_OUTPUT_MISMATCH",
-        ),
-    ],
-)
-def test_full_engine_canonicalizes_forged_failed_terminal_outcome(
-    terminal_payload,
-    generated_sql,
-    verification_status,
-    expected_reason,
-):
-    result, _, _ = _run_enhanced_terminal_scenario(
-        terminal_payload,
-        generated_sql=generated_sql,
-        verification_status=verification_status,
-        aggregated_final=terminal_payload,
-    )
-
-    canonical = result.terminal_outcome.to_mapping()
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.reason_code == expected_reason
-    assert result.final_output["final"] == canonical
-    assert result.final_output["outputs"]["final"] == canonical
-
-
-@pytest.mark.parametrize(
-    ("terminal_payload", "verification_status"),
-    [
-        (_failed_execution_payload(), "Approved"),
-        (_audit_failed_payload(), "Approved"),
-        (_verifier_contract_invalid_payload(), "Banana"),
-    ],
-)
-def test_full_engine_preserves_legitimate_failed_terminal_outcome(
-    terminal_payload,
-    verification_status,
-):
-    result, _, _ = _run_enhanced_terminal_scenario(
-        terminal_payload,
-        verification_status=verification_status,
-    )
-
-    canonical = result.terminal_outcome.to_mapping()
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.reason_code == terminal_payload["reason_code"]
-    assert result.final_output["final"] == canonical
-    assert result.final_output["outputs"]["final"] == canonical
-
-
-@pytest.mark.parametrize("generated_sql", ["", None, 42])
-def test_full_engine_fail_closed_path_handles_invalid_sql_without_throwing(generated_sql):
-    result, _, _ = _run_enhanced_terminal_scenario(
-        None,
-        generated_sql=generated_sql,
-        verification_status="Approved",
-        db_audit_status="failed",
-        aggregated_final=_successful_payload(),
-    )
-
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.status.value == TextToSqlTerminalStatus.FAILED.value
-    assert result.terminal_outcome.generated is False
-    assert result.terminal_outcome.approved is False
-    assert result.terminal_outcome.sql == ""
-    assert result.final_output["final"] == result.terminal_outcome.to_mapping()
-
-
-def test_text_to_sql_public_final_mappings_do_not_share_nested_aliases():
-    result, _, _ = _run_enhanced_terminal_scenario(_successful_payload())
-
-    public_final = result.final_output["final"]
-    output_final = result.final_output["outputs"]["final"]
-    public_final["execution"]["data"][0][0] = 99
-    public_final["audit"]["status"] = "mutated"
-
-    assert output_final["execution"]["data"] == [[1]]
-    assert output_final["audit"]["status"] == "logged"
-    assert result.terminal_outcome.execution["data"] == [[1]]
-    assert result.terminal_outcome.audit["status"] == "logged"
-
-
-def test_generic_workflow_public_final_remains_aggregator_owned():
-    raw_final = {"custom": {"answer": 42}}
-    result, _, _ = _run_enhanced_terminal_scenario(
-        raw_final,
-        aggregated_final=raw_final,
-        workflow_name="generic_pipeline",
-    )
-
-    assert result.status.value == "completed"
-    assert result.terminal_outcome is None
-    assert result.final_output["final"] == raw_final
-
-
-@pytest.mark.parametrize(
-    ("terminal_payload", "expected_reason"),
-    [
-        (_successful_payload(), "RESULT_AGGREGATION_FAILED"),
-        (
-            _successful_payload(
-                status="failed",
-                reason_code="EXECUTION_FAILED",
-                executed=True,
-                data=[],
-                columns=[],
-                rows_affected=0,
-                error="database failed",
-                execution={
-                    "success": False,
-                    "data": [],
-                    "columns": [],
-                    "rows_affected": 0,
-                    "execution_time_ms": 0,
-                    "dry_run_only": False,
-                    "skipped_execution": False,
-                    "error_message": "database failed",
-                },
-                persistence={"status": "not_attempted"},
-            ),
-            "EXECUTION_FAILED",
-        ),
-    ],
-)
-def test_aggregation_failure_preserves_runtime_evidence_and_checkpoints(
-    terminal_payload,
-    expected_reason,
-):
-    result, events, checkpoints = _run_enhanced_terminal_scenario(
-        terminal_payload,
-        aggregation_error=RuntimeError("aggregator exploded"),
-    )
-
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.reason_code == expected_reason
-    assert result.terminal_outcome.audited is terminal_payload["audited"]
-    assert result.terminal_outcome.execution == terminal_payload["execution"]
-    assert result.final_output["final"] == result.terminal_outcome.to_mapping()
-    assert checkpoints
-    assert "completed" not in events
-
-
-def test_real_aggregator_fallback_is_terminal_aggregation_failure():
-    result, events, checkpoints = _run_enhanced_terminal_scenario(
-        _successful_payload(),
-        real_aggregator_fallback=True,
-    )
-
-    assert result.status.value == "failed"
-    assert result.terminal_outcome.reason_code == "RESULT_AGGREGATION_FAILED"
-    assert result.terminal_outcome.executed is True
-    assert result.terminal_outcome.audited is True
-    assert result.final_output["type"] == "workflow_outputs"
-    assert result.final_output["final"] == result.terminal_outcome.to_mapping()
-    assert checkpoints
-    assert events.index("derive") < events.index("aggregate")
-    assert "completed" not in events
 
 
 def test_terminal_payload_is_json_serializable():

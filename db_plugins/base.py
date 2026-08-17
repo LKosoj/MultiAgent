@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -13,6 +14,135 @@ LARGE_TABLE_THRESHOLD = 10_000_000
 _READ_ONLY_FAIL_OPEN_PARAM = "read_only_fail_open"
 _TRUE_QUERY_VALUES = {"1", "true", "yes", "on"}
 _RESERVED_WORD_CACHE: Dict[str, set[str]] = {}
+_BOUND_PARAMETER_SENTINEL = "__text_to_sql_bound_parameter__"
+_BRACKET_IDENTIFIER_DIALECTS = frozenset({"sqlite", "tsql"})
+
+
+def _qmark_code_positions(sql: str, *, dialect: str) -> list[int]:
+    """Find question marks outside SQL literals, identifiers, and comments."""
+    positions: list[int] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        char = sql[index]
+        pair = sql[index : index + 2]
+
+        if pair == "--" or (char == "#" and dialect == "mysql"):
+            newline = sql.find("\n", index + (2 if pair == "--" else 1))
+            index = length if newline < 0 else newline + 1
+            continue
+        if pair == "/*":
+            depth = 1
+            index += 2
+            while index < length and depth:
+                if sql[index : index + 2] == "/*":
+                    depth += 1
+                    index += 2
+                elif sql[index : index + 2] == "*/":
+                    depth -= 1
+                    index += 2
+                else:
+                    index += 1
+            if depth:
+                raise ValueError("unterminated SQL block comment")
+            continue
+        if char == "$":
+            delimiter_match = re.match(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$", sql[index:])
+            if delimiter_match is not None:
+                delimiter = delimiter_match.group(0)
+                closing = sql.find(delimiter, index + len(delimiter))
+                if closing < 0:
+                    raise ValueError("unterminated SQL dollar-quoted literal")
+                index = closing + len(delimiter)
+                continue
+        if char in {"'", '"', "`"} or (
+            char == "[" and dialect in _BRACKET_IDENTIFIER_DIALECTS
+        ):
+            closing = "]" if char == "[" else char
+            index += 1
+            while index < length:
+                if sql[index] == "\\" and closing != "]":
+                    index += 2
+                    continue
+                if sql[index] != closing:
+                    index += 1
+                    continue
+                if index + 1 < length and sql[index + 1] == closing:
+                    index += 2
+                    continue
+                index += 1
+                break
+            else:
+                raise ValueError("unterminated SQL quoted value")
+            continue
+        if char == "?":
+            positions.append(index)
+        index += 1
+    return positions
+
+
+def _rewrite_qmark_placeholders(
+    sql: str,
+    *,
+    dialect: str,
+    parameter_marker: str,
+    expected_count: int,
+) -> str:
+    """Rewrite only parser-confirmed positional placeholders, or fail closed."""
+    if not isinstance(sql, str):
+        raise TypeError("sql must be text")
+    if not isinstance(parameter_marker, str) or not parameter_marker:
+        raise ValueError("parameter_marker must be non-empty text")
+    if not isinstance(expected_count, int) or isinstance(expected_count, bool):
+        raise TypeError("expected_count must be an integer")
+    if expected_count < 0:
+        raise ValueError("expected_count must not be negative")
+    if _BOUND_PARAMETER_SENTINEL in sql:
+        raise ValueError("SQL contains the reserved bound-parameter sentinel")
+
+    try:
+        import sqlglot
+        from sqlglot import exp
+    except ImportError as exc:
+        raise ValueError("bound SELECT execution requires sqlglot") from exc
+
+    placeholder_positions = []
+    for position in _qmark_code_positions(sql, dialect=dialect):
+        candidate = (
+            sql[:position]
+            + f":{_BOUND_PARAMETER_SENTINEL}"
+            + sql[position + 1 :]
+        )
+        try:
+            statements = [
+                statement
+                for statement in sqlglot.parse(candidate, read=dialect)
+                if statement is not None
+            ]
+        except Exception:
+            continue
+        if len(statements) != 1:
+            continue
+        sentinels = [
+            placeholder
+            for placeholder in statements[0].find_all(exp.Placeholder)
+            if placeholder.this == _BOUND_PARAMETER_SENTINEL
+        ]
+        if len(sentinels) == 1:
+            placeholder_positions.append(position)
+
+    if len(placeholder_positions) != expected_count:
+        raise ValueError(
+            "bound parameter count does not match SQL placeholder count"
+        )
+
+    chunks: list[str] = []
+    previous = 0
+    for position in placeholder_positions:
+        chunks.extend((sql[previous:position], parameter_marker))
+        previous = position + 1
+    chunks.append(sql[previous:])
+    return "".join(chunks)
 
 
 class CapabilityState(str, Enum):
@@ -238,6 +368,16 @@ class DBPlugin(Protocol):
         """Выполняет безопасный SELECT с ограничением строк и возвращает данные/колонки/время."""
         ...
 
+    def execute_select_bound(
+        self,
+        conn,
+        sql: str,
+        parameters: tuple[str | int | float | bool | None, ...],
+        row_limit: int = 500,
+    ) -> Dict[str, Any]:
+        """Executes SELECT with driver-bound positional parameters."""
+        ...
+
     def set_statement_timeout(self, conn, timeout_ms: int) -> None:
         """Sets per-statement execution timeout where supported."""
         ...
@@ -357,6 +497,10 @@ class DBPlugin(Protocol):
         Returns:
             Квотированный идентификатор
         """
+        ...
+
+    def quote_identifier_part(self, identifier: str) -> str:
+        """Квотирует одно имя, не разделяя его по точкам."""
         ...
 
     def build_select_all(self, table_name: str, limit: int) -> str:
@@ -701,13 +845,19 @@ class BaseDBPlugin:
             if part == "":
                 # Пропускаем пустые части, чтобы не генерировать лишние точки
                 continue
-            if not self._identifier_needs_quoting(part):
-                quoted_parts.append(part)
-            else:
-                escaped = part.replace('"', '""')
-                quoted_parts.append(f'"{escaped}"')
+            quoted_parts.append(self.quote_identifier_part(part))
 
         return ".".join(quoted_parts)
+
+    def quote_identifier_part(self, identifier: str) -> str:
+        """Quote one trusted identifier part without treating dots as separators."""
+        if not identifier:
+            return identifier
+        part = str(identifier)
+        if not self._identifier_needs_quoting(part):
+            return part
+        escaped = part.replace('"', '""')
+        return f'"{escaped}"'
 
     def _identifier_needs_quoting(self, part: str) -> bool:
         """Returns True for reserved, mixed-case, or non-simple identifiers."""
@@ -756,6 +906,49 @@ class BaseDBPlugin:
         raise UnsupportedCapabilityError(
             "statement timeout is unsupported by the base database plugin"
         )
+
+    def execute_select_bound(
+        self,
+        conn,
+        sql: str,
+        parameters: tuple[str | int | float | bool | None, ...],
+        row_limit: int = 500,
+    ) -> Dict[str, Any]:
+        del conn, sql, parameters, row_limit
+        raise UnsupportedCapabilityError(
+            "bound SELECT execution is unsupported by the base database plugin"
+        )
+
+    def _execute_select_bound_driver(
+        self,
+        conn,
+        sql: str,
+        parameters: tuple[str | int | float | bool | None, ...],
+        row_limit: int,
+        *,
+        parameter_marker: str = "?",
+    ) -> Dict[str, Any]:
+        start = time.time()
+        query = self.limit_select_sql(sql, row_limit)
+        query = _rewrite_qmark_placeholders(
+            query,
+            dialect=self._sqlglot_dialect_name(),
+            parameter_marker=parameter_marker,
+            expected_count=len(parameters),
+        )
+        with self._cursor(conn) as cursor:
+            cursor.execute(query, parameters)
+            rows = self.fetch_rows_with_limit(cursor, row_limit)
+            columns = [item[0] for item in cursor.description] if cursor.description else []
+        elapsed = int((time.time() - start) * 1000)
+        return {
+            "success": True,
+            "data": rows,
+            "columns": columns,
+            "rows_affected": len(rows),
+            "execution_time_ms": elapsed,
+            "error_message": None,
+        }
 
     def limit_select_sql(self, sql: str, row_limit: int) -> str:
         """Applies a top-level row cap while preserving top-level ORDER BY."""

@@ -33,7 +33,6 @@ class EvalGenerationRequest:
     include_explanation: bool
     validate_schema: bool
     dry_run_only: bool
-    use_schema_suggestions: bool
 
     @classmethod
     def from_case(cls, case: TextToSQLEvalCase) -> "EvalGenerationRequest":
@@ -48,7 +47,6 @@ class EvalGenerationRequest:
             include_explanation=options["include_explanation"],
             validate_schema=options["validate_schema"],
             dry_run_only=options["dry_run_only"],
-            use_schema_suggestions=options["use_schema_suggestions"],
         )
 
     def to_service_payload(self, *, connection_ref: str) -> dict[str, Any]:
@@ -62,7 +60,6 @@ class EvalGenerationRequest:
             "include_explanation": self.include_explanation,
             "validate_schema": self.validate_schema,
             "dry_run_only": self.dry_run_only,
-            "use_schema_suggestions": self.use_schema_suggestions,
         }
 
 
@@ -213,7 +210,6 @@ class AuthenticatedT13EvalAdapter:
                 include_explanation=payload["include_explanation"],
                 validate_schema=payload["validate_schema"],
                 dry_run_only=payload["dry_run_only"],
-                use_schema_suggestions=payload["use_schema_suggestions"],
             )
         )
         if case.cancel_after_start:

@@ -1,0 +1,12 @@
+version: 1
+name: execute_research_probe
+description: Execute one bounded model-authored research SELECT.
+implementation: execute_research_probe
+arguments:
+  - name: sql
+    type: string
+    required: true
+  - name: parameters
+    type: json_scalar_array
+    required: false
+additional_properties: false

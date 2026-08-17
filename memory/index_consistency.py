@@ -150,6 +150,29 @@ def _group_source_rows(
     return grouped, failed
 
 
+def source_namespace_semantic_ids(
+    *,
+    session_id: str,
+    agent_name: str,
+    cache_kind: str,
+) -> tuple[set[str], set[str]]:
+    """Возвращает валидные semantic ID из SQLite, не обращаясь к Chroma.
+
+    Этот узкий helper нужен проверкам, в которых SQLite остаётся источником
+    истины, а векторный индекс временно недоступен или пересобирается.
+    """
+    if cache_kind not in SEMANTIC_CACHE_KINDS:
+        raise ValueError("cache_kind is not a supported semantic record kind")
+    rows, malformed = _source_rows(
+        session_id=session_id,
+        agent_name=agent_name,
+        cache_kind=cache_kind,
+    )
+    grouped, failed = _group_source_rows(rows, cache_kind)
+    failed.update(malformed)
+    return set(grouped), failed
+
+
 def _where_filter(session_id: str, agent_name: str, cache_kind: str) -> dict[str, Any]:
     return {
         "$and": [

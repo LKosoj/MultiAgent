@@ -413,6 +413,9 @@ class EditorPanel(ttk.Frame):
             "negative_prompt_list": "Негативные промпты",
             "screenplay": "Сценарий",
             "shots": "Видеокадры",
+            "asset_map": "Карта объектов болванки",
+            "scene_spec": "Спецификация сцены болванки",
+            "chains": "Цепочки болванки",
             "pdf": "PDF книга",
             "markdown": "Markdown книга"
         }

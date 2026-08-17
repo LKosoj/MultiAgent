@@ -43,12 +43,12 @@ from configuration_api import (
     UIConfig,
 )
 from db_plugins.streamlit_api import get_db_plugin_manager
-from memory.streamlit_api import get_memory_rag_manager
 from telemetry import get_telemetry_manager
 from tool_manager import get_tool_manager
 from unified_logging import get_logging_manager
 from workflow.streamlit_api import WorkflowManager
 from workflow.models import is_text_to_sql_workflow_name
+from workflow.text_to_sql_contract import TEXT_TO_SQL_WORKFLOW_NAME
 from .auth import Principal, current_principal, normalize_session_id_for_principal
 from .redaction import (
     _dsn_fingerprint,
@@ -292,6 +292,17 @@ _DEFAULT_MAX_FILE_READ_BYTES = 1_000_000
 class ServiceTransportContext:
     run_id: str
     principal: Principal
+    cancellation_request_id: Optional[str] = None
+    cancellation_provenance: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if (self.cancellation_request_id is None) != (
+            self.cancellation_provenance is None
+        ):
+            raise ValueError(
+                "cancellation request identity and provenance must be supplied "
+                "together"
+            )
 
 
 def _model_mapping_details(mapping: Any) -> Dict[str, Dict[str, str]]:
@@ -998,12 +1009,13 @@ def _trusted_text_to_sql_schema_scope(
     record: ConnectionRecord | None,
     principal: Principal,
     run_id: str,
+    dsn: str,
 ) -> dict[str, object]:
     if record is None:
         tenant_id = principal.tenant_id
         access_scope_id = f"owner:{principal.subject}"
-        connection_view_id = f"compatibility-run:{run_id}"
-        transient = True
+        connection_view_id = f"dsn:{_dsn_fingerprint(dsn)}"
+        transient = False
     else:
         tenant_id = record.tenant_id
         access_scope_id = (
@@ -1011,7 +1023,7 @@ def _trusted_text_to_sql_schema_scope(
             if record.owner_subject is not None
             else "tenant-shared"
         )
-        connection_view_id = f"registry:{record.connection_ref}"
+        connection_view_id = f"dsn:{_dsn_fingerprint(dsn)}"
         transient = False
     return SchemaScope.from_mapping(
         {
@@ -1059,27 +1071,6 @@ def _workflow_result_outbox_path() -> Path:
         "workflow_result_outbox.db",
         legacy_path=project_root / "data" / "workflow_result_outbox.db",
     )
-
-
-def _extract_query(payload: Dict[str, Any]) -> str:
-    """Извлекает NL-запрос из payload AG-UI service action.
-
-    Контракт: ``natural_query`` имеет приоритет над ``query``; оба поля
-    опциональны. Возвращает пустую строку, если оба отсутствуют или пусты
-    после strip(). Поднимает ``ValueError`` для non-string значений.
-    """
-    for key in ("natural_query", "query"):
-        candidate = payload.get(key)
-        if candidate is None:
-            continue
-        if not isinstance(candidate, str):
-            raise ValueError(
-                f"{key} must be a string, got {type(candidate).__name__}"
-            )
-        stripped = candidate.strip()
-        if stripped:
-            return stripped
-    return ""
 
 
 def _load_text_to_sql_schema_from_memory(
@@ -1239,8 +1230,7 @@ def _coerce_strict_bool(value: Any, *, default: bool = False, field_name: str = 
     Принимает ``None`` → ``default``, ``bool``, ``0/1`` (int) и канонические
     строки. **На любом другом значении поднимает ValueError** с понятным
     сообщением, в которое включено ``field_name``. Используется для полей,
-    которые меняют поведение runtime (`allow_enhanced_fallback`,
-    feature flags), где тихое приведение — это бага.
+    которые меняют поведение runtime, где тихое приведение — это бага.
     """
     if value is None:
         return default
@@ -2337,7 +2327,7 @@ def _text_to_sql_terminal_projection(
     terminal = _validated_text_to_sql_terminal_outcome(value)
     if terminal is None:
         error = str(fallback_error) if fallback_error else None
-        return "unknown_legacy", False, error, None
+        return "invalid_terminal", False, error, None
 
     terminal_status = terminal["status"]
     error = terminal.get("error") or terminal.get("reason_code") or fallback_error
@@ -2903,6 +2893,8 @@ def _memory_manager():
     if _MEMORY_MANAGER is None:
         with _MEMORY_MANAGER_LOCK:
             if _MEMORY_MANAGER is None:
+                from memory.streamlit_api import get_memory_rag_manager
+
                 _MEMORY_MANAGER = get_memory_rag_manager()
     return _MEMORY_MANAGER
 
@@ -3939,6 +3931,14 @@ def handle_service_action(
                 response["execution"] = _serialize(terminal_outcome.get("execution"))
             elif isinstance(metadata, dict) and metadata.get("execution") is not None:
                 response["execution"] = _serialize(metadata.get("execution"))
+        if (
+            stored_run.run_kind == "text_to_sql"
+            and transport_context is not None
+            and transport_context.run_id == run_id
+        ):
+            response["__durable_workflow_result"] = _serialize(
+                {**result_payload, "result_seq": stored_run.result_seq}
+            )
         persist_report = status_value in {"completed", "failed", "cancelled"}
         try:
             response["report"] = _serialize(_telemetry_generate_report(telemetry_manager, run_id, persist=persist_report))
@@ -4031,6 +4031,8 @@ def handle_service_action(
         run_id = payload.get("run_id")
         if not run_id:
             raise ValueError("run_id is required")
+        if transport_context is not None and transport_context.run_id != run_id:
+            raise PermissionError("transport run does not match cancellation target")
         stored_run = _require_run_access(
             run_id,
             principal,
@@ -4044,7 +4046,23 @@ def handle_service_action(
             "timed_out",
         }:
             return {"cancelled": False}
-        return {"cancelled": wf_manager.cancel_workflow(run_id)}
+        cancellation_request_id = (
+            transport_context.cancellation_request_id
+            if transport_context is not None
+            else None
+        ) or f"cancel-{uuid.uuid4().hex}"
+        cancellation_provenance = (
+            transport_context.cancellation_provenance
+            if transport_context is not None
+            else None
+        ) or "agui_service_action:v1"
+        return {
+            "cancelled": wf_manager.cancel_workflow(
+                run_id,
+                cancellation_request_id=cancellation_request_id,
+                cancellation_provenance=cancellation_provenance,
+            )
+        }
     if action == "workflows.cleanup":
         max_age_hours = float(payload.get("max_age_hours", 24))
         cleaned = wf_manager.cleanup_completed_runs(max_age_hours)
@@ -5020,10 +5038,10 @@ def handle_service_action(
             safe_connection_ref
         )
         session_id = _scope_text_to_sql_session_id(base_session_id, principal)
-        agui_entrypoint = _workflow_agui_entrypoint(req.workflow_name)
+        agui_entrypoint = _workflow_agui_entrypoint(TEXT_TO_SQL_WORKFLOW_NAME)
         if agui_entrypoint != "presets.text_to_sql.generate":
             raise ForbiddenWorkflowNameError(
-                f"workflow_name='{req.workflow_name}' is not allowed via "
+                f"workflow_name='{TEXT_TO_SQL_WORKFLOW_NAME}' is not allowed via "
                 "presets.text_to_sql.generate. "
                 f"Use {agui_entrypoint or 'workflows.start'} service action instead."
             )
@@ -5035,36 +5053,35 @@ def handle_service_action(
         if transport_context is not None:
             run_id = transport_context.run_id
             stored_run = store.get_run(run_id)
-            if (
-                stored_run is None
-                or stored_run.run_kind != "text_to_sql"
+            if stored_run is not None and (
+                stored_run.run_kind != "text_to_sql"
                 or stored_run.owner_subject != principal.subject
                 or stored_run.tenant_id != principal.tenant_id
             ):
                 raise ValueError("run not found")
-            if stored_run.request_fingerprint != request_fingerprint:
+            if (
+                stored_run is not None
+                and stored_run.request_fingerprint != request_fingerprint
+            ):
                 raise ValueError("transport request fingerprint does not match run")
-            if stored_run.idempotency_key != req.idempotency_key:
+            if (
+                stored_run is not None
+                and stored_run.idempotency_key != req.idempotency_key
+            ):
                 raise ValueError("transport idempotency_key does not match run")
         else:
             proposed_run_id = f"run-{uuid.uuid4().hex[:16]}"
-            stored_run, _created = store.create_or_get_run(
-                principal=principal,
-                run_kind="text_to_sql",
-                idempotency_key=req.idempotency_key,
-                request_fingerprint=request_fingerprint,
-                proposed_run_id=proposed_run_id,
-                thread_id=session_id,
-            )
-            run_id = stored_run.run_id
+            run_id = proposed_run_id
 
         schema_scope = _trusted_text_to_sql_schema_scope(
             connection_record,
             principal,
             run_id,
+            resolved_dsn,
         )
         parameters = {
             "query": req.query,
+            "context_documents": list(req.context_documents),
             "dsn": resolved_dsn,
             "connection_ref": safe_connection_ref,
             "max_rows": req.max_rows,
@@ -5076,8 +5093,6 @@ def handle_service_action(
             "include_explanation": req.include_explanation,
             "validate_schema": req.validate_schema,
             "dry_run_only": req.dry_run_only,
-            "use_schema_suggestions": req.use_schema_suggestions,
-            "allow_enhanced_fallback": req.allow_enhanced_fallback,
         }
         from workflow.streamlit_api import WorkflowOwner
 
@@ -5087,23 +5102,24 @@ def handle_service_action(
             roles=principal.roles,
         )
         invocation = store.get_workflow_run_invocation(run_id)
-        if raw_compat_validation is not None:
-            _append_admin_raw_dsn_event_once(
-                store,
-                run_id,
-                raw_compat_validation,
-            )
         if invocation is None:
+            from ._t2s_requests import TextToSqlWorkflowAdmission
+
+            text_to_sql_admission = TextToSqlWorkflowAdmission(
+                idempotency_key=req.idempotency_key,
+                request_fingerprint=request_fingerprint,
+            )
             try:
                 started_run_id = wf_manager.start_workflow(
-                    workflow_name=req.workflow_name,
+                    workflow_name=TEXT_TO_SQL_WORKFLOW_NAME,
                     parameters=parameters,
                     session_id=session_id,
                     client_id=owner.quota_identity,
-                    use_enhanced=req.use_enhanced,
+                    use_enhanced=True,
                     enable_telemetry=req.enable_telemetry,
                     run_id=run_id,
                     owner=owner,
+                    text_to_sql_admission=text_to_sql_admission,
                 )
             except WorkflowRunAlreadyReservedError:
                 # A concurrent idempotent caller may have reserved the shared
@@ -5112,27 +5128,35 @@ def handle_service_action(
                 invocation = store.get_workflow_run_invocation(run_id)
                 if (
                     invocation is None
-                    or invocation.workflow_name != req.workflow_name
+                    or invocation.workflow_name != TEXT_TO_SQL_WORKFLOW_NAME
                     or invocation.session_id != session_id
                 ):
                     raise
             else:
-                if started_run_id != run_id:
+                if transport_context is not None and started_run_id != run_id:
                     raise ValueError(
                         "WorkflowManager returned unexpected run_id: "
                         f"requested={run_id}, got={started_run_id}"
                     )
+                run_id = started_run_id
+                parameters["run_id"] = run_id
         elif (
-            invocation.workflow_name != req.workflow_name
+            invocation.workflow_name != TEXT_TO_SQL_WORKFLOW_NAME
             or invocation.session_id != session_id
         ):
             raise ValueError("stored workflow invocation does not match request")
+        if raw_compat_validation is not None:
+            _append_admin_raw_dsn_event_once(
+                store,
+                run_id,
+                raw_compat_validation,
+            )
         # The durable invocation is the admission hand-off. PID attachment may
         # legitimately lag process reservation; lifecycle observation belongs
         # to RunManager and must not turn scheduler latency into another failure.
         return {
             "run_id": run_id,
-            "workflow_name": req.workflow_name,
+            "workflow_name": TEXT_TO_SQL_WORKFLOW_NAME,
             "session_id": session_id,
             "parameters": _redact_payload({
                 key: value

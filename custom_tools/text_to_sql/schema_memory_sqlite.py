@@ -42,6 +42,9 @@ from .utils import (
 
 logger = logging.getLogger(__name__)
 
+_VECTOR_READY = "ready"
+_VECTOR_NOT_READY = frozenset({"disabled", "stale", "unavailable", "rebuilding"})
+
 
 def _redact_schema_memory_value(value: Any) -> Any:
     try:
@@ -52,6 +55,74 @@ def _redact_schema_memory_value(value: Any) -> Any:
         return redact_pii_in_payload(_redact_payload(value))
     except Exception:
         return "<redacted>"
+
+
+_PERSISTED_DATA_PROBE_KINDS = frozenset(
+    {"profile_column", "sample_rows", "search_value", "distinct_values"}
+)
+
+
+def _probe_fact_key(fact: dict[str, Any]) -> str:
+    from .adaptive.serialization import canonical_digest
+
+    return "text2sql-schema-probe-fact-v1-" + canonical_digest(fact).removeprefix(
+        "sha256:"
+    )
+
+
+def _verified_probe_facts(
+    namespace: SchemaNamespace,
+    state: object,
+) -> list[dict[str, Any]]:
+    """Normalize only evidence whose exact producer action is still available."""
+    from .adaptive.models import ResearchState
+    from .adaptive.provenance import parse_probe_observation, read_evidence_provenance
+
+    if not isinstance(state, ResearchState):
+        raise TypeError("state must be ResearchState")
+    namespace_version = f"sha256:{namespace.version_key}"
+    if state.schema_namespace_version != namespace_version:
+        return []
+    facts: list[dict[str, Any]] = []
+    for evidence in state.evidence:
+        try:
+            provenance = read_evidence_provenance(evidence)
+            observation = parse_probe_observation(evidence.observation)
+        except ValueError:
+            continue
+        if (
+            provenance is None
+            or observation is None
+            or observation.storage != "inline"
+            or observation.truncated
+            or provenance.probe_kind.value not in _PERSISTED_DATA_PROBE_KINDS
+            or evidence.schema_namespace_version != namespace_version
+        ):
+            continue
+        actions = [
+            action
+            for action in state.action_history
+            if action.action_digest == evidence.action_digest
+        ]
+        if len(actions) != 1:
+            continue
+        action = actions[0]
+        if (
+            action.kind is not provenance.probe_kind
+            or action.target != evidence.target
+            or action.target != provenance.target
+            or action.expected_revision + 1 != evidence.revision
+        ):
+            continue
+        facts.append(
+            {
+                "probe_kind": action.kind.value,
+                "target": action.target.model_dump(mode="json", by_alias=True),
+                "parameters": [list(item) for item in action.parameters],
+                "payload": observation.payload,
+            }
+        )
+    return facts
 
 
 # === W2-T1: Кастомные исключения для fail-fast индексации схемы ===
@@ -206,6 +277,11 @@ class SchemaMemoryManager:
         self.repo_root = repo_root
         self.last_search_status = "not_started"
         self.last_search_error = None
+        # Это состояние относится только к дополнительному Chroma-индексу.
+        # Наличие SQLite-строк схемы проверяется отдельно и остаётся
+        # авторитетным результатом для pipeline.
+        self.last_vector_readiness = "unavailable"
+        self.last_vector_reason: Optional[str] = "not_initialized"
         # File-based lock: путь рядом с repo_root, чтобы все воркеры одного
         # деплоя видели один и тот же файл-маркер. Каталог гарантированно
         # существует (repo_root).
@@ -340,6 +416,112 @@ class SchemaMemoryManager:
             str(_redact_schema_memory_value(error)) if error is not None else None
         )
 
+    @staticmethod
+    def _sqlite_lexical_schema_tables(
+        entities: List[str],
+        namespace: SchemaNamespace,
+    ) -> List[str]:
+        terms = tuple(
+            dict.fromkeys(
+                entity.strip().casefold()
+                for entity in entities
+                if isinstance(entity, str) and len(entity.strip()) > 2
+            )
+        )[:5]
+        if not terms:
+            return []
+        from memory.tools import get_memory, memory_requester_context
+
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_table",
+                include_historical=False,
+                requesting_agent="Schema-RAG-Agent",
+            )
+        ranked_tables: list[tuple[int, str]] = []
+        seen_tables: set[str] = set()
+        for record in records:
+            data = record.get("data") if isinstance(record, dict) else None
+            if not isinstance(data, dict):
+                continue
+            table_fqn = data.get("table_fqn")
+            if not isinstance(table_fqn, str) or not table_fqn or table_fqn in seen_tables:
+                continue
+            table_info = data.get("table_info")
+            columns = table_info.get("columns") if isinstance(table_info, dict) else ()
+            searchable = [
+                data.get("table_fqn"),
+                data.get("table_name"),
+                data.get("description"),
+                table_info.get("table_name") if isinstance(table_info, dict) else None,
+                table_info.get("description") if isinstance(table_info, dict) else None,
+            ]
+            if isinstance(columns, list):
+                for column in columns:
+                    if isinstance(column, dict):
+                        searchable.extend((column.get("name"), column.get("description")))
+            text = " ".join(value for value in searchable if isinstance(value, str)).casefold()
+            matched_terms = sum(term in text for term in terms)
+            if matched_terms:
+                ranked_tables.append((matched_terms, table_fqn))
+                seen_tables.add(table_fqn)
+        ranked_tables.sort(key=lambda item: (-item[0], item[1]))
+        return [table_fqn for _matched_terms, table_fqn in ranked_tables]
+
+    def _observe_vector_readiness(self, memory_manager: Any) -> str:
+        """Возвращает явное состояние Chroma, не подменяя им SQLite-готовность."""
+        try:
+            handler = getattr(memory_manager, "db_handler", None)
+            raw_state = getattr(handler, "vector_readiness", None)
+            state = getattr(raw_state, "value", raw_state)
+        except Exception:
+            self.last_vector_readiness = "unavailable"
+            self.last_vector_reason = "vector_readiness_probe_failed"
+            return self.last_vector_readiness
+
+        if not isinstance(state, str) or state not in _VECTOR_NOT_READY | {_VECTOR_READY}:
+            try:
+                metadata_mismatch = getattr(handler, "embedding_metadata_mismatch", False)
+            except Exception:
+                self.last_vector_readiness = "unavailable"
+                self.last_vector_reason = "vector_readiness_probe_failed"
+                return self.last_vector_readiness
+            if metadata_mismatch:
+                state = "stale"
+            else:
+                try:
+                    get_collection = getattr(memory_manager, "get_tactical_collection", None)
+                    collection = get_collection() if callable(get_collection) else None
+                except Exception:
+                    state = "stale" if handler is not None else "unavailable"
+                    self.last_vector_readiness = state
+                    self.last_vector_reason = "tactical_collection_probe_failed"
+                    return state
+                state = _VECTOR_READY if collection is not None else "unavailable"
+        self.last_vector_readiness = state
+        try:
+            reason = getattr(handler, "vector_readiness_reason", None)
+        except Exception:
+            reason = "vector_readiness_probe_failed"
+        self.last_vector_reason = str(reason) if reason else None
+        return state
+
+    @staticmethod
+    def _mark_vector_stale(memory_manager: Any, reason: str) -> None:
+        """Не даёт ошибке Chroma выглядеть как готовому векторному индексу."""
+        try:
+            handler = getattr(memory_manager, "db_handler", None)
+            setter = getattr(handler, "set_vector_readiness", None)
+            if callable(setter):
+                setter("stale", reason)
+            elif handler is not None:
+                handler.vector_readiness = "stale"
+                handler.vector_readiness_reason = reason
+        except Exception:
+            logger.warning("Could not mark the vector index stale")
+
     def ensure_schema_indexed_in_memory(
         self,
         dsn: str | SchemaNamespace,
@@ -362,7 +544,7 @@ class SchemaMemoryManager:
           :class:`SchemaIndexingError` / :class:`SchemaIndexingMemoryUnavailable`
           с контекстом, чтобы caller мог решить retry/skip явно.
         """
-        from memory.tools import save_memory, get_memory
+        from memory.tools import save_memory
 
         if isinstance(dsn, SchemaScope):
             raise TypeError(
@@ -554,8 +736,38 @@ class SchemaMemoryManager:
             )
         namespace = session_id if isinstance(session_id, SchemaNamespace) else None
         if namespace is not None:
-            from memory.index_consistency import reconcile_tactical_namespace
+            from memory.index_consistency import (
+                reconcile_tactical_namespace,
+                source_namespace_semantic_ids,
+            )
+            from memory.manager import memory_manager
 
+            vector_readiness = self._observe_vector_readiness(memory_manager)
+            expected_ids = (
+                {
+                    canonical_schema_table_id(namespace.version_key, table_fqn)
+                    for table_fqn in expected_table_keys
+                }
+                if expected_table_keys is not None
+                else None
+            )
+            if vector_readiness != _VECTOR_READY:
+                source_ids, failed_ids = source_namespace_semantic_ids(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_table",
+                )
+                expected_ids = source_ids if expected_ids is None else expected_ids
+                return (
+                    bool(expected_ids)
+                    and not failed_ids
+                    and expected_ids == source_ids
+                    and (
+                        expected_count is None
+                        or expected_count <= 0
+                        or len(expected_ids) == expected_count
+                    )
+                )
             with self._write_lock_cm():
                 reconciliation = reconcile_tactical_namespace(
                     session_id=namespace.version_key,
@@ -564,32 +776,34 @@ class SchemaMemoryManager:
                     repair_missing=True,
                 )
             expected_ids = (
-                {
-                    canonical_schema_table_id(namespace.version_key, table_fqn)
-                    for table_fqn in expected_table_keys
-                }
-                if expected_table_keys is not None
-                else set(reconciliation.expected_ids)
+                set(reconciliation.expected_ids)
+                if expected_ids is None
+                else expected_ids
             )
             actual_ids = set(reconciliation.indexed_ids)
-            return (
+            sqlite_source_is_complete = (
                 bool(expected_ids)
                 and not reconciliation.failed_ids
-                and not reconciliation.missing_ids
-                and not reconciliation.unexpected_ids
-                and expected_ids == set(reconciliation.expected_ids) == actual_ids
+                and expected_ids == set(reconciliation.expected_ids)
                 and (
                     expected_count is None
                     or expected_count <= 0
                     or len(expected_ids) == expected_count
                 )
             )
+            return (
+                sqlite_source_is_complete
+                and not reconciliation.missing_ids
+                and not reconciliation.unexpected_ids
+                and expected_ids == actual_ids
+            )
 
         from memory.tools import get_memory
         try:
             from memory.tools import memory_requester_context
         except ImportError:
-            memory_requester_context = lambda _agent_name: nullcontext()
+            def memory_requester_context(_agent_name: str) -> Any:
+                return nullcontext()
 
         # Получаем ТОЛЬКО активные записи (include_historical=False по умолчанию)
         with memory_requester_context("Schema-RAG-Agent"):
@@ -745,6 +959,7 @@ class SchemaMemoryManager:
                             logger.info(f"Deleted {len(ids_to_delete)} schema records from ChromaDB for {filename}")
 
             except Exception as e:
+                self._mark_vector_stale(memory_manager, "schema_cleanup_failed")
                 if strict_chroma_cleanup:
                     raise
                 # EVENTUAL CONSISTENCY WINDOW: если процесс упадёт между SQLite commit и Chroma cleanup,
@@ -979,6 +1194,23 @@ class SchemaMemoryManager:
         try:
             from memory.manager import memory_manager
 
+            vector_readiness = self._observe_vector_readiness(memory_manager)
+            if vector_readiness != _VECTOR_READY:
+                if namespace is not None:
+                    relevant_tables = self._sqlite_lexical_schema_tables(
+                        entities, namespace
+                    )
+                    self._set_search_status(
+                        "sqlite_lexical_ok" if relevant_tables else "sqlite_lexical_no_hits",
+                        self.last_vector_reason
+                        or "semantic vector index is not ready",
+                    )
+                    return relevant_tables
+                self._set_search_status(
+                    f"vector_{vector_readiness}",
+                    self.last_vector_reason or "semantic vector index is not ready",
+                )
+                return []
             # T3.20: публичный API; `get_tactical_collection()` возвращает None,
             # если Chroma не инициализирована.
             tactical_collection = memory_manager.get_tactical_collection() if memory_manager else None
@@ -1148,14 +1380,6 @@ class SchemaMemoryManager:
 
             return relevant_tables
 
-        except (KeyError, TypeError) as e:
-            # Структурный баг в распаковке ids/distances — не маскируем,
-            # это признак регрессии в коде, а не runtime-недоступности.
-            logger.error(
-                "Bug in find_semantic_relevant_tables result unpacking: %s",
-                _redact_schema_memory_value(e),
-            )
-            raise
         except Exception as e:
             # Конфиг-ошибка эмбеддингов: пробрасываем, чтобы caller видел
             # реальную причину (OPENAI_API_KEY_DB / embedding config), а не []
@@ -1182,8 +1406,96 @@ class SchemaMemoryManager:
                 "Failed to find semantic relevant tables: %s",
                 _redact_schema_memory_value(e),
             )
-            self._set_search_status("memory_unavailable", str(e))
+            self._mark_vector_stale(memory_manager, "semantic_search_failed")
+            self.last_vector_readiness = "stale"
+            self.last_vector_reason = "semantic_search_failed"
+            self._set_search_status("vector_stale", "semantic_search_failed")
             return []
+
+    def find_verified_probe_facts(
+        self,
+        entities: List[str],
+        namespace: SchemaNamespace,
+    ) -> List[dict[str, Any]]:
+        """Return a bounded set of matching facts from one exact namespace."""
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        terms = tuple(
+            dict.fromkeys(
+                item.casefold()
+                for item in entities
+                if isinstance(item, str) and item.strip()
+            )
+        )
+        if not terms:
+            return []
+        from memory.tools import get_memory, memory_requester_context
+
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_probe_fact",
+                requesting_agent="Schema-RAG-Agent",
+            )
+        scored: list[tuple[int, str, dict[str, Any]]] = []
+        for record in records:
+            data = record.get("data") if isinstance(record, dict) else None
+            if not isinstance(data, dict) or data.get("schema_version") != namespace.version_key:
+                continue
+            fact = data.get("fact")
+            key = data.get("cache_key")
+            if not isinstance(fact, dict) or key != _probe_fact_key(fact):
+                continue
+            text = json.dumps(fact, ensure_ascii=False, sort_keys=True).casefold()
+            score = sum(term in text for term in terms)
+            if score:
+                scored.append((score, key, fact))
+        return [
+            fact
+            for _, _, fact in sorted(scored, key=lambda item: (-item[0], item[1]))[:5]
+        ]
+
+    def save_verified_probe_facts(
+        self,
+        namespace: SchemaNamespace,
+        state: object,
+    ) -> None:
+        """Save normalized facts once per namespace and fact key."""
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        from memory.tools import get_memory, memory_requester_context, save_memory
+
+        for fact in _verified_probe_facts(namespace, state):
+            fact_key = _probe_fact_key(fact)
+            with memory_requester_context("Schema-RAG-Agent"):
+                existing = get_memory(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_probe_fact",
+                    cache_key=fact_key,
+                    requesting_agent="Schema-RAG-Agent",
+                )
+            if any(
+                isinstance(record.get("data"), dict)
+                and record["data"].get("fact") == fact
+                for record in existing
+                if isinstance(record, dict)
+            ):
+                continue
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_probe_fact",
+                    "cache_key": fact_key,
+                    "cache_source": "typed_db_probe",
+                    "schema_version": namespace.version_key,
+                    "fact": fact,
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError("verified Typed probe fact was not persisted")
 
     def set_schema_ready_marker(
         self,

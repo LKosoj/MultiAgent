@@ -8,6 +8,7 @@ retry логикой и управлением ресурсами.
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -15,7 +16,6 @@ import uuid
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Any, Optional, Set, Union
 from pathlib import Path
-import traceback
 
 # Импорт из существующей системы (НЕ ИЗМЕНЯЕМ!)
 from agent_system import DynamicAgentSystem
@@ -23,13 +23,12 @@ from agent_system import DynamicAgentSystem
 # Импорт компонентов workflow engine
 from .models import (
     WorkflowDefinition, WorkflowResult, WorkflowContext, WorkflowStatus,
-    StepResult, StepStatus, WorkflowStep, RetryPolicy, ResourceLimits,
+    StepResult, StepStatus, WorkflowStep, ResourceLimits,
     WorkflowExecutionError, WorkflowStepError, WorkflowNotFoundError,
-    TextToSqlTerminalResult, TextToSqlTerminalStatus, bound_text_to_sql_error,
-    is_text_to_sql_workflow_name,
 )
 from .state_manager import WorkflowStateManager
 from .retry_engine import RetryEngine
+from .deadline import DeadlineBudget, execute_step_attempt
 from .resource_manager import ResourceManager
 from tool_runtime_context import (
     SupervisorExecutionEvidence,
@@ -52,7 +51,6 @@ _CODE_FENCE_RE = re.compile(
     r"^\s*```(?P<label>[A-Za-z0-9_+-]*)[ \t]*(?:\r?\n)?(?P<body>.*?)\r?\n?```\s*$",
     flags=re.DOTALL,
 )
-_SQL_FENCE_LABELS = {"", "sql", "postgres", "postgresql", "sqlite"}
 
 
 def _json_candidate_from_fence(raw_output: str) -> str:
@@ -86,43 +84,6 @@ def _json_candidate_from_text(raw_output: str) -> str:
     if any(delimiter in outside for delimiter in "{}["):
         return raw_output
     return raw_output[start:end]
-
-
-def _strip_leading_sql_comments(sql_text: str) -> str:
-    remaining = sql_text.lstrip()
-    while True:
-        if remaining.startswith("--"):
-            newline = remaining.find("\n")
-            if newline == -1:
-                return ""
-            remaining = remaining[newline + 1 :].lstrip()
-            continue
-        if remaining.startswith("/*"):
-            end = remaining.find("*/", 2)
-            if end == -1:
-                return remaining
-            remaining = remaining[end + 2 :].lstrip()
-            continue
-        return remaining
-
-
-def _recoverable_sql_generation_text(raw_output: str) -> Optional[str]:
-    sql_text = raw_output.strip()
-    if not sql_text:
-        return None
-
-    fence_match = _CODE_FENCE_RE.match(sql_text)
-    if fence_match is not None:
-        label = fence_match.group("label").lower()
-        if label not in _SQL_FENCE_LABELS:
-            return None
-        sql_text = fence_match.group("body").strip()
-
-    if sql_text.lstrip().startswith(("{", "[")):
-        return None
-    if re.match(r"(?is)^(select|with)\b", _strip_leading_sql_comments(sql_text)):
-        return sql_text
-    return None
 
 
 class WorkflowEngine(DynamicAgentSystem):
@@ -160,6 +121,67 @@ class WorkflowEngine(DynamicAgentSystem):
         self.active_workflows: Dict[str, Dict[str, Any]] = {}
         
         logger.info("🔄 WorkflowEngine инициализирован как расширение DynamicAgentSystem")
+
+    @staticmethod
+    def _context_deadline(context: WorkflowContext) -> Optional[DeadlineBudget]:
+        deadline = getattr(context, "_deadline_budget", None)
+        if deadline is not None and not isinstance(deadline, DeadlineBudget):
+            raise TypeError("context._deadline_budget must be a DeadlineBudget")
+        return deadline
+
+    @classmethod
+    def _require_deadline(cls, context: WorkflowContext, boundary: str) -> None:
+        deadline = cls._context_deadline(context)
+        if deadline is not None:
+            deadline.require_remaining(boundary)
+
+    async def _await_state_manager_write(
+        self,
+        context: WorkflowContext,
+        boundary: str,
+        write: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        deadline = self._context_deadline(context)
+        if deadline is None:
+            return await write()
+
+        async def run_write(_context: object) -> Any:
+            return await write()
+
+        return await execute_step_attempt(
+            boundary,
+            run_write,
+            None,
+            attempt_timeout=None,
+            deadline=deadline,
+        )
+
+    async def _save_workflow_definition(
+        self,
+        context: WorkflowContext,
+        workflow_definition: WorkflowDefinition,
+    ) -> None:
+        await self._await_state_manager_write(
+            context,
+            "definition checkpoint",
+            lambda: self.state_manager.save_workflow_definition(
+                context.workflow_id,
+                workflow_definition,
+            ),
+        )
+
+    @staticmethod
+    def _retry_engine_supports_keyword(retry_engine: Any, keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(
+                retry_engine.execute_with_retry
+            ).parameters.values()
+        except (TypeError, ValueError, AttributeError):
+            return False
+        return any(
+            parameter.name == keyword
+            for parameter in parameters
+        )
     
     # ===========================================
     # НОВЫЕ МЕТОДЫ ДЛЯ WORKFLOW FUNCTIONALITY  
@@ -206,6 +228,7 @@ class WorkflowEngine(DynamicAgentSystem):
         
         workflow_id = context.workflow_id
         start_time = datetime.now()
+        self._require_deadline(context, "workflow start")
         
         logger.info(f"🚀 Начинаем выполнение workflow '{workflow_def.name}' (ID: {workflow_id})")
         
@@ -213,6 +236,7 @@ class WorkflowEngine(DynamicAgentSystem):
             # 1-2. Инициализация и начальный checkpoint (через helper).
             # restored_step_results непуст только на resume — тогда первый checkpoint
             # сразу содержит уже завершённые шаги (см. _on_workflow_started).
+            self._require_deadline(context, "initial checkpoint")
             resource_lease = await self._on_workflow_started(
                 workflow_def, context, client_id, start_time,
                 step_results=restored_step_results,
@@ -226,7 +250,7 @@ class WorkflowEngine(DynamicAgentSystem):
             # он лишь делает данный workflow невосстановимым (resume_workflow вернёт ошибку).
             if skip_steps is None:
                 try:
-                    await self.state_manager.save_workflow_definition(workflow_id, workflow_def)
+                    await self._save_workflow_definition(context, workflow_def)
                 except Exception as persist_exc:
                     logger.warning(
                         "⚠️ Не удалось сохранить определение workflow %s — resume будет недоступен: %s",
@@ -328,6 +352,7 @@ class WorkflowEngine(DynamicAgentSystem):
         context._workflow_step_results = step_results
 
         for step in workflow_def.steps:
+            self._require_deadline(context, f"step '{step.id}' scheduling")
             # Resume: пропускаем уже завершённые шаги (их результат уже в step_results).
             if skip_steps is not None and step.id in skip_steps:
                 logger.info("⏭️ Пропускаем уже завершённый шаг %s (resume)", step.id)
@@ -371,6 +396,7 @@ class WorkflowEngine(DynamicAgentSystem):
             
             # Обрабатываем успешный/неуспешный шаг единым способом
             if step_result.status == StepStatus.COMPLETED:
+                self._require_deadline(context, f"step '{step.id}' checkpoint")
                 await self._on_step_completed(context.workflow_id, step, step_result, context, step_results)
                 if await self._is_workflow_cancelled(context.workflow_id):
                     logger.info(
@@ -432,6 +458,7 @@ class WorkflowEngine(DynamicAgentSystem):
         if step_result.status == StepStatus.COMPLETED:
             if step_results is not None:
                 step_results[step.id] = step_result
+            self._require_deadline(context, f"step '{step.id}' checkpoint")
             await self._on_step_completed(
                 context.workflow_id,
                 step,
@@ -450,6 +477,7 @@ class WorkflowEngine(DynamicAgentSystem):
     async def _finalize_workflow_execution(self, workflow_def, context, step_results, start_time, resource_lease):
         """Финализация выполнения workflow"""
         try:
+            self._require_deadline(context, "workflow finalization")
             if await self._is_workflow_cancelled(context.workflow_id):
                 return await self._build_cancelled_workflow_result(
                     workflow_def,
@@ -462,8 +490,19 @@ class WorkflowEngine(DynamicAgentSystem):
             duration = (end_time - start_time).total_seconds()
 
             # Формируем итоговый результат через агрегатор
-            final_output = await self.aggregator.aggregate_final_result(
-                step_results, workflow_def, context
+            deadline = self._context_deadline(context)
+
+            async def aggregate(_context):
+                return await self.aggregator.aggregate_final_result(
+                    step_results, workflow_def, context
+                )
+
+            final_output = await execute_step_attempt(
+                "result aggregation",
+                aggregate,
+                None,
+                attempt_timeout=None,
+                deadline=deadline,
             )
             completed_steps = len([r for r in step_results.values() if r.status == StepStatus.COMPLETED])
             failed_steps = len([r for r in step_results.values() if r.status == StepStatus.FAILED])
@@ -471,14 +510,27 @@ class WorkflowEngine(DynamicAgentSystem):
             workflow_status = WorkflowStatus.FAILED if failed_steps and stop_on_failure else WorkflowStatus.COMPLETED
 
             if workflow_status == WorkflowStatus.COMPLETED:
-                await self._on_workflow_completed(context.workflow_id, final_output)
-            else:
-                await self.state_manager.save_checkpoint(
-                    workflow_id=context.workflow_id,
-                    status=WorkflowStatus.FAILED,
+                self._require_deadline(context, "completion checkpoint")
+                await self._on_workflow_completed(
+                    context.workflow_id,
+                    final_output,
                     context=context,
-                    step_results=step_results,
-                    metadata={"workflow_name": workflow_def.name, "error": "Workflow failed steps"},
+                )
+            else:
+                self._require_deadline(context, "failure checkpoint")
+                await self._await_state_manager_write(
+                    context,
+                    "failure checkpoint",
+                    lambda: self.state_manager.save_checkpoint(
+                        workflow_id=context.workflow_id,
+                        status=WorkflowStatus.FAILED,
+                        context=context,
+                        step_results=step_results,
+                        metadata={
+                            "workflow_name": workflow_def.name,
+                            "error": "Workflow failed steps",
+                        },
+                    ),
                 )
             result = WorkflowResult(
                 workflow_id=context.workflow_id,
@@ -606,13 +658,17 @@ class WorkflowEngine(DynamicAgentSystem):
         )
         step_results = latest_checkpoint.step_results if latest_checkpoint else {}
         current_step = latest_checkpoint.current_step if latest_checkpoint else None
-        await self.state_manager.save_checkpoint(
-            workflow_id=workflow_id,
-            status=WorkflowStatus.CANCELLED,
-            context=context,
-            step_results=step_results,
-            current_step=current_step,
-            metadata={"cancellation_reason": reason}
+        await self._await_state_manager_write(
+            context,
+            "cancellation checkpoint",
+            lambda: self.state_manager.save_checkpoint(
+                workflow_id=workflow_id,
+                status=WorkflowStatus.CANCELLED,
+                context=context,
+                step_results=step_results,
+                current_step=current_step,
+                metadata={"cancellation_reason": reason},
+            ),
         )
     
     def get_system_metrics(self) -> Dict[str, Any]:
@@ -642,18 +698,37 @@ class WorkflowEngine(DynamicAgentSystem):
             client_id=client_id,
             requirements=workflow_def.global_resource_limits or ResourceLimits()
         )
-        await self.state_manager.save_checkpoint(
-            workflow_id=context.workflow_id,
-            status=WorkflowStatus.RUNNING,
-            context=context,
-            step_results=step_results or {},
-            metadata={"workflow_name": workflow_def.name, "start_time": start_time.isoformat()}
+        await self._await_state_manager_write(
+            context,
+            "initial checkpoint",
+            lambda: self.state_manager.save_checkpoint(
+                workflow_id=context.workflow_id,
+                status=WorkflowStatus.RUNNING,
+                context=context,
+                step_results=step_results or {},
+                metadata={
+                    "workflow_name": workflow_def.name,
+                    "start_time": start_time.isoformat(),
+                },
+            ),
         )
         return resource_lease
 
-    async def _on_workflow_completed(self, workflow_id: str, final_output: Dict[str, Any]) -> None:
+    async def _on_workflow_completed(
+        self,
+        workflow_id: str,
+        final_output: Dict[str, Any],
+        context: WorkflowContext,
+    ) -> None:
         """Общий финал workflow: сохранение финального состояния"""
-        await self.state_manager.mark_workflow_completed(workflow_id, final_output)
+        await self._await_state_manager_write(
+            context,
+            "completion checkpoint",
+            lambda: self.state_manager.mark_workflow_completed(
+                workflow_id,
+                final_output,
+            ),
+        )
 
     async def _on_workflow_failed(
         self,
@@ -670,13 +745,17 @@ class WorkflowEngine(DynamicAgentSystem):
         весь workflow с нуля, а не «с последнего успешного шага».
         """
         try:
-            await self.state_manager.save_checkpoint(
-                workflow_id=context.workflow_id,
-                status=WorkflowStatus.FAILED,
-                context=context,
-                step_results=step_results or {},
-                current_step=context.current_step,
-                metadata={"workflow_name": workflow_def.name, "error": str(error)},
+            await self._await_state_manager_write(
+                context,
+                "failure checkpoint",
+                lambda: self.state_manager.save_checkpoint(
+                    workflow_id=context.workflow_id,
+                    status=WorkflowStatus.FAILED,
+                    context=context,
+                    step_results=step_results or {},
+                    current_step=context.current_step,
+                    metadata={"workflow_name": workflow_def.name, "error": str(error)},
+                ),
             )
         finally:
             if resource_lease is not None:
@@ -743,19 +822,6 @@ class WorkflowEngine(DynamicAgentSystem):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
-            if step.id == "sql_generation":
-                sql_text = _recoverable_sql_generation_text(raw_output)
-                if sql_text is not None:
-                    fallback_output = {
-                        "sql": sql_text,
-                        "description": "Recovered from non-JSON sql_generation output",
-                        "output_normalization_warning": (
-                            "sql_generation returned a non-JSON string; "
-                            "treating it as raw SQL for verification"
-                        ),
-                    }
-                    self._validate_step_output_requirements(step, fallback_output)
-                    return fallback_output, True
             snippet = _redact_workflow_log_value(raw_output[:200])
             raise WorkflowStepError(
                 f"Step '{step.id}' declared output_schema=json_object but "
@@ -831,12 +897,16 @@ class WorkflowEngine(DynamicAgentSystem):
         self._write_step_output(context, step.id, normalized)
 
         # Сохраняем checkpoint после каждого успешного шага
-        await self.state_manager.save_checkpoint(
-            workflow_id=workflow_id,
-            status=WorkflowStatus.RUNNING,
-            context=context,
-            step_results=step_results,
-            current_step=step.id
+        await self._await_state_manager_write(
+            context,
+            f"step '{step.id}' checkpoint",
+            lambda: self.state_manager.save_checkpoint(
+                workflow_id=workflow_id,
+                status=WorkflowStatus.RUNNING,
+                context=context,
+                step_results=step_results,
+                current_step=step.id,
+            ),
         )
 
     def _step_dotted_output_keys(self, context: WorkflowContext, step_id: str) -> List[str]:
@@ -1034,6 +1104,8 @@ class WorkflowEngine(DynamicAgentSystem):
     ) -> StepResult:
         """Выполнение одного шага workflow"""
 
+        self._require_deadline(context, f"step '{step.id}' start")
+
         logger.info(f"🔄 Выполняем шаг {step.id} с агентом {step.agent_type}")
 
         # 6.1: Подставляем переменные в step.metadata ДО передачи в agent/tool.
@@ -1062,15 +1134,36 @@ class WorkflowEngine(DynamicAgentSystem):
             "context": context.__dict__,
             "retry_policy": retry_policy,
         }
-        if step.timeout is not None:
+        supports_timeout = self._retry_engine_supports_keyword(
+            self.retry_engine,
+            "timeout",
+        )
+        supports_deadline = self._retry_engine_supports_keyword(
+            self.retry_engine,
+            "deadline",
+        )
+        if step.timeout is not None and supports_timeout:
             retry_kwargs["timeout"] = step.timeout
-        try:
+        deadline = self._context_deadline(context)
+        if deadline is not None and supports_deadline:
+            retry_kwargs["deadline"] = deadline
+
+        async def run_retry(_context: object) -> StepResult:
             step_result = await self.retry_engine.execute_with_retry(**retry_kwargs)
-        except TypeError as exc:
-            if "unexpected keyword argument 'timeout'" not in str(exc) or "timeout" not in retry_kwargs:
-                raise
-            retry_kwargs.pop("timeout", None)
-            step_result = await self.retry_engine.execute_with_retry(**retry_kwargs)
+            return step_result
+
+        if deadline is None or supports_deadline:
+            step_result = await run_retry(None)
+        else:
+            step_result = await execute_step_attempt(
+                f"step '{step.id}' legacy retry",
+                run_retry,
+                None,
+                attempt_timeout=None,
+                deadline=deadline,
+            )
+
+        self._require_deadline(context, f"step '{step.id}' completion")
 
         # Cross-step feedback retry (EPIC 6 Block A фикс): после успешного шага
         # проверяем step.output_retry_policy. Если condition (на свежем output
@@ -1120,6 +1213,7 @@ class WorkflowEngine(DynamicAgentSystem):
 
         Возвращает новый StepResult, если был выполнен retry; иначе None.
         """
+        self._require_deadline(context, f"step '{step.id}' output retry")
         policy = getattr(step, "output_retry_policy", None)
         if not isinstance(policy, dict):
             return None
@@ -1212,46 +1306,12 @@ class WorkflowEngine(DynamicAgentSystem):
             else:
                 rerun_steps = [rerun_step]
 
-            if is_text_to_sql_workflow_name(workflow_def.name):
-                generation_output = None
-                if step_results is not None:
-                    generation_result = step_results.get("sql_generation")
-                    generation_output = (
-                        generation_result.output
-                        if generation_result is not None
-                        else None
-                    )
-                if not isinstance(generation_output, dict):
-                    generation_output = context.step_outputs.get("sql_generation")
-                previous_sql = (
-                    generation_output.get("sql")
-                    if isinstance(generation_output, dict)
-                    else context.step_outputs.get("sql_generation.sql")
+            try:
+                feedback_payload = json.dumps(
+                    step_result.output, ensure_ascii=False, default=str
                 )
-                from .text_to_sql_retry import build_corrective_feedback
-
-                try:
-                    feedback_payload = build_corrective_feedback(
-                        step_id=step.id,
-                        output=step_result.output,
-                        previous_sql=previous_sql,
-                        attempt_number=current_iter + 1,
-                    ).to_mapping()
-                except (TypeError, ValueError) as exc:
-                    logger.error(
-                        "Text-to-SQL output retry rejected invalid %s feedback: %s",
-                        step.id,
-                        bound_text_to_sql_error(exc),
-                    )
-                    keep_current_output = True
-                    return None
-            else:
-                try:
-                    feedback_payload = json.dumps(
-                        step_result.output, ensure_ascii=False, default=str
-                    )
-                except (TypeError, ValueError):
-                    feedback_payload = str(step_result.output)
+            except (TypeError, ValueError):
+                feedback_payload = str(step_result.output)
 
             counters[step.id] = current_iter + 1
             context.variables[feedback_field] = feedback_payload
@@ -1286,26 +1346,6 @@ class WorkflowEngine(DynamicAgentSystem):
                         f"{rerun_result.error or rerun_result.status}"
                     )
                     retained_output = None
-                    if (
-                        is_text_to_sql_workflow_name(workflow_def.name)
-                        and step.id == "db_audit"
-                    ):
-                        try:
-                            original_terminal = TextToSqlTerminalResult.from_mapping(
-                                step_result.output
-                            )
-                            if original_terminal.reason_code == "EXECUTION_FAILED":
-                                retained_output = original_terminal.to_mapping()
-                                retained_output.update({
-                                    "status": TextToSqlTerminalStatus.FAILED.value,
-                                    "reason_code": "OUTPUT_RETRY_CHAIN_FAILED",
-                                    "error": bound_text_to_sql_error(retry_error),
-                                })
-                                retained_output = TextToSqlTerminalResult.from_mapping(
-                                    retained_output
-                                ).to_mapping()
-                        except (TypeError, ValueError):
-                            retained_output = None
                     failed_result = StepResult(
                         step_id=step.id,
                         status=StepStatus.FAILED,

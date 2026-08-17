@@ -1,0 +1,27 @@
+{
+  "id": "cowboy_on_horse",
+  "name": "Ковбой на лошади",
+  "category": "character",
+  "tags": [
+    "cowboy",
+    "horse",
+    "western",
+    "author:andreiLlacuna"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.5992009823170786,
+    1.6581716179051842,
+    1.7
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/cowboy-on-horse-425707e4e78d4747bc6139bc01778e13",
+  "file_size_bytes": 3978028,
+  "fetched_at": "2026-08-16T22:08:17Z",
+  "asset_version": 1
+}

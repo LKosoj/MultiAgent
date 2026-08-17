@@ -1,0 +1,26 @@
+{
+  "id": "football_set",
+  "name": "Футбольный набор",
+  "category": "prop",
+  "tags": [
+    "goal",
+    "football",
+    "desc:Ворота и инвентарь для дворового матча."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.118209958076477,
+    0.8437525033950806,
+    0.7885287702083588
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/e9ecf5e168c0425181f4e917c43e75d3",
+  "file_size_bytes": 2923332,
+  "fetched_at": "2026-08-16T22:54:18Z",
+  "asset_version": 1
+}

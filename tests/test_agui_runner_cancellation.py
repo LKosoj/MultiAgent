@@ -139,7 +139,6 @@ def _load_runner_with_workflow_stub(monkeypatch, manager_holder: list):
     workflow_streamlit._GLOBAL_WORKFLOW_PROCESSES = {}
     monkeypatch.setitem(sys.modules, "workflow", workflow_pkg)
     monkeypatch.setitem(sys.modules, "workflow.streamlit_api", workflow_streamlit)
-
     sys.modules.pop("backend.fastapi_app.agui.runner", None)
     return importlib.import_module("backend.fastapi_app.agui.runner")
 

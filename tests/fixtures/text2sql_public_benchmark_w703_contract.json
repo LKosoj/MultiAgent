@@ -1,0 +1,42 @@
+{
+  "files": {
+    "artifact_handshake.json": {
+      "sha256": "0babffb7c13a48a5ff1c57853a562fa9f2cc4942281c8a815eb746fe060c3726",
+      "size_bytes": 1235
+    },
+    "bird_predictions.json": {
+      "sha256": "8eb8b40d32433b2d18009cdf049f1c7dfd31bab7b766aa66519ea2a53b1436ab",
+      "size_bytes": 85
+    },
+    "case_manifest.json": {
+      "sha256": "53d9be58796c3bba3ff675d6fbc81708dbdcf0d4ad7b64736151e7fef796c43a",
+      "size_bytes": 1257
+    },
+    "empty_history_evidence.json": {
+      "sha256": "7ea5c63b8b10df489abcc0277b0876b697ab56af8ce03d30800cf78de2da3432",
+      "size_bytes": 829
+    },
+    "manifest.json": {
+      "sha256": "09c8f432f373cf930f94456ef5e8016271f3fce8c5e05ccf79cc24910d52d098",
+      "size_bytes": 1712
+    },
+    "observations.jsonl": {
+      "sha256": "e9363d584be1df1b7a03f2b55cc0fc72a501afed104deadc55095965367d60d6",
+      "size_bytes": 452
+    },
+    "source_snapshot_manifest.json": {
+      "sha256": "23b3754a1b599b00d03fb546360089503d1f499b876aea4f51272044ed1fe638",
+      "size_bytes": 878
+    }
+  },
+  "normalization": {
+    "artifact_handshake.json": [
+      "artifacts.manifest.json=recomputed_from_normalized_manifest"
+    ],
+    "manifest.json": [
+      "state_root"
+    ]
+  },
+  "record_kind": "text2sql_public_benchmark_w703_byte_baseline",
+  "schema_version": 1
+}

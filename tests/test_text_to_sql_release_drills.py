@@ -33,6 +33,7 @@ def test_release_drill_script_is_fail_closed_and_local_only() -> None:
         "test_coordinator_runs_due_maintenance_and_records_exact_metrics",
         "test_workflow_report_never_returns_legacy_cache_without_source",
         "test_disposable_schema_backup_restore_and_rollback",
+        "test_read_only_operator_recomputes_gate_and_rejects_not_evaluated",
     ):
         assert contract in source
     for field in (
@@ -466,8 +467,13 @@ def test_release_workflow_only_validates_external_approved_backup_manifest() -> 
 
 
 def test_production_runbook_contains_exact_operations_and_honest_support_matrix() -> None:
+    from scripts.migrate_text2sql_state import load_state_schema_manifest
+
     runbook = PROJECT_ROOT / "docs" / "operations" / "text2sql-production.md"
     source = runbook.read_text(encoding="utf-8")
+    schema_heads = load_state_schema_manifest(
+        PROJECT_ROOT / "config/text_to_sql/state_schema.yaml"
+    )
 
     for heading in (
         "## Deploy",
@@ -499,7 +505,7 @@ def test_production_runbook_contains_exact_operations_and_honest_support_matrix(
         assert rollback_export in rollback_section
     assert "scripts/migrate_text2sql_state.py" in source
     assert "/healthz" in source and "/readyz" in source
-    assert "EventStore 7" in source
+    assert f"EventStore {schema_heads['event_store']}" in source
     assert "memory DB 1" in source
     assert "result outbox 3" in source
     assert "UNVERIFIED" in source

@@ -328,3 +328,94 @@ def test_hard_cap_trim_recomputes_rendered_column_counts(monkeypatch):
     assert diagnostics["tables"]["orders"]["omitted_columns"] == 2
     assert diagnostics["tables"]["orders"]["mandatory_columns"] == 1
     assert diagnostics["tables"]["orders"]["soft_limit_overflow"] == 0
+
+
+def test_include_all_tables_bypasses_only_table_soft_limit(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    schema = {
+        "first": _table({"ordinary": {"type": "TEXT"}}),
+        "second": _table({"ordinary": {"type": "TEXT"}}),
+        "third": _table({"ordinary": {"type": "TEXT"}}),
+    }
+    limiter = SchemaLimiter(priority_strategy="insertion", max_tables=1)
+
+    limited_default = limiter.limit_schema_for_prompt(schema)
+    limited_all = limiter.limit_schema_for_prompt(
+        schema,
+        include_all_tables=True,
+    )
+
+    assert list(limited_default) == ["first"]
+    assert list(limited_all) == ["first", "second", "third"]
+    assert all(
+        list(table_schema["columns"]) == ["ordinary"]
+        for table_schema in limited_all.values()
+    )
+
+
+def test_include_all_tables_preserves_mandatory_columns_in_late_table(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    schema = {
+        "first": _table({"ordinary": {"type": "TEXT"}}),
+        "orders": _table(
+            {
+                "ordinary": {"type": "TEXT"},
+                "id": {"type": "INTEGER", "constraint_type": "PK"},
+                "customer_id": {
+                    "type": "INTEGER",
+                    "constraint_type": "FK",
+                    "references": "customers(id)",
+                },
+                "revenue": {
+                    "type": "DECIMAL",
+                    "description": "requested revenue metric",
+                },
+            }
+        ),
+    }
+
+    limited = SchemaLimiter(
+        priority_strategy="insertion",
+        max_tables=1,
+    ).limit_schema_for_prompt(
+        schema,
+        query_terms=["revenue"],
+        include_all_tables=True,
+    )
+
+    assert list(limited) == ["first", "orders"]
+    assert list(limited["orders"]["columns"]) == [
+        "id",
+        "customer_id",
+        "revenue",
+    ]
+
+
+def test_include_all_tables_fails_closed_when_mandatory_context_exceeds_hard_cap(
+    monkeypatch,
+):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    schema = {
+        "first": _table(
+            {"first_id": {"type": "INTEGER", "constraint_type": "PK"}}
+        ),
+        "second": _table(
+            {"second_id": {"type": "INTEGER", "constraint_type": "PK"}}
+        ),
+    }
+    diagnostics = {}
+
+    with pytest.raises(SchemaContextBudgetExceeded) as exc_info:
+        SchemaLimiter(
+            priority_strategy="insertion",
+            max_tables=1,
+        ).build_schema_summary(
+            schema,
+            hard_max_chars=10,
+            diagnostics=diagnostics,
+            include_all_tables=True,
+        )
+
+    assert exc_info.value.reason_code == "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
+    assert diagnostics["hard_limit_exceeded"] is True
+    assert set(diagnostics["tables"]) == {"first", "second"}

@@ -118,6 +118,15 @@ class MySQLPlugin(BaseDBPlugin):
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
+    def execute_select_bound(self, conn, sql, parameters, row_limit=500):
+        return self._execute_select_bound_driver(
+            conn,
+            sql,
+            parameters,
+            row_limit,
+            parameter_marker="%s",
+        )
+
     def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
         # Строим WHERE условия динамически
         where_conditions = []
@@ -536,13 +545,19 @@ class MySQLPlugin(BaseDBPlugin):
         for part in parts:
             if part == "":
                 continue
-            if not self._identifier_needs_quoting(part):
-                quoted_parts.append(part)
-            else:
-                escaped = part.replace("`", "``")
-                quoted_parts.append(f"`{escaped}`")
+            quoted_parts.append(self.quote_identifier_part(part))
 
         return ".".join(quoted_parts)
+
+    def quote_identifier_part(self, identifier: str) -> str:
+        """Quote one MySQL identifier part without splitting dotted names."""
+        if not identifier:
+            return identifier
+        part = str(identifier)
+        if not self._identifier_needs_quoting(part):
+            return part
+        escaped = part.replace("`", "``")
+        return f"`{escaped}`"
 
     def build_select_all(self, table_name: str, limit: int) -> str:
         """MySQL SELECT * с LIMIT."""

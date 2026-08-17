@@ -492,6 +492,255 @@ def test_decision_log_status_reflects_missing_final_video(tmp_path, monkeypatch)
     assert present["status"] == "success"
 
 
+# === Э8 (раздел 11.4): состояние слоя болванок в сводках/promise ==============
+
+def test_preflight_summary_includes_blockout_state(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+
+    result = video_contract.storybook_video_preflight_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+
+    assert result["blockout"]["enabled"] is True
+    assert result["blockout"]["use_reference"] is True
+    assert "reference_forecast" in result["blockout"]
+
+
+def test_preflight_summary_blockout_defaults_to_disabled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+
+    result = video_contract.storybook_video_preflight_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["blockout"] == {
+        "enabled": False,
+        "use_reference": False,
+        "reference_forecast": {"eligible": 0, "not_eligible": 0},
+    }
+
+
+def test_delivery_promise_blockout_reference_forecast_counts_eligible_shots(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    base = tmp_path / "plots" / "storybooks" / "project-1"
+    blockout_ok = base / "93_blockout" / "scene_01_shot_01" / "blockout_ref.mp4"
+    blockout_ok.parent.mkdir(parents=True, exist_ok=True)
+    blockout_ok.write_bytes(b"clip")
+    _write_shots(
+        tmp_path,
+        "project-1",
+        [
+            # condition 2 satisfied (file exists), no junction_failed -> eligible.
+            {"scene_number": 1, "shot_number": 1, "video_prompt": "pan", "video_path": "video/1.mp4", "blockout_video": str(blockout_ok)},
+            # no blockout_video at all -> condition 2 fails.
+            {"scene_number": 1, "shot_number": 2, "video_prompt": "tilt", "video_path": "video/2.mp4"},
+            # blockout_video present but junction_failed -> condition 5 fails.
+            {
+                "scene_number": 1, "shot_number": 3, "video_prompt": "zoom", "video_path": "video/3.mp4",
+                "blockout_video": str(blockout_ok), "blockout_junction_failed": True,
+            },
+        ],
+    )
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+
+    assert result["blockout_reference_forecast"] == {"eligible": 1, "not_eligible": 2}
+
+
+def test_delivery_promise_blockout_reference_forecast_zero_when_layer_disabled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["blockout_reference_forecast"] == {"eligible": 0, "not_eligible": 1}
+
+
+def test_music_readiness_exposes_blockout_state_under_video(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+        generate_blockout=True,
+        blockout_use_as_video_reference=True,
+    )
+
+    assert result["video"]["blockout"]["enabled"] is True
+    assert result["video"]["blockout"]["use_reference"] is True
+
+
+def test_decision_log_ignores_blockout_flags_by_design(tmp_path, monkeypatch):
+    """раздел 11.4: журнал решений о болванке ничего не решает и полей не получает."""
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+    video_contract.storybook_video_preflight_tool("session-1", "project-1")
+    video_contract.storybook_video_delivery_promise_tool("session-1", "project-1")
+
+    result = video_contract.storybook_video_decision_log_tool(
+        session_id="session-1",
+        project_id="project-1",
+    )
+    assert "blockout" not in result
+
+
+def test_resolve_blockout_flags_prioritizes_explicit_args_over_brief(tmp_path, monkeypatch):
+    """Раздел 18.3: явный аргумент важнее 00_brief.json."""
+    monkeypatch.chdir(tmp_path)
+    project_dir = tmp_path / "plots" / "storybooks" / "project-1"
+    project_dir.mkdir(parents=True)
+    (project_dir / "00_brief.json").write_text(
+        json.dumps({"generate_blockout": True, "blockout_use_as_video_reference": True}),
+        encoding="utf-8",
+    )
+
+    resolved_blockout, resolved_reference = video_contract._resolve_blockout_flags(
+        project_dir, generate_blockout=False, blockout_use_as_video_reference=False
+    )
+
+    assert resolved_blockout is False
+    assert resolved_reference is False
+
+
+def test_resolve_blockout_flags_falls_back_to_brief_when_args_none(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_dir = tmp_path / "plots" / "storybooks" / "project-1"
+    project_dir.mkdir(parents=True)
+    (project_dir / "00_brief.json").write_text(
+        json.dumps({"generate_blockout": True, "blockout_use_as_video_reference": True}),
+        encoding="utf-8",
+    )
+
+    resolved_blockout, resolved_reference = video_contract._resolve_blockout_flags(
+        project_dir, generate_blockout=None, blockout_use_as_video_reference=None
+    )
+
+    assert resolved_blockout is True
+    assert resolved_reference is True
+
+
+def test_resolve_blockout_flags_defaults_to_false_without_brief(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project_dir = tmp_path / "plots" / "storybooks" / "project-1"
+    project_dir.mkdir(parents=True)
+
+    resolved_blockout, resolved_reference = video_contract._resolve_blockout_flags(
+        project_dir, generate_blockout=None, blockout_use_as_video_reference=None
+    )
+
+    assert resolved_blockout is False
+    assert resolved_reference is False
+
+
+def test_probe_blockout_blender_readiness_reports_missing_binary(monkeypatch):
+    monkeypatch.delenv("BLOCKOUT_BLENDER_MODE", raising=False)
+    monkeypatch.delenv("BLOCKOUT_BLENDER_BIN", raising=False)
+    monkeypatch.setattr(video_contract.shutil, "which", lambda name: None)
+
+    result = video_contract._probe_blockout_blender_readiness()
+
+    assert result["available"] is False
+    assert result["version"] is None
+    assert "not found" in result["message"]
+
+
+def test_probe_blockout_blender_readiness_reports_available_when_version_ok(monkeypatch):
+    monkeypatch.delenv("BLOCKOUT_BLENDER_MODE", raising=False)
+    monkeypatch.setenv("BLOCKOUT_BLENDER_BIN", "/usr/bin/blender")
+    fake_proc = type("Proc", (), {"returncode": 0, "stdout": "Blender 4.2.1"})()
+    monkeypatch.setattr(video_contract.subprocess, "run", lambda *a, **k: fake_proc)
+
+    result = video_contract._probe_blockout_blender_readiness()
+
+    assert result["available"] is True
+    assert result["version"] == "4.2"
+    assert result["path"] == "/usr/bin/blender"
+
+
+def test_probe_blockout_blender_readiness_rejects_version_below_minimum(monkeypatch):
+    monkeypatch.delenv("BLOCKOUT_BLENDER_MODE", raising=False)
+    monkeypatch.setenv("BLOCKOUT_BLENDER_BIN", "/usr/bin/blender")
+    fake_proc = type("Proc", (), {"returncode": 0, "stdout": "Blender 3.6.0"})()
+    monkeypatch.setattr(video_contract.subprocess, "run", lambda *a, **k: fake_proc)
+
+    result = video_contract._probe_blockout_blender_readiness()
+
+    assert result["available"] is False
+    assert "below minimum" in result["message"]
+
+
+def test_probe_blockout_blender_readiness_never_raises_in_module_mode(monkeypatch):
+    # bpy действительно не установлен в этом окружении — реальный import-error путь.
+    monkeypatch.setenv("BLOCKOUT_BLENDER_MODE", "module")
+
+    result = video_contract._probe_blockout_blender_readiness()
+
+    assert result["available"] is False
+    assert result["mode"] == "module"
+
+
+def test_blockout_asset_library_summary_reports_object_count_and_fetch_flag(monkeypatch):
+    monkeypatch.setattr(
+        video_contract, "_read_blockout_asset_index", lambda: {"objects": [{"id": "a"}, {"id": "b"}]}
+    )
+    monkeypatch.setenv("BLOCKOUT_ASSET_FETCH", "off")
+
+    result = video_contract._blockout_asset_library_summary()
+
+    assert result == {"object_count": 2, "fetch_enabled": False}
+
+
+def test_blockout_asset_library_summary_fetch_enabled_by_default(monkeypatch):
+    monkeypatch.setattr(video_contract, "_read_blockout_asset_index", lambda: {"objects": []})
+    monkeypatch.delenv("BLOCKOUT_ASSET_FETCH", raising=False)
+
+    result = video_contract._blockout_asset_library_summary()
+
+    assert result == {"object_count": 0, "fetch_enabled": True}
+
+
+def test_music_readiness_includes_blender_and_asset_library_under_blockout(tmp_path, monkeypatch):
+    """Раздел 18.3: панель читает video.blockout.blender/asset_library из этого контракта."""
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
+    fake_proc = type("Proc", (), {"returncode": 0, "stdout": "Blender 4.2.0"})()
+    monkeypatch.setattr(video_contract.subprocess, "run", lambda *a, **k: fake_proc)
+    monkeypatch.setattr(video_contract, "_read_blockout_asset_index", lambda: {"objects": [{"id": "a"}]})
+
+    result = video_contract.storybook_video_music_readiness(
+        project_id="project-1",
+        session_id="session-1",
+        generate_blockout=True,
+        blockout_use_as_video_reference=True,
+    )
+
+    assert result["video"]["blockout"]["blender"]["available"] is True
+    assert result["video"]["blockout"]["asset_library"]["object_count"] == 1
+
+
 def test_live_yaml_video_step_maps_to_known_provider():
     # Switch-agnostic drift guard: whichever tool_name is left uncommented in the
     # canonical pipeline must map to a known provider (catches step-id/tool typos).
@@ -500,3 +749,37 @@ def test_live_yaml_video_step_maps_to_known_provider():
     provider = video_contract._active_video_provider()
     assert provider is not None
     assert provider in set(video_contract._TOOL_NAME_TO_PROVIDER.values())
+
+
+def test_blockout_actions_registered_manager_only_and_web_unsupported():
+    """A36 (раздел 18.7): пять новых действий болванки в реестре, с
+    status: manager_only и surfaces.storybook_manager: available; на веб —
+    unsupported. Старая regenerate_image остаётся нетронутой."""
+    actions = {action["id"]: action for action in video_contract.STORYBOOK_WORKFLOW_ACTIONS}
+
+    for action_id in (
+        "blockout_render",
+        "blockout_preview_build",
+        "blockout_review",
+        "blockout_asset_map_edit",
+        "blockout_regenerate_shots",
+    ):
+        assert action_id in actions, action_id
+        action = actions[action_id]
+        assert action["status"] == "manager_only"
+        assert action["surfaces"]["storybook_manager"] == "available"
+        assert action["surfaces"]["react"] == "unsupported"
+        assert action["surfaces"]["streamlit"] == "unsupported"
+
+    assert actions["blockout_regenerate_shots"]["category"] == "selective_regeneration"
+
+    old_regenerate_image = actions["regenerate_image"]
+    assert old_regenerate_image["status"] == "not_implemented"
+    assert old_regenerate_image["surfaces"]["storybook_manager"] == "not_implemented"
+
+
+def test_storybook_workflow_actions_tool_returns_blockout_entries():
+    result = video_contract.storybook_workflow_actions()
+    ids = {action["id"] for action in result["actions"]}
+    assert {"blockout_render", "blockout_preview_build", "blockout_review",
+            "blockout_asset_map_edit", "blockout_regenerate_shots"} <= ids

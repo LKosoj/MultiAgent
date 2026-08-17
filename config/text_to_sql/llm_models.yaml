@@ -9,9 +9,8 @@
 #     (custom_tools/text_to_sql/schema_linking/strategies.py::llm_linking)
 #   * sql_generation — параметры LLM-запросов в SQL-генераторе
 #     (custom_tools/text_to_sql/sql_generator.py)
-#   * nlu — параметры LLM-запросов NLU (intent extraction + tokenization),
-#     custom_tools/text_to_sql/nlu.py. Ключи intent_max_tokens / nlp_max_tokens
-#     соответствуют двум разным вызовам внутри одного модуля.
+#   * nlu — параметры LLM-запросов NLU (intent extraction, tokenization и
+#     adaptive query understanding), custom_tools/text_to_sql/nlu.py.
 #
 # Дефолтный профиль содержит безопасные общие значения; конкретные
 # домены/датасеты могут переопределять их в своих профилях.
@@ -27,6 +26,7 @@ profiles:
     nlu:
       intent_max_tokens: 800
       nlp_max_tokens: 2000
+      query_understanding_max_tokens: 16000
 
   # muni_ru: копия default — зарезервирован для тюнинга под муниципальный
   # РФ-датасет. Добавлен для симметрии с остальными text-to-sql конфигами
@@ -42,3 +42,4 @@ profiles:
     nlu:
       intent_max_tokens: 800
       nlp_max_tokens: 2000
+      query_understanding_max_tokens: 16000

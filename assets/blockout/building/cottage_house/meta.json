@@ -1,0 +1,26 @@
+{
+  "id": "cottage_house",
+  "name": "Изба / коттедж",
+  "category": "building",
+  "tags": [
+    "house",
+    "cottage",
+    "desc:Уютный дом для мечты мальчика и русского интерьера."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    11.181340217590332,
+    4.89955997467041,
+    10.09037590026861
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/cf179aa6dc0944f1974ce3f7812031a6",
+  "file_size_bytes": 4113420,
+  "fetched_at": "2026-08-17T05:04:35Z",
+  "asset_version": 1
+}

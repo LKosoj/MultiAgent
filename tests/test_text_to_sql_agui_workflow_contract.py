@@ -41,17 +41,67 @@ _LIGHT_WORKFLOW_MODULES = [
     "agent_system",
 ]
 _MISSING_MODULE = object()
+_OUTBOX_DRAIN_THREAD_PREFIX = "workflow-outbox-drain-"
+
+
+class _LightOutboxDrainWorkers:
+    def __init__(self) -> None:
+        self.entries: list[
+            tuple[types.ModuleType, str, int, int, threading.Thread]
+        ] = []
+
+
+_ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS: _LightOutboxDrainWorkers | None = None
+
+
+def _clear_owned_light_outbox_scheduler(
+    owned_workers: _LightOutboxDrainWorkers,
+) -> None:
+    for result_delivery, key, pid, generation, _worker in owned_workers.entries:
+        with result_delivery._OUTBOX_DRAIN_SCHEDULE_LOCK:
+            if result_delivery._OUTBOX_DRAIN_SCHEDULED.get(key) == (pid, generation):
+                result_delivery._OUTBOX_DRAIN_SCHEDULED.pop(key)
+
+
+def _stop_light_outbox_drain_workers(
+    owned_workers: _LightOutboxDrainWorkers,
+) -> None:
+    _clear_owned_light_outbox_scheduler(owned_workers)
+
+    deadline = time.monotonic() + 2.0
+    while workers := tuple(
+        worker
+        for _module, _key, _pid, _generation, worker in owned_workers.entries
+        if worker.is_alive()
+    ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            names = ", ".join(worker.name for worker in workers)
+            raise AssertionError(f"owned outbox drain workers survived teardown: {names}")
+        for worker in workers:
+            worker.join(timeout=min(remaining, 0.05))
 
 
 @pytest.fixture(autouse=True)
 def _restore_light_workflow_modules():
+    global _ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS
+
     saved = {name: sys.modules.get(name, _MISSING_MODULE) for name in _LIGHT_WORKFLOW_MODULES}
-    yield
-    for name, module in saved.items():
-        if module is _MISSING_MODULE:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = module
+    previous_workers = _ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS
+    owned_workers = _LightOutboxDrainWorkers()
+    _ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS = owned_workers
+    try:
+        yield owned_workers
+    finally:
+        try:
+            _stop_light_outbox_drain_workers(owned_workers)
+        finally:
+            _ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS = previous_workers
+            for name, module in saved.items():
+                if module is _MISSING_MODULE:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = module
 
 
 def _load_service_with_stubs(monkeypatch, wf_manager):
@@ -231,10 +281,46 @@ class _WorkflowManagerStub:
     def __init__(self):
         self.calls = []
         self.active_runs = {}
+        self.store = None
 
     def start_workflow(self, **kwargs):
         self.calls.append(kwargs)
-        return kwargs["run_id"]
+        if self.store is None or "text_to_sql_admission" not in kwargs:
+            return kwargs["run_id"]
+        from backend.fastapi_app.agui.auth import Principal
+
+        owner = kwargs["owner"]
+        admission = kwargs["text_to_sql_admission"]
+        deadline_at_ms = int(time.time() * 1000) + 60_000
+        run_incarnation = f"stub-{len(self.calls)}"
+        stored, _newly_admitted = self.store.admit_workflow_run(
+            run_id=kwargs["run_id"],
+            thread_id=kwargs["session_id"],
+            principal=Principal(owner.subject, owner.tenant_id, owner.roles),
+            run_kind="text_to_sql",
+            run_incarnation=run_incarnation,
+            session_id=kwargs["session_id"],
+            workflow_name=kwargs["workflow_name"],
+            work_spec={
+                "spec_version": 1,
+                "workflow_path": str(
+                    Path("workflow_pipelines/text_to_sql_pipeline.yaml").resolve()
+                ),
+                "parameters": kwargs["parameters"],
+                "session_id": kwargs["session_id"],
+                "client_id": kwargs["client_id"],
+                "use_enhanced": kwargs["use_enhanced"],
+                "enable_telemetry": kwargs["enable_telemetry"],
+                "run_incarnation": run_incarnation,
+                "deadline_at_ms": deadline_at_ms,
+            },
+            deadline_at_ms=deadline_at_ms,
+            queue_limit=10,
+            create_if_missing=True,
+            idempotency_key=admission.idempotency_key,
+            request_fingerprint=admission.request_fingerprint,
+        )
+        return stored.run_id
 
     def get_active_run_snapshot(self, run_id):
         run_data = self.active_runs.get(run_id)
@@ -313,6 +399,8 @@ def _terminal_contract_payload(status="succeeded", run_id="run-terminal"):
             "filename": "query.md",
             "path": "/tmp/query.md",
         } if succeeded else {"status": "not_attempted"},
+        "result_review": {},
+        "ambiguity": None,
     }
 
 
@@ -379,6 +467,34 @@ def _load_light_workflow_streamlit_api():
 
     streamlit_api = _load_module("workflow.streamlit_api", root / "workflow" / "streamlit_api.py")
     workflow_pkg.streamlit_api = streamlit_api
+    owned_workers = _ACTIVE_LIGHT_OUTBOX_DRAIN_WORKERS
+    if owned_workers is not None:
+        result_delivery = sys.modules["workflow.result_delivery"]
+
+        def start_owned_outbox_drain(**kwargs):
+            worker = threading.Thread(
+                target=result_delivery._scheduled_workflow_result_outbox_drain,
+                kwargs=kwargs,
+                name=(
+                    f"{_OUTBOX_DRAIN_THREAD_PREFIX}"
+                    f"{abs(hash(kwargs['key'])) & 0xFFFF:x}"
+                ),
+                daemon=True,
+            )
+            owned_workers.entries.append(
+                (
+                    result_delivery,
+                    kwargs["key"],
+                    kwargs["pid"],
+                    kwargs["generation"],
+                    worker,
+                )
+            )
+            worker.start()
+
+        streamlit_api._start_scheduled_workflow_result_outbox_drain = (
+            start_owned_outbox_drain
+        )
     storage_dir = Path(tempfile.mkdtemp(prefix="workflow-streamlit-api-test-"))
     streamlit_api._agui_event_store_path = lambda: storage_dir / "events.db"
     if hasattr(streamlit_api, "_workflow_result_outbox_path"):
@@ -472,8 +588,6 @@ def test_text_to_sql_generate_uses_unique_run_id_and_records_parameters(monkeypa
     assert call["parameters"]["include_explanation"] is True
     assert call["parameters"]["dry_run_only"] is True
     assert call["parameters"]["validate_schema"] is False
-    assert call["parameters"]["use_schema_suggestions"] is True
-    assert call["parameters"]["allow_enhanced_fallback"] is False
     assert call["parameters"]["run_id"] == first["run_id"]
     assert call["parameters"]["session_id"] == first["session_id"]
 
@@ -626,7 +740,6 @@ def test_text_to_sql_generate_rejects_foreign_agui_entrypoint(monkeypatch):
                 "query": "show users",
                 "dsn": "sqlite:///tmp/app.db",
                 "admin_raw_dsn_compat": True,
-                "workflow_name": "text_to_sql_pipeline",
             },
         )
 
@@ -646,7 +759,6 @@ def test_text_to_sql_generate_rejects_workflow_without_text_to_sql_entrypoint(mo
                 "query": "show users",
                 "dsn": "sqlite:///tmp/app.db",
                 "admin_raw_dsn_compat": True,
-                "workflow_name": "text_to_sql_pipeline",
             },
         )
 
@@ -677,35 +789,34 @@ def test_text_to_sql_generate_validates_runtime_limits(monkeypatch):
             {"query": "show users", "dsn": "sqlite:///tmp/app.db", "safety_level": "moderate"},
         )
 
-    with pytest.raises(ValueError, match="allow_enhanced_fallback"):
-        service.handle_service_action(
-            "presets.text_to_sql.generate",
-            {
-                "query": "show users",
-                "dsn": "sqlite:///tmp/app.db",
-                "allow_enhanced_fallback": "maybe",
-            },
-        )
-
     assert wf_manager.calls == []
 
 
-@pytest.mark.parametrize("validate_schema", [True, False])
-def test_text_to_sql_generate_rejects_schema_suggestions_disabled(
+@pytest.mark.parametrize(
+    "removed_field, value",
+    [
+        ("workflow_name", "data_analysis"),
+        ("use_enhanced", False),
+        ("allow_enhanced_fallback", True),
+        ("use_schema_suggestions", False),
+    ],
+)
+def test_text_to_sql_generate_rejects_removed_mode_fields(
     monkeypatch,
-    validate_schema,
+    removed_field,
+    value,
 ):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
 
-    with pytest.raises(ValueError, match="schema grounding is required"):
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
         service.handle_service_action(
             "presets.text_to_sql.generate",
             {
                 "query": "show users",
                 "dsn": "sqlite:///tmp/app.db",
-                "use_schema_suggestions": False,
-                "validate_schema": validate_schema,
+                "admin_raw_dsn_compat": True,
+                removed_field: value,
             },
         )
 
@@ -732,8 +843,8 @@ def test_text_to_sql_generate_missing_query_raises(monkeypatch):
     assert wf_manager.calls == []
 
 
-def test_text_to_sql_generate_pydantic_defaults_match_legacy(monkeypatch):
-    """Контракт: Pydantic-модель не должна менять defaults для существующих payload."""
+def test_text_to_sql_generate_uses_canonical_defaults(monkeypatch):
+    """Контракт: публичный Typed-запрос получает канонические defaults."""
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
 
@@ -754,79 +865,46 @@ def test_text_to_sql_generate_pydantic_defaults_match_legacy(monkeypatch):
     assert params["include_explanation"] is True
     assert params["validate_schema"] is True
     assert params["dry_run_only"] is False
-    assert params["use_schema_suggestions"] is True
-    assert params["allow_enhanced_fallback"] is False
     assert call["use_enhanced"] is True
     assert call["enable_telemetry"] is False
     assert call["workflow_name"] == "text_to_sql_pipeline"
     assert result["workflow_name"] == "text_to_sql_pipeline"
 
 
-def test_text_to_sql_generate_pydantic_strict_bool_for_allow_enhanced_fallback(monkeypatch):
-    """7.23: allow_enhanced_fallback идёт через coerce_strict_bool — отвергает мусор,
-    принимает canonical значения."""
+def test_text_to_sql_generate_rejects_removed_natural_query_alias(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
 
-    # Canonical TRUE → bool True
-    service.handle_service_action(
-        "presets.text_to_sql.generate",
-        {
-            "query": "show users",
-            "dsn": "sqlite:///tmp/app.db",
-            "admin_raw_dsn_compat": True,
-            "allow_enhanced_fallback": "yes",
-        },
-    )
-    assert wf_manager.calls[-1]["parameters"]["allow_enhanced_fallback"] is True
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        service.handle_service_action(
+            "presets.text_to_sql.generate",
+            {
+                "query": "show users",
+                "natural_query": "old alias",
+                "dsn": "sqlite:///tmp/app.db",
+                "admin_raw_dsn_compat": True,
+            },
+        )
 
-    # Невалидное → ValueError
-    for bad in ["maybe", "2", 2, 1.5]:
-        with pytest.raises(ValueError, match="allow_enhanced_fallback"):
-            service.handle_service_action(
-                "presets.text_to_sql.generate",
-                {
-                    "query": "show users",
-                    "dsn": "sqlite:///tmp/app.db",
-                    "allow_enhanced_fallback": bad,
-                },
-            )
+    assert wf_manager.calls == []
 
 
-def test_text_to_sql_generate_pydantic_natural_query_takes_priority(monkeypatch):
-    """Backwards-compat: natural_query имеет приоритет над query (контракт _extract_query)."""
+def test_text_to_sql_generate_rejects_unknown_fields(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
 
-    service.handle_service_action(
-        "presets.text_to_sql.generate",
-        {
-            "query": "fallback",
-            "natural_query": "primary",
-            "dsn": "sqlite:///tmp/app.db",
-            "admin_raw_dsn_compat": True,
-        },
-    )
-    assert wf_manager.calls[-1]["parameters"]["query"] == "primary"
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        service.handle_service_action(
+            "presets.text_to_sql.generate",
+            {
+                "query": "show users",
+                "dsn": "sqlite:///tmp/app.db",
+                "admin_raw_dsn_compat": True,
+                "future_field": "rejected",
+            },
+        )
 
-
-def test_text_to_sql_generate_pydantic_unknown_fields_ignored(monkeypatch):
-    """7.23: extra='ignore' — payload может содержать лишние поля, они отбрасываются,
-    а не падают."""
-    wf_manager = _WorkflowManagerStub()
-    service = _load_service_with_stubs(monkeypatch, wf_manager)
-
-    result = service.handle_service_action(
-        "presets.text_to_sql.generate",
-        {
-            "query": "show users",
-            "dsn": "sqlite:///tmp/app.db",
-            "admin_raw_dsn_compat": True,
-            "future_field": "ignored",
-            "another_extra": 42,
-        },
-    )
-    assert "run_id" in result
+    assert wf_manager.calls == []
 
 
 def test_db_test_configs_save_list_resolve_and_delete(monkeypatch, tmp_path):
@@ -1608,8 +1686,8 @@ def test_generate_and_schema_legacy_reference_paths_remain_admin_only(
         "serialization_version": 1,
         "tenant_id": "ops",
         "access_scope_id": "owner:admin",
-        "connection_view_id": f"compatibility-run:{generated['run_id']}",
-        "transient": True,
+        "connection_view_id": f"dsn:{service._dsn_fingerprint(dsn)}",
+        "transient": False,
     }
     assert "schema_scope" not in generated["parameters"]
     monkeypatch.setattr(
@@ -1625,6 +1703,75 @@ def test_generate_and_schema_legacy_reference_paths_remain_admin_only(
         principal=admin,
     )
     assert loaded["source"] == "memory"
+
+
+def test_raw_dsn_schema_scope_is_stable_per_dsn_and_access_scope() -> None:
+    from datetime import datetime, timezone
+
+    from backend.fastapi_app.agui import service
+    from backend.fastapi_app.agui.auth import Principal
+    from backend.fastapi_app.agui.connection_registry import (
+        ConnectionRecord,
+        ConnectionRef,
+        ConnectionTargetKind,
+    )
+
+    dsn = "postgresql://svc:legacy-secret@db.example:5432/app"
+    same_scope_first = service._trusted_text_to_sql_schema_scope(
+        None,
+        Principal("admin", "ops", frozenset({"admin"})),
+        "run-1",
+        dsn,
+    )
+    same_scope_second = service._trusted_text_to_sql_schema_scope(
+        None,
+        Principal("admin", "ops", frozenset({"admin"})),
+        "run-2",
+        dsn,
+    )
+    registered_scope = service._trusted_text_to_sql_schema_scope(
+        ConnectionRecord(
+            connection_ref=ConnectionRef("conn-00000000-0000-0000-0000-000000000001"),
+            display_name="same database",
+            owner_subject="admin",
+            tenant_id="ops",
+            target_kind=ConnectionTargetKind.NETWORK,
+            dialect="postgresql",
+            target_description="db.example",
+            created_at=datetime.now(timezone.utc),
+        ),
+        Principal("admin", "ops", frozenset({"admin"})),
+        "run-registered",
+        dsn,
+    )
+    other_dsn_scope = service._trusted_text_to_sql_schema_scope(
+        None,
+        Principal("admin", "ops", frozenset({"admin"})),
+        "run-3",
+        "postgresql://svc:other-secret@db.example:5432/other_app",
+    )
+    other_access_scope = service._trusted_text_to_sql_schema_scope(
+        None,
+        Principal("other-admin", "ops", frozenset({"admin"})),
+        "run-4",
+        dsn,
+    )
+
+    assert same_scope_first == same_scope_second
+    assert same_scope_first == registered_scope
+    assert same_scope_first["transient"] is False
+    assert (
+        same_scope_first["connection_view_id"]
+        != other_dsn_scope["connection_view_id"]
+    )
+    assert same_scope_first["access_scope_id"] != other_access_scope["access_scope_id"]
+    serialized = json.dumps(
+        (same_scope_first, other_dsn_scope, other_access_scope),
+        ensure_ascii=False,
+    )
+    assert dsn not in serialized
+    assert "legacy-secret" not in serialized
+    assert "other-secret" not in serialized
 
 
 def test_generate_connection_admission_keeps_secret_private_and_events_admin_compat(
@@ -1673,18 +1820,29 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
         )
     assert wf_manager.calls == []
 
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        service.handle_service_action(
+            "presets.text_to_sql.generate",
+            {
+                "query": "show users",
+                "connection_ref": connection["connection_ref"],
+                "schema_scope": {
+                    "serialization_version": 1,
+                    "tenant_id": "attacker",
+                    "access_scope_id": "tenant-shared",
+                    "connection_view_id": "registry:attacker",
+                    "transient": False,
+                },
+            },
+            principal=alice,
+        )
+    assert wf_manager.calls == []
+
     generated = service.handle_service_action(
         "presets.text_to_sql.generate",
         {
             "query": "show users",
             "connection_ref": connection["connection_ref"],
-            "schema_scope": {
-                "serialization_version": 1,
-                "tenant_id": "attacker",
-                "access_scope_id": "tenant-shared",
-                "connection_view_id": "registry:attacker",
-                "transient": False,
-            },
         },
         principal=alice,
     )
@@ -1695,7 +1853,7 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
         "serialization_version": 1,
         "tenant_id": "tenant-1",
         "access_scope_id": "owner:alice",
-        "connection_view_id": f"registry:{connection['connection_ref']}",
+        "connection_view_id": f"dsn:{service._dsn_fingerprint(dsn)}",
         "transient": False,
     }
     assert "dsn" not in generated["parameters"]
@@ -1703,6 +1861,28 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
     assert "schema_scope" not in generated["parameters"]
     assert generated["parameters"]["connection_ref"] == connection["connection_ref"]
     assert "worker-secret" not in json.dumps(generated, ensure_ascii=False)
+
+    duplicate_connection = service.handle_service_action(
+        "db.connections.register",
+        {
+            "display_name": "Production duplicate",
+            "dsn": dsn,
+            "owner_subject": "alice",
+            "tenant_id": "tenant-1",
+        },
+        principal=admin,
+    )["connection"]
+    service.handle_service_action(
+        "presets.text_to_sql.generate",
+        {
+            "query": "show users again",
+            "connection_ref": duplicate_connection["connection_ref"],
+        },
+        principal=alice,
+    )
+    assert wf_manager.calls[-1]["parameters"]["schema_scope"] == private_parameters[
+        "schema_scope"
+    ]
 
     shared_connection = service.handle_service_action(
         "db.connections.register",
@@ -1726,7 +1906,7 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
         "serialization_version": 1,
         "tenant_id": "tenant-1",
         "access_scope_id": "tenant-shared",
-        "connection_view_id": f"registry:{shared_connection['connection_ref']}",
+        "connection_view_id": f"dsn:{service._dsn_fingerprint(dsn)}",
         "transient": False,
     }
 
@@ -1736,6 +1916,7 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
         "admin_raw_dsn_compat": True,
         "idempotency_key": "admin-compat-once",
     }
+    wf_manager.store = service._AGUI_EVENT_STORE
     first = service.handle_service_action(
         "presets.text_to_sql.generate", raw_payload, principal=admin
     )
@@ -1753,13 +1934,16 @@ def test_generate_connection_admission_keeps_secret_private_and_events_admin_com
     assert "worker-secret" not in event_text
     assert dsn not in event_text
     assert compat_events[0].payload["connection_ref"] == "admin_raw_dsn_compat"
-    assert wf_manager.calls[-1]["parameters"]["connection_ref"] == "admin_raw_dsn_compat"
-    assert wf_manager.calls[-1]["parameters"]["schema_scope"] == {
+    stored_spec = service._AGUI_EVENT_STORE.load_work_spec(first["run_id"])
+    assert stored_spec is not None
+    stored_parameters = stored_spec.to_mapping()["parameters"]
+    assert stored_parameters["connection_ref"] == "admin_raw_dsn_compat"
+    assert stored_parameters["schema_scope"] == {
         "serialization_version": 1,
         "tenant_id": "ops",
         "access_scope_id": "owner:admin",
-        "connection_view_id": f"compatibility-run:{first['run_id']}",
-        "transient": True,
+        "connection_view_id": f"dsn:{service._dsn_fingerprint(dsn)}",
+        "transient": False,
     }
     assert "dsn" not in first["parameters"]
     assert "schema_scope" not in first["parameters"]
@@ -2321,9 +2505,10 @@ def test_text_to_sql_workflow_result_reports_failure_and_dry_run_execution(monke
                         "skipped_execution": True,
                         "applied_row_limit": 100,
                 },
-                "audit": {"status": "logged", "log_id": "audit-1"},
-                "persistence": {"status": "not_attempted"},
-            },
+                    "audit": {"status": "logged", "log_id": "audit-1"},
+                    "persistence": {"status": "not_attempted"},
+                    "ambiguity": None,
+                },
             "result": {"message": "partial"},
             "artifacts": {
                 "final_output": {"message": "partial"},
@@ -2358,8 +2543,8 @@ def test_text_to_sql_workflow_result_reports_failure_and_dry_run_execution(monke
 @pytest.mark.parametrize(
     ("terminal_outcome", "expected_status", "expected_progress", "has_terminal"),
     [
-        (None, "unknown_legacy", 0.0, False),
-        ({"status": "succeeded"}, "unknown_legacy", 0.0, False),
+        (None, "invalid_terminal", 0.0, False),
+        ({"status": "succeeded"}, "invalid_terminal", 0.0, False),
         (_terminal_contract_payload("succeeded", "run-status"), "completed", 100.0, True),
     ],
 )
@@ -2431,7 +2616,7 @@ def test_generic_stored_result_is_not_reclassified_by_terminal_candidate(monkeyp
     assert result["success"] is True
 
 
-def test_text_to_sql_legacy_result_without_terminal_outcome_is_not_success(monkeypatch):
+def test_text_to_sql_result_without_terminal_outcome_is_not_success(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
     admin = _register_legacy_admin_run(service, "legacy")
@@ -2442,7 +2627,7 @@ def test_text_to_sql_legacy_result_without_terminal_outcome_is_not_success(monke
             "run_id": run_id,
             "status": "completed",
             "success": True,
-            "result": {"message": "legacy output"},
+            "result": {"message": "unvalidated output"},
             "snapshot": {"workflow_name": "text_to_sql_pipeline"},
         },
     )
@@ -2453,7 +2638,7 @@ def test_text_to_sql_legacy_result_without_terminal_outcome_is_not_success(monke
         principal=admin,
     )
 
-    assert result["status"] == "unknown_legacy"
+    assert result["status"] == "invalid_terminal"
     assert result["success"] is False
 
 
@@ -2549,7 +2734,7 @@ def test_text_to_sql_service_rejects_partial_or_malformed_terminal_outcome(
         principal=admin,
     )
 
-    assert result["status"] == "unknown_legacy"
+    assert result["status"] == "invalid_terminal"
     assert result["success"] is False
     assert "terminal_outcome" not in result
 
@@ -3493,75 +3678,32 @@ def test_workflow_dsn_env_service_default_is_false_without_operator_override(mon
     assert "TEXT_TO_SQL_DRY_RUN_ONLY" not in os.environ
 
 
-def test_text_to_sql_pipeline_contract_is_fail_fast_and_uses_entities():
+def test_text_to_sql_pipeline_is_typed_only():
     models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
     WorkflowDefinition = models.WorkflowDefinition
 
-    workflow = WorkflowDefinition.from_yaml(Path("workflow_pipelines/text_to_sql_pipeline.yaml"))
+    workflow = WorkflowDefinition.from_yaml(
+        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
+    )
     round_tripped = WorkflowDefinition.from_yaml_string(workflow.to_yaml_string())
-    schema_step = next(step for step in workflow.steps if step.id == "schema_linking_step")
-    # EPIC 6.3: god-manager sql_pipeline декомпозирован на sql_generation / sql_verification / db_audit.
-    # max_rows/dry_run_only/allow_enhanced_fallback теперь живут в metadata db_audit.
-    audit_step = next(step for step in workflow.steps if step.id == "db_audit")
-    generation_step = next(step for step in workflow.steps if step.id == "sql_generation")
-    verification_step = next(step for step in workflow.steps if step.id == "sql_verification")
+    steps = {step.id: step for step in workflow.steps}
 
-    assert workflow.error_handling["on_failure"] != "continue"
+    assert list(steps) == ["schema_research", "sql_solving", "db_audit"]
     assert workflow.requires_enhanced_engine is True
     assert round_tripped.requires_enhanced_engine is True
-    assert workflow.metadata["agui_entrypoint"] == "presets.text_to_sql.generate"
-    assert workflow.metadata["forbid_workflows_start"] is True
+    assert workflow.error_handling["on_failure"] == "fail"
     assert workflow.inputs["query"] == ""
     assert workflow.inputs["dsn"] == ""
     assert workflow.inputs["schema_scope"] is None
-    assert schema_step.tool_params["entities"] == "{intent_extraction_step.entities}"
-    assert schema_step.condition == "{use_schema_suggestions}"
-    # EPIC 6.9: skip_output теперь использует status: "skipped_disabled" вместо disabled: true.
-    schema_skip_output = schema_step.metadata["skip_output"]
-    assert schema_skip_output["status"] == "skipped_disabled"
-    assert schema_skip_output["decision"] == "ABSTAIN"
-    assert schema_skip_output["terminal_reason_code"] == "SCHEMA_GROUNDING_FAILED"
-    assert schema_skip_output["sql_generation_allowed"] is False
-    assert workflow.inputs["max_rows"] == 100
-    assert "dry_run_only" in workflow.inputs
-    assert workflow.inputs["allow_enhanced_fallback"] is False
-    assert audit_step.metadata["max_rows"] == "{max_rows}"
-    assert audit_step.metadata["retryable"] is False
-    assert audit_step.metadata["required_runtime_gate"] == "secure_db_executor"
-    assert audit_step.metadata["dry_run_only"] == "{dry_run_only}"
-    assert audit_step.metadata["allow_enhanced_fallback"] == "{allow_enhanced_fallback}"
-    assert schema_step.tool_params["dsn"] == "{dsn}"
-    assert schema_step.tool_params["schema_scope"] == "{schema_scope}"
-    assert generation_step.metadata["dsn"] == "{dsn}"
-    assert verification_step.metadata["dsn"] == "{dsn}"
-    assert audit_step.metadata["dsn"] == "{dsn}"
-    assert schema_step.tool_params["session_id"] == "{session_id}"
-    assert "dsn={dsn}" not in generation_step.task
-    assert "dsn={dsn}" not in verification_step.task
-    assert "dsn={dsn}" not in audit_step.task
-    assert generation_step.output_schema == "json_object"
-    assert generation_step.output_schema_requirements["required"] == [
-        "sql",
-        "description",
-    ]
-    assert generation_step.condition == "{schema_linking_step.sql_generation_allowed}"
-    assert generation_step.metadata["skip_output"]["sql"] == ""
-    assert generation_step.metadata["skip_output"]["error"] == "schema_linking_join_failed"
-    assert verification_step.output_schema_requirements["required"] == [
-        "verification_status",
-        "safety_check",
-        "performance_check",
-        "recommendations",
-    ]
-    assert verification_step.output_schema_requirements["properties"]["verification_status"]["enum"] == [
-        "Approved",
-        "Rejected",
-    ]
-    assert verification_step.metadata["advisory_only"] is True
-    assert verification_step.metadata["required_runtime_gate"] == "db_audit"
-    assert 'sql_generation_plugin(context=..., user_query=..., session_id="{session_id}")' in generation_step.task
-    assert "sql_safety_check(sql_query=...)" in verification_step.task
-    assert "sql_explain(sql_query=...)" in verification_step.task
+    assert "allow_enhanced_fallback" not in workflow.inputs
+    assert "use_schema_suggestions" not in workflow.inputs
+    assert steps["schema_research"].tool_name == "typed_schema_research"
+    assert steps["sql_solving"].agent_type == "sql_solver_agent"
+    assert steps["sql_solving"].condition == "{schema_research.ready_for_sql}"
+    assert steps["db_audit"].tool_name == "finalize_text_to_sql_run"
+    assert steps["db_audit"].condition == '{sql_solving.sql} != ""'
+    assert "verification_status" not in steps["db_audit"].tool_params
+    assert all(step.retry_policy.max_retries == 0 for step in workflow.steps)
 
 
 def test_workflow_engine_resolves_full_dotted_variable_to_object():
@@ -3577,17 +3719,17 @@ def test_workflow_engine_resolves_full_dotted_variable_to_object():
     assert engine._substitute_variables_in_string("{intent_extraction_step.entities}", variables) is entities
     assert engine._substitute_variables_in_string("entities={intent_extraction_step.entities}", variables) == f"entities={entities}"
 
-    context = WorkflowContext(variables={"use_schema_suggestions": False})
+    context = WorkflowContext(variables={"enable_optional_stage": False})
     step = WorkflowStep(
-        id="schema_linking_step",
-        task="schema linking",
-        condition="{use_schema_suggestions}",
-        metadata={"skip_output": {"disabled": True, "reason": "use_schema_suggestions=false"}},
+        id="optional_stage",
+        task="optional work",
+        condition="{enable_optional_stage}",
+        metadata={"skip_output": {"skipped": True, "reason": "optional stage disabled"}},
     )
 
     assert engine._should_skip_step_by_condition(step, context) is True
-    assert context.step_outputs["schema_linking_step"]["disabled"] is True
-    assert context.step_outputs["schema_linking_step.disabled"] is True
+    assert context.step_outputs["optional_stage"]["skipped"] is True
+    assert context.step_outputs["optional_stage.skipped"] is True
 
     async def not_cancelled(_workflow_id):
         return False
@@ -3595,10 +3737,10 @@ def test_workflow_engine_resolves_full_dotted_variable_to_object():
     engine._is_workflow_cancelled = not_cancelled
     workflow = WorkflowDefinition(name="test_skip_output", steps=[step])
     results = asyncio.run(engine._execute_steps_sequential(workflow, context))
-    assert results["schema_linking_step"].output["disabled"] is True
+    assert results["optional_stage"].output["skipped"] is True
 
 
-def test_enhanced_text_to_sql_fallback_requires_opt_in(monkeypatch):
+def test_enhanced_text_to_sql_never_falls_back_to_old_pipeline(monkeypatch):
     root = Path(__file__).resolve().parents[1]
     workflow_pkg = _install_light_workflow_package()
 
@@ -3664,7 +3806,6 @@ def test_enhanced_text_to_sql_fallback_requires_opt_in(monkeypatch):
     workflow_pkg.enhanced_engine = enhanced_module
     engine = object.__new__(enhanced_module.EnhancedWorkflowEngine)
     engine.feature_manager = types.SimpleNamespace(
-        workflow_overrides={"text_to_sql": {"fallback_to_legacy": False}},
         global_config={"enhanced_workflow": {"fallback_to_legacy": True}},
     )
     WorkflowContext = sys.modules["workflow.models"].WorkflowContext
@@ -3672,10 +3813,6 @@ def test_enhanced_text_to_sql_fallback_requires_opt_in(monkeypatch):
     workflow = WorkflowDefinition(name="text_to_sql_pipeline", metadata={"category": "text_to_sql"})
 
     assert engine._should_fallback_to_legacy(workflow, WorkflowContext(variables={})) is False
-    assert engine._should_fallback_to_legacy(
-        workflow,
-        WorkflowContext(variables={"allow_enhanced_fallback": True}),
-    ) is True
 
 
 def test_workflow_manager_reads_process_mode_artifacts_from_event_store(monkeypatch):
@@ -3736,7 +3873,7 @@ def test_workflow_manager_reads_process_mode_artifacts_from_event_store(monkeypa
     status = manager.get_workflow_status("run-process")
     artifacts = manager.get_workflow_artifacts("run-process")
 
-    assert status.status == "unknown_legacy"
+    assert status.status == "invalid_terminal"
     assert "Workflow failed steps: sql_pipeline" in status.error_message
     assert status.parameters["dry_run_only"] is True
     assert artifacts.step_outputs["sql_pipeline"]["sql_query"] == "SELECT 1"
@@ -3768,7 +3905,7 @@ def test_workflow_manager_reads_process_mode_artifacts_from_event_store(monkeypa
             _terminal_contract_payload("succeeded", "stored-run"),
             "completed",
         ),
-        ("text_to_sql_pipeline", "completed", {"status": "succeeded"}, "unknown_legacy"),
+        ("text_to_sql_pipeline", "completed", {"status": "succeeded"}, "invalid_terminal"),
         (
             "generic_pipeline",
             "completed",
@@ -4026,10 +4163,11 @@ def test_workflow_manager_same_session_invocations_get_unique_run_ids(
             )
         ),
     )
+    supervisor = _QueuedWorkflowSupervisor(streamlit_api)
     manager = streamlit_api.WorkflowManager(
         use_enhanced=False,
         pipelines_dir=str(tmp_path),
-        supervisor=_QueuedWorkflowSupervisor(streamlit_api),
+        supervisor=supervisor,
     )
 
     first_run_id = manager.start_workflow(
@@ -4049,6 +4187,13 @@ def test_workflow_manager_same_session_invocations_get_unique_run_ids(
     first = manager.get_active_run_snapshot(first_run_id)
     second = manager.get_active_run_snapshot(second_run_id)
     assert first["session_id"] == second["session_id"] == "shared-session"
+    expected_enhanced = workflow_name == "text_to_sql_pipeline"
+    assert first["use_enhanced_engine"] is expected_enhanced
+    assert second["use_enhanced_engine"] is expected_enhanced
+    assert all(
+        work_spec["use_enhanced"] is expected_enhanced
+        for _run_id, work_spec, _deadline_at_ms in supervisor.submissions
+    )
     assert first["run_incarnation"]
     assert second["run_incarnation"]
     assert first["run_incarnation"] != second["run_incarnation"]
@@ -5291,6 +5436,108 @@ def _wait_until(predicate, *, timeout: float = 5.0) -> bool:
     return bool(predicate())
 
 
+def test_light_outbox_cleanup_stops_worker_before_modules_are_restored(
+    monkeypatch,
+    tmp_path,
+    _restore_light_workflow_modules,
+):
+    streamlit_a = _load_light_workflow_streamlit_api()
+    result_delivery_a = importlib.import_module("workflow.result_delivery")
+    entered_a = threading.Event()
+    reset_a = threading.Event()
+    unrelated_release = threading.Event()
+    unrelated_started = threading.Event()
+    unrelated_key_a = "unrelated-scheduler-entry-a"
+    unrelated_key_b = "unrelated-scheduler-entry-b"
+    unrelated_scheduler_state = (99_999, 7)
+
+    def hold_until_own_key_is_removed(result_delivery, key, entered, reset):
+        def wait_for_owned_scheduler_reset(*, path):
+            entered.set()
+            while result_delivery._OUTBOX_DRAIN_SCHEDULED.get(key) is not None:
+                time.sleep(0.01)
+            reset.set()
+            return 0, False
+
+        return wait_for_owned_scheduler_reset
+
+    unrelated = threading.Thread(
+        target=lambda: (unrelated_started.set(), unrelated_release.wait()),
+        name=f"{_OUTBOX_DRAIN_THREAD_PREFIX}unrelated",
+        daemon=True,
+    )
+    try:
+        with result_delivery_a._OUTBOX_DRAIN_SCHEDULE_LOCK:
+            result_delivery_a._OUTBOX_DRAIN_SCHEDULED[unrelated_key_a] = (
+                unrelated_scheduler_state
+            )
+        unrelated.start()
+        assert unrelated_started.wait(timeout=1)
+        unrelated.join = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("teardown must not join an unrelated worker")
+        )
+        owned_key_a = str((tmp_path / "cleanup-a.db").absolute())
+        monkeypatch.setattr(
+            streamlit_a,
+            "_drain_workflow_result_outbox_batch",
+            hold_until_own_key_is_removed(
+                result_delivery_a, owned_key_a, entered_a, reset_a
+            ),
+        )
+        assert streamlit_a._schedule_workflow_result_outbox_drain(
+            path=tmp_path / "cleanup-a.db"
+        ) is True
+        assert entered_a.wait(timeout=1)
+
+        streamlit_b = _load_light_workflow_streamlit_api()
+        result_delivery_b = importlib.import_module("workflow.result_delivery")
+        entered_b = threading.Event()
+        reset_b = threading.Event()
+        with result_delivery_b._OUTBOX_DRAIN_SCHEDULE_LOCK:
+            result_delivery_b._OUTBOX_DRAIN_SCHEDULED[unrelated_key_b] = (
+                unrelated_scheduler_state
+            )
+        owned_key_b = str((tmp_path / "cleanup-b.db").absolute())
+        monkeypatch.setattr(
+            streamlit_b,
+            "_drain_workflow_result_outbox_batch",
+            hold_until_own_key_is_removed(
+                result_delivery_b, owned_key_b, entered_b, reset_b
+            ),
+        )
+        assert streamlit_b._schedule_workflow_result_outbox_drain(
+            path=tmp_path / "cleanup-b.db"
+        ) is True
+        assert entered_b.wait(timeout=1)
+
+        _stop_light_outbox_drain_workers(_restore_light_workflow_modules)
+        assert reset_a.is_set() and reset_b.is_set()
+        assert all(
+            not worker.is_alive()
+            for _module, _key, _pid, _generation, worker
+            in _restore_light_workflow_modules.entries
+        )
+        assert unrelated.is_alive()
+        for result_delivery, unrelated_key in (
+            (result_delivery_a, unrelated_key_a),
+            (result_delivery_b, unrelated_key_b),
+        ):
+            with result_delivery._OUTBOX_DRAIN_SCHEDULE_LOCK:
+                assert result_delivery._OUTBOX_DRAIN_SCHEDULED[unrelated_key] == (
+                    unrelated_scheduler_state
+                )
+    finally:
+        unrelated_release.set()
+        threading.Thread.join(unrelated, timeout=1)
+        for result_delivery, unrelated_key in (
+            (result_delivery_a, unrelated_key_a),
+            (locals().get("result_delivery_b"), unrelated_key_b),
+        ):
+            if result_delivery is not None:
+                with result_delivery._OUTBOX_DRAIN_SCHEDULE_LOCK:
+                    result_delivery._OUTBOX_DRAIN_SCHEDULED.pop(unrelated_key, None)
+
+
 def test_workflow_result_payload_uses_shared_canonical_event_key(monkeypatch):
     streamlit_api = _load_light_workflow_streamlit_api()
     identity_module = importlib.import_module("workflow.result_identity")
@@ -5699,19 +5946,16 @@ def test_workflow_result_outbox_scheduler_coalesces_per_path(monkeypatch, tmp_pa
     first_path = tmp_path / "first.db"
     second_path = tmp_path / "second.db"
 
-    try:
-        assert streamlit_api._schedule_workflow_result_outbox_drain(
-            path=first_path
-        ) is True
-        assert streamlit_api._schedule_workflow_result_outbox_drain(
-            path=first_path
-        ) is False
-        assert streamlit_api._schedule_workflow_result_outbox_drain(
-            path=second_path
-        ) is True
-        assert [call["path"] for call in started] == [first_path, second_path]
-    finally:
-        streamlit_api._reset_outbox_drain_scheduler_after_fork()
+    assert streamlit_api._schedule_workflow_result_outbox_drain(
+        path=first_path
+    ) is True
+    assert streamlit_api._schedule_workflow_result_outbox_drain(
+        path=first_path
+    ) is False
+    assert streamlit_api._schedule_workflow_result_outbox_drain(
+        path=second_path
+    ) is True
+    assert [call["path"] for call in started] == [first_path, second_path]
 
 
 @pytest.mark.parametrize("failure_stage", ["open", "list"])
@@ -5757,22 +6001,19 @@ def test_outbox_scheduler_retries_transient_failure_without_new_trigger(
         "_append_workflow_result_payload_to_primary",
         lambda queued: delivered.append(queued["event_key"]),
     )
+    assert streamlit_api._schedule_workflow_result_outbox_drain(
+        path=outbox_path
+    ) is True
+    assert _wait_until(
+        lambda: delivered == [payload["event_key"]],
+        timeout=3,
+    )
+    probe = real_outbox(str(outbox_path))
     try:
-        assert streamlit_api._schedule_workflow_result_outbox_drain(
-            path=outbox_path
-        ) is True
-        assert _wait_until(
-            lambda: delivered == [payload["event_key"]],
-            timeout=3,
-        )
-        probe = real_outbox(str(outbox_path))
-        try:
-            assert probe.count() == 0
-        finally:
-            probe.close()
-        assert failures_remaining == 0
+        assert probe.count() == 0
     finally:
-        streamlit_api._reset_outbox_drain_scheduler_after_fork()
+        probe.close()
+    assert failures_remaining == 0
 
 
 @pytest.mark.parametrize("backlog_size", [101, 512])
@@ -7001,6 +7242,7 @@ def test_workflow_manager_text_to_sql_serializes_typed_terminal_outcome(
         },
         "audit": {"status": "logged", "log_id": "audit-1"},
         "persistence": {"status": "not_attempted"},
+        "ambiguity": None,
     })
 
     class WorkflowDef:
@@ -7170,7 +7412,7 @@ def test_workflow_manager_stored_terminal_validation_fails_closed(
     status = manager.get_workflow_status("run-1")
     artifacts = manager.get_workflow_artifacts("run-1")
 
-    assert status.status == "unknown_legacy"
+    assert status.status == "invalid_terminal"
     assert status.terminal_outcome is None
     assert artifacts.terminal_outcome is None
 
@@ -7398,7 +7640,6 @@ def test_streamlit_start_uses_typed_client_and_opaque_state(monkeypatch):
         include_explanation=True,
         validate_schema=False,
         dry_run_only=True,
-        use_schema_suggestions=True,
     )
 
     request = captured["request"]
@@ -7411,214 +7652,35 @@ def test_streamlit_start_uses_typed_client_and_opaque_state(monkeypatch):
     assert "selected_dsn" not in session_state
 
 
-# ---------------------------------------------------------------------------
-# T12-pipeline: pipeline-конфиг и профиль
-# ---------------------------------------------------------------------------
-
-def test_sql_verification_step_has_condition_on_empty_sql():
-    """T12: шаг sql_verification должен иметь condition, проверяющий непустой sql из sql_generation."""
-    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
-    WorkflowDefinition = models.WorkflowDefinition
-
-    workflow = WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    verification_step = next(
-        step for step in workflow.steps if step.id == "sql_verification"
-    )
-
-    assert verification_step.condition is not None, (
-        "sql_verification должен иметь condition для guard пустого SQL"
-    )
-    assert "sql_generation.sql" in verification_step.condition, (
-        "condition должен проверять поле sql из sql_generation"
-    )
-
-
-def test_sql_verification_step_receives_semantic_context():
-    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    verification_step = next(
-        step for step in workflow.steps if step.id == "sql_verification"
-    )
-    task = verification_step.task
-
-    assert "{query}" in task
-    assert "{intent_extraction_step}" in task
-    assert "{schema_linking_step}" in task
-    for required_check in (
-        "mandatory filters",
-        "aggregation",
-        "grouping",
-        "cardinality",
-        "ordering",
-        "limit",
-    ):
-        assert required_check in task.lower()
-
-
-def test_text_to_sql_workflow_does_not_retry_timed_out_model_steps():
-    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    steps = {step.id: step for step in workflow.steps}
-
-    assert workflow.global_retry_policy.max_retries == 0
-    for step_id in (
-        "nlu_processing",
-        "intent_extraction_step",
-        "schema_linking_step",
-        "sql_generation",
-        "sql_verification",
-    ):
-        assert steps[step_id].retry_policy.max_retries == 0
-    assert steps["nlu_processing"].timeout <= 10
-    assert steps["sql_verification"].output_retry_policy["max_iterations"] == 1
-
-
-def test_sql_generation_step_requires_successful_schema_linking():
-    """P-2: join_success=False не должен пускать пайплайн в успешную генерацию SQL."""
-    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
-    WorkflowDefinition = models.WorkflowDefinition
-
-    workflow = WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    generation_step = next(
-        step for step in workflow.steps if step.id == "sql_generation"
-    )
-
-    assert generation_step.condition == "{schema_linking_step.sql_generation_allowed}"
-    skip_output = generation_step.metadata.get("skip_output")
-    assert skip_output is not None
-    assert skip_output["sql"] == ""
-    assert skip_output["error"] == "schema_linking_join_failed"
-
-
-def test_sql_generation_join_failure_condition_writes_explicit_skip_output():
-    """P-2: при join_success=False downstream видит явный failure payload, а не успешный SQL."""
-    WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
-    WorkflowContext = sys.modules["workflow.models"].WorkflowContext
-    WorkflowDefinition = sys.modules["workflow.models"].WorkflowDefinition
-
-    workflow = WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    generation_step = next(
-        step for step in workflow.steps if step.id == "sql_generation"
-    )
-    engine = object.__new__(WorkflowEngine)
-    context = WorkflowContext(
-        variables={},
-        step_outputs={
-            "schema_linking_step": {
-                "join_success": False,
-                "sql_generation_allowed": False,
-                "schema_info": {},
-                "joins": [],
-            },
-            "schema_linking_step.sql_generation_allowed": False,
-        },
-    )
-
-    assert engine._should_skip_step_by_condition(generation_step, context) is True
-    assert context.step_outputs["sql_generation"]["sql"] == ""
-    assert context.step_outputs["sql_generation.error"] == "schema_linking_join_failed"
-
-
-def test_sql_generation_stays_blocked_when_schema_linking_is_disabled():
-    """Legacy schema-disable payload remains fail-closed."""
-    WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
-    WorkflowContext = sys.modules["workflow.models"].WorkflowContext
-    WorkflowDefinition = sys.modules["workflow.models"].WorkflowDefinition
-
-    workflow = WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    generation_step = next(
-        step for step in workflow.steps if step.id == "sql_generation"
-    )
-    engine = object.__new__(WorkflowEngine)
-    context = WorkflowContext(
-        variables={},
-        step_outputs={
-            "schema_linking_step": {
-                "status": "skipped_disabled",
-                "decision": "ABSTAIN",
-                "terminal_reason_code": "SCHEMA_GROUNDING_FAILED",
-                "join_success": False,
-                "sql_generation_allowed": False,
-                "schema_info": {},
-                "joins": [],
-            },
-            "schema_linking_step.sql_generation_allowed": False,
-        },
-    )
-
-    assert engine._should_skip_step_by_condition(generation_step, context) is True
-    assert context.step_outputs["sql_generation"]["sql"] == ""
-    assert context.step_outputs["sql_generation.error"] == "schema_linking_join_failed"
-
-
-def test_sql_verification_step_skip_output_has_rejected_status():
-    """T12: при пропуске sql_verification должен возвращать verification_status=Rejected,
-    чтобы db_audit тоже пропустился через свой condition."""
-    models = importlib.import_module("tests.workflow_test_utils").load_light_workflow_models()
-    WorkflowDefinition = models.WorkflowDefinition
-
-    workflow = WorkflowDefinition.from_yaml(
-        Path("workflow_pipelines/text_to_sql_pipeline.yaml")
-    )
-    verification_step = next(
-        step for step in workflow.steps if step.id == "sql_verification"
-    )
-
-    skip_output = verification_step.metadata.get("skip_output")
-    assert skip_output is not None, (
-        "sql_verification.metadata должен содержать skip_output"
-    )
-    assert skip_output.get("verification_status") == "Rejected", (
-        "skip_output.verification_status должен быть Rejected, "
-        "чтобы db_audit пропустился через свой condition"
-    )
-    assert "recommendations" in skip_output, (
-        "skip_output должен содержать ключ recommendations (контракт output_schema)"
-    )
-
-
 def test_evaluate_condition_empty_sql_returns_false():
-    """T12: _evaluate_condition с пустым sql_generation.sql должен вернуть False."""
+    """db_audit не запускается, если Typed solver не вернул SQL."""
     WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
     WorkflowContext = sys.modules["workflow.models"].WorkflowContext
 
     engine = object.__new__(WorkflowEngine)
-    # sql_generation вернул пустую строку
     context = WorkflowContext(
         variables={},
-        step_outputs={"sql_generation": {"sql": "", "description": "failed"}},
+        step_outputs={"sql_solving": {"sql": "", "description": "failed"}},
     )
-    result = engine._evaluate_condition('{sql_generation.sql} != ""', context)
+    result = engine._evaluate_condition('{sql_solving.sql} != ""', context)
     assert result is False, (
-        "Пустой sql должен приводить к False, чтобы sql_verification пропустился"
+        "Пустой sql должен приводить к False, чтобы db_audit пропустился"
     )
 
 
 def test_evaluate_condition_nonempty_sql_returns_true():
-    """T12: _evaluate_condition с непустым sql_generation.sql должен вернуть True."""
+    """db_audit запускается, если Typed solver вернул SQL."""
     WorkflowEngine = _load_light_workflow_engine().WorkflowEngine
     WorkflowContext = sys.modules["workflow.models"].WorkflowContext
 
     engine = object.__new__(WorkflowEngine)
     context = WorkflowContext(
         variables={},
-        step_outputs={"sql_generation": {"sql": "SELECT 1", "description": "ok"}},
+        step_outputs={"sql_solving": {"sql": "SELECT 1", "description": "ok"}},
     )
-    result = engine._evaluate_condition('{sql_generation.sql} != ""', context)
+    result = engine._evaluate_condition('{sql_solving.sql} != ""', context)
     assert result is True, (
-        "Непустой sql должен приводить к True, чтобы sql_verification выполнился"
+        "Непустой sql должен приводить к True, чтобы db_audit выполнился"
     )
 
 
@@ -7635,3 +7697,505 @@ def test_db_audit_agent_prompt_has_no_format_placeholder_max_rows():
         "prompt_templates не должен содержать {max_rows} — "
         "этот плейсхолдер никогда не подставляется в instructions"
     )
+
+
+def _w0_08_manager(streamlit_api, run_id, workflow_name):
+    manager = object.__new__(streamlit_api.WorkflowManager)
+    manager.active_runs = {
+        run_id: {
+            "run_id": run_id,
+            "workflow_name": workflow_name,
+            "status": "running",
+            "start_time": streamlit_api.datetime.now(),
+            "parameters": {},
+        }
+    }
+    manager.run_callbacks = {}
+    manager._notify_progress = lambda *args, **kwargs: None
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("failure_mode", "error_text"),
+    [
+        ("yaml", "yaml import failed " + "x" * 800),
+        ("engine", "engine import failed " + "y" * 800),
+        ("missing_terminal", "Text-to-SQL result is missing terminal_outcome"),
+    ],
+)
+def test_w0_08_text_to_sql_early_failures_persist_typed_terminal(
+    monkeypatch,
+    tmp_path,
+    failure_mode,
+    error_text,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = f"w0-08-{failure_mode}"
+    manager = _w0_08_manager(streamlit_api, run_id, "text_to_sql_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+    appended = []
+
+    class WorkflowDef:
+        name = "text_to_sql_pipeline"
+        steps = []
+        metadata = {"category": "text_to_sql"}
+
+    if failure_mode == "yaml":
+        monkeypatch.setattr(
+            streamlit_api.WorkflowDefinition,
+            "from_yaml",
+            staticmethod(lambda _path: (_ for _ in ()).throw(ImportError(error_text))),
+        )
+    else:
+        monkeypatch.setattr(
+            streamlit_api.WorkflowDefinition,
+            "from_yaml",
+            staticmethod(lambda _path: WorkflowDef()),
+        )
+
+        class _Engine:
+            async def execute_workflow_from_yaml(self, *_args, **_kwargs):
+                if failure_mode == "engine":
+                    raise ImportError(error_text)
+                return types.SimpleNamespace(
+                    status=streamlit_api.WorkflowStatus.COMPLETED,
+                    workflow_id="w0-08-missing-terminal",
+                    final_output={"unexpected": "output"},
+                    step_results={},
+                    terminal_outcome=None,
+                )
+
+        manager.engine = _Engine()
+
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or True,
+    )
+
+    with pytest.raises(Exception):
+        manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1")
+
+    assert len(appended) == 1
+    terminal = appended[0][1]["terminal_outcome"]
+    assert terminal["status"] == "failed"
+    assert terminal["reason_code"] == "MANDATORY_STEP_NOT_COMPLETED"
+    assert terminal["error"] == streamlit_api.result_delivery.bound_text_to_sql_error(
+        error_text
+    )
+    assert appended[0][1]["artifacts"]["terminal_outcome"] == terminal
+
+
+def test_w0_08_no_runtime_terminal_includes_empty_result_review():
+    streamlit_api = _load_light_workflow_streamlit_api()
+
+    terminal = streamlit_api._build_text_to_sql_no_runtime_terminal(
+        run_id="w0-08-no-runtime-result-review",
+        status="failed",
+        reason_code="MANDATORY_STEP_NOT_COMPLETED",
+        error="workflow stopped before completion",
+    )
+
+    assert terminal["result_review"] == {}
+
+
+def test_w0_08_generic_early_failure_keeps_legacy_result_shape(monkeypatch, tmp_path):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = "w0-08-generic-yaml"
+    manager = _w0_08_manager(streamlit_api, run_id, "generic_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: generic_pipeline\nsteps: []\n", encoding="utf-8")
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: (_ for _ in ()).throw(ImportError("generic yaml failed"))),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or True,
+    )
+
+    with pytest.raises(ImportError, match="generic yaml failed"):
+        manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1")
+
+    assert len(appended) == 1
+    assert appended[0][1]["terminal_outcome"] is None
+
+
+@pytest.mark.parametrize("source_status", ["failed", "abstained", "cancelled", "timed_out"])
+def test_w0_08_persistence_fallback_preserves_non_success_terminal(
+    monkeypatch,
+    tmp_path,
+    source_status,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = f"w0-08-preserve-{source_status}"
+    manager = _w0_08_manager(streamlit_api, run_id, "text_to_sql_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+    source_terminal = streamlit_api.TextToSqlTerminalResult.from_mapping(
+        _terminal_contract_payload(source_status, run_id)
+    ).to_mapping()
+
+    class WorkflowDef:
+        name = "text_to_sql_pipeline"
+        steps = []
+        metadata = {"category": "text_to_sql"}
+
+    class _Engine:
+        async def execute_workflow_from_yaml(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status=streamlit_api.WorkflowStatus.COMPLETED,
+                workflow_id="w0-08-source-terminal",
+                final_output=source_terminal,
+                step_results={},
+                terminal_outcome=source_terminal,
+            )
+
+    manager.engine = _Engine()
+    append_results = iter([False, True])
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: WorkflowDef()),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or next(append_results),
+    )
+
+    with pytest.raises(streamlit_api.WorkflowExecutionError, match="WORKFLOW_RESULT"):
+        manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1")
+
+    assert len(appended) == 2
+    fallback_args, fallback = appended[1]
+    assert fallback["terminal_outcome"] == source_terminal
+    assert fallback["artifacts"]["terminal_outcome"] == source_terminal
+    assert fallback["artifacts"]["metadata"]["result_persistence_diagnostic"] == {
+        "reason_code": "RESULT_PERSISTENCE_FAILED",
+        "error": "Не удалось записать terminal WORKFLOW_RESULT для workflow",
+    }
+    durable_payload = streamlit_api._build_workflow_result_event_payload(
+        run_id,
+        source_terminal,
+        fallback_args[2],
+        error=fallback_args[3],
+        artifacts=fallback["artifacts"],
+        snapshot=fallback["snapshot"],
+        terminal_outcome=source_terminal,
+    )
+    assert durable_payload["artifacts"]["metadata"][
+        "result_persistence_diagnostic"
+    ] == fallback["artifacts"]["metadata"]["result_persistence_diagnostic"]
+
+
+def test_w0_08_persistence_fallback_keeps_result_failure_primary_for_success(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = "w0-08-success-fallback"
+    manager = _w0_08_manager(streamlit_api, run_id, "text_to_sql_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+    source_terminal = streamlit_api.TextToSqlTerminalResult.from_mapping(
+        _terminal_contract_payload("succeeded", run_id)
+    ).to_mapping()
+
+    class WorkflowDef:
+        name = "text_to_sql_pipeline"
+        steps = []
+        metadata = {"category": "text_to_sql"}
+
+    class _Engine:
+        async def execute_workflow_from_yaml(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status=streamlit_api.WorkflowStatus.COMPLETED,
+                workflow_id="w0-08-success-terminal",
+                final_output=source_terminal,
+                step_results={},
+                terminal_outcome=source_terminal,
+            )
+
+    manager.engine = _Engine()
+    append_results = iter([False, True])
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: WorkflowDef()),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or next(append_results),
+    )
+
+    with pytest.raises(streamlit_api.WorkflowExecutionError, match="WORKFLOW_RESULT"):
+        manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1")
+
+    assert len(appended) == 2
+    fallback = appended[1][1]
+    assert fallback["terminal_outcome"]["status"] == "failed"
+    assert fallback["terminal_outcome"]["reason_code"] == "RESULT_PERSISTENCE_FAILED"
+    assert fallback["terminal_outcome"]["result_review"] == source_terminal["result_review"]
+
+
+def test_w0_08_missing_terminal_persistence_failure_is_primary(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = "w0-08-missing-terminal-persistence"
+    manager = _w0_08_manager(streamlit_api, run_id, "text_to_sql_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+
+    class WorkflowDef:
+        name = "text_to_sql_pipeline"
+        steps = []
+        metadata = {"category": "text_to_sql"}
+
+    class _Engine:
+        async def execute_workflow_from_yaml(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status=streamlit_api.WorkflowStatus.COMPLETED,
+                workflow_id="w0-08-missing-terminal-persistence",
+                final_output={"unexpected": "output"},
+                step_results={},
+                terminal_outcome=None,
+            )
+
+    manager.engine = _Engine()
+    append_results = iter([False, True])
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: WorkflowDef()),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or next(append_results),
+    )
+
+    with pytest.raises(streamlit_api.WorkflowExecutionError, match="WORKFLOW_RESULT"):
+        manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1")
+
+    assert len(appended) == 2
+    fallback = appended[1][1]["terminal_outcome"]
+    assert fallback["status"] == "failed"
+    assert fallback["reason_code"] == "RESULT_PERSISTENCE_FAILED"
+    assert fallback["persistence"] == {
+        "status": "error",
+        "error": "Не удалось записать terminal WORKFLOW_RESULT для workflow",
+    }
+    assert fallback["result_review"] == {}
+
+
+def test_w0_08_persistence_race_keeps_authoritative_winner_without_duplicate(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = "w0-08-race-winner"
+    manager = _w0_08_manager(streamlit_api, run_id, "text_to_sql_pipeline")
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+    source_terminal = streamlit_api.TextToSqlTerminalResult.from_mapping(
+        _terminal_contract_payload("failed", run_id)
+    ).to_mapping()
+    winner_terminal = streamlit_api.TextToSqlTerminalResult.from_mapping(
+        _terminal_contract_payload("cancelled", run_id)
+    ).to_mapping()
+    winner = streamlit_api._build_workflow_result_event_payload(
+        run_id,
+        winner_terminal,
+        "cancelled",
+        error=winner_terminal["error"],
+        artifacts={"terminal_outcome": winner_terminal, "final_output": winner_terminal},
+        snapshot={"workflow_name": "text_to_sql_pipeline"},
+        terminal_outcome=winner_terminal,
+    )
+
+    class WorkflowDef:
+        name = "text_to_sql_pipeline"
+        steps = []
+        metadata = {"category": "text_to_sql"}
+
+    class _Engine:
+        async def execute_workflow_from_yaml(self, *_args, **_kwargs):
+            return types.SimpleNamespace(
+                status=streamlit_api.WorkflowStatus.COMPLETED,
+                workflow_id="w0-08-race-source",
+                final_output=source_terminal,
+                step_results={},
+                terminal_outcome=source_terminal,
+            )
+
+    manager.engine = _Engine()
+    append_results = iter([
+        False,
+        streamlit_api._WorkflowResultResolution(True, False, winner),
+    ])
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: WorkflowDef()),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or next(append_results),
+    )
+
+    assert manager._execute_workflow_in_context(run_id, workflow_file, {}, "session-1") == winner
+    assert len(appended) == 2
+    assert manager.active_runs[run_id]["terminal_outcome"] == winner_terminal
+
+
+def test_w0_08_fresh_supervisor_child_persists_yaml_failure_terminal(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    manager = object.__new__(streamlit_api.WorkflowManager)
+    manager.active_runs = {}
+    manager.run_callbacks = {}
+    manager._notify_progress = lambda *args, **kwargs: None
+    run_id = "w0-08-fresh-child-yaml"
+    run_incarnation = "w0-08-fresh-child-incarnation"
+    workflow_file = tmp_path / "workflow.yaml"
+    workflow_file.write_text("invalid: [yaml", encoding="utf-8")
+    error_text = "fresh child yaml import failed"
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(lambda _path: (_ for _ in ()).throw(ImportError(error_text))),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or True,
+    )
+
+    with pytest.raises(ImportError, match=error_text):
+        manager._execute_workflow_in_context(
+            run_id,
+            workflow_file,
+            {},
+            "session-1",
+            run_incarnation=run_incarnation,
+            reserved_workflow_name="text_to_sql_pipeline",
+        )
+
+    assert len(appended) == 1
+    terminal = appended[0][1]["terminal_outcome"]
+    assert terminal["status"] == "failed"
+    assert terminal["reason_code"] == "MANDATORY_STEP_NOT_COMPLETED"
+    assert terminal["error"] == error_text
+    assert manager.active_runs[run_id]["run_incarnation"] == run_incarnation
+    assert manager.active_runs[run_id]["workflow_name"] == "text_to_sql_pipeline"
+    assert manager.active_runs[run_id]["workflow_result_event_appended"] is True
+
+    with pytest.raises(ImportError, match=error_text):
+        manager._execute_workflow_in_context(
+            run_id,
+            workflow_file,
+            {},
+            "session-1",
+            run_incarnation=run_incarnation,
+            reserved_workflow_name="text_to_sql_pipeline",
+        )
+    assert len(appended) == 1
+
+
+def test_w0_08_supervisor_entry_passes_reserved_workflow_name(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    captured = {}
+
+    class ChildManager:
+        def __init__(self, *, use_enhanced):
+            captured["use_enhanced"] = use_enhanced
+
+        def _run_workflow_thread(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+    telemetry = types.ModuleType("telemetry")
+    telemetry.get_telemetry_manager = lambda enabled=False: None
+    monkeypatch.setitem(sys.modules, "telemetry", telemetry)
+    monkeypatch.setattr(streamlit_api, "WorkflowManager", ChildManager)
+    monkeypatch.setattr(streamlit_api, "_setup_comprehensive_logging_from_env", lambda: None)
+    monkeypatch.setattr(streamlit_api, "_setup_process_run_log_capture", lambda _run_id: None)
+    workflow_file = (tmp_path / "workflow.yaml").resolve()
+    workflow_file.write_text("name: text_to_sql_pipeline\nsteps: []\n", encoding="utf-8")
+    spec = {
+        "spec_version": 1,
+        "workflow_path": str(workflow_file),
+        "parameters": {},
+        "session_id": "session-1",
+        "client_id": None,
+        "use_enhanced": True,
+        "enable_telemetry": False,
+        "run_incarnation": "w0-08-entry-incarnation",
+        "deadline_at_ms": int(time.time() * 1000) + 60_000,
+    }
+    claim = {
+        "supervisor_id": "w0-08-supervisor",
+        "attempt_generation": 1,
+        "run_kind": "text_to_sql",
+        "workflow_name": "text_to_sql_pipeline",
+    }
+
+    streamlit_api._workflow_supervisor_process_entry("w0-08-entry", spec, claim)
+
+    assert captured["kwargs"]["reserved_workflow_name"] == "text_to_sql_pipeline"
+
+
+def test_w0_08_fresh_generic_yaml_failure_behavior_is_unchanged(
+    monkeypatch,
+    tmp_path,
+):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    manager = object.__new__(streamlit_api.WorkflowManager)
+    manager.active_runs = {}
+    manager.run_callbacks = {}
+    manager._notify_progress = lambda *args, **kwargs: None
+    appended = []
+    monkeypatch.setattr(
+        streamlit_api.WorkflowDefinition,
+        "from_yaml",
+        staticmethod(
+            lambda _path: (_ for _ in ()).throw(ImportError("generic yaml failed"))
+        ),
+    )
+    monkeypatch.setattr(
+        streamlit_api,
+        "_append_workflow_result_event",
+        lambda *args, **kwargs: appended.append((args, kwargs)) or True,
+    )
+
+    with pytest.raises(ImportError, match="generic yaml failed"):
+        manager._execute_workflow_in_context(
+            "w0-08-fresh-generic",
+            tmp_path / "workflow.yaml",
+            {},
+            "session-1",
+            run_incarnation="w0-08-fresh-generic-incarnation",
+            reserved_workflow_name="generic_pipeline",
+        )
+
+    assert manager.active_runs == {}
+    assert appended == []

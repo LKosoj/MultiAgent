@@ -148,6 +148,26 @@ class TestStepOutputArtifacts(unittest.TestCase):
         self.assertEqual(artifacts["video_generator"], ["97_shots/provider_jobs.json"])
         self.assertEqual(artifacts["artist_batch_shots"], ["97_shots/shots.json"])
 
+    def test_blockout_scene_builder_and_preview_artifacts_registered(self):
+        """ТЗ раздел 18.8: реестр артефактов болванки."""
+        from StoryBookManager.core.pipeline_runner import PipelineRunner
+
+        artifacts = PipelineRunner._step_output_artifacts()
+        self.assertEqual(
+            artifacts["blockout_scene_builder"],
+            [
+                "93_blockout/chains.json",
+                "93_blockout/scene_spec.json",
+                "93_blockout/asset_map.json",
+                "93_blockout/report.json",
+            ],
+        )
+        self.assertEqual(
+            artifacts["blockout_preview"],
+            ["93_blockout/preview/blockout_all.mp4", "93_blockout/preview/contact_sheet.png"],
+        )
+        self.assertNotIn("blockout_renderer", artifacts)
+
     def test_metadata_override_precedence(self):
         from StoryBookManager.core.pipeline_runner import PipelineRunner
 

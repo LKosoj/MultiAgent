@@ -361,7 +361,7 @@ def generate_hybrid_schema(ui_config: Dict[str, Any], data: Any, schema_type: st
 VALID_WIDGETS = {
     "entry", "text_area", "combobox", "spinbox", "checkbox",
     "list_editor", "nested_group", "universal_array_editor",
-    "dropdown_selector", "date_picker",
+    "dropdown_selector", "date_picker", "asset_reference",
 }
 
 VALID_INTERFACES = {"tabs", "dropdown_selector", "list", "accordion"}
@@ -752,6 +752,8 @@ class WidgetFactory:
             return self._create_universal_array_editor(field_info, value)
         elif widget_type == "dropdown_selector":
             return self._create_dropdown_selector(field_info, value)
+        elif widget_type == "asset_reference":
+            return self._create_asset_reference(field_info, value)
         # Специализированных редакторов больше нет — используем универсальный
         else:
             # Fallback к простому entry
@@ -901,7 +903,53 @@ class WidgetFactory:
             "set_value": lambda v: widget_var.set(str(v or "")),
             "validate": lambda: self._validate_enum(widget_var.get(), field_info)
         }
-    
+
+    def _create_asset_reference(self, field_info: Dict[str, Any], value: Any) -> Dict[str, Any]:
+        """Создает выбор объекта из библиотеки болванки (раздел 18.9 ТЗ).
+
+        В отличие от combobox список значений берётся не из ui_config.json, а
+        из index.json библиотеки объектов (custom_tools.storybook.blockout_assets),
+        путь к которой резолвится через blockout_assets_root(), а не константой.
+        Дополнительно всегда доступны три зарезервированных ID заглушек и
+        текущее значение поля, даже если его нет в индексе (раздел 9.4).
+        """
+        config = field_info.get("config", {})
+
+        try:
+            from custom_tools.storybook.blockout_assets import read_index, RESERVED_PROXY_IDS
+            library_ids = [
+                obj.get("id") for obj in read_index().get("objects", [])
+                if isinstance(obj, dict) and obj.get("id")
+            ]
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать библиотеку объектов болванки: {e}")
+            library_ids = []
+            RESERVED_PROXY_IDS = ()
+
+        values = list(dict.fromkeys([*library_ids, *RESERVED_PROXY_IDS]))
+
+        current_value = str(value or "")
+        if current_value and current_value not in values:
+            values.insert(0, current_value)
+
+        widget_var = tk.StringVar(value=current_value)
+        widget_var.trace_add('write', lambda *args: self.on_change())
+
+        widget = ttk.Combobox(
+            self.parent,
+            textvariable=widget_var,
+            values=values,
+            width=config.get("width", 30),
+            state="readonly",
+        )
+
+        return {
+            "widget": widget,
+            "get_value": lambda: widget_var.get(),
+            "set_value": lambda v: widget_var.set(str(v or "")),
+            "validate": lambda: True,
+        }
+
     def _create_spinbox(self, field_info: Dict[str, Any], value: Any) -> Dict[str, Any]:
         """Создает spinbox для чисел"""
         schema = field_info.get("schema", {})

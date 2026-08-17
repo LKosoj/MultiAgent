@@ -18,6 +18,7 @@ from smolagents.models import ChatMessage, MessageRole
 import re
 from collections import Counter
 import math
+import threading
 import numpy as np
 
 from agent_command import model_summary, model_big
@@ -68,6 +69,7 @@ class MemoryManager:
     """Гибридный менеджер памяти для SmolAgents, использующий SQLite + ChromaDB"""
     
     _shared_db_handler = None  # Общий DatabaseHandler для всех экземпляров
+    _shared_db_handler_lock = threading.Lock()
     
     def __init__(self, 
                  database_handler: DatabaseHandler = None,
@@ -82,8 +84,10 @@ class MemoryManager:
         if database_handler:
             self.db_handler = database_handler
         elif MemoryManager._shared_db_handler is None:
-            MemoryManager._shared_db_handler = DatabaseHandler()
-            self.db_handler = MemoryManager._shared_db_handler
+            with MemoryManager._shared_db_handler_lock:
+                if MemoryManager._shared_db_handler is None:
+                    MemoryManager._shared_db_handler = DatabaseHandler()
+                self.db_handler = MemoryManager._shared_db_handler
         else:
             self.db_handler = MemoryManager._shared_db_handler
         
@@ -566,13 +570,16 @@ class MemoryManager:
 
 # Глобальный синглтон для MemoryManager
 _global_memory_manager = None
+_global_memory_manager_lock = threading.Lock()
 
 def get_memory_manager():
     """Возвращает глобальный экземпляр MemoryManager (синглтон)"""
     global _global_memory_manager
     if _global_memory_manager is None:
-        print("🔧 Инициализация глобального MemoryManager...")
-        _global_memory_manager = MemoryManager()
+        with _global_memory_manager_lock:
+            if _global_memory_manager is None:
+                print("🔧 Инициализация глобального MemoryManager...")
+                _global_memory_manager = MemoryManager()
     return _global_memory_manager
 
 # Для обратной совместимости предоставляем также глобальный объект

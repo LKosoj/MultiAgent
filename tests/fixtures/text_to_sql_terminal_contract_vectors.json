@@ -31,13 +31,52 @@
       "status": "saved",
       "filename": "query.md",
       "path": "/tmp/query.md"
-    }
+    },
+    "result_review": {},
+    "ambiguity": null
   },
   "cases": [
     {
       "name": "valid_baseline_array_row",
       "valid": true,
       "overrides": {}
+    },
+    {
+      "name": "valid_stale_required_evidence_abstention",
+      "valid": true,
+      "overrides": {
+        "status": "abstained",
+        "reason_code": "STALE_REQUIRED_EVIDENCE",
+        "executed": false,
+        "dry_run": false,
+        "audited": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": null,
+        "execution": {"$replace": {}},
+        "audit": {"$replace": {}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      }
+    },
+    {
+      "name": "valid_deterministic_check_rejection",
+      "valid": true,
+      "overrides": {
+        "status": "abstained",
+        "reason_code": "DETERMINISTIC_CHECK_REJECTED",
+        "approved": false,
+        "executed": false,
+        "dry_run": false,
+        "audited": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": null,
+        "execution": {"$replace": {}},
+        "audit": {"$replace": {}},
+        "persistence": {"$replace": {"status": "not_attempted"}}
+      }
     },
     {
       "name": "valid_object_row",
@@ -283,6 +322,31 @@
       }
     },
     {
+      "name": "valid_research_ambiguous_abstention",
+      "valid": true,
+      "overrides": {
+        "status": "abstained",
+        "reason_code": "RESEARCH_AMBIGUOUS",
+        "sql": "",
+        "generated": false,
+        "approved": false,
+        "executed": false,
+        "audited": false,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error": null,
+        "execution": {"$replace": {}},
+        "audit": {"$replace": {}},
+        "persistence": {"$replace": {"status": "not_attempted"}},
+        "ambiguity": {
+          "interpretations": ["First reading.", "Second reading."],
+          "citation_evidence_ids": ["evidence-1"],
+          "missing_distinguishing_fact": "The definition is absent."
+        }
+      }
+    },
+    {
       "name": "valid_execution_failed_after_db_attempt",
       "valid": true,
       "overrides": {
@@ -332,6 +396,24 @@
         "persistence": {"$replace": {"status": "not_attempted"}}
       },
       "invalid_overrides": {"data": [[1]], "columns": ["value"], "rows_affected": 1}
+    },
+    {
+      "reason_code": "RESEARCH_TOOL_FAILURE",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "RESEARCH_TOOL_FAILURE", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "research tool failed", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"executed": true}
+    },
+    {
+      "reason_code": "RESEARCH_PROTOCOL_FAILURE",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "RESEARCH_PROTOCOL_FAILURE", "approved": false, "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "research outcome invalid", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"audit": {"$replace": {"status": "logged", "log_id": "audit-vector-1"}}}
+    },
+    {
+      "reason_code": "EXECUTION_UNKNOWN",
+      "profile": "no_runtime",
+      "valid_overrides": {"status": "failed", "reason_code": "EXECUTION_UNKNOWN", "executed": false, "audited": false, "data": [], "columns": [], "rows_affected": 0, "error": "finalizer outcome is unknown", "execution": {"$replace": {}}, "audit": {"$replace": {}}, "persistence": {"$replace": {"status": "not_attempted"}}},
+      "invalid_overrides": {"execution": {"$replace": {"success": false}}}
     },
     {
       "reason_code": "EXECUTOR_CONTRACT_INVALID",
@@ -484,6 +566,12 @@
       "reason_code": "RESULT_PERSISTENCE_FAILED",
       "profile": "result_failure",
       "valid_overrides": {"status": "failed", "reason_code": "RESULT_PERSISTENCE_FAILED", "error": "result persistence failed", "persistence": {"$replace": {"status": "error", "error": "result persistence failed"}}},
+      "invalid_overrides": {"persistence": {"$replace": {"status": "not_attempted"}}}
+    },
+    {
+      "reason_code": "RESULT_REVIEW_FAILED",
+      "profile": "result_failure",
+      "valid_overrides": {"status": "failed", "reason_code": "RESULT_REVIEW_FAILED", "error": "result review failed", "persistence": {"$replace": {"status": "error", "error": "result review failed"}}},
       "invalid_overrides": {"persistence": {"$replace": {"status": "not_attempted"}}}
     },
     {

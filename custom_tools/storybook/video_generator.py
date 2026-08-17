@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Импорт общего функционала для генераторов видео
 from custom_tools.storybook.video_generator_common import (
+    _VIDEO_MODEL_CAPABILITIES_REGISTRY,
+    parse_duration_seconds_from_timing,
     update_shots_with_descriptions,
     sync_items_to_memory
 )
@@ -40,6 +42,7 @@ from custom_tools.storybook.video_generator_aitunnel_jobs import (
     _hash_text,
     _new_provider_job,
 )
+from custom_tools.storybook.video_generator_aitunnel_media import _select_best_supported_duration
 
 # Импорты из проекта
 try:
@@ -52,9 +55,13 @@ except ImportError:
 ak = os.getenv("KLING_API_KEY")
 sk = os.getenv("KLING_API_SECRET_KEY")
 _KLING_PROVIDER_NAME = "kling"
-_KLING_MODEL_NAME = "kling-v2-1"
-_KLING_MODE = "pro"
-_KLING_ASPECT_RATIO = "16:9"
+# Централизованный реестр возможностей видеомоделей (раздел 6.1 ТЗ): значение
+# живёт только в _VIDEO_MODEL_CAPABILITIES_REGISTRY, эти имена — производные,
+# чтобы не переписывать десятки мест использования констант ниже по файлу.
+_KLING_CAPS = _VIDEO_MODEL_CAPABILITIES_REGISTRY["video_generator_tool"]
+_KLING_MODEL_NAME = _KLING_CAPS["model"]
+_KLING_MODE = _KLING_CAPS["mode"]
+_KLING_ASPECT_RATIO = _KLING_CAPS["aspect_ratio"]
 
 
 class _KlingPollTimeoutError(Exception):
@@ -179,7 +186,13 @@ def video_generator_tool(
             logger.info("📝 Этап 1: Анализ и обновление описаний изображений")
             descriptions_updated = update_shots_with_descriptions(shots_file_path, items_list, force_update_prompts, skip_prompt_enhancement)
             
-            if descriptions_updated:
+            if descriptions_updated < 0:
+                # Запись shots.json не удалась (см. журнал
+                # update_shots_with_descriptions) — items_list в памяти уже
+                # содержит обновления, перечитывать диск нельзя: там
+                # осталась устаревшая версия, это откатило бы их.
+                logger.error(f"❌ Не удалось сохранить обновлённые описания в {shots_file_path}, используем данные из памяти")
+            elif descriptions_updated:
                 logger.info("🔄 Описания обновлены, перезагружаем данные из shots.json")
                 # Перезагружаем данные после обновления описаний
                 try:
@@ -392,7 +405,13 @@ def _generate_single_video(
         logger.info(f"📹 Используем только start изображение")
 
     try:
-        duration = _parse_duration_from_timing(timing)
+        # M-6: запрошенная длительность (из timing) идёт в хеш входа, а подогнанная
+        # под supported_durations модели — только в запрос к провайдеру и в
+        # resolved_duration журнала (раздел 6.1 ТЗ).
+        requested_duration = _parse_duration_from_timing(timing)
+        resolved_duration = _select_best_supported_duration(
+            requested_duration, _KLING_CAPS["supported_durations"]
+        )
         prompt_hash = _hash_text(str(video_prompt or ""))
         source_image_hashes = {
             "start_image": _hash_source_image(start_image),
@@ -413,7 +432,7 @@ def _generate_single_video(
             trusted_output_job
             and trusted_output_job.get("prompt_hash") == prompt_hash
             and trusted_output_job.get("model") == _KLING_MODEL_NAME
-            and trusted_output_job.get("resolved_duration") == duration
+            and trusted_output_job.get("resolved_duration") == resolved_duration
             and (trusted_output_job.get("resolved_size_params") or {}) == {
                 "mode": _KLING_MODE,
                 "aspect_ratio": _KLING_ASPECT_RATIO,
@@ -444,7 +463,7 @@ def _generate_single_video(
             model_name=f"{_KLING_MODEL_NAME}|{_KLING_MODE}|{_KLING_ASPECT_RATIO}",
             prompt_hash=prompt_hash,
             source_image_hashes=source_image_hashes,
-            requested_duration=duration,
+            requested_duration=requested_duration,
             requested_width=0,
             requested_height=0,
             seed=None,
@@ -465,7 +484,7 @@ def _generate_single_video(
                     input_hash=input_hash,
                     output_path=str(video_path),
                     resolved_size_params={"mode": _KLING_MODE, "aspect_ratio": _KLING_ASPECT_RATIO},
-                    resolved_duration=duration,
+                    resolved_duration=resolved_duration,
                     provider_name=_KLING_PROVIDER_NAME,
                 )
             )
@@ -546,7 +565,7 @@ def _generate_single_video(
                 "negative_prompt": "blurry, distorted, low quality, artifacts, watermark",
                 "cfg_scale": 0.5,
                 "mode": _KLING_MODE,
-                "duration": duration,
+                "duration": resolved_duration,
                 "aspect_ratio": _KLING_ASPECT_RATIO
             }
 
@@ -855,55 +874,21 @@ def _download_video(video_url: str, output_path: str) -> bool:
 
 def _parse_duration_from_timing(timing: str) -> int:
     """
-    Парсит строку timing и возвращает длительность в секундах.
-    Kling AI поддерживает только 5 или 10 секунд.
-    
+    Парсит строку timing и возвращает запрошенную длительность в секундах.
+
+    Подгонка под сетку, поддерживаемую Kling AI, здесь больше не выполняется:
+    результат идёт как есть в _build_input_hash (M-6, раздел 6.1 ТЗ), а выбор
+    ближайшего поддерживаемого значения делает общая
+    _select_best_supported_duration() по набору из реестра возможностей.
+
     Args:
         timing: Строка вида "00:00 - 00:05" или "5s"
-        
+
     Returns:
-        5 или 10 секунд
+        Разобранная длительность в секундах
     """
-    try:
-        if " - " in timing:
-            start_str, end_str = timing.split(" - ")
-            start_seconds = _time_str_to_seconds(start_str.strip())
-            end_seconds = _time_str_to_seconds(end_str.strip())
-            duration = end_seconds - start_seconds
-        elif timing.endswith("s"):
-            duration = int(timing[:-1])
-        else:
-            duration = 5  # По умолчанию
-        
-        # Kling AI поддерживает только 5 или 10 секунд
-        if duration <= 5:
-            return 5
-        else:
-            return 10
-            
-    except Exception:
-        return 5  # По умолчанию 5 секунд
+    return int(parse_duration_seconds_from_timing(timing))
 
-
-def _time_str_to_seconds(time_str: str) -> int:
-    """
-    Конвертирует время в формате MM:SS в секунды.
-    """
-    try:
-        parts = time_str.split(":")
-        if len(parts) == 2:
-            minutes = int(parts[0])
-            seconds = int(parts[1])
-            return minutes * 60 + seconds
-        elif len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = int(parts[2])
-            return hours * 3600 + minutes * 60 + seconds
-        else:
-            return 0
-    except Exception:
-        return 0
 
 if __name__ == "__main__":
     ak = os.getenv("KLING_API_KEY")

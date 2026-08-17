@@ -9,8 +9,9 @@ import posixpath
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from .auth import Principal, principal_from_record, principal_to_record
 from workflow.result_identity import (
@@ -28,7 +29,7 @@ from workflow.state_files import acquire_sqlite_bundle, release_sqlite_bundle
 from workflow.models import TextToSqlTerminalResult, TextToSqlTerminalStatus
 
 
-AGUI_EVENT_STORE_SCHEMA_VERSION = 8
+AGUI_EVENT_STORE_SCHEMA_VERSION = 10
 WORKFLOW_RUN_SPEC_VERSION = 1
 WORKFLOW_RUN_SPEC_MAX_BYTES = 1024 * 1024
 
@@ -53,6 +54,10 @@ class WorkflowAdmissionRejected(RuntimeError):
     """The durable workflow queue has reached its configured limit."""
 
 
+class WorkflowAdmissionConflictError(ValueError):
+    """A durable workflow admission conflicts with an existing run."""
+
+
 class TextToSqlHistoryConflictError(ValueError):
     """A history key already contains a different terminal projection."""
 
@@ -67,6 +72,7 @@ class OperationalRetentionLeaseConflictError(RuntimeError):
 
 _NO_SUPERVISOR_PRECONDITION = object()
 _NO_ATTEMPT_GENERATION_PRECONDITION = object()
+WORKFLOW_PROCESS_CANCELLATION_PROVENANCE = "workflow_process_supervisor:v1"
 
 _EVENT_STORE_TABLE_SIGNATURES = {
     "agui_events": (
@@ -116,6 +122,14 @@ _EVENT_STORE_TABLE_SIGNATURES = {
         ("spec_version", "INTEGER", 1, 0, 0),
         ("spec_json", "TEXT", 1, 0, 0),
         ("spec_sha256", "TEXT", 1, 0, 0),
+        ("created_at_ms", "INTEGER", 1, 0, 0),
+    ),
+    "workflow_cancellation_requests": (
+        ("cancellation_request_id", "TEXT", 0, 1, 0),
+        ("run_id", "TEXT", 1, 0, 0),
+        ("provenance", "TEXT", 1, 0, 0),
+        ("accepted", "INTEGER", 1, 0, 0),
+        ("state", "TEXT", 1, 0, 0),
         ("created_at_ms", "INTEGER", 1, 0, 0),
     ),
     "text_to_sql_history": (
@@ -169,6 +183,7 @@ _EVENT_STORE_COLUMN_DEFAULTS = {
     },
     "workflow_run_invocations": {},
     "workflow_run_specs": {},
+    "workflow_cancellation_requests": {},
     "text_to_sql_history": {},
     "text_to_sql_history_quarantine": {},
     "text_to_sql_history_imports": {},
@@ -325,6 +340,16 @@ _EVENT_STORE_AUTOMATIC_UNIQUE_INDEXES = {
             ),
         ),
     ),
+    "workflow_cancellation_requests": (
+        (
+            "pk",
+            0,
+            (
+                (0, 0, "cancellation_request_id", 0, "BINARY", 1),
+                (1, -1, None, 0, "BINARY", 0),
+            ),
+        ),
+    ),
     "text_to_sql_history": (
         (
             "pk",
@@ -399,6 +424,14 @@ _EVENT_STORE_SQLITE_MASTER = {
         "CREATE TABLE WORKFLOW_RUN_SPECS ( RUN_ID TEXT PRIMARY KEY, "
         "SPEC_VERSION INTEGER NOT NULL, SPEC_JSON TEXT NOT NULL, "
         "SPEC_SHA256 TEXT NOT NULL, CREATED_AT_MS INTEGER NOT NULL )",
+    ),
+    "workflow_cancellation_requests": (
+        "table",
+        "workflow_cancellation_requests",
+        "CREATE TABLE WORKFLOW_CANCELLATION_REQUESTS ( "
+        "CANCELLATION_REQUEST_ID TEXT PRIMARY KEY, RUN_ID TEXT NOT NULL, "
+        "PROVENANCE TEXT NOT NULL, ACCEPTED INTEGER NOT NULL, "
+        "STATE TEXT NOT NULL, CREATED_AT_MS INTEGER NOT NULL )",
     ),
     "text_to_sql_history": (
         "table",
@@ -498,6 +531,11 @@ _EVENT_STORE_SQLITE_MASTER = {
     "sqlite_autoindex_workflow_run_specs_1": (
         "index",
         "workflow_run_specs",
+        None,
+    ),
+    "sqlite_autoindex_workflow_cancellation_requests_1": (
+        "index",
+        "workflow_cancellation_requests",
         None,
     ),
     "sqlite_autoindex_text_to_sql_history_1": (
@@ -634,8 +672,6 @@ _WORKFLOW_RUN_SPEC_KEYS = frozenset(
         "deadline_at_ms",
     }
 )
-
-
 def _validate_work_spec(
     work_spec: Mapping[str, Any],
     *,
@@ -643,7 +679,10 @@ def _validate_work_spec(
 ) -> tuple[dict[str, Any], str, str]:
     if not isinstance(work_spec, dict):
         raise ValueError("work_spec must be a JSON object")
-    if set(work_spec) != _WORKFLOW_RUN_SPEC_KEYS:
+    if not (
+        _WORKFLOW_RUN_SPEC_KEYS <= set(work_spec)
+        <= _WORKFLOW_RUN_SPEC_KEYS
+    ):
         raise ValueError("work_spec must contain exactly the required keys")
     if work_spec["spec_version"] != WORKFLOW_RUN_SPEC_VERSION:
         raise ValueError("work_spec has an unsupported spec_version")
@@ -904,6 +943,15 @@ class StoredRun:
 
 
 @dataclass(frozen=True)
+class WorkflowCancellationRequestRecord:
+    cancellation_request_id: str
+    run_id: str
+    provenance: str
+    accepted: bool
+    state: str
+
+
+@dataclass(frozen=True)
 class WorkflowClaimEnvelope:
     supervisor_id: str
     attempt_generation: int
@@ -915,6 +963,7 @@ class ClaimedWorkflowRun:
     work_spec: Optional[WorkflowRunSpec]
     claim: WorkflowClaimEnvelope
     invalid_work_spec: bool = False
+    workflow_name: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1100,6 +1149,18 @@ class EventStore:
                     spec_version INTEGER NOT NULL,
                     spec_json TEXT NOT NULL,
                     spec_sha256 TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_cancellation_requests (
+                    cancellation_request_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL,
+                    provenance TEXT NOT NULL,
+                    accepted INTEGER NOT NULL,
+                    state TEXT NOT NULL,
                     created_at_ms INTEGER NOT NULL
                 )
                 """
@@ -1796,7 +1857,11 @@ class EventStore:
     def load_work_spec(self, run_id: str) -> Optional[WorkflowRunSpec]:
         run_id = require_canonical_nonblank(run_id, field_name="run_id")
         with self._lock:
-            return self._load_work_spec_locked(run_id)
+            stored = self._load_raw_work_spec_locked(run_id)
+            if stored is None:
+                return None
+            stored.to_mapping()
+            return stored
 
     def has_work_spec(self, run_id: str) -> bool:
         run_id = require_canonical_nonblank(run_id, field_name="run_id")
@@ -1818,16 +1883,52 @@ class EventStore:
             deadline_at_ms, field_name="deadline_at_ms"
         )
         queue_limit = _require_positive_integer(queue_limit, field_name="queue_limit")
-        _normalized, spec_json, spec_sha256 = _validate_work_spec(
-            work_spec,
-            deadline_at_ms=deadline_at_ms,
-        )
         now_ms = int(time.time() * 1000)
         if deadline_at_ms <= now_ms:
             raise ValueError("deadline_at_ms must be in the future")
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                run_row = self._get_run_row_locked(run_id)
+                if run_row is None:
+                    raise ValueError(f"run not found: {run_id}")
+                stored_run = self._stored_run_from_row(run_row)
+                invocation_row = self._conn.execute(
+                    """
+                    SELECT run_incarnation, session_id, workflow_name
+                    FROM workflow_run_invocations
+                    WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                _normalized, spec_json, spec_sha256 = _validate_work_spec(
+                    work_spec,
+                    deadline_at_ms=deadline_at_ms,
+                )
+                if stored_run.status in {"queued", "running"}:
+                    stored_spec = self._load_work_spec_locked(run_id)
+                    if stored_spec is None:
+                        raise WorkflowAdmissionConflictError(
+                            "admitted run has no durable work_spec"
+                        )
+                    if invocation_row is None:
+                        raise WorkflowAdmissionConflictError(
+                            "admitted run has no durable workflow invocation"
+                        )
+                    stored_spec.to_mapping()
+                    if (
+                        stored_spec.spec_json != spec_json
+                        or stored_spec.spec_sha256 != spec_sha256
+                        or str(invocation_row[0]) != _normalized["run_incarnation"]
+                        or str(invocation_row[1]) != _normalized["session_id"]
+                    ):
+                        raise WorkflowAdmissionConflictError(
+                            "admitted run has a different admission bundle"
+                        )
+                    self._conn.commit()
+                    return stored_run
+                if stored_run.status != "pending":
+                    raise ValueError("only pending runs can be enqueued")
                 queued_count = int(
                     self._conn.execute(
                         "SELECT COUNT(*) FROM agui_runs WHERE status = 'queued'"
@@ -1837,11 +1938,6 @@ class EventStore:
                     raise WorkflowAdmissionRejected(
                         f"workflow queue limit reached: {queue_limit}"
                     )
-                run_row = self._get_run_row_locked(run_id)
-                if run_row is None:
-                    raise ValueError(f"run not found: {run_id}")
-                if self._stored_run_from_row(run_row).status != "pending":
-                    raise ValueError("only pending runs can be enqueued")
                 self._conn.execute(
                     """
                     INSERT INTO workflow_run_specs
@@ -1874,6 +1970,245 @@ class EventStore:
                 raise
         assert row is not None
         return self._stored_run_from_row(row)
+
+    def admit_workflow_run(
+        self,
+        *,
+        run_id: str,
+        thread_id: str,
+        principal: Principal,
+        run_kind: str,
+        run_incarnation: str,
+        session_id: str,
+        workflow_name: str,
+        work_spec: Mapping[str, Any],
+        deadline_at_ms: int,
+        queue_limit: int,
+        create_if_missing: bool,
+        idempotency_key: Optional[str] = None,
+        request_fingerprint: Optional[str] = None,
+    ) -> tuple[StoredRun, bool]:
+        """Persist one complete workflow admission before any scheduler wakeup.
+
+        The boolean is true only for a fresh durable admission. Matching
+        admissions return the existing bundle without another supervisor wake;
+        incomplete old rows are rejected without changing durable state.
+        """
+        run_id = require_canonical_nonblank(run_id, field_name="run_id")
+        thread_id = require_canonical_nonblank(thread_id, field_name="thread_id")
+        run_kind = _require_run_kind(run_kind)
+        run_incarnation = require_canonical_nonblank(
+            run_incarnation,
+            field_name="run_incarnation",
+        )
+        session_id = require_canonical_nonblank(session_id, field_name="session_id")
+        workflow_name = require_canonical_nonblank(
+            workflow_name,
+            field_name="workflow_name",
+        )
+        deadline_at_ms = _require_positive_integer(
+            deadline_at_ms,
+            field_name="deadline_at_ms",
+        )
+        queue_limit = _require_positive_integer(queue_limit, field_name="queue_limit")
+        if idempotency_key is not None:
+            idempotency_key = _require_idempotency_key(idempotency_key)
+            if request_fingerprint is None:
+                raise ValueError("request_fingerprint is required with idempotency_key")
+        if request_fingerprint is not None:
+            request_fingerprint = _require_request_fingerprint(request_fingerprint)
+        normalized_spec, spec_json, spec_sha256 = _validate_work_spec(
+            work_spec,
+            deadline_at_ms=deadline_at_ms,
+        )
+        if normalized_spec["run_incarnation"] != run_incarnation:
+            raise ValueError("work_spec incarnation does not match admission")
+        if normalized_spec["session_id"] != session_id:
+            raise ValueError("work_spec session does not match admission")
+        now_ms = int(time.time() * 1000)
+        if deadline_at_ms <= now_ms:
+            raise ValueError("deadline_at_ms must be in the future")
+        record = principal_to_record(principal)
+        owner_subject = require_canonical_nonblank(
+            record["subject"], field_name="owner_subject"
+        )
+        tenant_id = require_canonical_nonblank(record["tenant_id"], field_name="tenant_id")
+
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if idempotency_key is not None:
+                    idempotency_row = self._conn.execute(
+                        """
+                        SELECT run_id FROM agui_runs
+                        WHERE tenant_id = ? AND owner_subject = ?
+                          AND run_kind = ? AND idempotency_key = ?
+                        """,
+                        (tenant_id, owner_subject, run_kind, idempotency_key),
+                    ).fetchone()
+                    if idempotency_row is not None:
+                        existing_run_id = str(idempotency_row[0])
+                        existing_row = self._get_run_row_locked(existing_run_id)
+                        assert existing_row is not None
+                        existing = self._stored_run_from_row(existing_row)
+                        if existing.request_fingerprint != request_fingerprint:
+                            raise WorkflowAdmissionConflictError(
+                                "idempotency_key was already used for a different request"
+                            )
+                        invocation_row = self._conn.execute(
+                            """
+                            SELECT workflow_name FROM workflow_run_invocations
+                            WHERE run_id = ?
+                            """,
+                            (existing.run_id,),
+                        ).fetchone()
+                        stored_spec = self._load_work_spec_locked(existing.run_id)
+                        if invocation_row is None or stored_spec is None:
+                            raise WorkflowAdmissionConflictError(
+                                "workflow admission has partial durable state"
+                            )
+                        stored_spec.to_mapping()
+                        if existing.status not in {
+                            "queued",
+                            "running",
+                            "result_pending",
+                        }:
+                            raise WorkflowAdmissionConflictError(
+                                "workflow admission has an invalid durable status"
+                            )
+                        self._conn.commit()
+                        return existing, False
+                run_row = self._get_run_row_locked(run_id)
+                if run_row is None:
+                    if not create_if_missing:
+                        raise ValueError(f"run not found: {run_id}")
+                    self._conn.execute(
+                        """
+                        INSERT INTO agui_runs
+                            (run_id, thread_id, owner_subject, tenant_id, roles,
+                             created_at_ms, run_kind, status, updated_at_ms,
+                             idempotency_key, request_fingerprint)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                        """,
+                        (
+                            run_id,
+                            thread_id,
+                            owner_subject,
+                            tenant_id,
+                            json.dumps(record["roles"]),
+                            now_ms,
+                            run_kind,
+                            now_ms,
+                            idempotency_key,
+                            request_fingerprint,
+                        ),
+                    )
+                    run_row = self._get_run_row_locked(run_id)
+                assert run_row is not None
+                stored = self._stored_run_from_row(run_row)
+                if (
+                    stored.owner_subject != owner_subject
+                    or stored.tenant_id != tenant_id
+                    or stored.run_kind != run_kind
+                    or stored.idempotency_key != idempotency_key
+                    or stored.request_fingerprint != request_fingerprint
+                ):
+                    raise WorkflowAdmissionConflictError(
+                        "stored run does not match workflow admission"
+                    )
+
+                invocation_row = self._conn.execute(
+                    """
+                    SELECT run_id, run_incarnation, session_id, workflow_name
+                    FROM workflow_run_invocations WHERE run_id = ?
+                    """,
+                    (run_id,),
+                ).fetchone()
+                stored_spec = self._load_work_spec_locked(run_id)
+                if (invocation_row is None) != (stored_spec is None):
+                    raise WorkflowAdmissionConflictError(
+                        "workflow admission has partial durable state"
+                    )
+                if invocation_row is not None:
+                    invocation = WorkflowRunInvocation(
+                        run_id=str(invocation_row[0]),
+                        run_incarnation=str(invocation_row[1]),
+                        session_id=str(invocation_row[2]),
+                        workflow_name=str(invocation_row[3]),
+                    )
+                    if (
+                        invocation.run_incarnation != run_incarnation
+                        or invocation.session_id != session_id
+                        or invocation.workflow_name != workflow_name
+                        or stored_spec is None
+                        or stored_spec.spec_json != spec_json
+                        or stored_spec.spec_sha256 != spec_sha256
+                    ):
+                        raise WorkflowAdmissionConflictError(
+                            "workflow admission does not match durable identity"
+                        )
+                    if stored.status not in {"queued", "running", "result_pending"}:
+                        raise WorkflowAdmissionConflictError(
+                            "workflow admission has an invalid durable status"
+                        )
+                    self._conn.commit()
+                    return stored, False
+
+                if stored.status != "pending":
+                    raise WorkflowAdmissionConflictError(
+                        "only pending runs can receive a new workflow admission"
+                    )
+                queued_count = int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM agui_runs WHERE status = 'queued'"
+                    ).fetchone()[0]
+                )
+                if queued_count >= queue_limit:
+                    raise WorkflowAdmissionRejected(
+                        f"workflow queue limit reached: {queue_limit}"
+                    )
+                self._conn.execute(
+                    """
+                    INSERT INTO workflow_run_invocations
+                        (run_id, run_incarnation, session_id, workflow_name, created_at_ms)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (run_id, run_incarnation, session_id, workflow_name, now_ms),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO workflow_run_specs
+                        (run_id, spec_version, spec_json, spec_sha256, created_at_ms)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        WORKFLOW_RUN_SPEC_VERSION,
+                        spec_json,
+                        spec_sha256,
+                        now_ms,
+                    ),
+                )
+                cur = self._conn.execute(
+                    """
+                    UPDATE agui_runs
+                    SET status = 'queued', queued_at_ms = ?, deadline_at_ms = ?,
+                        updated_at_ms = ?
+                    WHERE run_id = ? AND status = 'pending'
+                    """,
+                    (now_ms, deadline_at_ms, now_ms, run_id),
+                )
+                if cur.rowcount != 1:
+                    raise WorkflowAdmissionConflictError(
+                        "run was no longer pending during workflow admission"
+                    )
+                row = self._get_run_row_locked(run_id)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        assert row is not None
+        return self._stored_run_from_row(row), True
 
     def claim_next_queued(
         self,
@@ -2005,6 +2340,13 @@ class EventStore:
                 row = self._get_run_row_locked(selected_run_id)
                 work_spec = self._load_raw_work_spec_locked(selected_run_id)
                 invalid_work_spec = work_spec is None
+                invocation_row = self._conn.execute(
+                    "SELECT workflow_name FROM workflow_run_invocations WHERE run_id = ?",
+                    (selected_run_id,),
+                ).fetchone()
+                workflow_name = (
+                    None if invocation_row is None else str(invocation_row[0])
+                )
                 if work_spec is not None:
                     try:
                         work_spec.to_mapping()
@@ -2025,6 +2367,7 @@ class EventStore:
                 attempt_generation=attempt_generation,
             ),
             invalid_work_spec=invalid_work_spec,
+            workflow_name=workflow_name,
         )
 
     def renew_worker_lease(
@@ -2077,19 +2420,82 @@ class EventStore:
                 raise
         return cur.rowcount == 1
 
-    def request_cancel(self, run_id: str) -> str:
+    def request_cancel(
+        self,
+        run_id: str,
+        *,
+        cancellation_request_id: Optional[str] = None,
+        cancellation_provenance: Optional[str] = None,
+    ) -> str | WorkflowCancellationRequestRecord:
         run_id = require_canonical_nonblank(run_id, field_name="run_id")
+        if (cancellation_request_id is None) != (cancellation_provenance is None):
+            raise ValueError(
+                "cancellation request identity and provenance must be supplied together"
+            )
+        if cancellation_request_id is not None:
+            cancellation_request_id = require_canonical_nonblank(
+                cancellation_request_id,
+                field_name="cancellation_request_id",
+            )
+            cancellation_provenance = require_canonical_nonblank(
+                cancellation_provenance,
+                field_name="cancellation_provenance",
+            )
         now_ms = int(time.time() * 1000)
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
+                if cancellation_request_id is not None:
+                    prior = self._conn.execute(
+                        """
+                        SELECT run_id, provenance, accepted, state
+                        FROM workflow_cancellation_requests
+                        WHERE cancellation_request_id = ?
+                        """,
+                        (cancellation_request_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        if (
+                            str(prior[0]) != run_id
+                            or str(prior[1]) != cancellation_provenance
+                        ):
+                            raise ValueError(
+                                "cancellation request identity belongs to another request"
+                            )
+                        self._conn.commit()
+                        return WorkflowCancellationRequestRecord(
+                            cancellation_request_id=cancellation_request_id,
+                            run_id=run_id,
+                            provenance=str(prior[1]),
+                            accepted=bool(prior[2]),
+                            state=str(prior[3]),
+                        )
                 row = self._get_run_row_locked(run_id)
                 if row is None:
                     raise ValueError(f"run not found: {run_id}")
                 stored = self._stored_run_from_row(row)
                 if stored.status in _TERMINAL_RUN_STATUSES:
+                    if cancellation_request_id is not None:
+                        return self._record_cancellation_request_locked(
+                            cancellation_request_id,
+                            run_id,
+                            cancellation_provenance,
+                            accepted=False,
+                            state=stored.status,
+                            created_at_ms=now_ms,
+                        )
                     self._conn.commit()
                     return stored.status
+                accepted = stored.cancel_requested_at_ms is None
+                if cancellation_request_id is not None and not accepted:
+                    return self._record_cancellation_request_locked(
+                        cancellation_request_id,
+                        run_id,
+                        cancellation_provenance,
+                        accepted=False,
+                        state=stored.status,
+                        created_at_ms=now_ms,
+                    )
                 if stored.status in {"pending", "queued"} and stored.run_kind != (
                     "text_to_sql"
                 ):
@@ -2109,6 +2515,15 @@ class EventStore:
                         "DELETE FROM workflow_run_specs WHERE run_id = ?",
                         (run_id,),
                     )
+                    if cancellation_request_id is not None:
+                        return self._record_cancellation_request_locked(
+                            cancellation_request_id,
+                            run_id,
+                            cancellation_provenance,
+                            accepted=True,
+                            state="cancelled",
+                            created_at_ms=now_ms,
+                        )
                     self._conn.commit()
                     return "cancelled"
                 self._conn.execute(
@@ -2122,11 +2537,55 @@ class EventStore:
                     """,
                     (now_ms, now_ms, run_id, stored.status),
                 )
+                if cancellation_request_id is not None:
+                    return self._record_cancellation_request_locked(
+                        cancellation_request_id,
+                        run_id,
+                        cancellation_provenance,
+                        accepted=True,
+                        state=stored.status,
+                        created_at_ms=now_ms,
+                    )
                 self._conn.commit()
                 return stored.status
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _record_cancellation_request_locked(
+        self,
+        cancellation_request_id: str,
+        run_id: str,
+        provenance: str,
+        *,
+        accepted: bool,
+        state: str,
+        created_at_ms: int,
+    ) -> WorkflowCancellationRequestRecord:
+        self._conn.execute(
+            """
+            INSERT INTO workflow_cancellation_requests
+                (cancellation_request_id, run_id, provenance, accepted,
+                 state, created_at_ms)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                cancellation_request_id,
+                run_id,
+                provenance,
+                int(accepted),
+                state,
+                created_at_ms,
+            ),
+        )
+        self._conn.commit()
+        return WorkflowCancellationRequestRecord(
+            cancellation_request_id=cancellation_request_id,
+            run_id=run_id,
+            provenance=provenance,
+            accepted=accepted,
+            state=state,
+        )
 
     def fence_worker_attempt(
         self,

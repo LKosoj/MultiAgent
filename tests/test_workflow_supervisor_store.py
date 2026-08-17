@@ -16,10 +16,12 @@ from backend.fastapi_app.agui.store import (
     WORKFLOW_RUN_SPEC_MAX_BYTES,
     ClaimedWorkflowRun,
     EventStore,
+    WorkflowAdmissionConflictError,
     WorkflowAdmissionRejected,
     WorkflowSupervisorOwnershipConflictError,
     workflow_result_event_key,
 )
+from workflow.process_supervisor import validate_work_spec
 
 
 def _principal(subject: str, tenant: str) -> Principal:
@@ -40,6 +42,8 @@ def _spec(*, deadline_at_ms: int, marker: str = "run") -> dict[str, object]:
     }
 
 
+
+
 def _create_run(
     store: EventStore,
     run_id: str,
@@ -47,12 +51,14 @@ def _create_run(
     subject: str = "alice",
     tenant: str = "tenant-a",
     run_kind: str = "agui",
+    request_fingerprint: str | None = None,
 ) -> None:
     store.create_run(
         run_id,
         f"thread-{run_id}",
         _principal(subject, tenant),
         run_kind=run_kind,
+        request_fingerprint=request_fingerprint,
     )
 
 
@@ -115,6 +121,249 @@ def _terminal_payload(
     }
 
 
+def test_enqueue_replay_accepts_matching_admission_after_scheduler_claim(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(str(tmp_path / "events.db"))
+    deadline = int(time.time() * 1000) + 60_000
+    spec = _spec(deadline_at_ms=deadline, marker="run-1")
+    try:
+        stored, admitted = store.admit_workflow_run(
+            run_id="run-1",
+            thread_id="thread-run-1",
+            principal=_principal("alice", "tenant-a"),
+            run_kind="agui",
+            run_incarnation="incarnation-run-1",
+            session_id="session-run-1",
+            workflow_name="workflow-run-1",
+            work_spec=spec,
+            deadline_at_ms=deadline,
+            queue_limit=10,
+            create_if_missing=True,
+        )
+        assert admitted is True
+        assert stored.status == "queued"
+        claimed = store.claim_next_queued(
+            "supervisor-1",
+            10,
+            10,
+            10,
+            int(time.time() * 1000) + 30_000,
+        )
+        assert claimed is not None
+        assert claimed.run.status == "running"
+
+        replay = store.enqueue_run("run-1", spec, deadline, 10)
+
+        assert replay.status == "running"
+        mismatched = {**spec, "parameters": {"question": "different"}}
+        with pytest.raises(
+            WorkflowAdmissionConflictError,
+            match="different admission bundle",
+        ):
+            store.enqueue_run("run-1", mismatched, deadline, 10)
+    finally:
+        store.close()
+
+
+def test_result_pending_exact_admission_replay_is_inert_and_mismatch_conflicts(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(str(tmp_path / "events.db"))
+    deadline = int(time.time() * 1000) + 60_000
+    spec = _spec(deadline_at_ms=deadline, marker="run-1")
+    admission = {
+        "run_id": "run-1",
+        "thread_id": "thread-run-1",
+        "principal": _principal("alice", "tenant-a"),
+        "run_kind": "text_to_sql",
+        "run_incarnation": "incarnation-run-1",
+        "session_id": "session-run-1",
+        "workflow_name": "workflow-run-1",
+        "work_spec": spec,
+        "deadline_at_ms": deadline,
+        "queue_limit": 10,
+        "create_if_missing": True,
+        "idempotency_key": "retry-key",
+        "request_fingerprint": "a" * 64,
+    }
+    try:
+        stored, newly_admitted = store.admit_workflow_run(**admission)
+        assert stored.status == "queued"
+        assert newly_admitted is True
+
+        claimed = store.claim_next_queued(
+            "supervisor-1",
+            10,
+            10,
+            10,
+            deadline,
+        )
+        assert claimed is not None
+        generation = claimed.claim.attempt_generation
+        assert store.set_worker_pid(
+            "run-1",
+            4321,
+            "supervisor-1",
+            generation,
+        )
+        assert store.mark_worker_result_pending(
+            "run-1",
+            "supervisor-1",
+            generation,
+        )
+
+        replay, replay_admitted = store.admit_workflow_run(**admission)
+
+        assert replay.run_id == "run-1"
+        assert replay.status == "result_pending"
+        assert replay_admitted is False
+        assert replay.worker_pid is None
+        assert replay.worker_lease_expires_at_ms is None
+        assert store.claim_next_queued(
+            "supervisor-2",
+            10,
+            10,
+            10,
+            deadline,
+        ) is None
+        with pytest.raises(
+            WorkflowAdmissionConflictError,
+            match="idempotency_key was already used for a different request",
+        ):
+            store.admit_workflow_run(
+                **{**admission, "request_fingerprint": "b" * 64}
+            )
+    finally:
+        store.close()
+
+
+def test_result_pending_replay_race_with_finalization_has_one_winner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db_path = tmp_path / "events.db"
+    finalizer = EventStore(str(db_path))
+    replay_store = EventStore(str(db_path))
+    deadline = int(time.time() * 1000) + 60_000
+    spec = _spec(deadline_at_ms=deadline, marker="run-1")
+    admission = {
+        "run_id": "run-1",
+        "thread_id": "thread-run-1",
+        "principal": _principal("alice", "tenant-a"),
+        "run_kind": "text_to_sql",
+        "run_incarnation": "incarnation-run-1",
+        "session_id": "session-run-1",
+        "workflow_name": "workflow-run-1",
+        "work_spec": spec,
+        "deadline_at_ms": deadline,
+        "queue_limit": 10,
+        "create_if_missing": True,
+        "idempotency_key": "retry-key",
+        "request_fingerprint": "a" * 64,
+    }
+    replay_entered = threading.Event()
+    release_replay = threading.Event()
+    finalizer_started = threading.Event()
+    replay_results: list[tuple[object, bool]] = []
+    finalization_results: list[int] = []
+    failures: list[BaseException] = []
+    try:
+        _stored, newly_admitted = finalizer.admit_workflow_run(**admission)
+        assert newly_admitted is True
+        claimed = finalizer.claim_next_queued(
+            "supervisor-1",
+            10,
+            10,
+            10,
+            deadline,
+        )
+        assert claimed is not None
+        generation = claimed.claim.attempt_generation
+        assert finalizer.set_worker_pid(
+            "run-1",
+            4321,
+            "supervisor-1",
+            generation,
+        )
+        assert finalizer.mark_worker_result_pending(
+            "run-1",
+            "supervisor-1",
+            generation,
+        )
+
+        original_load = replay_store._load_work_spec_locked
+
+        def blocked_load(run_id: str):
+            replay_entered.set()
+            assert release_replay.wait(timeout=5)
+            return original_load(run_id)
+
+        monkeypatch.setattr(replay_store, "_load_work_spec_locked", blocked_load)
+
+        def replay() -> None:
+            try:
+                replay_results.append(replay_store.admit_workflow_run(**admission))
+            except BaseException as exc:
+                failures.append(exc)
+
+        def finalize() -> None:
+            finalizer_started.set()
+            try:
+                finalization_results.append(
+                    finalizer.finalize_run_with_event(
+                        "run-1",
+                        _terminal_payload(),
+                        expected_supervisor_id="supervisor-1",
+                        expected_attempt_generation=generation,
+                    )
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        replay_thread = threading.Thread(target=replay)
+        replay_thread.start()
+        assert replay_entered.wait(timeout=5)
+        finalizer_thread = threading.Thread(target=finalize)
+        finalizer_thread.start()
+        assert finalizer_started.wait(timeout=5)
+        release_replay.set()
+        replay_thread.join(timeout=5)
+        finalizer_thread.join(timeout=5)
+
+        assert not failures
+        assert not replay_thread.is_alive()
+        assert not finalizer_thread.is_alive()
+        assert len(replay_results) == 1
+        replayed, replay_admitted = replay_results[0]
+        assert replayed.status == "result_pending"
+        assert replay_admitted is False
+        assert len(finalization_results) == 1
+
+        stored = finalizer.get_run("run-1")
+        assert stored is not None
+        assert stored.status == "failed"
+        assert stored.result_seq == finalization_results[0]
+        assert len(
+            [
+                event
+                for event in finalizer.list_after("run-1")
+                if event.event_type == "WORKFLOW_RESULT"
+            ]
+        ) == 1
+        assert finalizer.claim_next_queued(
+            "supervisor-2",
+            10,
+            10,
+            10,
+            deadline,
+        ) is None
+    finally:
+        release_replay.set()
+        replay_store.close()
+        finalizer.close()
+
+
 def test_v3_migration_adds_queue_columns_and_private_work_specs(tmp_path: Path) -> None:
     db_path = tmp_path / "events.db"
     store = EventStore(str(db_path))
@@ -147,7 +396,7 @@ def test_v3_migration_adds_queue_columns_and_private_work_specs(tmp_path: Path) 
         columns = {
             row[1] for row in migrated._conn.execute("PRAGMA table_info(agui_runs)")
         }
-        assert version == AGUI_EVENT_STORE_SCHEMA_VERSION == 8
+        assert version == AGUI_EVENT_STORE_SCHEMA_VERSION == 10
         assert {
             "queued_at_ms",
             "deadline_at_ms",
@@ -677,6 +926,68 @@ def test_queued_cancelled_run_never_claims_and_clears_spec(tmp_path: Path) -> No
         assert store.request_cancel("run-1") == "cancelled"
         assert store.claim_next_queued("supervisor", 1, 1, 1, deadline) is None
         assert store.load_work_spec("run-1") is None
+    finally:
+        store.close()
+
+
+def test_canonical_cancellation_request_is_idempotent_and_exclusive(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(str(tmp_path / "events.db"))
+    try:
+        deadline = int(time.time() * 1000) + 60_000
+        _create_run(store, "run-1", run_kind="text_to_sql")
+        _enqueue(store, "run-1", deadline_at_ms=deadline)
+
+        first = store.request_cancel(
+            "run-1",
+            cancellation_request_id="cancel-request-1",
+            cancellation_provenance="workflow_process_supervisor:v1",
+        )
+        replay = store.request_cancel(
+            "run-1",
+            cancellation_request_id="cancel-request-1",
+            cancellation_provenance="workflow_process_supervisor:v1",
+        )
+        conflict = store.request_cancel(
+            "run-1",
+            cancellation_request_id="cancel-request-2",
+            cancellation_provenance="workflow_process_supervisor:v1",
+        )
+
+        assert first == replay
+        assert first.accepted is True
+        assert first.state == "queued"
+        assert first.cancellation_request_id == "cancel-request-1"
+        assert conflict.accepted is False
+        assert conflict.cancellation_request_id == "cancel-request-2"
+        with pytest.raises(ValueError, match="identity"):
+            store.request_cancel(
+                "another-run",
+                cancellation_request_id="cancel-request-1",
+                cancellation_provenance="workflow_process_supervisor:v1",
+            )
+    finally:
+        store.close()
+
+
+def test_legacy_cancellation_cannot_be_claimed_by_later_canonical_request(
+    tmp_path: Path,
+) -> None:
+    store = EventStore(str(tmp_path / "events.db"))
+    try:
+        deadline = int(time.time() * 1000) + 60_000
+        _create_run(store, "run-1", run_kind="text_to_sql")
+        _enqueue(store, "run-1", deadline_at_ms=deadline)
+
+        assert store.request_cancel("run-1") == "queued"
+        claimed = store.request_cancel(
+            "run-1",
+            cancellation_request_id="cancel-request-1",
+            cancellation_provenance="workflow_process_supervisor:v1",
+        )
+
+        assert claimed.accepted is False
     finally:
         store.close()
 

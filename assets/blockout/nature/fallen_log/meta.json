@@ -1,0 +1,24 @@
+{
+  "id": "fallen_log",
+  "name": "Упавшее бревно",
+  "category": "nature",
+  "tags": [
+    "log"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.0,
+    0.5493216216564178,
+    0.4167194254696369
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 7440,
+  "fetched_at": "2026-08-16T21:19:54Z",
+  "asset_version": 1
+}

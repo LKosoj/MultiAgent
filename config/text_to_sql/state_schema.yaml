@@ -1,7 +1,7 @@
 manifest_version: 1
 stores:
   event_store:
-    head: 8
+    head: 10
     path: data/multiagent_state/agui_events.db
     owner: backend.fastapi_app.agui.store.EventStore
   memory_db:

@@ -1,0 +1,27 @@
+{
+  "id": "cartoon_kids",
+  "name": "Мультяшные дети",
+  "category": "character",
+  "tags": [
+    "kids",
+    "children",
+    "football",
+    "desc:Группа детей для двора: assorted football kids."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.5994850099086761,
+    2.777268171310425,
+    1.1832679510116577
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/16bd67d620a846b7abb9dfdbb3534f05",
+  "file_size_bytes": 252344,
+  "fetched_at": "2026-08-16T22:54:10Z",
+  "asset_version": 1
+}

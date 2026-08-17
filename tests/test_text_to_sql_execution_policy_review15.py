@@ -10,6 +10,16 @@ from collections.abc import Mapping
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _allow_typed_finalizer(monkeypatch):
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+    monkeypatch.setattr(
+        terminal,
+        "_pre_execution_gate_allowed",
+        lambda **_kwargs: True,
+    )
+
 from db_plugins.base import (
     Capability,
     DatabaseCapabilities,
@@ -185,7 +195,6 @@ def _finalize(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -571,7 +580,6 @@ def test_hostile_adapter_exception_never_escapes(monkeypatch, adapter):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -603,7 +611,6 @@ def test_hostile_adapter_result_type_never_escapes(monkeypatch):
         result = terminal.finalize_text_to_sql_run(
             "SELECT 1",
             "one",
-            "Approved",
             "sqlite:///unused.db",
             10,
             False,

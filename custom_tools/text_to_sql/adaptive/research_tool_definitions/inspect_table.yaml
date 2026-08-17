@@ -1,0 +1,9 @@
+version: 1
+name: inspect_table
+description: Inspect one exact table's structural metadata.
+implementation: inspect_table
+arguments:
+  - name: table
+    type: string
+    required: true
+additional_properties: false

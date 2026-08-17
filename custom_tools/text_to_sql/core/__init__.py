@@ -8,8 +8,10 @@
   (доступны для monkeypatch.setattr из тестов).
 
 Архитектура DI: singletons живут здесь, в фасаде. Подмодули принимают их
-keyword-only аргументами через wrapper'ы ниже. Внешние сигнатуры публичных
-функций остаются неизменны.
+keyword-only аргументами через wrapper'ы ниже. Имена и базовый API сохранены,
+но у доверенного внутреннего facade могут быть optional runtime controls.
+Они не model-facing: wrappers из custom_tools.sql_tools дают модели узкие
+сигнатуры без этих controls.
 
 FIXME EPIC-8.5 deferred: 13 функций-обёрток ниже выглядят повторяющимися,
 но они — намеренный архитектурный якорь, а не legacy-шум. Их нельзя
@@ -38,6 +40,8 @@ FIXME EPIC-8.5 deferred: 13 функций-обёрток ниже выгляд�
 import logging
 import threading
 from typing import Any, Dict, List, Optional
+
+from workflow.deadline import DeadlineBudget
 
 logger = logging.getLogger(__name__)
 
@@ -326,6 +330,7 @@ def sql_safety_check(
     dsn: Optional[str] = None,
     *,
     safety_policy: Any = None,
+    static_only: bool = False,
 ) -> Dict[str, object]:
     """Проверяет SQL на безопасность (запрещённые операторы, IN-list, comments).
 
@@ -333,6 +338,7 @@ def sql_safety_check(
         sql_query: SQL-запрос для проверки.
         dsn: явный DSN для выбора SQL-диалекта и dialect-specific safety правил.
         safety_policy: Внутренняя immutable policy текущего workflow-запроса.
+        static_only: Выполнить только статические проверки, без LLM-аудита.
 
     Returns:
         Словарь со статусом safety_status и списком violations.
@@ -344,6 +350,7 @@ def sql_safety_check(
         sql_validator=validator,
         dsn=dsn,
         safety_policy=policy,
+        static_only=static_only,
     )
 
 
@@ -352,6 +359,8 @@ def sql_explain(
     dsn: Optional[str] = None,
     *,
     safety_policy: Any = None,
+    dry_run_only: Optional[bool] = None,
+    deadline: Optional[DeadlineBudget] = None,
 ) -> Dict[str, object]:
     """Возвращает план выполнения SQL через `EXPLAIN`.
 
@@ -360,6 +369,9 @@ def sql_explain(
         dsn: явный DSN; если None, env ``DB_DSN`` используется только при
             ``SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1`` opt-in.
         safety_policy: Внутренняя immutable policy текущего workflow-запроса.
+        dry_run_only: При True не выполняет EXPLAIN. False или None не могут
+            отключить авторитетный operator override TEXT_TO_SQL_DRY_RUN_ONLY.
+        deadline: Общий лимит времени текущего workflow-запуска.
 
     Returns:
         Словарь с планом и метаинформацией.
@@ -371,6 +383,8 @@ def sql_explain(
         dsn,
         sql_validator=validator,
         safety_policy=policy,
+        dry_run_only=dry_run_only,
+        deadline=deadline,
     )
 
 
@@ -416,7 +430,6 @@ def secure_db_executor(
 def finalize_text_to_sql_run(
     sql_query: str,
     user_query: str,
-    verification_status: str,
     dsn: str,
     row_limit: int,
     dry_run_only: bool,
@@ -431,7 +444,6 @@ def finalize_text_to_sql_run(
     Args:
         sql_query: Generated SQL approved for final execution.
         user_query: Original natural-language request.
-        verification_status: Structured verifier status.
         dsn: Explicit target database DSN.
         row_limit: Maximum number of result rows.
         dry_run_only: Whether final generated SQL execution is forbidden.
@@ -449,7 +461,6 @@ def finalize_text_to_sql_run(
     return _impl(
         sql_query,
         user_query,
-        verification_status,
         dsn,
         row_limit,
         dry_run_only,

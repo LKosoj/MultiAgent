@@ -1,0 +1,27 @@
+{
+  "id": "bearded_man",
+  "name": "Бородатый капитан (Платонов)",
+  "category": "character",
+  "tags": [
+    "man",
+    "beard",
+    "platonov",
+    "desc:Бородатый мужчина в кителе — прообраз Платонова."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    8.937812805175781,
+    8.937810897827148,
+    4.320689499378204
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/69fa6d8aaaab4dc19f3c2cb5fcd498b1",
+  "file_size_bytes": 6251976,
+  "fetched_at": "2026-08-17T05:03:46Z",
+  "asset_version": 1
+}

@@ -253,6 +253,121 @@ def test_veo_saves_video_from_inline_bytes(tmp_path, monkeypatch):
     assert Path(item["video_path"]).read_bytes() == b"veo-bytes"
 
 
+# --- M-6: hash carries the requested duration, request carries the snapped one -------------------
+
+def test_veo_hashes_requested_duration_on_exact_match(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)  # timing "00:00 - 00:06": точное совпадение в {4, 6, 8}
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+    captured = {}
+    _install_client(monkeypatch, _success_from_bytes, captured=captured)
+
+    result = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    assert captured["config"].duration_seconds == 6
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["resolved_duration"] == 6
+    assert job["hash_inputs_version"] == 3
+
+    expected_hash = veo_module._build_input_hash(
+        model_name=f"{veo_module._VEO_MODEL_NAME}|gemini|{veo_module._VEO_ASPECT_RATIO}|{veo_module._VEO_RESOLUTION}|1",
+        prompt_hash=veo_module._hash_text(item["video_prompt"]),
+        source_image_hashes={
+            "start_image": veo_module._hash_source_image(item["start_image"]),
+            "end_image": None,
+        },
+        requested_duration=6,
+        requested_width=0,
+        requested_height=0,
+        seed=None,
+        frame_types=["first_frame"],
+        provider_name="veo",
+    )
+    assert job["input_hash"] == expected_hash
+
+
+def test_veo_snaps_duration_tie_to_smaller_but_hashes_requested(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)
+    item["timing"] = "00:00 - 00:07"  # 7s: ничья между 6 и 8 в {4, 6, 8} -> меньшее (6)
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+    captured = {}
+    _install_client(monkeypatch, _success_from_bytes, captured=captured)
+
+    result = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "success"
+    assert captured["config"].duration_seconds == 6
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["resolved_duration"] == 6
+
+    expected_hash = veo_module._build_input_hash(
+        model_name=f"{veo_module._VEO_MODEL_NAME}|gemini|{veo_module._VEO_ASPECT_RATIO}|{veo_module._VEO_RESOLUTION}|1",
+        prompt_hash=veo_module._hash_text(item["video_prompt"]),
+        source_image_hashes={
+            "start_image": veo_module._hash_source_image(item["start_image"]),
+            "end_image": None,
+        },
+        requested_duration=7,
+        requested_width=0,
+        requested_height=0,
+        seed=None,
+        frame_types=["first_frame"],
+        provider_name="veo",
+    )
+    assert job["input_hash"] == expected_hash
+
+
+# --- trusted reuse must not ignore resolved_duration (regression) --------------------------------
+
+def test_veo_duration_change_blocks_trusted_reuse_of_stale_clip(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [])
+    item = _make_item(shots_dir)  # timing "00:00 - 00:06" -> resolved_duration 6
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+    _install_client(monkeypatch, _success_from_bytes)
+
+    first = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+    assert first["status"] == "success"
+    assert _read_provider_jobs(shots_dir)[0]["resolved_duration"] == 6
+
+    # Source image later removed from disk (e.g. cleaned up) -> _hash_source_image
+    # returns None, which is exactly what enables the "trusted reuse" shortcut.
+    Path(item["start_image"]).unlink()
+    changed = dict(item)
+    changed["timing"] = "00:00 - 00:10"  # same prompt/model, longer clip -> resolved_duration 8
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [changed]}), encoding="utf-8")
+
+    def forbidden_resolver(prompt):
+        del prompt
+        raise AssertionError("must not silently reuse a differently-timed trusted clip")
+
+    _install_client(monkeypatch, forbidden_resolver)
+
+    second = veo_module.video_generator_veo_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    # Without the resolved_duration check, trusted_metadata_matches would be True here
+    # (same prompt_hash/model/aspect_ratio/resolution) and the stale 6s clip would be
+    # silently kept for what is now a 10s request. With the check it must fall through to
+    # a real attempt, which fails loudly because the source image is gone — not silently
+    # succeed with a wrong-length clip.
+    assert second["status"] == "error"
+    assert "Start image not found" in second["results"][0]["error"]
+
+
 # --- M-9: existence filter uses non-empty check --------------------------------------------------
 
 def test_veo_skips_existing_nonempty_video(tmp_path, monkeypatch):

@@ -20,23 +20,19 @@ describe("ordinary Text-to-SQL connection boundary", () => {
       query: "count orders",
       connectionRef,
       maxRows: 100,
-      workflowName: "text_to_sql_pipeline",
       sessionId: "session-1",
-      useEnhanced: true,
-      allowEnhancedFallback: false,
       enableTelemetry: true,
       safetyLevel: "strict",
       includeExplanation: true,
       validateSchema: true,
       dryRunOnly: false,
-      useSchemaSuggestions: true,
     });
 
     expect(payload).toMatchObject({
       query: "count orders",
-      natural_query: "count orders",
       connection_ref: connectionRef,
     });
+    expect(payload).not.toHaveProperty("natural_query");
     expect(payload).not.toHaveProperty("dsn");
     expect(payload).not.toHaveProperty("admin_raw_dsn_compat");
     expect(payload).not.toHaveProperty("persistence");
@@ -47,14 +43,11 @@ describe("ordinary Text-to-SQL connection boundary", () => {
       query: "count orders",
       connectionRef: "postgresql://user:secret@db.example/app",
       maxRows: 100,
-      useEnhanced: true,
-      allowEnhancedFallback: false,
       enableTelemetry: false,
       safetyLevel: "strict",
       includeExplanation: true,
       validateSchema: true,
       dryRunOnly: false,
-      useSchemaSuggestions: true,
     })).toThrow("Select an authorized database connection");
   });
 

@@ -1,0 +1,12 @@
+version: 1
+name: search_schema_catalog
+description: Search the trusted schema catalog by logical text.
+implementation: search_schema_catalog
+arguments:
+  - name: query
+    type: string
+    required: true
+  - name: top_k
+    type: integer
+    required: true
+additional_properties: false

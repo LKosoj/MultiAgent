@@ -74,7 +74,7 @@ def test_readiness_is_200_only_when_every_required_check_is_ready(tmp_path: Path
         "schema_heads": {
             name: {"expected": head, "actual": head}
             for name, head in {
-                "event_store": 8,
+                "event_store": 10,
                 "memory_db": 1,
                 "result_outbox": 3,
             }.items()

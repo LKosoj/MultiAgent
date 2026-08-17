@@ -412,6 +412,7 @@ def test_default_state_database_rejects_unsafe_existing_state_directory(tmp_path
     data_dir.mkdir(mode=0o770)
     state_dir = data_dir / "multiagent_state"
     state_dir.mkdir(mode=0o770)
+    state_dir.chmod(0o770)
     original_mode = stat.S_IMODE(os.lstat(state_dir).st_mode)
 
     with pytest.raises(PermissionError, match="directory mode"):
@@ -425,6 +426,7 @@ def test_explicit_sqlite_path_rejects_group_writable_parent_without_chmod(tmp_pa
     state_files = importlib.import_module("workflow.state_files")
     unsafe_parent = tmp_path / "unsafe"
     unsafe_parent.mkdir(mode=0o770)
+    unsafe_parent.chmod(0o770)
     original_mode = stat.S_IMODE(os.lstat(unsafe_parent).st_mode)
 
     with pytest.raises(PermissionError, match="directory mode"):
@@ -2082,11 +2084,18 @@ def test_ensure_private_directory_accepts_relative_current_directory(
     ) == directory
 
 
-def test_ensure_private_directory_handles_filesystem_root_explicitly():
+def test_ensure_private_directory_handles_filesystem_root_explicitly(monkeypatch):
     state_files = importlib.import_module("workflow.state_files")
+    calls = []
+    monkeypatch.setattr(
+        state_files.os,
+        "fchmod",
+        lambda *_args: calls.append("fchmod"),
+    )
 
-    with pytest.raises(PermissionError, match="directory mode"):
+    with pytest.raises(ValueError, match="filesystem root"):
         state_files.ensure_private_directory(Path("/"), create=False)
+    assert calls == []
 
 
 def test_workflow_result_outbox_accepts_relative_database_in_private_cwd(

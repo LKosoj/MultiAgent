@@ -1,0 +1,15 @@
+version: 1
+name: get_distinct_values
+description: Read bounded distinct values through the adaptive probe only.
+implementation: get_distinct_values
+arguments:
+  - name: table
+    type: string
+    required: true
+  - name: column
+    type: string
+    required: true
+  - name: top_k
+    type: integer
+    required: true
+additional_properties: false

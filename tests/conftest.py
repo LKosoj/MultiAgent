@@ -24,6 +24,24 @@ for _env_key, _env_default in (
         os.environ[_env_key] = _env_default
 
 
+def pytest_addoption(parser):
+    group = parser.getgroup("text-to-sql adaptive rollout")
+    group.addoption(
+        "--adaptive-repetitions",
+        action="store",
+        default=20,
+        type=int,
+        help="fixed repetition count for the adaptive research-cutover synthetic gate",
+    )
+    group.addoption(
+        "--gate",
+        action="store",
+        default="research-cutover",
+        dest="gate",
+        help="fixed gate name for the adaptive research-cutover synthetic gate",
+    )
+
+
 @pytest.fixture(autouse=True)
 def ensure_current_event_loop(request):
     """

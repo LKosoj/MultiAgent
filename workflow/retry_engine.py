@@ -13,6 +13,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Dict, Any, Callable, Optional
 
+from .deadline import DeadlineBudget, WorkflowDeadlineExceeded, execute_step_attempt
 from .models import RetryPolicy, StepResult, StepStatus, WorkflowStepError
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,8 @@ class RetryEngine:
                                step_func: Callable,
                                context: Dict[str, Any],
                                retry_policy: Optional[RetryPolicy] = None,
-                               timeout: Optional[int] = None) -> StepResult:
+                               timeout: Optional[int] = None,
+                               deadline: Optional[DeadlineBudget] = None) -> StepResult:
         """
         Выполнение функции с политикой повторных попыток
         
@@ -111,6 +113,10 @@ class RetryEngine:
         
         try:
             for attempt in range(policy.max_retries + 1):
+                if deadline is not None:
+                    deadline.require_remaining(
+                        f"retry attempt {attempt + 1} scheduling"
+                    )
                 self.active_retries[step_id]['current_attempt'] = attempt + 1
                 result.attempt_number = attempt + 1
                 
@@ -118,7 +124,13 @@ class RetryEngine:
                     logger.info(f"🔄 {step_id}: Попытка {attempt + 1}/{policy.max_retries + 1}")
                     
                     # Выполняем функцию
-                    output = await self._execute_with_timeout(step_func, context, timeout=timeout)
+                    output = await self._execute_with_timeout(
+                        step_id,
+                        step_func,
+                        context,
+                        timeout=timeout,
+                        deadline=deadline,
+                    )
                     
                     # Успешное выполнение
                     result.status = StepStatus.COMPLETED
@@ -129,6 +141,8 @@ class RetryEngine:
                     logger.info(f"✅ {step_id}: Выполнен успешно с попытки {attempt + 1}")
                     return result
                     
+                except WorkflowDeadlineExceeded:
+                    raise
                 except Exception as e:
                     error_type = self._classify_error(e)
                     safe_error = _redact_retry_error(e)
@@ -148,9 +162,15 @@ class RetryEngine:
                         
                         # Вычисляем задержку
                         delay = self._calculate_delay(attempt, policy)
+                        if deadline is not None:
+                            deadline.require_retry_delay(delay)
                         logger.info(f"⏳ {step_id}: Повтор через {delay:.1f} секунд")
                         
                         await asyncio.sleep(delay)
+                        if deadline is not None:
+                            deadline.require_remaining(
+                                f"retry attempt {attempt + 2} scheduling"
+                            )
                         continue
                     else:
                         # Исчерпаны попытки или ошибка не подлежит retry
@@ -169,15 +189,23 @@ class RetryEngine:
             
         return result
     
-    async def _execute_with_timeout(self, step_func: Callable, context: Dict[str, Any], 
-                                  timeout: Optional[int] = None) -> Any:
+    async def _execute_with_timeout(self, step_id: str, step_func: Callable,
+                                  context: Dict[str, Any], timeout: Optional[int] = None,
+                                  deadline: Optional[DeadlineBudget] = None) -> Any:
         """Выполнение функции с таймаутом"""
         timeout = timeout or 300  # 5 минут по умолчанию
-        
         try:
-            return await asyncio.wait_for(step_func(context), timeout=timeout)
-        except asyncio.TimeoutError:
-            raise WorkflowStepError(f"Step timed out after {timeout} seconds")
+            return await execute_step_attempt(
+                step_id,
+                step_func,
+                context,
+                attempt_timeout=timeout,
+                deadline=deadline,
+            )
+        except WorkflowDeadlineExceeded:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise WorkflowStepError(f"Step timed out after {timeout} seconds") from exc
     
     def _classify_error(self, error: Exception) -> str:
         """Классификация типа ошибки для принятия решения о retry"""

@@ -12,6 +12,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from agent_command import model_hard, model_code, model_ultimate, model_lite
 from utils import call_openai_api, parse_llm_json
 from .project_paths import safe_storybook_project_dir
+from .video_contract import _active_video_tool_name
+from .video_generator_common import (
+    resolve_video_model_capabilities,
+    resolve_effective_durations,
+    video_model_caps_warning,
+    append_video_model_caps_warnings,
+    _read_previous_video_caps,
+)
+from .video_generator_aitunnel_media import _select_best_supported_duration
 
 
 # Импорты из модуля screenplay_shots_generator_utils
@@ -25,6 +34,7 @@ from .screenplay_shots_generator_utils.shared_utils import (
     enrich_shot_frame_spec_environment_delta_via_llm,
     black_screen_storyboard_shot,
 )
+from .screenplay_shots_generator_utils.timing_utils import _parse_simple_timing
 
 logger = logging.getLogger(__name__)
 
@@ -230,10 +240,13 @@ def screenplay_shots_generator_tool(
     max_scenes: Optional[int] = None,
     scene_numbers: Optional[List[int]] = None,
     force: bool = False,
+    generate_blockout: bool = True,
+    allowed_durations: Optional[List[int]] = None,
+    screenplay_time: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Генерирует shots.json для создания изображений кадров на основе режиссерского сценария.
-    
+
     Args:
         session_id: Идентификатор сессии для трассировки выполнения.
         project_id: Идентификатор проекта.
@@ -243,7 +256,14 @@ def screenplay_shots_generator_tool(
         max_scenes: Опционально ограничить количество сцен (после фильтрации по scene_numbers).
         scene_numbers: Опционально явный список номеров сцен для генерации (например: [2, 3]).
         force: Если True — игнорирует существующий shots.json и перегенерирует заново (полезно при частичной генерации).
-        
+        generate_blockout: Если True (по умолчанию) — отсутствие/пустота набора supported_durations
+            видеомодели останавливает генерацию блокирующей ошибкой B15. Если False — генерация
+            продолжается без нормализации длительности (P14), существующие duration_s не трогаются.
+        allowed_durations: Ограничение набора длительностей модели значениями проекта
+            (blockout_allowed_durations). Пустой/не заданный — берётся весь набор модели.
+        screenplay_time: Целевая длительность сценария в секундах — только для справочной строки
+            предупреждения P17 (не влияет на нормализацию и ничего не блокирует).
+
     Returns:
         Словарь в формате items.json для совместимости с artist_agent_batch_edit_tool.
     """
@@ -330,11 +350,14 @@ def screenplay_shots_generator_tool(
     shots_path = f"{shots_dir}/shots.json"
     fcpxml_path = f"{shots_dir}/shots_timeline.fcpxml"
     photo_fcpxml_path = f"{shots_dir}/photo_shots_timeline.fcpxml"
-    
+    caps_file_path = f"{shots_dir}/video_model_caps.json"
+
     # Проверяем существование файлов
     shots_exists = os.path.exists(shots_path)
-    fcpxml_exists = os.path.exists(fcpxml_path)
-    photo_fcpxml_exists = os.path.exists(photo_fcpxml_path)
+    # Э0.3, блок 9: FCPXML теперь пересобирается на каждом выходе из функции
+    # (нормализация длительности могла изменить duration_s даже когда файлы уже
+    # существуют), поэтому больше не используем fcpxml_exists/photo_fcpxml_exists
+    # как условие «пропустить генерацию».
 
     # If the caller requests a partial scope or force regen, do NOT short-circuit on existing shots.json.
     requested_partial = (scene_numbers is not None) or (max_scenes is not None)
@@ -388,6 +411,86 @@ def screenplay_shots_generator_tool(
         generate_end_shots=generate_end_shots,
     )
 
+    # --- Э0.3, блоки 2/3/4: возможности видеомодели + effective_durations ---
+    # Выполняется ДО early-exit проверок ниже: иначе на уже полностью
+    # сгенерированном проекте (generation_completed=true) video_model_caps.json
+    # и нормализация длительности не выполнялись бы вообще ни разу (раздел 11.1 ТЗ).
+    active_tool_name = _active_video_tool_name()
+
+    # Старый набор длительностей читаем ДО resolve_video_model_capabilities() —
+    # она перезаписывает файл ("запись 1"), а P16 сравнивает набор ДО/ПОСЛЕ этого.
+    previous_caps = _read_previous_video_caps(caps_file_path)
+    previous_supported_durations = (
+        list(previous_caps.get("supported_durations") or [])
+        if isinstance(previous_caps, dict) else None
+    )
+
+    caps_payload = resolve_video_model_capabilities(
+        active_tool_name, caps_file_path, allowed_durations=allowed_durations
+    )
+    model_supported_durations = list(caps_payload.get("supported_durations") or [])
+
+    effective_durations: Optional[List[int]]
+    if not model_supported_durations:
+        if generate_blockout:
+            logger.error(
+                "❌ B15: набор supported_durations видеомодели не получен "
+                "(ни каталог, ни кэш, ни константа), generate_blockout=True — прогон остановлен"
+            )
+            return {
+                "items": [], "consistency_rules": [],
+                "error": "B15: supported_durations видеомодели не получен, рендер болванки невозможен",
+            }
+        logger.warning(
+            "⚠️ P14: набор supported_durations видеомодели не получен, generate_blockout=False — "
+            "нормализация длительности пропущена, существующие duration_s сохранены"
+        )
+        effective_durations = None
+    else:
+        effective_durations, _narrowing_warnings = resolve_effective_durations(
+            model_supported_durations, allowed_durations
+        )
+
+    def _append_duration_caps_warnings(
+        *,
+        shots_items: List[Dict[str, Any]],
+        duration_report: Dict[str, Any],
+        photo_fcpxml_built: Any,
+    ) -> None:
+        """Блок 2/9 ТЗ: "запись 2" video_model_caps.json — P08/P16/P17/P19/P20
+        собираются после нормализации и (пере)сборки FCPXML и дописываются в
+        уже существующий файл, не трогая остальные его поля."""
+        report_warnings = _build_duration_report_warnings(
+            shots_items=shots_items,
+            normalization_warnings=duration_report.get("warnings") or [],
+            previous_supported_durations=previous_supported_durations,
+            current_supported_durations=model_supported_durations,
+            affected_shots=duration_report.get("affected") or [],
+            screenplay_time=screenplay_time,
+            photo_fcpxml_built=(photo_fcpxml_built is not False),
+        )
+        if report_warnings:
+            append_video_model_caps_warnings(caps_file_path, report_warnings)
+
+    # Блок 6: лукап ручных длительностей строится один раз, из on-disk items,
+    # ДО какой-либо мутации/перезаписи (защищает duration_source == "manual" от
+    # потери при полном пересоздании shot_item).
+    manual_overrides = _build_manual_duration_overrides(on_disk_meta.get("items") or [])
+
+    # Точка 1 нормализации (раздел 6.2 ТЗ): применяется к уже лежащему на диске
+    # shots.json ДО short-circuit/resume проверок ниже — иначе на уже завершённом
+    # проекте нормализация не выполнилась бы никогда.
+    point1_report: Dict[str, Any] = {}
+    if shots_exists and on_disk_meta and effective_durations is not None:
+        on_disk_meta = _merge_write_shots(
+            shots_path,
+            shots_data=on_disk_meta,
+            partial=True,
+            manual_overrides=manual_overrides,
+            effective_durations=effective_durations,
+            duration_report=point1_report,
+        )
+
     completed_scenes_on_disk: set = set()
     try:
         completed_scenes_on_disk = {int(x) for x in (on_disk_meta.get("completed_scenes") or [])}
@@ -398,18 +501,19 @@ def screenplay_shots_generator_tool(
 
     if shots_exists and on_disk_meta and (not force) and (not requested_partial):
         if "generation_completed" not in on_disk_meta:
-            # Legacy shots.json без маркера завершённости → старая эвристика (shots + fcpxml).
+            # Legacy shots.json без маркера завершённости → старая эвристика (загружаем как есть).
+            # Блок 9 ТЗ: FCPXML пересобирается безусловно (Точка 1 нормализации выше могла
+            # поменять duration_s даже когда файлы уже существовали).
+            logger.info("✅ Legacy shots.json уже существует, загружаем shots.json")
             shots_data = on_disk_meta
             shots_items = shots_data.get("items", [])
-            if fcpxml_exists:
-                logger.info("✅ Legacy shots.json и shots_timeline.fcpxml уже существуют, загружаем shots.json")
-            else:
-                logger.info("📋 Legacy shots.json без shots_timeline.fcpxml — генерируем FCPXML")
-                _generate_fcpxml(project_id, shots_items, fcpxml_path)
-                logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
-            if not photo_fcpxml_exists:
-                _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
-                logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+            _generate_fcpxml(project_id, shots_items, fcpxml_path)
+            logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
+            photo_built = _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
+            logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+            _append_duration_caps_warnings(
+                shots_items=shots_items, duration_report=point1_report, photo_fcpxml_built=photo_built,
+            )
             return shots_data
         else:
             gen_done = on_disk_meta.get("generation_completed") is True
@@ -418,12 +522,14 @@ def screenplay_shots_generator_tool(
                 logger.info("✅ shots.json уже полностью сгенерирован (generation_completed=true, inputs_hash совпал)")
                 shots_data = on_disk_meta
                 shots_items = shots_data.get("items", [])
-                if not fcpxml_exists:
-                    _generate_fcpxml(project_id, shots_items, fcpxml_path)
-                    logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
-                if not photo_fcpxml_exists:
-                    _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
-                    logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+                # Блок 9 ТЗ: FCPXML пересобирается безусловно.
+                _generate_fcpxml(project_id, shots_items, fcpxml_path)
+                logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
+                photo_built = _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
+                logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+                _append_duration_caps_warnings(
+                    shots_items=shots_items, duration_report=point1_report, photo_fcpxml_built=photo_built,
+                )
                 return shots_data
             elif (not gen_done) and hash_ok:
                 # Частичный checkpoint с теми же входами → resume только недостающих сцен.
@@ -509,7 +615,10 @@ def screenplay_shots_generator_tool(
                 completed_scenes=sorted(completed_scene_numbers),
                 inputs_hash=inputs_hash,
             )
-            _merge_write_shots(shots_path, shots_data=checkpoint_data, partial=partial_write)
+            _merge_write_shots(
+                shots_path, shots_data=checkpoint_data, partial=partial_write,
+                manual_overrides=manual_overrides, effective_durations=effective_durations,
+            )
             logger.info(
                 "💾 Checkpoint shots.json обновлен после shot %s сцены %s (%s items)",
                 shot_number,
@@ -842,7 +951,10 @@ def screenplay_shots_generator_tool(
                     completed_scenes=completed_snapshot,
                     inputs_hash=inputs_hash,
                 )
-                _merge_write_shots(shots_path, shots_data=checkpoint_data, partial=partial_write)
+                _merge_write_shots(
+                    shots_path, shots_data=checkpoint_data, partial=partial_write,
+                    manual_overrides=manual_overrides, effective_durations=effective_durations,
+                )
                 logger.info(
                     "💾 Checkpoint shots.json синхронизирован после завершения сцены %s (%s items)",
                     futures[fut].get("scene_number"),
@@ -874,26 +986,33 @@ def screenplay_shots_generator_tool(
 
     logger.info("🈯 Shots prompts already generated on language: %s", language)
 
-    # Сохраняем shots.json (merge superset при partial/resume, иначе перезапись)
-    shots_data = _merge_write_shots(shots_path, shots_data=shots_data, partial=partial_write)
+    # Сохраняем shots.json (merge superset при partial/resume, иначе перезапись).
+    # Блок 5/6: перенос ручных длительностей + нормализация выполняются внутри
+    # _merge_write_shots; duration_report собирает результат для "записи 2".
+    final_duration_report: Dict[str, Any] = {}
+    shots_data = _merge_write_shots(
+        shots_path, shots_data=shots_data, partial=partial_write,
+        manual_overrides=manual_overrides, effective_durations=effective_durations,
+        duration_report=final_duration_report,
+    )
     shots_items = shots_data["items"]
     total_shots = len(shots_items)
-    
-    logger.info(f"✅ Кадры сценария сохранены: {shots_path}")
-    
-    # Генерируем FCPXML для DaVinci Resolve только если его не было
-    if not fcpxml_exists:
-        _generate_fcpxml(project_id, shots_items, fcpxml_path)
-        logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
-    else:
-        logger.info(f"ℹ️ FCPXML уже существует: {fcpxml_path}")
 
-    # Генерируем photo FCPXML для DaVinci Resolve только если его не было
-    if not photo_fcpxml_exists:
-        _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
-        logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
-    else:
-        logger.info(f"ℹ️ Photo FCPXML уже существует: {photo_fcpxml_path}")
+    logger.info(f"✅ Кадры сценария сохранены: {shots_path}")
+
+    # Блок 9 ТЗ: FCPXML пересобирается безусловно — нормализация длительности
+    # выше могла поменять duration_s даже когда файлы уже существовали.
+    _generate_fcpxml(project_id, shots_items, fcpxml_path)
+    logger.info(f"✅ FCPXML для DaVinci Resolve сохранен: {fcpxml_path}")
+
+    photo_built = _generate_photo_fcpxml(project_id, shots_items, photo_fcpxml_path)
+    logger.info(f"✅ Photo FCPXML для DaVinci Resolve сохранен: {photo_fcpxml_path}")
+
+    _append_duration_caps_warnings(
+        shots_items=shots_items,
+        duration_report=final_duration_report,
+        photo_fcpxml_built=photo_built,
+    )
 
     # Возвращаем данные в формате, совместимом с artist_agent_batch_edit_tool
     logger.info(f"📊 Возвращаем данные shots для дальнейшей обработки: {total_shots} кадров")
@@ -1041,20 +1160,343 @@ def _merge_shots_payload(on_disk: Dict[str, Any], fresh: Dict[str, Any]) -> Dict
     return out
 
 
+class _ManualDurationNotSupportedError(Exception):
+    """B01 (раздел 6.2 ТЗ): ручная длительность (duration_source == "manual")
+    не входит в effective_durations действующей видеомодели/проекта."""
+
+    def __init__(self, message: str, details: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.details = details or {}
+
+
+def _has_manual_mark(element: Any) -> bool:
+    """Метка duration_source == "manual" учитывается только с целым duration_s
+    (иначе метка проигнорирована — P20)."""
+    if not isinstance(element, dict):
+        return False
+    if element.get("duration_source") != "manual":
+        return False
+    value = element.get("duration_s")
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _seconds_to_mmss(total_seconds: Any) -> str:
+    try:
+        total_seconds = max(0, int(total_seconds))
+    except Exception:
+        total_seconds = 0
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def _build_manual_duration_overrides(items: List[Dict[str, Any]]) -> Dict[tuple, Dict[str, Any]]:
+    """Блок 6 ТЗ: лукап «ключ шота → ручные поля длительности», построенный ОДИН
+    раз из on-disk items ДО какой-либо мутации/перезаписи.
+
+    Защищает duration_source == "manual" от потери при полном пересоздании
+    shot_item — _create_shot_item ничего не знает про поля duration_s/
+    duration_source/duration_requested_s, поэтому при обычной регенерации
+    свежий item их не содержит вовсе.
+    """
+    overrides: Dict[tuple, Dict[str, Any]] = {}
+    for item in items or []:
+        if not _has_manual_mark(item):
+            continue
+        override: Dict[str, Any] = {
+            "duration_s": item["duration_s"],
+            "duration_source": "manual",
+        }
+        if "duration_requested_s" in item:
+            override["duration_requested_s"] = item["duration_requested_s"]
+        # "Старый" timing переносим тоже: если duration_requested_s ещё нет,
+        # нормализация (см. ниже) заполнит его разбором ИМЕННО этого timing,
+        # а не default-значения свежесозданного элемента.
+        if "timing" in item:
+            override["timing"] = item["timing"]
+        overrides[_shot_merge_key(item)] = override
+    return overrides
+
+
+def _apply_manual_duration_overrides(
+    items: List[Dict[str, Any]],
+    overrides: Dict[tuple, Dict[str, Any]],
+) -> None:
+    """Переносит ручные поля длительности на свежие/смёрженные items ДО
+    нормализации (блок 6 ТЗ). Мутирует items на месте."""
+    if not overrides:
+        return
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        override = overrides.get(_shot_merge_key(item))
+        if override:
+            item.update(override)
+
+
+def _normalize_shot_durations(
+    items: List[Dict[str, Any]],
+    effective_durations: List[int],
+) -> "tuple[bool, List[Dict[str, Any]], List[Dict[str, Any]]]":
+    """Блок 5 ТЗ (раздел 6.2): идемпотентная нормализация длительности шотов.
+
+    Группирует items по (scene_number, shot_number); для каждой пары (start/end,
+    один из них может отсутствовать у непарного шота):
+      - Если хотя бы у одного элемента пары есть валидная ручная метка
+        (duration_source == "manual" + целый duration_s) — она выигрывает.
+        Значение проверяется на вхождение в effective_durations (иначе B01).
+        duration_requested_s заполняется один раз: если поля ещё нет, оно
+        разбирается из СТАРОГО timing (до его перезаписи в этом проходе) —
+        человек мог проставить duration_s/duration_source вручную в файле до
+        первой нормализации, не тронув duration_requested_s.
+      - Иначе — длительность вычисляется из timing/duration_requested_s (если
+        уже есть — оно НЕИЗМЕНЯЕМО и остаётся источником "requested"), к
+        ближайшей поддерживаемой моделью (_select_best_supported_duration).
+        duration_source: "timing", если ближайшая длительность совпала с
+        запрошенной без замены, иначе "model_catalog".
+      - В обоих случаях timing пары перезаписывается в формате MM:SS, оба
+        элемента пары получают одинаковые duration_s/duration_source.
+
+    Возвращает (changed, warnings, affected_shots), где affected_shots — список
+    {"scene_number", "shot_number"} шотов, у которых duration_s реально изменился.
+    """
+    changed = False
+    warnings: List[Dict[str, Any]] = []
+    affected: List[Dict[str, Any]] = []
+
+    shots_by_key: Dict[tuple, Dict[str, Dict[str, Any]]] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        scene_number = item.get("scene_number", 1)
+        shot_number = item.get("shot_number", 1)
+        pair = shots_by_key.setdefault((scene_number, shot_number), {})
+        shot_type = item.get("shot_type", "start")
+        pair[shot_type] = item
+
+    for (scene_number, shot_number), pair in shots_by_key.items():
+        start_el = pair.get("start")
+        end_el = pair.get("end")
+        elements = [el for el in (start_el, end_el) if isinstance(el, dict)]
+        if not elements:
+            continue
+
+        manual_candidates = [el for el in (start_el, end_el) if isinstance(el, dict) and _has_manual_mark(el)]
+
+        # P20: метка проставлена (duration_source == "manual"), но duration_s
+        # отсутствует/не целое — метка игнорируется. Предупреждение уместно,
+        # только если после игнорирования у пары НЕ осталось ни одного валидного
+        # ручного элемента (иначе он всё равно побеждает, обычная ветка не идёт).
+        if not manual_candidates and any(
+            isinstance(el, dict) and el.get("duration_source") == "manual" and not _has_manual_mark(el)
+            for el in (start_el, end_el)
+        ):
+            warnings.append(video_model_caps_warning(
+                "P20",
+                f"Ручная метка длительности шота {scene_number}-{shot_number} без целого "
+                "duration_s проигнорирована, длительность вычислена обычным порядком",
+                details={"scene_number": scene_number, "shot_number": shot_number},
+            ))
+
+        if manual_candidates:
+            source_el = manual_candidates[0]  # при разногласии start/end побеждает start
+            manual_value = int(source_el["duration_s"])
+
+            if manual_value not in effective_durations:
+                raise _ManualDurationNotSupportedError(
+                    f"Ручная длительность {manual_value}s шота {scene_number}-{shot_number} не входит "
+                    f"в допустимый набор {sorted(set(int(v) for v in effective_durations))}",
+                    details={
+                        "scene_number": scene_number,
+                        "shot_number": shot_number,
+                        "duration_s": manual_value,
+                        "effective_durations": sorted(set(int(v) for v in effective_durations)),
+                    },
+                )
+
+            requested_fill: Optional[int] = None
+            if "duration_requested_s" not in source_el:
+                try:
+                    requested_fill = int(_parse_simple_timing(source_el.get("timing", "")))
+                except Exception:
+                    requested_fill = manual_value
+
+            shot_changed = False
+            for el in elements:
+                old_value = el.get("duration_s")
+                el["duration_s"] = manual_value
+                el["duration_source"] = "manual"
+                if "duration_requested_s" not in el:
+                    el["duration_requested_s"] = requested_fill if requested_fill is not None else manual_value
+                el["timing"] = _seconds_to_mmss(manual_value)
+                if old_value != manual_value:
+                    shot_changed = True
+            if shot_changed:
+                changed = True
+                affected.append({"scene_number": scene_number, "shot_number": shot_number})
+            continue
+
+        # --- автоматическая ветка (без ручной метки) ---
+        primary = start_el or end_el
+        requested = primary.get("duration_requested_s")
+        if requested is None:
+            try:
+                requested = int(_parse_simple_timing(primary.get("timing", "")))
+            except Exception:
+                requested = 5
+        else:
+            requested = int(requested)
+
+        resolved = _select_best_supported_duration(requested, effective_durations)
+        source_label = "timing" if resolved == requested else "model_catalog"
+
+        shot_changed = False
+        for el in elements:
+            old_value = el.get("duration_s")
+            el["duration_s"] = resolved
+            el["duration_source"] = source_label
+            if "duration_requested_s" not in el:
+                el["duration_requested_s"] = requested
+            el["timing"] = _seconds_to_mmss(resolved)
+            if old_value != resolved:
+                shot_changed = True
+        if shot_changed:
+            changed = True
+            affected.append({"scene_number": scene_number, "shot_number": shot_number})
+
+    return changed, warnings, affected
+
+
+def _sum_duration_s_per_shot(items: List[Dict[str, Any]]) -> int:
+    """P17 (раздел 6.2 ТЗ): сумма duration_s по ВСЕМ шотам, включая непарные —
+    в отличие от _calculate_total_duration (пропускает непарные, т.к. считает
+    длину <sequence> фото-таймлайна). Значения легитимно расходятся ровно на
+    сумму duration_s непарных шотов."""
+    shots_by_key: Dict[tuple, Dict[str, Any]] = {}
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("scene_number", 1), item.get("shot_number", 1))
+        pair = shots_by_key.setdefault(key, {})
+        shot_type = item.get("shot_type", "start")
+        pair[shot_type] = item
+
+    total = 0
+    for pair in shots_by_key.values():
+        representative = pair.get("start") or pair.get("end")
+        if not representative:
+            continue
+        duration_s = representative.get("duration_s")
+        if isinstance(duration_s, int) and not isinstance(duration_s, bool):
+            total += duration_s
+    return total
+
+
+def _build_duration_report_warnings(
+    *,
+    shots_items: List[Dict[str, Any]],
+    normalization_warnings: List[Dict[str, Any]],
+    previous_supported_durations: Optional[List[int]],
+    current_supported_durations: List[int],
+    affected_shots: List[Dict[str, Any]],
+    screenplay_time: Optional[int],
+    photo_fcpxml_built: bool,
+) -> List[Dict[str, Any]]:
+    """"Запись 2" video_model_caps.json (раздел 6.2 ТЗ, блок 2): собирает
+    P08/P16/P17/P19/P20 после нормализации и сборки FCPXML."""
+    warnings: List[Dict[str, Any]] = list(normalization_warnings or [])  # P20 уже внутри
+
+    # P08: сводка «duration_s отличается от duration_requested_s» по финальным items.
+    mismatched = 0
+    total_diff = 0
+    max_diff = 0
+    max_diff_key: Optional[str] = None
+    for item in shots_items or []:
+        duration_s = item.get("duration_s")
+        requested_s = item.get("duration_requested_s")
+        if not isinstance(duration_s, int) or isinstance(duration_s, bool):
+            continue
+        if not isinstance(requested_s, int) or isinstance(requested_s, bool):
+            continue
+        diff = duration_s - requested_s
+        if diff == 0:
+            continue
+        mismatched += 1
+        total_diff += abs(diff)
+        if abs(diff) > max_diff:
+            max_diff = abs(diff)
+            max_diff_key = f"{item.get('scene_number')}-{item.get('shot_number')}"
+    if mismatched:
+        warnings.append(video_model_caps_warning(
+            "P08",
+            f"duration_s отличается от duration_requested_s у {mismatched} шот(ов), "
+            f"суммарное расхождение {total_diff}s, максимальное {max_diff}s (шот {max_diff_key})",
+            details={
+                "mismatched_shots": mismatched,
+                "total_diff_seconds": total_diff,
+                "max_diff_seconds": max_diff,
+                "max_diff_shot_key": max_diff_key,
+            },
+        ))
+
+    # P16: набор длительностей модели изменился с прошлого прогона (сравниваем
+    # ДО/ПОСЛЕ "записи 1"), и это реально задело хотя бы один шот в этом прогоне.
+    if (
+        previous_supported_durations is not None
+        and sorted(previous_supported_durations) != sorted(current_supported_durations)
+        and affected_shots
+    ):
+        shot_keys = sorted({f"{a['scene_number']}-{a['shot_number']}" for a in affected_shots})
+        warnings.append(video_model_caps_warning(
+            "P16",
+            f"Набор длительностей видеомодели изменился с прошлого прогона, затронуто "
+            f"{len(shot_keys)} шот(ов), требуется перерендер болванки",
+            details={"affected_shots": shot_keys},
+        ))
+
+    # P17: справочная строка (не блокирует, без порога) — сумма по всем шотам vs screenplay_time.
+    if screenplay_time is not None:
+        total_duration_s = _sum_duration_s_per_shot(shots_items)
+        warnings.append(video_model_caps_warning(
+            "P17",
+            f"Суммарная длительность по шотам: {total_duration_s}s, ориентир screenplay_time: {screenplay_time}s",
+            level="info",
+            details={"total_duration_s": total_duration_s, "screenplay_time": screenplay_time},
+        ))
+
+    # P19: фото-таймлайн не собран (правило нулевой суммы в _generate_photo_fcpxml).
+    if not photo_fcpxml_built:
+        warnings.append(video_model_caps_warning(
+            "P19",
+            "Фото-таймлайн не собран: ни один шот не имеет одновременно start и end",
+        ))
+
+    return warnings
+
+
 def _merge_write_shots(
     shots_path: str,
     *,
     shots_data: Dict[str, Any],
     partial: bool,
+    manual_overrides: Optional[Dict[tuple, Dict[str, Any]]] = None,
+    effective_durations: Optional[List[int]] = None,
+    duration_report: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Атомарная кросс-процессная запись shots.json (M-7/H-4).
 
     flock на sidecar `{path}.lock` (НЕ подменяется)→(при partial: перечитать
-    shots_path + union-merge superset)→уникальный tmp `{path}.{pid}.tmp`→
-    os.replace→flock(LOCK_UN). Флокать сам shots_path нельзя: os.replace меняет
-    inode, и второй процесс флокнул бы уже НОВЫЙ inode (окно потерянного апдейта).
+    shots_path + union-merge superset)→(Э0.3, блок 5/6: перенос ручных длительностей
+    + идемпотентная нормализация)→уникальный tmp `{path}.{pid}.tmp`→os.replace→
+    flock(LOCK_UN). Флокать сам shots_path нельзя: os.replace меняет inode, и
+    второй процесс флокнул бы уже НОВЫЙ inode (окно потерянного апдейта).
     Внутрипроцессный _SHOTS_WRITE_LOCK защищает от гонки потоков-чекпойнтеров.
-    Возвращает фактически записанный payload (после merge).
+
+    ``effective_durations`` — None означает «нормализация пропускается» (B15/P14,
+    generate_blockout=False), поэтому вызывающий явно передаёт None, а не []
+    для «нечего нормализовать». ``duration_report``, если передан, заполняется
+    результатом нормализации ({"changed", "warnings", "affected"}) для сборки
+    "записи 2" video_model_caps.json вызывающим кодом.
+    Возвращает фактически записанный payload (после merge+нормализации).
     """
     directory = os.path.dirname(shots_path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -1078,10 +1520,28 @@ def _merge_write_shots(
                         logger.warning("⚠️ Не удалось перечитать shots.json для merge: %s", e)
                         on_disk = {}
                     shots_data = _merge_shots_payload(on_disk, shots_data)
+
+                items = shots_data.get("items") or []
+                if manual_overrides:
+                    _apply_manual_duration_overrides(items, manual_overrides)
+                if effective_durations is not None:
+                    changed, norm_warnings, affected = _normalize_shot_durations(items, effective_durations)
+                    if duration_report is not None:
+                        duration_report["changed"] = changed
+                        duration_report["warnings"] = norm_warnings
+                        duration_report["affected"] = affected
+
                 tmp = f"{shots_path}.{os.getpid()}.tmp"
-                with open(tmp, "w", encoding="utf-8") as wf:
-                    json.dump(shots_data, wf, ensure_ascii=False, indent=2)
-                os.replace(tmp, shots_path)
+                try:
+                    with open(tmp, "w", encoding="utf-8") as wf:
+                        json.dump(shots_data, wf, ensure_ascii=False, indent=2)
+                    os.replace(tmp, shots_path)
+                except Exception:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                    raise
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
     return shots_data

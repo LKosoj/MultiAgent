@@ -15,7 +15,6 @@ from workflow.deadline import WorkflowDeadlineExceeded
 from workflow.models import (
     TextToSqlTerminalResult,
     TextToSqlTerminalStatus,
-    TextToSqlVerificationStatus,
     bound_text_to_sql_error,
     normalize_text_to_sql_json_value,
     text_to_sql_executor_contract_error,
@@ -27,6 +26,8 @@ _SUMMARY_ERROR_LIMIT = 512
 # Compatibility name retained for focused contract tests; the implementation
 # lives in workflow.models and is shared with the trusted executor wrapper.
 _executor_contract_error = text_to_sql_executor_contract_error
+
+
 def _require_non_empty_string(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise TypeError(f"{field_name} must be a non-empty string")
@@ -35,6 +36,51 @@ def _require_non_empty_string(value: Any, field_name: str) -> str:
 
 def _not_attempted() -> Dict[str, str]:
     return {"status": "not_attempted"}
+
+
+_PRE_EXECUTION_GATE_ABSENT = object()
+_PRE_EXECUTION_GATE_REQUIRED_RUNTIME_KEY = "_text_to_sql_pre_execution_gate_required"
+_PRE_EXECUTION_GATE_RUNTIME_KEY = "_text_to_sql_pre_execution_gate"
+_RESULT_VALIDATION_ABSENT = object()
+_RESULT_REVIEW_ABSENT = object()
+
+
+def _pre_execution_gate_allowed(
+    *,
+    run_id: str,
+    sql_query: str,
+    safety_policy: Optional["TextToSqlSafetyPolicy"],
+) -> bool | None:
+    """Require the Typed pre-execution gate when the runtime installs it."""
+
+    from tool_runtime_context import get_tool_runtime_value
+
+    required = get_tool_runtime_value(
+        _PRE_EXECUTION_GATE_REQUIRED_RUNTIME_KEY,
+        False,
+    )
+    capability = get_tool_runtime_value(
+        _PRE_EXECUTION_GATE_RUNTIME_KEY,
+        _PRE_EXECUTION_GATE_ABSENT,
+    )
+    if capability is _PRE_EXECUTION_GATE_ABSENT or type(required) is not bool:
+        return False
+    from ..adaptive.pre_execution_gate import (
+        evaluate_pre_execution_gate_capability,
+    )
+
+    try:
+        receipt = evaluate_pre_execution_gate_capability(
+            capability,
+            expected_run_id=run_id,
+            expected_sql=sql_query,
+            safety_policy=safety_policy,
+        )
+    except WorkflowDeadlineExceeded:
+        raise
+    except Exception:
+        return False
+    return receipt.allowed is True
 
 
 def _content_fingerprint(value: str) -> Dict[str, Any]:
@@ -110,6 +156,7 @@ def _terminal_mapping(
     execution: Dict[str, Any],
     audit: Dict[str, Any],
     persistence: Dict[str, Any],
+    result_review: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     outcome = TextToSqlTerminalResult(
         run_id=run_id,
@@ -128,6 +175,7 @@ def _terminal_mapping(
         execution=execution,
         audit=audit,
         persistence=persistence,
+        result_review=result_review or {},
     )
     outcome.assert_invariants()
     return outcome.to_mapping()
@@ -314,7 +362,6 @@ def _normalize_execution_evidence(
 def finalize_text_to_sql_run(
     sql_query: str,
     user_query: str,
-    verification_status: str,
     dsn: str,
     row_limit: int,
     dry_run_only: bool,
@@ -347,35 +394,16 @@ def finalize_text_to_sql_run(
         if not isinstance(safety_policy, TextToSqlSafetyPolicy):
             raise TypeError("safety_policy must be a TextToSqlSafetyPolicy or null")
 
-    try:
-        verifier_status = TextToSqlVerificationStatus(verification_status)
-    except (TypeError, ValueError):
-        return _terminal_mapping(
-            run_id=run_id,
-            status=TextToSqlTerminalStatus.FAILED,
-            reason_code="VERIFIER_CONTRACT_INVALID",
-            sql=sql_query,
-            generated=True,
-            approved=False,
-            executed=False,
-            dry_run=False,
-            audited=False,
-            data=[],
-            columns=[],
-            rows_affected=0,
-            error=(
-                "verification_status must be exactly 'Approved' or 'Rejected'"
-            ),
-            execution={},
-            audit={},
-            persistence=_not_attempted(),
-        )
-
-    if verifier_status is TextToSqlVerificationStatus.REJECTED:
+    gate_allowed = _pre_execution_gate_allowed(
+        run_id=run_id,
+        sql_query=sql_query,
+        safety_policy=safety_policy,
+    )
+    if gate_allowed is False:
         return _terminal_mapping(
             run_id=run_id,
             status=TextToSqlTerminalStatus.ABSTAINED,
-            reason_code="VERIFIER_REJECTED",
+            reason_code="DETERMINISTIC_CHECK_REJECTED",
             sql=sql_query,
             generated=True,
             approved=False,
@@ -539,6 +567,123 @@ def finalize_text_to_sql_run(
             persistence=_not_attempted(),
         )
 
+    result_review: Dict[str, Any] = {}
+    if executed:
+        from tool_runtime_context import get_tool_runtime_value
+        from ..adaptive.result_validation import (
+            RESULT_VALIDATION_RUNTIME_KEY,
+            evaluate_result_validation_capability,
+        )
+
+        capability = get_tool_runtime_value(
+            RESULT_VALIDATION_RUNTIME_KEY,
+            _RESULT_VALIDATION_ABSENT,
+        )
+        if capability is not _RESULT_VALIDATION_ABSENT:
+            try:
+                receipt = evaluate_result_validation_capability(
+                    capability,
+                    expected_run_id=run_id,
+                    expected_sql=sql_query,
+                    execution=execution,
+                )
+                if receipt is not None:
+                    return receipt.model_dump(mode="json")
+            except WorkflowDeadlineExceeded:
+                raise
+            except Exception as exc:
+                reconciliation_error = (
+                    bound_text_to_sql_error(exc) or "result reconciliation failed"
+                )
+                return _terminal_mapping(
+                    run_id=run_id,
+                    status=TextToSqlTerminalStatus.FAILED,
+                    reason_code="RESULT_RECONCILIATION_FAILED",
+                    sql=sql_query,
+                    generated=True,
+                    approved=True,
+                    executed=True,
+                    dry_run=False,
+                    audited=True,
+                    data=data,
+                    columns=columns,
+                    rows_affected=rows_affected,
+                    error=reconciliation_error,
+                    execution=execution,
+                    audit=audit,
+                    persistence={"status": "error", "error": reconciliation_error},
+                )
+
+        from ..adaptive.result_review import (
+            RESULT_REVIEW_REQUIRED_RUNTIME_KEY,
+            RESULT_REVIEW_RUNTIME_KEY,
+            evaluate_result_review_capability,
+        )
+
+        review_capability = get_tool_runtime_value(
+            RESULT_REVIEW_RUNTIME_KEY,
+            _RESULT_REVIEW_ABSENT,
+        )
+        review_required = get_tool_runtime_value(
+            RESULT_REVIEW_REQUIRED_RUNTIME_KEY,
+            False,
+        )
+        if type(review_required) is not bool:
+            review_required = True
+        if review_required and review_capability is _RESULT_REVIEW_ABSENT:
+            review_error = "required result review capability is unavailable"
+            return _terminal_mapping(
+                run_id=run_id,
+                status=TextToSqlTerminalStatus.FAILED,
+                reason_code="RESULT_REVIEW_FAILED",
+                sql=sql_query,
+                generated=True,
+                approved=True,
+                executed=True,
+                dry_run=False,
+                audited=True,
+                data=data,
+                columns=columns,
+                rows_affected=rows_affected,
+                error=review_error,
+                execution=execution,
+                audit=audit,
+                persistence={"status": "error", "error": review_error},
+            )
+        if review_capability is not _RESULT_REVIEW_ABSENT:
+            try:
+                review_receipt = evaluate_result_review_capability(
+                    review_capability,
+                    expected_run_id=run_id,
+                    expected_sql=sql_query,
+                    execution=execution,
+                )
+                if review_receipt.verdict != "consistent":
+                    return review_receipt.model_dump(mode="json")
+                result_review = review_receipt.model_dump(mode="json")
+            except WorkflowDeadlineExceeded:
+                raise
+            except Exception as exc:
+                review_error = bound_text_to_sql_error(exc) or "result review failed"
+                return _terminal_mapping(
+                    run_id=run_id,
+                    status=TextToSqlTerminalStatus.FAILED,
+                    reason_code="RESULT_REVIEW_FAILED",
+                    sql=sql_query,
+                    generated=True,
+                    approved=True,
+                    executed=True,
+                    dry_run=False,
+                    audited=True,
+                    data=data,
+                    columns=columns,
+                    rows_affected=rows_affected,
+                    error=review_error,
+                    execution=execution,
+                    audit=audit,
+                    persistence={"status": "error", "error": review_error},
+                )
+
     persistence: Dict[str, Any] = _not_attempted()
     persistence_contract_error: Optional[str] = None
     if executed:
@@ -614,4 +759,5 @@ def finalize_text_to_sql_run(
         execution=execution,
         audit=audit,
         persistence=persistence,
+        result_review=result_review,
     )

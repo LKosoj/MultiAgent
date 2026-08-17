@@ -1,0 +1,27 @@
+{
+  "id": "eiffel_lp",
+  "name": "Эйфелева башня (low poly)",
+  "category": "building",
+  "tags": [
+    "paris",
+    "eiffel",
+    "landmark",
+    "desc:Париж на горизонте с крыши Монмартра."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.6624405384063721,
+    0.6624409556388855,
+    1.5681684911251068
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/c91c6bd4f96c4bca8e983a7c4c659d22",
+  "file_size_bytes": 317904,
+  "fetched_at": "2026-08-16T22:54:35Z",
+  "asset_version": 1
+}

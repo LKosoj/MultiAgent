@@ -1,0 +1,27 @@
+{
+  "id": "coconut_palm",
+  "name": "Кокосовая пальма",
+  "category": "nature",
+  "tags": [
+    "palm",
+    "cuba",
+    "tropics",
+    "desc:Куба, палящее солнце."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    6.296412706375122,
+    4.023053288459778,
+    6.283932495193767
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/26e787f2ff2e4c0fb004c3b0210805a3",
+  "file_size_bytes": 11707544,
+  "fetched_at": "2026-08-16T22:54:32Z",
+  "asset_version": 1
+}

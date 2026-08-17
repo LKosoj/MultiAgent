@@ -1,0 +1,25 @@
+{
+  "id": "train_woodcar",
+  "name": "Вагон с дровами",
+  "category": "vehicle",
+  "tags": [
+    "train",
+    "wood"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.2000234127044678,
+    2.700000047683716,
+    1.5748240947723389
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/train-kit",
+  "file_size_bytes": 83704,
+  "fetched_at": "2026-08-16T21:48:02Z",
+  "asset_version": 2
+}

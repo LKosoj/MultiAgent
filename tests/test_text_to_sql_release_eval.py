@@ -284,6 +284,7 @@ def _cancelled_terminal(run_id: str) -> dict:
         "columns": [],
         "rows_affected": 0,
         "error": None,
+        "ambiguity": None,
         "execution": {},
         "audit": {},
         "persistence": {"status": "not_attempted"},
@@ -373,7 +374,6 @@ def test_generation_request_contains_no_oracle_fields_or_values() -> None:
         "include_explanation",
         "validate_schema",
         "dry_run_only",
-        "use_schema_suggestions",
     }
     serialized = json.dumps(payload, sort_keys=True)
     assert case.expected_sql not in serialized

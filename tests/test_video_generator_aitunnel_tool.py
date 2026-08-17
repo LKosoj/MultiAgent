@@ -2,6 +2,7 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from custom_tools.storybook import video_generator_aitunnel_tool as aitunnel_module
@@ -172,7 +173,7 @@ def test_video_generator_aitunnel_tool_generates_video_with_installed_model_and_
     assert result["results"][0]["task_id"] == "job-1"
     assert result["results"][0]["model"] == "installed-model"
     assert captured_payload["json"]["model"] == "installed-model"
-    assert captured_payload["json"]["duration"] == 8
+    assert captured_payload["json"]["duration"] == 4
     assert captured_payload["json"]["size"] == "1280x720"
     assert captured_payload["json"]["generate_audio"] is False
     assert captured_payload["json"]["seed"] == 123
@@ -277,6 +278,43 @@ def test_disabled_project_run_updates_shot_descriptions_before_skipping(tmp_path
             "skip_prompt_enhancement": True,
         }
     ]
+
+
+def test_disabled_project_run_does_not_reload_after_failed_description_write(tmp_path, monkeypatch, caplog):
+    """update_shots_with_descriptions returns -1 when the shots.json write
+    itself failed (disk full/permissions) — distinct from 0 ("nothing to
+    update"). The caller must not treat -1 as truthy and reload shots.json
+    from disk: the on-disk file is stale (the write failed), so reloading it
+    would silently discard the already-updated in-memory items_list. Proof:
+    the fake update_shots_with_descriptions corrupts shots.json as a side
+    effect (standing in for "the failed write left the file unusable") and
+    returns -1; the tool's own initial read (before Этап 1) already
+    succeeded on the still-valid file, so if it wrongly tried to reload
+    afterwards, it would hit the JSON parse error branch and return
+    status="error" instead of the normal "skipped" result."""
+    monkeypatch.delenv("AITUNNEL_API_KEY", raising=False)
+    monkeypatch.delenv("AITUNNEL_VIDEO_MODEL", raising=False)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    project_id, _shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    def fake_update(shots_file_path, items_list, force_update=False, skip_prompt_enhancement=False):
+        Path(shots_file_path).write_text("{not valid json", encoding="utf-8")
+        return -1
+
+    monkeypatch.setattr(aitunnel_module, "update_shots_with_descriptions", fake_update)
+
+    with caplog.at_level("ERROR", logger=aitunnel_module.logger.name):
+        result = aitunnel_module.video_generator_aitunnel_tool(
+            session_id="session-1",
+            project_id=project_id,
+            enable=False,
+        )
+
+    assert result["status"] == "skipped"
+    assert "error" not in result
+    assert any("Не удалось сохранить обновлённые описания" in rec.message for rec in caplog.records)
 
 
 def test_video_generator_aitunnel_tool_reports_missing_installed_model(tmp_path, monkeypatch):
@@ -1576,7 +1614,7 @@ def test_input_hash_stores_resolved_params_as_metadata(tmp_path, monkeypatch):
     # ...which is stored only as job metadata, never folded into the input hash.
     assert job["resolved_size_params"] == {"size": "1280x720"}
     assert job["resolved_duration"] == 8
-    assert job["hash_inputs_version"] == 2
+    assert job["hash_inputs_version"] == 3
 
     expected_hash = aitunnel_module._build_input_hash(
         model_name="installed-model",
@@ -1658,3 +1696,326 @@ def test_legacy_v1_jobs_not_marked_stale_and_resume_by_shot_identity(tmp_path, m
     legacy_job = next(job for job in jobs if job.get("task_id") == "job-legacy")
     # M-6 compat: a hash-formula bump must never stale a legacy job (its task_id lives).
     assert legacy_job["status"] != "stale"
+
+
+# === Э8: video-reference blockout hash discipline (раздел 11.3) ==============
+
+def test_build_input_hash_without_reference_matches_pre_e8_dict_shape():
+    """Money-critical (A31/A37): with no blockout reference, the dict fed to
+    _hash_json() must be byte-for-byte the same composition it had before Э8 —
+    reconstructed here independently of _build_input_hash's own source, so a
+    regression that unconditionally adds the new key cannot pass silently."""
+    from custom_tools.storybook.video_generator_aitunnel_jobs import _hash_json
+
+    kwargs = dict(
+        model_name="installed-model",
+        prompt_hash="prompt-hash",
+        source_image_hashes={"start_image": "hash-1", "end_image": None},
+        requested_duration=6,
+        requested_width=1920,
+        requested_height=1080,
+        seed=None,
+        frame_types=["first_frame"],
+    )
+    pre_e8_dict = {
+        "provider": "aitunnel",
+        "model": kwargs["model_name"],
+        "prompt_hash": kwargs["prompt_hash"],
+        "source_image_hashes": kwargs["source_image_hashes"],
+        "requested_duration": kwargs["requested_duration"],
+        "requested_width": kwargs["requested_width"],
+        "requested_height": kwargs["requested_height"],
+        "seed": kwargs["seed"],
+        "generate_audio": False,
+        "frame_types": kwargs["frame_types"],
+    }
+    expected_hash = _hash_json(pre_e8_dict)
+
+    # Argument omitted entirely (as every pre-Э8 call site still does):
+    assert aitunnel_module._build_input_hash(**kwargs) == expected_hash
+    # Explicit None (Э8's own new call sites when no reference is attached):
+    assert aitunnel_module._build_input_hash(**kwargs, reference_video_hash=None) == expected_hash
+
+
+def test_build_input_hash_changes_when_reference_video_hash_present():
+    kwargs = dict(
+        model_name="installed-model",
+        prompt_hash="prompt-hash",
+        source_image_hashes={"start_image": "hash-1", "end_image": None},
+        requested_duration=6,
+        requested_width=1920,
+        requested_height=1080,
+        seed=None,
+        frame_types=["first_frame"],
+    )
+    without_reference = aitunnel_module._build_input_hash(**kwargs)
+    with_reference = aitunnel_module._build_input_hash(**kwargs, reference_video_hash="ref-hash-abc")
+    assert with_reference != without_reference
+
+
+def test_new_provider_job_defaults_video_reference_fields_to_none():
+    job = aitunnel_module._new_provider_job(
+        shot_key="1-1",
+        model="m",
+        prompt_hash="p",
+        source_image_hashes={},
+        input_hash="h",
+        output_path="out.mp4",
+    )
+    assert job["video_reference"] is None
+    assert job["video_reference_rejected_reason"] is None
+
+
+def test_new_provider_job_records_video_reference_and_rejection_reason():
+    attached = aitunnel_module._new_provider_job(
+        shot_key="1-1",
+        model="m",
+        prompt_hash="p",
+        source_image_hashes={},
+        input_hash="h",
+        output_path="out.mp4",
+        video_reference="/plots/storybooks/p/93_blockout/scene_01_shot_01/blockout_ref.mp4",
+    )
+    assert attached["video_reference"] == "/plots/storybooks/p/93_blockout/scene_01_shot_01/blockout_ref.mp4"
+    assert attached["video_reference_rejected_reason"] is None
+
+    rejected = aitunnel_module._new_provider_job(
+        shot_key="1-1",
+        model="m",
+        prompt_hash="p",
+        source_image_hashes={},
+        input_hash="h2",
+        output_path="out.mp4",
+        video_reference_rejected_reason="condition_2_video_missing",
+    )
+    assert rejected["video_reference"] is None
+    assert rejected["video_reference_rejected_reason"] == "condition_2_video_missing"
+
+
+def _write_blockout_reference(item=None, *, project_root: Path, resolution=(1920, 1080), duration_s=6, junction_failed=False):
+    blockout_dir = project_root / "plots" / "storybooks" / "project-1" / "93_blockout" / "scene_01_shot_01"
+    blockout_dir.mkdir(parents=True, exist_ok=True)
+    blockout_video = blockout_dir / "blockout_ref.mp4"
+    blockout_video.write_bytes(b"fake-blockout-clip-bytes")
+    (blockout_dir / "manifest.json").write_text(
+        json.dumps({"resolution": list(resolution), "duration_s": duration_s}), encoding="utf-8"
+    )
+    if item is not None:
+        item["blockout_video"] = str(blockout_video)
+        if junction_failed:
+            item["blockout_junction_failed"] = True
+    return blockout_video
+
+
+def test_blockout_reference_attached_when_all_five_conditions_met(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    _write_blockout_reference(item, project_root=tmp_path, resolution=(1920, 1080), duration_s=6)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    captured_payload = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, timeout
+        captured_payload["json"] = json
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+
+    assert result["status"] == "success"
+    assert captured_payload["json"]["reference_video"].startswith("data:video/mp4;base64,")
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["video_reference"] == item["blockout_video"]
+    assert job["video_reference_rejected_reason"] is None
+
+
+def test_blockout_reference_not_attached_when_flag_off_records_condition_1(tmp_path, monkeypatch):
+    """Condition 1 failing via a deliberate use_blockout_reference=False must still
+    record video_reference=None + a reason (раздел 11.3: "причина фиксируется в
+    provider_jobs.json" applies uniformly), while generation itself proceeds exactly
+    as before Э8 (no reference_video key in the payload)."""
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    _write_blockout_reference(item, project_root=tmp_path, resolution=(1920, 1080), duration_s=6)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    captured_payload = {}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, timeout
+        captured_payload["json"] = json
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+        generate_blockout=True,
+        use_blockout_reference=False,
+    )
+
+    assert result["status"] == "success"
+    assert "reference_video" not in captured_payload["json"]
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["video_reference"] is None
+    assert job["video_reference_rejected_reason"] == "condition_1_reference_disabled"
+
+
+@pytest.mark.parametrize(
+    "mutate,expected_reason",
+    [
+        (lambda item, path: item.__setitem__("blockout_video", str(path.parent / "missing.mp4")), "condition_2_video_missing"),
+        (lambda item, path: (path.parent / "manifest.json").unlink(), "condition_3_manifest_missing"),
+        (None, "condition_3_duration_mismatch"),
+        (None, "condition_4_aspect_mismatch"),
+        (lambda item, path: item.__setitem__("blockout_junction_failed", True), "condition_5_junction_failed"),
+    ],
+)
+def test_blockout_reference_rejection_reasons(tmp_path, monkeypatch, mutate, expected_reason):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+
+    if expected_reason == "condition_3_duration_mismatch":
+        blockout_video = _write_blockout_reference(item, project_root=tmp_path, resolution=(1920, 1080), duration_s=8)
+    elif expected_reason == "condition_4_aspect_mismatch":
+        blockout_video = _write_blockout_reference(item, project_root=tmp_path, resolution=(1080, 1920), duration_s=6)
+    else:
+        blockout_video = _write_blockout_reference(item, project_root=tmp_path, resolution=(1920, 1080), duration_s=6)
+
+    if mutate is not None:
+        mutate(item, blockout_video)
+
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        return _FakeResponse(status_code=202, json_payload={"id": "job-1", "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/job-1.mp4"))
+        if url == "https://cdn.example/job-1.mp4":
+            return _FakeResponse(status_code=200, content=b"video")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+
+    assert result["status"] == "success"
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["video_reference"] is None
+    assert job["video_reference_rejected_reason"] == expected_reason
+
+
+def test_rerendered_blockout_video_triggers_regeneration_via_changed_reference_hash(tmp_path, monkeypatch):
+    """A09: пере-рисовка болванки меняет reference_video_hash -> input_hash меняется
+    -> прежняя задача не переиспользуется, шот генерируется заново (не по каталогу —
+    именно по содержимому ролика, раздел 11.3)."""
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    blockout_video = _write_blockout_reference(item, project_root=tmp_path, resolution=(1920, 1080), duration_s=6)
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+
+    post_calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        del headers, timeout
+        task_id = f"job-{len(post_calls) + 1}"
+        post_calls.append(json.get("reference_video"))
+        return _FakeResponse(status_code=202, json_payload={"id": task_id, "status": "pending"})
+
+    def fake_get(url, headers=None, timeout=None, stream=False):
+        del headers, timeout, stream
+        for index in (1, 2):
+            if url.endswith(f"/videos/job-{index}"):
+                return _FakeResponse(
+                    status_code=200,
+                    json_payload=_completed_job_payload(f"job-{index}", f"https://cdn.example/job-{index}.mp4"),
+                )
+        if url.startswith("https://cdn.example/job-"):
+            return _FakeResponse(status_code=200, content=b"video-bytes")
+        raise AssertionError(f"Unexpected GET url: {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", fake_post)
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+
+    first = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+    assert first["status"] == "success"
+    assert len(post_calls) == 1
+    first_hash = _read_provider_jobs(shots_dir)[0]["input_hash"]
+
+    # Re-render: blockout clip bytes change; manifest resolution/duration untouched.
+    blockout_video.write_bytes(b"re-rendered-blockout-bytes-different-content")
+
+    second = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id=project_id,
+        enable=True,
+        max_concurrency=1,
+        generate_blockout=True,
+        use_blockout_reference=True,
+    )
+
+    assert second["status"] == "success"
+    assert len(post_calls) == 2  # regenerated, not reused from the stale reference hash
+    jobs = _read_provider_jobs(shots_dir)
+    second_job = next(job for job in jobs if job["input_hash"] != first_hash)
+    assert second_job["input_hash"] != first_hash
+    assert second_job["video_reference"] == str(blockout_video)

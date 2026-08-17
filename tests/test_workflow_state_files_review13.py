@@ -2,10 +2,75 @@ from __future__ import annotations
 
 import errno
 import os
+from pathlib import Path
 
 import pytest
 
 from workflow import state_files
+
+
+def test_existing_directory_mode_is_rejected_without_tightening(tmp_path):
+    directory = tmp_path / "existing"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o750)
+
+    with pytest.raises(PermissionError, match="0700"):
+        state_files.ensure_private_directory(
+            directory,
+            create=False,
+            tighten_existing=False,
+        )
+
+    assert directory.stat().st_mode & 0o777 == 0o750
+
+
+def test_existing_directory_mode_is_tightened_only_when_requested(tmp_path):
+    directory = tmp_path / "existing"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o750)
+
+    state_files.ensure_private_directory(
+        directory,
+        create=False,
+        tighten_existing=True,
+    )
+
+    assert directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_filesystem_root_is_rejected_without_fchmod(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        state_files.os,
+        "fchmod",
+        lambda *_args: calls.append("fchmod"),
+    )
+
+    with pytest.raises(ValueError, match="filesystem root"):
+        state_files.ensure_private_directory(Path("/"), create=False)
+
+    assert calls == []
+
+
+def test_directory_validation_error_precedes_close_error(tmp_path, monkeypatch):
+    directory = tmp_path / "existing"
+    directory.mkdir(mode=0o700)
+    directory.chmod(0o750)
+
+    monkeypatch.setattr(
+        state_files._PinnedDirectoryChain,
+        "close",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("close failed")),
+    )
+
+    with pytest.raises(PermissionError, match="0700"):
+        state_files.ensure_private_directory(
+            directory,
+            create=False,
+            tighten_existing=False,
+        )
+
+    assert directory.stat().st_mode & 0o777 == 0o750
 
 
 def test_first_created_descriptor_stat_failure_leaves_no_published_target(
@@ -50,10 +115,7 @@ def test_first_nonce_path_stat_failure_closes_and_removes_owned_temp(
         return file_descriptor
 
     def fail_nonce_path_stat(path, *args, **kwargs):
-        if (
-            isinstance(path, str)
-            and path.startswith(".state-create-")
-        ):
+        if isinstance(path, str) and path.startswith(".state-create-"):
             raise OSError(errno.EIO, "injected nonce path stat failure")
         return real_stat(path, *args, **kwargs)
 
@@ -82,7 +144,9 @@ def test_sqlite_bundle_rejects_multiply_linked_regular_files(tmp_path, member):
         protected_path.chmod(0o600)
     os.link(protected_path, tmp_path / f"{member}.alias")
 
-    with pytest.raises((PermissionError, ValueError, RuntimeError), match="link|private"):
+    with pytest.raises(
+        (PermissionError, ValueError, RuntimeError), match="link|private"
+    ):
         if member == "database":
             state_files.prepare_sqlite_file(db_path)
         else:
@@ -184,6 +248,57 @@ def test_transient_sqlite_sidecar_mode_is_rechecked_before_rejection(
 
     assert journal_checks >= 2
     assert (journal_path.stat().st_mode & 0o777) == 0o600
+
+
+def test_transient_unlinked_sidecar_is_retried_and_recreated_inode_is_validated(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "unlinked-sidecar.db"
+    wal_path = tmp_path / "unlinked-sidecar.db-wal"
+    state_files.prepare_sqlite_file(db_path)
+    wal_path.write_bytes(b"old wal")
+    wal_path.chmod(0o600)
+    real_optional = state_files._stat_at_optional
+    wal_checks = 0
+
+    def replace_unlinked_wal_after_first_stat(directory_fd, name):
+        nonlocal wal_checks
+        snapshot = real_optional(directory_fd, name)
+        if name == wal_path.name:
+            wal_checks += 1
+            if wal_checks == 1:
+                assert snapshot is not None
+                wal_path.unlink()
+                wal_path.write_bytes(b"replacement wal")
+                wal_path.chmod(0o600)
+                return os.stat_result(
+                    (
+                        snapshot.st_mode,
+                        snapshot.st_ino,
+                        snapshot.st_dev,
+                        0,
+                        snapshot.st_uid,
+                        snapshot.st_gid,
+                        snapshot.st_size,
+                        snapshot.st_atime,
+                        snapshot.st_mtime,
+                        snapshot.st_ctime,
+                    )
+                )
+        return snapshot
+
+    monkeypatch.setattr(
+        state_files,
+        "_stat_at_optional",
+        replace_unlinked_wal_after_first_stat,
+    )
+
+    state_files.secure_sqlite_sidecars(db_path)
+
+    assert wal_checks >= 2
+    assert wal_path.read_bytes() == b"replacement wal"
+    assert wal_path.stat().st_nlink == 1
 
 
 def test_inflight_nonce_hardlink_is_retried_without_weakening_alias_check(

@@ -12,7 +12,6 @@ import logging
 from pathlib import Path
 import sys
 import threading
-import time
 import uuid
 import shutil
 from datetime import datetime
@@ -26,13 +25,6 @@ except ImportError:
         _fallback_logger.info(f"[{title}] {content}")
 
 try:
-    import cv2
-    HAS_OPENCV = True
-except ImportError:
-    HAS_OPENCV = False
-    cv2 = None
-
-try:
     from PIL import Image, ImageTk
     HAS_PIL = True
 except ImportError:
@@ -42,6 +34,7 @@ except ImportError:
 
 from StoryBookManager.core.project_manager import Project
 from StoryBookManager.core.media_processor import MediaProcessor
+from StoryBookManager.gui.video_player import VideoPlayer
 from StoryBookManager.utils.scroll_utils import (
     bind_mousewheel_to_treeview,
     bind_mousewheel_to_text_with_scrollbar,
@@ -64,13 +57,10 @@ class MediaPanel(ttk.Frame):
         self.current_image_path: Optional[str] = None
         self.current_video_path: Optional[str] = None
         
-        # Переменные для встроенного видеоплеера
-        self.video_capture = None
-        self.is_playing = False
-        self.is_paused = False
-        self.video_thread = None
-        self.fps = 30  # По умолчанию
-        self._stop_playback = threading.Event()
+        # Встроенный видеоплеер (раздел 18.4 ТЗ: вынесен в общий класс VideoPlayer,
+        # чтобы им же пользовалась вкладка «Болванка») — создаётся в create_media_viewer(),
+        # когда появляется canvas и control_frame, в которые он рисует и пакует кнопки
+        self.video_player: Optional[VideoPlayer] = None
 
         # Фоновое сканирование медиа
         self._refresh_in_progress = False
@@ -127,9 +117,24 @@ class MediaPanel(ttk.Frame):
         self.media_filter = tk.StringVar(value="all")
         self.media_filter.trace_add('write', self.on_filter_changed)
         filter_combo = ttk.Combobox(filter_frame, textvariable=self.media_filter, width=15, state="readonly")
-        filter_combo['values'] = ("all", "illustrations", "references", "shots", "videos")
+        filter_combo['values'] = (
+            "all", "illustrations", "references", "shots", "videos",
+            "blockout_ref", "blockout_frame", "blockout_sheet",
+            "blockout_video", "blockout_preview", "shot_video",
+        )
         filter_combo.pack(side="left", padx=5)
-        
+
+        # Раздел 18.5 ТЗ: отдельные фреймы болванки по умолчанию не сканируются —
+        # их десятки тысяч на проект. Читается в главном потоке до запуска
+        # фонового сканирования (refresh_media()).
+        self.show_blockout_frames_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_frame,
+            text="показывать отдельные фреймы болванки",
+            variable=self.show_blockout_frames_var,
+            command=self.refresh_media,
+        ).pack(side="left", padx=5)
+
         # Дерево файлов
         tree_frame = ttk.Frame(parent)
         tree_frame.pack(fill="both", expand=True)
@@ -221,19 +226,10 @@ class MediaPanel(ttk.Frame):
         self.edit_image_btn.pack(side="left", padx=5)
         self.edit_image_btn.pack_forget()  # Скрываем по умолчанию
         
-        # Кнопки управления видео
-        self.play_video_btn = ttk.Button(control_frame, text="▶️ Воспроизвести", command=self.play_video_embedded)
-        self.play_video_btn.pack(side="left", padx=5)
-        self.play_video_btn.pack_forget()  # Скрываем по умолчанию
-        
-        self.pause_video_btn = ttk.Button(control_frame, text="⏸️ Пауза", command=self.pause_video)
-        self.pause_video_btn.pack(side="left", padx=2)
-        self.pause_video_btn.pack_forget()  # Скрываем по умолчанию
-        
-        self.stop_video_btn = ttk.Button(control_frame, text="⏹️ Стоп", command=self.stop_video)
-        self.stop_video_btn.pack(side="left", padx=2)
-        self.stop_video_btn.pack_forget()  # Скрываем по умолчанию
-        
+        # Кнопки управления видео (класс VideoPlayer, раздел 18.4 ТЗ) — скрыты по умолчанию,
+        # показываются в _add_video_controls() при выборе видео файла
+        self.video_player = VideoPlayer(self.image_canvas, control_frame, visible=False)
+
         # Разделитель
         ttk.Separator(control_frame, orient="vertical").pack(side="left", padx=10, fill="y")
         
@@ -287,9 +283,16 @@ class MediaPanel(ttk.Frame):
             "", "end", text="Обновление...", values=("", "", "", "")
         )
 
+        # Читаем состояние флажка здесь, в главном потоке: обращаться к Tk-переменной
+        # из фонового потока сканирования нельзя (раздел 18.5 ТЗ).
+        include_blockout_frames = (
+            bool(self.show_blockout_frames_var.get())
+            if hasattr(self, 'show_blockout_frames_var') else False
+        )
+
         def _scan():
             try:
-                images = self.media_processor.get_project_images()
+                images = self.media_processor.get_project_images(include_blockout_frames)
                 videos = self.media_processor.get_project_videos()
                 all_items = [(img, "image") for img in images] + [(vid, "video") for vid in videos]
             except Exception as exc:
@@ -492,12 +495,10 @@ class MediaPanel(ttk.Frame):
         self.edit_image_btn.pack(side="left", padx=5)
 
         # Скрываем кнопки управления видео (если показаны)
-        self.play_video_btn.pack_forget()
-        self.pause_video_btn.pack_forget()
-        self.stop_video_btn.pack_forget()
+        self.video_player.hide_controls()
 
         # Останавливаем видео если воспроизводится
-        self.stop_video()
+        self.video_player.stop()
 
         # Сохраняем путь для зума
         self._zoom_image_path = image_path
@@ -554,6 +555,7 @@ class MediaPanel(ttk.Frame):
             return
 
         self.current_video_path = video_path
+        self.video_player.load(video_path)
 
         # Показываем плейсхолдер
         self.image_canvas.delete("all")
@@ -603,9 +605,7 @@ class MediaPanel(ttk.Frame):
             tags="video_indicator"
         )
         self.edit_image_btn.pack_forget()
-        self.play_video_btn.pack(side="left", padx=5)
-        self.pause_video_btn.pack(side="left", padx=2)
-        self.stop_video_btn.pack(side="left", padx=2)
+        self.video_player.show_controls()
     
     def show_unsupported_file(self):
         """Показ сообщения о неподдерживаемом файле"""
@@ -727,160 +727,6 @@ class MediaPanel(ttk.Frame):
         except Exception as e:
             logger.error(f"Ошибка воспроизведения видео: {e}")
             messagebox.showerror("Ошибка", f"Не удалось воспроизвести видео:\n{e}")
-    
-    def play_video_embedded(self):
-        """Встроенное воспроизведение видео"""
-        if not HAS_OPENCV or not HAS_PIL:
-            missing = []
-            if not HAS_OPENCV:
-                missing.append("OpenCV")
-            if not HAS_PIL:
-                missing.append("Pillow")
-            messagebox.showerror("Ошибка", f"Не установлены библиотеки: {', '.join(missing)}.\nИспользуйте внешний плеер.")
-            return
-            
-        if not self.current_video_path:
-            messagebox.showwarning("Предупреждение", "Видео файл не выбран")
-            return
-        
-        try:
-            # Останавливаем текущее воспроизведение если есть
-            self.stop_video()
-            
-            # Открываем видео
-            self.video_capture = cv2.VideoCapture(self.current_video_path)
-            
-            if not self.video_capture.isOpened():
-                messagebox.showerror("Ошибка", "Не удалось открыть видео файл")
-                return
-            
-            # Получаем FPS видео
-            self.fps = self.video_capture.get(cv2.CAP_PROP_FPS)
-            if self.fps <= 0:
-                self.fps = 30  # По умолчанию
-            
-            # Запускаем воспроизведение
-            self.is_playing = True
-            self.is_paused = False
-            
-            # Запускаем поток воспроизведения
-            self.video_thread = threading.Thread(target=self._video_playback_loop, daemon=True)
-            self.video_thread.start()
-            
-            logger.info(f"Начато встроенное воспроизведение видео: {self.current_video_path}")
-            
-        except Exception as e:
-            logger.error(f"Ошибка запуска встроенного видеоплеера: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось запустить видео:\n{e}")
-    
-    def pause_video(self):
-        """Пауза/возобновление воспроизведения"""
-        if self.is_playing:
-            self.is_paused = not self.is_paused
-            if self.is_paused:
-                self.pause_video_btn.config(text="▶️ Продолжить")
-                logger.info("Видео поставлено на паузу")
-            else:
-                self.pause_video_btn.config(text="⏸️ Пауза")
-                logger.info("Воспроизведение видео возобновлено")
-    
-    def stop_video(self):
-        """Остановка воспроизведения"""
-        if self.is_playing:
-            self.is_playing = False
-            self.is_paused = False
-            self._stop_playback.set()
-
-            if self.video_thread and self.video_thread.is_alive():
-                self.video_thread.join(timeout=1.0)
-
-            self._stop_playback.clear()
-
-            if self.video_capture:
-                self.video_capture.release()
-                self.video_capture = None
-
-            # Сбрасываем текст кнопки
-            self.pause_video_btn.config(text="⏸️ Пауза")
-
-            logger.info("Воспроизведение видео остановлено")
-    
-    def _video_playback_loop(self):
-        """Основной цикл воспроизведения видео"""
-        frame_delay = 1.0 / self.fps
-
-        while self.is_playing and self.video_capture and not self._stop_playback.is_set():
-            if not self.is_paused:
-                ret, frame = self.video_capture.read()
-                
-                if not ret:
-                    # Конец видео
-                    self.is_playing = False
-                    self.is_paused = False
-                    break
-                
-                # Конвертируем кадр для tkinter
-                try:
-                    # Изменяем размер кадра для отображения
-                    canvas_width = self.image_canvas.winfo_width()
-                    canvas_height = self.image_canvas.winfo_height()
-                    
-                    if canvas_width > 1 and canvas_height > 1:
-                        height, width = frame.shape[:2]
-                        
-                        # Вычисляем масштаб для сохранения пропорций
-                        scale_x = canvas_width / width
-                        scale_y = canvas_height / height
-                        scale = min(scale_x, scale_y)
-                        
-                        new_width = int(width * scale * 0.9)  # Небольшой отступ
-                        new_height = int(height * scale * 0.9)
-                        
-                        # Изменяем размер кадра
-                        frame = cv2.resize(frame, (new_width, new_height))
-                        
-                        # Конвертируем BGR в RGB
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        
-                        # Конвертируем в PIL Image и передаём в главный поток
-                        pil_image = Image.fromarray(frame_rgb)
-
-                        # Обновляем canvas в главном потоке (PhotoImage создаётся там)
-                        self.image_canvas.after(0, self._update_video_frame, pil_image)
-                        
-                except Exception as e:
-                    logger.error(f"Ошибка обработки кадра видео: {e}")
-                    break
-            
-            time.sleep(frame_delay)
-        
-        # Освобождаем ресурсы только если stop_video не сделал это сам
-        if self.video_capture and not self._stop_playback.is_set():
-            self.video_capture.release()
-            self.video_capture = None
-    
-    def _update_video_frame(self, pil_image):
-        """Обновление кадра видео в canvas (вызывается в главном потоке)"""
-        try:
-            # PhotoImage создаём здесь — в главном Tk-потоке (thread-safe)
-            photo = ImageTk.PhotoImage(pil_image)
-            # Сохраняем ссылку на фото чтобы оно не удалилось сборщиком мусора
-            self.current_photo = photo
-            
-            # Очищаем canvas и отображаем новый кадр
-            self.image_canvas.delete("all")
-            
-            # Центрируем кадр
-            canvas_width = self.image_canvas.winfo_width()
-            canvas_height = self.image_canvas.winfo_height()
-            
-            x = canvas_width // 2
-            y = canvas_height // 2
-            
-            self.image_canvas.create_image(x, y, image=photo, anchor="center", tags="video_frame")
-            
-        except Exception as e:
-            logger.error(f"Ошибка обновления кадра видео: {e}")
     
     def open_in_system(self):
         """Открытие файла в системном приложении"""
@@ -1035,7 +881,7 @@ class MediaPanel(ttk.Frame):
                 if img_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.webp'] and str(img_path) != self.current_image_path:
                     available_references.append({
                         "path": str(img_path),
-                        "name": img_path.name
+                        "name": f"{img_path.parent.name}/{img_path.name}"
                     })
             
             # Открываем диалог редактирования

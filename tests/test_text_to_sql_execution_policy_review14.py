@@ -6,6 +6,16 @@ import importlib
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _allow_typed_finalizer(monkeypatch):
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+    monkeypatch.setattr(
+        terminal,
+        "_pre_execution_gate_allowed",
+        lambda **_kwargs: True,
+    )
+
 from db_plugins.base import (
     Capability,
     DatabaseCapabilities,
@@ -136,7 +146,6 @@ def _finalize_strategy_result(monkeypatch, strategy_result):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,

@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import importlib
 
+import pytest
+
 from db_plugins.base import (
     Capability,
     DatabaseCapabilities,
     EnforcementMode,
     PluginHealth,
 )
+
+
+@pytest.fixture(autouse=True)
+def _allow_typed_finalizer(monkeypatch):
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+    monkeypatch.setattr(
+        terminal,
+        "_pre_execution_gate_allowed",
+        lambda **_kwargs: True,
+    )
 
 
 class _AdmittedPluginDouble:
@@ -192,7 +204,6 @@ def test_finalizer_validates_operator_effective_dry_run_policy(monkeypatch):
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,
@@ -243,7 +254,6 @@ def test_finalizer_accepts_failed_pre_strategy_result_under_effective_dry_run(
     result = terminal.finalize_text_to_sql_run(
         "SELECT 1",
         "one",
-        "Approved",
         "sqlite:///unused.db",
         10,
         False,

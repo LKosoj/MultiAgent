@@ -873,6 +873,8 @@ class _SqlglotValidator:
         if isinstance(stmt, exp.Select):
             # Простой SELECT без INTO - разрешен; продолжаем проверку IN-списков и функций
             pass
+        elif isinstance(stmt, exp.Pivot) and isinstance(getattr(stmt, "this", None), exp.Table):
+            pass
         elif set_op_classes and isinstance(stmt, set_op_classes):
             # Set-операции (UNION/UNION ALL/INTERSECT/EXCEPT) — рекурсивно
             # валидируем обе ветки. Если дочерний узел не SELECT/With/Union —
@@ -1047,6 +1049,8 @@ class _SqlglotValidator:
             # WITH ... SELECT обычно парсится как exp.Select с args['with'];
             # exp.With в корне возможен для отдельных диалектов/форм.
             if isinstance(stmt, exp.Select):
+                return True
+            if isinstance(stmt, exp.Pivot) and isinstance(getattr(stmt, "this", None), exp.Table):
                 return True
             if set_op_classes and isinstance(stmt, set_op_classes):
                 # UNION/UNION ALL/INTERSECT/EXCEPT — это set-операции над SELECT,

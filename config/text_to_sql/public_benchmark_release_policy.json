@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "record_kind": "text2sql_public_benchmark_release_policy",
+  "repeat_seeds": [730201, 918273, 160947],
+  "datasets": {
+    "bird": {
+      "origin": "https://github.com/bird-bench/mini_dev",
+      "revision": "b3d4bcbbae9a96934ad812551eb400c7a3b23c12",
+      "case_count": 500,
+      "task_file": {
+        "path": "mini_dev_sqlite.json",
+        "size_bytes": 278486,
+        "sha256": "4ba5fa8de55856222f484d380d2ba872b380bf79d825de70478e2120cb0fc43b"
+      },
+      "evaluator": {
+        "origin": "https://github.com/bird-bench/mini_dev",
+        "revision": "b3d4bcbbae9a96934ad812551eb400c7a3b23c12",
+        "entrypoint": "evaluation/evaluation_ex.py",
+        "sha256": "da1bbcd4530be83692d7c650c814ea9704bb710d0c953eb75d02ccb38233cf89",
+        "call_surface": "python __main__:evaluation/evaluation_ex.py",
+        "source_closure_sha256": "94263640236a98589e70c880448eed4b0896ba67399b2a5d5ad480583fe18eb5",
+        "data_closure_sha256": "7a4bf610626d0b928ba8a588ab91bb3882325cb5a200d56b5078622839fc630f",
+        "runtime_identity_sha256": "177cb0d60c525cab9b09bddd678f250231f5ac8d5b24911568e1631218467dbd"
+      }
+    },
+    "spider": {
+      "origin": "https://github.com/xlang-ai/Spider2",
+      "revision": "01a4c67c1e3f6ab9032716b050a927abbb245f65",
+      "case_count": 135,
+      "task_file": {
+        "path": "spider2-lite.jsonl",
+        "size_bytes": 242129,
+        "sha256": "4ba48916576fbd60311a2478c6d4550b5d8cf3fcbc512457ea493b5941ca009d"
+      },
+      "database_map": {
+        "size_bytes": 3732,
+        "sha256": "61c6730e26f3753abb5a3d3148a98f2bf3e598a7d9c3adb500bdc643eb9e91c5"
+      },
+      "evaluator": {
+        "origin": "https://github.com/xlang-ai/Spider2",
+        "revision": "01a4c67c1e3f6ab9032716b050a927abbb245f65",
+        "entrypoint": "evaluation_suite/evaluate.py",
+        "sha256": "e93624e4ffa00e51c67bdee1d9e42b534630087cb453270c0dedc0c73e618480",
+        "call_surface": "python API:evaluate_spider2sql",
+        "source_closure_sha256": "f74b3f25e84a09609801749029d8baa86317c02dd51fbf30dc53934d5847397d",
+        "data_closure_sha256": "fa65342bd5584813c9fbccff61dc603d0233947dca72dd1f63e56b0eb84d1274",
+        "runtime_identity_sha256": "177cb0d60c525cab9b09bddd678f250231f5ac8d5b24911568e1631218467dbd"
+      }
+    }
+  },
+  "canonical_environment": {
+    "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
+    "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
+    "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0"
+  },
+  "model_routes": {
+    "model_code": {
+      "model_id": "llmgateway/qwen3.5",
+      "max_tokens": 32768,
+      "temperature": 0.7
+    },
+    "model_hard": {
+      "model_id": "llmgateway/high",
+      "max_tokens": 32768,
+      "temperature": 0.7
+    }
+  }
+}

@@ -14,7 +14,7 @@ from typing import Callable, Mapping
 
 
 REQUIRED_SCHEMA_HEADS = {
-    "event_store": 8,
+    "event_store": 10,
     "memory_db": 1,
     "result_outbox": 3,
 }

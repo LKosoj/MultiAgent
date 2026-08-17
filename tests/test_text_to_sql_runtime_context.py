@@ -498,6 +498,43 @@ def test_runtime_context_exposes_only_typed_deadline_budget():
         reset_tool_runtime_context(token)
 
 
+def test_model_sql_explain_uses_operator_dry_run_and_runtime_deadline(monkeypatch):
+    from custom_tools import sql_tools
+    from tool_runtime_context import reset_tool_runtime_context, set_tool_runtime_context
+    from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded
+
+    monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "true")
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.core.call_openai_api",
+        lambda **_kwargs: '{"issues": []}',
+    )
+    token = set_tool_runtime_context({"dsn": "sqlite:///tmp/runtime.db"})
+    try:
+        dry_run = sql_tools.sql_explain("SELECT 1")
+    finally:
+        reset_tool_runtime_context(token)
+
+    assert dry_run["dry_run_only"] is True
+    assert dry_run["skipped_execution"] is True
+
+    expired = DeadlineBudget(
+        deadline_monotonic=10.0,
+        deadline_at_ms=1,
+        monotonic=lambda: 10.0,
+    )
+    token = set_tool_runtime_context(
+        {
+            "dsn": "sqlite:///tmp/runtime.db",
+            "deadline_budget": expired,
+        }
+    )
+    try:
+        with pytest.raises(WorkflowDeadlineExceeded):
+            sql_tools.sql_explain("SELECT 1")
+    finally:
+        reset_tool_runtime_context(token)
+
+
 def test_runtime_context_exposes_only_typed_supervisor_evidence():
     from tool_runtime_context import (
         SupervisorExecutionEvidence,
@@ -787,6 +824,120 @@ async def test_workflow_direct_tool_resets_runtime_context_on_exception(
         await engine._execute_tool_step(step, context, "finalize")
 
     assert len(reset_tokens) == 1
+
+
+@pytest.mark.asyncio
+async def test_typed_schema_research_receives_supervisor_evidence(
+    stub_mcp_tools,
+    monkeypatch,
+):
+    import workflow.text_to_sql_typed_research as research_module
+    from tool_runtime_context import (
+        SupervisorExecutionEvidence,
+        get_runtime_context_supervisor_evidence,
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    runtime = object()
+    evidence = SupervisorExecutionEvidence("supervisor-1", 1)
+    outer_evidence = SupervisorExecutionEvidence("outer-supervisor", 1)
+    engine = object.__new__(EnhancedWorkflowEngine)
+    monkeypatch.setattr(engine, "_exact_typed_runtime", lambda _context: runtime)
+
+    async def run_research(observed_runtime):
+        assert observed_runtime is runtime
+        assert get_runtime_context_supervisor_evidence() is evidence
+        return {"status": "researched"}
+
+    monkeypatch.setattr(research_module, "run_typed_schema_research", run_research)
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+    context._supervisor_evidence = evidence
+    step = WorkflowStep(
+        id="schema_research",
+        task="research",
+        step_type="tool",
+        tool_name="typed_schema_research",
+    )
+    outer_token = set_tool_runtime_context(
+        {"supervisor_evidence": outer_evidence}
+    )
+    try:
+        result = await engine._execute_tool_step(step, context, "research")
+        assert get_runtime_context_supervisor_evidence() is outer_evidence
+    finally:
+        reset_tool_runtime_context(outer_token)
+
+    assert result == {"status": "researched"}
+
+
+@pytest.mark.asyncio
+async def test_typed_sql_solving_receives_supervisor_evidence(
+    stub_mcp_tools,
+    monkeypatch,
+):
+    import workflow.text_to_sql_adaptive_solver as solver_module
+    from custom_tools.text_to_sql.validators import resolve_safety_policy
+    from tool_runtime_context import (
+        SupervisorExecutionEvidence,
+        get_runtime_context_supervisor_evidence,
+        reset_tool_runtime_context,
+        set_tool_runtime_context,
+    )
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    runtime = types.SimpleNamespace(dsn="sqlite:///tmp/runtime-context.db")
+    policy = resolve_safety_policy("strict")
+    evidence = SupervisorExecutionEvidence("supervisor-1", 1)
+    outer_evidence = SupervisorExecutionEvidence("outer-supervisor", 1)
+    engine = object.__new__(EnhancedWorkflowEngine)
+
+    async def run_solver(
+        observed_runtime,
+        *,
+        safety_policy: object,
+        row_limit: int,
+        dry_run_only: bool,
+        table_namespace: str,
+    ):
+        assert observed_runtime is runtime
+        assert safety_policy is policy
+        assert row_limit == 5
+        assert dry_run_only is False
+        assert table_namespace == "main"
+        assert get_runtime_context_supervisor_evidence() is evidence
+        return {"sql": "SELECT 1"}
+
+    monkeypatch.setattr(
+        solver_module,
+        "run_production_adaptive_sql_generation",
+        run_solver,
+    )
+    context = WorkflowContext(
+        workflow_id="wf-1",
+        session_id="session-1",
+        variables={"dry_run_only": False},
+    )
+    context._supervisor_evidence = evidence
+    step = WorkflowStep(
+        id="sql_solving",
+        task="solve",
+        step_type="agent",
+        metadata={"max_rows": 5, "safety_policy": policy},
+    )
+    outer_token = set_tool_runtime_context(
+        {"supervisor_evidence": outer_evidence}
+    )
+    try:
+        result = await engine._execute_typed_sql_solving(step, context, runtime)
+        assert get_runtime_context_supervisor_evidence() is outer_evidence
+    finally:
+        reset_tool_runtime_context(outer_token)
+
+    assert result == {"sql": "SELECT 1"}
 
 
 @pytest.mark.asyncio

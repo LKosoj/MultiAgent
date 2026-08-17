@@ -7,11 +7,14 @@ Fallback-эвристика (``_fallback_extract_intent``/``_fallback_tokenize``
 не должно появляться закрытых эвристик, морфем или regex'ов в коде —
 смотри AGENTS.md (T4.1) и ``nlu_config.py``.
 """
+from __future__ import annotations
+
+import json
 import re
 import logging
 import os
 import yaml
-from typing import Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List
 
 from .nlu_config import NLUMorphemesRegistry, load_nlu_morphemes
 
@@ -22,14 +25,22 @@ try:
 except Exception:
     call_openai_api = None  # type: ignore
 
-from .prompts import build_nlu_prompt
+from .prompts import (  # noqa: E402
+    build_adaptive_query_completeness_prompt,
+    build_adaptive_query_understanding_prompt,
+    build_nlu_prompt,
+)
+
+if TYPE_CHECKING:
+    from .adaptive.models import QuerySpec
 
 
 def _nlu_max_tokens(key: str) -> int:
     """``max_tokens`` для NLU LLM-вызовов из llm_models.yaml (W6-T3).
 
-    ``key`` — ``"intent_max_tokens"`` или ``"nlp_max_tokens"``. Fail-fast при
-    отсутствии секции/ключа — magic-числа в .py запрещены AGENTS.md.
+    ``key`` — один из ключей NLU-секции, включая отдельный лимит adaptive
+    query understanding. Fail-fast при отсутствии секции/ключа — magic-числа
+    в .py запрещены AGENTS.md.
     """
     from .llm_models_config import load_llm_models_config
 
@@ -39,8 +50,6 @@ def _nlu_max_tokens(key: str) -> int:
 _TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}|\d+[.,]?\d*|[\w\-]+", re.IGNORECASE | re.UNICODE)
 _DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _NUM_TOKEN_PATTERN = re.compile(r"\d+[.,]?\d*")
-
-
 class NLUProcessor:
     """Обработчик естественного языка для извлечения намерений и сущностей."""
 
@@ -100,6 +109,61 @@ class NLUProcessor:
             else:
                 pos_tags.append("OTHER")
         return {"tokens": tokens, "pos_tags": pos_tags}
+
+    def _understand_query(
+        self,
+        text: str,
+        *,
+        run_id: str,
+        run_incarnation: str,
+        context_documents: tuple[str, ...] = (),
+    ) -> QuerySpec:
+        """Build strict adaptive ``QuerySpec`` without schema inference."""
+        if call_openai_api is None:
+            raise RuntimeError("LLM adaptive query understanding is unavailable")
+
+        from .utils import parse_llm_json_response
+        from .adaptive.query_understanding import understand_query
+
+        prompt = build_adaptive_query_understanding_prompt(
+            text,
+            context_documents=context_documents,
+        )
+        system_prompt = (
+            "Ты выделяешь только смысловые элементы запроса Text-to-SQL "
+            "без привязки к схеме. Верни только JSON."
+        )
+        max_tokens = _nlu_max_tokens("query_understanding_max_tokens")
+        response = call_openai_api(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        decoded = parse_llm_json_response(response)
+        understand_query(
+            text,
+            run_id=run_id,
+            run_incarnation=run_incarnation,
+            response=decoded,
+        )
+        completeness_response = call_openai_api(
+            prompt=build_adaptive_query_completeness_prompt(
+                text,
+                decoded,
+                context_documents=context_documents,
+            ),
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        corrected = parse_llm_json_response(completeness_response)
+        return understand_query(
+            text,
+            run_id=run_id,
+            run_incarnation=run_incarnation,
+            response=corrected,
+        )
 
     def extract_intent(self, text: str, session_id: str | None = None) -> Dict[str, Any]:
         """Извлечение намерения и сущностей из текста.

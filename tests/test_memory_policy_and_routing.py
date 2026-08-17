@@ -162,6 +162,30 @@ def test_explicit_cache_kind_disables_default_routing(monkeypatch):
     assert len(out) == 1
 
 
+def test_schema_probe_fact_never_uses_model_summary_or_filtering(monkeypatch):
+    from memory import tools as mt
+
+    records = [
+        {
+            "agent_name": "Schema-RAG-Agent",
+            "step": 1,
+            "data": {"cache_kind": "schema_probe_fact", "payload": "x" * 70_001},
+        }
+    ]
+    monkeypatch.setattr(
+        mt,
+        "_create_memory_summary",
+        lambda *_args: pytest.fail("structured probe facts must not be summarized"),
+    )
+
+    assert mt._apply_memory_filtering(
+        records,
+        query="revenue",
+        total_length=70_001,
+        cache_kind="schema_probe_fact",
+    ) == records
+
+
 def test_streamlit_memory_search_requires_session_for_user(monkeypatch):
     from backend.fastapi_app.agui.auth import Principal
     from memory.streamlit_api import MemoryRAGManager

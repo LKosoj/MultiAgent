@@ -784,8 +784,8 @@ def test_find_semantic_relevant_tables_raises_on_embedding_unavailable(monkeypat
         manager.find_semantic_relevant_tables(["orders"], dsn="sqlite:///tmp/t.db")
 
 
-def test_find_semantic_relevant_tables_raises_on_key_error_in_unpacking(monkeypatch, tmp_path):
-    """#20 MEDIUM: KeyError при распаковке ids/distances пробрасывается наверх."""
+def test_find_semantic_relevant_tables_marks_vector_stale_on_search_error(monkeypatch, tmp_path):
+    """Сбой чтения Chroma не оставляет индекс в состоянии ready."""
     collection = SimpleNamespace(metadata={"hnsw:space": "l2"}, configuration=None)
 
     # Возвращаем результат с некорректным типом, который вызовет TypeError при распаковке
@@ -813,9 +813,7 @@ def test_find_semantic_relevant_tables_raises_on_key_error_in_unpacking(monkeypa
 
     manager = SchemaMemoryManager(tmp_path)
 
-    # TypeError при isinstance(raw_distances[0], list) — строка[0] возвращает символ,
-    # не бросает TypeError. Вместо этого проверим, что KeyError пробрасывается.
-    # Тест с реальным KeyError:
+    # Тест с реальным сбоем чтения результатов Chroma:
     def fake_search_key_error(*a, **kw):
         raise KeyError("table_fqn_missing_key")
 
@@ -826,8 +824,8 @@ def test_find_semantic_relevant_tables_raises_on_key_error_in_unpacking(monkeypa
     monkeypatch.setattr(sqlite_mod, "memory_manager", fake_manager2, raising=False)
     monkeypatch.setattr(mm_module, "memory_manager", fake_manager2)
 
-    with pytest.raises(KeyError):
-        manager.find_semantic_relevant_tables(["orders"], dsn="sqlite:///tmp/t.db")
+    assert manager.find_semantic_relevant_tables(["orders"], dsn="sqlite:///tmp/t.db") == []
+    assert manager.last_search_status == "vector_stale"
 
 
 def test_file_lock_fd_closed_on_unexpected_exception(monkeypatch, tmp_path):

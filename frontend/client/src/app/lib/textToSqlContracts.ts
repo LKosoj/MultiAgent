@@ -46,9 +46,18 @@ export type TextToSqlTerminalOutcomeStatus =
 export const TEXT_TO_SQL_REASON_CODES = [
   "VERIFIER_CONTRACT_INVALID",
   "VERIFIER_REJECTED",
+  "DETERMINISTIC_CHECK_REJECTED",
   "SCHEMA_CLARIFICATION_REQUIRED",
   "SCHEMA_GROUNDING_FAILED",
   "SCHEMA_CONTEXT_BUDGET_EXCEEDED",
+  "RESEARCH_AMBIGUOUS",
+  "RESEARCH_UNSUPPORTED",
+  "RESEARCH_STAGNATED",
+  "RESEARCH_BUDGET_EXHAUSTED",
+  "RESEARCH_TOOL_FAILURE",
+  "RESEARCH_PROTOCOL_FAILURE",
+  "EXECUTION_UNKNOWN",
+  "STALE_REQUIRED_EVIDENCE",
   "EXECUTOR_CONTRACT_INVALID",
   "AUDIT_CONTRACT_INVALID",
   "AUDIT_FAILED",
@@ -106,11 +115,9 @@ const historyExecutionFieldNames = new Set([
   "error_message",
 ]);
 const historyFlagTypes: Record<string, "boolean" | "string"> = {
-  allow_enhanced_fallback: "boolean",
   dry_run_only: "boolean",
   include_explanation: "boolean",
   safety_level: "string",
-  use_schema_suggestions: "boolean",
   validate_schema: "boolean",
 };
 
@@ -266,7 +273,7 @@ export function textToSqlHistoryTerminalState(payload: unknown) {
   const summary = outcome === null && isTextToSqlHistorySummary(payload)
     ? payload
     : null;
-  const status = outcome?.status ?? summary?.status ?? "unknown_legacy";
+  const status = outcome?.status ?? summary?.status ?? "invalid_terminal";
   return {
     status,
     success: status === "succeeded",
@@ -352,7 +359,7 @@ const textToSqlRunTerminalStatuses = new Set([
   "failed",
   "cancelled",
   "timed_out",
-  "unknown_legacy",
+  "invalid_terminal",
 ]);
 
 export function textToSqlRunTerminalStatus(payload: unknown): string | null {

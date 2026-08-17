@@ -108,6 +108,15 @@ def _pipeline_default_bool(workflow_name: str, input_name: str) -> bool:
     return value
 
 
+def _pipeline_default_list_int(workflow_name: str, input_name: str) -> list[int]:
+    value = _pipeline_input_default(workflow_name, input_name)
+    if not isinstance(value, list):
+        raise RuntimeError(f"{workflow_name}.yaml inputs.{input_name} must be a list")
+    if not all(isinstance(item, int) and not isinstance(item, bool) for item in value):
+        raise RuntimeError(f"{workflow_name}.yaml inputs.{input_name} must be a list of integers")
+    return value
+
+
 def _storybook_default_str(input_name: str, *, allow_empty: bool = False) -> str:
     return _pipeline_default_str("storybook_pipeline", input_name, allow_empty=allow_empty)
 
@@ -118,6 +127,10 @@ def _storybook_default_int(input_name: str) -> int:
 
 def _storybook_default_bool(input_name: str) -> bool:
     return _pipeline_default_bool("storybook_pipeline", input_name)
+
+
+def _storybook_default_list_int(input_name: str) -> list[int]:
+    return _pipeline_default_list_int("storybook_pipeline", input_name)
 
 
 class ArchitectureReviewRequest(_BasePipelineRequest):
@@ -261,6 +274,46 @@ class StorybookPipelineRequest(_BasePipelineRequest):
     screenplay_time: int = Field(
         default_factory=lambda: _storybook_default_int("screenplay_time"),
         ge=1,
+        validate_default=True,
+    )
+    generate_blockout: bool = Field(
+        default_factory=lambda: _storybook_default_bool("generate_blockout"),
+        validate_default=True,
+    )
+    blockout_allowed_durations: list[int] = Field(
+        default_factory=lambda: _storybook_default_list_int("blockout_allowed_durations"),
+        validate_default=True,
+    )
+    blockout_fps: int = Field(
+        default_factory=lambda: _storybook_default_int("blockout_fps"),
+        ge=1,
+        validate_default=True,
+    )
+    blockout_resolution: str = Field(
+        default_factory=lambda: _storybook_default_str("blockout_resolution"),
+        min_length=1,
+        validate_default=True,
+    )
+    blockout_jobs: int = Field(
+        default_factory=lambda: _storybook_default_int("blockout_jobs"),
+        ge=0,
+        validate_default=True,
+    )
+    blockout_scope: str = Field(
+        default_factory=lambda: _storybook_default_str("blockout_scope"),
+        min_length=1,
+        validate_default=True,
+    )
+    blockout_preview_burnin: bool = Field(
+        default_factory=lambda: _storybook_default_bool("blockout_preview_burnin"),
+        validate_default=True,
+    )
+    blockout_use_as_image_reference: bool = Field(
+        default_factory=lambda: _storybook_default_bool("blockout_use_as_image_reference"),
+        validate_default=True,
+    )
+    blockout_use_as_video_reference: bool = Field(
+        default_factory=lambda: _storybook_default_bool("blockout_use_as_video_reference"),
         validate_default=True,
     )
     force_update_prompts: bool = Field(

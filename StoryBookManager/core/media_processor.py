@@ -7,6 +7,7 @@
 """
 
 import os
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 import logging
@@ -38,9 +39,10 @@ class MediaProcessor:
     """Обработка медиа файлов проекта"""
     
     def __init__(self, project_id: str):
+        from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
         self.project_id = project_id
-        self.projects_dir = app_settings.get_projects_directory()
-        self.project_path = self.projects_dir / project_id
+        self.project_path = safe_storybook_project_dir(project_id)
         self.cache_dir = app_settings.get_backup_directory() / "media_cache" / project_id
         
         # Создаем директорию кэша
@@ -50,10 +52,17 @@ class MediaProcessor:
         self.image_extensions = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff'}
         self.video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
     
-    def get_project_images(self) -> List[Dict[str, Any]]:
-        """Возвращает список всех изображений в проекте"""
+    def get_project_images(self, include_blockout_frames: bool = False) -> List[Dict[str, Any]]:
+        """Возвращает список всех изображений в проекте.
+
+        include_blockout_frames: включать ли в сканирование отдельные фреймы
+        болванки (93_blockout/*/frames/*.png, раздел 18.5 ТЗ). По умолчанию
+        выключено — на проекте из полусотни шотов таких файлов десятки тысяч,
+        и обходить их ради панели, где они скрыты фильтром, не нужно.
+        """
         images = []
-        
+        start_time = time.monotonic()
+
         try:
             # Основные изображения (иллюстрации книги)
             images_dir = self.project_path / "50_images"
@@ -104,12 +113,58 @@ class MediaProcessor:
                                     "modified": img_file.stat().st_mtime
                                 })
             
+            # Болванка (раздел 18.5 ТЗ)
+            blockout_dir = self.project_path / "93_blockout"
+            skipped_dirs: List[str] = []
+            if blockout_dir.exists():
+                for ref_file in sorted(blockout_dir.glob("*/ref_start.png")) + sorted(blockout_dir.glob("*/ref_end.png")):
+                    stat = ref_file.stat()
+                    images.append({
+                        "type": "blockout_ref",
+                        "category": "blockout_ref",
+                        "path": str(ref_file),
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime
+                    })
+
+                if include_blockout_frames:
+                    for frame_file in blockout_dir.glob("*/frames/*.png"):
+                        stat = frame_file.stat()
+                        images.append({
+                            "type": "blockout_frame",
+                            "category": "blockout_frame",
+                            "path": str(frame_file),
+                            "size": stat.st_size,
+                            "modified": stat.st_mtime
+                        })
+                else:
+                    # Каталожный уровень, не обход списка файлов внутри — иначе
+                    # флажок не сэкономил бы ничего (раздел 18.5 ТЗ).
+                    skipped_dirs = [str(p) for p in blockout_dir.glob("*/frames")]
+
+                for sheet_file in blockout_dir.glob("preview/contact_sheet*.png"):
+                    stat = sheet_file.stat()
+                    images.append({
+                        "type": "blockout_sheet",
+                        "category": "blockout_sheet",
+                        "path": str(sheet_file),
+                        "size": stat.st_size,
+                        "modified": stat.st_mtime
+                    })
+
             # Сортируем по типу и дате изменения
             images.sort(key=lambda x: (x["type"], -x["modified"]))
-            
+
+            if not include_blockout_frames:
+                elapsed = time.monotonic() - start_time
+                logger.info(
+                    f"get_project_images({self.project_id}): фреймы болванки не сканировались, "
+                    f"пропущены каталоги {skipped_dirs}, сканирование заняло {elapsed:.3f}s"
+                )
+
         except Exception as e:
             logger.error(f"Ошибка получения списка изображений проекта {self.project_id}: {e}")
-        
+
         return images
     
     def get_project_videos(self) -> List[Dict[str, Any]]:
@@ -124,6 +179,7 @@ class MediaProcessor:
                         for video_file in shot_dir.iterdir():
                             if video_file.suffix.lower() in self.video_extensions:
                                 videos.append({
+                                    "category": "shot_video",
                                     "scene": shot_dir.name,
                                     "path": str(video_file),
                                     "name": video_file.name,
@@ -131,7 +187,33 @@ class MediaProcessor:
                                     "modified": video_file.stat().st_mtime,
                                     "duration": self._get_video_duration(video_file)
                                 })
-            
+
+            # Болванка (раздел 18.5 ТЗ)
+            blockout_dir = self.project_path / "93_blockout"
+            if blockout_dir.exists():
+                for video_file in blockout_dir.glob("*/blockout_ref.mp4"):
+                    videos.append({
+                        "category": "blockout_video",
+                        "scene": video_file.parent.name,
+                        "path": str(video_file),
+                        "name": video_file.name,
+                        "size": video_file.stat().st_size,
+                        "modified": video_file.stat().st_mtime,
+                        "duration": self._get_video_duration(video_file)
+                    })
+                for video_file in blockout_dir.glob("preview/*.mp4"):
+                    videos.append({
+                        "category": "blockout_preview",
+                        # У файлов превью нет понятия сцены — устойчивый порядок
+                        # сортировки (в конец списка), раздел 18.5 ТЗ.
+                        "scene": "zz_preview",
+                        "path": str(video_file),
+                        "name": video_file.name,
+                        "size": video_file.stat().st_size,
+                        "modified": video_file.stat().st_mtime,
+                        "duration": self._get_video_duration(video_file)
+                    })
+
             # Сортируем по имени сцены
             videos.sort(key=lambda x: x["scene"])
             

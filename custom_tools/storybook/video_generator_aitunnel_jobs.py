@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 
 _PROVIDER_NAME = "aitunnel"
 _PROVIDER_JOBS_VERSION = 2
-_CURRENT_HASH_INPUTS_VERSION = 2
+_CURRENT_HASH_INPUTS_VERSION = 3
 _PROVIDER_JOBS_THREAD_LOCKS: Dict[str, threading.RLock] = {}
 _PROVIDER_JOBS_THREAD_LOCKS_GUARD = threading.Lock()
 
@@ -359,6 +359,8 @@ def _new_provider_job(
     resolved_size_params: Optional[Dict[str, str]] = None,
     resolved_duration: Optional[int] = None,
     provider_name: str = _PROVIDER_NAME,
+    video_reference: Optional[str] = None,
+    video_reference_rejected_reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "shot_key": shot_key,
@@ -370,6 +372,10 @@ def _new_provider_job(
         "hash_inputs_version": _CURRENT_HASH_INPUTS_VERSION,
         "resolved_size_params": resolved_size_params,
         "resolved_duration": resolved_duration,
+        # Э8 (раздел 11.3): путь к поданному видео-референсу или null; при null
+        # причина отказа фиксируется отдельным полем (критерии A08/A40).
+        "video_reference": video_reference,
+        "video_reference_rejected_reason": video_reference_rejected_reason,
         "task_id": None,
         "status": "prepared",
         "provider_status": None,
@@ -448,24 +454,34 @@ def _build_input_hash(
     frame_types: list[str],
     generate_audio: bool = False,
     provider_name: str = _PROVIDER_NAME,
+    reference_video_hash: Optional[str] = None,
 ) -> str:
     # M-6: hash only user-controlled inputs. The resolved duration/size come from
     # the provider's (process-cached, mutable) model catalog and must NOT enter the
     # hash, or a catalog change would force mass paid regeneration of unchanged shots.
-    return _hash_json(
-        {
-            "provider": provider_name,
-            "model": model_name,
-            "prompt_hash": prompt_hash,
-            "source_image_hashes": source_image_hashes,
-            "requested_duration": requested_duration,
-            "requested_width": requested_width,
-            "requested_height": requested_height,
-            "seed": seed,
-            "generate_audio": generate_audio,
-            "frame_types": frame_types,
-        }
-    )
+    # Note: 97_shots duration normalization (see screenplay_shots_generator.py) rewrites
+    # `timing`/`duration_s` before this hash is computed, so it still acts through the
+    # user-controlled input and does not violate M-6 by itself. Switching to a model with
+    # a different duration grid still triggers regeneration for affected shots — the
+    # difference is it now comes with an explicit P16 warning + shot list instead of
+    # happening silently.
+    payload = {
+        "provider": provider_name,
+        "model": model_name,
+        "prompt_hash": prompt_hash,
+        "source_image_hashes": source_image_hashes,
+        "requested_duration": requested_duration,
+        "requested_width": requested_width,
+        "requested_height": requested_height,
+        "seed": seed,
+        "generate_audio": generate_audio,
+        "frame_types": frame_types,
+    }
+    # Э8: only enters the hash when a blockout video reference is actually attached,
+    # so shots that never use a reference keep byte-identical hashes (no mass regen).
+    if reference_video_hash is not None:
+        payload["reference_video_hash"] = reference_video_hash
+    return _hash_json(payload)
 
 
 def _is_url_or_data_url(value: str) -> bool:

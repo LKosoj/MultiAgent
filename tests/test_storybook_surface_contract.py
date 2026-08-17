@@ -99,3 +99,55 @@ def test_storybook_project_inventory_rejects_path_escape(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="project_id must be a safe path segment"):
         storybook_surface.storybook_project_inventory("../outside")
+
+
+def test_json_artifacts_registers_blockout_files(tmp_path, monkeypatch):
+    """ТЗ раздел 18.9: серверный реестр видит chains/scene_spec/asset_map."""
+    projects_dir = tmp_path / "storybooks"
+    project_dir = projects_dir / "demo"
+    (project_dir / "93_blockout").mkdir(parents=True)
+    (project_dir / "93_blockout" / "chains.json").write_text("{}", encoding="utf-8")
+    (project_dir / "93_blockout" / "scene_spec.json").write_text("{}", encoding="utf-8")
+    (project_dir / "93_blockout" / "asset_map.json").write_text("[]", encoding="utf-8")
+
+    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_dir))
+
+    result = storybook_surface.storybook_project_inventory("demo")
+
+    artifacts = result["selected_project"]["artifacts"]
+    assert artifacts["chains"]["path"] == "93_blockout/chains.json"
+    assert artifacts["chains"]["status"] == "present"
+    assert artifacts["scene_spec"]["status"] == "present"
+    assert artifacts["asset_map"]["status"] == "present"
+
+
+def test_media_inventory_sees_blockout_preview_but_not_frames(tmp_path, monkeypatch):
+    """ТЗ раздел 18.9: MEDIA_DIRS содержит 93_blockout/preview, а НЕ корень
+    93_blockout — иначе рекурсивный rglob('*') обойдёт тысячи файлов frames/
+    на каждый inventory-запрос."""
+    projects_dir = tmp_path / "storybooks"
+    project_dir = projects_dir / "demo"
+    preview_dir = project_dir / "93_blockout" / "preview"
+    preview_dir.mkdir(parents=True)
+    (preview_dir / "blockout_all.mp4").write_bytes(b"mp4")
+    (preview_dir / "contact_sheet.png").write_bytes(b"png")
+
+    # Много "тяжёлых" файлов вне preview/, как frames/ реального рендера —
+    # если бы MEDIA_DIRS включал корень 93_blockout, они бы тоже обошлись.
+    frames_dir = project_dir / "93_blockout" / "scene_01_shot_01" / "frames"
+    frames_dir.mkdir(parents=True)
+    for i in range(500):
+        (frames_dir / f"frame_{i:04d}.png").write_bytes(b"f")
+
+    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_dir))
+
+    result = storybook_surface.storybook_project_inventory("demo")
+
+    media = result["selected_project"]["media"]
+    paths = {item["path"] for item in media["items"]}
+    assert "93_blockout/preview/blockout_all.mp4" in paths
+    assert "93_blockout/preview/contact_sheet.png" in paths
+    # Кадры фреймов не должны попасть в счётчик — MEDIA_DIRS не включает корень.
+    assert media["counts"]["image"] == 1
+    assert media["counts"]["video"] == 1
+    assert not any("frames" in item["path"] for item in media["items"])

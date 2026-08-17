@@ -20,8 +20,8 @@ from .text_to_sql.core import (
     code_formatter,
     
     # SQL Verification  
-    sql_safety_check,
-    sql_explain,
+    sql_safety_check as _sql_safety_check_internal,
+    sql_explain as _sql_explain_internal,
     
     # Execution and Audit
     secure_db_executor,
@@ -70,6 +70,39 @@ from workflow.deadline import WorkflowDeadlineExceeded
 # Настройка логирования
 import logging
 logger = logging.getLogger(__name__)
+
+
+def sql_safety_check(sql_query: str) -> dict:
+    """Проверяет SQL, который модель передаёт только через sql_query.
+
+    Trusted core получает policy из runtime context или настроенного при
+    запуске validator (объекта проверки).
+
+    Args:
+        sql_query: SQL-запрос для проверки.
+
+    Returns:
+        Результат статической и LLM-проверки безопасности.
+    """
+    return _sql_safety_check_internal(sql_query)
+
+
+def sql_explain(sql_query: str) -> dict:
+    """Строит EXPLAIN для SQL, который модель передаёт только через sql_query.
+
+    Trusted core получает policy из runtime context или настроенного при
+    запуске validator (объекта проверки); DSN — из runtime context или через
+    явный операторский opt-in DB_DSN при SECURE_DB_EXECUTOR_ALLOW_ENV_DSN=1;
+    DeadlineBudget — из runtime context. Dry-run задаёт только оператор через
+    TEXT_TO_SQL_DRY_RUN_ONLY.
+
+    Args:
+        sql_query: SQL-запрос для анализа.
+
+    Returns:
+        План выполнения или безопасный отказ.
+    """
+    return _sql_explain_internal(sql_query)
 
 
 

@@ -7,6 +7,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,6 +162,8 @@ class FakeStore:
         self.fence_calls: list[dict[str, object]] = []
         self.set_worker_pid_calls: list[dict[str, object]] = []
         self.cancel_calls: list[str] = []
+        self.canonical_cancel_calls: list[dict[str, str]] = []
+        self.canonical_cancel_results: dict[str, object] = {}
         self.finish_calls: list[dict[str, object]] = []
         self.expire_calls: list[dict[str, object]] = []
         self.requeue_calls: list[dict[str, object]] = []
@@ -247,8 +250,24 @@ class FakeStore:
             return self.set_worker_pid_results.pop(0)
         return True
 
-    def request_cancel(self, run_id: str) -> str:
+    def request_cancel(
+        self,
+        run_id: str,
+        *,
+        cancellation_request_id: str | None = None,
+        cancellation_provenance: str | None = None,
+    ) -> object:
         self.cancel_calls.append(run_id)
+        if cancellation_request_id is not None:
+            assert cancellation_provenance is not None
+            self.canonical_cancel_calls.append(
+                {
+                    "run_id": run_id,
+                    "cancellation_request_id": cancellation_request_id,
+                    "cancellation_provenance": cancellation_provenance,
+                }
+            )
+            return self.canonical_cancel_results[cancellation_request_id]
         return self.cancel_results.get(run_id, "running")
 
     def get_run(self, run_id: str) -> FakeRunState | None:
@@ -597,6 +616,36 @@ def test_submit_is_bounded_and_returns_explicit_queued_result(
         )
 
 
+def test_submit_generic_work_spec_does_not_require_adaptive_store_api(
+    config: SupervisorConfig,
+) -> None:
+    class LegacyStore:
+        def __init__(self) -> None:
+            self.enqueued: list[tuple[str, dict[str, object], int, int]] = []
+
+        def get_run(self, run_id: str) -> FakeRunState:
+            return FakeRunState(run_id=run_id)
+
+        def enqueue_run(
+            self,
+            run_id: str,
+            work_spec: Mapping[str, object],
+            deadline_at_ms: int,
+            queue_limit: int,
+        ) -> FakeStoredRun:
+            self.enqueued.append(
+                (run_id, dict(work_spec), deadline_at_ms, queue_limit)
+            )
+            return FakeStoredRun(run_id, deadline_at_ms)
+
+    store = LegacyStore()
+    supervisor = _supervisor(store, config, started=False)
+    spec = _work_spec(deadline_at_ms=20_000)
+
+    assert supervisor.submit("run-legacy", spec, deadline_at_ms=20_000).state == "queued"
+    assert store.enqueued == [("run-legacy", spec, 20_000, config.queue_limit)]
+
+
 def test_scheduler_passes_caps_and_spawns_with_run_id_and_persisted_spec(
     config: SupervisorConfig,
 ) -> None:
@@ -627,7 +676,12 @@ def test_scheduler_passes_caps_and_spawns_with_run_id_and_persisted_spec(
     assert process.args == (
         "run-1",
         _work_spec(),
-        {"supervisor_id": "supervisor-test", "attempt_generation": 1_000},
+        {
+            "supervisor_id": "supervisor-test",
+            "attempt_generation": 1_000,
+            "run_kind": None,
+            "workflow_name": None,
+        },
     )
     assert store.set_worker_pid_calls == [
         {
@@ -989,6 +1043,46 @@ def test_deadline_sends_term_then_kill_and_finishes_timed_out(
     }
 
 
+def test_cancelled_worker_that_exits_on_term_is_reaped_without_kill(
+    config: SupervisorConfig,
+) -> None:
+    store = FakeStore()
+    store.claims.append(_claim())
+    context = FakeContext()
+    signals: list[int] = []
+
+    def cooperative_signal(process: FakeProcess, sig: int) -> None:
+        signals.append(sig)
+        if sig == signal.SIGTERM:
+            process.alive = False
+            process.exitcode = -signal.SIGTERM
+
+    supervisor = WorkflowProcessSupervisor(
+        store,
+        process_entrypoint=_fake_process_entrypoint,
+        config=config,
+        supervisor_id="supervisor-test",
+        process_context=context,
+        now_ms=FakeClock().now_ms,
+        wait=lambda _seconds: False,
+        thread_factory=ManualThread,
+        process_group_signal=cooperative_signal,
+    )
+    assert supervisor.start()
+    supervisor._schedule_once()
+
+    result = supervisor.cancel("run-1")
+
+    assert (result.accepted, result.local) == (True, True)
+    assert signals == [signal.SIGTERM]
+    assert context.processes[0].join_calls == [config.cancel_grace_seconds, None]
+    assert store.finish_calls[0]["terminal_outcome"] == {
+        "status": "cancelled",
+        "reason": "CANCEL_REQUESTED",
+    }
+    assert supervisor.get_process_snapshot("run-1") is None
+
+
 def test_deadline_kill_abandons_join_and_still_releases_handle_when_process_survives_sigkill(
     config: SupervisorConfig,
     caplog: pytest.LogCaptureFixture,
@@ -1217,6 +1311,65 @@ def test_remote_running_cancel_is_durably_accepted(config: SupervisorConfig) -> 
     assert store.finish_calls == []
 
 
+def test_stable_cancellation_identity_is_forwarded_and_returned(
+    config: SupervisorConfig,
+) -> None:
+    store = FakeStore()
+    store.canonical_cancel_results["cancel-request-1"] = SimpleNamespace(
+        state="running",
+        accepted=True,
+        cancellation_request_id="cancel-request-1",
+        provenance="workflow_process_supervisor:v1",
+    )
+    supervisor = _supervisor(store, config)
+
+    result = supervisor.cancel(
+        "run-remote",
+        cancellation_request_id="cancel-request-1",
+    )
+
+    assert result.accepted is True
+    assert result.cancellation_request_id == "cancel-request-1"
+    assert result.cancellation_provenance == "workflow_process_supervisor:v1"
+    assert store.canonical_cancel_calls == [
+        {
+            "run_id": "run-remote",
+            "cancellation_request_id": "cancel-request-1",
+            "cancellation_provenance": "workflow_process_supervisor:v1",
+        }
+    ]
+
+
+def test_stable_cancellation_origin_is_forwarded_and_returned(
+    config: SupervisorConfig,
+) -> None:
+    store = FakeStore()
+    store.canonical_cancel_results["cancel-request-origin"] = SimpleNamespace(
+        state="running",
+        accepted=True,
+        cancellation_request_id="cancel-request-origin",
+        provenance="agui_run_manager:v1",
+    )
+    supervisor = _supervisor(store, config)
+
+    result = supervisor.cancel(
+        "run-remote",
+        cancellation_request_id="cancel-request-origin",
+        cancellation_provenance="agui_run_manager:v1",
+    )
+
+    assert result.accepted is True
+    assert result.cancellation_request_id == "cancel-request-origin"
+    assert result.cancellation_provenance == "agui_run_manager:v1"
+    assert store.canonical_cancel_calls == [
+        {
+            "run_id": "run-remote",
+            "cancellation_request_id": "cancel-request-origin",
+            "cancellation_provenance": "agui_run_manager:v1",
+        }
+    ]
+
+
 def test_spawn_failure_uses_terminalizer_and_releases_handle(
     config: SupervisorConfig,
 ) -> None:
@@ -1294,6 +1447,8 @@ def test_spawn_receives_separate_claim_envelope_and_uses_exact_pid_cas(
     assert context.processes[0].args[2] == {
         "supervisor_id": "supervisor-test",
         "attempt_generation": 41,
+        "run_kind": None,
+        "workflow_name": None,
     }
     assert "supervisor_id" not in context.processes[0].args[1]
     assert store.set_worker_pid_calls == [
@@ -1517,6 +1672,40 @@ def test_start_stop_are_idempotent_and_supervisor_id_is_stable(
     assert ManualThread.instances[-1].started is True
     assert supervisor.stop() is True
     assert supervisor.stop() is False
+
+
+def test_supervisor_stop_records_cancellation_origin(
+    config: SupervisorConfig,
+    monkeypatch,
+) -> None:
+    import workflow.process_supervisor as supervisor_module
+
+    store = FakeStore()
+    store.claims.append(_claim())
+    context = FakeContext()
+    supervisor = _supervisor(store, config, context=context)
+    supervisor._schedule_once()
+    request_id = "cancel-supervisor-stop-fixed"
+    store.canonical_cancel_results[request_id] = SimpleNamespace(
+        state="running",
+        accepted=True,
+        cancellation_request_id=request_id,
+        provenance="workflow_supervisor_stop:v1",
+    )
+    monkeypatch.setattr(
+        supervisor_module.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="fixed"),
+    )
+
+    assert supervisor.stop() is True
+    assert store.canonical_cancel_calls == [
+        {
+            "run_id": "run-1",
+            "cancellation_request_id": request_id,
+            "cancellation_provenance": "workflow_supervisor_stop:v1",
+        }
+    ]
 
 
 def test_stopped_supervisor_does_not_claim_or_spawn(

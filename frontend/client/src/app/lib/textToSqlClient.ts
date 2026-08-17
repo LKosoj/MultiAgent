@@ -25,16 +25,12 @@ export type TextToSqlStartPayloadInput = {
   query: string;
   connectionRef: string;
   maxRows: number;
-  workflowName?: string;
   sessionId?: string;
-  useEnhanced: boolean;
-  allowEnhancedFallback: boolean;
   enableTelemetry: boolean;
   safetyLevel: string;
   includeExplanation: boolean;
   validateSchema: boolean;
   dryRunOnly: boolean;
-  useSchemaSuggestions: boolean;
 };
 
 export type TextToSqlTerminalOutcome = {
@@ -112,19 +108,14 @@ export function buildTextToSqlStartPayload(
   }
   return {
     query: input.query,
-    natural_query: input.query,
     connection_ref: input.connectionRef,
     max_rows: input.maxRows,
-    workflow_name: input.workflowName,
     session_id: input.sessionId,
-    use_enhanced: input.useEnhanced,
-    allow_enhanced_fallback: input.allowEnhancedFallback,
     enable_telemetry: input.enableTelemetry,
     safety_level: input.safetyLevel,
     include_explanation: input.includeExplanation,
     validate_schema: input.validateSchema,
     dry_run_only: input.dryRunOnly,
-    use_schema_suggestions: input.useSchemaSuggestions,
   };
 }
 

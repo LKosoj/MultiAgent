@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 # Импорт общих функций из модуля common
 # Только те функции, которые реально используются в этом модуле
 from custom_tools.storybook.video_generator_common import (
+    _VIDEO_MODEL_CAPABILITIES_REGISTRY,
     parse_duration_seconds_from_timing,
     update_shots_with_descriptions,
     sync_items_to_memory
@@ -43,6 +44,7 @@ from custom_tools.storybook.video_generator_aitunnel_jobs import (
     _hash_text,
     _new_provider_job,
 )
+from custom_tools.storybook.video_generator_aitunnel_media import _select_best_supported_duration
 
 # Импорт для API
 try:
@@ -51,11 +53,13 @@ except ImportError:
     translate_prompts_in_items = None
     logger.warning("⚠️ Модуль utils.translate_prompts_in_items не найден")
 
-# MiniMax-Hailuo-02 поддерживает только фиксированные длительности видео
-_MM_SUPPORTED_DURATIONS = (6, 10)
 _MM_PROVIDER_NAME = "minimax"
-_MM_MODEL_NAME = "MiniMax-Hailuo-02"
-_MM_RESOLUTION = "768P"
+# Централизованный реестр возможностей видеомоделей (раздел 6.1 ТЗ): значение
+# живёт только в _VIDEO_MODEL_CAPABILITIES_REGISTRY, эти имена — производные,
+# чтобы не переписывать десятки мест использования констант ниже по файлу.
+_MM_CAPS = _VIDEO_MODEL_CAPABILITIES_REGISTRY["video_generator_mm_tool"]
+_MM_MODEL_NAME = _MM_CAPS["model"]
+_MM_RESOLUTION = _MM_CAPS["resolution"]
 
 
 class _MMPollTimeoutError(Exception):
@@ -104,11 +108,6 @@ def _sanitize_url_for_log(url: str) -> str:
         return f"{parsed.netloc}{path}" if parsed.netloc else "<url>"
     except Exception:
         return "<url>"
-
-
-def _snap_to_supported_duration_mm(duration: int) -> int:
-    """Приводит длительность к ближайшему поддерживаемому MiniMax-Hailuo-02 значению."""
-    return min(_MM_SUPPORTED_DURATIONS, key=lambda allowed: (abs(allowed - duration), allowed))
 
 
 def video_generator_mm_tool(
@@ -182,7 +181,13 @@ def video_generator_mm_tool(
         logger.info("🎬 Генерация видео MiniMax отключена (enable=False). Анализ изображений завершен.")
         return {"status": "skipped", "message": "Генерация видео отключена, анализ изображений выполнен", "results": []}
         
-    if descriptions_updated:
+    if descriptions_updated < 0:
+        # Запись shots.json не удалась (см. журнал
+        # update_shots_with_descriptions) — items_list в памяти уже
+        # содержит обновления, перечитывать диск нельзя: там осталась
+        # устаревшая версия, это откатило бы их.
+        logger.error(f"❌ Не удалось сохранить обновлённые описания в {shots_file_path}, используем данные из памяти")
+    elif descriptions_updated:
         logger.info("🔄 Описания обновлены, перезагружаем данные из shots.json")
         # Перезагружаем данные после обновления описаний
         try:
@@ -414,10 +419,13 @@ def _generate_single_video_mm(
     else:
         video_prompt = item.get('video_prompt', '')
 
-    # Определяем длительность видео из timing и приводим к поддерживаемым MiniMax-Hailuo-02 значениям
-    duration = _snap_to_supported_duration_mm(parse_duration_seconds_from_timing(timing))
+    # M-6: запрошенная длительность (из timing) идёт в хеш входа, а подогнанная
+    # под supported_durations модели — только в запрос к провайдеру и в
+    # resolved_duration журнала (раздел 6.1 ТЗ).
+    requested_duration = parse_duration_seconds_from_timing(timing)
+    resolved_duration = _select_best_supported_duration(requested_duration, _MM_CAPS["supported_durations"])
 
-    logger.info(f"🎥 Генерируем видео MiniMax для сцены {scene_number}, кадр {shot_number} длительность {duration}")
+    logger.info(f"🎥 Генерируем видео MiniMax для сцены {scene_number}, кадр {shot_number} длительность {resolved_duration}")
     if end_image:
         logger.info(f"📹 Используем start + end изображения для анимации MiniMax")
     else:
@@ -447,7 +455,7 @@ def _generate_single_video_mm(
             trusted_output_job
             and trusted_output_job.get("prompt_hash") == prompt_hash
             and trusted_output_job.get("model") == _MM_MODEL_NAME
-            and trusted_output_job.get("resolved_duration") == duration
+            and trusted_output_job.get("resolved_duration") == resolved_duration
             and (trusted_output_job.get("seed") == seed if trusted_output_job.get("seed") is not None or seed is not None else True)
         )
         if trusted_output_job and missing_trusted_source_hash and trusted_metadata_matches:
@@ -475,7 +483,7 @@ def _generate_single_video_mm(
             model_name=_MM_MODEL_NAME,
             prompt_hash=prompt_hash,
             source_image_hashes=source_image_hashes,
-            requested_duration=duration,
+            requested_duration=requested_duration,
             requested_width=0,
             requested_height=0,
             seed=seed,
@@ -495,7 +503,7 @@ def _generate_single_video_mm(
                 input_hash=input_hash,
                 output_path=str(video_path),
                 resolved_size_params={"resolution": _MM_RESOLUTION},
-                resolved_duration=duration,
+                resolved_duration=resolved_duration,
                 provider_name=_MM_PROVIDER_NAME,
             )
             job_data["seed"] = seed
@@ -610,7 +618,7 @@ def _generate_single_video_mm(
                     video_prompt,
                     first_frame_data_uri,
                     last_frame_data_uri,
-                    duration,
+                    resolved_duration,
                     api_key,
                     seed,
                 )

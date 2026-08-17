@@ -20,7 +20,7 @@ from typing import Any, Dict
 from smolagents import tool
 
 from .chroma_text import extract_tactical_chroma_text
-from .database import _embedding_dimension
+from .database import VectorReadiness, _embedding_dimension
 from .manager import memory_manager
 
 
@@ -150,6 +150,16 @@ def _handler_lock_cm(handler):
     return lock
 
 
+def _set_vector_readiness(handler, readiness: VectorReadiness, reason: str | None = None) -> None:
+    """Publish Chroma state without changing the authoritative SQLite rows."""
+    setter = getattr(handler, "set_vector_readiness", None)
+    if callable(setter):
+        setter(readiness, reason)
+        return
+    handler.vector_readiness = readiness
+    handler.vector_readiness_reason = reason
+
+
 def _empty_collection_report(
     *,
     failed: tuple[tuple[str, str], ...] = (),
@@ -191,10 +201,33 @@ def rebuild_chromadb_from_sqlite(db_handler=None) -> RebuildReport:
     started_at = monotonic()
     handler = db_handler or memory_manager.db_handler
     if not handler.chroma_client or not handler.embedding_model:
+        _set_vector_readiness(
+            handler,
+            VectorReadiness.UNAVAILABLE,
+            "rebuild_backend_unavailable",
+        )
         return _failed_report(started_at, "CHROMA_BACKEND_UNAVAILABLE")
 
     with _REBUILD_LOCK, _handler_lock_cm(handler):
-        return _rebuild_chromadb_from_sqlite_locked(handler, started_at)
+        _set_vector_readiness(handler, VectorReadiness.REBUILDING)
+        try:
+            report = _rebuild_chromadb_from_sqlite_locked(handler, started_at)
+        except BaseException:
+            _set_vector_readiness(
+                handler,
+                VectorReadiness.STALE,
+                "rebuild_interrupted",
+            )
+            raise
+        if report.status is RebuildStatus.COMPLETE:
+            _set_vector_readiness(handler, VectorReadiness.READY)
+        else:
+            _set_vector_readiness(
+                handler,
+                VectorReadiness.STALE,
+                report.error_code or "rebuild_incomplete",
+            )
+        return report
 
 
 def _rebuild_chromadb_from_sqlite_locked(handler, started_at: float) -> RebuildReport:

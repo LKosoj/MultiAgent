@@ -21,6 +21,9 @@ JSON_ARTIFACTS = {
     "screenplay": "91_screenplay/screenplay.json",
     "shots": "97_shots/shots.json",
     "provider_jobs": "97_shots/provider_jobs.json",
+    "chains": "93_blockout/chains.json",
+    "scene_spec": "93_blockout/scene_spec.json",
+    "asset_map": "93_blockout/asset_map.json",
     "audio_manifest": "98_audio/audio_manifest.json",
     "music_manifest": "98_audio/music_manifest.json",
     "final_manifest": "99_final/manifest.json",
@@ -36,6 +39,9 @@ MEDIA_DIRS = (
     "97_shots",
     "98_audio",
     "99_final",
+    # НЕ корень 93_blockout: обход там рекурсивный и ничем не ограничен
+    # (frames/ шота — тысячи файлов), см. раздел 18.9 ТЗ.
+    "93_blockout/preview",
 )
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tiff"}
 VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}

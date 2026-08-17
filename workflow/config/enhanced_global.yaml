@@ -7,10 +7,6 @@ enhanced_workflow:
   fallback_to_legacy: true
   version: "1.0"
 
-workflow_overrides:
-  text_to_sql:
-    fallback_to_legacy: false
-
 # Feature flags для отдельных компонентов
 features:
   # Планирование шагов

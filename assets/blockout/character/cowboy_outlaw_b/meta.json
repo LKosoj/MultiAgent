@@ -1,0 +1,162 @@
+{
+  "id": "cowboy_outlaw_b",
+  "name": "Грабитель Б",
+  "category": "character",
+  "tags": [
+    "cowboy",
+    "outlaw",
+    "character"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.6000000834465027,
+    0.800000011920929,
+    2.700000047683716
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [
+    {
+      "name": "attack-kick-left",
+      "duration_s": 0.583,
+      "loop": true
+    },
+    {
+      "name": "attack-kick-right",
+      "duration_s": 0.583,
+      "loop": true
+    },
+    {
+      "name": "attack-melee-left",
+      "duration_s": 0.417,
+      "loop": true
+    },
+    {
+      "name": "attack-melee-right",
+      "duration_s": 0.417,
+      "loop": true
+    },
+    {
+      "name": "die",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "drive",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "emote-no",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "emote-yes",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "holding-both",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-both-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "holding-left",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-left-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "holding-right",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-right-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "idle",
+      "duration_s": 1.333,
+      "loop": true
+    },
+    {
+      "name": "interact-left",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "interact-right",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "pick-up",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "sit",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "sprint",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "static",
+      "duration_s": 0.1,
+      "loop": true
+    },
+    {
+      "name": "walk",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-back",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-forward",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-left",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-right",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-sit",
+      "duration_s": 0.167,
+      "loop": true
+    }
+  ],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/blocky-characters",
+  "file_size_bytes": 62452,
+  "fetched_at": "2026-08-16T21:19:47Z",
+  "asset_version": 1
+}

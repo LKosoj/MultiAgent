@@ -83,6 +83,7 @@ _OUTBOX_DRAIN_TIME_BUDGET_SECONDS = 0.1
 _OUTBOX_DRAIN_RETRY_DELAY_SECONDS = 0.05
 _OUTBOX_DRAIN_SCHEDULE_LOCK = threading.Lock()
 _OUTBOX_DRAIN_SCHEDULED: Dict[str, Tuple[int, int]] = {}
+_RESULT_PERSISTENCE_DIAGNOSTIC_KEY = "result_persistence_diagnostic"
 
 
 def _reset_outbox_drain_scheduler_after_fork() -> None:
@@ -610,27 +611,49 @@ def _apply_text_to_sql_terminal_failure(
     terminal_outcome = None
     if is_text_to_sql_workflow_name(run_data.get("workflow_name")):
         public_error = bound_text_to_sql_error(public_error)
-        source = source_terminal or {}
-        terminal_outcome = TextToSqlTerminalResult.from_mapping({
-            "run_id": str(run_data.get("run_id") or run_id),
-            "status": TextToSqlTerminalStatus.FAILED.value,
-            "reason_code": reason_code,
-            "sql": source.get("sql", ""),
-            "generated": source.get("generated", False),
-            "approved": source.get("approved", False),
-            "executed": source.get("executed", False),
-            "dry_run": source.get("dry_run", False),
-            "audited": source.get("audited", False),
-            "data": source.get("data", []),
-            "columns": source.get("columns", []),
-            "rows_affected": source.get("rows_affected", 0),
-            "error": public_error,
-            "execution": source.get("execution", {}),
-            "audit": source.get("audit", {}),
-            "persistence": {"status": "error", "error": public_error},
-        }).to_mapping()
+        source = _validated_terminal_outcome(source_terminal)
+        if (
+            reason_code == "RESULT_PERSISTENCE_FAILED"
+            and source is not None
+            and source["status"] in {"failed", "abstained", "cancelled", "timed_out"}
+        ):
+            # A terminal result already proves the workflow outcome. A delivery
+            # failure is only secondary evidence and must not rewrite that proof.
+            terminal_outcome = source
+            run_data[_RESULT_PERSISTENCE_DIAGNOSTIC_KEY] = {
+                "reason_code": "RESULT_PERSISTENCE_FAILED",
+                "error": public_error,
+            }
+        else:
+            source = source or {}
+            terminal_outcome = TextToSqlTerminalResult.from_mapping({
+                "run_id": str(run_data.get("run_id") or run_id),
+                "status": TextToSqlTerminalStatus.FAILED.value,
+                "reason_code": reason_code,
+                "sql": source.get("sql", ""),
+                "generated": source.get("generated", False),
+                "approved": source.get("approved", False),
+                "executed": source.get("executed", False),
+                "dry_run": source.get("dry_run", False),
+                "audited": source.get("audited", False),
+                "data": source.get("data", []),
+                "columns": source.get("columns", []),
+                "rows_affected": source.get("rows_affected", 0),
+                "error": public_error,
+                "execution": source.get("execution", {}),
+                "audit": source.get("audit", {}),
+                "result_review": source.get("result_review", {}),
+                "persistence": (
+                    {"status": "error", "error": public_error}
+                    if reason_code == "RESULT_PERSISTENCE_FAILED"
+                    else {"status": "not_attempted"}
+                ),
+                "ambiguity": None,
+            }).to_mapping()
+        status, _success = _terminal_legacy_fields(terminal_outcome)
+        public_error = terminal_outcome.get("error")
     updates = {
-        "status": "failed",
+        "status": status if terminal_outcome is not None else "failed",
         "end_time": datetime.now(),
         "error": public_error,
     }
@@ -892,6 +915,8 @@ def _build_text_to_sql_no_runtime_terminal(
             "execution": {},
             "audit": {},
             "persistence": {"status": "not_attempted"},
+            "result_review": {},
+            "ambiguity": None,
         }
     ).to_mapping()
 
@@ -1485,6 +1510,15 @@ def _workflow_artifacts_from_run_data(run_data: Dict[str, Any]) -> Dict[str, Any
         metadata["execution"] = run_data.get("execution")
     if run_data.get("config_versions") is not None:
         metadata["config_versions"] = run_data.get("config_versions")
+    diagnostic = run_data.get(_RESULT_PERSISTENCE_DIAGNOSTIC_KEY)
+    if isinstance(diagnostic, dict) and set(diagnostic) == {"reason_code", "error"}:
+        reason_code = diagnostic.get("reason_code")
+        error = diagnostic.get("error")
+        if reason_code == "RESULT_PERSISTENCE_FAILED" and isinstance(error, str):
+            metadata[_RESULT_PERSISTENCE_DIAGNOSTIC_KEY] = {
+                "reason_code": reason_code,
+                "error": bound_text_to_sql_error(_redact_error_text(error)),
+            }
     return {
         "run_id": run_data.get("run_id"),
         "final_output": run_data.get("final_output"),
@@ -1526,6 +1560,13 @@ def _merge_workflow_result_payload(run_data: Dict[str, Any], payload: Dict[str, 
         run_data["execution"] = metadata.get("execution")
     if "config_versions" in metadata:
         run_data["config_versions"] = metadata.get("config_versions")
+    diagnostic = metadata.get(_RESULT_PERSISTENCE_DIAGNOSTIC_KEY)
+    if isinstance(diagnostic, dict) and set(diagnostic) == {"reason_code", "error"}:
+        if (
+            diagnostic.get("reason_code") == "RESULT_PERSISTENCE_FAILED"
+            and isinstance(diagnostic.get("error"), str)
+        ):
+            run_data[_RESULT_PERSISTENCE_DIAGNOSTIC_KEY] = dict(diagnostic)
     if "workflow_name" in snapshot and snapshot.get("workflow_name"):
         run_data["workflow_name"] = snapshot.get("workflow_name")
     if "parameters" in snapshot:

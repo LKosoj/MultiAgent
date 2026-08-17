@@ -1,0 +1,18 @@
+version: 1
+name: search_value
+description: Search one exact scalar value in one exact column.
+implementation: search_value
+arguments:
+  - name: table
+    type: string
+    required: true
+  - name: column
+    type: string
+    required: true
+  - name: value
+    type: json_scalar
+    required: true
+  - name: top_k
+    type: integer
+    required: true
+additional_properties: false

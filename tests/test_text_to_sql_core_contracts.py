@@ -29,6 +29,7 @@ from backend.fastapi_app.agui._t2s_requests import (
     parse_text_to_sql_generate,
     parse_text_to_sql_pipeline_inputs,
 )
+from workflow.deadline import DeadlineBudget
 
 
 class _AdmittedPluginDouble:
@@ -72,6 +73,15 @@ class _FakeMemory:
         return list(self.relevant_tables)
 
 
+class _RecordingSchemaLimiter:
+    def __init__(self):
+        self.calls = []
+
+    def build_schema_summary(self, db_schema, **kwargs):
+        self.calls.append({"db_schema": db_schema, **kwargs})
+        return ", ".join(db_schema)
+
+
 class _FkPreviewPlugin:
     def __init__(self):
         self.calls = []
@@ -91,20 +101,31 @@ class _FkPreviewPlugin:
         }
 
 
-@pytest.mark.parametrize("validate_schema", [True, False])
-def test_text_to_sql_public_and_pipeline_inputs_require_schema_grounding(
-    validate_schema,
+@pytest.mark.parametrize(
+    "removed_field, value",
+    [
+        ("use_schema_suggestions", False),
+        ("allow_enhanced_fallback", True),
+        ("use_enhanced", False),
+        ("workflow_name", "data_analysis"),
+    ],
+)
+@pytest.mark.parametrize(
+    "parser", (parse_text_to_sql_generate, parse_text_to_sql_pipeline_inputs)
+)
+def test_text_to_sql_public_and_pipeline_inputs_reject_removed_mode_fields(
+    parser,
+    removed_field,
+    value,
 ):
     payload = {
         "query": "show revenue",
         "dsn": "sqlite:///tmp/app.db",
-        "use_schema_suggestions": False,
-        "validate_schema": validate_schema,
+        removed_field: value,
     }
 
-    for parser in (parse_text_to_sql_generate, parse_text_to_sql_pipeline_inputs):
-        with pytest.raises(ValueError, match="schema grounding is required"):
-            parser(payload)
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        parser(payload)
 
 
 def _raw_pyodbc_dsn() -> str:
@@ -329,15 +350,102 @@ def test_schema_linker_masks_dsn_in_schema_loading_errors(monkeypatch):
     assert "***:***@db.example.com" in result["error"]
 
 
-def test_schema_linking_memory_unavailable_is_distinct_from_no_hits():
+@pytest.mark.parametrize(
+    "memory_status",
+    ["memory_unavailable", "vector_unavailable", "vector_disabled"],
+)
+def test_schema_linking_unavailable_uses_sorted_full_authoritative_schema(
+    memory_status,
+):
     class MemoryUnavailable(_FakeMemory):
         def find_semantic_relevant_tables(self, terms, dsn=None):
             self.terms = list(terms)
             self.dsn = dsn
-            self.last_search_status = "memory_unavailable"
-            self.last_search_error = "tactical collection is missing"
+            self.last_search_status = memory_status
+            self.last_search_error = "semantic vector retrieval is unavailable"
             return []
 
+    limiter = _RecordingSchemaLimiter()
+    db_schema = {
+        "zeta": {"columns": {"id": {"type": "INTEGER"}}},
+        "alpha": {"columns": {"amount": {"type": "DECIMAL"}}},
+    }
+
+    def fake_llm(**kwargs):
+        return json.dumps(
+            {
+                "linked_entities": {
+                    "metrics": [
+                        {"name": "revenue", "table": "alpha", "column": "amount"}
+                    ],
+                    "dimensions": [],
+                    "filters": {},
+                },
+                "joins": [],
+                "unlinked_entities": [],
+            }
+        )
+
+    result = SchemaLinkingCore(
+        limiter, MemoryUnavailable(), llm_caller=fake_llm
+    ).llm_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        db_schema,
+    )
+
+    assert result["linked_entities"]["metrics"][0]["table"] == "alpha"
+    assert len(limiter.calls) == 1
+    assert list(limiter.calls[0]["db_schema"]) == ["alpha", "zeta"]
+    assert limiter.calls[0]["db_schema"] == db_schema
+    assert limiter.calls[0]["include_all_tables"] is True
+
+
+@pytest.mark.parametrize(
+    "error_type_name",
+    ["EmbeddingUnavailableError", "EmbeddingFailedError"],
+)
+def test_schema_linking_embedding_error_uses_full_authoritative_schema(
+    error_type_name,
+):
+    from memory import manager as memory_manager_module
+
+    error_type = getattr(memory_manager_module, error_type_name)
+
+    class EmbeddingUnavailable(_FakeMemory):
+        def find_semantic_relevant_tables(self, terms, dsn=None):
+            raise error_type("embedding retrieval failed")
+
+    limiter = _RecordingSchemaLimiter()
+    db_schema = {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+
+    def fake_llm(**kwargs):
+        return json.dumps(
+            {
+                "linked_entities": {
+                    "metrics": [
+                        {"name": "revenue", "table": "orders", "column": "amount"}
+                    ],
+                    "dimensions": [],
+                    "filters": {},
+                },
+                "joins": [],
+                "unlinked_entities": [],
+            }
+        )
+
+    result = SchemaLinkingCore(
+        limiter, EmbeddingUnavailable(), llm_caller=fake_llm
+    ).llm_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        db_schema,
+    )
+
+    assert result["linked_entities"]["metrics"][0]["table"] == "orders"
+    assert limiter.calls[0]["db_schema"] == db_schema
+    assert limiter.calls[0]["include_all_tables"] is True
+
+
+def test_schema_linking_no_hits_remains_fail_closed():
     class NoHits(_FakeMemory):
         def find_semantic_relevant_tables(self, terms, dsn=None):
             self.terms = list(terms)
@@ -346,26 +454,70 @@ def test_schema_linking_memory_unavailable_is_distinct_from_no_hits():
             self.last_search_error = None
             return []
 
-    def must_not_call_llm(**kwargs):
-        raise AssertionError("LLM must not be called without schema context")
+    limiter = _RecordingSchemaLimiter()
 
-    unavailable = SchemaLinkingCore(
-        SchemaLimiter(), MemoryUnavailable(), llm_caller=must_not_call_llm
-    ).llm_linking(
-        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
-        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
-    )
     no_hits = SchemaLinkingCore(
-        SchemaLimiter(), NoHits(), llm_caller=must_not_call_llm
+        limiter,
+        NoHits(),
+        llm_caller=lambda **kwargs: pytest.fail("LLM must not be called for no_hits"),
     ).llm_linking(
         {"metrics": ["revenue"], "dimensions": [], "filters": {}},
         {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
     )
 
-    assert unavailable["memory_status"] == "memory_unavailable"
-    assert unavailable["error"].startswith("Schema memory unavailable")
+    assert limiter.calls == []
     assert no_hits["memory_status"] == "no_hits"
     assert no_hits["error"] == "No semantically relevant tables found"
+
+
+@pytest.mark.parametrize(
+    "memory_status",
+    ["vector_stale", "vector_rebuilding", None],
+)
+def test_schema_linking_non_available_status_is_not_reported_as_no_hits(
+    memory_status,
+):
+    class MemoryNotReady(_FakeMemory):
+        def find_semantic_relevant_tables(self, terms, dsn=None):
+            self.last_search_status = memory_status
+            self.last_search_error = "semantic vector retrieval is not ready"
+            return []
+
+    limiter = _RecordingSchemaLimiter()
+    result = SchemaLinkingCore(
+        limiter,
+        MemoryNotReady(),
+        llm_caller=lambda **kwargs: pytest.fail(
+            "LLM must not be called for a non-available retrieval status"
+        ),
+    ).llm_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}},
+    )
+
+    assert limiter.calls == []
+    assert result["memory_status"] == (memory_status or "unknown")
+    assert result["error"] != "No semantically relevant tables found"
+
+
+def test_schema_linking_empty_schema_never_calls_limiter_or_llm():
+    class MemoryUnavailable(_FakeMemory):
+        def find_semantic_relevant_tables(self, terms, dsn=None):
+            self.last_search_status = "vector_disabled"
+            return []
+
+    limiter = _RecordingSchemaLimiter()
+    result = SchemaLinkingCore(
+        limiter,
+        MemoryUnavailable(),
+        llm_caller=lambda **kwargs: pytest.fail("LLM must not receive an empty schema"),
+    ).llm_linking(
+        {"metrics": ["revenue"], "dimensions": [], "filters": {}},
+        {},
+    )
+
+    assert limiter.calls == []
+    assert result["error"] == "Database schema is empty"
 
 
 def test_schema_linking_cache_key_includes_linking_env(monkeypatch):
@@ -416,6 +568,7 @@ def test_search_examples_passes_sqlrag_example_cache_kind(monkeypatch):
 
 def test_llm_linking_uses_entity_names_for_semantic_search():
     memory = _FakeMemory(["orders"])
+    limiter = _RecordingSchemaLimiter()
 
     def fake_call_openai_api(**kwargs):
         return json.dumps({
@@ -428,7 +581,7 @@ def test_llm_linking_uses_entity_names_for_semantic_search():
             "unlinked_entities": [],
         })
 
-    core = SchemaLinkingCore(SchemaLimiter(), memory, llm_caller=fake_call_openai_api)
+    core = SchemaLinkingCore(limiter, memory, llm_caller=fake_call_openai_api)
 
     result = core.llm_linking(
         {"metrics": ["revenue"], "dimensions": ["region"], "filters": {"year": 2024}},
@@ -436,6 +589,8 @@ def test_llm_linking_uses_entity_names_for_semantic_search():
     )
 
     assert memory.terms == ["revenue", "region", "year"]
+    assert limiter.calls[0]["include_all_tables"] is False
+    assert list(limiter.calls[0]["db_schema"]) == ["orders"]
     assert result["linked_entities"]["metrics"][0]["column"] == "amount"
 
 
@@ -2162,6 +2317,47 @@ def test_sql_explain_dry_run_skips_database_connection(monkeypatch):
     assert result["issues"] == []
     assert result["dry_run_only"] is True
     assert result["skipped_execution"] is True
+
+
+def test_sql_explain_passes_explicit_deadline_and_dry_run_to_executor(monkeypatch):
+    from custom_tools.text_to_sql.core import _sql_generation_api
+
+    seen = {}
+
+    class Executor:
+        def execute(self, request):
+            seen["request"] = request
+            return QueryExecutionResult(
+                request.purpose,
+                {
+                    "success": True,
+                    "data": [],
+                    "columns": [],
+                    "rows_affected": 0,
+                    "execution_time_ms": 0,
+                    "error_message": None,
+                    "dry_run_only": True,
+                    "skipped_execution": True,
+                    "sql_query": request.sql_query,
+                    "applied_row_limit": request.row_limit,
+                },
+            )
+
+    from custom_tools.text_to_sql.core._db_exec import QueryExecutionResult
+
+    monkeypatch.setattr(_sql_generation_api, "QueryExecutor", Executor)
+    deadline = DeadlineBudget.from_duration(60)
+
+    result = sql_explain(
+        "SELECT 1",
+        dsn="sqlite:///tmp/app.db",
+        dry_run_only=True,
+        deadline=deadline,
+    )
+
+    assert result["dry_run_only"] is True
+    assert seen["request"].deadline is deadline
+    assert seen["request"].dry_run_only is True
 
 
 def test_sql_explain_dry_run_passes_empty_dsn_sentinel(monkeypatch):

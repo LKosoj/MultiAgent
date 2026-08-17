@@ -1,0 +1,7 @@
+{
+  "schema_version": 2,
+  "record_kind": "text2sql_public_benchmark_early_stop_policy",
+  "block_size": 1,
+  "min_completed": 2,
+  "min_signature_cases": 2
+}

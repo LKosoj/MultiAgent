@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Optional
 
 from pydantic import TypeAdapter, ValidationError
+from workflow.result_identity import workflow_result_identity_from_payload
 
 from .auth import Principal, current_principal, principal_context
+from ._cancellation import RunCancellationIntent, bind_run_cancellation_intent
 from .encoder import EventEncoder
 from .events import (
     BaseEvent,
@@ -60,6 +62,8 @@ _TEXT_TO_SQL_DURABLE_TERMINAL_STATUSES: frozenset[str] = frozenset(
 _DURABLE_FOLLOW_POLL_SECONDS = 0.05
 _DURABLE_FOLLOW_MAX_RETRY_SECONDS = 1.0
 _EVENT_ADAPTER = TypeAdapter(Event)
+_AGUI_CANCEL_PROVENANCE = "agui_run_manager:v1"
+_AGUI_ORPHAN_CANCEL_PROVENANCE = "agui_orphan_disconnect:v1"
 
 
 def _max_concurrent_runs() -> int:
@@ -106,6 +110,33 @@ def is_terminal_event(event: BaseEvent) -> bool:
     return is_terminal_event_payload(event.type.value, payload)
 
 
+def _projects_durable_workflow_result(
+    event: BaseEvent,
+    result: dict,
+    *,
+    result_seq: int,
+) -> bool:
+    if not isinstance(event, CustomEvent) or event.name != "workflow.result":
+        return False
+    if not isinstance(event.value, dict):
+        return False
+    try:
+        same_identity = (
+            workflow_result_identity_from_payload(event.value)
+            == workflow_result_identity_from_payload(result)
+        )
+    except ValueError:
+        return False
+    return (
+        same_identity
+        and type(result_seq) is int
+        and result_seq > 0
+        and result.get("result_seq") == result_seq
+        and event.value.get("result_seq") == result_seq
+        and event.value.get("terminal_outcome") == result.get("terminal_outcome")
+    )
+
+
 @dataclass
 class RunInfo:
     run_id: str
@@ -125,6 +156,11 @@ class RunInfo:
     durable_follower: bool = False
     durable_cancel_attempted: bool = False
     finalization_task: Optional[asyncio.Task[None]] = None
+    idempotency_key: Optional[str] = None
+    request_fingerprint: Optional[str] = None
+    cancellation_intent: RunCancellationIntent = field(
+        default_factory=RunCancellationIntent
+    )
 
 
 @dataclass(frozen=True)
@@ -175,13 +211,16 @@ def _text_to_sql_admission(
     from ._t2s_requests import (
         canonical_text_to_sql_start_fingerprint,
         parse_text_to_sql_start,
+        text_to_sql_request_payload,
     )
+    from workflow.text_to_sql_contract import TEXT_TO_SQL_WORKFLOW_NAME
 
-    request = parse_text_to_sql_start(payload)
+    request_payload = text_to_sql_request_payload(payload)
+    request = parse_text_to_sql_start(request_payload)
     return _TextToSqlAdmission(
         idempotency_key=request.idempotency_key,
-        request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
-        workflow_name=request.workflow_name,
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(request_payload),
+        workflow_name=TEXT_TO_SQL_WORKFLOW_NAME,
     )
 
 
@@ -325,6 +364,8 @@ class RunManager:
             started_at_ms=stored.created_at_ms,
             finished_at_ms=stored.finished_at_ms,
             events=events,
+            idempotency_key=stored.idempotency_key,
+            request_fingerprint=stored.request_fingerprint,
         )
 
     def _append_terminal_retry_projection(
@@ -376,6 +417,7 @@ class RunManager:
         )
         if primary is not None and primary.event_type == "WORKFLOW_RESULT":
             result = primary.payload
+            projected_result = {**result, "result_seq": stored.result_seq}
             terminal = result.get("terminal_outcome")
             terminal_status = (
                 str(terminal.get("status") or "failed")
@@ -418,16 +460,18 @@ class RunManager:
                     stored.run_id,
                 )
             if not any(
-                isinstance(event, CustomEvent)
-                and event.name == "workflow.result"
-                and event.value == result
+                _projects_durable_workflow_result(
+                    event,
+                    projected_result,
+                    result_seq=stored.result_seq,
+                )
                 for event in existing_events
             ):
                 events.append(
                     CustomEvent(
                         type=EventType.CUSTOM,
                         name="workflow.result",
-                        value=result,
+                        value=projected_result,
                         timestamp=now_ms,
                     )
                 )
@@ -681,6 +725,7 @@ class RunManager:
             info.durable_follower = True
             info.startup_error = None
             info.lifecycle_started = asyncio.Event()
+            info.cancellation_intent = RunCancellationIntent()
             info.task = asyncio.create_task(
                 self._follow_durable_text_to_sql(
                     info,
@@ -693,8 +738,10 @@ class RunManager:
         self,
         run_id: str,
         principal: Principal,
+        cancellation_request_id: str,
+        cancellation_provenance: str,
     ) -> _UncachedCancelDispatchResult:
-        from .service import handle_service_action
+        from .service import ServiceTransportContext, handle_service_action
 
         try:
             response = await asyncio.to_thread(
@@ -702,6 +749,12 @@ class RunManager:
                 "workflows.cancel",
                 {"run_id": run_id},
                 principal=principal,
+                transport_context=ServiceTransportContext(
+                    run_id=run_id,
+                    principal=principal,
+                    cancellation_request_id=cancellation_request_id,
+                    cancellation_provenance=cancellation_provenance,
+                ),
             )
         except Exception:  # noqa: BLE001
             logger.exception(
@@ -875,6 +928,23 @@ class RunManager:
                         input_data,
                         admission,
                     )
+                else:
+                    for candidate in self._runs.values():
+                        if (
+                            candidate.principal == principal
+                            and candidate.idempotency_key
+                            == admission.idempotency_key
+                        ):
+                            if (
+                                candidate.request_fingerprint
+                                != admission.request_fingerprint
+                            ):
+                                raise ValueError(
+                                    "idempotency_key was already used for a different request"
+                                )
+                            info = candidate
+                            replay_after = 0
+                            break
             if info is None:
                 if input_data.run_id in self._runs:
                     raise ValueError(f"run_id already exists: {input_data.run_id}")
@@ -906,15 +976,12 @@ class RunManager:
                     )
                     created = True
                 else:
-                    stored, created = await self._call_store(
-                        self._store.create_or_get_run,
-                        principal=principal,
-                        run_kind="text_to_sql",
-                        idempotency_key=admission.idempotency_key,
-                        request_fingerprint=admission.request_fingerprint,
-                        proposed_run_id=input_data.run_id,
-                        thread_id=input_data.thread_id,
-                    )
+                    # Text-to-SQL owns no durable row until its complete
+                    # workflow admission is committed by the service action.
+                    # Therefore cancellation or a crash before this task runs
+                    # cannot leave a pending-only durable run behind.
+                    stored = None
+                    created = True
                 if not created:
                     assert admission is not None
                     info = self._runs.get(stored.run_id)
@@ -938,7 +1005,18 @@ class RunManager:
                         admission,
                     )
                 else:
-                    info = await self._call_store(self._info_from_stored, stored)
+                    if stored is None:
+                        info = RunInfo(
+                            run_id=input_data.run_id,
+                            thread_id=input_data.thread_id,
+                            principal=principal,
+                            status=RunStatus.PENDING,
+                            started_at_ms=int(time.time() * 1000),
+                            idempotency_key=admission.idempotency_key,
+                            request_fingerprint=admission.request_fingerprint,
+                        )
+                    else:
+                        info = await self._call_store(self._info_from_stored, stored)
                     if admission is not None:
                         replay_after = 0
                     info.task = asyncio.create_task(
@@ -1023,6 +1101,7 @@ class RunManager:
             or info.task is None
             or info.task.done()
         ):
+            info.cancellation_intent = RunCancellationIntent()
             info.task = asyncio.create_task(
                 self._follow_durable_text_to_sql(
                     info,
@@ -1344,12 +1423,13 @@ class RunManager:
                 info.status = RunStatus.RUNNING
             else:
                 stored = await self._call_store(self._store.get_run, info.run_id)
-                if not _is_nonterminal_text_to_sql(stored):
+                if stored is not None and not _is_nonterminal_text_to_sql(stored):
                     raise RuntimeError(
                         f"run lifecycle is not eligible for Text-to-SQL admission: "
                         f"{info.run_id}"
                     )
-                info.status = _compatibility_status(stored.status)
+                if stored is not None:
+                    info.status = _compatibility_status(stored.status)
         except Exception as exc:  # noqa: BLE001
             if admission is None:
                 info.lifecycle_started.set()
@@ -1389,7 +1469,10 @@ class RunManager:
                 terminal_status = RunStatus.ERRORED
 
         try:
-            with principal_context(info.principal):
+            with (
+                principal_context(info.principal),
+                bind_run_cancellation_intent(info.cancellation_intent),
+            ):
                 agen = run_agent(input_data)
                 # T2 перевёл запись событий на await-раунд-трипы через
                 # ThreadPoolExecutor (_call_store/_publish_event), из-за чего
@@ -1737,7 +1820,12 @@ class RunManager:
                     timestamp=stored.finished_at_ms,
                 )
 
-    async def cancel_cached(self, run_id: str) -> Optional[bool]:
+    async def cancel_cached(
+        self,
+        run_id: str,
+        *,
+        provenance: str = _AGUI_CANCEL_PROVENANCE,
+    ) -> Optional[bool]:
         durable_info: Optional[RunInfo] = None
         dispatch: Optional[asyncio.Task[_UncachedCancelDispatchResult]] = None
         async with self._lock:
@@ -1780,12 +1868,28 @@ class RunManager:
                     return False
                 if await self._call_store(self._has_stored_terminal_event, run_id):
                     return False
+            if (
+                not info.durable_follower
+                and durable_text_to_sql
+                and not info.lifecycle_started.is_set()
+            ):
+                return False
+            info.cancellation_intent.authorize(
+                f"cancel-{uuid.uuid4().hex}",
+                provenance,
+            )
             if info.durable_follower:
                 assert stored_run is not None
+                cancellation_request_id = info.cancellation_intent.request_id
+                cancellation_provenance = info.cancellation_intent.provenance
+                assert cancellation_request_id is not None
+                assert cancellation_provenance is not None
                 dispatch = asyncio.create_task(
                     self._dispatch_uncached_text_to_sql_cancel(
                         run_id,
                         stored_run.principal,
+                        cancellation_request_id,
+                        cancellation_provenance,
                     )
                 )
                 self._uncached_cancel_dispatches[run_id] = dispatch
@@ -1793,8 +1897,6 @@ class RunManager:
                 durable_info = info
                 task = None
             else:
-                if durable_text_to_sql and not info.lifecycle_started.is_set():
-                    return False
                 info.task.cancel()
                 info.cancel_requested = True
                 task = info.task
@@ -1823,12 +1925,20 @@ class RunManager:
         except Exception:
             return False
         stored = await self._call_store(self._store.get_run, run_id)
+        if stored is None and info.idempotency_key is not None:
+            async with self._lock:
+                if self._runs.get(run_id) is info:
+                    info.status = RunStatus.CANCELLED
+                    info.finished_at_ms = int(time.time() * 1000)
+            return True
         return stored is not None and stored.status == "cancelled"
 
     async def cancel_uncached_text_to_sql(
         self,
         run_id: str,
         principal: Principal,
+        *,
+        provenance: str = _AGUI_CANCEL_PROVENANCE,
     ) -> bool:
         cached_run_appeared = False
         dispatch: Optional[asyncio.Task[_UncachedCancelDispatchResult]] = None
@@ -1871,7 +1981,12 @@ class RunManager:
                 cached_run_appeared = True
             elif dispatch is None:
                 dispatch = asyncio.create_task(
-                    self._dispatch_uncached_text_to_sql_cancel(run_id, principal)
+                    self._dispatch_uncached_text_to_sql_cancel(
+                        run_id,
+                        principal,
+                        f"cancel-{uuid.uuid4().hex}",
+                        provenance,
+                    )
                 )
                 self._uncached_cancel_dispatches[run_id] = dispatch
         if cached_run_appeared:
@@ -1903,8 +2018,13 @@ class RunManager:
                 self._uncached_cancel_dispatches.pop(run_id, None)
         return stored is not None and stored.status == "cancelled"
 
-    async def cancel(self, run_id: str) -> bool:
-        cancelled = await self.cancel_cached(run_id)
+    async def cancel(
+        self,
+        run_id: str,
+        *,
+        provenance: str = _AGUI_CANCEL_PROVENANCE,
+    ) -> bool:
+        cancelled = await self.cancel_cached(run_id, provenance=provenance)
         return cancelled is True
 
     async def cancel_if_orphaned(self, run_id: str) -> bool:
@@ -1929,7 +2049,10 @@ class RunManager:
                     return False
                 if await self._call_store(self._has_stored_terminal_event, run_id):
                     return False
-        return await self.cancel(run_id)
+        return await self.cancel(
+            run_id,
+            provenance=_AGUI_ORPHAN_CANCEL_PROVENANCE,
+        )
 
     def subscriber_count(self, run_id: str) -> int:
         """Возвращает число активных live-подписчиков run'а.

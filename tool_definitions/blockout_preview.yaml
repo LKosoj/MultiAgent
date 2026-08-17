@@ -1,0 +1,22 @@
+name: blockout_preview_tool
+description: "Concatenates rendered blockout_ref.mp4 segments into one continuous preview video (with optional burn-in captions) and a contact sheet, for human review before video-model generation"
+category: "storybook"
+source_type: custom_function
+implementation_source: custom_tools.storybook.blockout_preview.blockout_preview_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Execution trace/session identifier"
+    required: true
+  - name: project_id
+    type: str
+    description: "Storybook project identifier"
+    required: true
+  - name: burnin
+    type: bool
+    description: "If true, also builds blockout_all_burnin.mp4 with per-shot drawtext captions; blockout_preview_burnin"
+    required: false
+  - name: enable
+    type: bool
+    description: "If true, builds the preview from the blockout layer; if false, returns the zero contract without touching 93_blockout/"
+    required: false

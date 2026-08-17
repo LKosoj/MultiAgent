@@ -1,0 +1,24 @@
+{
+  "id": "campfire",
+  "name": "Костёр",
+  "category": "prop",
+  "tags": [
+    "campfire"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.540837898850441,
+    0.5155070424079895,
+    0.07775100320577621
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 15804,
+  "fetched_at": "2026-08-16T21:19:55Z",
+  "asset_version": 1
+}

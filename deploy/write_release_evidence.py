@@ -151,6 +151,7 @@ _REPORT_FIELDS = {
 }
 _ROLLBACK_REPORT_FIELDS = _REPORT_FIELDS | {"backup_manifest_sha256"}
 _DETERMINISTIC_DRILLS = {
+    "adaptive_rollback_operator",
     "supervisor_admission_and_reaping",
     "outbox_crash_and_restart",
     "memory_reconciliation_and_rebuild",

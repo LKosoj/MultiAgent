@@ -1,0 +1,26 @@
+{
+  "id": "cafe_furniture",
+  "name": "Мебель уличного кафе",
+  "category": "prop",
+  "tags": [
+    "cafe",
+    "furniture",
+    "desc:Столик и стулья для кафе."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.6682680249214172,
+    1.8070331811904907,
+    0.8260655403137207
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/441daec1a1f149698a88694780151b94",
+  "file_size_bytes": 2911484,
+  "fetched_at": "2026-08-17T05:04:28Z",
+  "asset_version": 1
+}

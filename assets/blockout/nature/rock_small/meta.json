@@ -1,0 +1,24 @@
+{
+  "id": "rock_small",
+  "name": "Малый камень",
+  "category": "nature",
+  "tags": [
+    "rock"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.36079999804496765,
+    0.36079999804496765,
+    0.19122401252388954
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 3100,
+  "fetched_at": "2026-08-16T21:19:54Z",
+  "asset_version": 1
+}

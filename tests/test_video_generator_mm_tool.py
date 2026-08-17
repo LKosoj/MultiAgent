@@ -105,15 +105,10 @@ def test_mm_load_env_file_uses_setdefault(tmp_path, monkeypatch):
 
 
 # --- L-3: duration parsed from timing, snapped to supported set, not hardcoded to 6 --------------
-
-def test_mm_snap_to_supported_duration():
-    assert mm_module._snap_to_supported_duration_mm(6) == 6
-    assert mm_module._snap_to_supported_duration_mm(10) == 10
-    assert mm_module._snap_to_supported_duration_mm(5) == 6
-    assert mm_module._snap_to_supported_duration_mm(9) == 10
-    assert mm_module._snap_to_supported_duration_mm(8) == 6  # ничья → меньшее
-    assert mm_module._snap_to_supported_duration_mm(1) == 6
-
+# Тай-брейк общей _select_best_supported_duration() покрыт
+# tests/test_video_generator_aitunnel_media.py (раздел 6.1 ТЗ, критерий A39),
+# включая случай (8, [6, 10]) -> 6 — эквивалент удалённого
+# _snap_to_supported_duration_mm(); дублировать здесь не нужно.
 
 def test_mm_uses_parsed_duration_instead_of_hardcoded_six(tmp_path, monkeypatch):
     _patch_common(monkeypatch)
@@ -132,6 +127,46 @@ def test_mm_uses_parsed_duration_instead_of_hardcoded_six(tmp_path, monkeypatch)
     assert result["stats"] == {"total": 1, "successful": 1, "failed": 0}
     assert Path(item["video_path"]).read_bytes() == b"mm-video-bytes"
     assert captured["payload"]["duration"] == 10  # L-3: длительность больше не форсируется в 6
+
+
+# --- M-6: hash carries the requested duration, request carries the snapped one -------------------
+
+def test_mm_snaps_duration_tie_to_smaller_but_hashes_requested(tmp_path, monkeypatch):
+    _patch_common(monkeypatch)
+    captured = {}
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-mm" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_item(shots_dir, 1, timing="00:00 - 00:08")  # 8s: ничья между 6 и 10 в {6, 10} -> меньшее
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+    _install_success_mocks(monkeypatch, captured)
+
+    result = mm_module.video_generator_mm_tool(
+        session_id="s", project_id=project_id, enable=True, max_concurrency=1
+    )
+
+    assert result["status"] == "success"
+    assert captured["payload"]["duration"] == 6
+
+    job = _read_provider_jobs(shots_dir)[0]
+    assert job["resolved_duration"] == 6
+    assert job["hash_inputs_version"] == 3
+
+    # ...а в хеш входа идёт именно запрошенная длительность (M-6, раздел 6.1 ТЗ), не подогнанная.
+    expected_hash = mm_module._build_input_hash(
+        model_name=mm_module._MM_MODEL_NAME,
+        prompt_hash=mm_module._hash_text(item["video_prompt"]),
+        source_image_hashes={
+            "start_image": mm_module._hash_source_image(item["start_image"]),
+            "end_image": None,
+        },
+        requested_duration=8,
+        requested_width=0,
+        requested_height=0,
+        seed=None,
+        frame_types=["first_frame"],
+        provider_name="minimax",
+    )
+    assert job["input_hash"] == expected_hash
 
 
 # --- M-9: atomic download + non-empty existence filter -------------------------------------------

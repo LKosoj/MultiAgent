@@ -1,0 +1,26 @@
+{
+  "id": "horse_black",
+  "name": "Чёрная лошадь",
+  "category": "character",
+  "tags": [
+    "horse",
+    "western",
+    "author:iRahulRajput"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.4549923241138458,
+    1.6662389039993286,
+    1.8940165042877197
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/midnight-black-horse-3d-model-free-924e04bb60924da69a8986cfbbbbab91",
+  "file_size_bytes": 3412416,
+  "fetched_at": "2026-08-16T22:08:20Z",
+  "asset_version": 1
+}

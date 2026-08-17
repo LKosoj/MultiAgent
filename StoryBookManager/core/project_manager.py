@@ -73,9 +73,12 @@ class Project:
                 "style_text": "30_style/style_text.json",
                 "style_images": "30_style/style_images.json",
                 "screenplay": "91_screenplay/screenplay.json",
-                "shots": "97_shots/shots.json"
+                "shots": "97_shots/shots.json",
+                "asset_map": "93_blockout/asset_map.json",
+                "scene_spec": "93_blockout/scene_spec.json",
+                "chains": "93_blockout/chains.json"
             }
-            
+
             structure["json_files"] = {}
             for key, relative_path in json_files.items():
                 file_path = self.project_path / relative_path
@@ -196,7 +199,9 @@ class ProjectManager:
     )
     
     def __init__(self):
-        self.projects_dir = app_settings.get_projects_directory()
+        from custom_tools.storybook.project_paths import storybook_projects_root
+
+        self.projects_dir = storybook_projects_root()
         self.backup_dir = app_settings.get_backup_directory()
         
         # Создаем необходимые директории
@@ -453,6 +458,9 @@ class ProjectManager:
             "negative_prompt_list": str(project_path / "30_style/negative_prompt_list.txt"),
             "screenplay": str(project_path / "91_screenplay/screenplay.json"),
             "shots": str(project_path / "97_shots/shots.json"),
+            "asset_map": str(project_path / "93_blockout/asset_map.json"),
+            "scene_spec": str(project_path / "93_blockout/scene_spec.json"),
+            "chains": str(project_path / "93_blockout/chains.json"),
             "pdf": str(project_path / "95_pdf/book.pdf"),
             "markdown": str(project_path / "90_md/book.md")
         }

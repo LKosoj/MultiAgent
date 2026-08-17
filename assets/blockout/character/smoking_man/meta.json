@@ -1,0 +1,27 @@
+{
+  "id": "smoking_man",
+  "name": "Курящий мужчина (Хемингуэй)",
+  "category": "character",
+  "tags": [
+    "man",
+    "cigar",
+    "hemingway",
+    "desc:Мужчина с сигарой — прообраз Хемингуэя."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.5532649018251136,
+    0.4964408686267379,
+    1.7
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/4cc32b82a3be42c28949b1281bb2cc3b",
+  "file_size_bytes": 675680,
+  "fetched_at": "2026-08-17T05:03:53Z",
+  "asset_version": 1
+}

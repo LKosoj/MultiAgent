@@ -1,0 +1,26 @@
+{
+  "id": "horse",
+  "name": "Лошадь",
+  "category": "character",
+  "tags": [
+    "horse",
+    "animal",
+    "western"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.16380367428064346,
+    0.10779086500406265,
+    0.21997890953571186
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "polyhaven",
+  "source_url": "https://polyhaven.com/a/horse_statue_01",
+  "file_size_bytes": 701316,
+  "fetched_at": "2026-08-16T21:19:50Z",
+  "asset_version": 1
+}

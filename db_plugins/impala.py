@@ -567,13 +567,19 @@ class ImpalaPlugin(BaseDBPlugin):
         for part in parts:
             if part == "":
                 continue
-            if not self._identifier_needs_quoting(part):
-                quoted_parts.append(part)
-            else:
-                escaped = part.replace("`", "``")
-                quoted_parts.append(f"`{escaped}`")
+            quoted_parts.append(self.quote_identifier_part(part))
 
         return ".".join(quoted_parts)
+
+    def quote_identifier_part(self, identifier: str) -> str:
+        """Quote one Impala identifier part without splitting dotted names."""
+        if not identifier:
+            return identifier
+        part = str(identifier)
+        if not self._identifier_needs_quoting(part):
+            return part
+        escaped = part.replace("`", "``")
+        return f"`{escaped}`"
 
     def build_select_all(self, table_name: str, limit: int) -> str:
         """Impala SELECT * с LIMIT."""

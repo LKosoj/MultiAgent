@@ -67,6 +67,7 @@ def test_start_uses_authenticated_run_api_and_opaque_connection_ref() -> None:
             query="show monthly sales",
             connection_ref="connection-7",
             idempotency_key="request-9",
+            enable_telemetry=True,
         )
     )
 
@@ -78,6 +79,7 @@ def test_start_uses_authenticated_run_api_and_opaque_connection_ref() -> None:
     assert forwarded["service_action"] == "presets.text_to_sql.generate"
     assert forwarded["service_payload"]["connection_ref"] == "connection-7"
     assert forwarded["service_payload"]["idempotency_key"] == "request-9"
+    assert forwarded["service_payload"]["enable_telemetry"] is True
     assert "dsn" not in repr(body).lower()
 
 
@@ -95,9 +97,9 @@ def test_status_result_cancel_connections_and_schema_use_typed_http_contract() -
             },
             {"cancelled": False},
             {
-                "action": "db.connections.list",
-                "ok": True,
-                "data": {"connections": [{"connection_ref": "connection-7"}]},
+                "connections": [
+                    {"connection_ref": "conn-123e4567-e89b-42d3-a456-426614174000"}
+                ]
             },
             {
                 "action": "text_to_sql.schema.load",
@@ -120,29 +122,47 @@ def test_status_result_cancel_connections_and_schema_use_typed_http_contract() -
     assert client.get_run("run-1").status == "running"
     assert client.get_result("run-1").sql == "SELECT 1 AS value"
     assert client.cancel("run-1").status == "not_cancelled"
-    assert client.list_connections()[0].connection_ref == "connection-7"
+    assert (
+        client.list_connections()[0].connection_ref
+        == "conn-123e4567-e89b-42d3-a456-426614174000"
+    )
     assert client.load_schema("connection-7").tables[0]["name"] == "orders"
     assert [call[:2] for call in calls[:3]] == [
         ("GET", "/v1/runs/run-1"),
         ("GET", "/v1/runs/run-1/result"),
         ("POST", "/v1/runs/run-1/cancel"),
     ]
+    assert calls[3][:2] == ("GET", "/v1/text-to-sql/connections")
+    assert calls[4][:2] == ("POST", "/v1/runs")
 
 
-def test_register_connection_uses_authenticated_service_action() -> None:
+def test_streamlit_client_preserves_workflow_artifact_final_output_for_benchmark_receipt() -> None:
+    terminal = _successful_terminal()
+    expected = {"receipt": "research-stagnated"}
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=lambda *_args, **_kwargs: {
+            "result": {
+                "terminal_outcome": terminal,
+                "artifacts": {"final_output": expected},
+            }
+        },
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    assert client.get_result(terminal["run_id"]).final_output == expected
+
+
+def test_register_connection_uses_authenticated_connection_endpoint() -> None:
     calls = []
 
     def transport(method, path, *, json_body, headers):
         calls.append((method, path, json_body, headers))
         return {
-            "action": "db.connections.register",
-            "ok": True,
-            "data": {
-                "connection": {
-                    "connection_ref": "conn-123e4567-e89b-42d3-a456-426614174000",
-                    "display_name": "release-postgres",
-                }
-            },
+            "connection": {
+                "connection_ref": "conn-123e4567-e89b-42d3-a456-426614174000",
+                "display_name": "release-postgres",
+            }
         }
 
     client = TextToSqlApiClient(
@@ -160,11 +180,9 @@ def test_register_connection_uses_authenticated_service_action() -> None:
 
     assert connection.connection_ref.startswith("conn-")
     method, path, body, headers = calls[0]
-    assert (method, path) == ("POST", "/v1/runs")
+    assert (method, path) == ("POST", "/v1/text-to-sql/connections")
     assert headers == {"Authorization": "Bearer token"}
-    forwarded = body["forwardedProps"]
-    assert forwarded["service_action"] == "db.connections.register"
-    assert forwarded["service_payload"] == {
+    assert body == {
         "display_name": "release-postgres",
         "dsn": "postgresql://database.internal/release",
         "owner_subject": "text2sql-release-eval",
@@ -172,6 +190,45 @@ def test_register_connection_uses_authenticated_service_action() -> None:
         "enabled_for_user": True,
     }
     assert "dsn" not in connection.raw
+
+
+@pytest.mark.parametrize("connection_ref", (None, 7))
+def test_connection_endpoint_client_rejects_missing_or_non_string_ref(
+    connection_ref: object,
+) -> None:
+    response = {"connection": {"display_name": "release-postgres"}}
+    if connection_ref is not None:
+        response["connection"]["connection_ref"] = connection_ref
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=lambda *_args, **_kwargs: response,
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    with pytest.raises(TextToSqlApiError):
+        client.register_connection(
+            display_name="release-postgres",
+            dsn="postgresql://database.internal/release",
+            owner_subject="text2sql-release-eval",
+            tenant_id="text2sql-release",
+        )
+
+
+@pytest.mark.parametrize("connection_ref", (None, 7))
+def test_connection_list_client_rejects_missing_or_non_string_ref(
+    connection_ref: object,
+) -> None:
+    connection = {"display_name": "release-postgres"}
+    if connection_ref is not None:
+        connection["connection_ref"] = connection_ref
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=lambda *_args, **_kwargs: {"connections": [connection]},
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    with pytest.raises(TextToSqlApiError):
+        client.list_connections()
 
 
 def test_history_methods_use_owner_scoped_service_actions() -> None:

@@ -94,6 +94,9 @@ class DuckDBPlugin(BaseDBPlugin):
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
+    def execute_select_bound(self, conn, sql, parameters, row_limit=500):
+        return self._execute_select_bound_driver(conn, sql, parameters, row_limit)
+
     def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Dict[str, str]]]:
         # Строим WHERE условия динамически
         where_conditions = []

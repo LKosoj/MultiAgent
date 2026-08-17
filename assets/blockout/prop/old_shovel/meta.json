@@ -1,0 +1,27 @@
+{
+  "id": "old_shovel",
+  "name": "Старая лопата",
+  "category": "prop",
+  "tags": [
+    "shovel",
+    "janitor",
+    "platonov",
+    "desc:Лопата дворника / Платонова."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.3334119915962219,
+    0.46756795048713684,
+    1.999999761581421
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/5ea945cb4d9a4bd387fb9d6ed74527f1",
+  "file_size_bytes": 3363676,
+  "fetched_at": "2026-08-16T22:54:20Z",
+  "asset_version": 1
+}

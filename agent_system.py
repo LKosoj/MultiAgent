@@ -67,14 +67,11 @@ class DynamicAgentSystem:
 Все агенты управляются менеджером!
 Проанализируй зависимости между агентами и менеджером-агентом, отрази последовательность выполнения агентов на диаграмме.
 На диаграмме должны быть отражены **все** агенты и **все** их возможные зависимости.
-Всего возможно три варианта последовательности вызова агентов:
-1. Агенты относятся к Text-to-SQL, то их последовательность вызова строго определена. Менеджер->NLU-Agent->schema_rag_agent->sql_generator_agent->sql_verifier_agent->db_audit_agent.
-2. Агенты для создания курса лекций и практических работ, то их последовательность вызова строго определена. Менеджер->researcher->analyst->architect(опционально, зависит от задачи)->course_plan_agent->content_education_expert_agent->practical_lab_designer_agent->validator(опционально, зависит от задачи). Если валидация не прошла, то вызов передается researcher.
-3. Для остальных агентов последовательность ВСЕГДА начинается так: Менеджер->researcher. 
-   ВАЖНО: ВСЕ агенты третьей ветки ВСЕГДА вызываются ТОЛЬКО через researcher, а НЕ напрямую от менеджера!
-   Researcher вызывает все остальные агенты третьей ветки в зависимости от задачи.
-   В эту ветку входят ВСЕ остальные агенты, которые НЕ относятся к первым двум веткам.
-Validator, в случае необходимости, вызывается в конце второй и третьей ветки.
+Всего возможно два варианта последовательности вызова агентов:
+1. Агенты для создания курса лекций и практических работ, то их последовательность вызова строго определена. Менеджер->researcher->analyst->architect(опционально, зависит от задачи)->course_plan_agent->content_education_expert_agent->practical_lab_designer_agent->validator(опционально, зависит от задачи). Если валидация не прошла, то вызов передается researcher.
+2. Для остальных агентов последовательность ВСЕГДА начинается так: Менеджер->researcher.
+   ВАЖНО: все агенты второй ветки вызываются только через researcher, а не напрямую от менеджера.
+Validator, в случае необходимости, вызывается в конце обеих веток.
 Если валидация не прошла, то вызов передается researcher.
 
 **ВАЖНО:**
@@ -83,14 +80,12 @@ Validator, в случае необходимости, вызывается в �
   ОТРАЗИ ВСЕ ЗАВИСИМОСТИ МЕЖДУ АГЕНТАМИ НА ДИАГРАММЕ! УЧИТЫВАЙ ОПЦИОНАЛЬНОСТЬ ВЫЗОВА АГЕНТОВ!
   
 **КРИТИЧЕСКИ ВАЖНО:**
-  В третьей ветке НИКОГДА не должно быть прямых связей от менеджера к другим агентам, кроме researcher!
-  ВСЕ агенты третьей ветки ВСЕГДА вызываются ТОЛЬКО через researcher!
+  Во второй ветке не должно быть прямых связей от менеджера к другим агентам, кроме researcher.
   
 <agent_list>
 Список агентов:
 """
-        # Определяем агентов для каждой ветки - используем фиксированные списки только для первых двух веток
-        sql_branch_agents = ['nlu_agent', 'schema_rag_agent', 'sql_generator_agent', 'sql_verifier_agent', 'db_audit_agent']
+        # Для курсов используем отдельную фиксированную ветку.
         course_branch_agents = ['course_plan_agent', 'content_education_expert_agent', 'practical_lab_designer_agent']
         
         # Динамически получаем список всех агентов из AGENT_PROFILES
@@ -100,16 +95,14 @@ Validator, в случае необходимости, вызывается в �
         third_branch_agents = []
         for agent_type in all_agents:
             agent_type_lower = agent_type.lower()
-            if (agent_type_lower not in sql_branch_agents and 
-                agent_type_lower not in course_branch_agents):
+            if agent_type_lower not in course_branch_agents:
                 third_branch_agents.append(agent_type)
         
         # Добавляем информацию о ветках в описание
         diagram_description += "\n\n**Информация о ветках:**"
-        diagram_description += "\n- Ветка 1 (Text-to-SQL): " + ", ".join(sql_branch_agents)
-        diagram_description += "\n- Ветка 2 (Курсы): " + ", ".join(course_branch_agents)
-        diagram_description += "\n- Ветка 3 (Остальные): " + ", ".join([agent for agent in third_branch_agents if agent.lower() not in ['manager', 'researcher']])
-        diagram_description += "\n\n**Пример правильной структуры третьей ветки:**"
+        diagram_description += "\n- Ветка 1 (Курсы): " + ", ".join(course_branch_agents)
+        diagram_description += "\n- Ветка 2 (Остальные): " + ", ".join([agent for agent in third_branch_agents if agent.lower() not in ['manager', 'researcher']])
+        diagram_description += "\n\n**Пример правильной структуры второй ветки:**"
         diagram_description += """
 ```
 Менеджер --> researcher
@@ -118,7 +111,7 @@ researcher --> agent2
 researcher --> agent3
 ```
 
-**Пример НЕПРАВИЛЬНОЙ структуры третьей ветки (так делать НЕЛЬЗЯ!):**
+**Пример НЕПРАВИЛЬНОЙ структуры второй ветки (так делать НЕЛЬЗЯ!):**
 ```
 Менеджер --> researcher
 Менеджер --> agent1  # НЕПРАВИЛЬНО! Должно быть researcher --> agent1

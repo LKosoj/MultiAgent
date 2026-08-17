@@ -184,10 +184,47 @@ def test_v6_store_migrates_history_import_journal_additively(tmp_path) -> None:
                 WHERE type = 'table' AND name = 'text_to_sql_history_imports'
                 """
             ).fetchone()
-        assert version == AGUI_EVENT_STORE_SCHEMA_VERSION == 8
+        assert version == AGUI_EVENT_STORE_SCHEMA_VERSION == 10
         assert table == ("text_to_sql_history_imports",)
     finally:
         migrated.close()
+
+
+def test_v8_store_migrates_cancellation_state_without_losing_runs(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.db"
+    initial = EventStore(str(path))
+    try:
+        initial.create_run(
+            "run-preserved",
+            "thread-preserved",
+            _principal("alice"),
+            run_kind="text_to_sql",
+        )
+    finally:
+        initial.close()
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE workflow_cancellation_requests")
+        connection.execute("PRAGMA user_version=8")
+
+    migrated = EventStore(str(path))
+    try:
+        assert migrated.get_run("run-preserved") is not None
+        assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == 10
+        assert migrated._conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE name = 'workflow_cancellation_requests'"
+        ).fetchone() == ("workflow_cancellation_requests",)
+    finally:
+        migrated.close()
+
+    reopened = EventStore(str(path))
+    try:
+        assert reopened.get_run("run-preserved") is not None
+        assert reopened._conn.execute("PRAGMA user_version").fetchone()[0] == 10
+    finally:
+        reopened.close()
 
 
 def test_history_upsert_is_typed_idempotent_and_owner_scoped(tmp_path) -> None:

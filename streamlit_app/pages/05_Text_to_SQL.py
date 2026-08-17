@@ -106,7 +106,6 @@ def generate_sql_query(
     include_explanation: bool,
     validate_schema: bool,
     dry_run_only: bool,
-    use_schema_suggestions: bool,
 ) -> None:
     normalized_rows, normalized_safety = _validate_text_to_sql_options(
         max_rows,
@@ -122,7 +121,6 @@ def generate_sql_query(
             include_explanation=include_explanation,
             validate_schema=validate_schema,
             dry_run_only=dry_run_only,
-            use_schema_suggestions=use_schema_suggestions,
         )
     )
     st.session_state.agent_run_id = handle.run_id
@@ -200,7 +198,6 @@ def show_sql_generation(
         include_explanation = st.checkbox("Добавить объяснение", value=True)
         validate_schema = st.checkbox("Проверять схему", value=True)
         dry_run_only = st.checkbox("Только подготовить SQL", value=False)
-        use_schema_suggestions = st.checkbox("Использовать подсказки схемы", value=True)
         submitted = st.form_submit_button("Запустить")
 
     if submitted:
@@ -214,7 +211,6 @@ def show_sql_generation(
                 include_explanation=include_explanation,
                 validate_schema=validate_schema,
                 dry_run_only=dry_run_only,
-                use_schema_suggestions=use_schema_suggestions,
             )
             st.success(f"Запуск создан: {st.session_state.agent_run_id}")
         except (ValueError, TextToSqlApiError) as exc:

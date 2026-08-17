@@ -80,6 +80,8 @@
     "atmosphere_field": "Атмосфера (поле)",
     "gesture_set_field": "Набор жестов (поле)",
     "characters": "Персонажи",
+    "locations": "Локации",
+    "unmapped": "Без сопоставления",
     "description_field": "Описание (поле)",
     "*": "Все",
     "reference_image_path_field": "Путь к референсу (поле)",
@@ -1019,6 +1021,51 @@
           "readonly": false,
           "width": 20
         }
+      }
+    }
+  },
+  "asset_map": {
+    "field_groups": {
+      "asset_map_groups": {
+        "title": "Карта объектов болванки",
+        "hide_label": true,
+        "fields": [
+          "*"
+        ],
+        "layout": "vertical"
+      }
+    },
+    "field_config": {
+      "*": {
+        "hide_label": true
+      },
+      "characters": {
+        "widget": "universal_array_editor",
+        "interface": "dropdown_selector",
+        "display_field": "name",
+        "add_button_text": "➕ Добавить персонажа",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "hide_label": true,
+        "asset_id_field": {
+          "widget": "asset_reference"
+        }
+      },
+      "locations": {
+        "widget": "universal_array_editor",
+        "interface": "dropdown_selector",
+        "display_field": "key_object",
+        "add_button_text": "➕ Добавить объект локации",
+        "hide_selector_label": true,
+        "hide_edit_label": true,
+        "hide_label": true,
+        "asset_id_field": {
+          "widget": "asset_reference"
+        }
+      },
+      "unmapped": {
+        "widget": "list_editor",
+        "hide_label": true
       }
     }
   }

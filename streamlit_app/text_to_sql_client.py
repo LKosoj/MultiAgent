@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping, Optional
 from urllib import error, request
 import uuid
 
+from backend.fastapi_app.agui.connection_registry import ConnectionRef
 from workflow.text_to_sql_contract import (
     TEXT_TO_SQL_MAX_ERROR_LENGTH,
     TEXT_TO_SQL_TERMINAL_REQUIRED_FIELDS,
@@ -29,19 +30,22 @@ class TextToSqlApiError(RuntimeError):
 class TextToSqlRunRequest:
     query: str
     connection_ref: str
+    context_documents: tuple[str, ...] = ()
     idempotency_key: Optional[str] = None
     max_rows: int = 100
     safety_level: str = "strict"
     include_explanation: bool = True
     validate_schema: bool = True
     dry_run_only: bool = False
-    use_schema_suggestions: bool = True
+    enable_telemetry: bool = False
 
     def __post_init__(self) -> None:
         if not self.query.strip():
             raise ValueError("query is required")
         if not self.connection_ref.strip():
             raise ValueError("connection_ref is required")
+        if any(not isinstance(item, str) or not item.strip() for item in self.context_documents):
+            raise ValueError("context_documents entries must be non-empty text strings")
 
 
 @dataclass(frozen=True)
@@ -84,11 +88,32 @@ class TextToSqlResult:
     reason_code_recognized: bool = True
 
 
+# Boundary: only connection references returned by trusted connection endpoints
+# may feed future requests; public event and snapshot values are display-only.
 @dataclass(frozen=True)
 class ConnectionSummary:
     connection_ref: str
     display_name: str = ""
     raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _connection_summary(value: object) -> ConnectionSummary:
+    if not isinstance(value, Mapping):
+        raise TextToSqlApiError("connection metadata must be an object")
+    connection_ref = value.get("connection_ref")
+    if not isinstance(connection_ref, str) or not connection_ref:
+        raise TextToSqlApiError("connection metadata has an invalid connection_ref")
+    try:
+        ConnectionRef(connection_ref)
+    except ValueError as exc:
+        raise TextToSqlApiError(
+            "connection metadata has an invalid connection_ref"
+        ) from exc
+    return ConnectionSummary(
+        connection_ref=connection_ref,
+        display_name=str(value.get("display_name") or value.get("name") or ""),
+        raw=dict(value),
+    )
 
 
 @dataclass(frozen=True)
@@ -301,8 +326,10 @@ class TextToSqlApiClient:
             "include_explanation": run_request.include_explanation,
             "validate_schema": run_request.validate_schema,
             "dry_run_only": run_request.dry_run_only,
-            "use_schema_suggestions": run_request.use_schema_suggestions,
+            "enable_telemetry": run_request.enable_telemetry,
         }
+        if run_request.context_documents:
+            payload["context_documents"] = list(run_request.context_documents)
         if run_request.idempotency_key:
             payload["idempotency_key"] = run_request.idempotency_key
         response = self._request(
@@ -354,13 +381,16 @@ class TextToSqlApiClient:
         result_envelope = response.get("result", response)
         if not isinstance(result_envelope, Mapping):
             raise TextToSqlApiError("run result must be an object")
+        artifacts = result_envelope.get("artifacts", {})
+        if not isinstance(artifacts, Mapping):
+            raise TextToSqlApiError("run result artifacts must be an object")
         result = result_envelope.get("terminal_outcome", result_envelope)
         if not isinstance(result, Mapping):
             raise TextToSqlApiError("terminal outcome must be an object")
         return _validate_terminal_outcome(
             result,
             expected_run_id=run_id,
-            final_output=result_envelope.get("final_output"),
+            final_output=artifacts.get("final_output"),
         )
 
     def cancel(self, run_id: str) -> RunStatus:
@@ -413,17 +443,11 @@ class TextToSqlApiClient:
         return data
 
     def list_connections(self) -> list[ConnectionSummary]:
-        data = self._run_service_action("db.connections.list", {})
+        data = self._request("GET", "/v1/text-to-sql/connections")
         connections = data.get("connections") or []
-        return [
-            ConnectionSummary(
-                connection_ref=str(item["connection_ref"]),
-                display_name=str(item.get("display_name") or item.get("name") or ""),
-                raw=dict(item),
-            )
-            for item in connections
-            if isinstance(item, Mapping) and item.get("connection_ref")
-        ]
+        if not isinstance(connections, list):
+            raise TextToSqlApiError("connection list must be an array")
+        return [_connection_summary(item) for item in connections]
 
     def register_connection(
         self,
@@ -434,8 +458,9 @@ class TextToSqlApiClient:
         tenant_id: str,
         enabled_for_user: bool = True,
     ) -> ConnectionSummary:
-        data = self._run_service_action(
-            "db.connections.register",
+        data = self._request(
+            "POST",
+            "/v1/text-to-sql/connections",
             {
                 "display_name": display_name,
                 "dsn": dsn,
@@ -445,15 +470,7 @@ class TextToSqlApiClient:
             },
         )
         connection = data.get("connection")
-        if not isinstance(connection, Mapping) or not connection.get("connection_ref"):
-            raise TextToSqlApiError("connection registration result is invalid")
-        return ConnectionSummary(
-            connection_ref=str(connection["connection_ref"]),
-            display_name=str(
-                connection.get("display_name") or connection.get("name") or ""
-            ),
-            raw=dict(connection),
-        )
+        return _connection_summary(connection)
 
     def load_schema(self, connection_ref: str) -> SchemaResult:
         if not connection_ref.strip():

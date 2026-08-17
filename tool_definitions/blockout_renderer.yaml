@@ -1,0 +1,34 @@
+name: blockout_renderer_tool
+description: "Renders the 3D blockout scene (Blender Workbench) into blockout_ref.mp4 and ref_start.png/ref_end.png per shot, from scene_spec.json"
+category: "storybook"
+source_type: custom_function
+implementation_source: custom_tools.storybook.blockout_renderer.blockout_renderer_tool
+parameters:
+  - name: session_id
+    type: str
+    description: "Execution trace/session identifier"
+    required: true
+  - name: project_id
+    type: str
+    description: "Storybook project identifier"
+    required: true
+  - name: fps
+    type: int
+    description: "Blockout frame rate; must match scene_spec.json's fps (blockout_fps)"
+    required: false
+  - name: resolution
+    type: str
+    description: "Requested blockout resolution, e.g. '1280x720'"
+    required: false
+  - name: jobs
+    type: int
+    description: "Parallel Blender render jobs across independent chains (0 = cpu_count-1); blockout_jobs"
+    required: false
+  - name: scope
+    type: str
+    description: "What to (re-)render: 'all', 'scene_NN', 'scene_NN_shot_MM', or a chain_id; blockout_scope"
+    required: false
+  - name: enable
+    type: bool
+    description: "If true, renders the blockout scene; if false, returns the zero contract without touching 93_blockout/"
+    required: false

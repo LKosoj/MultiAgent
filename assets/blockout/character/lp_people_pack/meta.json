@@ -1,0 +1,27 @@
+{
+  "id": "lp_people_pack",
+  "name": "Люди lowpoly (набор)",
+  "category": "character",
+  "tags": [
+    "people",
+    "adult",
+    "crowd",
+    "desc:Набор маленьких человеческих фигур: дворник, Хемингуэй, Моруа, прохожие."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.7388313114643097,
+    0.3066021427512169,
+    0.30695405602455633
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/6c13a4d1d04943e487313f377b4f3548",
+  "file_size_bytes": 209192,
+  "fetched_at": "2026-08-16T22:54:06Z",
+  "asset_version": 1
+}

@@ -12,7 +12,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator, Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,6 +25,10 @@ from backend.fastapi_app.agui.auth import (
     authenticate_request,
     principal_to_record,
     validate_auth_configuration,
+)
+from backend.fastapi_app.agui.connection_registry import (
+    ConnectionRef,
+    ConnectionTargetPolicyError,
 )
 from backend.fastapi_app.agui.encoder import EventEncoder
 from backend.fastapi_app.agui.events import EventType, RunErrorEvent
@@ -227,6 +231,66 @@ app.add_middleware(
 )
 
 
+_CONNECTION_METADATA_FIELDS = (
+    "connection_ref",
+    "display_name",
+    "owner_subject",
+    "tenant_id",
+    "target_kind",
+    "dialect",
+    "target_description",
+    "created_at",
+    "enabled_for_user",
+)
+_CONNECTION_REGISTRATION_VALIDATION_ERRORS = frozenset(
+    {
+        "owner_subject is required; use null for tenant-wide scope",
+        "tenant_id is required",
+        "display_name is required",
+        "dsn is required",
+        "display_name must be a non-empty trimmed string",
+        "owner_subject must be a non-empty trimmed string",
+        "tenant_id must be a non-empty trimmed string",
+        "enabled_for_user must be boolean",
+    }
+)
+
+
+def _is_connection_registration_validation_error(exc: ValueError) -> bool:
+    return isinstance(exc, ConnectionTargetPolicyError) or str(exc) in (
+        _CONNECTION_REGISTRATION_VALIDATION_ERRORS
+    )
+
+
+def _connection_metadata_record(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        raise HTTPException(status_code=500, detail="connection metadata is invalid")
+    connection_ref = value.get("connection_ref")
+    if not isinstance(connection_ref, str) or not connection_ref:
+        raise HTTPException(status_code=500, detail="connection metadata is invalid")
+    try:
+        ConnectionRef(connection_ref)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="connection metadata is invalid",
+        ) from exc
+    return {field: value[field] for field in _CONNECTION_METADATA_FIELDS if field in value}
+
+
+def _connection_metadata_response(
+    result: Mapping[str, object],
+    *,
+    field: str,
+) -> dict[str, object]:
+    value = result.get(field)
+    if field == "connection":
+        return {field: _connection_metadata_record(value)}
+    if not isinstance(value, list):
+        raise HTTPException(status_code=500, detail="connection metadata is invalid")
+    return {field: [_connection_metadata_record(item) for item in value]}
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -250,6 +314,47 @@ async def readyz(request: Request) -> JSONResponse:
 @app.get("/v1/auth/me")
 async def auth_me(request: Request) -> dict[str, object]:
     return principal_to_record(authenticate_request(request))
+
+
+@app.get("/v1/text-to-sql/connections")
+async def list_text_to_sql_connections(request: Request) -> dict[str, object]:
+    principal = authenticate_request(request)
+    from backend.fastapi_app.agui.service import handle_service_action
+
+    try:
+        result = await asyncio.to_thread(
+            handle_service_action,
+            "db.connections.list",
+            {},
+            principal,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return _connection_metadata_response(result, field="connections")
+
+
+@app.post("/v1/text-to-sql/connections")
+async def register_text_to_sql_connection(
+    payload: dict[str, Any],
+    request: Request,
+) -> dict[str, object]:
+    principal = authenticate_request(request)
+    from backend.fastapi_app.agui.service import handle_service_action
+
+    try:
+        result = await asyncio.to_thread(
+            handle_service_action,
+            "db.connections.register",
+            payload,
+            principal,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        if _is_connection_registration_validation_error(exc):
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        raise
+    return _connection_metadata_response(result, field="connection")
 
 
 @app.post("/agent")
@@ -538,7 +643,16 @@ async def run_status(run_id: str, request: Request) -> dict[str, str | int | Non
     await _ensure_run_access(run_id, principal)
     stored_run = await _call_store(store.get_run, run_id)
     if stored_run is None:
-        raise HTTPException(status_code=404, detail="run not found")
+        cached_run = run_manager.get_info(run_id)
+        if cached_run is None:
+            raise HTTPException(status_code=404, detail="run not found")
+        return {
+            "run_id": cached_run.run_id,
+            "thread_id": cached_run.thread_id,
+            "status": cached_run.status.value,
+            "started_at_ms": cached_run.started_at_ms,
+            "finished_at_ms": cached_run.finished_at_ms,
+        }
     status = {
         "pending": "pending",
         "queued": "queued",
@@ -629,4 +743,12 @@ async def run_result_v1(run_id: str, request: Request) -> dict[str, object | Non
     if latest_result is None:
         if stored_run is None:
             raise HTTPException(status_code=404, detail="run not found")
-    return {"result": _redact_gateway_payload(latest_result)}
+    public_result = _redact_gateway_payload(latest_result)
+    if (
+        stored_run is not None
+        and stored_run.run_kind == "text_to_sql"
+        and isinstance(public_result, dict)
+        and isinstance(public_result.get("terminal_outcome"), dict)
+    ):
+        public_result["terminal_outcome"]["run_id"] = run_id
+    return {"result": public_result}

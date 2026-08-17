@@ -1,0 +1,186 @@
+{
+  "id": "cowboy_sheriff",
+  "name": "Шериф",
+  "category": "character",
+  "tags": [
+    "sheriff",
+    "character"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.7671682834625244,
+    0.46065741777420044,
+    0.8097751848399639
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": true,
+  "animations": [
+    {
+      "name": "attack-kick-left",
+      "duration_s": 0.533,
+      "loop": true
+    },
+    {
+      "name": "attack-kick-right",
+      "duration_s": 0.533,
+      "loop": true
+    },
+    {
+      "name": "attack-melee-left",
+      "duration_s": 0.417,
+      "loop": true
+    },
+    {
+      "name": "attack-melee-right",
+      "duration_s": 0.417,
+      "loop": true
+    },
+    {
+      "name": "crouch",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "die",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "drive",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "emote-no",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "emote-yes",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "fall",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "holding-both",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-both-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "holding-left",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-left-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "holding-right",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "holding-right-shoot",
+      "duration_s": 0.2,
+      "loop": true
+    },
+    {
+      "name": "idle",
+      "duration_s": 1.333,
+      "loop": true
+    },
+    {
+      "name": "interact-left",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "interact-right",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "jump",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "pick-up",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "sit",
+      "duration_s": 0.167,
+      "loop": true
+    },
+    {
+      "name": "sprint",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "static",
+      "duration_s": 0.1,
+      "loop": true
+    },
+    {
+      "name": "walk",
+      "duration_s": 0.667,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-look-left",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-look-right",
+      "duration_s": 0.333,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-back",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-forward",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-left",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-move-right",
+      "duration_s": 0.5,
+      "loop": true
+    },
+    {
+      "name": "wheelchair-sit",
+      "duration_s": 0.167,
+      "loop": true
+    }
+  ],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/mini-characters",
+  "file_size_bytes": 216464,
+  "fetched_at": "2026-08-16T21:19:48Z",
+  "asset_version": 1
+}

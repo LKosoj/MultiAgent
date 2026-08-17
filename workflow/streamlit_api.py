@@ -12,7 +12,7 @@ import uuid
 import signal
 import time
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Callable, Tuple
+from typing import TYPE_CHECKING, Dict, List, Any, Optional, Callable, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 from contextlib import contextmanager
@@ -27,10 +27,13 @@ from tool_runtime_context import SupervisorExecutionEvidence
 
 from ._result_common import _validate_private_claim
 from .deadline import DeadlineBudget
+from .text_to_sql_contract import (
+    TEXT_TO_SQL_WORKFLOW_NAME,
+    is_text_to_sql_workflow_name,
+)
 from .models import (
     WorkflowDefinition, WorkflowContext, WorkflowStatus,
     StepStatus, WorkflowExecutionError, TEXT_TO_SQL_WORKFLOW_CATEGORY,
-    is_text_to_sql_workflow_name,
     TextToSqlTerminalResult as TextToSqlTerminalResult,
 )
 from .result_repository import (
@@ -38,6 +41,9 @@ from .result_repository import (
 )
 from backend.fastapi_app.agui.errors import WorkflowRunAlreadyReservedError
 from custom_tools.text_to_sql.redaction import redact_pii_in_payload
+
+if TYPE_CHECKING:
+    from backend.fastapi_app.agui._t2s_requests import TextToSqlWorkflowAdmission
 
 logger = logging.getLogger(__name__)
 
@@ -295,10 +301,11 @@ def _workflow_supervisor_process_entry(
     """Точка входа для выполнения workflow в отдельном процессе"""
     from .process_supervisor import validate_work_spec
 
-    spec = validate_work_spec(work_spec)
     if not isinstance(claim_envelope, Mapping) or set(claim_envelope) != {
         "supervisor_id",
         "attempt_generation",
+        "run_kind",
+        "workflow_name",
     }:
         raise ValueError("claim_envelope has an invalid shape")
     supervisor_id, attempt_generation = _validate_private_workflow_claim(
@@ -307,6 +314,7 @@ def _workflow_supervisor_process_entry(
     )
     if supervisor_id is None or attempt_generation is None:
         raise ValueError("spawned workflow requires a claimed attempt")
+    spec = validate_work_spec(work_spec)
     workflow_path = str(spec["workflow_path"])
     parameters = dict(spec["parameters"])
     session_id = str(spec["session_id"])
@@ -317,6 +325,24 @@ def _workflow_supervisor_process_entry(
     deadline_budget = DeadlineBudget.from_deadline_at_ms(
         int(spec["deadline_at_ms"])
     )
+    typed_admission = None
+    reserved_workflow_name = claim_envelope.get("workflow_name")
+    if not isinstance(reserved_workflow_name, str):
+        reserved_workflow_name = None
+    if claim_envelope.get("run_kind") == "text_to_sql" and (
+        is_text_to_sql_workflow_name(reserved_workflow_name)
+    ):
+        from .text_to_sql_typed_runtime import capture_text_to_sql_typed_admission
+
+        typed_admission = capture_text_to_sql_typed_admission(
+            run_id=run_id,
+            run_incarnation=run_incarnation,
+            deadline=deadline_budget,
+            query=parameters.get("query"),
+            context_documents=parameters.get("context_documents", ()),
+            dsn=parameters.get("dsn"),
+            schema_scope=parameters.get("schema_scope"),
+        )
     # Глобальные переменные в контексте процесса для доступа из signal handler
     _process_telemetry_manager = None
     _process_root_span = None
@@ -388,6 +414,8 @@ def _workflow_supervisor_process_entry(
             enable_telemetry=enable_telemetry, # Pass down the telemetry flag
             run_incarnation=run_incarnation,
             deadline_budget=deadline_budget,
+            typed_admission=typed_admission,
+            reserved_workflow_name=reserved_workflow_name,
             supervisor_id=supervisor_id,
             attempt_generation=attempt_generation,
         )
@@ -662,6 +690,7 @@ class WorkflowManager:
         enable_telemetry: bool = False,
         run_id: Optional[str] = None,
         owner: Optional[WorkflowOwner] = None,
+        text_to_sql_admission: Optional["TextToSqlWorkflowAdmission"] = None,
     ) -> str:
         """Durably enqueue one workflow for the process supervisor."""
         from backend.fastapi_app.agui.auth import Principal
@@ -695,6 +724,20 @@ class WorkflowManager:
                     + "; ".join(load_errors)
                 )
             raise ValueError(f"Пайплайн '{workflow_name}' не найден")
+        if is_text_to_sql_workflow_name(workflow_definition.name):
+            use_enhanced = True
+        if text_to_sql_admission is not None:
+            from backend.fastapi_app.agui._t2s_requests import (
+                TextToSqlWorkflowAdmission,
+            )
+
+            if not isinstance(text_to_sql_admission, TextToSqlWorkflowAdmission):
+                raise TypeError("text_to_sql_admission must be server-internal")
+            if not is_text_to_sql_workflow_name(workflow_definition.name):
+                raise ValueError(
+                    "text_to_sql_admission is only valid for "
+                    f"{TEXT_TO_SQL_WORKFLOW_NAME}"
+                )
         if workflow_definition.requires_enhanced_engine and not use_enhanced:
             raise ValueError(
                 f"Pipeline '{workflow_name}' requires EnhancedWorkflowEngine "
@@ -731,87 +774,119 @@ class WorkflowManager:
         # позволил бы обходить per-client квоты произвольными идентификаторами).
         client_id = owner.quota_identity
 
+        if run_id is None:
+            run_id = f"run-{uuid.uuid4().hex}"
+
+        from workflow.process_supervisor import SupervisorConfig
+        from backend.fastapi_app.agui.store import WorkflowAdmissionConflictError
+
+        queue_limit = SupervisorConfig.from_environment().queue_limit
         store = EventStore(str(_agui_event_store_path()))
         try:
-            if caller_supplied_owner:
-                assert run_id is not None
-                stored = store.get_run(run_id)
-                if (
-                    stored is None
-                    or stored.owner_subject != owner.subject
-                    or stored.tenant_id != owner.tenant_id
-                    or stored.status
-                    not in {"pending", "queued", "running", "result_pending"}
-                ):
-                    raise ValueError("run not found")
-                invocation = store.get_workflow_run_invocation(run_id)
-                if invocation is None:
-                    run_incarnation = uuid.uuid4().hex
-                    if not store.reserve_workflow_run(
-                        run_id,
-                        run_incarnation,
-                        session_id,
-                        workflow_definition.name,
-                    ):
-                        raise WorkflowRunAlreadyReservedError(
-                            f"run_id is already reserved: {run_id}"
-                        )
-                else:
-                    if (
-                        invocation.workflow_name != workflow_definition.name
-                        or invocation.session_id != session_id
-                    ):
-                        raise WorkflowRunAlreadyReservedError(
-                            f"run_id is already reserved: {run_id}"
-                        )
-                    run_incarnation = invocation.run_incarnation
+            existing = None
+            existing_invocation = None
+            existing_spec = None
+            if caller_supplied_owner and text_to_sql_admission is None:
+                existing = store.get_run(run_id)
+                if existing is not None:
+                    existing_invocation = store.get_workflow_run_invocation(run_id)
                     existing_spec = store.load_work_spec(run_id)
-                    if stored.status in {
-                        "queued",
-                        "running",
-                        "result_pending",
-                    } and existing_spec:
-                        return run_id
-                    if stored.status != "pending" or existing_spec is not None:
+                    if (existing_invocation is None) != (existing_spec is None):
                         raise WorkflowRunAlreadyReservedError(
                             f"run_id is already reserved: {run_id}"
                         )
-            else:
-                if run_id is None:
-                    run_id = f"run-{uuid.uuid4().hex}"
-                elif store.get_run(run_id) is not None:
-                    raise ValueError(f"run_id already exists: {run_id}")
-                run_incarnation = uuid.uuid4().hex
-                if not store.reserve_workflow_run(
-                    run_id,
-                    run_incarnation,
-                    session_id,
-                    workflow_definition.name,
+            if existing_invocation is not None and existing_spec is not None:
+                stored_work_spec = existing_spec.to_mapping()
+                if (
+                    existing is None
+                    or existing.owner_subject != owner.subject
+                    or existing.tenant_id != owner.tenant_id
+                    or existing.run_kind != "agui"
+                    or existing.status not in {"queued", "running", "result_pending"}
+                    or existing_invocation.workflow_name != workflow_definition.name
+                    or existing_invocation.session_id != session_id
+                    or stored_work_spec["run_incarnation"]
+                    != existing_invocation.run_incarnation
+                    or stored_work_spec["session_id"] != session_id
                 ):
                     raise WorkflowRunAlreadyReservedError(
                         f"run_id is already reserved: {run_id}"
                     )
-                store.create_run(
-                    run_id,
-                    session_id,
-                    Principal(owner.subject, owner.tenant_id, owner.roles),
-                    run_kind="legacy",
-                )
+                stored = existing
+                newly_admitted = False
+                run_incarnation = existing_invocation.run_incarnation
+                work_spec = stored_work_spec
+                deadline_at_ms = work_spec["deadline_at_ms"]
+                parameters = dict(work_spec["parameters"])
+            else:
+                run_incarnation = uuid.uuid4().hex
+                deadline_at_ms = int(time.time() * 1_000) + duration_seconds * 1_000
+                work_spec = {
+                    "spec_version": 1,
+                    "workflow_path": str(workflow_file),
+                    "parameters": parameters,
+                    "session_id": session_id,
+                    "client_id": client_id,
+                    "use_enhanced": use_enhanced,
+                    "enable_telemetry": enable_telemetry,
+                    "run_incarnation": run_incarnation,
+                    "deadline_at_ms": deadline_at_ms,
+                }
+                try:
+                    stored, newly_admitted = store.admit_workflow_run(
+                        run_id=run_id,
+                        thread_id=session_id,
+                        principal=Principal(owner.subject, owner.tenant_id, owner.roles),
+                        run_kind=(
+                            "text_to_sql"
+                            if text_to_sql_admission is not None
+                            else "agui" if caller_supplied_owner else "legacy"
+                        ),
+                        run_incarnation=run_incarnation,
+                        session_id=session_id,
+                        workflow_name=workflow_definition.name,
+                        work_spec=work_spec,
+                        deadline_at_ms=deadline_at_ms,
+                        queue_limit=queue_limit,
+                        create_if_missing=(
+                            not caller_supplied_owner
+                            or text_to_sql_admission is not None
+                        ),
+                        idempotency_key=(
+                            text_to_sql_admission.idempotency_key
+                            if text_to_sql_admission is not None
+                            else None
+                        ),
+                        request_fingerprint=(
+                            text_to_sql_admission.request_fingerprint
+                            if text_to_sql_admission is not None
+                            else None
+                        ),
+                    )
+                except WorkflowAdmissionConflictError as exc:
+                    raise WorkflowRunAlreadyReservedError(
+                        f"run_id is already reserved: {run_id}"
+                    ) from exc
+            if not newly_admitted:
+                if not caller_supplied_owner and explicit_run_id:
+                    raise WorkflowRunAlreadyReservedError(
+                        f"run_id is already reserved: {run_id}"
+                    )
+                invocation = store.get_workflow_run_invocation(stored.run_id)
+                stored_spec = store.load_work_spec(stored.run_id)
+                if invocation is None or stored_spec is None:
+                    raise WorkflowAdmissionConflictError(
+                        "workflow admission replay is missing durable state"
+                    )
+                run_id = stored.run_id
+                run_incarnation = invocation.run_incarnation
+                session_id = invocation.session_id
+                work_spec = stored_spec.to_mapping()
+                deadline_at_ms = work_spec["deadline_at_ms"]
+                parameters = dict(work_spec["parameters"])
         finally:
             store.close()
 
-        deadline_at_ms = int(time.time() * 1_000) + duration_seconds * 1_000
-        work_spec = {
-            "spec_version": 1,
-            "workflow_path": str(workflow_file),
-            "parameters": parameters,
-            "session_id": session_id,
-            "client_id": client_id,
-            "use_enhanced": use_enhanced,
-            "enable_telemetry": enable_telemetry,
-            "run_incarnation": run_incarnation,
-            "deadline_at_ms": deadline_at_ms,
-        }
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             existing = self.active_runs.get(run_id)
             if existing is not None and existing.get("run_incarnation") != (
@@ -822,7 +897,7 @@ class WorkflowManager:
                 "run_id": run_id,
                 "run_incarnation": run_incarnation,
                 "workflow_name": workflow_definition.name,
-                "status": "pending",
+                "status": stored.status,
                 "start_time": datetime.now(),
                 "parameters": _public_workflow_parameters(parameters),
                 "session_id": session_id,
@@ -839,29 +914,30 @@ class WorkflowManager:
                 callbacks.append(("log", log_callback))
             if callbacks:
                 self.run_callbacks[run_id] = callbacks
-        try:
-            submission = self._process_supervisor().submit(
-                run_id,
-                work_spec,
-                deadline_at_ms=deadline_at_ms,
-            )
-            if str(getattr(submission, "state", "")) != "queued":
-                raise WorkflowExecutionError(
-                    "supervisor did not return queued admission"
+        if newly_admitted:
+            try:
+                submission = self._process_supervisor().submit(
+                    run_id,
+                    work_spec,
+                    deadline_at_ms=deadline_at_ms,
                 )
-        except Exception:
-            with _GLOBAL_WORKFLOW_RUNS_LOCK:
-                live = self.active_runs.get(run_id)
-                if live is not None and live.get("run_incarnation") == (
-                    run_incarnation
-                ):
-                    self.active_runs.pop(run_id, None)
-                    self.run_callbacks.pop(run_id, None)
-            raise
+                if str(getattr(submission, "state", "")) != "queued":
+                    raise WorkflowExecutionError(
+                        "supervisor did not return queued admission"
+                    )
+            except Exception:
+                with _GLOBAL_WORKFLOW_RUNS_LOCK:
+                    live = self.active_runs.get(run_id)
+                    if live is not None and live.get("run_incarnation") == (
+                        run_incarnation
+                    ):
+                        self.active_runs.pop(run_id, None)
+                        self.run_callbacks.pop(run_id, None)
+                raise
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             live = self.active_runs.get(run_id)
             if live is not None and live.get("run_incarnation") == run_incarnation:
-                live["status"] = "queued"
+                live["status"] = stored.status
         logger.info("Workflow '%s' queued with run_id=%s", workflow_name, run_id)
         return run_id
 
@@ -871,6 +947,8 @@ class WorkflowManager:
                            enable_telemetry: bool = False,
                            run_incarnation: Optional[str] = None,
                            deadline_budget: Optional[DeadlineBudget] = None,
+                           typed_admission: Optional[object] = None,
+                           reserved_workflow_name: Optional[str] = None,
                            supervisor_id: Optional[str] = None,
                            attempt_generation: Optional[int] = None):
         """Выполнение workflow в отдельном потоке"""
@@ -931,6 +1009,8 @@ class WorkflowManager:
                                     client_id,
                                     run_incarnation=run_incarnation,
                                     deadline_budget=deadline_budget,
+                                    typed_admission=typed_admission,
+                                    reserved_workflow_name=reserved_workflow_name,
                                     **claim_kwargs,
                                 )
                         else:
@@ -942,6 +1022,8 @@ class WorkflowManager:
                                 client_id,
                                 run_incarnation=run_incarnation,
                                 deadline_budget=deadline_budget,
+                                typed_admission=typed_admission,
+                                reserved_workflow_name=reserved_workflow_name,
                                 **claim_kwargs,
                             )
 
@@ -1007,6 +1089,8 @@ class WorkflowManager:
                                     client_id: Optional[str] = None,
                                     run_incarnation: Optional[str] = None,
                                     deadline_budget: Optional[DeadlineBudget] = None,
+                                    typed_admission: Optional[object] = None,
+                                    reserved_workflow_name: Optional[str] = None,
                                     supervisor_id: Optional[str] = None,
                                     attempt_generation: Optional[int] = None) -> Any:
         """Выполнение workflow в контексте run_id"""
@@ -1021,6 +1105,15 @@ class WorkflowManager:
             SupervisorExecutionEvidence(supervisor_id, attempt_generation)
             if supervisor_id is not None and attempt_generation is not None
             else None
+        )
+        if reserved_workflow_name is not None and (
+            not isinstance(reserved_workflow_name, str)
+            or not reserved_workflow_name
+            or reserved_workflow_name != reserved_workflow_name.strip()
+        ):
+            raise ValueError("reserved_workflow_name must be canonical text")
+        reserved_text_to_sql = is_text_to_sql_workflow_name(
+            reserved_workflow_name
         )
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             preexisting_run = self.active_runs.get(run_id)
@@ -1040,9 +1133,37 @@ class WorkflowManager:
                 if isinstance(preexisting_run, dict)
                 else None
             )
+            if preexisting_run is None and reserved_text_to_sql:
+                preexisting_run = {
+                    "run_id": run_id,
+                    "run_incarnation": effective_incarnation,
+                    "workflow_name": reserved_workflow_name,
+                    "status": "running",
+                    "start_time": datetime.now(),
+                }
+                self.active_runs[run_id] = preexisting_run
+            elif (
+                isinstance(preexisting_run, dict)
+                and reserved_text_to_sql
+                and preexisting_run.get("workflow_name") not in {
+                    None,
+                    "",
+                    reserved_workflow_name,
+                }
+            ):
+                raise WorkflowExecutionError(
+                    f"Reserved workflow changed for run_id {run_id}"
+                )
         try:
             # Загружаем workflow definition до входа в лок (медленный from_yaml вне лока)
             workflow_def = WorkflowDefinition.from_yaml(workflow_file)
+            if (
+                reserved_text_to_sql
+                and workflow_def.name != reserved_workflow_name
+            ):
+                raise WorkflowExecutionError(
+                    f"Loaded workflow does not match reservation for run_id {run_id}"
+                )
 
             # Инициализируем статус выполнения и пишем метаданные в одном блоке под локом
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
@@ -1083,6 +1204,8 @@ class WorkflowManager:
                 )
                 if deadline_budget is not None:
                     context._deadline_budget = deadline_budget
+                if typed_admission is not None:
+                    context._text_to_sql_typed_admission = typed_admission
                 if supervisor_evidence is not None:
                     context._supervisor_evidence = supervisor_evidence
                 with _workflow_dsn_env(
@@ -1127,6 +1250,7 @@ class WorkflowManager:
                 terminal_outcome = _terminal_outcome_mapping(
                     getattr(result, "terminal_outcome", None)
                 )
+                authoritative_terminal_outcome = terminal_outcome
                 if is_text_to_sql:
                     if terminal_outcome is None:
                         run_status = "failed"
@@ -1187,13 +1311,22 @@ class WorkflowManager:
                     })
                     if terminal_outcome is not None:
                         candidate_run["execution"] = terminal_outcome.get("execution")
+                    elif is_text_to_sql:
+                        terminal_outcome = _apply_text_to_sql_terminal_failure(
+                            candidate_run,
+                            run_id=run_id,
+                            reason_code="MANDATORY_STEP_NOT_COMPLETED",
+                            error=error_message or (
+                                "Text-to-SQL result is missing terminal_outcome"
+                            ),
+                        )
                     _status_snap = candidate_run["status"]
                     _error_snap = candidate_run.get("error")
                     _artifacts_snap = _workflow_artifacts_from_run_data(candidate_run)
 
                 result_resolution = _persist_workflow_result(
                     run_id,
-                    getattr(result, "final_output", None),
+                    candidate_run.get("final_output"),
                     _status_snap,
                     _error_snap,
                     artifacts=_artifacts_snap,
@@ -1216,7 +1349,7 @@ class WorkflowManager:
                         run_id=run_id,
                         reason_code="RESULT_PERSISTENCE_FAILED",
                         error=append_error,
-                        source_terminal=terminal_outcome,
+                        source_terminal=authoritative_terminal_outcome,
                     )
                     persistence_output = persistence_run.get("final_output")
                     persistence_artifacts = _workflow_artifacts_from_run_data(
@@ -1225,8 +1358,8 @@ class WorkflowManager:
                     fallback_resolution = _persist_workflow_result(
                         run_id,
                         persistence_output,
-                        "failed",
-                        error=append_error,
+                        persistence_run["status"],
+                        error=persistence_run.get("error"),
                         artifacts=persistence_artifacts,
                         snapshot={
                             "workflow_name": workflow_def.name,
@@ -1341,9 +1474,19 @@ class WorkflowManager:
                         "error": safe_error,
                         "config_versions": worker_config_versions,
                     })
+                    candidate_terminal = candidate_run.get("terminal_outcome")
+                    if is_text_to_sql_workflow_name(
+                        candidate_run.get("workflow_name")
+                    ):
+                        candidate_terminal = _apply_text_to_sql_terminal_failure(
+                            candidate_run,
+                            run_id=run_id,
+                            reason_code="MANDATORY_STEP_NOT_COMPLETED",
+                            error=safe_error,
+                            source_terminal=candidate_terminal,
+                        )
                     existing_output = candidate_run.get("final_output")
                     artifacts = _workflow_artifacts_from_run_data(candidate_run)
-                    candidate_terminal = candidate_run.get("terminal_outcome")
                 else:
                     existing_output = None
                     artifacts = None
@@ -1401,14 +1544,47 @@ class WorkflowManager:
                 ) from e
 
             append_error = "Не удалось записать terminal WORKFLOW_RESULT для workflow"
+            persistence_run = dict(candidate_run)
+            persistence_terminal = _apply_text_to_sql_terminal_failure(
+                persistence_run,
+                run_id=run_id,
+                reason_code="RESULT_PERSISTENCE_FAILED",
+                error=append_error,
+                source_terminal=candidate_terminal,
+            )
+            fallback_resolution = _persist_workflow_result(
+                run_id,
+                persistence_run.get("final_output"),
+                persistence_run["status"],
+                error=persistence_run.get("error"),
+                artifacts=_workflow_artifacts_from_run_data(persistence_run),
+                terminal_outcome=persistence_terminal,
+                run_incarnation=effective_incarnation,
+                supervisor_id=supervisor_id,
+                attempt_generation=attempt_generation,
+            )
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
                 live_run = self.active_runs.get(run_id)
                 if isinstance(live_run, dict) and (
                     effective_incarnation is None
                     or live_run.get("run_incarnation") == effective_incarnation
                 ):
-                    live_run.update(candidate_run)
-                    live_run["error"] = append_error
+                    if fallback_resolution.resolved_payload is not None:
+                        _merge_workflow_result_payload(
+                            live_run,
+                            fallback_resolution.resolved_payload,
+                        )
+                    else:
+                        live_run.update(persistence_run)
+                    live_run["workflow_result_append_failure_handled"] = True
+                    if fallback_resolution.persistence_succeeded:
+                        live_run["workflow_result_event_appended"] = True
+            if (
+                fallback_resolution.persistence_succeeded
+                and not fallback_resolution.candidate_won
+                and fallback_resolution.resolved_payload is not None
+            ):
+                return fallback_resolution.resolved_payload
             self._notify_progress(run_id, "failed", {"error": append_error})
             raise WorkflowExecutionError(append_error) from e
 
@@ -1533,7 +1709,7 @@ class WorkflowManager:
             stored_status = stored_payload.get("status", "unknown")
             if is_text_to_sql_workflow_name(workflow_name):
                 if terminal_outcome is None:
-                    stored_status = "unknown_legacy"
+                    stored_status = "invalid_terminal"
                 else:
                     stored_status, _ = _terminal_legacy_fields(terminal_outcome)
             snapshot_parameters = snapshot.get("parameters")
@@ -1564,7 +1740,7 @@ class WorkflowManager:
             if terminal_outcome is not None:
                 run_data["status"], _ = _terminal_legacy_fields(terminal_outcome)
             elif run_data.get("status") in {"completed", "failed", "cancelled"}:
-                run_data["status"] = "unknown_legacy"
+                run_data["status"] = "invalid_terminal"
         
         # Вычисляем длительность
         duration = None
@@ -1800,9 +1976,23 @@ class WorkflowManager:
         except Exception as exc:
             return False, f"Ошибка удаления '{target_file}': {_redact_error_text(exc)}"
 
-    def cancel_workflow(self, run_id: str) -> bool:
+    def cancel_workflow(
+        self,
+        run_id: str,
+        *,
+        cancellation_request_id: str | None = None,
+        cancellation_provenance: str | None = None,
+    ) -> bool:
         """Delegate durable cancellation and process ownership to the supervisor."""
-        result = self._process_supervisor().cancel(run_id)
+        supervisor = self._process_supervisor()
+        if cancellation_request_id is None:
+            result = supervisor.cancel(run_id)
+        else:
+            result = supervisor.cancel(
+                run_id,
+                cancellation_request_id=cancellation_request_id,
+                cancellation_provenance=cancellation_provenance,
+            )
         accepted = bool(getattr(result, "accepted", False))
         state = str(getattr(result, "state", ""))
         with _GLOBAL_WORKFLOW_RUNS_LOCK:

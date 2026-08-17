@@ -10,9 +10,48 @@ import threading
 import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
+
+import requests
 
 logger = logging.getLogger(__name__)
+
+_AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/videos"
+_AITUNNEL_MODELS_TIMEOUT_SECONDS = 60
+_AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+
+
+def _get_aitunnel_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    global _AITUNNEL_MODELS_CACHE
+
+    # Fast-path: avoid lock acquisition on cache-hit (double-checked locking).
+    if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
+        return _AITUNNEL_MODELS_CACHE
+
+    with _AITUNNEL_MODELS_CACHE_LOCK:
+        if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
+            return _AITUNNEL_MODELS_CACHE
+
+        response = requests.get(_AITUNNEL_MODELS_URL, timeout=_AITUNNEL_MODELS_TIMEOUT_SECONDS)
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AITUNNEL models endpoint failed: {response.status_code} - {response.text}"
+            )
+
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Неверный ответ публичного models endpoint: {payload}")
+
+        _AITUNNEL_MODELS_CACHE = payload
+        return payload
+
+
+def _get_active_aitunnel_model_record(
+    model_catalog: Dict[str, Dict[str, Any]], configured_model: str
+) -> Optional[Dict[str, Any]]:
+    config = model_catalog.get(configured_model)
+    return config if isinstance(config, dict) else None
 
 
 def safe_parse_json(data: Any) -> Any:
@@ -455,6 +494,21 @@ def _simple_translate_prompt(prompt: str) -> Optional[str]:
     return None
 
 
+# Fields this function ever writes onto a shot item (see the two phases below).
+# Used to merge the in-memory item back onto the freshly re-read on-disk item:
+# only these are overlaid, so a field written concurrently by another writer
+# (blockout paths, duration_s/duration_source/duration_requested_s, a manual
+# edit from the "Editor" tab, etc.) between this function's caller reading
+# items_list and this function's write is not clobbered.
+_UPDATE_SHOTS_WRITABLE_FIELDS = (
+    "image_description",
+    "image_description_timestamp",
+    "original_video_prompt",
+    "video_prompt",
+    "video_prompt_updated_timestamp",
+)
+
+
 def update_shots_with_descriptions(
     shots_file_path: str,
     items_list: List[Dict[str, Any]],
@@ -472,7 +526,10 @@ def update_shots_with_descriptions(
         skip_prompt_enhancement: Если True, пропускает улучшение video_prompt (только перевод)
         
     Returns:
-        Количество обновленных элементов
+        Количество обновленных элементов; 0 — обновлять было нечего;
+        -1 — изменения посчитаны (уже применены к items_list в памяти), но
+        запись shots.json на диск не удалась (см. журнал) — на диске
+        остаётся прежняя версия файла.
     """
     if not os.path.exists(shots_file_path):
         logger.warning(f"⚠️ Файл {shots_file_path} не существует")
@@ -707,17 +764,61 @@ def update_shots_with_descriptions(
                     except Exception as read_err:
                         logger.warning(f"⚠️ Не удалось перечитать существующий shots.json: {read_err}")
 
-                    # Обновляем только items, сохраняя остальные ключи
+                    # Обновляем items поэлементным слиянием (не заменой целиком),
+                    # сохраняя остальные ключи верхнего уровня: между чтением
+                    # items_list вызывающим кодом и этой записью другой писатель
+                    # (blockout_renderer, ручная правка длительности/редактор)
+                    # мог дописать в диск-версию элемента поля, которых нет в
+                    # items_list, — полная замена items их бы стёрла.
                     if isinstance(existing_data, dict):
-                        existing_data["items"] = items_list
+                        disk_items = existing_data.get("items") or []
+                        if disk_items:
+                            fresh_by_key: Dict[tuple, Dict[str, Any]] = {}
+                            for it in items_list:
+                                fresh_by_key[
+                                    (it.get("scene_number"), it.get("shot_number"), it.get("shot_type"))
+                                ] = it
+                            merged_items = []
+                            seen_keys = set()
+                            for disk_item in disk_items:
+                                key = (
+                                    disk_item.get("scene_number"),
+                                    disk_item.get("shot_number"),
+                                    disk_item.get("shot_type"),
+                                )
+                                seen_keys.add(key)
+                                fresh_item = fresh_by_key.get(key)
+                                if fresh_item is None:
+                                    merged_items.append(disk_item)
+                                    continue
+                                merged = dict(disk_item)
+                                for field in _UPDATE_SHOTS_WRITABLE_FIELDS:
+                                    if field in fresh_item:
+                                        merged[field] = fresh_item[field]
+                                merged_items.append(merged)
+                            # Items present only in items_list (not yet on disk under
+                            # this key) are appended as-is: nothing to merge onto.
+                            for key, fresh_item in fresh_by_key.items():
+                                if key not in seen_keys:
+                                    merged_items.append(fresh_item)
+                            existing_data["items"] = merged_items
+                        else:
+                            existing_data["items"] = items_list
                         shots_data = existing_data
                     else:
                         shots_data = {"items": items_list}
 
                     tmp = f"{shots_file_path}.{os.getpid()}.tmp"
-                    with open(tmp, 'w', encoding='utf-8') as wf:
-                        json.dump(shots_data, wf, ensure_ascii=False, indent=2)
-                    os.replace(tmp, shots_file_path)
+                    try:
+                        with open(tmp, 'w', encoding='utf-8') as wf:
+                            json.dump(shots_data, wf, ensure_ascii=False, indent=2)
+                        os.replace(tmp, shots_file_path)
+                    except Exception:
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                        raise
                 finally:
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
 
@@ -725,7 +826,11 @@ def update_shots_with_descriptions(
             return updated_count
         except Exception as write_err:
             logger.error(f"❌ Не удалось записать обновленные данные в {shots_file_path}: {write_err}")
-            return 0
+            # -1, а не 0: отличает "запись не удалась" от "обновлять было
+            # нечего" (см. docstring) — вызывающие проверяют
+            # `descriptions_updated < 0`, чтобы не перечитывать с диска
+            # устаревшую версию поверх уже обновлённых в памяти items_list.
+            return -1
     else:
         logger.info("ℹ️ Нет изменений для сохранения")
         return 0
@@ -793,7 +898,10 @@ def sync_items_to_memory(
         return 0
 
 
-def parse_duration_seconds_from_timing(timing: str, default: int = 6, minimum: int = 1, maximum: int = 10) -> int:
+def parse_duration_seconds_from_timing(timing: str, default: int = 5, minimum: int = 1) -> int:
+    # Границ у длительности нет, кроме нижней (раздел 6.2 ТЗ): подгонка под набор
+    # допустимых значений модели выполняется отдельно, общей функцией выбора
+    # длительности (раздел 6.1 ТЗ), а не отсечением здесь.
     try:
         if " - " in timing:
             start_str, end_str = timing.split(" - ")
@@ -802,19 +910,31 @@ def parse_duration_seconds_from_timing(timing: str, default: int = 6, minimum: i
             duration = end_seconds - start_seconds
         elif timing.endswith("s"):
             duration = int(timing[:-1])
+        elif ":" in timing:
+            # Одиночная метка "MM:SS"/"HH:MM:SS" (не диапазон) — разбираем как длительность
+            # напрямую, а не проваливаемся в default (дефект раздела 2.5 ТЗ).
+            parsed = _time_str_to_seconds(timing.strip(), None)
+            if parsed is None:
+                logger.warning(
+                    "⚠️ Не удалось разобрать timing %r как MM:SS/HH:MM:SS, используем default=%s",
+                    timing, default,
+                )
+            duration = parsed if parsed is not None else default
         else:
-            duration = default
+            duration = int(timing)
 
         if duration < minimum:
             return minimum
-        if duration > maximum:
-            return maximum
         return duration
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            "⚠️ Не удалось разобрать timing %r (%s), используем default=%s",
+            timing, e, default,
+        )
         return default
 
 
-def _time_str_to_seconds(time_str: str, default: int = 0) -> int:
+def _time_str_to_seconds(time_str: str, default: Optional[int] = None) -> Optional[int]:
     try:
         parts = time_str.split(":")
         if len(parts) == 2:
@@ -829,3 +949,354 @@ def _time_str_to_seconds(time_str: str, default: int = 0) -> int:
         return default
     except Exception:
         return default
+
+
+# ---------------------------------------------------------------------------
+# Централизованный реестр возможностей видеомоделей (раздел 6.1 ТЗ).
+#
+# Источники значений — константы, которые раньше жили в самих инструментах:
+#   video_generator_mm_tool.py (MiniMax): _MM_MODEL_NAME (строка 57),
+#       _MM_SUPPORTED_DURATIONS (строка 55), _MM_RESOLUTION (строка 58);
+#   video_generator.py (Kling): _KLING_MODEL_NAME (строка 55), _KLING_MODE
+#       (строка 56), _KLING_ASPECT_RATIO (строка 57); supported_durations
+#       [5, 10] выведен из правила «≤5 с → 5, иначе → 10» в
+#       _parse_duration_from_timing() (строки 878-882);
+#   video_generator_veo_tool.py (VEO): _VEO_MODEL_NAME (строка 80),
+#       _VEO_ASPECT_RATIO (строка 81), _VEO_RESOLUTION (строка 82);
+#       supported_durations [4, 6, 8] в коде не заданы — источник:
+#       документация Google для veo-3.1-generate-preview при resolution=720p
+#       без extend/reference images.
+# Записи для video_generator_aitunnel_tool здесь нет: его возможности
+# целиком приходят из сетевого каталога (_get_aitunnel_video_models()).
+# ---------------------------------------------------------------------------
+_VIDEO_MODEL_CAPABILITIES_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "video_generator_mm_tool": {
+        "model": "MiniMax-Hailuo-02",
+        "supported_durations": [6, 10],
+        "supported_sizes": [],
+        "supported_resolutions": ["768P"],
+        "supported_aspect_ratios": [],
+        "supported_modes": [],
+        "resolution": "768P",
+        "aspect_ratio": None,
+        "mode": None,
+    },
+    "video_generator_tool": {
+        "model": "kling-v2-1",
+        "supported_durations": [5, 10],
+        "supported_sizes": [],
+        "supported_resolutions": [],
+        "supported_aspect_ratios": ["16:9"],
+        "supported_modes": ["pro"],
+        "resolution": None,
+        "aspect_ratio": "16:9",
+        "mode": "pro",
+    },
+    "video_generator_veo_tool": {
+        "model": "veo-3.1-generate-preview",
+        "supported_durations": [4, 6, 8],
+        "supported_sizes": [],
+        "supported_resolutions": ["720p"],
+        "supported_aspect_ratios": ["16:9"],
+        "supported_modes": [],
+        "resolution": "720p",
+        "aspect_ratio": "16:9",
+        "mode": None,
+    },
+}
+
+# Публикуемые поля возможностей (без resolution/aspect_ratio/mode — см. раздел 6.1 ТЗ:
+# они нужны инструменту для сборки запроса, а не рендереру болванки).
+_CAPABILITY_FIELDS = (
+    "supported_durations",
+    "supported_sizes",
+    "supported_resolutions",
+    "supported_aspect_ratios",
+    "supported_modes",
+)
+
+
+def video_model_caps_warning(
+    code: str,
+    message: str,
+    level: str = "warning",
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Формирует запись для списка `warnings` файла video_model_caps.json.
+
+    Формат зафиксирован (раздел 6.1 ТЗ) и используется другими модулями,
+    которые дописывают в этот же список: {"code", "level", "message", "details"}.
+    """
+    return {
+        "code": code,
+        "level": level,
+        "message": message,
+        "details": details if details is not None else {},
+    }
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _read_previous_video_caps(caps_file_path: str) -> Optional[Dict[str, Any]]:
+    """Читает video_model_caps.json прежнего прогона для отката (source=cache)."""
+    try:
+        if not caps_file_path or not os.path.exists(caps_file_path):
+            return None
+        with open(caps_file_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def _write_video_model_caps(caps_file_path: str, payload: Dict[str, Any]) -> None:
+    """Атомарная запись video_model_caps.json: уникальный tmp-файл + os.replace."""
+    try:
+        directory = os.path.dirname(caps_file_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{caps_file_path}.{os.getpid()}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_path, caps_file_path)
+    except Exception as e:
+        logger.error(f"❌ Не удалось записать {caps_file_path}: {e}")
+
+
+def _resolve_aitunnel_capabilities(caps_file_path: str) -> Dict[str, Any]:
+    """Ветка video_generator_aitunnel_tool: каталог по сети, иначе откат на кэш."""
+    warnings: List[Dict[str, Any]] = []
+    configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+    record: Optional[Dict[str, Any]] = None
+    # Причина неудачи — три разных сценария, тексты P14 не должны их путать.
+    reason = "переменная окружения AITUNNEL_VIDEO_MODEL не задана"
+
+    if configured_model:
+        try:
+            catalog = _get_aitunnel_video_models()
+        except Exception as e:
+            logger.warning(f"⚠️ Не удалось получить каталог видеомоделей AITUNNEL: {e}")
+            reason = "каталог видеомоделей AITUNNEL недоступен"
+        else:
+            record = _get_active_aitunnel_model_record(catalog, configured_model)
+            if record is None:
+                reason = f"модель {configured_model!r} отсутствует в каталоге видеомоделей AITUNNEL"
+
+    if record is not None:
+        return {
+            "model": configured_model,
+            "supported_durations": list(record.get("supported_durations") or []),
+            "supported_sizes": list(record.get("supported_sizes") or []),
+            "supported_resolutions": list(record.get("supported_resolutions") or []),
+            "supported_aspect_ratios": list(record.get("supported_aspect_ratios") or []),
+            "supported_modes": list(record.get("supported_modes") or []),
+            "source": "catalog",
+            "resolved_at": _utc_now_iso(),
+            "warnings": warnings,
+        }
+
+    cached = _read_previous_video_caps(caps_file_path)
+    # Откат на кэш допустим только при непустом supported_durations в прежнем файле
+    # (раздел 6.1 ТЗ): иначе файл, уже записанный ранее с пустым набором и
+    # source=null, самоподдерживал бы себя как "cache" на каждом следующем прогоне.
+    if cached is not None and cached.get("supported_durations"):
+        resolved_at = cached.get("resolved_at")
+        if not resolved_at:
+            # Запасной вариант: в прежнем файле нет resolved_at — копировать
+            # нечего, используем момент этой (неудачной) попытки.
+            resolved_at = _utc_now_iso()
+        warnings.append(video_model_caps_warning(
+            "P14",
+            f"Не удалось получить возможности видеомодели AITUNNEL из каталога ({reason}), "
+            "использован набор возможностей из video_model_caps.json предыдущего прогона",
+            details={"tool_name": "video_generator_aitunnel_tool", "configured_model": configured_model or None},
+        ))
+        return {
+            "model": cached.get("model"),
+            "supported_durations": list(cached.get("supported_durations") or []),
+            "supported_sizes": list(cached.get("supported_sizes") or []),
+            "supported_resolutions": list(cached.get("supported_resolutions") or []),
+            "supported_aspect_ratios": list(cached.get("supported_aspect_ratios") or []),
+            "supported_modes": list(cached.get("supported_modes") or []),
+            "source": "cache",
+            "resolved_at": resolved_at,
+            "warnings": warnings,
+        }
+
+    warnings.append(video_model_caps_warning(
+        "P14",
+        f"Не удалось определить возможности видеомодели AITUNNEL ({reason}), а video_model_caps.json "
+        "предыдущего прогона отсутствует или содержит пустой набор длительностей",
+        details={"tool_name": "video_generator_aitunnel_tool", "configured_model": configured_model or None},
+    ))
+    return {
+        "model": None,
+        "supported_durations": [],
+        "supported_sizes": [],
+        "supported_resolutions": [],
+        "supported_aspect_ratios": [],
+        "supported_modes": [],
+        "source": None,
+        "resolved_at": _utc_now_iso(),
+        "warnings": warnings,
+    }
+
+
+def resolve_effective_durations(
+    supported_durations: List[int],
+    allowed_durations: Optional[List[int]],
+) -> "tuple[List[int], List[Dict[str, Any]]]":
+    """Пересекает полный набор длительностей модели с ограничением проекта.
+
+    Раздел 6.2 ТЗ, блок 4: значения проекта (``blockout_allowed_durations``),
+    которых нет в наборе модели, отбрасываются (warning-запись со списком
+    отброшенного). Если пересечение оказывается пустым — ограничение проекта
+    игнорируется целиком и используется полный набор модели (error-запись).
+    Пустой/не заданный ``allowed_durations`` означает «взять всё, что
+    поддерживает модель» — пересечение не применяется.
+
+    Возвращает (effective_durations, warnings) — само пересечение НЕ
+    публикуется в video_model_caps.json (там всегда полный набор модели),
+    warnings из этой функции подмешиваются в общий список.
+    """
+    full_set = list(supported_durations or [])
+    if not allowed_durations:
+        return full_set, []
+
+    allowed_set = {int(v) for v in allowed_durations}
+    intersection = [v for v in full_set if int(v) in allowed_set]
+
+    if intersection:
+        dropped = sorted(allowed_set - {int(v) for v in intersection})
+        if dropped:
+            return intersection, [video_model_caps_warning(
+                "DURATION_ALLOWED_NARROWED",
+                f"Значения blockout_allowed_durations {dropped} не поддерживаются моделью и отброшены",
+                details={"dropped": dropped, "supported_durations": full_set},
+            )]
+        return intersection, []
+
+    return full_set, [video_model_caps_warning(
+        "DURATION_ALLOWED_EMPTY_INTERSECTION",
+        "Пересечение blockout_allowed_durations с набором модели пусто, ограничение проекта "
+        "проигнорировано целиком, использован полный набор модели",
+        level="error",
+        details={"allowed_durations": sorted(allowed_set), "supported_durations": full_set},
+    )]
+
+
+def append_video_model_caps_warnings(caps_file_path: str, new_warnings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """"Запись 2" video_model_caps.json (раздел 6.2 ТЗ, блок 2): дописывает
+    предупреждения в уже существующий файл, не перезаписывая остальные поля.
+
+    Атомарно, под тем же sidecar-локом, что и остальные писатели этого файла:
+    flock на ``{caps_file_path}.lock``, чтение-изменение-запись, уникальный
+    tmp-файл + os.replace (см. _merge_write_shots в screenplay_shots_generator.py).
+    """
+    if not new_warnings:
+        return {}
+
+    directory = os.path.dirname(caps_file_path) or "."
+    os.makedirs(directory, exist_ok=True)
+    lock_path = f"{caps_file_path}.lock"
+    with open(lock_path, "a+", encoding="utf-8") as lock_f:
+        fcntl.flock(lock_f, fcntl.LOCK_EX)
+        try:
+            payload = _read_previous_video_caps(caps_file_path)
+            if payload is None:
+                logger.warning(
+                    "⚠️ append_video_model_caps_warnings: %s не найден, дописывать некуда",
+                    caps_file_path,
+                )
+                return {}
+            existing = payload.get("warnings")
+            if not isinstance(existing, list):
+                existing = []
+            payload["warnings"] = existing + list(new_warnings)
+            _write_video_model_caps(caps_file_path, payload)
+            return payload
+        finally:
+            fcntl.flock(lock_f, fcntl.LOCK_UN)
+
+
+def resolve_video_model_capabilities(
+    tool_name: Optional[str],
+    caps_file_path: str,
+    allowed_durations: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Определяет возможности активной видеомодели и публикует их в caps_file_path.
+
+    Никогда не бросает исключений; файл создаётся всегда (раздел 6.1 ТЗ).
+
+    ``allowed_durations`` (опционально, раздел 6.2 ТЗ блок 4) — ограничение
+    проекта (blockout_allowed_durations). Публикуемый ``supported_durations``
+    всегда остаётся ПОЛНЫМ набором модели — пересечение не меняет схему
+    возврата (проверяется тестом на точный набор ключей), а только добавляет
+    предупреждения о сужении/пустом пересечении в общий список ``warnings``.
+    Сам список эффективных длительностей для нормализации нужно получить
+    отдельным вызовом resolve_effective_durations(...).
+    """
+    try:
+        if tool_name == "video_generator_aitunnel_tool":
+            resolved = _resolve_aitunnel_capabilities(caps_file_path)
+        else:
+            registry_entry = _VIDEO_MODEL_CAPABILITIES_REGISTRY.get(tool_name)
+            if registry_entry is not None:
+                resolved = {
+                    "model": registry_entry["model"],
+                    **{field: list(registry_entry[field]) for field in _CAPABILITY_FIELDS},
+                    "source": "constant",
+                    "resolved_at": _utc_now_iso(),
+                    "warnings": [],
+                }
+            else:
+                logger.warning(f"⚠️ Неизвестный tool_name видеогенератора: {tool_name!r}")
+                resolved = {
+                    "model": None,
+                    "supported_durations": [],
+                    "supported_sizes": [],
+                    "supported_resolutions": [],
+                    "supported_aspect_ratios": [],
+                    "supported_modes": [],
+                    "source": None,
+                    "resolved_at": _utc_now_iso(),
+                    "warnings": [video_model_caps_warning(
+                        "P14",
+                        f"Неизвестный tool_name видеогенератора: {tool_name!r}, возможности модели не определены",
+                        details={"tool_name": tool_name},
+                    )],
+                }
+
+        if allowed_durations:
+            _, narrowing_warnings = resolve_effective_durations(
+                resolved.get("supported_durations") or [], allowed_durations
+            )
+            if narrowing_warnings:
+                resolved = {**resolved, "warnings": list(resolved.get("warnings") or []) + narrowing_warnings}
+
+        payload = {"tool_name": tool_name, **resolved}
+    except Exception as e:
+        logger.error(f"❌ resolve_video_model_capabilities: непредвиденная ошибка: {e}")
+        payload = {
+            "tool_name": tool_name,
+            "model": None,
+            "supported_durations": [],
+            "supported_sizes": [],
+            "supported_resolutions": [],
+            "supported_aspect_ratios": [],
+            "supported_modes": [],
+            "source": None,
+            "resolved_at": _utc_now_iso(),
+            "warnings": [video_model_caps_warning(
+                "P14",
+                f"Внутренняя ошибка при определении возможностей видеомодели: {e}",
+                details={"tool_name": tool_name},
+            )],
+        }
+
+    _write_video_model_caps(caps_file_path, payload)
+    return payload

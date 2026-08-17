@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import time
 import random
-from typing import Union, List, Dict, Any, Optional, Tuple
+from typing import Union, List, Dict, Any, Optional, Tuple, Mapping
 from agent_command import model_code, model_big, model_summary, model_reranker, model_vision, model_mapping
 from smolagents import logger, ChatMessage, MessageRole
 import httpx
@@ -772,6 +772,12 @@ def call_openai_api(prompt: str, system_prompt: str = None, max_tokens: int = 10
                 response_text = response.choices[0].message.content
             elif isinstance(response, dict) and 'choices' in response and response['choices'] is not None and len(response['choices']) > 0:
                 response_text = response["choices"][0]["message"]["content"]
+            elif (
+                isinstance(response, Mapping)
+                and isinstance(response_format, dict)
+                and response_format.get("type") == "json_schema"
+            ):
+                raise ValueError("Некорректный provider response без choices")
             else:
                 response_text = str(response)
             

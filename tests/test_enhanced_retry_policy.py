@@ -325,7 +325,6 @@ def test_adaptive_retry_retries_transient_class():
     assert calls["n"] == 3, "транзиентная ошибка повторяется max_retries+1 раз"
     assert result.status.value == "failed"
 
-
 # ---------------------------------------------------------------------------
 # 7. module-level classify_error: тексты таймаутов классифицируются как retryable
 # ---------------------------------------------------------------------------
@@ -453,85 +452,3 @@ def test_adaptive_retry_retries_transient_failed_result():
     )
     assert calls["n"] == 3, "транзиентный FAILED-результат повторяется max_retries+1 раз"
     assert result.status.value == "failed"
-
-
-def test_corrective_feedback_is_immutable_bounded_and_json_renderable():
-    from dataclasses import FrozenInstanceError
-
-    from workflow.text_to_sql_retry import (
-        CORRECTIVE_FEEDBACK_MAX_MESSAGE_LENGTH,
-        CORRECTIVE_FEEDBACK_MAX_RECOMMENDATIONS,
-        CORRECTIVE_FEEDBACK_MAX_RECOMMENDATION_LENGTH,
-        CorrectiveFeedback,
-        CorrectiveFeedbackSource,
-    )
-
-    feedback = CorrectiveFeedback.create(
-        source=CorrectiveFeedbackSource.VERIFICATION,
-        failure_code="VERIFIER_REJECTED",
-        message="m" * (CORRECTIVE_FEEDBACK_MAX_MESSAGE_LENGTH + 20),
-        previous_sql="SELECT broken",
-        recommendations=[
-            "r" * (CORRECTIVE_FEEDBACK_MAX_RECOMMENDATION_LENGTH + 20)
-            for _ in range(CORRECTIVE_FEEDBACK_MAX_RECOMMENDATIONS + 2)
-        ],
-        attempt_number=2,
-    )
-
-    mapping = feedback.to_mapping()
-    assert mapping == {
-        "source": "VERIFICATION",
-        "failure_code": "VERIFIER_REJECTED",
-        "message": "m" * CORRECTIVE_FEEDBACK_MAX_MESSAGE_LENGTH,
-        "previous_sql": "SELECT broken",
-        "recommendations": [
-            "r" * CORRECTIVE_FEEDBACK_MAX_RECOMMENDATION_LENGTH
-            for _ in range(CORRECTIVE_FEEDBACK_MAX_RECOMMENDATIONS)
-        ],
-        "attempt_number": 2,
-    }
-    with pytest.raises(FrozenInstanceError):
-        feedback.attempt_number = 3
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        "Rejected",
-        {"verification_status": "Rejected", "recommendations": "fix"},
-        {"verification_status": "Approved", "recommendations": []},
-    ],
-)
-def test_verifier_corrective_feedback_rejects_malformed_output(payload):
-    from workflow.text_to_sql_retry import build_corrective_feedback
-
-    with pytest.raises((TypeError, ValueError)):
-        build_corrective_feedback(
-            step_id="sql_verification",
-            output=payload,
-            previous_sql="SELECT broken",
-            attempt_number=1,
-        )
-
-
-@pytest.mark.parametrize(
-    "reason_code",
-    [
-        "SCHEMA_CLARIFICATION_REQUIRED",
-        "SCHEMA_GROUNDING_FAILED",
-        "SCHEMA_CONTEXT_BUDGET_EXCEEDED",
-        "OUTPUT_RETRY_CHAIN_FAILED",
-    ],
-)
-def test_schema_and_non_execution_terminal_reasons_cannot_create_feedback(
-    reason_code,
-):
-    from workflow.text_to_sql_retry import build_corrective_feedback
-
-    with pytest.raises(ValueError, match="EXECUTION_FAILED"):
-        build_corrective_feedback(
-            step_id="db_audit",
-            output={"reason_code": reason_code},
-            previous_sql="SELECT broken",
-            attempt_number=1,
-        )

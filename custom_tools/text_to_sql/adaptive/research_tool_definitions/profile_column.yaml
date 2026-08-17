@@ -1,0 +1,12 @@
+version: 1
+name: profile_column
+description: Profile one exact column through the bounded data probe.
+implementation: profile_column
+arguments:
+  - name: table
+    type: string
+    required: true
+  - name: column
+    type: string
+    required: true
+additional_properties: false

@@ -10,13 +10,15 @@ Text-to-SQL: константы, JSON-safe примитивы, перечисл�
 ``workflow.models`` реэкспортирует нужные имена для существующих импортёров.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Iterator, Sequence
 from itertools import islice
 from typing import Any, Dict, Mapping, Optional
 from enum import Enum
 import math
 import json
+
+from custom_tools.text_to_sql.adaptive.ambiguity import AmbiguityReport
 
 TEXT_TO_SQL_WORKFLOW_NAME = "text_to_sql_pipeline"
 TEXT_TO_SQL_WORKFLOW_CATEGORY = "text_to_sql"
@@ -318,9 +320,18 @@ class TextToSqlTerminalReasonCode(str, Enum):
 
     VERIFIER_CONTRACT_INVALID = "VERIFIER_CONTRACT_INVALID"
     VERIFIER_REJECTED = "VERIFIER_REJECTED"
+    DETERMINISTIC_CHECK_REJECTED = "DETERMINISTIC_CHECK_REJECTED"
     SCHEMA_CLARIFICATION_REQUIRED = "SCHEMA_CLARIFICATION_REQUIRED"
     SCHEMA_GROUNDING_FAILED = "SCHEMA_GROUNDING_FAILED"
     SCHEMA_CONTEXT_BUDGET_EXCEEDED = "SCHEMA_CONTEXT_BUDGET_EXCEEDED"
+    RESEARCH_AMBIGUOUS = "RESEARCH_AMBIGUOUS"
+    RESEARCH_UNSUPPORTED = "RESEARCH_UNSUPPORTED"
+    RESEARCH_STAGNATED = "RESEARCH_STAGNATED"
+    RESEARCH_BUDGET_EXHAUSTED = "RESEARCH_BUDGET_EXHAUSTED"
+    RESEARCH_TOOL_FAILURE = "RESEARCH_TOOL_FAILURE"
+    RESEARCH_PROTOCOL_FAILURE = "RESEARCH_PROTOCOL_FAILURE"
+    EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
+    STALE_REQUIRED_EVIDENCE = "STALE_REQUIRED_EVIDENCE"
     EXECUTOR_CONTRACT_INVALID = "EXECUTOR_CONTRACT_INVALID"
     AUDIT_CONTRACT_INVALID = "AUDIT_CONTRACT_INVALID"
     AUDIT_FAILED = "AUDIT_FAILED"
@@ -341,11 +352,15 @@ class TextToSqlTerminalReasonCode(str, Enum):
     RESULT_AGGREGATION_FAILED = "RESULT_AGGREGATION_FAILED"
     RESULT_PERSISTENCE_FAILED = "RESULT_PERSISTENCE_FAILED"
     RESULT_RECONCILIATION_FAILED = "RESULT_RECONCILIATION_FAILED"
+    RESULT_REVIEW_FAILED = "RESULT_REVIEW_FAILED"
     OUTPUT_RETRY_CHAIN_FAILED = "OUTPUT_RETRY_CHAIN_FAILED"
 
 
 _TEXT_TO_SQL_FAILURE_EVIDENCE_PROFILES = {
     TextToSqlTerminalReasonCode.VERIFIER_CONTRACT_INVALID: "no_runtime",
+    TextToSqlTerminalReasonCode.RESEARCH_TOOL_FAILURE: "no_runtime",
+    TextToSqlTerminalReasonCode.RESEARCH_PROTOCOL_FAILURE: "no_runtime",
+    TextToSqlTerminalReasonCode.EXECUTION_UNKNOWN: "no_runtime",
     TextToSqlTerminalReasonCode.EXECUTOR_CONTRACT_INVALID: "untrusted_executor",
     TextToSqlTerminalReasonCode.AUDIT_CONTRACT_INVALID: "audit_failure",
     TextToSqlTerminalReasonCode.AUDIT_FAILED: "audit_failure",
@@ -366,13 +381,20 @@ _TEXT_TO_SQL_FAILURE_EVIDENCE_PROFILES = {
     TextToSqlTerminalReasonCode.RESULT_AGGREGATION_FAILED: "post_success",
     TextToSqlTerminalReasonCode.RESULT_PERSISTENCE_FAILED: "result_failure",
     TextToSqlTerminalReasonCode.RESULT_RECONCILIATION_FAILED: "result_failure",
+    TextToSqlTerminalReasonCode.RESULT_REVIEW_FAILED: "result_failure",
     TextToSqlTerminalReasonCode.OUTPUT_RETRY_CHAIN_FAILED: "execution_failure",
 }
 _TEXT_TO_SQL_ABSTAIN_REASONS = frozenset({
     TextToSqlTerminalReasonCode.VERIFIER_REJECTED,
+    TextToSqlTerminalReasonCode.DETERMINISTIC_CHECK_REJECTED,
     TextToSqlTerminalReasonCode.SCHEMA_CLARIFICATION_REQUIRED,
     TextToSqlTerminalReasonCode.SCHEMA_GROUNDING_FAILED,
     TextToSqlTerminalReasonCode.SCHEMA_CONTEXT_BUDGET_EXCEEDED,
+    TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS,
+    TextToSqlTerminalReasonCode.RESEARCH_UNSUPPORTED,
+    TextToSqlTerminalReasonCode.RESEARCH_STAGNATED,
+    TextToSqlTerminalReasonCode.RESEARCH_BUDGET_EXHAUSTED,
+    TextToSqlTerminalReasonCode.STALE_REQUIRED_EVIDENCE,
 })
 _TEXT_TO_SQL_NON_FAILED_REASONS = frozenset({
     *_TEXT_TO_SQL_ABSTAIN_REASONS,
@@ -392,7 +414,22 @@ _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS = frozenset({
     TextToSqlTerminalReasonCode.SCHEMA_CLARIFICATION_REQUIRED,
     TextToSqlTerminalReasonCode.SCHEMA_GROUNDING_FAILED,
     TextToSqlTerminalReasonCode.SCHEMA_CONTEXT_BUDGET_EXCEEDED,
+    TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS,
+    TextToSqlTerminalReasonCode.RESEARCH_UNSUPPORTED,
+    TextToSqlTerminalReasonCode.RESEARCH_STAGNATED,
+    TextToSqlTerminalReasonCode.RESEARCH_BUDGET_EXHAUSTED,
 })
+
+_TEXT_TO_SQL_RESEARCH_TERMINAL_STATUSES = {
+    TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS: TextToSqlTerminalStatus.ABSTAINED,
+    TextToSqlTerminalReasonCode.RESEARCH_UNSUPPORTED: TextToSqlTerminalStatus.ABSTAINED,
+    TextToSqlTerminalReasonCode.RESEARCH_STAGNATED: TextToSqlTerminalStatus.ABSTAINED,
+    TextToSqlTerminalReasonCode.RESEARCH_BUDGET_EXHAUSTED: TextToSqlTerminalStatus.ABSTAINED,
+    TextToSqlTerminalReasonCode.RESEARCH_TOOL_FAILURE: TextToSqlTerminalStatus.FAILED,
+    TextToSqlTerminalReasonCode.RESEARCH_PROTOCOL_FAILURE: TextToSqlTerminalStatus.FAILED,
+    TextToSqlTerminalReasonCode.CANCELLED: TextToSqlTerminalStatus.CANCELLED,
+    TextToSqlTerminalReasonCode.TIMED_OUT: TextToSqlTerminalStatus.TIMED_OUT,
+}
 
 
 _TEXT_TO_SQL_ENFORCEMENT_MODE_FIELDS = (
@@ -781,6 +818,8 @@ class TextToSqlTerminalResult:
     execution: Mapping[str, Any]
     audit: Mapping[str, Any]
     persistence: Mapping[str, Any]
+    ambiguity: AmbiguityReport | None = None
+    result_review: Mapping[str, Any] = field(default_factory=dict)
 
     _FIELDS = frozenset({
         "run_id",
@@ -799,6 +838,8 @@ class TextToSqlTerminalResult:
         "execution",
         "audit",
         "persistence",
+        "ambiguity",
+        "result_review",
     })
 
     def __post_init__(self) -> None:
@@ -829,7 +870,9 @@ class TextToSqlTerminalResult:
             raise TypeError("rows_affected must be a non-negative integer")
         if self.error is not None and not isinstance(self.error, str):
             raise TypeError("error must be a string or null")
-        for field_name in ("execution", "audit", "persistence"):
+        if self.ambiguity is not None and type(self.ambiguity) is not AmbiguityReport:
+            raise TypeError("ambiguity must be an AmbiguityReport or null")
+        for field_name in ("execution", "audit", "persistence", "result_review"):
             if not isinstance(getattr(self, field_name), Mapping):
                 raise TypeError(f"{field_name} must be an object")
         evidence = _isolated_json_value(
@@ -839,13 +882,14 @@ class TextToSqlTerminalResult:
                 "execution": self.execution,
                 "audit": self.audit,
                 "persistence": self.persistence,
+                "result_review": self.result_review,
             },
             field_name="terminal evidence",
         )
-        for field_name in ("data", "columns", "execution", "audit", "persistence"):
+        for field_name in ("data", "columns", "execution", "audit", "persistence", "result_review"):
             object.__setattr__(self, field_name, evidence[field_name])
         self.assert_invariants()
-        for field_name in ("data", "columns", "execution", "audit", "persistence"):
+        for field_name in ("data", "columns", "execution", "audit", "persistence", "result_review"):
             object.__setattr__(
                 self,
                 field_name,
@@ -905,6 +949,16 @@ class TextToSqlTerminalResult:
                 if isinstance(value["persistence"], dict)
                 else value["persistence"]
             ),
+            ambiguity=(
+                None
+                if value["ambiguity"] is None
+                else AmbiguityReport.model_validate(value["ambiguity"])
+            ),
+            result_review=(
+                dict(value["result_review"])
+                if isinstance(value["result_review"], dict)
+                else value["result_review"]
+            ),
         )
 
     def assert_invariants(self) -> None:
@@ -913,7 +967,13 @@ class TextToSqlTerminalResult:
         execution = _thaw_json_value(self.execution)
         audit = _thaw_json_value(self.audit)
         persistence = _thaw_json_value(self.persistence)
+        result_review = _thaw_json_value(self.result_review)
         reason: Optional[TextToSqlTerminalReasonCode] = None
+
+        if (self.reason_code == TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS.value) != (
+            self.ambiguity is not None
+        ):
+            raise ValueError("ambiguity must be present exactly for RESEARCH_AMBIGUOUS")
 
         if self.error is not None and len(self.error) > TEXT_TO_SQL_MAX_ERROR_LENGTH:
             raise ValueError(
@@ -1161,6 +1221,20 @@ class TextToSqlTerminalResult:
             raise ValueError(
                 "executed or dry_run terminal state requires execution evidence"
             )
+
+        if result_review:
+            from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
+
+            receipt = ResultReviewReceipt.model_validate(result_review)
+            if (
+                receipt.verdict != "consistent"
+                or receipt.run_id != self.run_id
+                or receipt.execution != execution
+            ):
+                raise ValueError("result_review must bind a consistent execution review")
+        elif self.status is TextToSqlTerminalStatus.SUCCEEDED and self.executed:
+            # Non-Typed callers remain supported; Typed runtime installs its reviewer.
+            pass
 
         if audit:
             audit_status = audit.get("status")
@@ -1436,7 +1510,52 @@ class TextToSqlTerminalResult:
             "execution": _thaw_json_value(self.execution),
             "audit": _thaw_json_value(self.audit),
             "persistence": _thaw_json_value(self.persistence),
+            "ambiguity": (
+                None if self.ambiguity is None else self.ambiguity.model_dump(mode="json")
+            ),
+            "result_review": _thaw_json_value(self.result_review),
         }, field_name="terminal_result")
+
+
+def text_to_sql_research_terminal_result(
+    run_id: object,
+    reason_code: object,
+    ambiguity: AmbiguityReport | None = None,
+) -> TextToSqlTerminalResult | None:
+    """Build the closed public terminal for a typed research stop code."""
+
+    if type(run_id) is not str or not run_id.strip() or type(reason_code) is not str:
+        return None
+    try:
+        reason = TextToSqlTerminalReasonCode(reason_code)
+    except ValueError:
+        return None
+    status = _TEXT_TO_SQL_RESEARCH_TERMINAL_STATUSES.get(reason)
+    if status is None:
+        return None
+    if (reason is TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS) != (
+        ambiguity is not None
+    ):
+        return None
+    return TextToSqlTerminalResult(
+        run_id=run_id,
+        status=status,
+        reason_code=reason.value,
+        sql="",
+        generated=False,
+        approved=False,
+        executed=False,
+        dry_run=False,
+        audited=False,
+        data=[],
+        columns=[],
+        rows_affected=0,
+        error=None,
+        execution={},
+        audit={},
+        persistence={"status": "not_attempted"},
+        ambiguity=ambiguity,
+    )
 
 
 # Public alias for the top-level required field names of a Text-to-SQL

@@ -109,11 +109,12 @@ def test_admin_raw_dsn_compat_rejects_non_boolean_values(value):
 
 def test_reference_start_fingerprint_is_canonical_and_reference_sensitive():
     first = {
-        "natural_query": "  count orders  ",
+        "query": "  count orders  ",
         "connection_ref": _CONNECTION_REF,
         "max_rows": "100",
         "client_id": "client-a",
         "idempotency_key": "key-a",
+        "__request_id": "request-a",
     }
     equivalent = {
         "query": "count orders",
@@ -121,6 +122,7 @@ def test_reference_start_fingerprint_is_canonical_and_reference_sensitive():
         "max_rows": 100,
         "client_id": "client-b",
         "idempotency_key": "key-b",
+        "__request_id": "request-b",
     }
     other_reference = {**equivalent, "connection_ref": "conn-other"}
 
@@ -132,14 +134,14 @@ def test_reference_start_fingerprint_is_canonical_and_reference_sensitive():
     )
 
 
-def test_raw_dsn_start_fingerprint_remains_compatible():
+def test_raw_dsn_start_fingerprint_uses_canonical_typed_contract():
     assert canonical_text_to_sql_start_fingerprint(
         {"query": "count orders", "dsn": _DSN}
-    ) == "92eb7ab589acb2a84b4be00d8ebc8df07c9a9db7c0541a5732dd184ad4180ff1"
+    ) == "a8aef22f2bab01c153f8444e1f71903d5c4f536aaf00e8d4c12bca446a6d1be6"
     assert canonical_text_to_sql_start_fingerprint(
         {
             "query": "count orders",
             "dsn": _DSN,
             "admin_raw_dsn_compat": True,
         }
-    ) == "92eb7ab589acb2a84b4be00d8ebc8df07c9a9db7c0541a5732dd184ad4180ff1"
+    ) == "a8aef22f2bab01c153f8444e1f71903d5c4f536aaf00e8d4c12bca446a6d1be6"

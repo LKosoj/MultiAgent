@@ -1,0 +1,25 @@
+{
+  "id": "railroad_straight",
+  "name": "Прямой участок железной дороги",
+  "category": "prop",
+  "tags": [
+    "railroad",
+    "track"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.0,
+    4.0,
+    0.10000002384185791
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/train-kit",
+  "file_size_bytes": 36744,
+  "fetched_at": "2026-08-16T21:19:45Z",
+  "asset_version": 1
+}

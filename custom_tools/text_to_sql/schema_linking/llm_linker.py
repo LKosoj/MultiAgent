@@ -10,7 +10,6 @@ caller не передан и LLM включён — ``perform_linking`` воз�
 explicit error (silent fallback запрещён, см. AGENTS.md).
 """
 import logging
-import os
 from typing import Any, Callable, Dict, List, Optional
 
 from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
@@ -22,6 +21,10 @@ from ..validators.schema_limiter import SchemaContextBudgetExceeded
 from .resolution import _resolve_column_name, _resolve_table_name
 
 logger = logging.getLogger(__name__)
+
+_SEMANTIC_RETRIEVAL_UNAVAILABLE_STATUSES = frozenset(
+    {"memory_unavailable", "vector_unavailable", "vector_disabled"}
+)
 
 
 def _redact_linking_value(value: Any) -> Any:
@@ -88,7 +91,7 @@ class LLMLinker:
                 "LLM caller is not configured for schema linking. "
                 "Check DI setup (pass llm_caller= to constructor)."
             )
-        schema_budget: Dict[str, Any] = {}
+        schema_budget: Dict[str, Any] = {"model_calls": 0}
         try:
             entity_names = self._collect_entity_terms(entities)
             if not entity_names:
@@ -98,78 +101,108 @@ class LLMLinker:
                     "query_entities": [],
                 }
 
-            if namespace is None:
-                relevant_tables = self.memory_manager.find_semantic_relevant_tables(
-                    entity_names,
-                    dsn=dsn,
+            if not db_schema:
+                return {
+                    "error": "Database schema is empty",
+                    "suggestion": "Load the authoritative database schema before schema linking.",
+                    "query_entities": _redact_linking_value(entity_names),
+                }
+
+            embedding_retrieval_unavailable = False
+            try:
+                if namespace is None:
+                    relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                        entity_names,
+                        dsn=dsn,
+                    )
+                else:
+                    relevant_tables = self.memory_manager.find_semantic_relevant_tables(
+                        entity_names,
+                        namespace=namespace,
+                    )
+                memory_status = getattr(
+                    self.memory_manager, "last_search_status", None
                 )
-            else:
-                relevant_tables = self.memory_manager.find_semantic_relevant_tables(
-                    entity_names,
-                    namespace=namespace,
+                memory_error = getattr(self.memory_manager, "last_search_error", None)
+            except (EmbeddingUnavailableError, EmbeddingFailedError) as e:
+                relevant_tables = []
+                memory_status = "embedding_unavailable"
+                memory_error = _redact_linking_error(e)
+                embedding_retrieval_unavailable = True
+                logger.warning(
+                    "LLM linking: embedding retrieval is unavailable; "
+                    "using the authoritative schema: %s",
+                    memory_error,
                 )
             logger.info(
                 f"Found {len(relevant_tables)} relevant tables for LLM linking: {relevant_tables}"
             )
-            memory_status = getattr(self.memory_manager, "last_search_status", None)
-            memory_error = getattr(self.memory_manager, "last_search_error", None)
-            safe_memory_error = str(_redact_linking_value(memory_error or "unknown reason"))
-            if not relevant_tables and memory_status == "memory_unavailable":
-                return {
-                    "error": f"Schema memory unavailable: {safe_memory_error}",
-                    "memory_status": memory_status,
-                    "suggestion": "Ensure schema_table records are indexed before schema linking.",
-                    "query_entities": _redact_linking_value(entity_names),
+            safe_memory_error = str(
+                _redact_linking_value(memory_error or "unknown reason")
+            )
+
+            include_all_tables = False
+            if relevant_tables:
+                schema_for_prompt: Dict[str, Any] = {
+                    table_name: db_schema[table_name]
+                    for table_name in relevant_tables
+                    if table_name in db_schema
                 }
-
-            filtered_schema: Dict[str, Any] = {}
-            for table_name in relevant_tables:
-                if table_name in db_schema:
-                    filtered_schema[table_name] = db_schema[table_name]
-
-            if not filtered_schema:
-                n_fallback = int(os.getenv("SCHEMA_LLM_USE_FIRST_N_FALLBACK", "0") or "0")
-                if n_fallback > 0:
+                if not schema_for_prompt:
                     logger.warning(
-                        f"No relevant tables found via memory search, "
-                        f"using first {n_fallback} tables as fallback"
+                        "Memory suggested tables %s but none found in db_schema "
+                        "(schema tables sample: %s); possible schema rename or stale "
+                        "index — re-index schema",
+                        relevant_tables[:10],
+                        list(db_schema.keys())[:10],
                     )
-                    table_names = list(db_schema.keys())[:n_fallback]
-                    for table_name in table_names:
-                        filtered_schema[table_name] = db_schema[table_name]
-                else:
-                    # T5-linking / LOW: если memory вернула таблицы, которых нет
-                    # в db_schema — это признак устаревшего индекса или переименования.
-                    # Даём явный диагностический сигнал.
-                    if relevant_tables:
-                        logger.warning(
-                            "Memory suggested tables %s but none found in db_schema "
-                            "(schema tables sample: %s); possible schema rename or stale "
-                            "index — re-index schema",
-                            relevant_tables[:10],
-                            list(db_schema.keys())[:10],
-                        )
-                    else:
-                        logger.warning(
-                            "No relevant tables via memory and fallback disabled; "
-                            "schema likely lacks data for this query domain"
-                        )
-                    memory_status = getattr(self.memory_manager, "last_search_status", None)
-                    memory_error = getattr(self.memory_manager, "last_search_error", None)
                     return {
-                        "error": "No semantically relevant tables found",
-                        "memory_status": memory_status or "no_hits",
+                        "error": "Semantic search returned tables absent from the authoritative schema",
+                        "memory_status": memory_status or "unknown",
                         "memory_error": _redact_linking_value(memory_error),
-                        "suggestion": (
-                            "Database schema may not contain data relevant to the requested "
-                            "query domain"
-                        ),
+                        "suggestion": "Re-index schema metadata before schema linking.",
                         "available_tables": list(db_schema.keys())[:10],
                         "query_entities": _redact_linking_value(entity_names),
                     }
+            elif (
+                memory_status in _SEMANTIC_RETRIEVAL_UNAVAILABLE_STATUSES
+                or embedding_retrieval_unavailable
+            ):
+                schema_for_prompt = {
+                    table_name: db_schema[table_name]
+                    for table_name in sorted(db_schema)
+                }
+                include_all_tables = True
+                logger.warning(
+                    "Semantic retrieval status=%s; using all %s authoritative "
+                    "schema tables: %s",
+                    memory_status,
+                    len(schema_for_prompt),
+                    safe_memory_error,
+                )
+            elif memory_status == "no_hits":
+                return {
+                    "error": "No semantically relevant tables found",
+                    "memory_status": memory_status,
+                    "memory_error": _redact_linking_value(memory_error),
+                    "suggestion": (
+                        "Database schema may not contain data relevant to the requested "
+                        "query domain"
+                    ),
+                    "available_tables": list(db_schema.keys())[:10],
+                    "query_entities": _redact_linking_value(entity_names),
+                }
+            else:
+                return {
+                    "error": "Semantic schema retrieval is not ready",
+                    "memory_status": memory_status or "unknown",
+                    "memory_error": _redact_linking_value(memory_error),
+                    "suggestion": "Restore semantic retrieval before schema linking.",
+                    "query_entities": _redact_linking_value(entity_names),
+                }
 
             logger.info(
-                f"Using {len(filtered_schema)} tables for LLM linking "
+                f"Using {len(schema_for_prompt)} tables for LLM linking "
                 f"(from {len(db_schema)} total)"
             )
 
@@ -181,10 +214,11 @@ class LLMLinker:
                 "schema_linking", "schema_prompt_hard_max_chars"
             )
             schema_str = self.schema_limiter.build_schema_summary(
-                filtered_schema,
+                schema_for_prompt,
                 query_terms=entity_names,
                 hard_max_chars=hard_max_chars,
                 diagnostics=schema_budget,
+                include_all_tables=include_all_tables,
             )
             # L58: entities могут содержать PII (значения фильтров из
             # пользовательского запроса). LLM-линкеру нужны КЛЮЧИ фильтров
@@ -217,6 +251,7 @@ class LLMLinker:
             prompts_profile = load_prompts_config()
             system_prompt = prompts_profile.get_text("schema_linking", "system_prompt")
 
+            schema_budget["model_calls"] = 1
             resp = call_openai_api(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -273,29 +308,10 @@ class LLMLinker:
             return {
                 "error": str(e),
                 "reason_code": e.reason_code,
-                "schema_budget": e.diagnostics,
+                "schema_budget": {**e.diagnostics, "model_calls": 0},
                 "query_entities": _redact_linking_value(
                     self._collect_entity_terms(entities)
                 ),
-            }
-        except (EmbeddingUnavailableError, EmbeddingFailedError) as e:
-            # T3: find_semantic_relevant_tables пробрасывает эти ошибки, когда
-            # модель эмбеддингов не настроена/недоступна. Не маскируем их под
-            # generic "LLM schema linking failed" — даём caller'у (orchestrator)
-            # явную причину и actionable-подсказку. Orchestrator по наличию
-            # ключа "error" уйдёт в heuristic-fallback (string matching), но
-            # причина теперь видима в логах/ответе, а не молча проглочена.
-            safe_error = _redact_linking_error(e)
-            logger.warning(
-                "LLM linking: модель эмбеддингов недоступна для поиска "
-                "релевантных таблиц: %s",
-                safe_error,
-            )
-            return {
-                "error": f"Schema memory unavailable (embeddings): {safe_error}",
-                "memory_status": "embedding_unavailable",
-                "suggestion": "Check OPENAI_API_KEY_DB / embedding config; ensure schema_table records are indexed.",
-                "query_entities": _redact_linking_value(self._collect_entity_terms(entities)),
             }
         except Exception as e:
             safe_error = _redact_linking_error(e)
@@ -304,6 +320,7 @@ class LLMLinker:
                 "error": f"LLM schema linking failed: {safe_error}",
                 "suggestion": "Retry schema linking after fixing the LLM response or API failure.",
                 "query_entities": _redact_linking_value(self._collect_entity_terms(entities)),
+                "schema_budget": schema_budget,
             }
 
 

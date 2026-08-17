@@ -1,0 +1,27 @@
+{
+  "id": "barrel_organ",
+  "name": "Шарманка",
+  "category": "prop",
+  "tags": [
+    "organ",
+    "street",
+    "paris",
+    "desc:Шарманщик на парижской улице."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.0363299250602722,
+    1.8530276417732239,
+    2.3711706548929214
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/a0f553fb19c543b582bd77edb49b75ee",
+  "file_size_bytes": 141860,
+  "fetched_at": "2026-08-17T05:04:21Z",
+  "asset_version": 1
+}

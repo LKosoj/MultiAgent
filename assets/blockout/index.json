@@ -1,0 +1,1975 @@
+{
+  "version": 1,
+  "generated_at": "2026-08-17T05:04:54Z",
+  "objects": [
+    {
+      "id": "cottage_house",
+      "name": "Изба / коттедж",
+      "category": "building",
+      "tags": [
+        "house",
+        "cottage",
+        "desc:Уютный дом для мечты мальчика и русского интерьера."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        11.181340217590332,
+        4.89955997467041,
+        10.09037590026861
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/cf179aa6dc0944f1974ce3f7812031a6",
+      "file_size_bytes": 4113420,
+      "fetched_at": "2026-08-17T05:04:35Z",
+      "asset_version": 1,
+      "path": "building/cottage_house"
+    },
+    {
+      "id": "eiffel_lp",
+      "name": "Эйфелева башня (low poly)",
+      "category": "building",
+      "tags": [
+        "paris",
+        "eiffel",
+        "landmark",
+        "desc:Париж на горизонте с крыши Монмартра."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.6624405384063721,
+        0.6624409556388855,
+        1.5681684911251068
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/c91c6bd4f96c4bca8e983a7c4c659d22",
+      "file_size_bytes": 317904,
+      "fetched_at": "2026-08-16T22:54:35Z",
+      "asset_version": 1,
+      "path": "building/eiffel_lp"
+    },
+    {
+      "id": "paris_building",
+      "name": "Парижский дом (диорама)",
+      "category": "building",
+      "tags": [
+        "paris",
+        "roof",
+        "montmartre",
+        "desc:Крыши и фасады Монмартра / Пляс Пигаль."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        14.71086311340332,
+        15.654326915740967,
+        25.462082982063293
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/4b99125447d64031bcd4b18cff451e8d",
+      "file_size_bytes": 1186520,
+      "fetched_at": "2026-08-16T22:54:38Z",
+      "asset_version": 1,
+      "path": "building/paris_building"
+    },
+    {
+      "id": "soviet_building",
+      "name": "Советский жилой дом",
+      "category": "building",
+      "tags": [
+        "moscow",
+        "apartment",
+        "soviet",
+        "desc:Московский двор, фасад с окнами"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        34.58913993835449,
+        53.304739864054454,
+        18.332656860351562
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/cb5c1471b2ab4f12a308f6f8931af332",
+      "file_size_bytes": 8747092,
+      "fetched_at": "2026-08-16T23:00:45Z",
+      "asset_version": 2,
+      "path": "building/soviet_building"
+    },
+    {
+      "id": "bearded_man",
+      "name": "Бородатый капитан (Платонов)",
+      "category": "character",
+      "tags": [
+        "man",
+        "beard",
+        "platonov",
+        "desc:Бородатый мужчина в кителе — прообраз Платонова."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        8.937812805175781,
+        8.937810897827148,
+        4.320689499378204
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/69fa6d8aaaab4dc19f3c2cb5fcd498b1",
+      "file_size_bytes": 6251976,
+      "fetched_at": "2026-08-17T05:03:46Z",
+      "asset_version": 1,
+      "path": "character/bearded_man"
+    },
+    {
+      "id": "cartoon_kids",
+      "name": "Мультяшные дети",
+      "category": "character",
+      "tags": [
+        "kids",
+        "children",
+        "football",
+        "desc:Группа детей для двора: assorted football kids."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.5994850099086761,
+        2.777268171310425,
+        1.1832679510116577
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/16bd67d620a846b7abb9dfdbb3534f05",
+      "file_size_bytes": 252344,
+      "fetched_at": "2026-08-16T22:54:10Z",
+      "asset_version": 1,
+      "path": "character/cartoon_kids"
+    },
+    {
+      "id": "cowboy_on_horse",
+      "name": "Ковбой на лошади",
+      "category": "character",
+      "tags": [
+        "cowboy",
+        "horse",
+        "western",
+        "author:andreiLlacuna"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.5992009823170786,
+        1.6581716179051842,
+        1.7
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/cowboy-on-horse-425707e4e78d4747bc6139bc01778e13",
+      "file_size_bytes": 3978028,
+      "fetched_at": "2026-08-16T22:08:17Z",
+      "asset_version": 1,
+      "path": "character/cowboy_on_horse"
+    },
+    {
+      "id": "cowboy_outlaw_a",
+      "name": "Грабитель А",
+      "category": "character",
+      "tags": [
+        "cowboy",
+        "outlaw",
+        "character"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.5999999642372131,
+        0.800000011920929,
+        2.700000047683716
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [
+        {
+          "name": "attack-kick-left",
+          "duration_s": 0.583,
+          "loop": true
+        },
+        {
+          "name": "attack-kick-right",
+          "duration_s": 0.583,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-left",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-right",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "die",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "drive",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "emote-no",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "emote-yes",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "holding-both",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-both-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-left",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-left-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-right",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-right-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "idle",
+          "duration_s": 1.333,
+          "loop": true
+        },
+        {
+          "name": "interact-left",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "interact-right",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "pick-up",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "sit",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "sprint",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "static",
+          "duration_s": 0.1,
+          "loop": true
+        },
+        {
+          "name": "walk",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-back",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-forward",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-left",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-right",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-sit",
+          "duration_s": 0.167,
+          "loop": true
+        }
+      ],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/blocky-characters",
+      "file_size_bytes": 69796,
+      "fetched_at": "2026-08-16T21:19:46Z",
+      "asset_version": 1,
+      "path": "character/cowboy_outlaw_a"
+    },
+    {
+      "id": "cowboy_outlaw_b",
+      "name": "Грабитель Б",
+      "category": "character",
+      "tags": [
+        "cowboy",
+        "outlaw",
+        "character"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.6000000834465027,
+        0.800000011920929,
+        2.700000047683716
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [
+        {
+          "name": "attack-kick-left",
+          "duration_s": 0.583,
+          "loop": true
+        },
+        {
+          "name": "attack-kick-right",
+          "duration_s": 0.583,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-left",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-right",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "die",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "drive",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "emote-no",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "emote-yes",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "holding-both",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-both-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-left",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-left-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-right",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-right-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "idle",
+          "duration_s": 1.333,
+          "loop": true
+        },
+        {
+          "name": "interact-left",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "interact-right",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "pick-up",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "sit",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "sprint",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "static",
+          "duration_s": 0.1,
+          "loop": true
+        },
+        {
+          "name": "walk",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-back",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-forward",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-left",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-right",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-sit",
+          "duration_s": 0.167,
+          "loop": true
+        }
+      ],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/blocky-characters",
+      "file_size_bytes": 62452,
+      "fetched_at": "2026-08-16T21:19:47Z",
+      "asset_version": 1,
+      "path": "character/cowboy_outlaw_b"
+    },
+    {
+      "id": "cowboy_sheriff",
+      "name": "Шериф",
+      "category": "character",
+      "tags": [
+        "sheriff",
+        "character"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.7671682834625244,
+        0.46065741777420044,
+        0.8097751848399639
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": true,
+      "animations": [
+        {
+          "name": "attack-kick-left",
+          "duration_s": 0.533,
+          "loop": true
+        },
+        {
+          "name": "attack-kick-right",
+          "duration_s": 0.533,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-left",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-right",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "crouch",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "die",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "drive",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "emote-no",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "emote-yes",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "fall",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "holding-both",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-both-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-left",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-left-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-right",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-right-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "idle",
+          "duration_s": 1.333,
+          "loop": true
+        },
+        {
+          "name": "interact-left",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "interact-right",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "jump",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "pick-up",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "sit",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "sprint",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "static",
+          "duration_s": 0.1,
+          "loop": true
+        },
+        {
+          "name": "walk",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-look-left",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-look-right",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-back",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-forward",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-left",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-right",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-sit",
+          "duration_s": 0.167,
+          "loop": true
+        }
+      ],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/mini-characters",
+      "file_size_bytes": 216464,
+      "fetched_at": "2026-08-16T21:19:48Z",
+      "asset_version": 1,
+      "path": "character/cowboy_sheriff"
+    },
+    {
+      "id": "cowboy_standing",
+      "name": "Ковбой",
+      "category": "character",
+      "tags": [
+        "cowboy",
+        "western",
+        "author:Zuno Liu"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.4050376122681982,
+        0.40128680209290135,
+        1.7
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/cowboy-68cc35172e644409a63a28236824256c",
+      "file_size_bytes": 334904,
+      "fetched_at": "2026-08-16T22:08:18Z",
+      "asset_version": 1,
+      "path": "character/cowboy_standing"
+    },
+    {
+      "id": "cowboy_western",
+      "name": "Ковбой western 01",
+      "category": "character",
+      "tags": [
+        "cowboy",
+        "western",
+        "author:ALTEREGO (v.a.c.u.u.m.)"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        2.0090153217315674,
+        0.43992698192596436,
+        1.8768589496612549
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/cowboy-western-01-9df692aa75c24fbe9ec695f5626a1cb7",
+      "file_size_bytes": 2139316,
+      "fetched_at": "2026-08-16T22:08:19Z",
+      "asset_version": 1,
+      "path": "character/cowboy_western"
+    },
+    {
+      "id": "horse",
+      "name": "Лошадь",
+      "category": "character",
+      "tags": [
+        "horse",
+        "animal",
+        "western"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.16380367428064346,
+        0.10779086500406265,
+        0.21997890953571186
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "polyhaven",
+      "source_url": "https://polyhaven.com/a/horse_statue_01",
+      "file_size_bytes": 701316,
+      "fetched_at": "2026-08-16T21:19:50Z",
+      "asset_version": 1,
+      "path": "character/horse"
+    },
+    {
+      "id": "horse_black",
+      "name": "Чёрная лошадь",
+      "category": "character",
+      "tags": [
+        "horse",
+        "western",
+        "author:iRahulRajput"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.4549923241138458,
+        1.6662389039993286,
+        1.8940165042877197
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/midnight-black-horse-3d-model-free-924e04bb60924da69a8986cfbbbbab91",
+      "file_size_bytes": 3412416,
+      "fetched_at": "2026-08-16T22:08:20Z",
+      "asset_version": 1,
+      "path": "character/horse_black"
+    },
+    {
+      "id": "lp_boy",
+      "name": "Мальчик (low poly)",
+      "category": "character",
+      "tags": [
+        "boy",
+        "child",
+        "moscow",
+        "football",
+        "desc:Ребёнок для московской улицы: футболисты и убегающий школьник."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.9080058804683976,
+        0.42796126023504955,
+        1.7
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/d984291f35244621abdbbd7527d44b33",
+      "file_size_bytes": 99448,
+      "fetched_at": "2026-08-16T22:54:03Z",
+      "asset_version": 1,
+      "path": "character/lp_boy"
+    },
+    {
+      "id": "lp_people_pack",
+      "name": "Люди lowpoly (набор)",
+      "category": "character",
+      "tags": [
+        "people",
+        "adult",
+        "crowd",
+        "desc:Набор маленьких человеческих фигур: дворник, Хемингуэй, Моруа, прохожие."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.7388313114643097,
+        0.3066021427512169,
+        0.30695405602455633
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/6c13a4d1d04943e487313f377b4f3548",
+      "file_size_bytes": 209192,
+      "fetched_at": "2026-08-16T22:54:06Z",
+      "asset_version": 1,
+      "path": "character/lp_people_pack"
+    },
+    {
+      "id": "male_casual",
+      "name": "Мужчина в повседневной одежде",
+      "category": "character",
+      "tags": [
+        "man",
+        "adult",
+        "hemingway",
+        "platonov",
+        "janitor",
+        "desc:Взрослый мужчина: дворник/Платонов, Хемингуэй, Андре Моруа."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.831129014492035,
+        0.323393315076828,
+        1.8061977580364328
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/24ad029f3a094a679bc0b0b109ee40e3",
+      "file_size_bytes": 1307316,
+      "fetched_at": "2026-08-16T22:54:08Z",
+      "asset_version": 1,
+      "path": "character/male_casual"
+    },
+    {
+      "id": "passenger",
+      "name": "Пассажир",
+      "category": "character",
+      "tags": [
+        "passenger",
+        "character"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.0987870693206787,
+        0.4995303153991699,
+        0.792512308806181
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": true,
+      "animations": [
+        {
+          "name": "attack-kick-left",
+          "duration_s": 0.533,
+          "loop": true
+        },
+        {
+          "name": "attack-kick-right",
+          "duration_s": 0.533,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-left",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "attack-melee-right",
+          "duration_s": 0.417,
+          "loop": true
+        },
+        {
+          "name": "crouch",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "die",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "drive",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "emote-no",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "emote-yes",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "fall",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "holding-both",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-both-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-left",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-left-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "holding-right",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "holding-right-shoot",
+          "duration_s": 0.2,
+          "loop": true
+        },
+        {
+          "name": "idle",
+          "duration_s": 1.333,
+          "loop": true
+        },
+        {
+          "name": "interact-left",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "interact-right",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "jump",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "pick-up",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "sit",
+          "duration_s": 0.167,
+          "loop": true
+        },
+        {
+          "name": "sprint",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "static",
+          "duration_s": 0.1,
+          "loop": true
+        },
+        {
+          "name": "walk",
+          "duration_s": 0.667,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-look-left",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-look-right",
+          "duration_s": 0.333,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-back",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-forward",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-left",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-move-right",
+          "duration_s": 0.5,
+          "loop": true
+        },
+        {
+          "name": "wheelchair-sit",
+          "duration_s": 0.167,
+          "loop": true
+        }
+      ],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/mini-characters",
+      "file_size_bytes": 223756,
+      "fetched_at": "2026-08-16T21:19:49Z",
+      "asset_version": 1,
+      "path": "character/passenger"
+    },
+    {
+      "id": "proportional_man",
+      "name": "Пропорциональный человек (Моруа)",
+      "category": "character",
+      "tags": [
+        "man",
+        "morua",
+        "desc:Простая мужская фигура — прообраз Моруа."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        3.3620998859405518,
+        1.0580716654658318,
+        5.746279876679182
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/0bfd0e2b49a348a4b64b20cc8196e3b3",
+      "file_size_bytes": 27344,
+      "fetched_at": "2026-08-17T05:04:00Z",
+      "asset_version": 1,
+      "path": "character/proportional_man"
+    },
+    {
+      "id": "smoking_man",
+      "name": "Курящий мужчина (Хемингуэй)",
+      "category": "character",
+      "tags": [
+        "man",
+        "cigar",
+        "hemingway",
+        "desc:Мужчина с сигарой — прообраз Хемингуэя."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.5532649018251136,
+        0.4964408686267379,
+        1.7
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/4cc32b82a3be42c28949b1281bb2cc3b",
+      "file_size_bytes": 675680,
+      "fetched_at": "2026-08-17T05:03:53Z",
+      "asset_version": 1,
+      "path": "character/smoking_man"
+    },
+    {
+      "id": "cactus_short",
+      "name": "Низкий кактус",
+      "category": "nature",
+      "tags": [
+        "cactus",
+        "desert"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.34166160225868225,
+        0.2971896082162857,
+        0.5329999811947346
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 7876,
+      "fetched_at": "2026-08-16T21:19:51Z",
+      "asset_version": 1,
+      "path": "nature/cactus_short"
+    },
+    {
+      "id": "cactus_tall",
+      "name": "Высокий кактус",
+      "category": "nature",
+      "tags": [
+        "cactus",
+        "desert"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.3962499499320984,
+        0.3390820622444153,
+        0.7499999888241291
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 8640,
+      "fetched_at": "2026-08-16T21:19:51Z",
+      "asset_version": 1,
+      "path": "nature/cactus_tall"
+    },
+    {
+      "id": "coconut_palm",
+      "name": "Кокосовая пальма",
+      "category": "nature",
+      "tags": [
+        "palm",
+        "cuba",
+        "tropics",
+        "desc:Куба, палящее солнце."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        6.296412706375122,
+        4.023053288459778,
+        6.283932495193767
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/26e787f2ff2e4c0fb004c3b0210805a3",
+      "file_size_bytes": 11707544,
+      "fetched_at": "2026-08-16T22:54:32Z",
+      "asset_version": 1,
+      "path": "nature/coconut_palm"
+    },
+    {
+      "id": "desert_bush",
+      "name": "Куст",
+      "category": "nature",
+      "tags": [
+        "bush"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.3743099868297577,
+        0.3356877863407135,
+        0.2429330237209797
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 5812,
+      "fetched_at": "2026-08-16T21:19:55Z",
+      "asset_version": 1,
+      "path": "nature/desert_bush"
+    },
+    {
+      "id": "desert_tree",
+      "name": "Дерево",
+      "category": "nature",
+      "tags": [
+        "tree"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.7550000548362732,
+        0.6538490056991577,
+        1.7078874595463276
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 9136,
+      "fetched_at": "2026-08-16T21:19:52Z",
+      "asset_version": 1,
+      "path": "nature/desert_tree"
+    },
+    {
+      "id": "desert_tree_detailed",
+      "name": "Дерево детальное",
+      "category": "nature",
+      "tags": [
+        "tree"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.8471150398254395,
+        0.7616024911403656,
+        1.3324170596897602
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 29572,
+      "fetched_at": "2026-08-16T21:19:52Z",
+      "asset_version": 1,
+      "path": "nature/desert_tree_detailed"
+    },
+    {
+      "id": "fallen_log",
+      "name": "Упавшее бревно",
+      "category": "nature",
+      "tags": [
+        "log"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.0,
+        0.5493216216564178,
+        0.4167194254696369
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 7440,
+      "fetched_at": "2026-08-16T21:19:54Z",
+      "asset_version": 1,
+      "path": "nature/fallen_log"
+    },
+    {
+      "id": "palm_trees",
+      "name": "Пальмы",
+      "category": "nature",
+      "tags": [
+        "palm",
+        "cuba",
+        "desc:Дополнительная растительность Кубы."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        17.15501117706299,
+        4.375538110733032,
+        5.313905596733093
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/55690379305145488e20afb05fc687e6",
+      "file_size_bytes": 1709092,
+      "fetched_at": "2026-08-16T22:54:34Z",
+      "asset_version": 1,
+      "path": "nature/palm_trees"
+    },
+    {
+      "id": "rock_large_a",
+      "name": "Большой камень A",
+      "category": "nature",
+      "tags": [
+        "rock",
+        "desert"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.7849066853523254,
+        1.0154614448547363,
+        0.25977597013115883
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 7212,
+      "fetched_at": "2026-08-16T21:19:53Z",
+      "asset_version": 1,
+      "path": "nature/rock_large_a"
+    },
+    {
+      "id": "rock_large_c",
+      "name": "Большой камень C",
+      "category": "nature",
+      "tags": [
+        "rock",
+        "desert"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.064409852027893,
+        1.0156620740890503,
+        0.3211119957268238
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 6712,
+      "fetched_at": "2026-08-16T21:19:53Z",
+      "asset_version": 1,
+      "path": "nature/rock_large_c"
+    },
+    {
+      "id": "rock_small",
+      "name": "Малый камень",
+      "category": "nature",
+      "tags": [
+        "rock"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.36079999804496765,
+        0.36079999804496765,
+        0.19122401252388954
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 3100,
+      "fetched_at": "2026-08-16T21:19:54Z",
+      "asset_version": 1,
+      "path": "nature/rock_small"
+    },
+    {
+      "id": "snow_pile",
+      "name": "Куча снега",
+      "category": "nature",
+      "tags": [
+        "snow",
+        "moscow",
+        "winter",
+        "desc:Ноябрьский двор, сугроб."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        2.0003284215927124,
+        1.163071870803833,
+        0.5910219550132751
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/f67b976438774533be86316c0dfc16c1",
+      "file_size_bytes": 3200332,
+      "fetched_at": "2026-08-16T22:54:29Z",
+      "asset_version": 1,
+      "path": "nature/snow_pile"
+    },
+    {
+      "id": "barrel_organ",
+      "name": "Шарманка",
+      "category": "prop",
+      "tags": [
+        "organ",
+        "street",
+        "paris",
+        "desc:Шарманщик на парижской улице."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.0363299250602722,
+        1.8530276417732239,
+        2.3711706548929214
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/a0f553fb19c543b582bd77edb49b75ee",
+      "file_size_bytes": 141860,
+      "fetched_at": "2026-08-17T05:04:21Z",
+      "asset_version": 1,
+      "path": "prop/barrel_organ"
+    },
+    {
+      "id": "cafe_furniture",
+      "name": "Мебель уличного кафе",
+      "category": "prop",
+      "tags": [
+        "cafe",
+        "furniture",
+        "desc:Столик и стулья для кафе."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.6682680249214172,
+        1.8070331811904907,
+        0.8260655403137207
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/441daec1a1f149698a88694780151b94",
+      "file_size_bytes": 2911484,
+      "fetched_at": "2026-08-17T05:04:28Z",
+      "asset_version": 1,
+      "path": "prop/cafe_furniture"
+    },
+    {
+      "id": "campfire",
+      "name": "Костёр",
+      "category": "prop",
+      "tags": [
+        "campfire"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.540837898850441,
+        0.5155070424079895,
+        0.07775100320577621
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/nature-kit",
+      "file_size_bytes": 15804,
+      "fetched_at": "2026-08-16T21:19:55Z",
+      "asset_version": 1,
+      "path": "prop/campfire"
+    },
+    {
+      "id": "football_set",
+      "name": "Футбольный набор",
+      "category": "prop",
+      "tags": [
+        "goal",
+        "football",
+        "desc:Ворота и инвентарь для дворового матча."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.118209958076477,
+        0.8437525033950806,
+        0.7885287702083588
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/e9ecf5e168c0425181f4e917c43e75d3",
+      "file_size_bytes": 2923332,
+      "fetched_at": "2026-08-16T22:54:18Z",
+      "asset_version": 1,
+      "path": "prop/football_set"
+    },
+    {
+      "id": "old_shovel",
+      "name": "Старая лопата",
+      "category": "prop",
+      "tags": [
+        "shovel",
+        "janitor",
+        "platonov",
+        "desc:Лопата дворника / Платонова."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.3334119915962219,
+        0.46756795048713684,
+        1.999999761581421
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/5ea945cb4d9a4bd387fb9d6ed74527f1",
+      "file_size_bytes": 3363676,
+      "fetched_at": "2026-08-16T22:54:20Z",
+      "asset_version": 1,
+      "path": "prop/old_shovel"
+    },
+    {
+      "id": "railroad_straight",
+      "name": "Прямой участок железной дороги",
+      "category": "prop",
+      "tags": [
+        "railroad",
+        "track"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.0,
+        4.0,
+        0.10000002384185791
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 36744,
+      "fetched_at": "2026-08-16T21:19:45Z",
+      "asset_version": 1,
+      "path": "prop/railroad_straight"
+    },
+    {
+      "id": "russian_stove",
+      "name": "Русская печь / газовая плита",
+      "category": "prop",
+      "tags": [
+        "stove",
+        "russian",
+        "desc:Печь для интерьера русской избы."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.7992685735225677,
+        0.9174118861556053,
+        1.2299059629440308
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/0c96e2a3ecca4690a563da62bbbad064",
+      "file_size_bytes": 4684952,
+      "fetched_at": "2026-08-17T05:04:13Z",
+      "asset_version": 1,
+      "path": "prop/russian_stove"
+    },
+    {
+      "id": "soccer_ball",
+      "name": "Футбольный мяч",
+      "category": "prop",
+      "tags": [
+        "ball",
+        "football",
+        "soccer",
+        "desc:Мяч, который летит в окно."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        2.104843020439148,
+        2.089207410812378,
+        2.114738702774048
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/46c91864ef384158b0078e20bdbfe3e9",
+      "file_size_bytes": 2536016,
+      "fetched_at": "2026-08-16T22:54:15Z",
+      "asset_version": 1,
+      "path": "prop/soccer_ball"
+    },
+    {
+      "id": "wooden_bed",
+      "name": "Деревянная кровать",
+      "category": "prop",
+      "tags": [
+        "bed",
+        "wood",
+        "desc:Мечта мальчика об уюте."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        7.460257858037949,
+        6.399373650550842,
+        3.6000014543533325
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/562722351be64b8b95a2a94a65643610",
+      "file_size_bytes": 706436,
+      "fetched_at": "2026-08-17T05:04:06Z",
+      "asset_version": 1,
+      "path": "prop/wooden_bed"
+    },
+    {
+      "id": "wooden_desk",
+      "name": "Письменный стол",
+      "category": "prop",
+      "tags": [
+        "desk",
+        "wood",
+        "desc:Стол мальчика с уроками."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.9199948310852051,
+        2.1402876377105713,
+        0.7966171168748417
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/67cc4558a0e74bb6be61a1af1eb13b66",
+      "file_size_bytes": 3136788,
+      "fetched_at": "2026-08-17T05:04:42Z",
+      "asset_version": 1,
+      "path": "prop/wooden_desk"
+    },
+    {
+      "id": "wooden_door",
+      "name": "Деревянная дверь",
+      "category": "prop",
+      "tags": [
+        "door",
+        "entrance",
+        "desc:Подъезд, из которого выбегает дворник."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        3.185464024543762,
+        0.759134829044342,
+        6.219295501708984
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/8726b6c219a54ed585e096f267c2a35e",
+      "file_size_bytes": 2605588,
+      "fetched_at": "2026-08-16T22:54:27Z",
+      "asset_version": 1,
+      "path": "prop/wooden_door"
+    },
+    {
+      "id": "wooden_stool",
+      "name": "Табуретка",
+      "category": "prop",
+      "tags": [
+        "stool",
+        "wood",
+        "desc:Табуретка для интерьера."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        0.4622284770011902,
+        0.4685431867837906,
+        0.582695722579956
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/168f0b13b6e341c194c84976fc6605dc",
+      "file_size_bytes": 1970980,
+      "fetched_at": "2026-08-17T05:04:49Z",
+      "asset_version": 1,
+      "path": "prop/wooden_stool"
+    },
+    {
+      "id": "wooden_windows",
+      "name": "Старые деревянные окна",
+      "category": "prop",
+      "tags": [
+        "window",
+        "glass",
+        "desc:Рама окна, которое разбивает мяч."
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        7.630606174468994,
+        0.07771138846874237,
+        2.4338977932929993
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/c60a6fe181e1482d96f9412a20c4a390",
+      "file_size_bytes": 1738840,
+      "fetched_at": "2026-08-16T22:54:25Z",
+      "asset_version": 1,
+      "path": "prop/wooden_windows"
+    },
+    {
+      "id": "steam_locomotive_class95",
+      "name": "Паровоз DRG Class 95",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "locomotive",
+        "steam",
+        "class95",
+        "author:Jesper Landin"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        23.7905330657959,
+        109.72036361694336,
+        34.98030339367688
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "sketchfab",
+      "source_url": "https://sketchfab.com/3d-models/drg-class-95-prussian-t-20-steam-locomotive-c904d4f807a34e3c90b13aa55110817f",
+      "file_size_bytes": 3454400,
+      "fetched_at": "2026-08-16T22:08:15Z",
+      "asset_version": 1,
+      "path": "vehicle/steam_locomotive_class95"
+    },
+    {
+      "id": "train_boxcar",
+      "name": "Товарный вагон",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "boxcar"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.2000234127044678,
+        2.700000286102295,
+        1.2976958751678467
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 79024,
+      "fetched_at": "2026-08-16T21:48:01Z",
+      "asset_version": 2,
+      "path": "vehicle/train_boxcar"
+    },
+    {
+      "id": "train_flatbed",
+      "name": "Платформа",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "flatbed"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.100000023841858,
+        2.700000047683716,
+        1.1594994068145752
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 81860,
+      "fetched_at": "2026-08-16T21:48:02Z",
+      "asset_version": 2,
+      "path": "vehicle/train_flatbed"
+    },
+    {
+      "id": "train_locomotive",
+      "name": "Паровоз",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "locomotive",
+        "western"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.4293325543403625,
+        2.6000001430511475,
+        1.6594994068145752
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 120320,
+      "fetched_at": "2026-08-16T21:48:00Z",
+      "asset_version": 2,
+      "path": "vehicle/train_locomotive"
+    },
+    {
+      "id": "train_tender",
+      "name": "Тендер с углём",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "tender",
+        "coal"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.2000234127044678,
+        2.700000286102295,
+        1.6456960439682007
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 87064,
+      "fetched_at": "2026-08-16T21:48:00Z",
+      "asset_version": 2,
+      "path": "vehicle/train_tender"
+    },
+    {
+      "id": "train_woodcar",
+      "name": "Вагон с дровами",
+      "category": "vehicle",
+      "tags": [
+        "train",
+        "wood"
+      ],
+      "file": "model.glb",
+      "dimensions_m": [
+        1.2000234127044678,
+        2.700000047683716,
+        1.5748240947723389
+      ],
+      "pivot": "base_center",
+      "forward_axis": "+Y",
+      "up_axis": "+Z",
+      "has_armature": false,
+      "animations": [],
+      "source": "kenney",
+      "source_url": "https://kenney.nl/assets/train-kit",
+      "file_size_bytes": 83704,
+      "fetched_at": "2026-08-16T21:48:02Z",
+      "asset_version": 2,
+      "path": "vehicle/train_woodcar"
+    }
+  ]
+}

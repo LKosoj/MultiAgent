@@ -64,6 +64,8 @@ except ImportError:
 # Импорт общего функционала для генераторов видео
 # Только те функции, которые реально используются в этом модуле
 from custom_tools.storybook.video_generator_common import (
+    _VIDEO_MODEL_CAPABILITIES_REGISTRY,
+    parse_duration_seconds_from_timing,
     update_shots_with_descriptions,
     sync_items_to_memory
 )
@@ -74,12 +76,17 @@ from custom_tools.storybook.video_generator_aitunnel_jobs import (
     _hash_text,
     _new_provider_job,
 )
+from custom_tools.storybook.video_generator_aitunnel_media import _select_best_supported_duration
 
 
 _VEO_PROVIDER_NAME = "veo"
-_VEO_MODEL_NAME = 'veo-3.1-generate-preview'
-_VEO_ASPECT_RATIO = "16:9"
-_VEO_RESOLUTION = "720p"
+# Централизованный реестр возможностей видеомоделей (раздел 6.1 ТЗ): значение
+# живёт только в _VIDEO_MODEL_CAPABILITIES_REGISTRY, эти имена — производные,
+# чтобы не переписывать десятки мест использования констант ниже по файлу.
+_VEO_CAPS = _VIDEO_MODEL_CAPABILITIES_REGISTRY["video_generator_veo_tool"]
+_VEO_MODEL_NAME = _VEO_CAPS["model"]
+_VEO_ASPECT_RATIO = _VEO_CAPS["aspect_ratio"]
+_VEO_RESOLUTION = _VEO_CAPS["resolution"]
 
 
 class _VeoPollTimeoutError(Exception):
@@ -202,7 +209,13 @@ def video_generator_veo_tool(
         logger.info("🎬 Генерация видео Veo отключена (enable=False). Анализ изображений завершен.")
         return {"status": "skipped", "message": "Генерация видео отключена, анализ изображений выполнен", "results": []}
     
-    if descriptions_updated:
+    if descriptions_updated < 0:
+        # Запись shots.json не удалась (см. журнал
+        # update_shots_with_descriptions) — items_list в памяти уже
+        # содержит обновления, перечитывать диск нельзя: там осталась
+        # устаревшая версия, это откатило бы их.
+        logger.error(f"❌ Не удалось сохранить обновлённые описания в {shots_file_path}, используем данные из памяти")
+    elif descriptions_updated:
         logger.info("🔄 Описания обновлены, перезагружаем данные из shots.json")
         # Перезагружаем данные после обновления описаний
         try:
@@ -392,6 +405,12 @@ def _generate_single_video_veo(
 
     try:
         backend_identity = f"vertex:{project_id}:{location}" if use_vertex else "gemini"
+        # M-6: запрошенная длительность (из timing) идёт в хеш входа, а подогнанная
+        # под supported_durations модели — только в config_params запроса и в
+        # resolved_duration журнала (раздел 6.1 ТЗ). Раньше разбора timing здесь не
+        # было вовсе, и в хеш уходил requested_duration=0.
+        requested_duration = parse_duration_seconds_from_timing(item.get("timing", "00:00 - 00:05"))
+        resolved_duration = _select_best_supported_duration(requested_duration, _VEO_CAPS["supported_durations"])
         prompt_hash = _hash_text(str(prompt or ""))
         source_image_hashes = {
             "start_image": _hash_source_image(start_path),
@@ -412,6 +431,7 @@ def _generate_single_video_veo(
             trusted_output_job
             and trusted_output_job.get("prompt_hash") == prompt_hash
             and trusted_output_job.get("model") == _VEO_MODEL_NAME
+            and trusted_output_job.get("resolved_duration") == resolved_duration
             and (trusted_output_job.get("resolved_size_params") or {}) == {
                 "aspect_ratio": _VEO_ASPECT_RATIO,
                 "resolution": _VEO_RESOLUTION,
@@ -440,7 +460,7 @@ def _generate_single_video_veo(
             model_name=f"{_VEO_MODEL_NAME}|{backend_identity}|{_VEO_ASPECT_RATIO}|{_VEO_RESOLUTION}|1",
             prompt_hash=prompt_hash,
             source_image_hashes=source_image_hashes,
-            requested_duration=0,
+            requested_duration=requested_duration,
             requested_width=0,
             requested_height=0,
             seed=None,
@@ -461,7 +481,7 @@ def _generate_single_video_veo(
                     input_hash=input_hash,
                     output_path=str(video_path),
                     resolved_size_params={"aspect_ratio": _VEO_ASPECT_RATIO, "resolution": _VEO_RESOLUTION},
-                    resolved_duration=None,
+                    resolved_duration=resolved_duration,
                     provider_name=_VEO_PROVIDER_NAME,
                 )
             )
@@ -530,6 +550,11 @@ def _generate_single_video_veo(
                 "number_of_videos": 1,
                 "aspect_ratio": _VEO_ASPECT_RATIO,
                 "resolution": _VEO_RESOLUTION,
+                # Имя поля сверено с google-genai 1.72.0 (types.GenerateVideosConfig,
+                # см. также GenerateVideosConfigDict): "Duration of the clip for video
+                # generation in seconds". Пакет не установлен в этом окружении —
+                # сверить с фактически используемой версией при первом боевом запуске.
+                "duration_seconds": resolved_duration,
             }
 
             if end_bytes:

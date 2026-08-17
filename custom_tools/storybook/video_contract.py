@@ -1,10 +1,15 @@
 import json
 import os
+import re
 import shutil
+import subprocess
 from pathlib import Path
+from typing import Optional
 
 import yaml
 
+from custom_tools.storybook.blockout_assets import read_index as _read_blockout_asset_index
+from custom_tools.storybook.blockout_common import MIN_BLENDER_VERSION
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
 
 
@@ -202,6 +207,42 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "reason": "Pause/resume is bound to the local PipelineRunner instance.",
     },
     {
+        "id": "blockout_render",
+        "label": "Render 3D blockout for shots",
+        "category": "execution",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "reason": "Blockout rendering needs local Blender and file-system access.",
+    },
+    {
+        "id": "blockout_preview_build",
+        "label": "Build blockout preview video",
+        "category": "execution",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "reason": "Preview assembly runs ffmpeg over local blockout frames.",
+    },
+    {
+        "id": "blockout_review",
+        "label": "Review blockout vs generated frames",
+        "category": "media_manager",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "reason": "Side-by-side blockout review is a desktop-only flow.",
+    },
+    {
+        "id": "blockout_asset_map_edit",
+        "label": "Edit blockout asset mapping",
+        "category": "artifact_editor",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "reason": "Asset mapping editing needs the object library preview.",
+    },
+    {
         "id": "regenerate_image",
         "label": "Regenerate one image",
         "category": "selective_regeneration",
@@ -224,6 +265,15 @@ STORYBOOK_WORKFLOW_ACTIONS = (
             "react": "not_implemented",
             "streamlit": "not_implemented",
         },
+    },
+    {
+        "id": "blockout_regenerate_shots",
+        "label": "Regenerate selected blockout shots",
+        "category": "selective_regeneration",
+        "status": "manager_only",
+        "service_action": None,
+        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "reason": "Blockout rendering needs local Blender and file-system access.",
     },
     {
         "id": "fix_project_errors",
@@ -285,6 +335,8 @@ def storybook_video_preflight_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
+    generate_blockout: bool = False,
+    use_blockout_reference: bool = False,
 ) -> dict:
     """Write a provider capability preflight summary for storybook video.
 
@@ -293,8 +345,10 @@ def storybook_video_preflight_tool(
         project_id: Storybook project identifier under plots/storybooks.
         language: Language code stored in generated metadata.
         enable: Whether video generation is requested for this run.
+        generate_blockout: Whether the project's blockout layer is enabled (раздел 11.4).
+        use_blockout_reference: Whether the blockout clip will be submitted as a video reference.
     """
-    summary = _provider_summary(session_id, project_id, language, enable)
+    summary = _provider_summary(session_id, project_id, language, enable, generate_blockout, use_blockout_reference)
     _atomic_write_json(Path(summary["artifact_path"]), summary)
     return summary
 
@@ -304,6 +358,8 @@ def storybook_video_delivery_promise_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
+    generate_blockout: bool = False,
+    use_blockout_reference: bool = False,
 ) -> dict:
     """Write the explicit delivery promise for motion-led storybook video.
 
@@ -312,9 +368,11 @@ def storybook_video_delivery_promise_tool(
         project_id: Storybook project identifier under plots/storybooks.
         language: Language code stored in generated metadata.
         enable: Whether video generation is requested for this run.
+        generate_blockout: Whether the project's blockout layer is enabled (раздел 11.4).
+        use_blockout_reference: Whether the blockout clip will be submitted as a video reference.
     """
     enabled = _as_bool(enable)
-    summary = _provider_summary(session_id, project_id, language, enabled)
+    summary = _provider_summary(session_id, project_id, language, enabled, generate_blockout, use_blockout_reference)
     expected_outputs = [item["video_path"] for item in summary["expected_video_items"]]
 
     blocking_reasons = []
@@ -351,6 +409,10 @@ def storybook_video_delivery_promise_tool(
         "artifact_path": artifact_path,
         "provider_menu_artifact_path": summary["artifact_path"],
         "delivery_promise": _delivery_message(enabled, will_generate, blocking_reasons, len(expected_outputs)),
+        # Раздел 11.4: верхняя оценка (условия 1, 2, 5 раздела 11.3 — 3 и 4 требуют
+        # каталога видеомодели и здесь не проверяются); фактический исход по каждому
+        # шоту фиксирует video_generator предупреждением P09.
+        "blockout_reference_forecast": summary["blockout"]["reference_forecast"],
     }
     if status == "error":
         promise["error"] = promise["delivery_promise"]
@@ -413,14 +475,28 @@ def storybook_video_music_readiness(
     language: str = "ru",
     enable: bool = True,
     generate_music: bool = True,
+    generate_blockout: Optional[bool] = None,
+    blockout_use_as_video_reference: Optional[bool] = None,
 ) -> dict:
     """Return a UI-safe readiness summary for storybook video, music, and render.
 
     The summary contains booleans, provider names, paths, and artifact statuses only.
     It intentionally never returns raw API keys or other secret values.
+
+    generate_blockout/blockout_use_as_video_reference (раздел 18.3): трёхуровневый
+    приоритет — явный аргумент важнее 00_brief.json, файл важнее умолчания False.
+    None означает «аргумент не передан» и включает чтение брифа. Панель генерации
+    передаёт сюда текущие значения флажков напрямую, минуя файл; веб-поверхности
+    зовут функцию без этих двух аргументов, и тогда состояние читается из
+    00_brief.json проекта (при отсутствии ключей — False).
     """
     base = _project_dir(project_id)
-    summary = _provider_summary(session_id, project_id, language, enable)
+    resolved_generate_blockout, resolved_use_reference = _resolve_blockout_flags(
+        base, generate_blockout, blockout_use_as_video_reference
+    )
+    summary = _provider_summary(session_id, project_id, language, enable, resolved_generate_blockout, resolved_use_reference)
+    summary["blockout"]["blender"] = _probe_blockout_blender_readiness()
+    summary["blockout"]["asset_library"] = _blockout_asset_library_summary()
     contract_dir = base / "96_video_contract"
     shots_dir = base / "97_shots"
     audio_dir = base / "98_audio"
@@ -493,6 +569,7 @@ def storybook_video_music_readiness(
             "shots_path": summary["shots_path"],
             "shots_exists": summary["shots_exists"],
             "shots_error": summary["shots_error"],
+            "blockout": summary["blockout"],
         },
         "music": {
             "enabled": music_enabled,
@@ -541,8 +618,10 @@ def storybook_video_music_readiness(
     return payload
 
 
-def _provider_summary(session_id, project_id, language, enable):
+def _provider_summary(session_id, project_id, language, enable, generate_blockout=False, use_blockout_reference=False):
     enabled = _as_bool(enable)
+    blockout_enabled = _as_bool(generate_blockout)
+    blockout_use_reference = _as_bool(use_blockout_reference)
     shots_path, items, shots_error = _load_shots(project_id)
     provider, providers = _select_provider()
     ffmpeg_path = shutil.which("ffmpeg")
@@ -589,8 +668,139 @@ def _provider_summary(session_id, project_id, language, enable):
             ),
         },
         "expected_video_items": expected_video_items,
+        "blockout": {
+            "enabled": blockout_enabled,
+            "use_reference": blockout_use_reference,
+            "reference_forecast": _blockout_reference_forecast(items, blockout_enabled, blockout_use_reference),
+        },
     }
     return summary
+
+
+def _blockout_reference_forecast(items, generate_blockout, use_blockout_reference):
+    """Раздел 11.4: верхняя оценка того, сколько шотов может получить видео-референс
+    болванки и сколько заведомо нет — по условиям 1, 2, 5 раздела 11.3. Условия 3 и 4
+    (совпадение длительности/соотношения сторон) требуют записи активной видеомодели
+    и здесь не проверяются: video_contract.py к каталогу моделей не обращается."""
+    reference_enabled = bool(generate_blockout and use_blockout_reference)
+    expected_count = 0
+    eligible = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        video_prompt = str(item.get("video_prompt") or "").strip()
+        video_path = str(item.get("video_path") or "").strip()
+        if not (video_prompt and video_path):
+            continue
+        expected_count += 1
+        if not reference_enabled:
+            continue
+        blockout_video = str(item.get("blockout_video") or "").strip()
+        if not blockout_video or not Path(blockout_video).exists():
+            continue
+        if item.get("blockout_junction_failed"):
+            continue
+        eligible += 1
+
+    return {"eligible": eligible, "not_eligible": expected_count - eligible}
+
+
+def _resolve_blockout_flags(project_dir, generate_blockout, blockout_use_as_video_reference):
+    """Раздел 18.3: разрешает два Optional[bool]-параметра готовности болванки по
+    трёхуровневому приоритету (аргумент > 00_brief.json > False). Бриф читается
+    не более одного раза и только если он вообще нужен."""
+    brief = None
+    if generate_blockout is None or blockout_use_as_video_reference is None:
+        brief = _read_json(project_dir / "00_brief.json") or {}
+    resolved_blockout = (
+        _as_bool(generate_blockout)
+        if generate_blockout is not None
+        else _as_bool(brief.get("generate_blockout", False))
+    )
+    resolved_reference = (
+        _as_bool(blockout_use_as_video_reference)
+        if blockout_use_as_video_reference is not None
+        else _as_bool(brief.get("blockout_use_as_video_reference", False))
+    )
+    return resolved_blockout, resolved_reference
+
+
+_BLOCKOUT_BLENDER_READINESS_TIMEOUT = 5
+
+
+def _probe_blockout_blender_readiness():
+    """Раздел 18.3: разовая информационная проверка наличия и версии Blender для
+    панели готовности. Правила те же, что у B12 (check_blender_available(),
+    custom_tools/storybook/blockout_common.py), но с тайм-аутом 5 секунд, а не с
+    захардкоженными там 30: обе веб-поверхности зовут эту функцию синхронно, и
+    более длинный тайм-аут держал бы обработчик запроса. Никогда не бросает
+    исключения."""
+    mode = (os.getenv("BLOCKOUT_BLENDER_MODE") or "binary").strip().lower()
+    if mode == "module":
+        try:
+            import bpy  # type: ignore[import-not-found]
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "available": False, "version": None, "mode": mode, "path": None,
+                "message": f"bpy module not importable: {exc}",
+            }
+        version = tuple(bpy.app.version[:2])
+        version_str = f"{version[0]}.{version[1]}"
+        if version < MIN_BLENDER_VERSION:
+            return {
+                "available": False, "version": version_str, "mode": mode, "path": None,
+                "message": f"blender module version {version_str} is below minimum "
+                           f"{MIN_BLENDER_VERSION[0]}.{MIN_BLENDER_VERSION[1]}",
+            }
+        return {"available": True, "version": version_str, "mode": mode, "path": None, "message": "ok"}
+
+    blender_bin = os.getenv("BLOCKOUT_BLENDER_BIN") or shutil.which("blender")
+    if not blender_bin:
+        return {
+            "available": False, "version": None, "mode": mode, "path": None,
+            "message": "blender binary not found in PATH (set BLOCKOUT_BLENDER_BIN)",
+        }
+    try:
+        proc = subprocess.run(
+            [blender_bin, "--version"],
+            capture_output=True, text=True,
+            timeout=_BLOCKOUT_BLENDER_READINESS_TIMEOUT, check=False,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "available": False, "version": None, "mode": mode, "path": blender_bin,
+            "message": f"failed to run '{blender_bin} --version': {exc}",
+        }
+    if proc.returncode != 0:
+        return {
+            "available": False, "version": None, "mode": mode, "path": blender_bin,
+            "message": f"'{blender_bin} --version' exited with code {proc.returncode}",
+        }
+    match = re.search(r"Blender\s+(\d+)\.(\d+)", proc.stdout)
+    if not match:
+        return {
+            "available": False, "version": None, "mode": mode, "path": blender_bin,
+            "message": f"could not parse blender version from output: {proc.stdout[:200]!r}",
+        }
+    version = (int(match.group(1)), int(match.group(2)))
+    version_str = f"{version[0]}.{version[1]}"
+    if version < MIN_BLENDER_VERSION:
+        return {
+            "available": False, "version": version_str, "mode": mode, "path": blender_bin,
+            "message": f"blender version {version_str} is below minimum "
+                       f"{MIN_BLENDER_VERSION[0]}.{MIN_BLENDER_VERSION[1]}",
+        }
+    return {"available": True, "version": version_str, "mode": mode, "path": blender_bin, "message": "ok"}
+
+
+def _blockout_asset_library_summary():
+    """Раздел 18.3/9.1/9.5: сводка по общей библиотеке 3D-объектов для панели
+    готовности — число объектов в index.json и состояние автоподбора
+    (BLOCKOUT_ASSET_FETCH, по умолчанию включён)."""
+    index = _read_blockout_asset_index()
+    object_count = len(index.get("objects") or [])
+    fetch_enabled = (os.getenv("BLOCKOUT_ASSET_FETCH") or "on").strip().lower() != "off"
+    return {"object_count": object_count, "fetch_enabled": fetch_enabled}
 
 
 def _readiness_blockers(summary, capabilities):

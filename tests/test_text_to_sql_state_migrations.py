@@ -44,7 +44,7 @@ def test_state_manifest_matches_all_owning_schema_heads() -> None:
         "memory_db": MEMORY_DB_SCHEMA_VERSION,
         "result_outbox": WORKFLOW_RESULT_OUTBOX_SCHEMA_VERSION,
     }
-    assert manifest == {"event_store": 8, "memory_db": 1, "result_outbox": 3}
+    assert manifest == {"event_store": 10, "memory_db": 1, "result_outbox": 3}
 
 
 def test_migration_runner_invokes_owner_initializers_and_verifies_exact_heads(
@@ -63,13 +63,13 @@ def test_migration_runner_invokes_owner_initializers_and_verifies_exact_heads(
     assert report["schema_heads"] == {
         key: {"expected": expected, "actual": expected}
         for key, expected in {
-            "event_store": 8,
+                "event_store": 10,
             "memory_db": 1,
             "result_outbox": 3,
         }.items()
     }
     assert {key: _head(path) for key, path in paths.items()} == {
-        "event_store": 8,
+        "event_store": 10,
         "memory_db": 1,
         "result_outbox": 3,
     }
@@ -83,7 +83,7 @@ def test_migration_runner_rejects_future_head_without_mutating_it(tmp_path: Path
 
     paths = _store_paths(tmp_path)
     connection = sqlite3.connect(paths["event_store"])
-    connection.execute("PRAGMA user_version=9")
+    connection.execute("PRAGMA user_version=11")
     connection.close()
 
     with pytest.raises(FutureSchemaVersionError, match="event_store"):
@@ -93,7 +93,7 @@ def test_migration_runner_rejects_future_head_without_mutating_it(tmp_path: Path
             store_paths=paths,
         )
 
-    assert _head(paths["event_store"]) == 9
+    assert _head(paths["event_store"]) == 11
     assert not paths["memory_db"].exists()
     assert not paths["result_outbox"].exists()
 

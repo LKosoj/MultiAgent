@@ -73,16 +73,12 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
   const [naturalQuery, setNaturalQuery] = useState("");
   const [connectionRef, setConnectionRef] = useState("");
   const [sessionId, setSessionId] = useState("");
-  const [workflowName, setWorkflowName] = useState("text_to_sql_pipeline");
   const [maxRows, setMaxRows] = useState("100");
-  const [useEnhanced, setUseEnhanced] = useState(true);
-  const [allowEnhancedFallback, setAllowEnhancedFallback] = useState(false);
   const [enableTelemetry, setEnableTelemetry] = useState(true);
   const [safetyLevel, setSafetyLevel] = useState("strict");
   const [includeExplanation, setIncludeExplanation] = useState(true);
   const [validateSchema, setValidateSchema] = useState(true);
   const [dryRunOnly, setDryRunOnly] = useState(false);
-  const [useSchemaSuggestions, setUseSchemaSuggestions] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [connections, setConnections] = useState<TextToSqlConnection[]>([]);
   const [schemaFilter, setSchemaFilter] = useState("");
@@ -232,14 +228,8 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
           setNaturalQuery={setNaturalQuery}
           sessionId={sessionId}
           setSessionId={setSessionId}
-          workflowName={workflowName}
-          setWorkflowName={setWorkflowName}
           maxRows={maxRows}
           setMaxRows={setMaxRows}
-          useEnhanced={useEnhanced}
-          setUseEnhanced={setUseEnhanced}
-          allowEnhancedFallback={allowEnhancedFallback}
-          setAllowEnhancedFallback={setAllowEnhancedFallback}
           enableTelemetry={enableTelemetry}
           setEnableTelemetry={setEnableTelemetry}
           safetyLevel={safetyLevel}
@@ -250,8 +240,6 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
           setValidateSchema={setValidateSchema}
           dryRunOnly={dryRunOnly}
           setDryRunOnly={setDryRunOnly}
-          useSchemaSuggestions={useSchemaSuggestions}
-          setUseSchemaSuggestions={setUseSchemaSuggestions}
           isSubmitting={isSubmitting}
           setIsSubmitting={setIsSubmitting}
         />

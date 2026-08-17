@@ -1,0 +1,26 @@
+{
+  "id": "wooden_bed",
+  "name": "Деревянная кровать",
+  "category": "prop",
+  "tags": [
+    "bed",
+    "wood",
+    "desc:Мечта мальчика об уюте."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    7.460257858037949,
+    6.399373650550842,
+    3.6000014543533325
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/562722351be64b8b95a2a94a65643610",
+  "file_size_bytes": 706436,
+  "fetched_at": "2026-08-17T05:04:06Z",
+  "asset_version": 1
+}

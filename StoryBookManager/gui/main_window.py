@@ -17,6 +17,7 @@ from StoryBookManager.gui.project_panel import ProjectPanel
 from StoryBookManager.gui.editor_panel import EditorPanel
 from StoryBookManager.gui.media_panel import MediaPanel
 from StoryBookManager.gui.generation_panel import GenerationPanel
+from StoryBookManager.gui.blockout_panel import BlockoutPanel
 from StoryBookManager.gui.settings_dialog import SettingsDialog
 
 logger = logging.getLogger(__name__)
@@ -200,7 +201,12 @@ class MainWindow:
             on_generation_complete=self.on_generation_complete,
         )
         self.notebook.add(self.generation_panel, text="🚀 Генерация", state="disabled")
-        
+
+        # Панель болванки (раздел 18.4) — регистрируется последней, использует
+        # generation_panel для запуска шагов (общая блокировка is_generating)
+        self.blockout_panel = BlockoutPanel(self.notebook, self.generation_panel)
+        self.notebook.add(self.blockout_panel, text="🧊 Болванка", state="disabled")
+
         # Обработчик смены вкладок
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
     
@@ -254,6 +260,7 @@ class MainWindow:
             self.editor_panel.load_project(project)
             self.media_panel.load_project(project)
             self.generation_panel.load_project(project)
+            self.blockout_panel.load_project(project)
             
             self.set_status(f"Загружен проект: {project.name}")
             logger.info(f"Выбран проект: {project.project_id}")
@@ -278,6 +285,10 @@ class MainWindow:
                 self.media_panel.refresh_media()
             except Exception as e:
                 logger.warning(f"Ошибка обновления медиа после генерации: {e}")
+            try:
+                self.blockout_panel.refresh()
+            except Exception as e:
+                logger.warning(f"Ошибка обновления вкладки болванки после генерации: {e}")
             # Перезагружаем редактор только если нет несохранённых изменений
             try:
                 if self.editor_panel.has_unsaved_changes():
@@ -357,8 +368,8 @@ class MainWindow:
         if not self.current_project:
             messagebox.showwarning("Предупреждение", "Выберите проект для запуска pipeline")
             return
-        # Переключаемся на вкладку генерации (индекс 3)
-        self.notebook.select(3)
+        # Переключаемся на вкладку генерации
+        self.notebook.select(self.generation_panel)
         self.generation_panel.run_from_step()
     
     def backup_project(self):
@@ -413,7 +424,12 @@ class MainWindow:
 
     def apply_settings(self):
         """Применение настроек без перезапуска приложения."""
-        self.project_manager.projects_dir = app_settings.get_projects_directory()
+        import os
+
+        from custom_tools.storybook.project_paths import storybook_projects_root
+
+        os.environ["STORYBOOK_PROJECTS_DIR"] = str(app_settings.get_projects_directory())
+        self.project_manager.projects_dir = storybook_projects_root()
         self.project_manager.backup_dir = app_settings.get_backup_directory()
         logging.getLogger().setLevel(app_settings.get("log_level", "INFO"))
         self.refresh_projects()

@@ -19,26 +19,27 @@ from custom_tools.storybook.video_generator_aitunnel_jobs import (
 )
 from custom_tools.storybook.video_generator_aitunnel_media import (
     _build_frame_image_payload,
+    _build_reference_video_payload,
     _is_url_or_data_url,
     _resolve_frame_dimensions,
     _resolve_model_and_size,
+    _should_attach_blockout_reference,
 )
 from custom_tools.storybook.video_generator_common import (
+    _get_aitunnel_video_models,
+    parse_duration_seconds_from_timing,
     sync_items_to_memory,
     update_shots_with_descriptions,
 )
 
 logger = logging.getLogger(__name__)
 
-_AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/videos"
 _DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1"
 _DEFAULT_TIMEOUT_SECONDS = 60
 _DEFAULT_MAX_WAIT_SECONDS = 900
 _DEFAULT_POLL_INTERVAL_SECONDS = 15
 _DEFAULT_POLL_MAX_TRANSIENT_ERRORS = 5
 _DEFAULT_POLL_BACKOFF_CAP_SECONDS = 120
-_AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
-_AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
 
 
 class _PollTransientError(Exception):
@@ -99,6 +100,8 @@ def video_generator_aitunnel_tool(
     skip_prompt_enhancement: bool = False,
     sample_before_batch: bool = False,
     sample_shot_key: Optional[str] = None,
+    generate_blockout: bool = False,
+    use_blockout_reference: bool = False,
 ) -> Dict[str, Any]:
     """
     Генерирует видео через AITUNNEL, сохраняя контракт storybook video tools.
@@ -120,6 +123,8 @@ def video_generator_aitunnel_tool(
         skip_prompt_enhancement: Пропустить улучшение промпта (только перевод и т.п.).
         sample_before_batch: Если True, обрабатывает только один выбранный/ожидающий шот.
         sample_shot_key: Опциональный ключ шота в формате "scene-shot" для sample режима.
+        generate_blockout: Включён ли слой болванок проекта (раздел 11.3).
+        use_blockout_reference: Подавать ли ролик болванки видео-референсом в запрос (раздел 11.3).
 
     Returns:
         Словарь со статусом, сообщением и списком results по шотам.
@@ -128,6 +133,8 @@ def video_generator_aitunnel_tool(
     force_update_prompts = _as_bool(force_update_prompts)
     skip_prompt_enhancement = _as_bool(skip_prompt_enhancement)
     sample_before_batch = _as_bool(sample_before_batch)
+    generate_blockout = _as_bool(generate_blockout)
+    use_blockout_reference = _as_bool(use_blockout_reference)
     if not enable and not project_id and items is None:
         logger.info("🎬 Генерация видео AITUNNEL отключена (enable=False).")
         return {
@@ -185,7 +192,13 @@ def video_generator_aitunnel_tool(
             force_update=force_update_prompts,
             skip_prompt_enhancement=skip_prompt_enhancement,
         )
-        if descriptions_updated:
+        if descriptions_updated < 0:
+            # Запись shots.json не удалась (см. журнал
+            # update_shots_with_descriptions) — items_list в памяти уже
+            # содержит обновления, перечитывать диск нельзя: там осталась
+            # устаревшая версия, это откатило бы их.
+            logger.error("❌ Не удалось сохранить обновлённые описания в %s, используем данные из памяти", shots_file_path)
+        elif descriptions_updated:
             logger.info("🔄 Описания обновлены, перезагружаем данные из shots.json")
             try:
                 with open(shots_file_path, "r", encoding="utf-8") as shots_file:
@@ -270,6 +283,8 @@ def video_generator_aitunnel_tool(
                     seed,
                     language,
                     job_store,
+                    generate_blockout,
+                    use_blockout_reference,
                 ): item
                 for item in batch_items
             }
@@ -288,6 +303,11 @@ def video_generator_aitunnel_tool(
                         "video_path": item.get("video_path"),
                     }
                 results.append(result)
+
+    # ТЗ раздел 20.3, код P09: video_generator — единственный, кто знает,
+    # какие референсы фактически ушли в запрос; фиксирует результат уже
+    # принятого решения (_should_attach_blockout_reference), не дублируя его.
+    _write_video_generator_report_section(project_id, results, generate_blockout)
 
     successful = len([result for result in results if result.get("success")])
     total = len(results)
@@ -346,6 +366,68 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, (int, float)):
         return value != 0
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+# P09_SKIPPED_REASON — условие 1 §11.3 (слой болванок/видео-референс выключены
+# конфигурацией). ТЗ §20.2: P09 фиксируется только для невыполненных условий
+# 2-5 — намеренно выключенный референс не является наблюдением, о котором
+# нужно предупреждать.
+_P09_SKIPPED_REASON = "condition_1_reference_disabled"
+
+
+def _write_video_generator_report_section(
+    project_id: Optional[str],
+    results: List[Dict[str, Any]],
+    generate_blockout: bool,
+) -> None:
+    """ТЗ раздел 20.3: секция ``video_generator`` (код P09) в
+    ``93_blockout/report.json``, под той же sidecar-блокировкой, что и у
+    остальных писателей отчёта. Пишется последней в графе шагов.
+
+    Создатель файла — только ``blockout_scene_builder``: если файла ещё
+    нет, эта функция ничего не создаёт и не падает. Секция пишется только
+    при включённом слое болванок (иначе P09 не возникает вовсе, раздел
+    20.3); внутри секции — слияние по ключу шота (scene_number,
+    shot_number), чужие находки вне scope этого прогона не трогаются.
+    """
+    if not generate_blockout or not project_id:
+        return
+
+    from custom_tools.storybook.blockout_scene_builder import merge_write_report
+    from custom_tools.storybook.project_paths import safe_storybook_project_dir
+
+    report_path = safe_storybook_project_dir(project_id) / "93_blockout" / "report.json"
+    if not report_path.is_file():
+        return
+
+    processed_keys = set()
+    findings: List[Dict[str, Any]] = []
+    for result in results:
+        scene_number = result.get("scene_number")
+        shot_number = result.get("shot_number")
+        processed_keys.add((scene_number, shot_number))
+        reason = result.get("video_reference_rejected_reason")
+        if reason and reason != _P09_SKIPPED_REASON:
+            findings.append({
+                "code": "P09",
+                "level": "warning",
+                "scene_number": scene_number,
+                "shot_number": shot_number,
+                "message": f"blockout video reference not attached to the request: {reason}",
+                "details": {"reason": reason},
+            })
+
+    def _update(section: Dict[str, Any]) -> Dict[str, Any]:
+        section = dict(section)
+        checks = [
+            c for c in (section.get("checks") or [])
+            if (c.get("scene_number"), c.get("shot_number")) not in processed_keys
+        ]
+        checks.extend(findings)
+        section["checks"] = checks
+        return section
+
+    merge_write_report(report_path, "video_generator", _update)
 
 
 def _collect_video_items(items_list: List[Dict[str, Any]], include_existing: bool = False) -> List[Dict[str, Any]]:
@@ -484,6 +566,8 @@ def _generate_single_video_aitunnel(
     seed: Optional[int],
     language: str,
     job_store: Optional[_ProviderJobStore] = None,
+    generate_blockout: bool = False,
+    use_blockout_reference: bool = False,
 ) -> Dict[str, Any]:
     del session_id
 
@@ -494,6 +578,10 @@ def _generate_single_video_aitunnel(
     start_image = item.get("start_image")
     end_image = item.get("end_image")
     input_hash: Optional[str] = None
+    # ТЗ раздел 20.2/20.3, код P09: причина отказа условий 2-5 §11.3, если
+    # видео-референс болванки не был подан (см. _should_attach_blockout_reference
+    # ниже). Предобъявлено, чтобы быть доступным и в except-обработчике.
+    video_reference_rejected_reason: Optional[str] = None
 
     try:
         prompt = _resolve_video_prompt(item, language)
@@ -562,8 +650,23 @@ def _generate_single_video_aitunnel(
             if not output_exists:
                 raise
 
+        # Раздел 11.3: подавать ли ролик болванки видео-референсом. Пять условий
+        # проверяются здесь, до формирования хеша и записи журнала задания.
+        should_attach_reference, reference_info = _should_attach_blockout_reference(
+            item, generate_blockout, use_blockout_reference, duration, size_params
+        )
+        reference_video_path = reference_info if should_attach_reference else None
+        video_reference_rejected_reason = None if should_attach_reference else reference_info
+        reference_video_hash = _hash_source_image(reference_video_path) if reference_video_path else None
+
         # M-6: hash user inputs only; the catalog-resolved model/size/duration are
         # stored as job metadata below, never fed into input_hash.
+        # Note: duration normalization in 97_shots rewrites `timing`/`duration_s` before
+        # requested_duration is derived, so it still flows in via user input and does not
+        # violate M-6. A model-catalog change can still trigger regeneration for affected
+        # shots — now with an explicit P16 warning + shot list instead of silently.
+        # Э8 (раздел 11.3): reference_video_hash входит в словарь только когда референс
+        # действительно подан — иначе состав словаря и хеш остаются прежними (A31/A37).
         input_hash = _build_input_hash(
             model_name=configured_model,
             prompt_hash=prompt_hash,
@@ -573,6 +676,7 @@ def _generate_single_video_aitunnel(
             requested_height=requested_height,
             seed=seed,
             frame_types=frame_types,
+            reference_video_hash=reference_video_hash,
         )
 
         if job_store:
@@ -589,6 +693,8 @@ def _generate_single_video_aitunnel(
                     output_path=str(video_path),
                     resolved_size_params=size_params,
                     resolved_duration=duration,
+                    video_reference=reference_video_path,
+                    video_reference_rejected_reason=video_reference_rejected_reason,
                 )
             )
         else:
@@ -622,6 +728,7 @@ def _generate_single_video_aitunnel(
                 "cost_rub": None,
                 "cost": None,
                 "currency": None,
+                "video_reference_rejected_reason": video_reference_rejected_reason,
             }
 
         frame_images = [_build_frame_image_payload(start_image, "first_frame")]
@@ -638,6 +745,8 @@ def _generate_single_video_aitunnel(
         payload.update(size_params)
         if seed is not None:
             payload["seed"] = seed
+        if reference_video_path:
+            payload["reference_video"] = _build_reference_video_payload(reference_video_path)
 
         video_dir = os.path.dirname(video_path)
         if video_dir:
@@ -857,6 +966,7 @@ def _generate_single_video_aitunnel(
             "cost_rub": cost if currency == "RUB" else ((status_payload.get("usage") or {}).get("cost_rub")),
             "cost": cost,
             "currency": currency,
+            "video_reference_rejected_reason": video_reference_rejected_reason,
         }
     except Exception as exc:
         if job_store and input_hash:
@@ -877,6 +987,7 @@ def _generate_single_video_aitunnel(
             "scene_number": scene_number,
             "shot_number": shot_number,
             "video_path": video_path,
+            "video_reference_rejected_reason": video_reference_rejected_reason,
         }
 
 
@@ -1058,60 +1169,5 @@ def _stored_video_url_requires_auth(job: Dict[str, Any], video_url: str, base_ur
     return str(video_url or "").startswith(base_url.rstrip("/") + "/")
 
 
-def _get_aitunnel_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
-    global _AITUNNEL_MODELS_CACHE
-
-    # Fast-path: avoid lock acquisition on cache-hit (double-checked locking).
-    if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
-        return _AITUNNEL_MODELS_CACHE
-
-    with _AITUNNEL_MODELS_CACHE_LOCK:
-        if _AITUNNEL_MODELS_CACHE is not None and not force_refresh:
-            return _AITUNNEL_MODELS_CACHE
-
-        response = requests.get(_AITUNNEL_MODELS_URL, timeout=_DEFAULT_TIMEOUT_SECONDS)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"AITUNNEL models endpoint failed: {response.status_code} - {response.text}"
-            )
-
-        payload = response.json()
-        if not isinstance(payload, dict):
-            raise RuntimeError(f"Неверный ответ публичного models endpoint: {payload}")
-
-        _AITUNNEL_MODELS_CACHE = payload
-        return payload
-
-
 def _parse_duration_from_timing(timing: str) -> int:
-    try:
-        if " - " in timing:
-            start_str, end_str = timing.split(" - ", 1)
-            duration = _time_str_to_seconds(end_str.strip()) - _time_str_to_seconds(start_str.strip())
-        elif str(timing).endswith("s"):
-            duration = int(str(timing)[:-1])
-        else:
-            duration = int(timing)
-    except Exception:
-        duration = 6
-
-    if duration < 1:
-        return 1
-    return duration
-
-
-def _time_str_to_seconds(time_str: str) -> int:
-    parts = time_str.split(":")
-    try:
-        if len(parts) == 2:
-            minutes = int(parts[0])
-            seconds = int(parts[1])
-            return minutes * 60 + seconds
-        if len(parts) == 3:
-            hours = int(parts[0])
-            minutes = int(parts[1])
-            seconds = int(parts[2])
-            return hours * 3600 + minutes * 60 + seconds
-    except Exception:
-        return 0
-    return 0
+    return int(parse_duration_seconds_from_timing(timing))

@@ -227,6 +227,7 @@ class SchemaLimiter:
         *,
         query_terms: Optional[List[str]] = None,
         diagnostics: Optional[Dict[str, Any]] = None,
+        include_all_tables: bool = False,
     ) -> Dict[str, Dict[str, Dict[str, str]]]:
         """Ограничивает схему для включения в LLM промпт."""
         budget = diagnostics if diagnostics is not None else {}
@@ -245,7 +246,7 @@ class SchemaLimiter:
         limited_schema = {}
         tables_items = self._order_tables(db_schema, priority_strategy)
 
-        if self.max_tables > 0:
+        if not include_all_tables and self.max_tables > 0:
             tables_items = tables_items[: self.max_tables]
 
         for table_name, table_schema in tables_items:
@@ -512,6 +513,7 @@ class SchemaLimiter:
         query_terms: Optional[List[str]] = None,
         hard_max_chars: Optional[int] = None,
         diagnostics: Optional[Dict[str, Any]] = None,
+        include_all_tables: bool = False,
     ) -> str:
         """Строит краткое описание схемы, не удаляя обязательные колонки."""
         budget = diagnostics if diagnostics is not None else {}
@@ -519,6 +521,7 @@ class SchemaLimiter:
             db_schema,
             query_terms=query_terms,
             diagnostics=budget,
+            include_all_tables=include_all_tables,
         )
         full_summary = self._render_schema_summary(limited_schema)
         if hard_max_chars is None:

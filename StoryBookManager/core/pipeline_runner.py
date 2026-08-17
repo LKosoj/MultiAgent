@@ -268,6 +268,20 @@ class PipelineRunner:
             "md_to_pdf": ["95_pdf/book.pdf"],
             "screenplay_generator": ["91_screenplay/screenplay.json"],
             "screenplay_shots_generator": ["97_shots/shots.json"],
+            "blockout_scene_builder": [
+                "93_blockout/chains.json",
+                "93_blockout/scene_spec.json",
+                "93_blockout/asset_map.json",
+                "93_blockout/report.json",
+            ],
+            # у "blockout_renderer" записи нет: его артефакты лежат по путям вида
+            # 93_blockout/scene_NN_shot_MM/…, то есть зависят от состава шотов,
+            # а реестр оперирует фиксированными путями. Отчёт числится за
+            # blockout_scene_builder — он его создаёт (разделы 10.1, 20.3)
+            "blockout_preview": [
+                "93_blockout/preview/blockout_all.mp4",
+                "93_blockout/preview/contact_sheet.png",
+            ],
             "shots_prompt_qa": ["97_shots/shots.json"],
             "artist_batch_shots": ["97_shots/shots.json"],
             "storybook_video_preflight": ["96_video_contract/provider_menu_summary.json"],
@@ -300,15 +314,78 @@ class PipelineRunner:
                     artifacts[step.id] = list(override)
         return artifacts
 
+    @staticmethod
+    def _read_generate_blockout_flag(project_path: Optional[Path]) -> bool:
+        """Читает флаг generate_blockout из 00_brief.json (ТЗ раздел 18.8, Р6:
+        отсутствующий ключ/файл/проект трактуется как False)."""
+        if project_path is None:
+            return False
+        brief_path = project_path / "00_brief.json"
+        try:
+            with open(brief_path, "r", encoding="utf-8") as f:
+                brief_data = json.load(f)
+        except (OSError, ValueError):
+            return False
+        if not isinstance(brief_data, dict):
+            return False
+        return bool(brief_data.get("generate_blockout", False))
+
+    @staticmethod
+    def _read_blockout_allowed_durations(project_path: Optional[Path]) -> List[int]:
+        """Читает blockout_allowed_durations из 00_brief.json тем же безопасным
+        способом, что и _read_generate_blockout_flag (ТЗ раздел 18.6, Р3):
+        отсутствующий/битый файл и пустой список трактуются одинаково — как
+        «весь набор модели» (раздел 6.1), поэтому в обоих случаях возвращается
+        пустой список."""
+        if project_path is None:
+            return []
+        brief_path = project_path / "00_brief.json"
+        try:
+            with open(brief_path, "r", encoding="utf-8") as f:
+                brief_data = json.load(f)
+        except (OSError, ValueError):
+            return []
+        if not isinstance(brief_data, dict):
+            return []
+        raw = brief_data.get("blockout_allowed_durations") or []
+        if not isinstance(raw, list):
+            return []
+        result: List[int] = []
+        for value in raw:
+            try:
+                result.append(int(value))
+            except (TypeError, ValueError):
+                continue
+        return result
+
     @classmethod
     def _collect_required_artifacts(
         cls,
         workflow_def,
         start_step: str,
+        project_path: Optional[Path] = None,
     ) -> List[str]:
-        """Возвращает список артефактов, обязательных перед запуском start_step."""
+        """Возвращает список артефактов, обязательных перед запуском start_step.
+
+        ``project_path``, если передан, отфильтровывает артефакты шагов, гейтированных
+        флагом ``generate_blockout`` (раздел 18.8): при выключенном слое болванок
+        частичный запуск не должен требовать их артефактов.
+        """
         step_map = {step.id: step for step in workflow_def.steps}
         artifact_map = cls._step_output_artifacts(workflow_def)
+        # Признак «шаг гейтирован болванкой» — точное строковое совпадение с
+        # шаблоном enable в YAML. ТЗ (раздел 18.8) не задаёт более надёжного
+        # признака (например, отдельного metadata-флага у шага): если формат
+        # шаблона когда-нибудь изменится (другой пробел, составное выражение),
+        # совпадение тихо перестанет находить шаг, и его артефакты снова станут
+        # обязательными при generate_blockout: false — вернутся ложные ошибки
+        # частичного запуска, которые эта фильтрация чинит.
+        blockout_gated_steps = {
+            step.id
+            for step in workflow_def.steps
+            if (step.tool_params or {}).get("enable") == "{generate_blockout}"
+        }
+        generate_blockout = cls._read_generate_blockout_flag(project_path)
         visited: Set[str] = set()
         visiting: Set[str] = set()
         required: List[str] = []
@@ -323,6 +400,8 @@ class PipelineRunner:
                 _require_dependency(dep_id)
             visiting.remove(step_id)
             visited.add(step_id)
+            if step_id in blockout_gated_steps and not generate_blockout:
+                return
             required.extend(artifact_map.get(step_id, []))
 
         start = step_map.get(start_step)
@@ -1093,6 +1172,94 @@ class PipelineRunner:
             if invalid_json:
                 errors.extend([f"Некорректный JSON: {err}" for err in invalid_json])
 
+            # --- Блок «Болванка» (ТЗ раздел 18.6) ---------------------------
+            # B12 — доступность Blender: проверка ОКРУЖЕНИЯ, выполняется всегда,
+            # независимо от generate_blockout. Уровень — предупреждение, а не
+            # ошибка: запуск блокирует сам шаг blockout_scene_builder (раздел
+            # 13.4), пред-запусковая проверка лишь предупреждает заранее.
+            # Переиспользуем то же средство и тот же тайм-аут 5 секунд, что и
+            # блок готовности (раздел 18.3) — без тайм-аута синхронный вызов из
+            # веб-обработчика мог бы зависнуть.
+            from custom_tools.storybook.video_contract import (
+                _probe_blockout_blender_readiness,
+            )
+
+            blender_probe = _probe_blockout_blender_readiness()
+            if not blender_probe.get("available"):
+                warnings.append(
+                    f"Blockout B12: Blender недоступен ({blender_probe.get('message')})"
+                )
+
+            # B01/B15 — проверки СОСТОЯНИЯ проекта: только при generate_blockout:
+            # true (Р6) и только если screenplay_shots_generator уже отработал
+            # хотя бы раз (маркер — 97_shots/video_model_caps.json; его
+            # отсутствие означает, что нормализация длительностей ещё не
+            # проводилась, и на свежем проекте это не ошибка). Флаг и набор
+            # длительностей читаем уже существующим _read_generate_blockout_flag()
+            # (Э7) и парным ему _read_blockout_allowed_durations() тем же
+            # безопасным способом, а не парсим 00_brief.json заново (Р3) — оба
+            # сами безопасны к отсутствующему или повреждённому брифу, поэтому
+            # отдельного brief_data-словаря здесь не нужно.
+            if self._read_generate_blockout_flag(project_path):
+                caps_path = project_path / "97_shots" / "video_model_caps.json"
+                if caps_path.exists():
+                    try:
+                        with open(caps_path, "r", encoding="utf-8") as caps_file:
+                            caps_data = json.load(caps_file)
+                    except (OSError, ValueError):
+                        caps_data = None
+                    supported_durations = (
+                        caps_data.get("supported_durations") if isinstance(caps_data, dict) else None
+                    ) or []
+                    if not supported_durations:
+                        errors.append(
+                            "B15: не получен набор допустимых длительностей видеомодели "
+                            "(97_shots/video_model_caps.json)"
+                        )
+                    else:
+                        supported_set = set()
+                        for value in supported_durations:
+                            try:
+                                supported_set.add(int(value))
+                            except (TypeError, ValueError):
+                                continue
+                        # Допустимый набор — пересечение supported_durations с
+                        # непустым blockout_allowed_durations (ТЗ раздел 10.1
+                        # пункт 2, раздел 6.1). Пустой blockout_allowed_durations
+                        # означает «весь набор модели». Если пересечение пусто, а
+                        # supported_set непуст, ограничение проекта игнорируется
+                        # целиком — берётся полный набор модели, как и в самом
+                        # blockout_scene_builder.
+                        configured_durations = set(
+                            self._read_blockout_allowed_durations(project_path)
+                        )
+                        if configured_durations:
+                            intersection = supported_set & configured_durations
+                            allowed_set = intersection if intersection else supported_set
+                        else:
+                            allowed_set = supported_set
+                        try:
+                            with open(
+                                project_path / "97_shots" / "shots.json", "r", encoding="utf-8"
+                            ) as shots_file:
+                                shots_data = json.load(shots_file)
+                        except (OSError, ValueError):
+                            shots_data = None
+                        bad_shots = set()
+                        for item in (shots_data.get("items") if isinstance(shots_data, dict) else None) or []:
+                            duration = item.get("duration_s")
+                            try:
+                                in_set = duration is not None and int(duration) in allowed_set
+                            except (TypeError, ValueError):
+                                in_set = False
+                            if not in_set:
+                                bad_shots.add(f"scene {item.get('scene_number')} shot {item.get('shot_number')}")
+                        if bad_shots:
+                            errors.append(
+                                "B01: duration_s не входит в допустимый набор длительностей "
+                                "у шотов: " + ", ".join(sorted(bad_shots))
+                            )
+
             if start_step:
                 yaml_path = project_root / "workflow_pipelines" / "storybook_pipeline.yaml"
                 if not yaml_path.exists():
@@ -1108,6 +1275,7 @@ class PipelineRunner:
                         required_artifacts = self._collect_required_artifacts(
                             workflow_def,
                             start_step,
+                            project_path,
                         )
                         for artifact in required_artifacts:
                             artifact_path = project_path / artifact

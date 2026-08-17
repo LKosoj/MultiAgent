@@ -50,7 +50,7 @@ silently continue after a migration/readiness failure.
 
 ## Migrate
 
-The authoritative migration heads are EventStore 7, memory DB 1, and workflow
+The authoritative migration heads are EventStore 10, memory DB 1, and workflow
 result outbox 3. `config/text_to_sql/state_schema.yaml` records those heads.
 The runner invokes each store's owning initializer; it does not contain a
 second DDL or Alembic history.
@@ -123,6 +123,9 @@ curl --fail --silent --show-error http://127.0.0.1:8000/readyz
 ```
 
 ## Rollback
+
+The protected procedure below rolls back the deployment. It is never called
+automatically by benchmark evaluation or CI.
 
 Required protected inputs are immutable candidate `BACKEND_IMAGE` and
 `FRONTEND_IMAGE` (either raw local Docker IDs `sha256:<64-hex>` or

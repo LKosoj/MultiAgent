@@ -22,6 +22,8 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 if TYPE_CHECKING:
+    from workflow.deadline import DeadlineBudget
+
     from ..validators import TextToSqlSafetyPolicy
 
 from ..prompts import build_sql_safety_prompt
@@ -732,6 +734,7 @@ def sql_safety_check(
     sql_validator,
     dsn: Optional[str] = None,
     safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
+    static_only: bool = False,
 ) -> Dict[str, object]:
     """Orchestrator: статический слой + LLM-advisory (если static прошёл).
 
@@ -750,6 +753,8 @@ def sql_safety_check(
     времени, плюс QA-слой не зависит от LLM-доступности).
     """
     logger.info("Performing SQL safety check")
+    if type(static_only) is not bool:
+        raise TypeError("static_only must be a boolean")
 
     from ..utils import get_runtime_context_dsn
 
@@ -788,6 +793,11 @@ def sql_safety_check(
     if not safety_result.get("is_safe"):
         safety_result["safety_status"] = "unsafe"
         safety_result["llm_audit"] = "skipped_static_unsafe"
+        return safety_result
+
+    if static_only:
+        safety_result["safety_status"] = "safe"
+        safety_result["llm_audit"] = "skipped_static_only"
         return safety_result
 
     # === LLM ADVISORY LAYER (non-blocking) ===================================
@@ -899,6 +909,8 @@ def sql_explain(
     *,
     sql_validator,
     safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
+    dry_run_only: Optional[bool] = None,
+    deadline: Optional["DeadlineBudget"] = None,
 ) -> Dict[str, object]:
     """EXPLAIN/PLAN для разных СУБД.
 
@@ -939,7 +951,9 @@ def sql_explain(
                 purpose=QueryPurpose.EXPLAIN,
                 row_limit=1,
                 dsn=dsn,
+                dry_run_only=dry_run_only,
                 safety_policy=safety_policy,
+                deadline=deadline,
             )
         )
     except MissingDSNError as exc:

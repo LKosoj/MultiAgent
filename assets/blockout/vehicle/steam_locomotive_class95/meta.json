@@ -1,0 +1,28 @@
+{
+  "id": "steam_locomotive_class95",
+  "name": "Паровоз DRG Class 95",
+  "category": "vehicle",
+  "tags": [
+    "train",
+    "locomotive",
+    "steam",
+    "class95",
+    "author:Jesper Landin"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    23.7905330657959,
+    109.72036361694336,
+    34.98030339367688
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/drg-class-95-prussian-t-20-steam-locomotive-c904d4f807a34e3c90b13aa55110817f",
+  "file_size_bytes": 3454400,
+  "fetched_at": "2026-08-16T22:08:15Z",
+  "asset_version": 1
+}

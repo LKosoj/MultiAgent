@@ -1,0 +1,26 @@
+{
+  "id": "train_tender",
+  "name": "Тендер с углём",
+  "category": "vehicle",
+  "tags": [
+    "train",
+    "tender",
+    "coal"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.2000234127044678,
+    2.700000286102295,
+    1.6456960439682007
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/train-kit",
+  "file_size_bytes": 87064,
+  "fetched_at": "2026-08-16T21:48:00Z",
+  "asset_version": 2
+}

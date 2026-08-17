@@ -123,6 +123,13 @@ def _install_fakes(monkeypatch):
     monkeypatch.setattr(shots_generator, "_generate_shot_prompt", fake_prompt)
     monkeypatch.setattr(shots_generator, "_generate_fcpxml", lambda *a, **k: None)
     monkeypatch.setattr(shots_generator, "_generate_photo_fcpxml", lambda *a, **k: None)
+    # Э0.3: этот файл не про нормализацию длительности видео — фиксируем набор
+    # supported_durations, чтобы новый блокирующий B15 (пустой набор + generate_blockout=True
+    # по умолчанию) не мешал существующим сценариям.
+    monkeypatch.setattr(
+        shots_generator, "resolve_video_model_capabilities",
+        lambda *a, **k: {"supported_durations": [1, 5, 10], "warnings": []},
+    )
 
 
 # --------------------------------------------------------------------------------

@@ -3,15 +3,28 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+_DETERMINISTIC_DRILL_NAMES = frozenset(
+    {
+        "adaptive_rollback_operator",
+        "memory_reconciliation_and_rebuild",
+        "outbox_crash_and_restart",
+        "retention_and_report_fallback",
+        "schema_backup_restore_rollback",
+        "supervisor_admission_and_reaping",
+    }
+)
 
 
 def _read(path: str) -> str:
@@ -619,8 +632,16 @@ def _write_valid_release_evidence(
         encoding="utf-8",
     )
 
+    state_manifest_path = ROOT / "config/text_to_sql/state_schema.yaml"
+    state_manifest = yaml.safe_load(state_manifest_path.read_text(encoding="utf-8"))
+    assert state_manifest["manifest_version"] == 1
+    state_stores = state_manifest["stores"]
+    assert set(state_stores) == {"event_store", "memory_db", "result_outbox"}
+    heads = {
+        name: int(state_stores[name]["head"])
+        for name in ("event_store", "memory_db", "result_outbox")
+    }
     readiness = runtime / "readiness.json"
-    heads = {"event_store": 8, "memory_db": 1, "result_outbox": 3}
     readiness.write_text(
         json.dumps(
             {
@@ -809,14 +830,7 @@ def _write_valid_release_evidence(
         encoding="utf-8",
     )
 
-    schema_ref = "sha256:" + _sha256(ROOT / "config/text_to_sql/state_schema.yaml")
-    deterministic_names = {
-        "supervisor_admission_and_reaping",
-        "outbox_crash_and_restart",
-        "memory_reconciliation_and_rebuild",
-        "retention_and_report_fallback",
-        "schema_backup_restore_rollback",
-    }
+    schema_ref = "sha256:" + _sha256(state_manifest_path)
     (artifacts / "deterministic-drills.json").write_text(
         json.dumps(
             {
@@ -829,7 +843,7 @@ def _write_valid_release_evidence(
                 "release_eligible": False,
                 "drills": [
                     {"name": name, "status": "passed"}
-                    for name in sorted(deterministic_names)
+                    for name in sorted(_DETERMINISTIC_DRILL_NAMES)
                 ],
             }
         ),
@@ -838,11 +852,8 @@ def _write_valid_release_evidence(
 
     backup = tmp_path / "backup"
     backup.mkdir()
-    for filename, head in (
-        ("agui_events.db", 8),
-        ("smolagents_memory.db", 1),
-        ("workflow_result_outbox.db", 3),
-    ):
+    for name, head in heads.items():
+        filename = Path(state_stores[name]["path"]).name
         _write_sqlite_head(backup / filename, head)
     backup_manifest = protected / "backup-manifest.json"
     subprocess.run(
@@ -995,6 +1006,105 @@ def test_release_evidence_writer_accepts_only_fully_cross_bound_evidence(
     assert index["rollback"]["backup_manifest_sha256"] == _sha256(
         context["backup_manifest"]
     )
+
+
+def test_release_evidence_writer_accepts_actual_deterministic_drill_report(
+    tmp_path,
+) -> None:
+    context = _write_valid_release_evidence(tmp_path)
+    report_path = context["artifacts"] / "deterministic-drills.json"
+    env = os.environ.copy()
+    env.update(
+        {
+            "TEXT2SQL_CANDIDATE_REF": context["candidate_digest"],
+            "TEXT2SQL_DRILL_REPORT": str(report_path),
+        }
+    )
+
+    producer = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/test_text2sql_release_drills.sh"),
+            "--deterministic",
+        ],
+        cwd=ROOT,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert producer.returncode == 0, producer.stdout + producer.stderr
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert {drill["name"] for drill in report["drills"]} == _DETERMINISTIC_DRILL_NAMES
+
+    completed = _run_evidence_writer(context)
+
+    assert completed.returncode == 0, completed.stderr
+    index = json.loads(
+        (context["artifacts"] / "protected-gates.json").read_text(encoding="utf-8")
+    )
+    assert index["release_eligible"] is True
+    assert index["validation_errors"] == []
+
+
+@pytest.mark.parametrize("missing_name", sorted(_DETERMINISTIC_DRILL_NAMES))
+def test_release_evidence_writer_rejects_each_missing_deterministic_drill(
+    tmp_path,
+    missing_name: str,
+) -> None:
+    context = _write_valid_release_evidence(tmp_path)
+    report_path = context["artifacts"] / "deterministic-drills.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    report["drills"] = [
+        drill for drill in report["drills"] if drill["name"] != missing_name
+    ]
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    completed = _run_evidence_writer(context)
+
+    assert completed.returncode == 1
+    index = json.loads(
+        (context["artifacts"] / "protected-gates.json").read_text(encoding="utf-8")
+    )
+    assert index["validation_errors"] == ["ValueError: drill report steps mismatch"]
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    (
+        ("duplicate", "drill step is duplicated"),
+        ("unknown", "drill report has missing or failed steps"),
+        ("adaptive_failed", "drill report has missing or failed steps"),
+    ),
+)
+def test_release_evidence_writer_rejects_invalid_deterministic_drill_step(
+    tmp_path,
+    mutation: str,
+    expected_error: str,
+) -> None:
+    context = _write_valid_release_evidence(tmp_path)
+    report_path = context["artifacts"] / "deterministic-drills.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    drills = report["drills"]
+    adaptive = next(
+        drill for drill in drills if drill["name"] == "adaptive_rollback_operator"
+    )
+    if mutation == "duplicate":
+        drills[-1] = dict(drills[0])
+    elif mutation == "unknown":
+        adaptive["name"] = "unknown_drill"
+    else:
+        adaptive["status"] = "failed"
+    report_path.write_text(json.dumps(report), encoding="utf-8")
+
+    completed = _run_evidence_writer(context)
+
+    assert completed.returncode == 1
+    index = json.loads(
+        (context["artifacts"] / "protected-gates.json").read_text(encoding="utf-8")
+    )
+    assert index["validation_errors"] == [f"ValueError: {expected_error}"]
 
 
 def test_release_evidence_writer_accepts_bootstrap_baseline_and_skips_latency_gate(

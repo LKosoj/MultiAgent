@@ -4,13 +4,30 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+import hashlib
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sqlite3
-import statistics
+import sys
+import tempfile
 from typing import Any, Iterable, Mapping, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from scripts import text2sql_benchmark_reporting as benchmark_reporting  # noqa: E402
+from custom_tools.text_to_sql.eval.release_diagnostics import (  # noqa: E402
+    FAILURE_CLASS_ORDER,
+    build_diagnostic_summary,
+    latency_summary,
+    render_failure_rows,
+)
+
+_latency_summary = latency_summary
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -49,6 +66,59 @@ def _load_scores(path: Path | None) -> dict[str, dict[str, Any]]:
             raise ValueError(f"{path}: duplicate score for {case_key}")
         scores[case_key] = row
     return scores
+
+
+def _validate_evaluator_receipt(
+    path: Path, score_path: Path, scores: Mapping[str, Any],
+    *, expected_case_keys: Sequence[str] | None = None,
+    evaluator_input: Path | None = None,
+    run_manifest: Mapping[str, Any] | None = None,
+    run_manifest_path: Path | None = None,
+    case_manifest: Mapping[str, Any] | None = None,
+    case_manifest_path: Path | None = None,
+) -> dict[str, Any]:
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not benchmark_reporting.evaluator_receipt_is_closed(value):
+        raise ValueError("evaluator receipt is invalid")
+    if value["score_sha256"] != "sha256:" + hashlib.sha256(score_path.read_bytes()).hexdigest():
+        raise ValueError("evaluator receipt score digest mismatch")
+    if (
+        not isinstance(value["case_keys"], list)
+        or len(value["case_keys"]) != len(set(value["case_keys"]))
+        or set(value["case_keys"]) != set(scores)
+        or (expected_case_keys is not None and value["case_keys"] != list(expected_case_keys))
+    ):
+        raise ValueError("evaluator receipt case keys mismatch")
+    if evaluator_input is not None and value["evaluator_input_sha256"] != (
+        "sha256:" + hashlib.sha256(evaluator_input.read_bytes()).hexdigest()
+    ):
+        raise ValueError("evaluator receipt input digest mismatch")
+    if run_manifest is not None:
+        identity = run_manifest.get("evaluator_identity")
+        if not isinstance(identity, Mapping) or value["evaluator_identity"] != identity:
+            raise ValueError("evaluator receipt identity is not pinned by run manifest")
+    if run_manifest_path is not None and value["run_manifest_sha256"] != (
+        "sha256:" + hashlib.sha256(run_manifest_path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("evaluator receipt run manifest digest mismatch")
+    if case_manifest_path is not None and value["case_manifest_sha256"] != (
+        "sha256:" + hashlib.sha256(case_manifest_path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("evaluator receipt case manifest digest mismatch")
+    if case_manifest is not None:
+        cases = case_manifest.get("cases")
+        if not isinstance(cases, list):
+            raise ValueError("case manifest is invalid")
+        manifest_keys = [
+            row.get("case_key") for row in cases if isinstance(row, Mapping)
+        ]
+        if (
+            len(manifest_keys) != len(cases)
+            or any(not isinstance(key, str) or not key for key in manifest_keys)
+            or value["case_keys"] != manifest_keys
+        ):
+            raise ValueError("evaluator receipt does not match case manifest order")
+    return value
 
 
 def _load_latest_checkpoints(
@@ -114,52 +184,36 @@ def _stage_diagnostics(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
             "error": raw_result.get("error"),
         }
 
-    schema_result = step_results.get("schema_linking_step", {})
-    schema_output = (
-        schema_result.get("output") if isinstance(schema_result, dict) else {}
+    research_result = step_results.get("schema_research", {})
+    research_output = (
+        research_result.get("output") if isinstance(research_result, dict) else {}
     )
-    if not isinstance(schema_output, dict):
-        schema_output = {}
-    generation_result = step_results.get("sql_generation", {})
-    generation_output = (
-        generation_result.get("output")
-        if isinstance(generation_result, dict)
+    if not isinstance(research_output, dict):
+        research_output = {}
+    solving_result = step_results.get("sql_solving", {})
+    solving_output = (
+        solving_result.get("output")
+        if isinstance(solving_result, dict)
         else {}
     )
-    if not isinstance(generation_output, dict):
-        generation_output = {}
-    verification_result = step_results.get("sql_verification", {})
-    verification_output = (
-        verification_result.get("output")
-        if isinstance(verification_result, dict)
-        else {}
-    )
-    if not isinstance(verification_output, dict):
-        verification_output = {}
+    if not isinstance(solving_output, dict):
+        solving_output = {}
 
     return {
         "checkpoint_status": checkpoint.get("checkpoint_status"),
         "checkpoint_timestamp": checkpoint.get("checkpoint_timestamp"),
         "stages": stages,
-        "schema_linking": {
-            "decision": schema_output.get("decision"),
-            "decision_reasons": schema_output.get("decision_reasons") or [],
-            "linking_strategy": schema_output.get("linking_strategy"),
-            "confidence": schema_output.get("confidence"),
-            "join_success": schema_output.get("join_success"),
-            "unlinked_entities": schema_output.get("unlinked_entities") or [],
-            "unresolved_entities": schema_output.get("unresolved_entities") or [],
-            "ambiguous_bindings": schema_output.get("ambiguous_bindings") or [],
-            "linked_entities": schema_output.get("linked_entities") or {},
-            "joins": schema_output.get("joins") or [],
+        "schema_research": {
+            "stop_reason": research_output.get("stop_reason"),
+            "ready_for_sql": research_output.get("ready_for_sql"),
+            "terminal_reason_code": research_output.get("terminal_reason_code"),
+            "schema_namespace_version": research_output.get(
+                "schema_namespace_version"
+            ),
         },
-        "generation": {
-            "has_sql": bool(generation_output.get("sql")),
-            "error": generation_output.get("error"),
-        },
-        "verification": {
-            "status": verification_output.get("verification_status"),
-            "recommendations": verification_output.get("recommendations") or [],
+        "sql_solving": {
+            "has_sql": bool(solving_output.get("sql")),
+            "description": solving_output.get("description"),
         },
     }
 
@@ -167,88 +221,27 @@ def _stage_diagnostics(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
 def classify_case(
     observation: Mapping[str, Any],
     score: Mapping[str, Any] | None,
+    evaluator_receipt: Mapping[str, Any] | None = None,
 ) -> str:
-    if observation.get("observation_status") != "completed":
-        return "runner_or_transport_error"
-    outcome = observation.get("outcome")
-    if not isinstance(outcome, Mapping):
-        return "missing_terminal_outcome"
-    terminal_status = outcome.get("status")
-    reason_code = str(outcome.get("reason_code") or "")
-    if terminal_status != "succeeded":
-        if reason_code.startswith("SCHEMA_"):
-            return "schema_linking_abstention"
-        if reason_code in {"VERIFIER_REJECTED", "SAFETY_REJECTED"}:
-            return "verification_rejection"
-        if reason_code == "EXECUTION_FAILED":
-            return "pipeline_execution_failure"
-        if terminal_status == "timed_out":
-            return "pipeline_timeout"
-        return "other_terminal_failure"
-    if score is None:
-        return "not_evaluated"
-    if score.get("score") == 1:
-        return "correct"
+    result = benchmark_reporting.failure_class(
+        observation,
+        score.get("score") if score is not None else None,
+        evaluator_receipt,
+    )
+    if result != "wrong_result":
+        return result
     error_info = str(score.get("error_info") or "")
     if error_info and error_info != "Result Error":
-        return "prediction_execution_error"
-    return "wrong_result"
-
-
-def _percentile(values: Sequence[float], percentile: float) -> float | None:
-    if not values:
-        return None
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return round(ordered[0], 3)
-    position = (len(ordered) - 1) * percentile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return round(
-        ordered[lower] + (ordered[upper] - ordered[lower]) * fraction,
-        3,
-    )
-
-
-def _latency_summary(values: Sequence[float]) -> dict[str, float | None]:
-    return {
-        "mean": round(statistics.mean(values), 3) if values else None,
-        "median": round(statistics.median(values), 3) if values else None,
-        "p90": _percentile(values, 0.90),
-        "p95": _percentile(values, 0.95),
-        "max": round(max(values), 3) if values else None,
-    }
-
-
-def _group_summary(
-    diagnostics: Sequence[Mapping[str, Any]],
-    field: str,
-) -> dict[str, dict[str, Any]]:
-    groups: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    for row in diagnostics:
-        value = row.get(field)
-        groups[str(value) if value is not None else "unknown"].append(row)
-    result: dict[str, dict[str, Any]] = {}
-    for key, rows in sorted(groups.items()):
-        evaluated = [row for row in rows if row.get("official_score") is not None]
-        correct = sum(row.get("official_score") == 1 for row in evaluated)
-        result[key] = {
-            "cases": len(rows),
-            "evaluated": len(evaluated),
-            "correct": correct,
-            "execution_accuracy": (
-                round(correct / len(evaluated), 6) if evaluated else None
-            ),
-        }
+        return "bad_sql"
     return result
 
 
-def summarize(
+def _build_case_diagnostics(
     observations: Sequence[Mapping[str, Any]],
     scores: Mapping[str, Mapping[str, Any]],
     checkpoints: Mapping[str, Mapping[str, Any]],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    evaluator_receipt: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
     diagnostics: list[dict[str, Any]] = []
     for observation in sorted(
         observations,
@@ -290,122 +283,162 @@ def summarize(
                 "sql": outcome.get("sql"),
                 "official_score": score.get("score") if score else None,
                 "official_error": score.get("error_info") if score else None,
-                "failure_class": classify_case(observation, score),
+                "failure_class": classify_case(
+                    observation, score, evaluator_receipt
+                ),
                 **stage_data,
             }
         )
+    return diagnostics
 
-    evaluated = [row for row in diagnostics if row["official_score"] is not None]
-    correct = sum(row["official_score"] == 1 for row in evaluated)
-    executed = [row for row in diagnostics if row["executed"] is True]
-    executed_evaluated = [row for row in evaluated if row["executed"] is True]
-    executed_correct = sum(
-        row["official_score"] == 1 for row in executed_evaluated
+
+def summarize(
+    observations: Sequence[Mapping[str, Any]],
+    scores: Mapping[str, Mapping[str, Any]],
+    checkpoints: Mapping[str, Mapping[str, Any]],
+    evaluator_receipt: Mapping[str, Any] | None = None,
+    *,
+    created_at: str | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    diagnostics = _build_case_diagnostics(
+        observations, scores, checkpoints, evaluator_receipt
     )
-    latency_values = [
-        float(row["elapsed_seconds"])
-        for row in diagnostics
-        if isinstance(row.get("elapsed_seconds"), (int, float))
-    ]
-    latency_by_failure_class: dict[str, list[float]] = defaultdict(list)
-    latency_by_terminal_status: dict[str, list[float]] = defaultdict(list)
-    schema_reasons: Counter[str] = Counter()
-    step_durations: dict[str, list[float]] = defaultdict(list)
-    for row in diagnostics:
-        elapsed_seconds = row.get("elapsed_seconds")
-        if isinstance(elapsed_seconds, (int, float)):
-            latency_by_failure_class[row["failure_class"]].append(
-                float(elapsed_seconds)
-            )
-            latency_by_terminal_status[str(row["terminal_status"])].append(
-                float(elapsed_seconds)
-            )
-        for reason in row["schema_linking"]["decision_reasons"]:
-            schema_reasons[str(reason)] += 1
-        for step_id, stage in row["stages"].items():
-            duration = stage.get("duration_seconds")
-            if isinstance(duration, (int, float)):
-                step_durations[step_id].append(float(duration))
 
-    summary = {
-        "schema_version": 1,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "cases": len(diagnostics),
-        "evaluated": len(evaluated),
-        "correct": correct,
-        "execution_accuracy": (
-            round(correct / len(evaluated), 6) if evaluated else None
-        ),
-        "execution_coverage": (
-            round(len(executed_evaluated) / len(evaluated), 6)
-            if evaluated
-            else None
-        ),
-        "conditional_execution_accuracy": (
-            round(executed_correct / len(executed_evaluated), 6)
-            if executed_evaluated
-            else None
-        ),
-        "terminal_statuses": dict(
-            Counter(str(row["terminal_status"]) for row in diagnostics)
-        ),
-        "reason_codes": dict(
-            Counter(str(row["reason_code"] or "") for row in diagnostics)
-        ),
-        "failure_classes": dict(
-            Counter(row["failure_class"] for row in diagnostics)
-        ),
-        "generated": sum(row["generated"] is True for row in diagnostics),
-        "executed": len(executed),
-        "schema_decisions": dict(
-            Counter(
-                str(row["schema_linking"].get("decision") or "missing")
-                for row in diagnostics
-            )
-        ),
-        "schema_decision_reasons": dict(schema_reasons),
-        "latency_seconds": _latency_summary(latency_values),
-        "latency_seconds_by_failure_class": {
-            failure_class: _latency_summary(values)
-            for failure_class, values in sorted(latency_by_failure_class.items())
-        },
-        "latency_seconds_by_terminal_status": {
-            terminal_status: _latency_summary(values)
-            for terminal_status, values in sorted(
-                latency_by_terminal_status.items()
-            )
-        },
-        "step_latency_seconds": {
-            step_id: _latency_summary(values)
-            for step_id, values in sorted(step_durations.items())
-        },
-        "by_database": _group_summary(diagnostics, "database_id"),
-        "by_difficulty": _group_summary(diagnostics, "difficulty"),
-    }
+    summary = build_diagnostic_summary(
+        diagnostics,
+        created_at=created_at or datetime.now(timezone.utc).isoformat(),
+    )
     return diagnostics, summary
 
 
+def _publish_bytes_sealed(path: Path, payload: bytes) -> None:
+    if path.exists() or path.is_symlink():
+        if (
+            path.is_file()
+            and not path.is_symlink()
+            and path.stat().st_mode & 0o777 == 0o444
+            and path.read_bytes() == payload
+        ):
+            return
+        raise ValueError(f"sealed summary artifact differs: {path.name}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(payload)
+            handle.flush()
+            os.fchmod(handle.fileno(), 0o444)
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if not (
+                path.is_file()
+                and not path.is_symlink()
+                and path.stat().st_mode & 0o777 == 0o444
+                and path.read_bytes() == payload
+            ):
+                raise ValueError(f"sealed summary artifact differs: {path.name}")
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+
+
 def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(
-                json.dumps(
-                    row,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+    payload = "".join(
+        json.dumps(
+            row,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+        for row in rows
+    ).encode("utf-8")
+    _publish_bytes_sealed(path, payload)
+
+
+def _sha256(path: Path) -> str:
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _relative_artifact_path(path: Path, output_dir: Path, *, label: str) -> str:
+    resolved = path.resolve(strict=True)
+    root = output_dir.resolve(strict=True)
+    if path.is_symlink() or not resolved.is_file() or not resolved.is_relative_to(root):
+        raise ValueError(f"{label} must be a regular file inside --output-dir")
+    return resolved.relative_to(root).as_posix()
+
+
+def _failure_report(
+    summary: Mapping[str, Any],
+    *,
+    not_started_release_legs: int = 0,
+    observations_sha256: str = "unavailable",
+) -> str:
+    status = "FULL / SCORED" if summary.get("evaluated") else "INCOMPLETE / NOT_SCORED"
+    failure_classes = summary["failure_classes"]
+    lines = [
+        "# Text-to-SQL benchmark report",
+        "",
+        f"Status: **{status}**",
+        "",
+        "## Verified conclusion",
+        "",
+        (
+            f"Processed cases: {summary['cases']}; official scores: "
+            f"{summary['evaluated']}; correct scored results: {summary['correct']}."
+        ),
+        f"Completed cases: {summary['cases']}",
+        f"Not-started release legs: {not_started_release_legs}",
+        f"Observations evidence: observations.jsonl ({observations_sha256})",
+        "The counts below are verified observations, not a claim about root cause.",
+        "",
+        "## Failure classes",
+        "",
+    ]
+    counts = {name: int(failure_classes.get(name, 0)) for name in FAILURE_CLASS_ORDER}
+    lines.extend(render_failure_rows(counts, total=int(summary["cases"])))
+    lines.extend(
+        [
+            "",
+            "## General repair plan",
+            "",
+            "1. Reproduce the largest verified failure class from `diagnostics.jsonl` and `summary.json`.",
+            "2. Add a focused regression test before changing the pipeline.",
+            "3. If this is an early stop, record a separately reviewed `repair_decision.json` bound to the candidate before resuming.",
+            "",
+            "Evidence: `diagnostics.jsonl`, `summary.json`, and `evaluator_receipt.json` when scored.",
+            "This report intentionally omits SQL and questions.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--observations", type=Path, required=True)
     parser.add_argument("--scores", type=Path)
+    parser.add_argument("--evaluator-receipt", type=Path)
+    parser.add_argument("--evaluator-input", type=Path)
+    parser.add_argument("--run-manifest", type=Path)
+    parser.add_argument("--case-manifest", type=Path)
     parser.add_argument("--workflow-state-db", type=Path, action="append", default=[])
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--created-at")
+    parser.add_argument("--not-started-release-legs", type=int, default=0)
     return parser
 
 
@@ -413,14 +446,84 @@ def main(argv: Iterable[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     observations = _read_jsonl(args.observations)
     scores = _load_scores(args.scores)
+    evaluator_paths = (
+        args.evaluator_receipt,
+        args.evaluator_input,
+        args.run_manifest,
+        args.case_manifest,
+    )
+    if scores and any(path is None for path in evaluator_paths):
+        raise ValueError(
+            "official scores require --evaluator-receipt, --evaluator-input, "
+            "--run-manifest, and --case-manifest"
+        )
+    evaluator_receipt = None
+    if scores:
+        evaluator_receipt = _validate_evaluator_receipt(
+            args.evaluator_receipt,
+            args.scores,
+            scores,
+            evaluator_input=args.evaluator_input,
+            run_manifest=json.loads(args.run_manifest.read_text(encoding="utf-8")),
+            run_manifest_path=args.run_manifest,
+            case_manifest=json.loads(args.case_manifest.read_text(encoding="utf-8")),
+            case_manifest_path=args.case_manifest,
+        )
     checkpoints = _load_latest_checkpoints(args.workflow_state_db)
-    diagnostics, summary = summarize(observations, scores, checkpoints)
+    diagnostics, summary = summarize(
+        observations,
+        scores,
+        checkpoints,
+        evaluator_receipt,
+        created_at=args.created_at,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True)
     _write_jsonl(args.output_dir / "diagnostics.jsonl", diagnostics)
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
+    _publish_bytes_sealed(
+        args.output_dir / "summary.json",
+        (
+            json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8"),
     )
+    _publish_bytes_sealed(
+        args.output_dir / "failure_report.md",
+        _failure_report(
+            summary,
+            not_started_release_legs=args.not_started_release_legs,
+            observations_sha256=_sha256(args.observations),
+        ).encode("utf-8"),
+    )
+    if scores:
+        evaluation_manifest = {
+            "schema_version": 1,
+            "record_kind": "text2sql_public_benchmark_evaluation_manifest",
+            "evaluator_input_sha256": _sha256(args.evaluator_input),
+            "evaluator_input_path": _relative_artifact_path(
+                args.evaluator_input, args.output_dir, label="evaluator input"
+            ),
+            "score_sha256": _sha256(args.scores),
+            "score_path": _relative_artifact_path(
+                args.scores, args.output_dir, label="official scores"
+            ),
+            "evaluator_receipt_sha256": _sha256(args.evaluator_receipt),
+            "run_manifest_sha256": _sha256(args.run_manifest),
+            "case_manifest_sha256": _sha256(args.case_manifest),
+            "diagnostics_sha256": _sha256(args.output_dir / "diagnostics.jsonl"),
+            "summary_sha256": _sha256(args.output_dir / "summary.json"),
+            "case_keys": list(evaluator_receipt["case_keys"]),
+        }
+        _publish_bytes_sealed(
+            args.output_dir / "evaluation_manifest.json",
+            (
+                json.dumps(
+                    evaluation_manifest,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode("utf-8"),
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

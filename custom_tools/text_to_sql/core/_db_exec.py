@@ -62,6 +62,10 @@ class QueryPurpose(str, Enum):
     DISTINCT = "DISTINCT"
     GROUNDING = "GROUNDING"
     CONTAINMENT = "CONTAINMENT"
+    RESEARCH = "RESEARCH"
+
+
+QueryParameter = str | int | float | bool | None
 
 
 # Purposes for which dry_run_only short-circuits execution before any DB
@@ -81,6 +85,7 @@ class QueryExecutionRequest:
     dry_run_only: Optional[bool] = None
     safety_policy: Optional["TextToSqlSafetyPolicy"] = None
     deadline: Optional[DeadlineBudget] = None
+    parameters: tuple[QueryParameter, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.sql_query, str):
@@ -94,6 +99,18 @@ class QueryExecutionRequest:
             DeadlineBudget,
         ):
             raise TypeError("deadline must be a DeadlineBudget or null")
+        if type(self.parameters) is not tuple:
+            raise TypeError("parameters must be an immutable tuple")
+        for value in self.parameters:
+            if value is None or type(value) in {str, int, bool}:
+                continue
+            if type(value) is float:
+                if not math.isfinite(value):
+                    raise ValueError("parameters must contain finite JSON numbers")
+                continue
+            raise TypeError("parameters must contain exact JSON scalar values")
+        if self.parameters and self.purpose is not QueryPurpose.RESEARCH:
+            raise ValueError("bound parameters are only supported for RESEARCH")
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,11 +189,21 @@ class QueryExecutor:
             get_runtime_context_supervisor_evidence,
         )
 
-        deadline = request.deadline or get_runtime_context_deadline()
+        runtime_deadline = get_runtime_context_deadline()
+        runtime_safety_policy = get_runtime_context_safety_policy()
+        if request.purpose is QueryPurpose.RESEARCH:
+            deadline = _narrow_research_deadline(
+                request.deadline,
+                runtime_deadline,
+            )
+            safety_policy = _narrow_research_safety_policy(
+                request.safety_policy,
+                runtime_safety_policy,
+            )
+        else:
+            deadline = request.deadline or runtime_deadline
+            safety_policy = request.safety_policy or runtime_safety_policy
         supervisor_evidence = get_runtime_context_supervisor_evidence()
-        safety_policy = (
-            request.safety_policy or get_runtime_context_safety_policy()
-        )
         outcome = _secure_db_executor(
             request.sql_query,
             request.row_limit,
@@ -187,8 +214,69 @@ class QueryExecutor:
             deadline=deadline,
             supervisor_evidence=supervisor_evidence,
             plugin_resolver=self._get_plugin,
+            parameters=request.parameters,
         )
         return QueryExecutionResult(request.purpose, outcome)
+
+
+def _narrow_research_deadline(
+    requested: Optional[DeadlineBudget],
+    runtime: Optional[DeadlineBudget],
+) -> Optional[DeadlineBudget]:
+    """Keep a research request inside the authoritative runtime deadline."""
+    if runtime is None or requested is None:
+        return requested or runtime
+    if (
+        requested.deadline_monotonic > runtime.deadline_monotonic
+        or requested.deadline_at_ms > runtime.deadline_at_ms
+    ):
+        raise ValueError("RESEARCH request deadline cannot widen runtime deadline")
+    return requested
+
+
+def _narrow_research_safety_policy(
+    requested: Optional["TextToSqlSafetyPolicy"],
+    runtime: Optional["TextToSqlSafetyPolicy"],
+) -> Optional["TextToSqlSafetyPolicy"]:
+    """Allow a research request to add restrictions, never remove runtime ones."""
+    if runtime is None or requested is None:
+        return requested or runtime
+
+    from ..validators import TextToSqlSafetyPolicy
+
+    if not isinstance(requested, TextToSqlSafetyPolicy):
+        raise TypeError("safety_policy must be a TextToSqlSafetyPolicy or null")
+    if not isinstance(runtime, TextToSqlSafetyPolicy):
+        raise TypeError("runtime safety_policy must be a TextToSqlSafetyPolicy")
+
+    def normalized(values: Any) -> frozenset[str]:
+        return frozenset(str(value).upper() for value in values)
+
+    requested_restrictions = (
+        normalized(requested.forbidden_keywords),
+        normalized(requested.forbidden_functions),
+        normalized(requested.ast_forbidden_stmt_classes),
+        normalized(requested.ast_forbidden_command_words),
+    )
+    runtime_restrictions = (
+        normalized(runtime.forbidden_keywords),
+        normalized(runtime.forbidden_functions),
+        normalized(runtime.ast_forbidden_stmt_classes),
+        normalized(runtime.ast_forbidden_command_words),
+    )
+    if (
+        any(
+            not requested_values.issuperset(runtime_values)
+            for requested_values, runtime_values in zip(
+                requested_restrictions,
+                runtime_restrictions,
+            )
+        )
+        or requested.max_query_length > runtime.max_query_length
+        or requested.max_in_list_size > runtime.max_in_list_size
+    ):
+        raise ValueError("RESEARCH request safety_policy cannot widen runtime policy")
+    return requested
 
 
 # Кортеж примитивных JSON-типов вынесен на уровень модуля, чтобы не создавать
@@ -285,6 +373,31 @@ def _normalize_executor_result(
     if row_limit is None and pre_execution_error_code is not None:
         normalized["pre_execution_error_code"] = pre_execution_error_code
     return normalized
+
+
+def _validate_research_strategy_result(result: Any, row_limit: int) -> None:
+    """Keep RESEARCH rows typed; legacy purposes retain compatibility coercion."""
+    if not isinstance(result, dict) or result.get("success") is not True:
+        return
+    columns = result.get("columns")
+    rows = result.get("data")
+    if not isinstance(columns, (list, tuple)) or not all(
+        type(column) is str and column for column in columns
+    ):
+        raise TypeError("RESEARCH result columns must be non-empty exact strings")
+    if len(columns) != len(set(columns)):
+        raise ValueError("RESEARCH result columns must be unique")
+    if not isinstance(rows, (list, tuple)) or len(rows) > row_limit:
+        raise ValueError("RESEARCH result rows exceed the closed row bound")
+    for row in rows:
+        if not isinstance(row, (list, tuple)) or len(row) != len(columns):
+            raise TypeError("RESEARCH result rows must match the declared columns")
+        for value in row:
+            if value is None or type(value) in {str, int, bool}:
+                continue
+            if type(value) is float and math.isfinite(value):
+                continue
+            raise TypeError("RESEARCH result cells must be exact JSON scalars")
 
 
 def _describe_identifier_parts_from_text(sql_query: str) -> list[str]:
@@ -751,6 +864,7 @@ _PREPARATION_PURPOSE_KINDS: Dict[QueryPurpose, frozenset[str]] = {
     QueryPurpose.DISTINCT: frozenset({"select"}),
     QueryPurpose.GROUNDING: frozenset({"select"}),
     QueryPurpose.CONTAINMENT: frozenset({"select"}),
+    QueryPurpose.RESEARCH: frozenset({"select"}),
 }
 
 
@@ -767,6 +881,115 @@ def _validate_query_purpose(
             f"{purpose.value} purpose requires {expected} statement, "
             f"got {statement_kind.upper()}"
         )
+
+
+def _research_limit_value(limit: Any) -> int:
+    """Return a positive literal LIMIT/FETCH count, rejecting dynamic bounds."""
+    try:
+        from sqlglot import exp
+    except ImportError as exc:
+        raise ValueError("RESEARCH requires sqlglot SQL parsing") from exc
+
+    expression = getattr(limit, "args", {}).get("expression")
+    if expression is None:
+        expression = getattr(limit, "args", {}).get("count")
+    while isinstance(expression, exp.Paren):
+        expression = expression.this
+    if not isinstance(expression, exp.Literal) or expression.is_string:
+        raise ValueError("RESEARCH requires a positive literal row LIMIT")
+    text = expression.this
+    if not isinstance(text, str) or not re.fullmatch(r"[1-9][0-9]*", text):
+        raise ValueError("RESEARCH requires a positive literal row LIMIT")
+    return int(text)
+
+
+def _validate_research_query(
+    sql_query: str,
+    row_limit: int,
+    dsn: Optional[str],
+    parameters: tuple[QueryParameter, ...],
+) -> None:
+    """Admit one bounded, projection-explicit read query before any connection.
+
+    This deliberately uses the normal dialect resolver and parser instead of
+    SQLite syntax.  It is an execution boundary, not a query rewriter: callers
+    must state their own positive SQL LIMIT and a concrete projection.
+    """
+    from ..dialects import get_sqlglot_dialect
+    from ..utils import parse_with_timeout
+
+    try:
+        from sqlglot import exp
+    except ImportError as exc:
+        raise ValueError("RESEARCH requires sqlglot SQL parsing") from exc
+
+    dialect = get_sqlglot_dialect(dsn, strict=bool(dsn and dsn.strip()))
+    try:
+        statements = parse_with_timeout(
+            sql_query,
+            read=None if dialect == "ansi" else dialect,
+        )
+    except Exception as exc:
+        raise ValueError(
+            "RESEARCH requires one valid bounded SELECT statement"
+        ) from exc
+    statements = [statement for statement in (statements or []) if statement is not None]
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        raise ValueError("RESEARCH purpose requires exactly one SELECT statement")
+
+    statement = statements[0]
+    unsafe_nodes = tuple(
+        node_class
+        for node_class in (
+            getattr(exp, "DML", None),
+            getattr(exp, "DDL", None),
+            getattr(exp, "Command", None),
+            getattr(exp, "Transaction", None),
+            getattr(exp, "Commit", None),
+            getattr(exp, "Rollback", None),
+            getattr(exp, "Set", None),
+            getattr(exp, "Use", None),
+            getattr(exp, "Grant", None),
+            getattr(exp, "Pragma", None),
+        )
+        if node_class is not None
+    )
+    if unsafe_nodes and any(statement.find_all(*unsafe_nodes)):
+        raise ValueError("RESEARCH purpose requires a read-only SELECT statement")
+    if statement.find(exp.Into, exp.Lock) is not None:
+        raise ValueError("RESEARCH purpose requires a read-only SELECT statement")
+
+    columns_class = getattr(exp, "Columns", None)
+    has_unsafe_star = any(
+        not (
+            isinstance(star.parent, exp.Count)
+            and star.parent.this is star
+        )
+        for star in statement.find_all(exp.Star)
+    )
+    if has_unsafe_star or (
+        columns_class is not None and any(statement.find_all(columns_class))
+    ):
+        raise ValueError("RESEARCH purpose does not allow dynamic star projections")
+
+    query_limit = statement.args.get("limit")
+    if query_limit is None:
+        raise ValueError("RESEARCH purpose requires an explicit positive row LIMIT")
+    if _research_limit_value(query_limit) > row_limit:
+        raise ValueError("RESEARCH SQL LIMIT cannot exceed request row_limit")
+
+    placeholders = list(statement.find_all(exp.Placeholder))
+    parameter_class = getattr(exp, "Parameter", None)
+    if (
+        any(placeholder.this is not None for placeholder in placeholders)
+        or (
+            parameter_class is not None
+            and any(statement.find_all(parameter_class))
+        )
+    ):
+        raise ValueError("RESEARCH requires anonymous positional parameters")
+    if len(placeholders) != len(parameters):
+        raise ValueError("RESEARCH parameter count does not match SQL placeholders")
 
 
 def _require_query_deadline(
@@ -903,6 +1126,37 @@ def _parse_row_limit(
     return parsed, None
 
 
+def _enforce_research_runtime_row_limit(
+    row_limit: int,
+    start: float,
+    sql_query: str,
+) -> Optional[Dict[str, Any]]:
+    authoritative_limit, failure = _parse_positive_int_env(
+        "DB_EXECUTOR_ROW_LIMIT",
+        "500",
+        start,
+        sql_query,
+        evidence_row_limit=row_limit,
+        null_row_limit_error_code="INVALID_ROW_LIMIT",
+    )
+    if failure is not None:
+        return failure
+    assert authoritative_limit is not None
+    if row_limit <= authoritative_limit:
+        return None
+    return _normalize_executor_result(
+        _build_failure_result(
+            start,
+            f"row_limit {row_limit} exceeds DB_EXECUTOR_ROW_LIMIT "
+            f"{authoritative_limit}",
+        ),
+        start_time=start,
+        sql_query=sql_query,
+        row_limit=row_limit,
+        skipped_execution=True,
+    )
+
+
 def _apply_statement_timeout(
     plugin,
     conn,
@@ -1016,6 +1270,7 @@ def _secure_db_executor(
     deadline: Optional[DeadlineBudget] = None,
     supervisor_evidence: Optional[SupervisorExecutionEvidence] = None,
     plugin_resolver: Optional[Callable[[str], Any]] = None,
+    parameters: tuple[QueryParameter, ...] = (),
 ) -> Dict[str, object]:
     """Безопасное выполнение SELECT и разрешённых команд (DESCRIBE/EXPLAIN/SHOW).
 
@@ -1047,6 +1302,8 @@ def _secure_db_executor(
         raise TypeError(
             "supervisor_evidence must be a SupervisorExecutionEvidence or null"
         )
+    if type(parameters) is not tuple:
+        raise TypeError("parameters must be an immutable tuple")
 
     logger.info("Executing SQL query securely")
     start = time.time()
@@ -1062,6 +1319,16 @@ def _secure_db_executor(
         failure["skipped_execution"] = True
         return failure
     assert row_limit is not None  # для типчекеров
+    if purpose is QueryPurpose.RESEARCH:
+        failure = _enforce_research_runtime_row_limit(
+            row_limit,
+            start,
+            sql_query,
+        )
+        if failure is not None:
+            failure["dry_run_only"] = dry_run_only
+            failure["skipped_execution"] = True
+            return failure
     statement_timeout_ms, failure = _parse_statement_timeout_ms(
         start,
         sql_query,
@@ -1099,11 +1366,15 @@ def _secure_db_executor(
     if purpose is not QueryPurpose.FINAL:
         statement_kind = _classify_statement(sql_query, dsn=dsn)
         _validate_query_purpose(purpose, statement_kind)
+    if purpose is QueryPurpose.RESEARCH:
+        _validate_research_query(sql_query, row_limit, dsn, parameters)
 
     # Через фасад: тесты monkeypatch'ят core.sql_safety_check / core.get_plugin.
     from custom_tools.text_to_sql import core as _facade
 
     safety_kwargs: Dict[str, Any] = {"dsn": dsn or ""}
+    if purpose is QueryPurpose.RESEARCH:
+        safety_kwargs["static_only"] = True
     if safety_policy is not None:
         safety_kwargs["safety_policy"] = safety_policy
     safety = _facade.sql_safety_check(sql_query, **safety_kwargs)
@@ -1164,6 +1435,7 @@ def _secure_db_executor(
         required_capabilities = RequiredDatabaseCapabilities(
             explain=statement_kind == "explain",
             introspection=statement_kind == "describe",
+            parameter_binding=bool(parameters),
             allow_supervisor=(
                 supervisor_evidence is not None and deadline is not None
             ),
@@ -1307,13 +1579,30 @@ def _secure_db_executor(
                 else:
                     strategy_started = True
                     try:
-                        raw_result = strategy(
-                            sql_query=sql_query,
-                            plugin=plugin,
-                            conn=conn,
-                            start=start,
-                            row_limit=row_limit,
-                        )
+                        if parameters:
+                            execute_bound = getattr(
+                                plugin,
+                                "execute_select_bound",
+                                None,
+                            )
+                            if not callable(execute_bound):
+                                raise RuntimeError(
+                                    "declared parameter binding implementation is missing"
+                                )
+                            raw_result = execute_bound(
+                                conn,
+                                sql_query,
+                                parameters,
+                                row_limit,
+                            )
+                        else:
+                            raw_result = strategy(
+                                sql_query=sql_query,
+                                plugin=plugin,
+                                conn=conn,
+                                start=start,
+                                row_limit=row_limit,
+                            )
                     except WorkflowDeadlineExceeded:
                         raise
                     except Exception as exc:
@@ -1325,6 +1614,11 @@ def _secure_db_executor(
                         )
                     else:
                         try:
+                            if purpose is QueryPurpose.RESEARCH:
+                                _validate_research_strategy_result(
+                                    raw_result,
+                                    row_limit,
+                                )
                             normalized_result = _normalize_executor_result(
                                 raw_result,
                                 start_time=start,

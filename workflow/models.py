@@ -31,6 +31,7 @@ from .text_to_sql_contract import (  # noqa: F401
     normalize_text_to_sql_json_value,
     preflight_text_to_sql_json_value,
     text_to_sql_executor_contract_error,
+    text_to_sql_research_terminal_result,
     text_to_sql_type_name,
     _TEXT_TO_SQL_ABSTAIN_REASONS,
     _TEXT_TO_SQL_SCHEMA_ABSTENTION_REASONS,

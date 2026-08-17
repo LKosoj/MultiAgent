@@ -94,9 +94,18 @@ def _install_service_stub(monkeypatch, handler) -> None:
     service_module = types.ModuleType("backend.fastapi_app.agui.service")
 
     class ServiceTransportContext:
-        def __init__(self, *, run_id, principal) -> None:
+        def __init__(
+            self,
+            *,
+            run_id,
+            principal,
+            cancellation_request_id=None,
+            cancellation_provenance=None,
+        ) -> None:
             self.run_id = run_id
             self.principal = principal
+            self.cancellation_request_id = cancellation_request_id
+            self.cancellation_provenance = cancellation_provenance
 
     service_module.ServiceTransportContext = ServiceTransportContext
     service_module.handle_service_action = handler
@@ -236,10 +245,10 @@ class _ConfirmedCancellationAfterStartError:
                     "run_id": "outer-run",
                     "workflow_name": "text_to_sql_pipeline",
                     "session_id": "workflow-session",
-                    "status": "cancelled" if self.cancelled else "running",
+                    "status": "cancelled" if self.cancelled else "queued",
                     "result_seq": 1 if self.cancelled else None,
                     "invocation_registered": self.reserved,
-                    "worker_pid": 12345,
+                    "worker_pid": None,
                 }
             }
         if action == "workflows.cancel":
@@ -302,10 +311,10 @@ class _RetryableCancellationAfterStartError:
                     "run_id": "outer-run",
                     "workflow_name": "text_to_sql_pipeline",
                     "session_id": "workflow-session",
-                    "status": "cancelled" if self.cancelled else "running",
+                    "status": "cancelled" if self.cancelled else "queued",
                     "result_seq": 1 if self.cancelled else None,
                     "invocation_registered": self.reserved,
-                    "worker_pid": 12345,
+                    "worker_pid": None,
                 }
             }
         if action == "workflows.cancel":
@@ -347,7 +356,7 @@ class _RetryableCancellationAfterStartError:
 
 
 @pytest.mark.asyncio
-async def test_start_error_after_reservation_with_unconfirmed_cancel_keeps_following(
+async def test_start_error_after_worker_handoff_keeps_following_without_cancel(
     monkeypatch,
 ):
     service = _ReservationThenStartError()
@@ -366,7 +375,7 @@ async def test_start_error_after_reservation_with_unconfirmed_cancel_keeps_follo
     try:
         assert await asyncio.to_thread(service.follow_entered.wait, 2)
         assert task.done() is False
-        assert service.cancel_calls == 1
+        assert service.cancel_calls == 0
 
         service.completed = True
         service.follow_gate.set()

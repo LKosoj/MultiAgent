@@ -14,6 +14,7 @@ import os
 import re
 import tempfile
 import time
+import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
@@ -275,7 +276,71 @@ class SQLiteWorkflowStore:
         self.secrets_lock_path = self.secrets_path.with_name(
             f"{self.secrets_path.name}.lock"
         )
+        self._adaptive_state_store = None
+        self._adaptive_state_store_lock = threading.Lock()
+        self._adaptive_research_state_store = None
+        self._adaptive_research_state_store_lock = threading.Lock()
+        self._adaptive_budget_ledger = None
+        self._adaptive_budget_ledger_lock = threading.Lock()
+        self._adaptive_solver_checkpoint_store = None
+        self._adaptive_solver_checkpoint_store_lock = threading.Lock()
         self.init_database()
+
+    def get_adaptive_state_store(self):
+        """Return the separate append-only adaptive journal on this SQLite file."""
+        with self._adaptive_state_store_lock:
+            if self._adaptive_state_store is None:
+                from .adaptive_state_store import AdaptiveStateStore
+
+                self._adaptive_state_store = AdaptiveStateStore(self.db_path)
+        return self._adaptive_state_store
+
+    def get_adaptive_research_state_store(self):
+        """Return the separate durable typed adaptive snapshot store."""
+        with self._adaptive_research_state_store_lock:
+            if self._adaptive_research_state_store is None:
+                from .adaptive_research_state_store import AdaptiveResearchStateStore
+
+                self._adaptive_research_state_store = AdaptiveResearchStateStore(self.db_path)
+        return self._adaptive_research_state_store
+
+    def get_adaptive_budget_ledger(self):
+        """Return the append-only adaptive probe and model budget ledger."""
+        with self._adaptive_budget_ledger_lock:
+            if self._adaptive_budget_ledger is None:
+                from .adaptive_budget_ledger import AdaptiveBudgetLedger
+
+                self._adaptive_budget_ledger = AdaptiveBudgetLedger(self.db_path)
+        return self._adaptive_budget_ledger
+
+    def get_adaptive_solver_checkpoint_store(self):
+        """Return the durable adaptive SQL-solver journal."""
+        with self._adaptive_solver_checkpoint_store_lock:
+            if self._adaptive_solver_checkpoint_store is None:
+                from .adaptive_solver_checkpoint import AdaptiveSolverCheckpointStore
+
+                self._adaptive_solver_checkpoint_store = AdaptiveSolverCheckpointStore(
+                    self.db_path
+                )
+        return self._adaptive_solver_checkpoint_store
+
+    def on_state_transition(
+        self,
+        key: Any,
+        phase: Any,
+        *,
+        expected_revision: int | None,
+        action: Any,
+        artifact_digest: str | None = None,
+    ) -> Any:
+        """Persist one accepted adaptive-state transition through the journal."""
+        return self.get_adaptive_state_store().on_state_transition(
+            key,
+            phase,
+            expected_revision=expected_revision,
+            action=action,
+            artifact_digest=artifact_digest,
+        )
 
     def _load_secrets(self) -> Dict[str, Any]:
         if not self.secrets_path.exists():
@@ -863,9 +928,34 @@ class WorkflowStateManager:
             from memory.manager import get_memory_manager
             self.memory_manager = get_memory_manager()
             logger.info("🔗 Интеграция с существующей системой памяти установлена")
-        except ImportError:
+        except Exception as exc:
             self.memory_manager = None
-            logger.warning("⚠️ Система памяти недоступна, используется только SQLite")
+            logger.warning(
+                "⚠️ Система памяти недоступна, используется только SQLite: %s",
+                _redact_checkpoint_error_text(exc),
+            )
+
+    def get_adaptive_state_store(self):
+        """Return the narrow adaptive checkpoint journal adapter."""
+        return self.store.get_adaptive_state_store()
+
+    def on_state_transition(
+        self,
+        key: Any,
+        phase: Any,
+        *,
+        expected_revision: int | None,
+        action: Any,
+        artifact_digest: str | None = None,
+    ) -> Any:
+        """Persist one accepted adaptive-state transition without runtime integration."""
+        return self.store.on_state_transition(
+            key,
+            phase,
+            expected_revision=expected_revision,
+            action=action,
+            artifact_digest=artifact_digest,
+        )
     
     async def save_checkpoint(self, workflow_id: str, status: WorkflowStatus,
                             context: WorkflowContext, step_results: Dict[str, StepResult],

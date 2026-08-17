@@ -9,6 +9,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -26,6 +27,7 @@ from backend.fastapi_app.agui._t2s_requests import (
 from backend.fastapi_app.agui.store import (
     AGUI_EVENT_STORE_SCHEMA_VERSION,
     EventStore,
+    WorkflowAdmissionConflictError,
     WorkflowClaimEnvelope,
 )
 from backend.fastapi_app.agui.events import (
@@ -146,6 +148,54 @@ def _create_text_to_sql_run(
     )
 
 
+def _admit_workflow_run(
+    store: EventStore,
+    *,
+    run_id: str,
+    principal: Principal | None = None,
+    idempotency_key: str | None = None,
+    request_fingerprint: str | None = None,
+    run_incarnation: str = "inc-1",
+    session_id: str | None = None,
+    workflow_name: str = "text_to_sql_pipeline",
+    parameters: dict[str, object] | None = None,
+    work_spec: dict[str, object] | None = None,
+    create_if_missing: bool = False,
+):
+    principal = principal or _principal()
+    session_id = session_id or f"session-{run_id}"
+    deadline_at_ms = int(time.time() * 1000) + 60_000
+    work_spec = work_spec or {
+        "spec_version": 1,
+        "workflow_path": os.path.abspath(
+            "workflow_pipelines/text_to_sql_pipeline.yaml"
+        ),
+        "parameters": parameters or {},
+        "session_id": session_id,
+        "client_id": None,
+        "use_enhanced": True,
+        "enable_telemetry": False,
+        "run_incarnation": run_incarnation,
+        "deadline_at_ms": deadline_at_ms,
+    }
+    deadline_at_ms = int(work_spec["deadline_at_ms"])
+    return store.admit_workflow_run(
+        run_id=run_id,
+        thread_id=session_id,
+        principal=principal,
+        run_kind="text_to_sql",
+        run_incarnation=run_incarnation,
+        session_id=session_id,
+        workflow_name=workflow_name,
+        work_spec=work_spec,
+        deadline_at_ms=deadline_at_ms,
+        queue_limit=10,
+        create_if_missing=create_if_missing,
+        idempotency_key=idempotency_key,
+        request_fingerprint=request_fingerprint,
+    )
+
+
 def _claim_text_to_sql_worker(
     store: EventStore,
     *,
@@ -155,38 +205,46 @@ def _claim_text_to_sql_worker(
     workflow_name: str = "text_to_sql_pipeline",
     supervisor_id: str = "test-supervisor",
     worker_pid: int = 54_321,
+    principal: Principal | None = None,
+    idempotency_key: str | None = None,
+    request_fingerprint: str | None = None,
+    parameters: dict[str, object] | None = None,
+    work_spec: dict[str, object] | None = None,
 ) -> WorkflowClaimEnvelope:
-    assert store.reserve_workflow_run(
-        run_id,
-        run_incarnation,
-        thread_id,
-        workflow_name,
-    )
-    deadline_at_ms = 9_999_999_999_999
-    store.enqueue_run(
-        run_id,
-        {
-            "spec_version": 1,
-            "workflow_path": os.path.abspath(
-                f"workflow_pipelines/{workflow_name}.yaml"
-            ),
-            "parameters": {"query": "count orders"},
-            "session_id": thread_id,
-            "client_id": "owner:tenant:owner",
-            "use_enhanced": True,
-            "enable_telemetry": False,
-            "run_incarnation": run_incarnation,
-            "deadline_at_ms": deadline_at_ms,
-        },
-        deadline_at_ms,
-        10,
-    )
+    stored = store.get_run(run_id)
+    if stored is None:
+        _admit_workflow_run(
+            store,
+            run_id=run_id,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+            run_incarnation=run_incarnation,
+            session_id=thread_id,
+            workflow_name=workflow_name,
+            parameters=parameters or {"query": "count orders"},
+            work_spec=work_spec,
+            create_if_missing=True,
+        )
+    elif store.get_workflow_run_invocation(run_id) is None:
+        _admit_workflow_run(
+            store,
+            run_id=run_id,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+            run_incarnation=run_incarnation,
+            session_id=thread_id,
+            workflow_name=workflow_name,
+            parameters=parameters or {"query": "count orders"},
+            work_spec=work_spec,
+        )
     claimed = store.claim_next_queued(
         supervisor_id,
         10,
         10,
         10,
-        deadline_at_ms,
+        9_999_999_999_999,
     )
     assert claimed is not None
     assert claimed.run.run_id == run_id
@@ -221,6 +279,7 @@ def _terminal_payload(
             "columns": [],
             "rows_affected": 0,
             "error": "result reconciliation failed",
+            "ambiguity": None,
             "execution": {},
             "audit": {},
             "persistence": {
@@ -289,6 +348,7 @@ def _terminal_contract(
         "columns": ["value"] if succeeded else [],
         "rows_affected": 1 if succeeded else 0,
         "error": None if succeeded else status,
+        "ambiguity": None,
         "execution": execution,
         "audit": audit,
         "persistence": (
@@ -305,7 +365,7 @@ def _terminal_contract(
 
 def test_text_to_sql_start_fingerprint_is_canonical_and_client_id_neutral():
     first = {
-        "natural_query": "  count orders  ",
+        "query": "  count orders  ",
         "dsn": "sqlite:///example.db",
         "max_rows": "100",
         "include_explanation": "true",
@@ -342,7 +402,7 @@ def test_text_to_sql_idempotency_key_is_bounded_canonical_opaque_text(key):
 
 
 @pytest.mark.asyncio
-async def test_run_manager_reserves_text_to_sql_before_task_and_reuses_same_id(
+async def test_run_manager_keeps_text_to_sql_unpersisted_before_task_and_reuses_same_id(
     tmp_path,
     monkeypatch,
 ):
@@ -370,9 +430,7 @@ async def test_run_manager_reserves_text_to_sql_before_task_and_reuses_same_id(
             principal=principal,
         )
         stored_before_task = store.get_run("run-proposed-1")
-        assert stored_before_task is not None
-        assert stored_before_task.run_kind == "text_to_sql"
-        assert stored_before_task.owner_subject == principal.subject
+        assert stored_before_task is None
 
         second = await manager.start_run(
             _run_input(
@@ -391,6 +449,39 @@ async def test_run_manager_reserves_text_to_sql_before_task_and_reuses_same_id(
         release.set()
         if first.task is not None:
             await first.task
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_text_to_sql_cancel_before_outer_task_leaves_no_partial_admission(
+    tmp_path,
+    monkeypatch,
+):
+    entered = asyncio.Event()
+
+    async def fake_run_agent(_input_data):
+        entered.set()
+        await asyncio.Event().wait()
+        yield None
+
+    monkeypatch.setattr(run_manager_module, "run_agent", fake_run_agent)
+    store = EventStore(str(tmp_path / "events.db"))
+    manager = run_manager_module.RunManager(store)
+    try:
+        info = await manager.start_run(
+            _run_input("run-cancel-before-admission", idempotency_key="cancel-key"),
+            principal=_principal(),
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert store.get_run(info.run_id) is None
+        assert info.task is not None
+        info.task.cancel()
+        await info.task
+        assert store.get_run(info.run_id) is None
+        assert store.get_workflow_run_invocation(info.run_id) is None
+        assert store.load_work_spec(info.run_id) is None
+    finally:
+        manager.close()
         store.close()
 
 
@@ -521,7 +612,7 @@ async def test_retry_cursor_projection_is_ordered_with_pending_event_publication
 
 
 @pytest.mark.asyncio
-async def test_concurrent_pre_reservation_retries_have_isolated_start_views(
+async def test_concurrent_pre_admission_retries_join_one_in_memory_task(
     tmp_path,
     monkeypatch,
 ):
@@ -529,61 +620,50 @@ async def test_concurrent_pre_reservation_retries_have_isolated_start_views(
     runner_started = asyncio.Event()
     release_runner = asyncio.Event()
     runner_calls: list[str] = []
-    reservation_calls: list[str] = []
-    real_reserve = store.reserve_workflow_run
-
-    def reserve_once(run_id, *args, **kwargs):
-        reservation_calls.append(run_id)
-        return real_reserve(run_id, *args, **kwargs)
-
-    monkeypatch.setattr(store, "reserve_workflow_run", reserve_once)
 
     async def fake_run_agent(input_data):
         runner_calls.append(input_data.run_id)
         runner_started.set()
         await release_runner.wait()
-        assert store.reserve_workflow_run(
-            input_data.run_id,
-            "inc-concurrent-retry",
-            input_data.thread_id,
-            "text_to_sql_pipeline",
-        )
-        terminal = _terminal_payload(
+        deadline_at_ms = int(time.time() * 1000) + 60_000
+        work_spec = {
+            "spec_version": 1,
+            "workflow_path": "/srv/workflows/text_to_sql_pipeline.yaml",
+            "parameters": {},
+            "session_id": input_data.thread_id,
+            "client_id": None,
+            "use_enhanced": True,
+            "enable_telemetry": False,
+            "run_incarnation": "inc-concurrent-retry",
+            "deadline_at_ms": deadline_at_ms,
+        }
+        payload = input_data.forwarded_props["service_payload"]
+        stored, admitted = _admit_workflow_run(
+            store,
             run_id=input_data.run_id,
+            principal=_principal(),
+            idempotency_key="concurrent-retry-key",
+            request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
+            run_incarnation="inc-concurrent-retry",
+            session_id=input_data.thread_id,
+            workflow_name="text_to_sql_pipeline",
+            work_spec=work_spec,
+            create_if_missing=True,
+        )
+        assert admitted is True
+        terminal = _terminal_payload(
+            run_id=stored.run_id,
             incarnation="inc-concurrent-retry",
             status="succeeded",
             reason="",
         )
-        store.finalize_run_with_event(input_data.run_id, terminal)
-        yield CustomEvent(
-            type=EventType.CUSTOM,
-            name="service.result",
-            value={
-                "action": "presets.text_to_sql.generate",
-                "ok": True,
-                "data": {"run_id": input_data.run_id},
-                "__request_id": "original-request",
-            },
-            timestamp=1,
-        )
-        yield CustomEvent(
-            type=EventType.CUSTOM,
-            name="workflow.progress",
-            value={"run_id": input_data.run_id, "status": "running"},
-            timestamp=2,
-        )
-        yield CustomEvent(
-            type=EventType.CUSTOM,
-            name="workflow.result",
-            value=terminal,
-            timestamp=3,
-        )
+        store.finalize_run_with_event(stored.run_id, terminal)
         yield RunFinishedEvent(
             type=EventType.RUN_FINISHED,
             thread_id=input_data.thread_id,
             run_id=input_data.run_id,
             result=terminal,
-            timestamp=4,
+            timestamp=1,
         )
 
     monkeypatch.setattr(run_manager_module, "run_agent", fake_run_agent)
@@ -598,106 +678,41 @@ async def test_concurrent_pre_reservation_retries_have_isolated_start_views(
             ),
             principal=_principal(),
         )
-        assert original_view is not None
         await asyncio.wait_for(runner_started.wait(), timeout=1)
-        assert store.get_workflow_run_invocation(info.run_id) is None
+        assert store.get_run(info.run_id) is None
 
         retry_a, retry_b = await asyncio.gather(
             manager.start_run_request_view(
-                _run_input(
-                    "proposal-a",
-                    idempotency_key="concurrent-retry-key",
-                    request_id="request-a",
-                ),
+                _run_input("proposal-a", idempotency_key="concurrent-retry-key", request_id="request-a"),
                 principal=_principal(),
             ),
             manager.start_run_request_view(
-                _run_input(
-                    "proposal-b",
-                    idempotency_key="concurrent-retry-key",
-                    request_id="request-b",
-                ),
+                _run_input("proposal-b", idempotency_key="concurrent-retry-key", request_id="request-b"),
                 principal=_principal(),
             ),
         )
-        retry_views = [retry_a[1], retry_b[1]]
-        assert all(view is not None for view in retry_views)
-        assert store.get_workflow_run_invocation(info.run_id) is None
-        assert [
-            event.value["__request_id"]
-            for _seq, event in info.events
-            if isinstance(event, CustomEvent) and event.name == "service.result"
-        ] == ["request-a", "request-b"]
+        assert retry_a[0] is info
+        assert retry_b[0] is info
+        assert original_view is not None
+        assert retry_a[1] is not None
+        assert retry_b[1] is not None
+        assert {retry_a[1].request_id, retry_b[1].request_id} == {"request-a", "request-b"}
+        assert store.get_run(info.run_id) is None
 
-        async def collect(view):
-            assert view is not None
-            return [
-                event
-                async for event in manager.stream_live(
-                    info.run_id,
-                    request_view=view,
-                )
-            ]
-
-        collectors = [
-            asyncio.create_task(collect(view))
-            for view in retry_views
-        ]
-        await asyncio.sleep(0)
         release_runner.set()
-        events_a, events_b = await asyncio.wait_for(
-            asyncio.gather(*collectors),
-            timeout=2,
-        )
-
-        for request_id, events in zip(
-            ("request-a", "request-b"),
-            (events_a, events_b),
-            strict=True,
-        ):
-            service_results = [
-                event
-                for event in events
-                if isinstance(event, CustomEvent)
-                and event.name == "service.result"
-            ]
-            assert [
-                event.value["__request_id"] for event in service_results
-            ] == [request_id]
-            assert [
-                (
-                    event.type,
-                    event.name if isinstance(event, CustomEvent) else None,
-                )
-                for event in events
-                if not (
-                    isinstance(event, CustomEvent)
-                    and event.name == "service.result"
-                )
-            ] == [
-                (EventType.CUSTOM, "workflow.progress"),
-                (EventType.CUSTOM, "workflow.result"),
-                (EventType.RUN_FINISHED, None),
-            ]
-
+        await asyncio.wait_for(info.task, timeout=2)
+        stored = store.get_run(info.run_id)
+        assert stored is not None
+        assert stored.status == "succeeded"
+        assert store.get_workflow_run_invocation(info.run_id) is not None
         assert runner_calls == ["original-run"]
-        assert reservation_calls == ["original-run"]
-        default_events = [
-            event async for event in manager.stream_live(info.run_id)
-        ]
-        assert [
-            event.value["__request_id"]
-            for event in default_events
-            if isinstance(event, CustomEvent) and event.name == "service.result"
-        ] == ["request-a", "request-b", "original-request"]
     finally:
         release_runner.set()
         if info is not None and info.task is not None and not info.task.done():
             info.task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await info.task
+            await info.task
+        manager.close()
         store.close()
-
 
 @pytest.mark.asyncio
 async def test_request_view_replaces_stale_terminal_loser_with_durable_winner(
@@ -835,7 +850,8 @@ async def test_request_view_replaces_stale_terminal_loser_with_durable_winner(
         assert any(
             isinstance(event, CustomEvent)
             and event.name == "workflow.result"
-            and event.value == winner
+            and event.value
+            == {**winner, "result_seq": terminal_stored.result_seq}
             for _seq, event in info.events
         )
         assert any(
@@ -848,6 +864,110 @@ async def test_request_view_replaces_stale_terminal_loser_with_durable_winner(
             with pytest.raises(asyncio.CancelledError):
                 await collector
         store.close()
+
+
+def test_terminal_retry_projection_deduplicates_by_durable_result_identity(
+    tmp_path,
+):
+    input_data = _run_input(
+        "outer-run",
+        idempotency_key="projection-identity-key",
+    )
+    payload = input_data.forwarded_props["service_payload"]
+    store = EventStore(str(tmp_path / "events.db"))
+    _admit_workflow_run(
+        store,
+        run_id="outer-run",
+        idempotency_key="projection-identity-key",
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
+        run_incarnation="inc-projection",
+        session_id=input_data.thread_id,
+        create_if_missing=True,
+    )
+    primary = _terminal_payload(
+        run_id="outer-run",
+        incarnation="inc-projection",
+        status="cancelled",
+        reason="CANCELLED",
+    )
+    store.finalize_run_with_event("outer-run", primary)
+    stored = store.get_run("outer-run")
+    assert stored is not None and stored.result_seq is not None
+    manager = run_manager_module.RunManager(store)
+    info = manager._info_from_stored(stored)
+    info.events.append(
+        (
+            stored.result_seq + 1,
+            CustomEvent(
+                type=EventType.CUSTOM,
+                name="workflow.result",
+                value={
+                    **primary,
+                    "result_seq": stored.result_seq,
+                    "transport_report": {"persisted": True},
+                },
+                timestamp=1,
+            ),
+        )
+    )
+    admission = run_manager_module._text_to_sql_admission(input_data)
+    assert admission is not None
+    try:
+        manager._append_terminal_retry_projection(
+            info,
+            stored,
+            input_data,
+            admission,
+            include_start=False,
+        )
+
+        workflow_results = [
+            event
+            for _seq, event in info.events
+            if isinstance(event, CustomEvent) and event.name == "workflow.result"
+        ]
+        assert len(workflow_results) == 1
+        terminals = [
+            event
+            for _seq, event in info.events
+            if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}
+        ]
+        assert len(terminals) == 1
+    finally:
+        store.close()
+
+
+def test_terminal_projection_identity_requires_authoritative_result_seq():
+    primary = _terminal_payload(
+        run_id="outer-run",
+        incarnation="inc-projection",
+        status="cancelled",
+        reason="CANCELLED",
+    )
+    durable_projection = {**primary, "result_seq": 41}
+    another_sequence = CustomEvent(
+        type=EventType.CUSTOM,
+        name="workflow.result",
+        value={**primary, "result_seq": 42},
+        timestamp=1,
+    )
+    same_sequence = CustomEvent(
+        type=EventType.CUSTOM,
+        name="workflow.result",
+        value=durable_projection,
+        timestamp=1,
+    )
+
+    assert not run_manager_module._projects_durable_workflow_result(
+        another_sequence,
+        durable_projection,
+        result_seq=41,
+    )
+    assert run_manager_module._projects_durable_workflow_result(
+        same_sequence,
+        durable_projection,
+        result_seq=41,
+    )
 
 
 @pytest.mark.asyncio
@@ -899,11 +1019,17 @@ async def test_request_view_preserves_server_restarted_terminal_without_result(
 
 
 @pytest.mark.asyncio
-async def test_outer_success_cannot_terminalize_text_to_sql_without_primary_result(
+async def test_outer_success_after_admission_follows_durable_winner(
     tmp_path,
     monkeypatch,
 ):
     async def fake_run_agent(input_data):
+        _admit_workflow_run(
+            store,
+            run_id=input_data.run_id,
+            session_id=input_data.thread_id,
+            create_if_missing=True,
+        )
         yield RunFinishedEvent(
             type=EventType.RUN_FINISHED,
             thread_id=input_data.thread_id,
@@ -925,26 +1051,30 @@ async def test_outer_success_cannot_terminalize_text_to_sql_without_primary_resu
 
         stored = store.get_run("run-no-primary")
         assert stored is not None
-        assert stored.status == "failed"
-        assert stored.result_seq is not None
-        result = store.get_event("run-no-primary", stored.result_seq)
-        assert result is not None
-        assert result.event_type == "WORKFLOW_RESULT"
-        assert result.payload["terminal_outcome"]["status"] == "failed"
-        assert result.payload["terminal_outcome"]["reason_code"] == (
-            "MANDATORY_STEP_NOT_COMPLETED"
+        assert stored.status == "queued"
+        follower = info.task
+        assert follower is not None
+        store.finalize_run_with_event(
+            "run-no-primary",
+            _terminal_payload(
+                run_id="run-no-primary",
+                incarnation="inc-1",
+                status="succeeded",
+                reason="COMPLETED",
+            ),
         )
+        await asyncio.wait_for(follower, timeout=2)
         assert [
             event.type
             for _seq, event in info.events
             if event.type in {EventType.RUN_FINISHED, EventType.RUN_ERROR}
-        ] == [EventType.RUN_ERROR]
+        ] == [EventType.RUN_FINISHED]
     finally:
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_pre_invocation_text_to_sql_failure_has_primary_terminal_result(
+async def test_pre_invocation_text_to_sql_failure_leaves_no_partial_admission(
     tmp_path,
     monkeypatch,
 ):
@@ -964,25 +1094,15 @@ async def test_pre_invocation_text_to_sql_failure_has_primary_terminal_result(
         await info.task
 
         stored = store.get_run("run-start-failed")
-        assert stored is not None
-        assert stored.status == "failed"
-        assert stored.result_seq is not None
-        event = store.get_event("run-start-failed", stored.result_seq)
-        assert event is not None
-        assert event.event_type == "WORKFLOW_RESULT"
-        assert event.payload["terminal_outcome"]["status"] == "failed"
-        assert event.payload["terminal_outcome"]["reason_code"] == (
-            "MANDATORY_STEP_NOT_COMPLETED"
-        )
-        from workflow.models import TextToSqlTerminalResult
-
-        TextToSqlTerminalResult.from_mapping(event.payload["terminal_outcome"])
+        assert stored is None
+        assert store.get_workflow_run_invocation("run-start-failed") is None
+        assert store.load_work_spec("run-start-failed") is None
     finally:
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_pre_invocation_text_to_sql_cancel_has_primary_terminal_result(
+async def test_pre_invocation_text_to_sql_cancel_leaves_no_partial_admission(
     tmp_path,
     monkeypatch,
 ):
@@ -1006,13 +1126,10 @@ async def test_pre_invocation_text_to_sql_cancel_has_primary_terminal_result(
 
         assert await manager.cancel("run-start-cancelled") is True
         stored = store.get_run("run-start-cancelled")
-        assert stored is not None
-        assert stored.status == "cancelled"
-        assert stored.result_seq is not None
-        event = store.get_event("run-start-cancelled", stored.result_seq)
-        assert event is not None
-        assert event.event_type == "WORKFLOW_RESULT"
-        assert event.payload["terminal_outcome"]["status"] == "cancelled"
+        assert stored is None
+        assert store.get_workflow_run_invocation("run-start-cancelled") is None
+        assert store.load_work_spec("run-start-cancelled") is None
+        assert info.status == run_manager_module.RunStatus.CANCELLED
         assert info.task is not None and info.task.done()
     finally:
         release.set()
@@ -1344,7 +1461,11 @@ async def test_outer_finalizer_read_failure_adopts_durable_follower(
                 ),
             )
 
-        await asyncio.wait_for(observer_task, timeout=2)
+            await asyncio.wait_for(observer_task, timeout=2)
+        else:
+            await asyncio.wait_for(observer_task, timeout=2)
+            assert original_get_run("outer-run") is None
+            return
         stored = original_get_run("outer-run")
         assert stored is not None
         assert stored.status == ("succeeded" if reserve_invocation else "failed")
@@ -1499,11 +1620,15 @@ async def test_post_invocation_workflow_mismatch_persists_typed_failure(
     release_outer = asyncio.Event()
 
     async def exit_after_mismatched_invocation(input_data):
-        assert store.reserve_workflow_run(
-            input_data.run_id,
-            "inc-mismatched-workflow",
-            input_data.thread_id,
-            "different_workflow",
+        payload = input_data.forwarded_props["service_payload"]
+        _claim_text_to_sql_worker(
+            store,
+            run_id=input_data.run_id,
+            run_incarnation="inc-mismatched-workflow",
+            thread_id=input_data.thread_id,
+            workflow_name="different_workflow",
+            idempotency_key=payload["idempotency_key"],
+            request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
         )
         invocation_ready.set()
         await release_outer.wait()
@@ -1568,7 +1693,7 @@ async def test_post_invocation_workflow_mismatch_persists_typed_failure(
 
 
 @pytest.mark.asyncio
-async def test_immediate_cancel_after_start_handshake_persists_terminal_result(
+async def test_immediate_cancel_after_start_handshake_leaves_no_partial_admission(
     tmp_path,
     monkeypatch,
 ):
@@ -1597,9 +1722,10 @@ async def test_immediate_cancel_after_start_handshake_persists_terminal_result(
         assert info.lifecycle_started.is_set()
         assert await manager.cancel("run-immediate-cancel") is True
         stored = store.get_run("run-immediate-cancel")
-        assert stored is not None
-        assert stored.status == "cancelled"
-        assert stored.result_seq is not None
+        assert stored is None
+        assert store.get_workflow_run_invocation("run-immediate-cancel") is None
+        assert store.load_work_spec("run-immediate-cancel") is None
+        assert info.status == run_manager_module.RunStatus.CANCELLED
     finally:
         never.set()
         store.close()
@@ -1612,9 +1738,19 @@ async def test_cancel_timeout_reopens_text_to_sql_cancel_attempt(
 ):
     release = asyncio.Event()
     cancellation_count = 0
+    claim: WorkflowClaimEnvelope | None = None
 
-    async def stubborn_follower(_input_data):
-        nonlocal cancellation_count
+    async def stubborn_follower(input_data):
+        nonlocal cancellation_count, claim
+        payload = input_data.forwarded_props["service_payload"]
+        claim = _claim_text_to_sql_worker(
+            store,
+            run_id=input_data.run_id,
+            run_incarnation="inc-stubborn",
+            thread_id=input_data.thread_id,
+            idempotency_key=payload["idempotency_key"],
+            request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
+        )
         try:
             await asyncio.Event().wait()
         except asyncio.CancelledError:
@@ -1639,23 +1775,40 @@ async def test_cancel_timeout_reopens_text_to_sql_cancel_attempt(
         assert info.cancel_requested is False
         assert await manager.cancel("run-stubborn") is False
         assert cancellation_count == 1
-        assert info.task.cancelling() >= 2
-        # The finalizer writes the terminal "cancelled" status via
-        # RunManager._call_store's executor hop (T2), so it may not have
-        # landed yet at this exact instant; poll with the file's usual
-        # bounded-wait idiom instead of asserting on an immediate read.
-        stored = None
-        for _ in range(50):
-            stored = store.get_run("run-stubborn")
-            if stored is not None and stored.status in {"running", "cancelled"}:
-                break
-            await asyncio.sleep(0.02)
+        assert info.durable_follower is True
+        assert claim is not None
+        release.set()
+        store.finalize_run_with_event(
+            "run-stubborn",
+            _terminal_payload(
+                run_id="run-stubborn",
+                incarnation="inc-stubborn",
+                status="cancelled",
+                reason="CANCELLED",
+            ),
+            expected_supervisor_id=claim.supervisor_id,
+            expected_attempt_generation=claim.attempt_generation,
+        )
+        await asyncio.sleep(0)
+        stored = store.get_run("run-stubborn")
         assert stored is not None
-        assert stored.status in {"running", "cancelled"}
+        assert stored.status == "cancelled"
+        assert stored.result_seq is not None
+        task = info.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2)
+        assert task.done()
+        assert info.status == run_manager_module.RunStatus.CANCELLED
     finally:
         release.set()
         if info.task is not None:
-            await info.task
+            task = info.task
+            if not task.done():
+                task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=1)
+            except asyncio.CancelledError:
+                pass
         store.close()
 
 
@@ -1874,6 +2027,62 @@ async def test_outer_cancel_waits_for_child_cancel_winner_and_emits_one_terminal
         assert stored.status == "cancelled"
         assert stored.result_seq is not None
     finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_unrequested_outer_task_cancel_preserves_durable_workflow(
+    tmp_path,
+    monkeypatch,
+):
+    """A foreign outer-task cancellation must not become a workflow cancel."""
+    import backend.fastapi_app.agui.runner as runner_module
+    import backend.fastapi_app.agui.service as service_module
+
+    store = EventStore(str(tmp_path / "events.db"))
+    manager = run_manager_module.RunManager(store)
+    fake = _LifecycleServiceFake(store)
+    fake.block_first_status = True
+    monkeypatch.setattr(service_module, "handle_service_action", fake)
+    monkeypatch.setattr(runner_module, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0.01)
+    info = None
+    try:
+        info = await manager.start_run(
+            _run_input("outer-run", idempotency_key="foreign-cancel-key"),
+            principal=_principal(),
+        )
+        assert await asyncio.to_thread(fake.status_entered.wait, 5)
+        original_task = info.task
+        assert original_task is not None
+
+        # This deliberately bypasses RunManager.cancel(). There is no user,
+        # orphan, or shutdown cancellation intent attached to this task.cancel().
+        original_task.cancel()
+        for _attempt in range(100):
+            if fake.cancel_calls or info.durable_follower:
+                break
+            await asyncio.sleep(0.01)
+
+        assert fake.cancel_calls == 0
+        assert info.durable_follower is True
+
+        fake.complete_primary()
+        fake.status_gate.set()
+        follower = info.task
+        assert follower is not None and follower is not original_task
+        await asyncio.wait_for(follower, timeout=2)
+        stored = store.get_run("outer-run")
+        assert stored is not None
+        assert stored.status == "succeeded"
+        assert stored.cancel_requested_at_ms is None
+    finally:
+        fake.status_gate.set()
+        if info is not None and info.task is not None and not info.task.done():
+            info.task.cancel()
+            try:
+                await info.task
+            except asyncio.CancelledError:
+                pass
         store.close()
 
 
@@ -2394,6 +2603,7 @@ async def test_cancel_while_sync_start_is_blocked_waits_then_cancels_child(
     fake.block_start_after_reservation = True
     monkeypatch.setattr(service_module, "handle_service_action", fake)
     monkeypatch.setattr(runner_module, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0)
+    info = None
     try:
         info = await manager.start_run(
             _run_input("outer-run", idempotency_key="cancel-during-start-key"),
@@ -2412,14 +2622,25 @@ async def test_cancel_while_sync_start_is_blocked_waits_then_cancels_child(
         assert stored is not None
         assert stored.status == "cancelled"
         assert stored.result_seq is not None
-        assert info.task is not None and info.task.done()
+        task = info.task
+        assert task is not None
+        await asyncio.wait_for(task, timeout=2)
+        assert task.done()
     finally:
         fake.start_gate.set()
+        if info is not None and info.task is not None:
+            task = info.task
+            if not task.done():
+                task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=1)
+            except asyncio.CancelledError:
+                pass
         store.close()
 
 
 @pytest.mark.asyncio
-async def test_start_error_after_reservation_cancels_child_before_propagation(
+async def test_start_response_error_after_worker_handoff_preserves_child(
     tmp_path,
     monkeypatch,
 ):
@@ -2432,20 +2653,58 @@ async def test_start_error_after_reservation_cancels_child_before_propagation(
     fake.raise_after_start_reservation = True
     monkeypatch.setattr(service_module, "handle_service_action", fake)
     monkeypatch.setattr(runner_module, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0)
+    info = None
     try:
         info = await manager.start_run(
             _run_input("outer-run", idempotency_key="error-during-start-key"),
             principal=_principal(),
         )
         assert info.task is not None
-        await info.task
+        assert await asyncio.to_thread(fake.status_entered.wait, 5)
+
+        assert not await asyncio.to_thread(fake.cancel_entered.wait, 0.2)
+        assert fake.cancel_calls == 0
+        fake.complete_primary()
+        await asyncio.wait_for(info.task, timeout=2)
+        stored = store.get_run("outer-run")
+        assert stored is not None
+        assert stored.status == "succeeded"
+        assert stored.result_seq is not None
+        assert info.task.done()
+    finally:
+        if info is not None and info.task is not None and not info.task.done():
+            await asyncio.wait_for(info.task, timeout=2)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_start_error_before_worker_handoff_cleans_up_queued_child(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.fastapi_app.agui.runner as runner_module
+    import backend.fastapi_app.agui.service as service_module
+
+    store = EventStore(str(tmp_path / "events.db"))
+    manager = run_manager_module.RunManager(store)
+    fake = _LifecycleServiceFake(store)
+    fake.leave_start_unclaimed = True
+    fake.raise_after_start_reservation = True
+    monkeypatch.setattr(service_module, "handle_service_action", fake)
+    monkeypatch.setattr(runner_module, "_WORKFLOW_POLL_INTERVAL_SECONDS", 0)
+    try:
+        info = await manager.start_run(
+            _run_input("outer-run", idempotency_key="queued-start-error-key"),
+            principal=_principal(),
+        )
+        assert info.task is not None
+        await asyncio.wait_for(info.task, timeout=2)
 
         assert fake.cancel_calls == 1
         stored = store.get_run("outer-run")
         assert stored is not None
         assert stored.status == "cancelled"
         assert stored.result_seq is not None
-        assert info.task.done()
     finally:
         store.close()
 
@@ -2454,19 +2713,66 @@ class _WorkflowManagerSpy:
     def __init__(self, store: EventStore) -> None:
         self.store = store
         self.start_calls: list[dict[str, object]] = []
+        self.worker_starts = 0
 
     def start_workflow(self, **kwargs):
         self.start_calls.append(kwargs)
         run_id = str(kwargs["run_id"])
+        owner = kwargs["owner"]
+        principal = Principal(owner.subject, owner.tenant_id, owner.roles)
+        admission = kwargs.get("text_to_sql_admission")
+        idempotency_key = None if admission is None else admission.idempotency_key
+        request_fingerprint = (
+            None if admission is None else admission.request_fingerprint
+        )
+        if admission is not None:
+            existing = self.store.get_run_by_idempotency(
+                principal=principal,
+                run_kind="text_to_sql",
+                idempotency_key=idempotency_key,
+            )
+            if existing is not None:
+                assert existing.request_fingerprint == request_fingerprint
+                return existing.run_id
+        run_incarnation = f"inc-{len(self.start_calls)}"
+        session_id = str(kwargs["session_id"])
+        deadline_at_ms = int(time.time() * 1000) + 60_000
+        work_spec = {
+            "spec_version": 1,
+            "workflow_path": os.path.abspath(
+                "workflow_pipelines/text_to_sql_pipeline.yaml"
+            ),
+            "parameters": kwargs["parameters"],
+            "session_id": session_id,
+            "client_id": kwargs["client_id"],
+            "use_enhanced": kwargs["use_enhanced"],
+            "enable_telemetry": kwargs["enable_telemetry"],
+            "run_incarnation": run_incarnation,
+            "deadline_at_ms": deadline_at_ms,
+        }
+        _stored, should_wake = _admit_workflow_run(
+            self.store,
+            run_id=run_id,
+            principal=principal,
+            idempotency_key=idempotency_key,
+            request_fingerprint=request_fingerprint,
+            run_incarnation=run_incarnation,
+            session_id=session_id,
+            workflow_name=str(kwargs["workflow_name"]),
+            work_spec=work_spec,
+            create_if_missing=True,
+        )
+        assert should_wake is True
         _claim_text_to_sql_worker(
             self.store,
             run_id=run_id,
-            run_incarnation=f"inc-{len(self.start_calls)}",
-            thread_id=str(kwargs["session_id"]),
+            run_incarnation=run_incarnation,
+            thread_id=session_id,
             workflow_name=str(kwargs["workflow_name"]),
             supervisor_id=f"test-supervisor-{len(self.start_calls)}",
             worker_pid=10_000 + len(self.start_calls),
         )
+        self.worker_starts += 1
         return run_id
 
 
@@ -2478,11 +2784,13 @@ class _LifecycleServiceFake:
         self.block_first_status = False
         self.status_calls = 0
         self.cancel_calls = 0
+        self.cancel_entered = threading.Event()
         self.fail_status_calls: set[int] = set()
         self.start_entered = threading.Event()
         self.start_gate = threading.Event()
         self.block_start_after_reservation = False
         self.raise_after_start_reservation = False
+        self.leave_start_unclaimed = False
         self.cancel_result = True
         self.cancel_exception: Exception | None = None
         self.cancel_gate: threading.Event | None = None
@@ -2511,12 +2819,21 @@ class _LifecycleServiceFake:
     ):
         if action == "presets.text_to_sql.generate":
             assert transport_context.run_id == "outer-run"
-            self.claim = _claim_text_to_sql_worker(
-                self.store,
-                run_id="outer-run",
-                run_incarnation="inc-1",
-                thread_id="outer-thread",
-            )
+            if self.leave_start_unclaimed:
+                _admit_workflow_run(
+                    self.store,
+                    run_id="outer-run",
+                    run_incarnation="inc-1",
+                    session_id="outer-thread",
+                    create_if_missing=True,
+                )
+            else:
+                self.claim = _claim_text_to_sql_worker(
+                    self.store,
+                    run_id="outer-run",
+                    run_incarnation="inc-1",
+                    thread_id="outer-thread",
+                )
             self.start_entered.set()
             if self.block_start_after_reservation:
                 assert self.start_gate.wait(timeout=5)
@@ -2535,6 +2852,7 @@ class _LifecycleServiceFake:
             stored = self.store.get_run("outer-run")
             status = {
                 "pending": "pending",
+                "queued": "queued",
                 "running": "running",
                 "succeeded": "completed",
                 "failed": "failed",
@@ -2555,6 +2873,7 @@ class _LifecycleServiceFake:
                 }
             }
         if action == "workflows.cancel":
+            self.cancel_entered.set()
             self.cancel_calls += 1
             if self.cancel_gate is not None:
                 assert self.cancel_gate.wait(timeout=5)
@@ -2562,22 +2881,31 @@ class _LifecycleServiceFake:
                 raise self.cancel_exception
             if not self.cancel_result:
                 return {"cancelled": False}
-            assert self.claim is not None
-            self.store.finalize_run_with_event(
-                "outer-run",
-                _terminal_payload(
-                    run_id="outer-run",
-                    status="cancelled",
-                    reason="CANCELLED",
-                ),
-                expected_supervisor_id=self.claim.supervisor_id,
-                expected_attempt_generation=self.claim.attempt_generation,
+            terminal = _terminal_payload(
+                run_id="outer-run",
+                status="cancelled",
+                reason="CANCELLED",
             )
+            if self.claim is None:
+                self.store.finalize_run_with_event("outer-run", terminal)
+            else:
+                self.store.finalize_run_with_event(
+                    "outer-run",
+                    terminal,
+                    expected_supervisor_id=self.claim.supervisor_id,
+                    expected_attempt_generation=self.claim.attempt_generation,
+                )
             return {"cancelled": True}
         if action == "workflows.result":
             stored = self.store.get_run("outer-run")
             event = self.store.get_event("outer-run", stored.result_seq)
-            return event.payload
+            return {
+                **event.payload,
+                "__durable_workflow_result": {
+                    **event.payload,
+                    "result_seq": stored.result_seq,
+                },
+            }
         raise AssertionError(action)
 
 
@@ -2598,14 +2926,12 @@ async def test_run_manager_service_workflow_enqueue_preserves_pending_owner(
         tmp_path,
         principal,
     )
-    submitted = threading.Event()
     observed_statuses: list[str] = []
 
     class PersistingSupervisor:
         def submit(self, run_id, work_spec, *, deadline_at_ms):
             observed_statuses.append(store.get_run(run_id).status)
             store.enqueue_run(run_id, work_spec, deadline_at_ms, 10)
-            submitted.set()
             return types.SimpleNamespace(state="queued")
 
         @staticmethod
@@ -2660,9 +2986,10 @@ async def test_run_manager_service_workflow_enqueue_preserves_pending_owner(
     info = None
     try:
         info = await manager.start_run(input_data, principal=principal)
-        assert await asyncio.to_thread(submitted.wait, 2)
+        assert info.task is not None
+        await asyncio.wait_for(info.task, timeout=2)
         stored = store.get_run("outer-run")
-        assert observed_statuses == ["pending"]
+        assert observed_statuses == ["queued"]
         assert stored is not None
         assert stored.status == "queued"
         assert store.get_workflow_run_invocation("outer-run") is not None
@@ -2679,6 +3006,87 @@ async def test_run_manager_service_workflow_enqueue_preserves_pending_owner(
                 follower_task.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await follower_task
+        store.close()
+
+
+def test_workflow_admission_rolls_back_if_spec_insert_fails(tmp_path):
+    store = EventStore(str(tmp_path / "events.db"))
+    try:
+        store._conn.execute(
+            """
+            CREATE TRIGGER fail_work_spec_insert
+            BEFORE INSERT ON workflow_run_specs
+            BEGIN
+                SELECT RAISE(ABORT, 'forced work_spec failure');
+            END
+            """
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="forced work_spec failure"):
+            _admit_workflow_run(
+                store,
+                run_id="rollback-run",
+                create_if_missing=True,
+            )
+        assert store.get_run("rollback-run") is None
+        assert store.get_workflow_run_invocation("rollback-run") is None
+        assert store.load_work_spec("rollback-run") is None
+    finally:
+        store.close()
+
+
+def test_workflow_admission_rejects_partial_legacy_reservation_unchanged(tmp_path):
+    store = EventStore(str(tmp_path / "events.db"))
+    try:
+        _create_text_to_sql_run(store, run_id="partial-run")
+        assert store.reserve_workflow_run(
+            "partial-run",
+            "partial-inc",
+            "session-partial-run",
+            "text_to_sql_pipeline",
+        )
+        with pytest.raises(WorkflowAdmissionConflictError, match="partial"):
+            _admit_workflow_run(
+                store,
+                run_id="partial-run",
+                run_incarnation="partial-inc",
+            )
+        stored = store.get_run("partial-run")
+        assert stored is not None
+        assert stored.status == "pending"
+        assert store.load_work_spec("partial-run") is None
+    finally:
+        store.close()
+
+
+def test_matching_workflow_admission_is_idempotent_and_conflicts_are_unchanged(
+    tmp_path,
+):
+    store = EventStore(str(tmp_path / "events.db"))
+    try:
+        _create_text_to_sql_run(store, run_id="admitted-run")
+        stored, should_wake = _admit_workflow_run(
+            store,
+            run_id="admitted-run",
+            session_id="session-admitted-run",
+            parameters={"query": "first"},
+        )
+        spec = store.load_work_spec("admitted-run")
+        assert stored.status == "queued"
+        assert should_wake is True
+        assert spec is not None
+        with pytest.raises(WorkflowAdmissionConflictError, match="identity"):
+            _admit_workflow_run(
+                store,
+                run_id="admitted-run",
+                run_incarnation="conflicting-incarnation",
+                session_id="session-admitted-run",
+                parameters={"query": "second"},
+            )
+        assert store.load_work_spec("admitted-run") == spec
+        assert store.get_workflow_run_invocation(
+            "admitted-run"
+        ).run_incarnation == "inc-1"
+    finally:
         store.close()
 
 
@@ -2770,7 +3178,8 @@ def test_standalone_service_retry_reuses_one_durable_id_and_worker(
         )
 
         assert second["run_id"] == first["run_id"]
-        assert len(manager.start_calls) == 1
+        assert len(manager.start_calls) == 2
+        assert manager.worker_starts == 1
         stored = store.get_run(first["run_id"])
         assert stored is not None
         assert stored.run_kind == "text_to_sql"
@@ -2783,73 +3192,76 @@ def test_concurrent_standalone_retries_share_one_reservation_and_worker(
     tmp_path,
     monkeypatch,
 ):
-    import backend.fastapi_app.agui.service as service_module
-    from backend.fastapi_app.agui.errors import WorkflowRunAlreadyReservedError
+    import workflow.streamlit_api as streamlit_api
+    from backend.fastapi_app.agui._t2s_requests import TextToSqlWorkflowAdmission
 
-    store = EventStore(str(tmp_path / "events.db"))
-    barrier = threading.Barrier(2)
-    result_lock = threading.Lock()
-
-    class RacingManager:
-        def __init__(self):
-            self.attempts = 0
-            self.successful_starts = 0
-            self.worker_starts = 0
-
-        def start_workflow(self, **kwargs):
-            with result_lock:
-                self.attempts += 1
-            barrier.wait(timeout=5)
-            reserved = store.reserve_workflow_run(
-                str(kwargs["run_id"]),
-                "inc-race",
-                str(kwargs["session_id"]),
-                str(kwargs["workflow_name"]),
-            )
-            if not reserved:
-                raise WorkflowRunAlreadyReservedError("already reserved")
-            assert store.set_worker_pid(str(kwargs["run_id"]), 54321)
-            with result_lock:
-                self.successful_starts += 1
-                self.worker_starts += 1
-            return kwargs["run_id"]
-
-    manager = RacingManager()
-    principal = _principal()
-    connection_ref = _install_service_connection(
-        service_module,
-        monkeypatch,
-        tmp_path,
-        principal,
+    event_path = tmp_path / "events.db"
+    monkeypatch.setattr(streamlit_api, "_agui_event_store_path", lambda: event_path)
+    monkeypatch.setattr(
+        streamlit_api,
+        "_workflow_result_outbox_path",
+        lambda: tmp_path / "outbox.db",
     )
-    payload = {
-        "query": "count orders",
-        "connection_ref": connection_ref,
-        "idempotency_key": "concurrent-standalone-key",
-    }
-    monkeypatch.setattr(service_module, "_AGUI_EVENT_STORE", store)
-    monkeypatch.setattr(service_module, "_WF_MANAGER", manager)
+    with streamlit_api._GLOBAL_WORKFLOW_RUNS_LOCK:
+        streamlit_api._GLOBAL_WORKFLOW_ACTIVE_RUNS.clear()
+        streamlit_api._GLOBAL_WORKFLOW_RUN_CALLBACKS.clear()
+    barrier = threading.Barrier(2)
+    submit_calls: list[str] = []
+    submit_lock = threading.Lock()
 
-    def start():
-        return service_module.handle_service_action(
-            "presets.text_to_sql.generate",
-            payload,
-            principal=principal,
+    class Supervisor:
+        def submit(self, run_id, _work_spec, *, deadline_at_ms):
+            assert deadline_at_ms > int(time.time() * 1000)
+            with submit_lock:
+                submit_calls.append(run_id)
+            return types.SimpleNamespace(state="queued")
+
+    manager = streamlit_api.WorkflowManager(
+        pipelines_dir="workflow_pipelines",
+        supervisor=Supervisor(),
+    )
+    principal = _principal()
+    owner = streamlit_api.WorkflowOwner(
+        subject=principal.subject,
+        tenant_id=principal.tenant_id,
+        roles=principal.roles,
+    )
+    admission = TextToSqlWorkflowAdmission(
+        idempotency_key="concurrent-standalone-key",
+        request_fingerprint="a" * 64,
+    )
+
+    def start(index: int) -> str:
+        barrier.wait(timeout=5)
+        return manager.start_workflow(
+            "text_to_sql_pipeline",
+            parameters={"run_id": f"proposed-{index}"},
+            session_id="session-race",
+            run_id=f"run-proposed-{index}",
+            owner=owner,
+            text_to_sql_admission=admission,
         )
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-            responses = list(pool.map(lambda _index: start(), range(2)))
+            responses = list(pool.map(start, range(2)))
 
-        assert responses[0]["run_id"] == responses[1]["run_id"]
-        assert manager.attempts == 2
-        assert manager.successful_starts == 1
-        assert manager.worker_starts == 1
-        invocation = store.get_workflow_run_invocation(responses[0]["run_id"])
-        assert invocation is not None
-        assert invocation.workflow_name == "text_to_sql_pipeline"
+        assert responses[0] == responses[1]
+        assert submit_calls == [responses[0]]
+        store = EventStore(str(event_path))
+        try:
+            stored = store.get_run(responses[0])
+            assert stored is not None
+            assert stored.run_kind == "text_to_sql"
+            assert stored.status == "queued"
+            assert store.get_workflow_run_invocation(stored.run_id) is not None
+            assert store.load_work_spec(stored.run_id) is not None
+        finally:
+            store.close()
     finally:
-        store.close()
+        with streamlit_api._GLOBAL_WORKFLOW_RUNS_LOCK:
+            streamlit_api._GLOBAL_WORKFLOW_ACTIVE_RUNS.clear()
+            streamlit_api._GLOBAL_WORKFLOW_RUN_CALLBACKS.clear()
 
 
 def test_matching_standalone_retry_does_not_wait_for_delayed_pid_attach(
@@ -2864,21 +3276,70 @@ def test_matching_standalone_retry_does_not_wait_for_delayed_pid_attach(
 
     class DelayedAttachManager:
         def __init__(self):
-            self.start_calls = 0
+            self.start_attempts = 0
             self.worker_starts = 0
 
         def start_workflow(self, **kwargs):
-            self.start_calls += 1
+            self.start_attempts += 1
             run_id = str(kwargs["run_id"])
-            assert store.reserve_workflow_run(
-                run_id,
-                "inc-delayed-attach",
-                str(kwargs["session_id"]),
-                str(kwargs["workflow_name"]),
+            owner = kwargs["owner"]
+            admission_principal = Principal(
+                owner.subject,
+                owner.tenant_id,
+                owner.roles,
             )
+            admission = kwargs["text_to_sql_admission"]
+            existing = store.get_run_by_idempotency(
+                principal=admission_principal,
+                run_kind="text_to_sql",
+                idempotency_key=admission.idempotency_key,
+            )
+            if existing is not None:
+                assert existing.request_fingerprint == admission.request_fingerprint
+                return existing.run_id
+            session_id = str(kwargs["session_id"])
+            deadline_at_ms = int(time.time() * 1000) + 60_000
+            _stored, should_wake = _admit_workflow_run(
+                store,
+                run_id=run_id,
+                principal=admission_principal,
+                idempotency_key=admission.idempotency_key,
+                request_fingerprint=admission.request_fingerprint,
+                run_incarnation="inc-delayed-attach",
+                session_id=session_id,
+                workflow_name=str(kwargs["workflow_name"]),
+                work_spec={
+                    "spec_version": 1,
+                    "workflow_path": os.path.abspath(
+                        "workflow_pipelines/text_to_sql_pipeline.yaml"
+                    ),
+                    "parameters": kwargs["parameters"],
+                    "session_id": session_id,
+                    "client_id": kwargs["client_id"],
+                    "use_enhanced": kwargs["use_enhanced"],
+                    "enable_telemetry": kwargs["enable_telemetry"],
+                    "run_incarnation": "inc-delayed-attach",
+                    "deadline_at_ms": deadline_at_ms,
+                },
+                create_if_missing=True,
+            )
+            assert should_wake is True
+            claim = store.claim_next_queued(
+                "test-supervisor-delayed-attach",
+                10,
+                10,
+                10,
+                9_999_999_999_999,
+            )
+            assert claim is not None
             reserved.set()
             assert attach_gate.wait(timeout=5)
-            assert store.set_worker_pid(run_id, 54321)
+            assert store.set_worker_pid(
+                run_id,
+                54321,
+                claim.claim.supervisor_id,
+                claim.claim.attempt_generation,
+            )
             self.worker_starts += 1
             return run_id
 
@@ -2916,7 +3377,7 @@ def test_matching_standalone_retry_does_not_wait_for_delayed_pid_attach(
             original = first.result(timeout=5)
 
         assert retry["run_id"] == original["run_id"]
-        assert manager.start_calls == 1
+        assert manager.start_attempts == 2
         assert manager.worker_starts == 1
     finally:
         attach_gate.set()
@@ -3139,6 +3600,52 @@ def test_workflow_status_projects_terminal_fields_from_primary_result_seq(
         store.close()
 
 
+def test_internal_workflow_result_includes_durable_projection_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.fastapi_app.agui.service as service_module
+
+    store = EventStore(str(tmp_path / "events.db"))
+    _admit_workflow_run(
+        store,
+        run_id="run-1",
+        run_incarnation="inc-result-projection",
+        create_if_missing=True,
+    )
+    primary = _terminal_payload(
+        run_id="run-1",
+        incarnation="inc-result-projection",
+        status="cancelled",
+        reason="CANCELLED",
+    )
+    store.finalize_run_with_event("run-1", primary)
+    monkeypatch.setattr(service_module, "_AGUI_EVENT_STORE", store)
+    try:
+        internal = service_module.handle_service_action(
+            "workflows.result",
+            {"run_id": "run-1"},
+            principal=_principal(),
+            transport_context=service_module.ServiceTransportContext(
+                run_id="run-1",
+                principal=_principal(),
+            ),
+        )
+        public = service_module.handle_service_action(
+            "workflows.result",
+            {"run_id": "run-1"},
+            principal=_principal(),
+        )
+
+        assert internal["__durable_workflow_result"] == {
+            **primary,
+            "result_seq": 1,
+        }
+        assert "__durable_workflow_result" not in public
+    finally:
+        store.close()
+
+
 @pytest.mark.parametrize("as_admin", [False, True], ids=["owner", "admin"])
 def test_owner_actions_allow_own_user_and_explicit_admin_cross_owner(
     tmp_path,
@@ -3154,7 +3661,7 @@ def test_owner_actions_allow_own_user_and_explicit_admin_cross_owner(
         def get_workflow_status(self, _run_id):
             return None
 
-        def cancel_workflow(self, run_id):
+        def cancel_workflow(self, run_id, **_kwargs):
             self.cancelled.append(run_id)
             return True
 
@@ -3200,6 +3707,57 @@ def test_owner_actions_allow_own_user_and_explicit_admin_cross_owner(
         assert artifacts == {"artifacts": None}
         assert cancelled == {"cancelled": True}
         assert manager.cancelled == ["run-1"]
+    finally:
+        store.close()
+
+
+def test_workflow_cancel_uses_server_transport_cancellation_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import backend.fastapi_app.agui.service as service_module
+
+    observed: list[tuple[str, str | None, str | None]] = []
+
+    class RecordingManager:
+        def cancel_workflow(
+            self,
+            run_id,
+            *,
+            cancellation_request_id=None,
+            cancellation_provenance=None,
+        ):
+            observed.append(
+                (run_id, cancellation_request_id, cancellation_provenance)
+            )
+            return True
+
+    store = EventStore(str(tmp_path / "events.db"))
+    _create_text_to_sql_run(store)
+    monkeypatch.setattr(service_module, "_AGUI_EVENT_STORE", store)
+    monkeypatch.setattr(service_module, "_WF_MANAGER", RecordingManager())
+    context = service_module.ServiceTransportContext(
+        run_id="run-1",
+        principal=_principal(),
+        cancellation_request_id="cancel-server-1",
+        cancellation_provenance="agui_run_manager:v1",
+    )
+    try:
+        response = service_module.handle_service_action(
+            "workflows.cancel",
+            {
+                "run_id": "run-1",
+                "cancellation_request_id": "forged-client-id",
+                "cancellation_provenance": "forged-client-source",
+            },
+            principal=_principal(),
+            transport_context=context,
+        )
+
+        assert response == {"cancelled": True}
+        assert observed == [
+            ("run-1", "cancel-server-1", "agui_run_manager:v1")
+        ]
     finally:
         store.close()
 
@@ -3357,6 +3915,89 @@ async def test_terminal_retry_without_transport_events_replays_current_correlati
         assert workflow_results[0].value["terminal_outcome"]["status"] == "failed"
         assert len(terminal_events) == 1
     finally:
+        store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_status", "expected_status"),
+    (
+        ("succeeded", run_manager_module.RunStatus.FINISHED),
+        ("failed", run_manager_module.RunStatus.ERRORED),
+        ("cancelled", run_manager_module.RunStatus.CANCELLED),
+    ),
+)
+async def test_terminal_idempotent_retry_replays_without_worker(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+    expected_status,
+):
+    original = _run_input(
+        "original-run",
+        idempotency_key="terminal-status-key",
+        request_id="original-request",
+    )
+    payload = original.forwarded_props["service_payload"]
+    store = EventStore(str(tmp_path / "events.db"))
+    store.create_or_get_run(
+        principal=_principal(),
+        run_kind="text_to_sql",
+        idempotency_key="terminal-status-key",
+        request_fingerprint=canonical_text_to_sql_start_fingerprint(payload),
+        proposed_run_id="original-run",
+        thread_id="original-thread",
+    )
+    assert store.reserve_workflow_run(
+        "original-run",
+        "inc-1",
+        "original-thread",
+        "text_to_sql_pipeline",
+    )
+    result_seq = store.finalize_run_with_event(
+        "original-run",
+        _terminal_payload(
+            run_id="original-run",
+            status=terminal_status,
+        ),
+    )
+
+    async def reject_runner(_input_data):
+        raise AssertionError("terminal retry must not start a worker")
+        yield
+
+    monkeypatch.setattr(run_manager_module, "run_agent", reject_runner)
+    manager = run_manager_module.RunManager(store)
+    try:
+        retried = await manager.start_run(
+            _run_input(
+                "retry-proposal",
+                idempotency_key="terminal-status-key",
+                request_id="retry-request",
+            ),
+            principal=_principal(),
+        )
+
+        assert retried.run_id == "original-run"
+        assert retried.task is None
+        assert retried.status is expected_status
+        stored = store.get_run("original-run")
+        assert stored is not None
+        assert stored.result_seq == result_seq
+        with pytest.raises(
+            ValueError,
+            match="idempotency_key was already used for a different request",
+        ):
+            await manager.start_run(
+                _run_input(
+                    "mismatch-proposal",
+                    idempotency_key="terminal-status-key",
+                    query="count paid orders",
+                ),
+                principal=_principal(),
+            )
+    finally:
+        manager.close()
         store.close()
 
 
@@ -3727,7 +4368,6 @@ async def test_durable_follower_cancel_timeout_keeps_singleflight_until_exceptio
         "text_to_sql_pipeline",
     )
     gate = threading.Event()
-    first_finished = threading.Event()
     calls: list[Principal] = []
     active = 0
     max_active = 0
@@ -3760,8 +4400,6 @@ async def test_durable_follower_cancel_timeout_keeps_singleflight_until_exceptio
         finally:
             with calls_lock:
                 active -= 1
-            if call_number == 1:
-                first_finished.set()
 
     async def reject_runner(_input_data):
         raise AssertionError("durable follower must not execute run_agent")
@@ -3781,9 +4419,15 @@ async def test_durable_follower_cancel_timeout_keeps_singleflight_until_exceptio
         assert await manager.cancel("original-run") is False
         assert calls == [_principal()]
         assert max_active == 1
+        first_dispatch = manager._uncached_cancel_dispatches["original-run"]
 
         gate.set()
-        assert await asyncio.to_thread(first_finished.wait, 2)
+        first_result = await asyncio.wait_for(
+            asyncio.shield(first_dispatch),
+            timeout=2,
+        )
+        assert first_result.failed is True
+        assert first_result.explicit_false is False
         assert await manager.cancel("original-run") is True
         assert calls == [_principal(), _principal()]
         assert max_active == 1
@@ -4025,6 +4669,15 @@ async def test_uncached_cancel_completed_exception_releases_for_one_retry(
             "uncached-exception-run",
             owner,
         ) is False
+        first_dispatch = manager._uncached_cancel_dispatches.get(
+            "uncached-exception-run"
+        )
+        if first_dispatch is not None:
+            first_result = await asyncio.wait_for(
+                asyncio.shield(first_dispatch),
+                timeout=1,
+            )
+            assert first_result.failed is True
         assert await manager.cancel_uncached_text_to_sql(
             "uncached-exception-run",
             owner,
@@ -4058,7 +4711,6 @@ async def test_uncached_cancel_timeout_keeps_singleflight_until_late_exception(
         "text_to_sql_pipeline",
     )
     gate = threading.Event()
-    first_finished = threading.Event()
     calls: list[Principal] = []
     active = 0
     max_active = 0
@@ -4091,8 +4743,6 @@ async def test_uncached_cancel_timeout_keeps_singleflight_until_late_exception(
         finally:
             with calls_lock:
                 active -= 1
-            if call_number == 1:
-                first_finished.set()
 
     monkeypatch.setattr(service_module, "handle_service_action", blocked_then_cancel)
     monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 0.01)
@@ -4101,6 +4751,7 @@ async def test_uncached_cancel_timeout_keeps_singleflight_until_late_exception(
     unhandled: list[dict] = []
     previous_handler = loop.get_exception_handler()
     loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+    first_dispatch = None
     try:
         assert await manager.cancel_uncached_text_to_sql(
             "uncached-timeout-run",
@@ -4112,9 +4763,18 @@ async def test_uncached_cancel_timeout_keeps_singleflight_until_late_exception(
         ) is False
         assert calls == [owner]
         assert max_active == 1
+        first_dispatch = manager._uncached_cancel_dispatches[
+            "uncached-timeout-run"
+        ]
 
         gate.set()
-        assert await asyncio.to_thread(first_finished.wait, 2)
+        first_result = await asyncio.wait_for(
+            asyncio.shield(first_dispatch),
+            timeout=2,
+        )
+        assert first_result.failed is True
+        assert first_result.explicit_false is False
+        monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 1.0)
         assert await manager.cancel_uncached_text_to_sql(
             "uncached-timeout-run",
             owner,
@@ -4127,9 +4787,24 @@ async def test_uncached_cancel_timeout_keeps_singleflight_until_late_exception(
             for context in unhandled
         )
     finally:
+        active_error = sys.exception()
+        cleanup_error = None
         gate.set()
+        if first_dispatch is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(first_dispatch),
+                    timeout=2,
+                )
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                if active_error is None:
+                    cleanup_error = exc
         loop.set_exception_handler(previous_handler)
         store.close()
+        if cleanup_error is not None:
+            raise cleanup_error
 
 
 @pytest.mark.asyncio
@@ -4207,6 +4882,76 @@ async def test_cached_cancel_does_not_overlap_uncached_dispatch(
 
 
 @pytest.mark.asyncio
+async def test_http_status_uses_cached_pending_run_before_durable_admission(
+    tmp_path,
+    monkeypatch,
+):
+    import workflow.state_files as state_files_module
+    import backend.fastapi_app as fastapi_package
+
+    monkeypatch.setattr(
+        state_files_module,
+        "default_state_database_path",
+        lambda *_args, **_kwargs: tmp_path / "main-pending-events.db",
+    )
+    previous_module = sys.modules.pop("backend.fastapi_app.main", None)
+    previous_package_main = getattr(fastapi_package, "main", None)
+    main_module = importlib.import_module("backend.fastapi_app.main")
+
+    release = asyncio.Event()
+
+    async def no_admission(_input_data):
+        await release.wait()
+        if False:
+            yield None
+
+    monkeypatch.setattr(run_manager_module, "run_agent", no_admission)
+    store = EventStore(str(tmp_path / "events.db"))
+    manager = run_manager_module.RunManager(store)
+    original_store = main_module.store
+    monkeypatch.setattr(main_module, "store", store)
+    monkeypatch.setattr(main_module, "run_manager", manager)
+    monkeypatch.setattr(
+        main_module,
+        "authenticate_request",
+        lambda _request: _principal(),
+    )
+    info = None
+    try:
+        info = await manager.start_run(
+            _run_input("run-pending", idempotency_key="pending-key"),
+            principal=_principal(),
+        )
+
+        assert store.get_run(info.run_id) is None
+        status = await main_module.run_status_v1(info.run_id, object())
+
+        assert status == {
+            "runId": info.run_id,
+            "threadId": info.thread_id,
+            "status": "pending",
+            "startedAtMs": info.started_at_ms,
+            "finishedAtMs": None,
+        }
+        assert store.get_run(info.run_id) is None
+    finally:
+        release.set()
+        if info is not None and info.task is not None:
+            await info.task
+        manager.close()
+        store.close()
+        original_store.close()
+        sys.modules.pop("backend.fastapi_app.main", None)
+        if previous_module is not None:
+            sys.modules["backend.fastapi_app.main"] = previous_module
+            setattr(fastapi_package, "main", previous_module)
+        elif previous_package_main is not None:
+            setattr(fastapi_package, "main", previous_package_main)
+        elif getattr(fastapi_package, "main", None) is main_module:
+            delattr(fastapi_package, "main")
+
+
+@pytest.mark.asyncio
 async def test_http_status_result_and_cancel_fall_back_to_durable_terminal_run(
     tmp_path,
     monkeypatch,
@@ -4260,6 +5005,59 @@ async def test_http_status_result_and_cancel_fall_back_to_durable_terminal_run(
         }
         assert result == {"result": payload}
         assert cancelled == {"cancelled": False}
+    finally:
+        store.close()
+        original_store.close()
+        sys.modules.pop("backend.fastapi_app.main", None)
+        if previous_module is not None:
+            sys.modules["backend.fastapi_app.main"] = previous_module
+            setattr(fastapi_package, "main", previous_module)
+        elif previous_package_main is not None:
+            setattr(fastapi_package, "main", previous_package_main)
+        elif getattr(fastapi_package, "main", None) is main_module:
+            delattr(fastapi_package, "main")
+
+
+@pytest.mark.asyncio
+async def test_http_result_preserves_terminal_run_id(
+    tmp_path,
+    monkeypatch,
+):
+    import workflow.state_files as state_files_module
+    import backend.fastapi_app as fastapi_package
+
+    monkeypatch.setattr(
+        state_files_module,
+        "default_state_database_path",
+        lambda *_args, **_kwargs: tmp_path / "main-terminal-run-id-events.db",
+    )
+    previous_module = sys.modules.pop("backend.fastapi_app.main", None)
+    previous_package_main = getattr(fastapi_package, "main", None)
+    main_module = importlib.import_module("backend.fastapi_app.main")
+
+    run_id = "run-1114802362924b2d"
+    store = EventStore(str(tmp_path / "events.db"))
+    _create_text_to_sql_run(store, run_id=run_id)
+    store.reserve_workflow_run(
+        run_id,
+        "inc-1",
+        "thread-1",
+        "text_to_sql_pipeline",
+    )
+    store.finalize_run_with_event(run_id, _terminal_payload(run_id=run_id))
+    manager = run_manager_module.RunManager(store)
+    original_store = main_module.store
+    monkeypatch.setattr(main_module, "store", store)
+    monkeypatch.setattr(main_module, "run_manager", manager)
+    monkeypatch.setattr(
+        main_module,
+        "authenticate_request",
+        lambda _request: _principal(),
+    )
+    try:
+        result = await main_module.run_result_v1(run_id, object())
+
+        assert result["result"]["terminal_outcome"]["run_id"] == run_id
     finally:
         store.close()
         original_store.close()

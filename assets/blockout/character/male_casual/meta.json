@@ -1,0 +1,29 @@
+{
+  "id": "male_casual",
+  "name": "Мужчина в повседневной одежде",
+  "category": "character",
+  "tags": [
+    "man",
+    "adult",
+    "hemingway",
+    "platonov",
+    "janitor",
+    "desc:Взрослый мужчина: дворник/Платонов, Хемингуэй, Андре Моруа."
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    1.831129014492035,
+    0.323393315076828,
+    1.8061977580364328
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "sketchfab",
+  "source_url": "https://sketchfab.com/3d-models/24ad029f3a094a679bc0b0b109ee40e3",
+  "file_size_bytes": 1307316,
+  "fetched_at": "2026-08-16T22:54:08Z",
+  "asset_version": 1
+}

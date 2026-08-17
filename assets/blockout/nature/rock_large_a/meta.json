@@ -1,0 +1,25 @@
+{
+  "id": "rock_large_a",
+  "name": "Большой камень A",
+  "category": "nature",
+  "tags": [
+    "rock",
+    "desert"
+  ],
+  "file": "model.glb",
+  "dimensions_m": [
+    0.7849066853523254,
+    1.0154614448547363,
+    0.25977597013115883
+  ],
+  "pivot": "base_center",
+  "forward_axis": "+Y",
+  "up_axis": "+Z",
+  "has_armature": false,
+  "animations": [],
+  "source": "kenney",
+  "source_url": "https://kenney.nl/assets/nature-kit",
+  "file_size_bytes": 7212,
+  "fetched_at": "2026-08-16T21:19:53Z",
+  "asset_version": 1
+}

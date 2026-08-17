@@ -12,13 +12,6 @@ parameters:
     type: string
     description: "Исходный запрос пользователя."
     required: true
-  - name: verification_status
-    type: string
-    description: "Структурированный статус верификатора: Approved или Rejected."
-    required: true
-    enum:
-      - Approved
-      - Rejected
   - name: dsn
     type: string
     description: "Явный DSN целевой базы данных."

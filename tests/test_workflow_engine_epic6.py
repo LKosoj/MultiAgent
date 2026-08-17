@@ -1,16 +1,9 @@
-"""EPIC 6 Block A: workflow engine + pipeline yaml.
-
-Тесты соответствуют задачам:
-    6.1   _substitute_variables_in_metadata + fail-fast на unresolved
-    6.2   json.dumps для dict/list при подстановке в task.format
-    6.14  run_id подставляется наравне с session_id
-    6.9   schema_linking_step.metadata.skip_output: status=skipped_disabled (вместо disabled: true)
-    6.3   декомпозиция god-manager: sql_generation -> sql_verification -> db_audit
-"""
+"""Workflow engine and Typed Text-to-SQL pipeline tests."""
 from __future__ import annotations
 
 import ast
 import asyncio
+from contextlib import contextmanager
 import importlib.util
 import json
 import logging
@@ -25,27 +18,53 @@ from tests.workflow_test_utils import load_light_workflow_models
 
 
 ROOT = Path(__file__).resolve().parents[1]
-_LIGHT_WORKFLOW_MODULES = [
-    "workflow",
-    "workflow.engine",
-    "workflow.models",
-    "workflow.state_manager",
-    "workflow.retry_engine",
-    "workflow.resource_manager",
-    "agent_system",
-]
 _MISSING_MODULE = object()
+
+
+def _workflow_module_snapshot() -> dict[str, object]:
+    return {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "workflow" or name.startswith("workflow.")
+    }
+
+
+def _restore_workflow_module_snapshot(
+    snapshot: dict[str, object],
+    agent_system: object,
+) -> None:
+    for name in tuple(sys.modules):
+        if name == "workflow" or name.startswith("workflow."):
+            sys.modules.pop(name, None)
+    sys.modules.update(snapshot)
+    if agent_system is _MISSING_MODULE:
+        sys.modules.pop("agent_system", None)
+    else:
+        sys.modules["agent_system"] = agent_system
+    for name, module in sorted(
+        snapshot.items(),
+        key=lambda item: item[0].count("."),
+    ):
+        parent_name, separator, child = name.rpartition(".")
+        parent = snapshot.get(parent_name)
+        if separator and parent is not None:
+            setattr(parent, child, module)
+
+
+@contextmanager
+def _preserve_workflow_module_tree():
+    snapshot = _workflow_module_snapshot()
+    agent_system = sys.modules.get("agent_system", _MISSING_MODULE)
+    try:
+        yield
+    finally:
+        _restore_workflow_module_snapshot(snapshot, agent_system)
 
 
 @pytest.fixture(autouse=True)
 def _restore_light_workflow_modules():
-    saved = {name: sys.modules.get(name, _MISSING_MODULE) for name in _LIGHT_WORKFLOW_MODULES}
-    yield
-    for name, module in saved.items():
-        if module is _MISSING_MODULE:
-            sys.modules.pop(name, None)
-        else:
-            sys.modules[name] = module
+    with _preserve_workflow_module_tree():
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +81,10 @@ def _load_module(module_name: str, file_path: Path):
 
 
 def _install_light_workflow_package():
-    for module_name in _LIGHT_WORKFLOW_MODULES:
-        sys.modules.pop(module_name, None)
+    for module_name in tuple(sys.modules):
+        if module_name == "workflow" or module_name.startswith("workflow."):
+            sys.modules.pop(module_name, None)
+    sys.modules.pop("agent_system", None)
 
     workflow_pkg = types.ModuleType("workflow")
     workflow_pkg.__path__ = [str(ROOT / "workflow")]
@@ -112,115 +133,6 @@ def _workflow_models():
     return sys.modules["workflow.models"]
 
 
-def _verification_output(status: str, recommendations: list[str] | None = None) -> dict:
-    return {
-        "verification_status": status,
-        "safety_check": "ok" if status == "Approved" else "failed",
-        "performance_check": "ok",
-        "recommendations": recommendations or [],
-    }
-
-
-def _terminal_output(
-    *,
-    status: str = "failed",
-    reason_code: str = "EXECUTION_FAILED",
-    sql: str = "SELECT 1",
-    error: str | None = "database unavailable",
-) -> dict:
-    succeeded = status == "succeeded"
-    attempted = succeeded or reason_code in {
-        "EXECUTION_FAILED",
-        "OUTPUT_RETRY_CHAIN_FAILED",
-    }
-    payload = {
-        "run_id": "run-execution-feedback",
-        "status": status,
-        "reason_code": reason_code,
-        "sql": sql,
-        "generated": True,
-        "approved": True,
-        "executed": attempted,
-        "dry_run": False,
-        "audited": True,
-        "data": [[1]] if succeeded else [],
-        "columns": ["value"] if succeeded else [],
-        "rows_affected": 1 if succeeded else 0,
-        "error": error,
-        "execution": {
-            "success": succeeded,
-            "data": [[1]] if succeeded else [],
-            "columns": ["value"] if succeeded else [],
-            "rows_affected": 1 if succeeded else 0,
-            "error_message": None if succeeded else error,
-            "execution_time_ms": 1,
-            "dry_run_only": False,
-            "skipped_execution": False,
-            "sql_query": sql,
-            "applied_row_limit": 10,
-        },
-        "audit": {"status": "logged", "log_id": "audit-1"},
-        "persistence": (
-            {
-                "status": "saved",
-                "filename": "query.md",
-                "path": "/tmp/query.md",
-            }
-            if succeeded
-            else {"status": "not_attempted"}
-        ),
-    }
-    if reason_code in {"AUDIT_FAILED", "AUDIT_CONTRACT_INVALID"}:
-        payload.update({
-            "executed": True,
-            "audited": False,
-            "data": [[1]],
-            "columns": ["value"],
-            "rows_affected": 1,
-            "execution": {
-                "success": True,
-                "data": [[1]],
-                "columns": ["value"],
-                "rows_affected": 1,
-                "execution_time_ms": 1,
-                "error_message": None,
-                "dry_run_only": False,
-                "skipped_execution": False,
-                "sql_query": sql,
-                "applied_row_limit": 10,
-            },
-            "audit": {"status": "error", "error": error or "audit failed"},
-        })
-    elif reason_code == "PERSISTENCE_CONTRACT_INVALID":
-        payload.update({
-            "executed": True,
-            "data": [[1]],
-            "columns": ["value"],
-            "rows_affected": 1,
-            "execution": {
-                "success": True,
-                "data": [[1]],
-                "columns": ["value"],
-                "rows_affected": 1,
-                "execution_time_ms": 1,
-                "error_message": None,
-                "dry_run_only": False,
-                "skipped_execution": False,
-                "sql_query": sql,
-                "applied_row_limit": 10,
-            },
-            "persistence": {"status": "error", "error": error or "persistence failed"},
-        })
-    elif reason_code == "EXECUTOR_CONTRACT_INVALID":
-        payload["execution"] = {"invalid_result_type": "dict"}
-    elif reason_code == "VERIFIER_CONTRACT_INVALID":
-        payload.update({
-            "approved": False,
-            "audited": False,
-            "execution": {},
-            "audit": {},
-        })
-    return payload
 
 
 def test_enhanced_engine_treats_status_error_dict_as_tool_error():
@@ -310,7 +222,7 @@ def test_metadata_substitution_allows_braces_inside_substituted_dsn():
     result = engine._substitute_variables_in_metadata(
         {"dsn": "{dsn}"},
         {"dsn": dsn},
-        step_id="sql_generation",
+        step_id="agent_step",
     )
 
     assert result["dsn"] == dsn
@@ -353,9 +265,9 @@ def test_step_with_substituted_metadata_preserves_output_schema_requirements():
 
     requirements = {"required": ["sql", "description"]}
     step = WorkflowStep(
-        id="sql_generation",
+        id="agent_step",
         task="task",
-        agent_type="sql_generator_agent",
+        agent_type="worker_agent",
         metadata={"dsn": "{dsn}"},
         output_schema="json_object",
         output_schema_requirements=requirements,
@@ -951,38 +863,26 @@ def test_enhanced_non_retryable_step_skips_adaptive_retry():
 
 
 def test_pipeline_yaml_declares_run_id_input():
-    """run_id должен быть объявлен в inputs пайплайна как пустая строка (как session_id)."""
+    """Typed stages share one workflow deadline instead of fixed stage caps."""
     models = load_light_workflow_models()
     workflow = models.WorkflowDefinition.from_yaml(
         ROOT / "workflow_pipelines" / "text_to_sql_pipeline.yaml"
     )
     assert "run_id" in workflow.inputs
     assert workflow.inputs["run_id"] == ""
-
-
-# ===========================================================================
-# 6.9: schema_linking_step skip_output uses status: "skipped_disabled"
-# ===========================================================================
-def test_status_skipped_disabled_instead_of_disabled_true():
-    models = load_light_workflow_models()
-    workflow = models.WorkflowDefinition.from_yaml(
-        ROOT / "workflow_pipelines" / "text_to_sql_pipeline.yaml"
-    )
-    schema_step = next(s for s in workflow.steps if s.id == "schema_linking_step")
-    skip_output = schema_step.metadata["skip_output"]
-
-    assert skip_output.get("status") == "skipped_disabled"
-    assert "disabled" not in skip_output, (
-        "Старый ключ disabled должен быть полностью убран, чтобы не путать downstream"
-    )
-    assert skip_output["decision"] == "ABSTAIN"
-    assert skip_output["terminal_reason_code"] == "SCHEMA_GROUNDING_FAILED"
-    assert skip_output["sql_generation_allowed"] is False
+    assert workflow.global_resource_limits.max_duration_seconds == 14_400
+    assert [step.id for step in workflow.steps] == [
+        "schema_research",
+        "sql_solving",
+        "db_audit",
+    ]
+    assert all(step.timeout is None for step in workflow.steps)
+    schema_research = workflow.steps[0]
+    assert schema_research.resource_limits.max_duration_seconds == 14_400
 
 
 def test_skip_output_propagates_status_to_step_outputs():
-    """Когда условие false и schema_linking_step скиппится, в step_outputs появляется
-    status=skipped_disabled (это новый контракт после 6.9)."""
+    """Пропущенный по условию шаг записывает заданный status в step_outputs."""
     engine = _engine_instance()
     models = _workflow_models()
     WorkflowContext = models.WorkflowContext
@@ -991,1279 +891,28 @@ def test_skip_output_propagates_status_to_step_outputs():
     ctx = WorkflowContext(
         workflow_id="wf-1",
         session_id="sess-1",
-        variables={"use_schema_suggestions": False},
+        variables={"enable_optional_stage": False},
     )
     step = WorkflowStep(
-        id="schema_linking_step",
-        task="schema linking",
-        condition="{use_schema_suggestions}",
+        id="optional_stage",
+        task="optional work",
+        condition="{enable_optional_stage}",
         metadata={
             "skip_output": {
                 "status": "skipped_disabled",
-                "reason": "use_schema_suggestions=false",
+                "reason": "enable_optional_stage=false",
             }
         },
     )
 
     assert engine._should_skip_step_by_condition(step, ctx) is True
-    assert ctx.step_outputs["schema_linking_step"]["status"] == "skipped_disabled"
-    assert ctx.step_outputs["schema_linking_step.status"] == "skipped_disabled"
+    assert ctx.step_outputs["optional_stage"]["status"] == "skipped_disabled"
+    assert ctx.step_outputs["optional_stage.status"] == "skipped_disabled"
 
 
 # ===========================================================================
 # 6.3: декомпозиция god-manager sql_pipeline
 # ===========================================================================
-def _load_text_to_sql_workflow():
-    models = load_light_workflow_models()
-    return models.WorkflowDefinition.from_yaml(
-        ROOT / "workflow_pipelines" / "text_to_sql_pipeline.yaml"
-    )
-
-
-def _strict_safety_policy_mapping():
-    from custom_tools.text_to_sql.validators import resolve_safety_policy
-
-    return resolve_safety_policy("strict").to_mapping()
-
-
-def test_pipeline_has_3_decomposed_steps_sql_gen_verify_audit():
-    workflow = _load_text_to_sql_workflow()
-    step_ids = [s.id for s in workflow.steps]
-
-    # sql_pipeline god-step должен быть удалён
-    assert "sql_pipeline" not in step_ids, (
-        "После декомпозиции (6.3) шаг 'sql_pipeline' должен быть удалён"
-    )
-
-    # Должны появиться три новых шага
-    assert "sql_generation" in step_ids
-    assert "sql_verification" in step_ids
-    assert "db_audit" in step_ids
-
-    # Generation/verification remain agent steps; terminal execution is a tool.
-    gen_step = next(s for s in workflow.steps if s.id == "sql_generation")
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-    aud_step = next(s for s in workflow.steps if s.id == "db_audit")
-
-    assert gen_step.step_type == "agent"
-    assert gen_step.agent_type == "sql_generator_agent"
-    assert ver_step.agent_type == "sql_verifier_agent"
-    assert aud_step.step_type == "tool"
-    assert aud_step.tool_name == "finalize_text_to_sql_run"
-    assert aud_step.agent_type is None
-    assert aud_step.metadata["retryable"] is False
-
-    # depends_on выстраивается в цепочку через retrieval успешных SQL-примеров
-    retrieval_step = next(
-        s for s in workflow.steps if s.id == "successful_sql_retrieval"
-    )
-    assert "schema_linking_step" in retrieval_step.depends_on
-    assert "successful_sql_retrieval" in gen_step.depends_on
-    assert "sql_generation" in ver_step.depends_on
-    assert "sql_verification" in aud_step.depends_on
-
-
-def test_verifier_reject_triggers_generator_retry():
-    """Runtime тест: при verification_status=Rejected движок РЕАЛЬНО запускает
-    sql_generation повторно через output_retry_policy.
-
-    Проверяется через мок retry_engine: считаем число вызовов sql_generation
-    при условии, что первая верификация возвращает Rejected, вторая — Approved.
-    """
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-
-    gen_step = next(s for s in workflow.steps if s.id == "sql_generation")
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-
-    # output_retry_policy должен быть распарсен из YAML
-    assert ver_step.output_retry_policy is not None, (
-        "sql_verification должен иметь output_retry_policy для feedback loop"
-    )
-    policy = ver_step.output_retry_policy
-    assert policy["rerun_step"] == "sql_generation"
-    assert policy["feedback_field"] == "sql_safety_check_feedback"
-    assert policy["max_iterations"] >= 1
-
-    # Готовим контекст с обязательными переменными (нужно для metadata-substitution).
-    ctx = WorkflowContext(
-        workflow_id="wf-retry",
-        session_id="sess-retry",
-        variables={
-            "query": "test",
-            "dsn": "sqlite:///x.db",
-            "max_rows": 10,
-            "session_id": "sess-retry",
-            "run_id": "run-retry",
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "dry_run_only": False,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-            "safety_policy": _strict_safety_policy_mapping(),
-        },
-        step_outputs={
-            "successful_sql_retrieval": {"context_json": "[]"},
-            "successful_sql_retrieval.context_json": "[]",
-        },
-    )
-
-    # Мокаем retry_engine.execute_with_retry: возвращает заранее заданный output
-    # в зависимости от step_id и количества вызовов.
-    call_counter = {"sql_generation": 0, "sql_verification": 0}
-
-    async def fake_execute_with_retry(step_id, step_func, context, retry_policy=None):
-        call_counter[step_id] = call_counter.get(step_id, 0) + 1
-        if step_id == "sql_generation":
-            output = {"sql": f"SELECT 1 -- v{call_counter[step_id]}", "description": "x"}
-        elif step_id == "sql_verification":
-            # Первый раз — Rejected, второй — Approved
-            if call_counter[step_id] == 1:
-                output = _verification_output("Rejected", ["fix WHERE"])
-            else:
-                output = _verification_output("Approved")
-        else:
-            output = {}
-        from datetime import datetime as _dt
-        return StepResult(
-            step_id=step_id,
-            status=StepStatus.COMPLETED,
-            output=output,
-            start_time=_dt.now(),
-            end_time=_dt.now(),
-        )
-
-    class _RetryEngine:
-        async def execute_with_retry(self, *args, **kwargs):
-            return await fake_execute_with_retry(*args, **kwargs)
-
-    engine.retry_engine = _RetryEngine()
-    # state_manager не нужен — _on_step_completed внутри _maybe_run_output_retry
-    # сохраняет checkpoint, замокаем no-op.
-
-    checkpoints = []
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            checkpoints.append({
-                "current_step": kwargs.get("current_step"),
-                "step_result_keys": set((kwargs.get("step_results") or {}).keys()),
-            })
-            return None
-
-    engine.state_manager = _StateManager()
-
-    # Запускаем verification — _maybe_run_output_retry внутри обнаружит Rejected
-    # и перезапустит sql_generation, затем повторно sql_verification.
-    step_results = {
-        gen_step.id: StepResult(
-            step_id=gen_step.id,
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT old", "description": "stale"},
-        )
-    }
-    result = asyncio.run(
-        engine._execute_workflow_step(ver_step, ctx, workflow, step_results=step_results)
-    )
-
-    # 1) sql_generation должен быть вызван дважды (1 раз rerun)
-    assert call_counter["sql_generation"] == 1, (
-        f"sql_generation должен ЗАПУСКАТЬСЯ повторно при Rejected, "
-        f"вызовов: {call_counter['sql_generation']}"
-    )
-    # NB: первый вызов sql_generation делается отдельно как зависимость, в этом
-    # тесте мы вызываем только verification напрямую, поэтому 1 = один rerun.
-    # 2) sql_verification должен быть вызван дважды (1 раз изначально, 1 раз после rerun)
-    assert call_counter["sql_verification"] == 2, (
-        f"sql_verification должен быть вызван дважды (initial + после rerun), "
-        f"вызовов: {call_counter['sql_verification']}"
-    )
-    # 3) Финальный output verification — Approved
-    assert result.output["verification_status"] == "Approved"
-    assert ctx.step_outputs["sql_verification"]["verification_status"] == "Approved"
-    assert ctx.step_outputs["sql_verification.verification_status"] == "Approved"
-    assert ctx.step_outputs["sql_verification.recommendations"] == []
-    # 4) step_results должен видеть свежий output rerun-step; финальные artifacts
-    # строятся из step_results, а не только из context.step_outputs.
-    assert step_results["sql_generation"].output["sql"] == "SELECT 1 -- v1"
-
-
-def test_enhanced_output_retry_updates_context_on_success():
-    """Enhanced runtime должен оставить в context свежий Approved после retry."""
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-
-    gen_step = next(s for s in workflow.steps if s.id == "sql_generation")
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-    ctx = WorkflowContext(
-        workflow_id="wf-enhanced-retry",
-        session_id="sess-enhanced-retry",
-        variables={
-            "query": "test",
-            "dsn": "sqlite:///x.db",
-            "max_rows": 10,
-            "session_id": "sess-enhanced-retry",
-            "run_id": "run-enhanced-retry",
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "dry_run_only": False,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-        },
-    )
-
-    checkpoints = []
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            checkpoints.append({
-                "current_step": kwargs.get("current_step"),
-                "step_result_keys": set((kwargs.get("step_results") or {}).keys()),
-            })
-            return None
-
-    engine.state_manager = _StateManager()
-    calls = {"sql_generation": 0, "sql_verification": 0}
-
-    async def fake_execute_enhanced_step(step, context, previous_results):
-        from datetime import datetime as _dt
-
-        calls[step.id] = calls.get(step.id, 0) + 1
-        if step.id == "sql_generation":
-            output = {"sql": "SELECT 1 -- enhanced", "description": "fresh"}
-            status = StepStatus.COMPLETED
-            error = None
-        elif step.id == "sql_verification":
-            output = _verification_output("Approved")
-            status = StepStatus.COMPLETED
-            error = None
-        else:
-            output = {}
-            status = StepStatus.COMPLETED
-            error = None
-        return StepResult(
-            step_id=step.id,
-            status=status,
-            output=output,
-            error=error,
-            start_time=_dt.now(),
-            end_time=_dt.now(),
-        )
-
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-    step_results = {
-        gen_step.id: StepResult(
-            step_id=gen_step.id,
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT old", "description": "stale"},
-        )
-    }
-    initial = StepResult(
-        step_id=ver_step.id,
-        status=StepStatus.COMPLETED,
-        output=_verification_output("Rejected", ["fix"]),
-    )
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            ver_step, initial, ctx, workflow, step_results
-        )
-    )
-
-    assert result.output["verification_status"] == "Approved"
-    assert calls["sql_generation"] == 1
-    assert calls["sql_verification"] == 1
-    assert ctx.step_outputs["sql_verification"]["verification_status"] == "Approved"
-    assert ctx.step_outputs["sql_verification.verification_status"] == "Approved"
-    assert step_results["sql_generation"].output["sql"] == "SELECT 1 -- enhanced"
-    generation_checkpoints = [
-        item for item in checkpoints if item["current_step"] == "sql_generation"
-    ]
-    assert len(generation_checkpoints) == 1
-    assert "sql_generation" in generation_checkpoints[0]["step_result_keys"]
-
-
-def test_enhanced_parallel_wrapper_passes_and_updates_shared_step_results():
-    engine = _enhanced_engine_instance()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-    WorkflowStep = models.WorkflowStep
-    WorkflowDefinition = models.WorkflowDefinition
-
-    step = WorkflowStep(id="current", task="t", agent_type="x")
-    previous = StepResult(
-        step_id="previous",
-        status=StepStatus.COMPLETED,
-        output={"value": 0},
-    )
-    initial = StepResult(
-        step_id="current",
-        status=StepStatus.COMPLETED,
-        output={"value": 1},
-    )
-    completed = StepResult(
-        step_id="current",
-        status=StepStatus.COMPLETED,
-        output={"value": 2},
-    )
-    shared_results = {"previous": previous}
-    context = WorkflowContext(workflow_id="wf-enhanced-parallel")
-    context._workflow_definition = WorkflowDefinition(name="wf-enhanced-parallel", steps=[step])
-    context._workflow_step_results = shared_results
-    captured = {}
-
-    async def fake_execute_enhanced_step(step_arg, context_arg, previous_results):
-        captured["execute_previous_results"] = previous_results
-        return initial
-
-    async def fake_complete(step_arg, step_result_arg, context_arg, workflow_def_arg, step_results_arg):
-        captured["complete_step_results"] = step_results_arg
-        captured["complete_current_result"] = step_results_arg.get(step.id)
-        return completed
-
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-    engine._complete_enhanced_step_with_output_retry = fake_complete
-
-    result = asyncio.run(engine._execute_enhanced_step_wrapper(step, context))
-
-    assert result is completed
-    assert captured["execute_previous_results"] is shared_results
-    assert captured["complete_step_results"] is shared_results
-    assert captured["complete_current_result"] is initial
-    assert shared_results["previous"] is previous
-    assert shared_results["current"] is completed
-
-
-def test_enhanced_output_retry_failed_recheck_does_not_keep_rejected_context():
-    """Если повторный verifier FAILED, старый Rejected не должен выглядеть финальным output."""
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-    ctx = WorkflowContext(
-        workflow_id="wf-enhanced-retry-failed",
-        session_id="sess-enhanced-retry-failed",
-        variables={
-            "query": "test",
-            "dsn": "sqlite:///x.db",
-            "max_rows": 10,
-            "session_id": "sess-enhanced-retry-failed",
-            "run_id": "run-enhanced-retry-failed",
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "dry_run_only": False,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-        },
-    )
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    engine.state_manager = _StateManager()
-
-    async def fake_execute_enhanced_step(step, context, previous_results):
-        from datetime import datetime as _dt
-
-        if step.id == "sql_generation":
-            return StepResult(
-                step_id=step.id,
-                status=StepStatus.COMPLETED,
-                output={"sql": "SELECT 1 -- enhanced", "description": "fresh"},
-                start_time=_dt.now(),
-                end_time=_dt.now(),
-            )
-        return StepResult(
-            step_id=step.id,
-            status=StepStatus.FAILED,
-            output=None,
-            error="verifier failed",
-            start_time=_dt.now(),
-            end_time=_dt.now(),
-        )
-
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-    initial = StepResult(
-        step_id=ver_step.id,
-        status=StepStatus.COMPLETED,
-        output=_verification_output("Rejected", ["fix"]),
-    )
-    previous_results = {
-        "sql_generation": StepResult(
-            step_id="sql_generation",
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT broken", "description": "initial"},
-        ),
-    }
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            ver_step, initial, ctx, workflow, previous_results
-        )
-    )
-
-    assert result.status == StepStatus.FAILED
-    assert "sql_verification" not in ctx.step_outputs
-    assert "sql_verification.verification_status" not in ctx.step_outputs
-
-
-def test_db_audit_skipped_when_verifier_rejects():
-    """db_audit имеет condition '{sql_verification.verification_status} == "Approved"'.
-    Если verifier вернул Rejected, db_audit должен скипнуться и подставить skip_output.
-    """
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    WorkflowContext = models.WorkflowContext
-
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-
-    # db_audit должен иметь condition
-    assert audit_step.condition is not None
-    assert "Approved" in audit_step.condition
-
-    ctx = WorkflowContext(
-        workflow_id="wf-1",
-        session_id="sess-1",
-        variables={"run_id": "run-1"},
-        step_outputs={
-            "sql_generation": {"sql": "SELECT 1", "description": "one"},
-            "sql_generation.sql": "SELECT 1",
-            "sql_verification": _verification_output("Rejected", ["fix"]),
-            "sql_verification.verification_status": "Rejected",
-        },
-    )
-
-    # _should_skip_step_by_condition должен вернуть True (condition не выполнено)
-    assert engine._should_skip_step_by_condition(audit_step, ctx) is True
-
-    # skip_output должен быть подставлен в step_outputs
-    audit_out = ctx.step_outputs.get("db_audit")
-    assert isinstance(audit_out, dict)
-    assert audit_out.get("status") == "abstained"
-    assert audit_out.get("reason_code") == "VERIFIER_REJECTED"
-    assert audit_out.get("executed") is False
-    # И dotted-ключ тоже
-    assert ctx.step_outputs.get("db_audit.status") == "abstained"
-
-
-def test_db_audit_runs_when_verifier_approves():
-    """db_audit должен НЕ скипаться, если verifier вернул Approved."""
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    WorkflowContext = models.WorkflowContext
-
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-
-    ctx = WorkflowContext(
-        workflow_id="wf-1",
-        session_id="sess-1",
-        variables={},
-        step_outputs={
-            "sql_verification": {"verification_status": "Approved"},
-            "sql_verification.verification_status": "Approved",
-        },
-    )
-
-    # condition == "Approved" → выполнено → шаг НЕ скипается
-    assert engine._should_skip_step_by_condition(audit_step, ctx) is False
-    # step_outputs.db_audit не должен быть подставлен (skip_output не сработал)
-    assert "db_audit" not in ctx.step_outputs
-
-
-def test_feedback_propagated_to_sql_generation_on_retry():
-    """При retry feedback с recommendations должен попасть в
-    context.variables[feedback_field] (sql_safety_check_feedback), чтобы
-    sql_generator_agent мог его подставить через {sql_safety_check_feedback}.
-    """
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-
-    ctx = WorkflowContext(
-        workflow_id="wf-fb",
-        session_id="sess-fb",
-        variables={
-            "query": "test",
-            "dsn": "sqlite:///x.db",
-            "max_rows": 10,
-            "session_id": "sess-fb",
-            "run_id": "run-fb",
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "dry_run_only": False,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-            "safety_policy": _strict_safety_policy_mapping(),
-        },
-        step_outputs={
-            "successful_sql_retrieval": {"context_json": "[]"},
-            "successful_sql_retrieval.context_json": "[]",
-            "sql_generation": {
-                "sql": "SELECT broken",
-                "description": "initial",
-            },
-            "sql_generation.sql": "SELECT broken",
-        },
-    )
-
-    seen_variables_at_rerun = {}
-    call_counter = {"sql_generation": 0, "sql_verification": 0}
-
-    async def fake_execute_with_retry(step_id, step_func, context, retry_policy=None):
-        call_counter[step_id] = call_counter.get(step_id, 0) + 1
-        from datetime import datetime as _dt
-        if step_id == "sql_generation":
-            # На rerun сохраняем snapshot ctx.variables, чтобы проверить feedback
-            seen_variables_at_rerun["call_" + str(call_counter[step_id])] = (
-                dict(ctx.variables)
-            )
-            output = {"sql": "SELECT 1", "description": "x"}
-        else:  # sql_verification
-            if call_counter[step_id] == 1:
-                output = _verification_output("Rejected", ["use WHERE", "limit rows"])
-            else:
-                output = _verification_output("Approved")
-        return StepResult(
-            step_id=step_id,
-            status=StepStatus.COMPLETED,
-            output=output,
-            start_time=_dt.now(),
-            end_time=_dt.now(),
-        )
-
-    class _RetryEngine:
-        async def execute_with_retry(self, *args, **kwargs):
-            return await fake_execute_with_retry(*args, **kwargs)
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    engine.retry_engine = _RetryEngine()
-    engine.state_manager = _StateManager()
-
-    asyncio.run(engine._execute_workflow_step(ver_step, ctx, workflow))
-
-    # На rerun (call_1) sql_generation должен видеть sql_safety_check_feedback
-    # в context.variables
-    assert "call_1" in seen_variables_at_rerun
-    fb_vars = seen_variables_at_rerun["call_1"]
-    assert "sql_safety_check_feedback" in fb_vars, (
-        "При rerun sql_generation context.variables должен содержать "
-        "sql_safety_check_feedback с output отклонённой верификации"
-    )
-    feedback_value = fb_vars["sql_safety_check_feedback"]
-    assert feedback_value == {
-        "source": "VERIFICATION",
-        "failure_code": "VERIFIER_REJECTED",
-        "message": "SQL verifier rejected the generated SQL",
-        "previous_sql": "SELECT broken",
-        "recommendations": ["use WHERE", "limit rows"],
-        "attempt_number": 1,
-    }
-
-
-def test_output_retry_policy_respects_max_iterations():
-    """Loop guard: если verifier продолжает возвращать Rejected, движок
-    останавливается после max_iterations. Финальный output остаётся Rejected,
-    db_audit потом скипнется по condition.
-    """
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepStatus = models.StepStatus
-    StepResult = models.StepResult
-    WorkflowContext = models.WorkflowContext
-
-    ver_step = next(s for s in workflow.steps if s.id == "sql_verification")
-    max_iter = ver_step.output_retry_policy["max_iterations"]
-
-    ctx = WorkflowContext(
-        workflow_id="wf-loop",
-        session_id="sess-loop",
-        variables={
-            "query": "test",
-            "dsn": "sqlite:///x.db",
-            "max_rows": 10,
-            "session_id": "sess-loop",
-            "run_id": "run-loop",
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "dry_run_only": False,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-            "safety_policy": _strict_safety_policy_mapping(),
-        },
-        step_outputs={
-            "successful_sql_retrieval": {"context_json": "[]"},
-            "successful_sql_retrieval.context_json": "[]",
-            "sql_generation": {
-                "sql": "SELECT broken",
-                "description": "initial",
-            },
-            "sql_generation.sql": "SELECT broken",
-        },
-    )
-
-    call_counter = {"sql_generation": 0, "sql_verification": 0}
-
-    async def fake_execute_with_retry(step_id, step_func, context, retry_policy=None):
-        call_counter[step_id] = call_counter.get(step_id, 0) + 1
-        from datetime import datetime as _dt
-        if step_id == "sql_generation":
-            output = {"sql": "SELECT 1", "description": "x"}
-        else:
-            # Всегда Rejected
-            output = _verification_output("Rejected", ["fix"])
-        return StepResult(
-            step_id=step_id,
-            status=StepStatus.COMPLETED,
-            output=output,
-            start_time=_dt.now(),
-            end_time=_dt.now(),
-        )
-
-    class _RetryEngine:
-        async def execute_with_retry(self, *args, **kwargs):
-            return await fake_execute_with_retry(*args, **kwargs)
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    engine.retry_engine = _RetryEngine()
-    engine.state_manager = _StateManager()
-
-    result = asyncio.run(engine._execute_workflow_step(ver_step, ctx, workflow))
-
-    # sql_generation должно быть запущено ровно max_iter раз (только rerun'ы)
-    assert call_counter["sql_generation"] == max_iter, (
-        f"Ожидалось {max_iter} rerun'ов sql_generation, получено {call_counter['sql_generation']}"
-    )
-    # sql_verification: 1 первоначальный вызов + max_iter повторных
-    assert call_counter["sql_verification"] == max_iter + 1
-    # Финальный output — Rejected
-    assert result.output["verification_status"] == "Rejected"
-
-
-def test_db_audit_terminal_tool_has_one_exact_execution_feedback_retry():
-    workflow = _load_text_to_sql_workflow()
-    db_step = next(s for s in workflow.steps if s.id == "db_audit")
-    assert db_step.output_retry_policy == {
-        "condition": '{db_audit.reason_code} == "EXECUTION_FAILED"',
-        "rerun_step": "sql_generation",
-        "rerun_chain": ["sql_generation", "sql_verification"],
-        "max_iterations": 1,
-        "feedback_field": "sql_execution_feedback",
-    }
-    assert db_step.retry_policy.max_retries == 0
-
-    assert workflow.inputs["sql_execution_feedback"] == {}
-    assert workflow.inputs["sql_safety_check_feedback"] == {}
-    generation_step = next(s for s in workflow.steps if s.id == "sql_generation")
-    assert "{sql_execution_feedback}" in generation_step.task
-
-
-def test_execution_failure_feedback_reruns_full_chain_once_and_finalizes_again():
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepResult = models.StepResult
-    StepStatus = models.StepStatus
-    WorkflowContext = models.WorkflowContext
-
-    generation_step = next(s for s in workflow.steps if s.id == "sql_generation")
-    verification_step = next(s for s in workflow.steps if s.id == "sql_verification")
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    context = WorkflowContext(
-        workflow_id="wf-execution-feedback",
-        session_id="db-session",
-        variables={
-            **workflow.inputs,
-            "query": "one",
-            "dsn": "sqlite:///x.db",
-            "session_id": "db-session",
-            "run_id": "run-execution-feedback",
-        },
-    )
-    previous_results = {
-        generation_step.id: StepResult(
-            step_id=generation_step.id,
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT broken", "description": "initial"},
-        ),
-        verification_step.id: StepResult(
-            step_id=verification_step.id,
-            status=StepStatus.COMPLETED,
-            output=_verification_output("Approved"),
-        ),
-    }
-    initial_result = StepResult(
-        step_id=audit_step.id,
-        status=StepStatus.COMPLETED,
-        output=_terminal_output(sql="SELECT broken"),
-    )
-    calls: list[str] = []
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    async def fake_execute_enhanced_step(step, context, previous_results):
-        calls.append(step.id)
-        if step.id == generation_step.id:
-            output = {"sql": "SELECT 1", "description": "corrected"}
-        elif step.id == verification_step.id:
-            output = _verification_output("Approved")
-        else:
-            output = _terminal_output(
-                status="succeeded",
-                reason_code="",
-                sql="SELECT 1",
-                error=None,
-            )
-        return StepResult(
-            step_id=step.id,
-            status=StepStatus.COMPLETED,
-            output=output,
-        )
-
-    engine.state_manager = _StateManager()
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            audit_step,
-            initial_result,
-            context,
-            workflow,
-            previous_results,
-        )
-    )
-
-    assert calls == ["sql_generation", "sql_verification", "db_audit"]
-    assert result.output["status"] == "succeeded"
-    assert result.output["sql"] == "SELECT 1"
-    assert previous_results["sql_generation"].output["sql"] == "SELECT 1"
-    assert previous_results["sql_verification"].output["verification_status"] == "Approved"
-    assert context.step_outputs["db_audit"]["status"] == "succeeded"
-    assert context.variables["__output_retry_counters__"]["db_audit"] == 1
-    assert context.variables["sql_execution_feedback"] == {
-        "source": "EXECUTION",
-        "failure_code": "EXECUTION_FAILED",
-        "message": "database unavailable",
-        "previous_sql": "SELECT broken",
-        "recommendations": [],
-        "attempt_number": 1,
-    }
-
-
-def test_execution_failure_feedback_retry_is_bounded_when_second_finalizer_fails():
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepResult = models.StepResult
-    StepStatus = models.StepStatus
-    WorkflowContext = models.WorkflowContext
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    context = WorkflowContext(
-        workflow_id="wf-execution-feedback-bound",
-        session_id="db-session",
-        variables={**workflow.inputs},
-    )
-    calls: list[str] = []
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    async def fake_execute_enhanced_step(step, context, previous_results):
-        calls.append(step.id)
-        if step.id == "sql_generation":
-            output = {"sql": "SELECT 2", "description": "retry"}
-        elif step.id == "sql_verification":
-            output = _verification_output("Approved")
-        else:
-            output = _terminal_output(sql="SELECT 2", error="still unavailable")
-        return StepResult(
-            step_id=step.id,
-            status=StepStatus.COMPLETED,
-            output=output,
-        )
-
-    engine.state_manager = _StateManager()
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-    initial_result = StepResult(
-        step_id=audit_step.id,
-        status=StepStatus.COMPLETED,
-        output=_terminal_output(),
-    )
-    previous_results = {
-        "sql_generation": StepResult(
-            step_id="sql_generation",
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT 1", "description": "initial"},
-        ),
-        "sql_verification": StepResult(
-            step_id="sql_verification",
-            status=StepStatus.COMPLETED,
-            output=_verification_output("Approved"),
-        ),
-    }
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            audit_step,
-            initial_result,
-            context,
-            workflow,
-            previous_results,
-        )
-    )
-
-    assert calls == ["sql_generation", "sql_verification", "db_audit"]
-    assert result.output["reason_code"] == "EXECUTION_FAILED"
-    assert context.variables["__output_retry_counters__"] == {"db_audit": 1}
-
-
-@pytest.mark.parametrize("failed_step_id", ["sql_generation", "sql_verification"])
-def test_execution_feedback_retry_chain_failure_preserves_original_terminal_evidence(
-    failed_step_id,
-):
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepResult = models.StepResult
-    StepStatus = models.StepStatus
-    WorkflowContext = models.WorkflowContext
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    context = WorkflowContext(
-        workflow_id=f"wf-retry-chain-{failed_step_id}",
-        session_id="db-session",
-        variables={
-            **workflow.inputs,
-            "run_id": "run-execution-feedback",
-            "session_id": "db-session",
-        },
-    )
-    previous_results = {
-        "sql_generation": StepResult(
-            step_id="sql_generation",
-            status=StepStatus.COMPLETED,
-            output={"sql": "SELECT broken", "description": "initial"},
-        ),
-        "sql_verification": StepResult(
-            step_id="sql_verification",
-            status=StepStatus.COMPLETED,
-            output=_verification_output("Approved"),
-        ),
-    }
-    calls = []
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    async def fake_execute_enhanced_step(step, context, previous_results):
-        calls.append(step.id)
-        if step.id == failed_step_id:
-            return StepResult(
-                step_id=step.id,
-                status=StepStatus.FAILED,
-                error=f"{step.id} corrective rerun failed",
-            )
-        if step.id == "sql_generation":
-            output = {"sql": "SELECT 2", "description": "corrected"}
-        elif step.id == "sql_verification":
-            output = _verification_output("Approved")
-        else:
-            pytest.fail("finalizer must not run after an intermediate retry failure")
-        return StepResult(
-            step_id=step.id,
-            status=StepStatus.COMPLETED,
-            output=output,
-        )
-
-    engine.state_manager = _StateManager()
-    engine._execute_enhanced_step = fake_execute_enhanced_step
-    initial_output = _terminal_output(sql="SELECT broken")
-    initial_result = StepResult(
-        step_id="db_audit",
-        status=StepStatus.COMPLETED,
-        output=initial_output,
-    )
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            audit_step,
-            initial_result,
-            context,
-            workflow,
-            previous_results,
-        )
-    )
-
-    assert result.status.value == StepStatus.FAILED.value
-    assert result.step_id == "db_audit"
-    assert result.error_class == "output_retry_chain_failed"
-    assert previous_results[failed_step_id].status.value == StepStatus.FAILED.value
-    assert previous_results["db_audit"] is result
-    assert result.output["status"] == "failed"
-    assert result.output["reason_code"] == "OUTPUT_RETRY_CHAIN_FAILED"
-    assert result.output["error"] == result.error
-    for field in (
-        "run_id",
-        "sql",
-        "generated",
-        "approved",
-        "executed",
-        "dry_run",
-        "audited",
-        "data",
-        "columns",
-        "rows_affected",
-        "execution",
-        "audit",
-        "persistence",
-    ):
-        assert result.output[field] == initial_output[field]
-    assert result.output["executed"] is True
-    assert result.output["execution"]["success"] is False
-    assert result.output["audited"] is True
-    assert result.output["data"] == []
-    assert result.output["persistence"] == {"status": "not_attempted"}
-    assert context.step_outputs["db_audit"] == result.output
-    terminal = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        previous_results,
-    )
-    assert terminal.status.value == models.TextToSqlTerminalStatus.FAILED.value
-    assert terminal.reason_code == "OUTPUT_RETRY_CHAIN_FAILED"
-    assert terminal.executed is True
-    assert terminal.execution == initial_output["execution"]
-    assert terminal.audited is True
-    assert terminal.audit == initial_output["audit"]
-    assert terminal.data == initial_output["data"]
-    assert terminal.persistence == initial_output["persistence"]
-    assert calls == (
-        ["sql_generation"]
-        if failed_step_id == "sql_generation"
-        else ["sql_generation", "sql_verification"]
-    )
-
-
-def test_retry_chain_failure_without_valid_terminal_evidence_fails_closed():
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    context = models.WorkflowContext(
-        workflow_id="wf-invalid-retry-evidence",
-        variables={"run_id": "run-invalid-retry-evidence"},
-    )
-    steps = {
-        "db_audit": models.StepResult(
-            step_id="db_audit",
-            status=models.StepStatus.FAILED,
-            output=None,
-            error="corrective retry chain failed",
-            error_class="output_retry_chain_failed",
-        ),
-    }
-
-    outcome = engine._derive_text_to_sql_terminal_outcome(
-        workflow,
-        context,
-        steps,
-    )
-
-    assert outcome.status.value == "failed"
-    assert outcome.reason_code == "DB_AUDIT_OUTPUT_INVALID"
-    assert outcome.executed is False
-    assert outcome.audited is False
-    assert outcome.execution == {}
-    assert outcome.audit == {}
-
-
-@pytest.mark.parametrize(
-    "reason_code",
-    [
-        "AUDIT_FAILED",
-        "AUDIT_CONTRACT_INVALID",
-        "PERSISTENCE_CONTRACT_INVALID",
-        "VERIFIER_CONTRACT_INVALID",
-        "EXECUTOR_CONTRACT_INVALID",
-    ],
-)
-def test_db_audit_does_not_retry_non_execution_failure_reasons(reason_code):
-    engine = _enhanced_engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    StepResult = models.StepResult
-    StepStatus = models.StepStatus
-    WorkflowContext = models.WorkflowContext
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    context = WorkflowContext(
-        workflow_id=f"wf-no-retry-{reason_code}",
-        variables={**workflow.inputs},
-    )
-
-    class _StateManager:
-        async def save_checkpoint(self, **kwargs):
-            return None
-
-    async def unexpected_execute(*args, **kwargs):
-        pytest.fail(f"unexpected execution-feedback retry for {reason_code}")
-
-    engine.state_manager = _StateManager()
-    engine._execute_enhanced_step = unexpected_execute
-    initial_result = StepResult(
-        step_id=audit_step.id,
-        status=StepStatus.COMPLETED,
-        output=_terminal_output(reason_code=reason_code),
-    )
-
-    result = asyncio.run(
-        engine._complete_enhanced_step_with_output_retry(
-            audit_step,
-            initial_result,
-            context,
-            workflow,
-            {},
-        )
-    )
-
-    assert result is initial_result
-    assert "__output_retry_counters__" not in context.variables
-
-
-def test_final_output_from_db_audit():
-    """outputs.final.from_step должен указывать на последний шаг (db_audit)."""
-    workflow = _load_text_to_sql_workflow()
-    assert workflow.outputs["final"]["from_step"] == "db_audit"
-
-
-def test_ag_ui_workflows_result_envelope_compatible():
-    """Контракт AG-UI: preload_agents с правильными именами агентов должны сохраниться.
-    Inputs пайплайна (max_rows, safety_level и т.д.) тоже сохраняются."""
-    workflow = _load_text_to_sql_workflow()
-
-    # Inputs сохранены
-    for key in [
-        "query",
-        "dsn",
-        "max_rows",
-        "session_id",
-        "run_id",
-        "safety_level",
-        "include_explanation",
-        "validate_schema",
-        "dry_run_only",
-        "use_schema_suggestions",
-        "allow_enhanced_fallback",
-    ]:
-        assert key in workflow.inputs, f"input '{key}' пропал из пайплайна"
-
-    # Generation and verification remain explicit agent steps.
-    for step_id in ("sql_generation", "sql_verification"):
-        step = next(s for s in workflow.steps if s.id == step_id)
-        assert step.agent_type and step.agent_type != "manager", (
-            f"{step_id} должен быть отдельным агентом, а не manager"
-        )
-    terminal_step = next(s for s in workflow.steps if s.id == "db_audit")
-    assert terminal_step.step_type == "tool"
-    assert terminal_step.tool_name == "finalize_text_to_sql_run"
-
-    # Финальный шаг (db_audit) должен иметь доступ к max_rows и dry_run_only через
-    # metadata (для прокидывания в БД-tool).
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    assert audit_step.metadata.get("max_rows") == "{max_rows}"
-    assert audit_step.metadata.get("dry_run_only") == "{dry_run_only}"
-
-
-def test_decomposed_steps_use_substituted_metadata_via_engine():
-    """Smoke-тест: новые шаги после декомпозиции корректно проходят metadata-substitution
-    через engine._step_with_substituted_metadata (6.1 интеграция с 6.3)."""
-    engine = _engine_instance()
-    workflow = _load_text_to_sql_workflow()
-    models = _workflow_models()
-    WorkflowContext = models.WorkflowContext
-
-    audit_step = next(s for s in workflow.steps if s.id == "db_audit")
-    ctx = WorkflowContext(
-        workflow_id="wf-1",
-        session_id="sess-1",
-        variables={
-            "max_rows": 100,
-            "dry_run_only": False,
-            "safety_level": "strict",
-            "include_explanation": True,
-            "validate_schema": True,
-            "use_schema_suggestions": True,
-            "allow_enhanced_fallback": False,
-            "dsn": "sqlite:///x.db",
-            "run_id": "run-xyz",
-            "safety_policy": _strict_safety_policy_mapping(),
-        },
-        step_outputs={
-            "sql_generation": {"sql": "SELECT 1", "description": "one"},
-            "sql_generation.sql": "SELECT 1",
-        },
-    )
-    new_step = engine._step_with_substituted_metadata(audit_step, ctx)
-    assert new_step.metadata.get("max_rows") == 100
-    assert new_step.metadata.get("dry_run_only") is False
-    assert new_step.metadata.get("dsn") == "sqlite:///x.db"
-
-
-# ===========================================================================
-# 7.22: allow_enhanced_fallback через coerce_strict_bool в EnhancedWorkflowEngine
-# ===========================================================================
-def _make_fallback_stub_engine():
-    """Создаёт минимальный stub `_should_fallback_to_legacy` без heavy enhanced deps.
-
-    Импорт `workflow.enhanced_engine` тянет тяжёлые зависимости (PolicyEngine,
-    AdaptiveRetryEngine, CircuitBreakerManager …), которые в этом lightweight
-    test-окружении не нужны. Подгружаем сам метод через ``__func__`` от исходного
-    модуля и привязываем к stub-инстансу с feature_manager-стабом.
-    """
-    import importlib.util
-    import types
-    from types import SimpleNamespace
-
-    spec = importlib.util.spec_from_file_location(
-        "workflow.enhanced_engine_for_test",
-        ROOT / "workflow" / "enhanced_engine.py",
-    )
-    # Чтение и анализ исходника без exec — нам нужен только текст метода.
-    source = spec.origin
-    src_text = Path(source).read_text(encoding="utf-8")
-    # Извлекаем функции _should_fallback_to_legacy + _coerce_bool + _is_text_to_sql_workflow
-    # — компилируем их изолированно.
-    import ast
-
-    tree = ast.parse(src_text)
-    funcs = {}
-    class_node = next(
-        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "EnhancedWorkflowEngine"
-    )
-    for n in class_node.body:
-        if isinstance(n, ast.FunctionDef) and n.name in (
-            "_should_fallback_to_legacy",
-            "_coerce_bool",
-            "_is_text_to_sql_workflow",
-        ):
-            mod = ast.Module(body=[n], type_ignores=[])
-            code = compile(mod, source, "exec")
-            ns: dict = {}
-            # Inject minimal __builtins__ + needed names
-            exec(  # noqa: S102
-                code,
-                {
-                    "__builtins__": __builtins__,
-                    "Any": object,
-                    "Optional": object,
-                    "WorkflowDefinition": object,
-                    "WorkflowContext": object,
-                    "TEXT_TO_SQL_WORKFLOW_CATEGORY": "text_to_sql",
-                    "is_text_to_sql_workflow_name": (
-                        lambda value: value == "text_to_sql_pipeline"
-                    ),
-                    "logger": SimpleNamespace(warning=lambda *args, **kwargs: None),
-                },
-                ns,
-            )
-            funcs[n.name] = ns[n.name]
-
-    stub = SimpleNamespace()
-    stub._coerce_bool = types.MethodType(funcs["_coerce_bool"], stub)
-    stub._is_text_to_sql_workflow = types.MethodType(funcs["_is_text_to_sql_workflow"], stub)
-    stub._should_fallback_to_legacy = types.MethodType(funcs["_should_fallback_to_legacy"], stub)
-    stub.feature_manager = SimpleNamespace(
-        workflow_overrides={"text_to_sql": {"fallback_to_legacy": False}},
-        global_config={},
-    )
-    return stub
-
-
-def _make_t2s_workflow_def():
-    from types import SimpleNamespace
-    return SimpleNamespace(name="text_to_sql_pipeline", metadata={})
-
-
-def _make_ctx(variables: dict):
-    from types import SimpleNamespace
-    return SimpleNamespace(variables=variables)
-
-
-def test_allow_enhanced_fallback_strict_accepts_true_values():
-    stub = _make_fallback_stub_engine()
-    wf = _make_t2s_workflow_def()
-    for value in [True, 1, "1", "true", "TRUE", "yes", "on"]:
-        ctx = _make_ctx({"allow_enhanced_fallback": value})
-        assert stub._should_fallback_to_legacy(wf, ctx) is True, (
-            f"value={value!r} должно coerce-иться в True"
-        )
-
-
-def test_allow_enhanced_fallback_strict_accepts_false_values():
-    stub = _make_fallback_stub_engine()
-    wf = _make_t2s_workflow_def()
-    for value in [False, 0, "0", "false", "no", "off", ""]:
-        ctx = _make_ctx({"allow_enhanced_fallback": value})
-        assert stub._should_fallback_to_legacy(wf, ctx) is False, (
-            f"value={value!r} должно coerce-иться в False"
-        )
-
-
-def test_allow_enhanced_fallback_strict_none_uses_default():
-    stub = _make_fallback_stub_engine()
-    wf = _make_t2s_workflow_def()
-    # default_enabled = override.fallback_to_legacy = False
-    ctx = _make_ctx({})
-    assert stub._should_fallback_to_legacy(wf, ctx) is False
-
-    # override = True → default берётся True
-    stub.feature_manager.workflow_overrides = {"text_to_sql": {"fallback_to_legacy": True}}
-    assert stub._should_fallback_to_legacy(wf, ctx) is True
-
-
-def test_allow_enhanced_fallback_strict_rejects_invalid():
-    stub = _make_fallback_stub_engine()
-    wf = _make_t2s_workflow_def()
-    for bad in ["maybe", "yesnt", "2", 2, -1, 1.5, [], {}]:
-        ctx = _make_ctx({"allow_enhanced_fallback": bad})
-        with pytest.raises(ValueError, match="allow_enhanced_fallback"):
-            stub._should_fallback_to_legacy(wf, ctx)
-
-
 def test_enhanced_engine_disabled_fails_for_required_enhanced_workflow():
     engine = _enhanced_engine_instance()
     models = _workflow_models()
@@ -2283,6 +932,36 @@ def test_enhanced_engine_disabled_fails_for_required_enhanced_workflow():
 
     with pytest.raises(WorkflowExecutionError, match="requires enhanced engine"):
         asyncio.run(engine.execute_workflow(workflow, context))
+
+
+def test_text_to_sql_always_uses_typed_engine_when_generic_feature_is_disabled(
+    monkeypatch,
+):
+    engine = _enhanced_engine_instance()
+    models = _workflow_models()
+    WorkflowContext = models.WorkflowContext
+    WorkflowDefinition = models.WorkflowDefinition
+    DeadlineBudget = sys.modules["workflow.deadline"].DeadlineBudget
+    expected = object()
+
+    engine.feature_manager = types.SimpleNamespace(
+        is_enhanced_enabled=lambda workflow_id=None: False,
+    )
+    workflow = WorkflowDefinition(
+        name="text_to_sql_pipeline",
+        steps=[],
+        requires_enhanced_engine=True,
+        metadata={"category": "text_to_sql"},
+    )
+    context = WorkflowContext(workflow_id="typed-only", session_id="session")
+    context._deadline_budget = DeadlineBudget.from_duration(5.0)
+
+    async def execute_typed(*_args, **_kwargs):
+        return expected
+
+    monkeypatch.setattr(engine, "_execute_enhanced_workflow", execute_typed)
+
+    assert asyncio.run(engine.execute_workflow(workflow, context)) is expected
 
 
 def test_base_engine_rejects_required_enhanced_workflow():

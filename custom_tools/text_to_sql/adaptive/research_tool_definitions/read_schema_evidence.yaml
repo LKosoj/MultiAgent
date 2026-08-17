@@ -1,0 +1,9 @@
+version: 1
+name: read_schema_evidence
+description: Read one allowlisted structural evidence document.
+implementation: read_schema_evidence
+arguments:
+  - name: document_id
+    type: string
+    required: true
+additional_properties: false

@@ -4,7 +4,7 @@
 
 DatabaseHandler отвечает за:
 - Инициализацию и подключение к SQLite
-- Инициализацию и подключение к ChromaDB  
+- Инициализацию и подключение к ChromaDB
 - Создание схемы БД с темпоральными полями
 - Управление соединениями
 """
@@ -17,6 +17,10 @@ import warnings
 import os
 import logging
 from datetime import datetime, timedelta, timezone
+from enum import Enum
+
+import chromadb
+from sentence_transformers import SentenceTransformer
 
 warnings.filterwarnings(
     "ignore",
@@ -24,11 +28,23 @@ warnings.filterwarnings(
     category=DeprecationWarning,
 )
 
-import chromadb
-from sentence_transformers import SentenceTransformer
-
 logger = logging.getLogger(__name__)
 MEMORY_DB_SCHEMA_VERSION = 1
+
+
+class VectorReadiness(str, Enum):
+    """Состояние дополнительного векторного индекса.
+
+    SQLite остаётся источником истины для памяти. Это поле нужно только для
+    того, чтобы вызывающий код не принимал недоступный или устаревший Chroma
+    за готовый индекс.
+    """
+
+    DISABLED = "disabled"
+    READY = "ready"
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+    REBUILDING = "rebuilding"
 
 
 def _sqlite_busy_timeout_ms() -> int:
@@ -92,8 +108,7 @@ def _deduplicate_active_agent_memory(cursor: sqlite3.Cursor) -> None:
         ]
         for offset, rowid in enumerate(ordered_rowids[1:], start=1):
             closed_at = (
-                base_time
-                + timedelta(microseconds=group_index * 1000 + offset)
+                base_time + timedelta(microseconds=group_index * 1000 + offset)
             ).isoformat()
             cursor.execute(
                 """
@@ -130,26 +145,28 @@ _patch_chromadb_swig_type_modules()
 atexit.register(_patch_chromadb_swig_type_modules)
 
 # Устанавливаем переменную окружения для отключения параллелизма токенизаторов
-os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Устанавливаем оффлайн режим для HuggingFace Hub (использовать только локальный кэш)
 # Это предотвратит попытки скачивания модели при каждом запуске
-if os.environ.get('HF_HUB_OFFLINE') != '0':  # Можно переопределить через env переменную
-    os.environ['HF_HUB_OFFLINE'] = '1'
+if os.environ.get("HF_HUB_OFFLINE") != "0":  # Можно переопределить через env переменную
+    os.environ["HF_HUB_OFFLINE"] = "1"
 
 # Подавляем предупреждения от transformers
-warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
+warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
 
 class DatabaseHandler:
     """Обработчик баз данных для системы памяти"""
-    
-    def __init__(self, 
-                 db_path: str = "memory/smolagents_memory.db", 
-                 chroma_path: str = "memory/chromadb",
-                 embedding_model: str = "intfloat/multilingual-e5-base"):
+
+    def __init__(
+        self,
+        db_path: str = "memory/smolagents_memory.db",
+        chroma_path: str = "memory/chromadb",
+        embedding_model: str = "intfloat/multilingual-e5-base",
+    ):
         """Инициализация обработчика БД
-        
+
         Args:
             db_path: Путь к файлу базы данных SQLite
             chroma_path: Путь к директории ChromaDB
@@ -158,13 +175,38 @@ class DatabaseHandler:
         self.db_path = db_path
         self.chroma_path = chroma_path
         self._lock = threading.Lock()
-        
+        self._vector_readiness_lock = threading.Lock()
+        self.vector_readiness = VectorReadiness.UNAVAILABLE
+        self.vector_readiness_reason = "not_initialized"
+
         # Инициализация SQLite
         self._init_db()
-        
-        # Инициализация ChromaDB
-        self._init_chroma(embedding_model)
-    
+
+        # Chroma — дополнительный индекс. Явное отключение не должно мешать
+        # SQLite-памяти, уже инициализированной выше.
+        if os.getenv("MEMORY_CHROMA_DISABLED", "0") == "1":
+            self.embedding_model = None
+            self.embedding_model_name = ""
+            self.embedding_dimension = None
+            self.embedding_metadata_mismatch = False
+            self.chroma_client = None
+            self.strategic_collection = None
+            self.tactical_collection = None
+            self.set_vector_readiness(VectorReadiness.DISABLED, "disabled_by_config")
+        else:
+            self._init_chroma(embedding_model)
+
+    def set_vector_readiness(
+        self,
+        readiness: VectorReadiness | str,
+        reason: str | None = None,
+    ) -> None:
+        """Публикует состояние Chroma отдельно от доступности SQLite."""
+        state = VectorReadiness(readiness)
+        with self._vector_readiness_lock:
+            self.vector_readiness = state
+            self.vector_readiness_reason = reason
+
     def _configure_connection(self, conn: sqlite3.Connection) -> sqlite3.Connection:
         busy_timeout_ms = _sqlite_busy_timeout_ms()
         conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
@@ -173,7 +215,9 @@ class DatabaseHandler:
             try:
                 conn.execute("PRAGMA journal_mode = WAL")
             except sqlite3.DatabaseError as exc:
-                logger.warning("SQLite WAL mode is unavailable for %s: %s", self.db_path, exc)
+                logger.warning(
+                    "SQLite WAL mode is unavailable for %s: %s", self.db_path, exc
+                )
         return conn
 
     def _get_connection(self):
@@ -194,13 +238,13 @@ class DatabaseHandler:
         linking-результата) должны звать публичный API.
         """
         return self._get_connection()
-    
+
     def _init_db(self):
         """Инициализация структуры базы данных с темпоральными полями"""
         conn = self._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute('''
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS agent_memory (
                     session_id TEXT,
                     agent_name TEXT,
@@ -215,35 +259,35 @@ class DatabaseHandler:
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     PRIMARY KEY (session_id, agent_name, step, valid_to)
                 )
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_session_agent 
                 ON agent_memory(session_id, agent_name)
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_memory_temporal 
                 ON agent_memory(valid_from, valid_to)
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_memory_active 
                 ON agent_memory(session_id) WHERE valid_to IS NULL
-            ''')
+            """)
             _deduplicate_active_agent_memory(cursor)
-            cursor.execute('''
+            cursor.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_memory_active_step_unique
                 ON agent_memory(session_id, agent_name, step)
                 WHERE valid_to IS NULL
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_memory_run 
                 ON agent_memory(session_id, agent_name, run_id)
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_memory_instance_step 
                 ON agent_memory(session_id, agent_name, instance_step)
-            ''')
+            """)
             # --- Strategic Memory Table ---
-            cursor.execute('''
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS strategic_memory (
                     memory_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT NOT NULL,
@@ -256,19 +300,19 @@ class DatabaseHandler:
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_strategic_session_type
                 ON strategic_memory(session_id, type)
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_strategic_temporal 
                 ON strategic_memory(valid_from, valid_to)
-            ''')
-            cursor.execute('''
+            """)
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_strategic_active 
                 ON strategic_memory(session_id, type) WHERE valid_to IS NULL
-            ''')
+            """)
             current_version = cursor.execute("PRAGMA user_version").fetchone()[0]
             if current_version > MEMORY_DB_SCHEMA_VERSION:
                 raise RuntimeError(
@@ -288,25 +332,27 @@ class DatabaseHandler:
             print(f"Загружаем модель эмбеддингов: {embedding_model}")
             # Сначала пробуем загрузить из локального кэша
             try:
-                self.embedding_model = SentenceTransformer(embedding_model, local_files_only=True)
-                print(f"✅ Модель загружена из локального кэша")
-            except Exception as e:
+                self.embedding_model = SentenceTransformer(
+                    embedding_model, local_files_only=True
+                )
+                print("✅ Модель загружена из локального кэша")
+            except Exception:
                 # Если модели нет локально, загружаем из интернета
-                print(f"⚠️ Модель не найдена локально, загружаем из HuggingFace...")
+                print("⚠️ Модель не найдена локально, загружаем из HuggingFace...")
                 self.embedding_model = SentenceTransformer(embedding_model)
             # Сохраняем читаемое имя модели для UI
             self.embedding_model_name = embedding_model
             self.embedding_dimension = _embedding_dimension(self.embedding_model)
             self.embedding_metadata_mismatch = False
-            
+
             # Создаем клиент ChromaDB с отключенной телеметрией
             from chromadb.config import Settings
+
             settings = Settings(anonymized_telemetry=False)
             self.chroma_client = chromadb.PersistentClient(
-                path=self.chroma_path,
-                settings=settings
+                path=self.chroma_path, settings=settings
             )
-            
+
             # Создаем коллекции для разных типов памяти.
             # W5-T1: явная метрика расстояния через hnsw:space (default
             # cosine). Все пороги text-to-sql (min_score=0.2, формулы
@@ -325,7 +371,10 @@ class DatabaseHandler:
             # Опционально можно переопределить через env
             # TEXT_TO_SQL_CHROMA_METRIC (cosine|l2|ip), но cosine — единственный
             # вариант, под который написана downstream-логика.
-            chroma_metric = os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine").strip().lower() or "cosine"
+            chroma_metric = (
+                os.getenv("TEXT_TO_SQL_CHROMA_METRIC", "cosine").strip().lower()
+                or "cosine"
+            )
             collection_metadata = {
                 "hnsw:space": chroma_metric,
                 "embedding_model_name": self.embedding_model_name,
@@ -357,8 +406,15 @@ class DatabaseHandler:
             ):
                 _actual = None
                 _meta = getattr(_coll, "metadata", None)
-                if isinstance(_meta, dict):
-                    _actual = _meta.get("hnsw:space")
+                if not isinstance(_meta, dict):
+                    self.embedding_metadata_mismatch = True
+                    logger.error(
+                        "Chroma collection '%s' exposes invalid metadata; "
+                        "rebuild ChromaDB from SQLite before semantic memory operations.",
+                        _coll_name,
+                    )
+                    continue
+                _actual = _meta.get("hnsw:space")
                 if _actual and _actual != chroma_metric:
                     logger.warning(
                         "Chroma collection '%s' uses hnsw:space='%s', "
@@ -369,36 +425,42 @@ class DatabaseHandler:
                         _actual,
                         chroma_metric,
                     )
-                if isinstance(_meta, dict):
-                    stored_model = _meta.get("embedding_model_name")
-                    stored_dim = _meta.get("embedding_dimension")
-                    model_mismatch = (
-                        isinstance(stored_model, str)
-                        and stored_model
-                        and stored_model != self.embedding_model_name
+                stored_model = _meta.get("embedding_model_name")
+                stored_dim = _meta.get("embedding_dimension")
+                model_mismatch = (
+                    isinstance(stored_model, str)
+                    and stored_model
+                    and stored_model != self.embedding_model_name
+                )
+                dim_mismatch = False
+                if stored_dim is not None and self.embedding_dimension is not None:
+                    try:
+                        dim_mismatch = int(stored_dim) != int(self.embedding_dimension)
+                    except (TypeError, ValueError):
+                        dim_mismatch = True
+                if model_mismatch or dim_mismatch:
+                    self.embedding_metadata_mismatch = True
+                    logger.error(
+                        "Chroma collection '%s' embedding metadata mismatch: "
+                        "stored model=%r dim=%r, current model=%r dim=%r. "
+                        "Semantic search may fail; rebuild ChromaDB from SQLite.",
+                        _coll_name,
+                        stored_model,
+                        stored_dim,
+                        self.embedding_model_name,
+                        self.embedding_dimension,
                     )
-                    dim_mismatch = False
-                    if stored_dim is not None and self.embedding_dimension is not None:
-                        try:
-                            dim_mismatch = int(stored_dim) != int(self.embedding_dimension)
-                        except (TypeError, ValueError):
-                            dim_mismatch = True
-                    if model_mismatch or dim_mismatch:
-                        self.embedding_metadata_mismatch = True
-                        logger.error(
-                            "Chroma collection '%s' embedding metadata mismatch: "
-                            "stored model=%r dim=%r, current model=%r dim=%r. "
-                            "Semantic search may fail; rebuild ChromaDB from SQLite.",
-                            _coll_name,
-                            stored_model,
-                            stored_dim,
-                            self.embedding_model_name,
-                            self.embedding_dimension,
-                        )
-            
+
             _patch_chromadb_swig_type_modules()
+            if self.embedding_metadata_mismatch:
+                self.set_vector_readiness(
+                    VectorReadiness.STALE,
+                    "collection_metadata_mismatch",
+                )
+            else:
+                self.set_vector_readiness(VectorReadiness.READY)
             print("ChromaDB инициализирована успешно")
-            
+
         except Exception as e:
             print(f"Ошибка при инициализации ChromaDB: {e}")
             # Fallback: устанавливаем None чтобы система работала только с SQLite
@@ -409,6 +471,10 @@ class DatabaseHandler:
             self.chroma_client = None
             self.strategic_collection = None
             self.tactical_collection = None
+            self.set_vector_readiness(
+                VectorReadiness.UNAVAILABLE,
+                "initialization_failed",
+            )
 
     @property
     def lock(self):

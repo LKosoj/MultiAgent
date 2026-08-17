@@ -337,7 +337,6 @@ def test_all_semantic_consumers_forward_the_same_namespace(
         entity_term_collector=lambda _entities: ["amount"],
         llm_caller=lambda *args, **kwargs: "{}",
     )
-    monkeypatch.setenv("SCHEMA_LLM_USE_FIRST_N_FALLBACK", "0")
     linker.llm_linking(
         {"metrics": ["amount"], "dimensions": [], "filters": {}},
         _schema(),

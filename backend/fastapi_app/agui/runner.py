@@ -10,6 +10,12 @@ import uuid
 from pathlib import Path
 from typing import Any, AsyncIterator, Iterable, Optional, Tuple
 
+from ._cancellation import (
+    RunCancellationIntent,
+    current_run_cancellation_intent,
+    run_cancellation_context_is_bound,
+)
+
 from .events import (
     EventType,
     CustomEvent,
@@ -589,15 +595,27 @@ async def _run_text_to_sql_service_action(
         principal=principal,
     )
     request_id = payload.get("__request_id")
+    from ._t2s_requests import text_to_sql_request_payload
+
+    request_payload = text_to_sql_request_payload(payload)
+    fallback_cancel_intent = RunCancellationIntent()
 
     async def call_service(
         action: str,
         action_payload: dict[str, Any],
         *,
         include_transport: bool = False,
+        cancellation_intent: Optional[RunCancellationIntent] = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {"principal": principal}
-        if include_transport:
+        if cancellation_intent is not None:
+            kwargs["transport_context"] = ServiceTransportContext(
+                run_id=input_data.run_id,
+                principal=principal,
+                cancellation_request_id=cancellation_intent.request_id,
+                cancellation_provenance=cancellation_intent.provenance,
+            )
+        elif include_transport:
             kwargs["transport_context"] = transport_context
         value = await asyncio.to_thread(
             handle_service_action,
@@ -632,7 +650,23 @@ async def _run_text_to_sql_service_action(
             result = await call_service(
                 "workflows.result",
                 {"run_id": input_data.run_id},
+                include_transport=True,
             )
+        projected_result = result.get("__durable_workflow_result")
+        if isinstance(projected_result, dict):
+            from workflow.result_identity import (
+                workflow_result_identity_from_payload,
+            )
+
+            workflow_result_identity_from_payload(
+                projected_result,
+                expected_run_id=input_data.run_id,
+            )
+            terminal_result = dict(projected_result)
+            terminal_result.pop("result_seq", None)
+        else:
+            projected_result = result
+            terminal_result = projected_result
         terminal = result.get("terminal_outcome")
         terminal_status = (
             str(terminal.get("status") or "failed").lower()
@@ -642,7 +676,7 @@ async def _run_text_to_sql_service_action(
         result_event = CustomEvent(
             type=EventType.CUSTOM,
             name="workflow.result",
-            value=redact_pii_in_payload(_redact_payload(result)),
+            value=redact_pii_in_payload(_redact_payload(projected_result)),
             timestamp=_now_ms(),
         )
         if terminal_status in {"succeeded", "abstained"}:
@@ -650,7 +684,7 @@ async def _run_text_to_sql_service_action(
                 type=EventType.RUN_FINISHED,
                 thread_id=input_data.thread_id,
                 run_id=input_data.run_id,
-                result=result,
+                result=terminal_result,
                 timestamp=_now_ms(),
             )
         else:
@@ -685,11 +719,25 @@ async def _run_text_to_sql_service_action(
         timeout: float = _WORKFLOW_CANCEL_REQUEST_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         return await asyncio.wait_for(
-            call_service(action, {"run_id": input_data.run_id}),
+            call_service(
+                action,
+                {"run_id": input_data.run_id},
+                include_transport=action == "workflows.result",
+            ),
             timeout=max(timeout, 0.001),
         )
 
     cancel_dispatch: Optional[asyncio.Task[dict[str, Any]]] = None
+
+    def cancellation_intent() -> RunCancellationIntent:
+        intent = current_run_cancellation_intent()
+        if intent is not None:
+            return intent
+        fallback_cancel_intent.authorize(
+            f"cancel-{uuid.uuid4().hex}",
+            "agui_failed_start_cleanup:v1",
+        )
+        return fallback_cancel_intent
 
     def consume_cancel_dispatch(task: asyncio.Task[dict[str, Any]]) -> None:
         try:
@@ -735,6 +783,7 @@ async def _run_text_to_sql_service_action(
                 call_service(
                     "workflows.cancel",
                     {"run_id": input_data.run_id},
+                    cancellation_intent=cancellation_intent(),
                 )
             )
             cancel_dispatch.add_done_callback(consume_cancel_dispatch)
@@ -853,6 +902,22 @@ async def _run_text_to_sql_service_action(
         status = await start_side_effects_status()
         if status is None:
             return None
+        result_seq = status.get("result_seq")
+        worker_pid = status.get("worker_pid")
+        durable_handoff = (
+            type(result_seq) is int and result_seq > 0
+        ) or (
+            str(status.get("status") or "").lower() == "running"
+            and type(worker_pid) is int
+            and worker_pid > 0
+        )
+        if durable_handoff:
+            terminal_events = (
+                await confirmed_final_events(None)
+                if type(result_seq) is int and result_seq > 0
+                else None
+            )
+            return informational_start_result(status), terminal_events
         terminal_confirmed, terminal_result = await cancel_and_wait_for_terminal()
         terminal_events = (
             await confirmed_final_events(terminal_result)
@@ -880,7 +945,7 @@ async def _run_text_to_sql_service_action(
     start_task = asyncio.create_task(
         call_service(
             _TEXT_TO_SQL_SERVICE_ACTION,
-            payload,
+            request_payload,
             include_transport=True,
         )
     )
@@ -889,6 +954,20 @@ async def _run_text_to_sql_service_action(
         if start_result.get("run_id") != input_data.run_id:
             raise ValueError("Text-to-SQL start returned another run_id")
     except asyncio.CancelledError as cancelled:
+        if (
+            run_cancellation_context_is_bound()
+            and current_run_cancellation_intent() is None
+        ):
+            current_task = asyncio.current_task()
+            logger.warning(
+                "Text-to-SQL outer task was cancelled without an authorized "
+                "cancellation intent for %s (cancelling=%s); preserving the "
+                "durable workflow",
+                input_data.run_id,
+                current_task.cancelling() if current_task is not None else 0,
+            )
+            observe_detached_start(start_task)
+            raise
         try:
             start_result = await asyncio.wait_for(
                 asyncio.shield(start_task),
@@ -1001,6 +1080,19 @@ async def _run_text_to_sql_service_action(
             )
             await asyncio.sleep(max(_WORKFLOW_POLL_INTERVAL_SECONDS, 0.001))
         except asyncio.CancelledError:
+            if (
+                run_cancellation_context_is_bound()
+                and current_run_cancellation_intent() is None
+            ):
+                current_task = asyncio.current_task()
+                logger.warning(
+                    "Text-to-SQL status follow was cancelled without an "
+                    "authorized cancellation intent for %s (cancelling=%s); "
+                    "preserving the durable workflow",
+                    input_data.run_id,
+                    current_task.cancelling() if current_task is not None else 0,
+                )
+                raise
             terminal_confirmed, terminal_result = await cancel_and_wait_for_terminal()
             if not terminal_confirmed:
                 continue

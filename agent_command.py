@@ -80,11 +80,11 @@ _MODEL_CONFIGS: dict[str, dict] = {
 }
 
 
-@functools.lru_cache(maxsize=None)
-def _get_model(name: str) -> RetryOpenAIServerModel:
+def _create_model(name: str, **overrides: object) -> RetryOpenAIServerModel:
     if name not in _MODEL_CONFIGS:
         raise AttributeError(f"Unknown model: {name!r}")
     config = dict(_MODEL_CONFIGS[name])
+    config.update(overrides)
     api_key = os.getenv("OPENAI_API_KEY_DB")
     if not api_key:
         raise EnvironmentError("OPENAI_API_KEY_DB is required but not set")
@@ -93,6 +93,31 @@ def _get_model(name: str) -> RetryOpenAIServerModel:
     config.setdefault("custom_role_conversions", custom_role_conversions)
     config.setdefault("extra_headers", {"X-Title": "MAgent"})
     return RetryOpenAIServerModel(**config)
+
+
+@functools.lru_cache(maxsize=None)
+def _get_model(name: str) -> RetryOpenAIServerModel:
+    return _create_model(name)
+
+
+def create_text_to_sql_model(
+    name: str,
+    *,
+    max_tokens: int,
+    temperature: float,
+    timeout_seconds: float | None = None,
+    client_max_retries: int = 1,
+) -> RetryOpenAIServerModel:
+    """Create the isolated Typed provider with its per-call contract."""
+
+    return _create_model(
+        name,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        max_retries=0,
+        client_kwargs={"max_retries": client_max_retries},
+        timeout_seconds=timeout_seconds,
+    )
 
 
 class _ModelMapping:

@@ -167,7 +167,7 @@ class SchemaLinkingCore:
         linked_filters: Dict[str, Any] = {}
         unlinked: List[str] = []
         ambiguous_bindings: List[Dict[str, Any]] = []
-        schema_budget: Dict[str, Any] = {}
+        schema_budget: Dict[str, Any] = {"model_calls": 0}
         reason_code: Optional[str] = None
 
         llm_joins: List[Dict[str, Any]] = []
@@ -318,7 +318,7 @@ class SchemaLinkingCore:
                     f"{len(llm_joins) - len(validated_joins)} invalid"
                 )
 
-            if joins_info["unconnected_tables"]:
+            if main_table is not None and joins_info["unconnected_tables"]:
                 # Authoritative FK closure is deterministic schema evidence,
                 # not a heuristic fallback. Convention-based joins remain
                 # gated by SCHEMA_LINKING_ALLOW_FALLBACKS.
@@ -363,20 +363,28 @@ class SchemaLinkingCore:
             main_table = self._pick_main_table_from_linked(
                 linked_metrics, linked_dimensions, pre_required, db_schema
             )
-            joins_info = self.build_joins(
-                linked_metrics,
-                linked_dimensions,
-                linked_filters,
-                db_schema,
-                main_table=main_table,
-                include_conventions=allow_fallbacks,
-            )
-            joins_info["success"] = (
-                bool(joins_info.get("main_table"))
-                and not joins_info.get("unconnected_tables")
-            )
-            if allow_fallbacks:
-                heuristic_used = True
+            if main_table is None:
+                joins_info = {
+                    "joins": [],
+                    "success": False,
+                    "unconnected_tables": sorted(pre_required),
+                    "main_table": None,
+                }
+            else:
+                joins_info = self.build_joins(
+                    linked_metrics,
+                    linked_dimensions,
+                    linked_filters,
+                    db_schema,
+                    main_table=main_table,
+                    include_conventions=allow_fallbacks,
+                )
+                joins_info["success"] = (
+                    bool(joins_info.get("main_table"))
+                    and not joins_info.get("unconnected_tables")
+                )
+                if allow_fallbacks:
+                    heuristic_used = True
 
         # Определяем фактически использованную стратегию.
         # hybrid — LLM отдал результат И heuristic дополнительно подключался

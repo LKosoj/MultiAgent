@@ -54,6 +54,10 @@ class SQLitePlugin(BaseDBPlugin):
         if dsn.startswith("sqlite:///"):
             parsed = urlparse(driver_dsn)
             path = parsed.path
+            if driver_dsn.startswith("sqlite:////") and not driver_dsn.startswith(
+                "sqlite://///"
+            ):
+                path = path[1:]
             if path in {":memory:", "/:memory:"}:
                 return sqlite3.connect(":memory:")
             conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
@@ -106,6 +110,9 @@ class SQLitePlugin(BaseDBPlugin):
             columns = [d[0] for d in cur.description] if cur.description else []
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
+
+    def execute_select_bound(self, conn, sql, parameters, row_limit=500):
+        return self._execute_select_bound_driver(conn, sql, parameters, row_limit)
 
     def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
         schema_result: Dict[str, Dict[str, Any]] = {}
