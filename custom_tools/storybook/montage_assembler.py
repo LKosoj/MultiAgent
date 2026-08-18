@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -18,6 +19,8 @@ from custom_tools.storybook.project_paths import (
     storybook_projects_root,
 )
 
+logger = logging.getLogger(__name__)
+
 _RENDER_TIMEOUT_S = 1800
 _PROBE_TIMEOUT_S = 120
 _ANALYZE_TIMEOUT_S = 300
@@ -25,6 +28,17 @@ _AUDIO_FADE_S = 1.0
 _FREEZE_MAX_RATIO = 0.40
 _FADE_WINDOW_S = 1.5
 _DARK_TERMS = ("night", "fade", "blackout", "dark", "ночь", "затемнение", "чернота")
+
+# Per-scene leitmotif audio (see docs/plans/2026-08-18-4a-music-per-scene-leitmotif-design.md).
+_MUSIC_PLAN_FILENAME = "music_plan.json"
+_MUSIC_MANIFEST_FILENAME = "music_manifest.json"
+_SCENE_FADE_S = 0.5
+_SCENE_CROSSFADE_S = 1.0
+_MIN_TRACK_DURATION_S = 0.5
+_MIN_FADE_SCENE_DURATION_S = 1.0  # == 2 * _SCENE_FADE_S: below this, in+out fades would overlap
+_MIN_CROSSFADE_S = 0.1  # crossfades shorter than this are not worth it; hard-cut instead
+_CROSSFADE_MARGIN_S = 0.05  # keep crossfade shorter than half of either scene's duration
+_MIN_SCENE_AUDIO_DURATION_S = 0.1  # scenes at/under this are too short to carry a leitmotif track
 
 
 def montage_assembler_tool(
@@ -155,6 +169,8 @@ def montage_assembler_tool(
                 audio_tracks=usable_audio_tracks,
                 output_path=paths["final_video"],
                 expected_duration=expected_duration,
+                base_dir=base_dir,
+                warnings=warnings,
             )
             if int(render_result.get("returncode", 1)) != 0:
                 errors.append("ffmpeg render failed")
@@ -576,6 +592,59 @@ def _render_final_video(
     audio_tracks: List[Dict[str, Any]],
     output_path: Path,
     expected_duration: float,
+    base_dir: Optional[Path] = None,
+    loop_audio: bool = False,
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    if base_dir is not None:
+        audio_dir = base_dir / "98_audio"
+        plan_path = audio_dir / _MUSIC_PLAN_FILENAME
+        manifest_path = audio_dir / _MUSIC_MANIFEST_FILENAME
+        if plan_path.exists() and manifest_path.exists():
+            scenes = _group_scenes_from_clips(clips)
+            plan: Optional[Dict[str, Any]] = None
+            manifest: Optional[Dict[str, Any]] = None
+            try:
+                plan = _read_json(plan_path)
+                manifest = _read_json(manifest_path)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to read %s/%s (%s); falling back to legacy single-track audio",
+                    _MUSIC_PLAN_FILENAME, _MUSIC_MANIFEST_FILENAME, exc,
+                )
+            if (
+                plan is not None
+                and manifest is not None
+                and _plan_is_valid(plan, manifest, scenes, warnings=warnings)
+            ):
+                return _render_with_per_scene_audio(
+                    ffmpeg_bin=ffmpeg_bin,
+                    clips=clips,
+                    scenes=scenes,
+                    plan=plan,
+                    manifest=manifest,
+                    audio_dir=audio_dir,
+                    audio_tracks=audio_tracks,
+                    output_path=output_path,
+                    expected_duration=expected_duration,
+                    warnings=warnings,
+                )
+    return _render_legacy_single_track(
+        ffmpeg_bin=ffmpeg_bin,
+        clips=clips,
+        audio_tracks=audio_tracks,
+        output_path=output_path,
+        expected_duration=expected_duration,
+        loop_audio=loop_audio,
+    )
+
+
+def _render_legacy_single_track(
+    ffmpeg_bin: str,
+    clips: List[Dict[str, Any]],
+    audio_tracks: List[Dict[str, Any]],
+    output_path: Path,
+    expected_duration: float,
     loop_audio: bool = False,
 ) -> Dict[str, Any]:
     tmp_path = output_path.parent / f"{output_path.name}.tmp-{os.getpid()}"
@@ -615,6 +684,259 @@ def _build_audio_filter(audio_input_index: int, duration: float, loop_audio: boo
         f"[{audio_input_index}:a:0]{base},atrim=0:{duration:.3f},"
         f"afade=t=out:st={fade_start:.3f}:d={_AUDIO_FADE_S:.3f}[aout]"
     )
+
+
+def _group_scenes_from_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Group timeline clips into per-scene duration buckets, preserving clip order.
+
+    Consecutive clips sharing the same scene_number are merged into one scene
+    whose duration is the sum of their planned durations.
+    """
+    scenes: List[Dict[str, Any]] = []
+    for clip in clips:
+        scene_id = str(clip.get("scene_number"))
+        duration = _clip_duration(clip)
+        if scenes and scenes[-1]["scene_id"] == scene_id:
+            scenes[-1]["duration_seconds"] += duration
+        else:
+            scenes.append({"scene_id": scene_id, "duration_seconds": duration})
+    return scenes
+
+
+def _plan_is_valid(
+    plan: Any,
+    manifest: Any,
+    scenes: List[Dict[str, Any]],
+    warnings: Optional[List[str]] = None,
+) -> bool:
+    """Check that music_plan.json + music_manifest.json explicitly cover every
+    scene with a leitmotif/neutral key that resolves to a manifest entry.
+
+    Any gap (missing scene, missing manifest entry) means the per-scene render
+    path must not run — the caller falls back to the legacy single-track path.
+    Every rejection is logged (and, if `warnings` is given, recorded there too)
+    with the concrete reason — silently falling back left no trace that the
+    per-scene leitmotif render was skipped at all.
+    """
+
+    def _reject(reason: str) -> bool:
+        message = f"Per-scene leitmotif audio plan invalid ({reason}); falling back to legacy single-track audio"
+        logger.warning(message)
+        if warnings is not None:
+            warnings.append(message)
+        return False
+
+    if not scenes:
+        return _reject("no scenes derived from clips")
+    if not isinstance(plan, dict) or not isinstance(manifest, dict):
+        return _reject("music_plan.json or music_manifest.json is not a JSON object")
+    scene_mapping = plan.get("scene_mapping")
+    if not isinstance(scene_mapping, dict) or not scene_mapping:
+        return _reject("scene_mapping missing or empty in music_plan.json")
+    for scene in scenes:
+        scene_id = scene["scene_id"]
+        if scene_id not in scene_mapping:
+            return _reject(f"scene {scene_id!r} missing from scene_mapping")
+        mp3_key = scene_mapping[scene_id]
+        if not isinstance(mp3_key, str):
+            return _reject(f"scene_mapping[{scene_id!r}]={mp3_key!r} is not a string")
+        relpath = manifest.get(mp3_key)
+        if not relpath or not isinstance(relpath, str):
+            return _reject(
+                f"manifest has no usable entry for key {mp3_key!r} (scene {scene_id!r})"
+            )
+    return True
+
+
+def _render_with_per_scene_audio(
+    ffmpeg_bin: str,
+    clips: List[Dict[str, Any]],
+    scenes: List[Dict[str, Any]],
+    plan: Dict[str, Any],
+    manifest: Dict[str, Any],
+    audio_dir: Path,
+    audio_tracks: List[Dict[str, Any]],
+    output_path: Path,
+    expected_duration: float,
+    warnings: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Render the final video with a per-scene leitmotif audio filter_complex chain.
+
+    Each scene's music input is trimmed/looped to the scene duration with a
+    0.5s fade in/out, and adjacent scenes are joined with a duration-clamped
+    acrossfade (hard cut when both scenes are too short for any crossfade).
+    Falls back to the legacy single-track path (with the original audio_tracks)
+    if a referenced mp3 escapes the project directory, is missing on disk, or
+    is too short to probe reliably.
+    """
+    scene_mapping = plan.get("scene_mapping", {})
+
+    def _fallback() -> Dict[str, Any]:
+        return _render_legacy_single_track(
+            ffmpeg_bin=ffmpeg_bin,
+            clips=clips,
+            audio_tracks=audio_tracks,
+            output_path=output_path,
+            expected_duration=expected_duration,
+        )
+
+    def _warn(message: str) -> None:
+        logger.warning(message)
+        if warnings is not None:
+            warnings.append(message)
+
+    # Scenes at/under _MIN_SCENE_AUDIO_DURATION_S leave no room for a trimmed/faded
+    # leitmotif clip; drop them from the audio chain instead of feeding ffmpeg a
+    # near-zero-length atrim.
+    kept_scenes = []
+    for scene in scenes:
+        duration = float(scene.get("duration_seconds") or 0.0)
+        if duration <= _MIN_SCENE_AUDIO_DURATION_S:
+            _warn(
+                f"Scene {scene['scene_id']!r} duration {duration:.3f}s <= "
+                f"{_MIN_SCENE_AUDIO_DURATION_S}s; skipping its leitmotif audio"
+            )
+            continue
+        kept_scenes.append(scene)
+    if not kept_scenes:
+        _warn(
+            "All scenes are at or under the minimum audio duration; "
+            "falling back to legacy single-track audio"
+        )
+        return _fallback()
+    scenes = kept_scenes
+
+    scene_paths: List[Path] = []
+    for scene in scenes:
+        mp3_key = scene_mapping.get(scene["scene_id"], "neutral")
+        relpath = manifest.get(mp3_key)
+        scene_path, path_allowed = _resolve_audio_path(str(relpath), audio_dir)
+        if not path_allowed:
+            _warn(
+                f"Leitmotif track path escapes project directory (scene={scene['scene_id']}, "
+                f"key={mp3_key}, path={scene_path}); falling back to legacy single-track audio"
+            )
+            return _fallback()
+        if not scene_path.is_file():
+            _warn(
+                f"Leitmotif track missing on disk (scene={scene['scene_id']}, key={mp3_key}, "
+                f"path={scene_path}); falling back to legacy single-track audio"
+            )
+            return _fallback()
+        scene_paths.append(scene_path)
+
+    track_durations: Dict[Path, float] = {}
+    for scene_path in scene_paths:
+        if scene_path in track_durations:
+            continue
+        track_duration = _probe_duration(_probe_media(scene_path))
+        if track_duration is None or track_duration < _MIN_TRACK_DURATION_S:
+            probed = track_duration if track_duration is not None else -1.0
+            _warn(
+                f"Leitmotif track too short or unprobeable ({probed:.3f}s): {scene_path}; "
+                "falling back to legacy single-track audio"
+            )
+            return _fallback()
+        track_durations[scene_path] = track_duration
+
+    unique_paths: List[Path] = []
+    input_index_by_path: Dict[Path, int] = {}
+    for scene_path in scene_paths:
+        if scene_path not in input_index_by_path:
+            input_index_by_path[scene_path] = len(unique_paths)
+            unique_paths.append(scene_path)
+
+    scene_count = len(scenes)
+    audio_parts: List[str] = []
+    for index, (scene, scene_path) in enumerate(zip(scenes, scene_paths)):
+        # Input index: video clips occupy [0, len(clips)); unique mp3 inputs follow.
+        ffmpeg_input_index = len(clips) + input_index_by_path[scene_path]
+        duration = max(0.0, float(scene.get("duration_seconds") or 0.0))
+        track_duration = track_durations[scene_path]
+        out_label = "a_final" if scene_count == 1 else f"a_scene_{index}"
+        audio_parts.append(
+            _build_scene_audio_chain(ffmpeg_input_index, duration, track_duration, out_label)
+        )
+
+    if scene_count > 1:
+        prev_label = "a_scene_0"
+        for index in range(1, scene_count):
+            cur_label = f"a_scene_{index}"
+            out_label = "a_final" if index == scene_count - 1 else f"a_0{index}"
+            duration_a = max(0.0, float(scenes[index - 1].get("duration_seconds") or 0.0))
+            duration_b = max(0.0, float(scenes[index].get("duration_seconds") or 0.0))
+            crossfade_d = _crossfade_duration(duration_a, duration_b)
+            if crossfade_d is None:
+                # Neither adjacent scene has room for any crossfade — hard-cut
+                # instead of letting ffmpeg reject an acrossfade longer than
+                # one of its inputs.
+                audio_parts.append(f"[{prev_label}][{cur_label}]concat=n=2:v=0:a=1[{out_label}]")
+            else:
+                audio_parts.append(
+                    f"[{prev_label}][{cur_label}]acrossfade=d={crossfade_d:.3f}[{out_label}]"
+                )
+            prev_label = out_label
+
+    audio_filter = ";".join(audio_parts)
+    video_filter = _build_video_filter(clips)
+    filter_complex = f"{video_filter};{audio_filter}"
+
+    tmp_path = output_path.parent / f"{output_path.name}.tmp-{os.getpid()}"
+    command = [ffmpeg_bin, "-y"]
+    for clip in clips:
+        command.extend(["-i", clip["path"]])
+    for path in unique_paths:
+        command.extend(["-i", str(path)])
+    command.extend(["-filter_complex", filter_complex, "-map", "[vout]"])
+    command.extend(["-map", "[a_final]", "-c:a", "aac"])
+    command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+    if expected_duration > 0:
+        command.extend(["-t", f"{expected_duration:.3f}"])
+    command.append(str(tmp_path))
+
+    result = _run_command(command, timeout=_RENDER_TIMEOUT_S)
+    if int(result.get("returncode", 1)) == 0 and _is_non_empty_file(tmp_path):
+        os.replace(tmp_path, output_path)
+    else:
+        _safe_unlink(tmp_path)
+    return result
+
+
+def _crossfade_duration(duration_a: float, duration_b: float) -> Optional[float]:
+    """Pick a safe acrossfade duration for two adjacent scene audio streams.
+
+    ffmpeg's acrossfade requires both inputs to be at least as long as the
+    crossfade duration; a fixed 1.0s crossfade fails outright once either
+    scene drops below ~2s. Returns None when neither scene has room for a
+    crossfade at all — the caller should hard-cut the pair instead.
+    """
+    d = min(_SCENE_CROSSFADE_S, min(duration_a, duration_b) / 2 - _CROSSFADE_MARGIN_S)
+    if d < _MIN_CROSSFADE_S:
+        return None
+    return d
+
+
+def _build_scene_audio_chain(
+    input_index: int,
+    duration: float,
+    track_duration: float,
+    out_label: str,
+) -> str:
+    """Build the atrim/aloop/afade chain for one scene's leitmotif audio input."""
+    duration = max(0.0, duration)
+    skip_fades = duration < _MIN_FADE_SCENE_DURATION_S
+    if duration <= track_duration:
+        stages = [f"atrim=0:{duration:.3f}"]
+    else:
+        # size=2147483647 (max int32, same constant the legacy loop_audio path uses)
+        # instead of a sample-rate-derived size: Suno mp3s aren't guaranteed to be
+        # 44.1kHz, so assuming a fixed rate can undersize the loop and click at the seam.
+        stages = ["aloop=loop=-1:size=2147483647", f"atrim=0:{duration:.3f}"]
+    if not skip_fades:
+        fade_out_start = max(0.0, duration - _SCENE_FADE_S)
+        stages.append(f"afade=in:0:{_SCENE_FADE_S:.1f}")
+        stages.append(f"afade=out:st={fade_out_start:.3f}:d={_SCENE_FADE_S:.1f}")
+    return f"[{input_index}:a]{','.join(stages)}[{out_label}]"
 
 
 def _build_video_filter(clips: List[Dict[str, Any]]) -> str:

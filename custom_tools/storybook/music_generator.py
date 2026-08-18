@@ -1,4 +1,6 @@
+import hashlib
 import json
+import logging
 import os
 import time
 import uuid
@@ -8,6 +10,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from custom_tools.storybook.audio_subtitle import _safe_project_dir
+
+
+logger = logging.getLogger(__name__)
 
 
 STUDIO_API_BASE_URL = "https://studio-api.prod.suno.com"
@@ -45,7 +50,13 @@ def storybook_music_generator_tool(
     timeout_seconds: int = 600,
     force_regenerate: bool = False,
 ) -> Dict[str, Any]:
-    """Generate or reuse a background music track and register it in audio_manifest.json.
+    """Generate or reuse background music and register it in audio_manifest.json.
+
+    When ``98_audio/music_plan.json`` exists and is valid (see
+    ``music_planner_tool`` / docs/plans/2026-08-18-4a-music-per-scene-leitmotif-design.md),
+    this generates one Suno track per leitmotif plus a neutral track
+    (``98_audio/music_manifest.json`` + ``98_audio/music/*.mp3``). Otherwise it
+    falls back 100% to the legacy single-track behavior.
 
     Args:
         session_id: Execution session identifier used in generated artifacts.
@@ -53,12 +64,397 @@ def storybook_music_generator_tool(
         language: Language code stored in generated metadata.
         enable: If false, skip music generation and write a skipped manifest.
         provider: Music provider name. Currently only "suno" is implemented.
-        prompt: Optional explicit music prompt. If empty, it is derived from screenplay/brief data.
+        prompt: Optional explicit music prompt (legacy single-track path only).
+            If empty, it is derived from screenplay/brief data.
         instrumental: Request instrumental music from Suno.
         wait_for_completion: If true, poll until an audio URL is available and download it.
         poll_interval_seconds: Polling interval for async provider jobs.
         timeout_seconds: Max polling time for async provider jobs.
-        force_regenerate: If false, reuse 98_audio/music.mp3 when it already exists.
+        force_regenerate: If false, reuse existing track(s) when already generated.
+    """
+    if _as_bool(enable) and str(provider or "suno").strip().lower() == "suno":
+        try:
+            base_dir = _safe_project_dir(project_id)
+        except ValueError:
+            base_dir = None
+        plan = _load_music_plan(base_dir) if base_dir is not None else None
+        if plan is not None:
+            return _multi_track_path(
+                base_dir=base_dir,
+                plan=plan,
+                session_id=session_id,
+                project_id=project_id,
+                language=language,
+                enable=enable,
+                provider=provider,
+                prompt=prompt,
+                instrumental=instrumental,
+                wait_for_completion=wait_for_completion,
+                poll_interval_seconds=poll_interval_seconds,
+                timeout_seconds=timeout_seconds,
+                force_regenerate=force_regenerate,
+            )
+
+    return _legacy_single_track_path(
+        session_id=session_id,
+        project_id=project_id,
+        language=language,
+        enable=enable,
+        provider=provider,
+        prompt=prompt,
+        instrumental=instrumental,
+        wait_for_completion=wait_for_completion,
+        poll_interval_seconds=poll_interval_seconds,
+        timeout_seconds=timeout_seconds,
+        force_regenerate=force_regenerate,
+    )
+
+
+def _load_music_plan(base_dir: Path) -> Optional[Dict[str, Any]]:
+    """Load and validate 98_audio/music_plan.json written by music_planner_tool.
+
+    Returns None (which triggers the legacy single-track fallback) unless the
+    file exists and is a dict with both "neutral" and "scene_mapping" keys, per
+    the contract in docs/plans/2026-08-18-4a-music-per-scene-leitmotif-design.md.
+    """
+    plan_path = base_dir / "98_audio" / "music_plan.json"
+    if not plan_path.exists():
+        return None
+    plan = _read_json(plan_path)
+    if not isinstance(plan, dict):
+        return None
+    if not isinstance(plan.get("scene_mapping"), dict):
+        return None
+    if not isinstance(plan.get("neutral"), dict):
+        return None
+    return plan
+
+
+def _tracks_from_plan(plan: Dict[str, Any]) -> List[Tuple[str, str]]:
+    """Extract (track_id, suno_prompt) pairs from a validated music_plan.json.
+
+    Leitmotifs first, neutral last. Entries without a usable suno_prompt are
+    skipped defensively (music_planner_tool is expected to have already
+    validated prompt length/content before writing the plan).
+    """
+    tracks: List[Tuple[str, str]] = []
+    leitmotifs = plan.get("leitmotifs")
+    if isinstance(leitmotifs, dict):
+        for leitmotif_id, spec in leitmotifs.items():
+            if not leitmotif_id or not isinstance(spec, dict):
+                continue
+            suno_prompt = str(spec.get("suno_prompt") or "").strip()
+            if suno_prompt:
+                tracks.append((str(leitmotif_id), suno_prompt))
+    neutral = plan.get("neutral")
+    if isinstance(neutral, dict):
+        suno_prompt = str(neutral.get("suno_prompt") or "").strip()
+        if suno_prompt:
+            tracks.append(("neutral", suno_prompt))
+    return tracks
+
+
+def _multi_track_path(
+    base_dir: Path,
+    plan: Dict[str, Any],
+    session_id: str,
+    project_id: str,
+    language: str,
+    enable: bool,
+    provider: str,
+    prompt: Optional[str],
+    instrumental: bool,
+    wait_for_completion: bool,
+    poll_interval_seconds: int,
+    timeout_seconds: int,
+    force_regenerate: bool,
+) -> Dict[str, Any]:
+    """Generate one Suno track per leitmotif plus a neutral track from music_plan.json.
+
+    A single track's Suno failure is logged and that track is simply omitted
+    from the manifest (montage falls back to "neutral" for its scenes). Only a
+    fully empty manifest (every track failed) falls back to the legacy
+    single-track path.
+    """
+    audio_dir = base_dir / "98_audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    tracks_to_generate = _tracks_from_plan(plan)
+    normalized_instrumental = _as_bool(instrumental)
+    normalized_wait = _as_bool(wait_for_completion)
+    normalized_force = _as_bool(force_regenerate)
+
+    manifest: Dict[str, str] = {}
+    for track_id, suno_prompt in tracks_to_generate:
+        # C1: the manifest key must be the bare id ("hero", "neutral", ...) -- it is looked
+        # up directly as manifest[scene_mapping[scene_id]] by montage_assembler, and
+        # music_planner's scene_mapping values are bare ids without a "leitmotif_" prefix.
+        mp3_relpath = f"music/{track_id}.mp3"
+        mp3_fullpath = audio_dir / mp3_relpath
+        try:
+            _generate_single_track(
+                base_dir=base_dir,
+                track_id=track_id,
+                suno_prompt=suno_prompt,
+                target_path=mp3_fullpath,
+                instrumental=normalized_instrumental,
+                wait_for_completion=normalized_wait,
+                poll_interval_seconds=poll_interval_seconds,
+                timeout_seconds=timeout_seconds,
+                force_regenerate=normalized_force,
+            )
+            manifest[track_id] = mp3_relpath
+        except Exception as exc:
+            logger.warning("Suno failed for %s: %s", track_id, exc)
+
+    if not manifest:
+        logger.warning(
+            "Multi-track music generation produced no tracks; falling back to legacy single-track path"
+        )
+        return _legacy_single_track_path(
+            session_id=session_id,
+            project_id=project_id,
+            language=language,
+            enable=enable,
+            provider=provider,
+            prompt=prompt,
+            instrumental=instrumental,
+            wait_for_completion=wait_for_completion,
+            poll_interval_seconds=poll_interval_seconds,
+            timeout_seconds=timeout_seconds,
+            force_regenerate=force_regenerate,
+        )
+
+    manifest_path = _write_manifest(base_dir, manifest)
+
+    # C2: montage_assembler_tool's allow_missing_audio gate reads 98_audio/audio_manifest.json's
+    # legacy audio_tracks list (usable_audio_tracks), not music_manifest.json. Without this,
+    # a default final_allow_missing_audio=false run hard-errors before montage ever gets to try
+    # the per-scene render path, even though music_plan.json/music_manifest.json are both ready.
+    # Mirror _legacy_single_track_path's _merge_music_status call, using the first successfully
+    # generated track as the canonical entry for legacy consumers.
+    audio_manifest_path = audio_dir / "audio_manifest.json"
+    canonical_relpath = next(iter(manifest.values()))
+    canonical_music_path = audio_dir / canonical_relpath
+    canonical_track = _music_track(canonical_music_path, provider, task_id=None, reused=False)
+    canonical_track["path"] = canonical_relpath  # relative to audio_dir, e.g. "music/hero.mp3"
+    _merge_music_status(
+        audio_manifest_path,
+        {
+            "status": "ok",
+            "provider": provider,
+            "manifest_path": str(manifest_path),
+            "music_path": str(canonical_music_path),
+        },
+        track=canonical_track,
+    )
+
+    return {
+        "status": "ok",
+        "tracks": len(manifest),
+        "manifest_path": str(manifest_path),
+        "manifest": manifest,
+    }
+
+
+def _generate_single_track(
+    base_dir: Path,
+    track_id: str,
+    suno_prompt: str,
+    target_path: Path,
+    instrumental: bool,
+    wait_for_completion: bool,
+    poll_interval_seconds: int,
+    timeout_seconds: int,
+    force_regenerate: bool,
+) -> Path:
+    """Generate (or reuse) a single Suno track at target_path.
+
+    H4 cache priority: reuse is decided solely by the prompt-hash cache (there is no
+    separate target_path.exists() fast path), so a changed suno_prompt always
+    regenerates instead of silently reusing a stale mp3 that happens to already sit
+    at target_path under the same track_id filename.
+
+    M-20 money-safety resume (mirrors _legacy_single_track_path / _resume_saved_clips):
+    before POSTing to Suno, and as soon as clip ids exist, this persists
+    98_audio/music/.submitted/<track_id>.json with the prompt hash and clip ids, so an
+    interrupted run resumes polling the already-paid job on the next run instead of
+    resubmitting (double charge).
+
+    Raises on any failure; the caller catches and omits this track for the current
+    run. The durable submitted-state file, if any, survives so a later run can resume.
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # H4: the prompt-hash cache is the single source of truth for "already generated" --
+    # a bare target_path.exists() check was removed because it would reuse a stale mp3
+    # left over from a since-changed suno_prompt (same track_id, different content).
+    cache_path = _prompt_cache_path(base_dir, suno_prompt)
+    if cache_path.exists() and not force_regenerate:
+        _copy_file(cache_path, target_path)
+        return target_path
+
+    if not wait_for_completion:
+        raise RuntimeError("Multi-track music generation requires wait_for_completion=True")
+
+    _load_env_file()
+    cookie_raw = _env("SUNO_COOKIE")
+    if not cookie_raw:
+        raise RuntimeError("SUNO_COOKIE is not configured")
+
+    prompt_hash = _prompt_hash(suno_prompt)
+    submitted = _read_submitted_state(base_dir, track_id)
+    clip_ids: List[str] = []
+    if submitted and submitted.get("prompt_hash") == prompt_hash:
+        clip_ids = [str(clip_id) for clip_id in (submitted.get("clip_ids") or []) if clip_id not in (None, "")]
+    elif submitted:
+        # The saved clip ids were paid for a different (now-stale) prompt; they cannot
+        # be resumed against the current one.
+        _clear_submitted_state(base_dir, track_id)
+
+    auth = _authenticate(cookie_raw)
+
+    if clip_ids:
+        # M-20 resume: poll the already-submitted (already-paid) clip ids instead of
+        # resubmitting.
+        try:
+            _write_submitted_state(base_dir, track_id, "polling", suno_prompt, prompt_hash, clip_ids)
+            _record_payload, audio_url, _task_id = _wait_for_suno_audio_url(
+                auth=auth,
+                clip_ids=clip_ids,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+            )
+        except _SunoTransientError:
+            # Feed temporarily unreadable; the job is still submitted/paid. Re-raise
+            # without touching the durable state so a later run resumes for free.
+            raise
+        except RuntimeError:
+            # Genuine "failed for all clips": the saved submission is dead, so clear
+            # it and fall through to a fresh submission below.
+            _clear_submitted_state(base_dir, track_id)
+            clip_ids = []
+        else:
+            if not audio_url:
+                raise RuntimeError("Suno resume completed without an audio URL")
+            _write_submitted_state(base_dir, track_id, "downloading", suno_prompt, prompt_hash, clip_ids)
+            _download_audio(audio_url, target_path)
+            _copy_file(target_path, cache_path)
+            _clear_submitted_state(base_dir, track_id)
+            return target_path
+
+    captcha_required = _captcha_required(auth)
+    manual_token = _env("SUNO_HCAPTCHA_TOKEN") or None
+    if captcha_required and not manual_token:
+        raise RuntimeError("Suno requires a captcha for this request; set SUNO_HCAPTCHA_TOKEN to provide one")
+    token = manual_token if captcha_required else None
+
+    _write_submitted_state(base_dir, track_id, "submitting", suno_prompt, prompt_hash, [])
+    request_payload = _build_suno_payload(suno_prompt, instrumental, base_dir, token)
+    submit_response = _post_suno_generate(auth, request_payload)
+    clip_ids = _extract_clip_ids(submit_response)
+    if not clip_ids:
+        raise RuntimeError("Suno response did not include any clip ids")
+
+    # M-20: persist clip_ids BEFORE polling so a kill/timeout mid-poll cannot orphan
+    # the paid Suno job; the next run resumes polling these ids for free.
+    _write_submitted_state(base_dir, track_id, "submitted", suno_prompt, prompt_hash, clip_ids)
+
+    _record_payload, audio_url, _task_id = _wait_for_suno_audio_url(
+        auth=auth,
+        clip_ids=clip_ids,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+    )
+    if not audio_url:
+        raise RuntimeError("Suno task completed without an audio URL")
+
+    _write_submitted_state(base_dir, track_id, "downloading", suno_prompt, prompt_hash, clip_ids)
+    _download_audio(audio_url, target_path)
+    _copy_file(target_path, cache_path)
+    _clear_submitted_state(base_dir, track_id)
+    return target_path
+
+
+def _prompt_hash(suno_prompt: str) -> str:
+    return hashlib.sha256(suno_prompt.encode("utf-8")).hexdigest()
+
+
+def _prompt_cache_path(base_dir: Path, suno_prompt: str) -> Path:
+    """Suno cache key = hash(suno_prompt), so reruns with an unchanged prompt skip regeneration."""
+    return base_dir / "98_audio" / "music" / ".cache" / f"{_prompt_hash(suno_prompt)}.mp3"
+
+
+def _submitted_state_path(base_dir: Path, track_id: str) -> Path:
+    """M-20 durable marker for one leitmotif/neutral track's in-flight Suno submission."""
+    return base_dir / "98_audio" / "music" / ".submitted" / f"{track_id}.json"
+
+
+def _read_submitted_state(base_dir: Path, track_id: str) -> Optional[Dict[str, Any]]:
+    state = _read_json(_submitted_state_path(base_dir, track_id))
+    return state if isinstance(state, dict) else None
+
+
+def _write_submitted_state(
+    base_dir: Path,
+    track_id: str,
+    status: str,
+    suno_prompt: str,
+    prompt_hash: str,
+    clip_ids: List[str],
+) -> None:
+    payload: Dict[str, Any] = {
+        "status": status,
+        "suno_prompt": suno_prompt,
+        "prompt_hash": prompt_hash,
+    }
+    if clip_ids:
+        payload["clip_ids"] = list(clip_ids)
+    _write_json(_submitted_state_path(base_dir, track_id), payload)
+
+
+def _clear_submitted_state(base_dir: Path, track_id: str) -> None:
+    _submitted_state_path(base_dir, track_id).unlink(missing_ok=True)
+
+
+def _copy_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    tmp_path.write_bytes(source.read_bytes())
+    os.replace(tmp_path, destination)
+
+
+def _write_manifest(base_dir: Path, manifest: Dict[str, str]) -> Path:
+    """Write 98_audio/music_manifest.json as a flat {manifest_key: relative_mp3_path} dict.
+
+    Keys are bare ids ("neutral" or the leitmotif id, e.g. "hero") and must match
+    music_plan.json's scene_mapping values exactly -- montage_assembler looks up
+    manifest[scene_mapping[scene_id]] directly, with no prefix translation.
+    """
+    manifest_path = base_dir / "98_audio" / "music_manifest.json"
+    _write_json(manifest_path, manifest)
+    return manifest_path
+
+
+def _legacy_single_track_path(
+    session_id: str,
+    project_id: str,
+    language: str = "ru",
+    enable: bool = True,
+    provider: str = "suno",
+    prompt: Optional[str] = None,
+    instrumental: bool = True,
+    wait_for_completion: bool = True,
+    poll_interval_seconds: int = 10,
+    timeout_seconds: int = 600,
+    force_regenerate: bool = False,
+) -> Dict[str, Any]:
+    """Generate or reuse a single background music track (pre-4a behavior).
+
+    Used directly when 98_audio/music_plan.json is absent/invalid, and as the
+    fallback of _multi_track_path when every leitmotif/neutral Suno
+    generation fails. Body intentionally unchanged from the pre-patch
+    storybook_music_generator_tool for 100% backward compatibility.
     """
     enable = _as_bool(enable)
     instrumental = _as_bool(instrumental)

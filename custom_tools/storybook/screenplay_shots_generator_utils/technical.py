@@ -20,6 +20,73 @@ from .shared_utils import (
 logger = logging.getLogger(__name__)
 
 
+_NEGATIVE_SYNONYMS: Dict[str, List[str]] = {
+    "SPLIT_SCREEN": [
+        "split screen", "split-screen", "splitscreen",
+        "разделённый экран", "разделенный экран",
+        "сплит-скрин", "сплит скрин", "разделение экрана",
+    ],
+    "MULTIPANEL": [
+        "разделение на панели", "multipanel", "multi-panel", "multi panel", "панели",
+    ],
+    "GRID": ["grid", "сетка", "grid layout"],
+    "COLLAGE": ["collage", "коллаж"],
+    "TRIPTYCH": ["triptych", "триптих"],
+    "DIPTYCH": ["diptych", "диптих"],
+    "BLUR": ["blurry", "размытие", "blur", "размытость"],
+    "MOTION_BLUR": ["motion blur", "размытие в движении", "motion-blur"],
+    "WATERMARK": ["watermark", "водяной знак", "вотермарк"],
+    "TEXT": [
+        "text", "текст", "unwanted text", "нежелательный текст",
+        "случайный текст", "random text",
+    ],
+    "CROP": [
+        "cropping", "cropped", "обрезка", "обрезанные объекты", "обрезка объектов",
+        "truncation", "усечение",
+    ],
+}
+
+
+def _dedup_negative_prompt(text: str) -> str:
+    """Схлопывает повторяющиеся запреты (RU/EN синонимы) в строке negative_prompt, сохраняя порядок."""
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    if not text:
+        return ""
+
+    def _norm(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"""[.,;:!?"'()\[\]]""", "", s)
+        s = s.replace("-", "").replace("_", "")
+        s = re.sub(r"\s+", "", s)
+        return s
+
+    lookup: Dict[str, str] = {}
+    for canon, synonyms in _NEGATIVE_SYNONYMS.items():
+        for syn in synonyms:
+            key = _norm(syn)
+            if key:
+                lookup[key] = canon
+
+    seen: set = set()
+    out: List[str] = []
+    for part in re.split(r"[,.]", text):
+        original = part.strip()
+        if not original:
+            continue
+        key = _norm(original)
+        if not key:
+            continue
+        canon_key = lookup.get(key, key)
+        if canon_key in seen:
+            continue
+        seen.add(canon_key)
+        out.append(original)
+    return ", ".join(out)
+
+
 def _character_reference_should_be_primary_for_img2img(
     *,
     shot_frame_spec: Optional[Dict[str, Any]],
@@ -2013,6 +2080,7 @@ LOCATION_TIME: "{location_time}"
             f"{normalized_negative}, {black_extra}" if (normalized_negative or "").strip() else black_extra
         )
     normalized_negative = merge_style_do_not_into_negative(normalized_negative, style_do_not_include)
+    normalized_negative = _dedup_negative_prompt(normalized_negative)
 
     # NOTE: We intentionally do NOT post-fix the human-readable shot-size phrase in english_prompt.
     # Shot sizing must be handled upstream by storyboard camera_plan locks in technical/artistic prompts.
@@ -2315,7 +2383,10 @@ def _sanitize_start_via_llm(
             response_format={"type": "json_object"},
         )
         clean_resp = extract_json_from_markdown(response)
-        return json.loads(clean_resp)
+        result = json.loads(clean_resp)
+        if isinstance(result, dict) and "negative_prompt" in result:
+            result["negative_prompt"] = _dedup_negative_prompt(result["negative_prompt"])
+        return result
     except Exception as e:
         logger.error(f"❌ Ошибка LLM-санитайза START: {e}")
         return None
@@ -2539,10 +2610,12 @@ def _sanitize_end_via_llm(
         # Валидируем negative_prompt против prop_continuity
         if "negative_prompt" in result and "prop_continuity" in result:
             result["negative_prompt"] = _validate_negative_prompt_consistency(
-                result["negative_prompt"], 
+                result["negative_prompt"],
                 result["prop_continuity"]
             )
-        
+        if "negative_prompt" in result:
+            result["negative_prompt"] = _dedup_negative_prompt(result["negative_prompt"])
+
         return result
     except Exception as e:
         logger.error(f"❌ Ошибка LLM-санитайза END: {e}")

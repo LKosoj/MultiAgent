@@ -24,7 +24,7 @@ inputs:
   blockout_scope: all
   blockout_preview_burnin: true
   blockout_use_as_image_reference: true
-  blockout_use_as_video_reference: true
+  blockout_use_as_video_reference: false
   force_update_prompts: false
   skip_prompt_enhancement: true  # Если true, видео-промпт только переводится без "улучшений" LLM
   sample_before_batch: false
@@ -412,6 +412,27 @@ steps:
     enable: '{generate_screenplay}'
   depends_on:
   - video_generator
+- id: music_planner
+  step_type: tool
+  task: Plan per-scene leitmotifs (max 2 or 3 by film duration) and neutral theme
+  timeout: 180
+  # Дешёвый LLM-only шаг, но пишет план для дорогого Suno-шага дальше;
+  # идемпотентен по хэшу screenplay/brief, движковый retry разрешён.
+  metadata:
+    retryable: true
+  tool_name: music_planner_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - plan_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+  depends_on:
+  - storybook_audio_subtitle
+  condition: '{generate_screenplay} and {generate_music}'
 - id: storybook_music_generator
   step_type: tool
   task: Generate or reuse background music and register it in audio manifest
@@ -437,6 +458,7 @@ steps:
     wait_for_completion: true
   depends_on:
   - storybook_audio_subtitle
+  - music_planner
   condition: '{generate_screenplay}'
 - id: montage_assembler
   step_type: tool

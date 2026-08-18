@@ -1005,6 +1005,69 @@ def _get_next_shot_info(storyboard: List[Dict[str, Any]], current_shot_number: i
     except (IndexError, KeyError):
         return None
 
+
+def _build_shot_continuity_window(
+    current_shot: Optional[Dict[str, Any]],
+    previous_shot: Optional[Dict[str, Any]],
+    next_shot: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """3-shot окно для motion continuity: prev.final_action → curr → next.opening_action."""
+
+    def _desc(shot: Dict[str, Any]) -> str:
+        return str(shot.get("shot_description") or shot.get("description") or "")
+
+    def _sentences(text: str) -> List[str]:
+        parts = re.split(r"[.!?]+", text)
+        return [p.strip() for p in parts if p.strip()]
+
+    def _infer_action(text: str, mode: str) -> Optional[str]:
+        parts = _sentences(text)
+        if not parts:
+            return None
+        chosen = (parts[0] if mode == "opening" else parts[-1])[:120].strip()
+        return chosen or None
+
+    def _prev_block(shot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not shot:
+            return None
+        desc = _desc(shot)
+        return {
+            "shot_number": shot.get("shot_number"),
+            "shot_type": shot.get("shot_type"),
+            "camera_plan": shot.get("camera_plan", ""),
+            "shot_description_tail": desc[-240:],
+            "final_action": _infer_action(desc, "final"),
+        }
+
+    def _next_block(shot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not shot:
+            return None
+        desc = _desc(shot)
+        return {
+            "shot_number": shot.get("shot_number"),
+            "shot_type": shot.get("shot_type"),
+            "camera_plan": shot.get("camera_plan", ""),
+            "shot_description_head": desc[:240],
+            "opening_action": _infer_action(desc, "opening"),
+        }
+
+    curr_block: Optional[Dict[str, Any]] = None
+    if current_shot:
+        curr_block = {
+            "shot_number": current_shot.get("shot_number"),
+            "shot_type": current_shot.get("shot_type"),
+            "camera_plan": current_shot.get("camera_plan", ""),
+            "shot_description": _desc(current_shot),
+        }
+
+    return {
+        "window_size": 3,
+        "prev": _prev_block(previous_shot),
+        "curr": curr_block,
+        "next": _next_block(next_shot),
+    }
+
+
 def _extract_scene_mood(scene: Dict[str, Any]) -> str:
     """Извлекает настроение из action, sound, dialogue"""
     mood_indicators = []
@@ -1519,9 +1582,15 @@ def _build_extended_context(
     }
     
     # Контекст соседних кадров
+    _sb = storyboard or []
+    _idx = int(shot_number) - 1
+    _curr_raw = _sb[_idx] if 0 <= _idx < len(_sb) else None
+    _prev_raw = _sb[_idx - 1] if _idx - 1 >= 0 and _idx - 1 < len(_sb) else None
+    _next_raw = _sb[_idx + 1] if 0 <= _idx + 1 < len(_sb) else None
     neighbor_context = {
         "previous_shot": _get_previous_shot_info(storyboard, shot_number),
         "next_shot": _get_next_shot_info(storyboard, shot_number),
+        "continuity_window": _build_shot_continuity_window(_curr_raw, _prev_raw, _next_raw),
         "total_shots_in_scene": len(storyboard),
         "current_shot_position": f"{shot_number}/{len(storyboard)}"
     }

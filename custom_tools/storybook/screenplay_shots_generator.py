@@ -67,10 +67,21 @@ _PROMPT_CREATE_PREFIXES = {
     "fr": "Cree",
     "de": "Erstelle",
 }
+_PROMPT_LANGUAGE_NAMES = {
+    "ru": "Russian",
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "de": "German",
+}
 
 
 def _get_prompt_language_label(language: str) -> str:
     return _PROMPT_LANGUAGE_LABELS.get(language, f"языке с кодом {language}")
+
+
+def _get_prompt_language_name(language: str) -> str:
+    return _PROMPT_LANGUAGE_NAMES.get(language, language)
 
 
 def _get_prompt_edit_prefix(language: str) -> str:
@@ -1662,6 +1673,7 @@ def _generate_shot_artistic(
     """
     
     prompt_language_label = _get_prompt_language_label(language)
+    source_language_label = _get_prompt_language_name(language)
     edit_prefix = _get_prompt_edit_prefix(language)
     create_prefix = _get_prompt_create_prefix(language)
 
@@ -1679,10 +1691,20 @@ def _generate_shot_artistic(
 
 Ты — креативный директор. Создай команды редактирования для START кадра (T=0) на основе технических параметров.
 
-**LANGUAGE CONTRACT:**
-- `english_prompt`, `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary`, `spatial_composition` — строго на {prompt_language_label}.
-- `video_prompt` — ТОЛЬКО на английском языке.
+**LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):**
+- `english_prompt`: ALWAYS in English regardless of source language.
+- `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary`,
+  `spatial_composition`: in {prompt_language_label} (source language) — these feed downstream QA.
+- `video_prompt`: English-only (unchanged).
 - Continuity-редактирование: префикс `{edit_prefix}`. Создание с нуля: префикс `{create_prefix}`.
+
+**TEXT-IN-IMAGE RULE (critical):**
+Any visible text/inscription/signage/label/writing that appears IN the rendered image
+MUST be in the source language `{source_language_label}` (NOT translated to English).
+Wrap such text with the marker: [in-image text: "..."].
+Example (source=Russian): wooden sign nailed to door reads [in-image text: "Осторожно, злая собака"]
+Example (source=English): wooden sign nailed to door reads [in-image text: "Beware of dog"]
+NEVER auto-translate signage/labels to English — source language wins for on-image text.
 
 **[P0 CRITICAL] SHOT_FRAME_SPEC = SOURCE OF TRUTH:**
 - `shot_frame_spec` — авторитетная спецификация шота. Поля `primary_subject`, `visible_characters`, `must_show`, `must_not_show`, `visible_readable_texts`, `hidden_readable_texts`, `world_physics` обязательны.
@@ -1889,11 +1911,21 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 
     user_prompt = f"""Создай художественные промпты на основе технических параметров с учетом полного контекста.
 {black_screen_mode_block}
-LANGUAGE CONTRACT:
-- `english_prompt`, `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary` и `spatial_composition` пиши строго на {prompt_language_label}.
-- `video_prompt` оставляй строго на английском языке.
+LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):
+- `english_prompt`: ALWAYS in English regardless of source language.
+- `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary`,
+  `spatial_composition`: in {prompt_language_label} (source language) — these feed downstream QA.
+- `video_prompt`: English-only (unchanged).
 - Для continuity-редактирования используй `{edit_prefix}`.
 - Для создания кадра с нуля используй `{create_prefix}`.
+
+TEXT-IN-IMAGE RULE (critical):
+Any visible text/inscription/signage/label/writing that appears IN the rendered image
+MUST be in the source language `{source_language_label}` (NOT translated to English).
+Wrap such text with the marker: [in-image text: "..."].
+Example (source=Russian): wooden sign nailed to door reads [in-image text: "Осторожно, злая собака"]
+Example (source=English): wooden sign nailed to door reads [in-image text: "Beware of dog"]
+NEVER auto-translate signage/labels to English — source language wins for on-image text.
 
 {_build_state_to_image_user_core(
     phase_name="START",
@@ -2154,6 +2186,7 @@ def _generate_shot_prompt(
         source_params: Dict[str, Any],
         *,
         final_fields: bool = False,
+        extended_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         merged = dict(llm_result or {})
 
@@ -2181,10 +2214,21 @@ def _generate_shot_prompt(
             merged["characters"] = source_params.get("characters", [])
 
         if _is_empty(merged.get("main_subject")) or _looks_like_placeholder(merged.get("main_subject")):
-            merged["main_subject"] = (
+            candidate = (
                 source_params.get("main_subject")
                 or shot_frame_spec.get("primary_subject", "")
             )
+            if _is_empty(candidate) and isinstance(extended_context, dict):
+                sfs_ctx = extended_context.get("shot_frame_spec") or {}
+                if isinstance(sfs_ctx, dict):
+                    candidate = sfs_ctx.get("primary_subject") or ""
+            if _is_empty(candidate):
+                logger.warning(
+                    "main_subject fallback exhausted (LLM/technical_params/shot_frame_spec all empty); using empty string"
+                )
+                merged["main_subject"] = ""
+            else:
+                merged["main_subject"] = candidate
 
         if final_fields:
             authoritative_final_fields = (
@@ -2257,7 +2301,12 @@ def _generate_shot_prompt(
         if not artistic_result:
             logger.error("❌ Не удалось выполнить художественную генерацию START промптов")
             return None
-        artistic_result = _merge_structured_fields(artistic_result, technical_params, final_fields=False)
+        artistic_result = _merge_structured_fields(
+            artistic_result,
+            technical_params,
+            final_fields=False,
+            extended_context=start_context,
+        )
             
         # ПРИНУДИТЕЛЬНО добавляем continuity reference, если есть
         continuity_ref_path = start_context.get('continuity_reference_path')
@@ -2467,7 +2516,12 @@ def _generate_shot_prompt(
         if not end_artistic_result:
             logger.error("❌ Не удалось выполнить художественную генерацию END промптов")
             return None
-        final_end = _merge_structured_fields(end_artistic_result, end_technical_params, final_fields=True)
+        final_end = _merge_structured_fields(
+            end_artistic_result,
+            end_technical_params,
+            final_fields=True,
+            extended_context=end_context,
+        )
 
         # ------------------------------------------------------------
         # CONTINUITY FALLBACK:
@@ -2564,6 +2618,11 @@ SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовы
 - Quality keywords (выбери ОДИН): natural / energetic / slow and deliberate / graceful / confident / fluid movement
 - Направление: "спускается"→"descends" (НИКОГДА "ascends"). "Касается"→"makes contact" (НЕ "approaching")
 - Формат: "subject with [quality] movement [action], then [action2]"
+- MUST — geometric clarity: direction OR destination OR body part MUST be named.
+  Weak: "makes contact", "reaches out", "approaches"
+  Strong: "hand descends toward ceramic bowl", "head turns 30° right toward window",
+          "foot steps forward onto stone platform"
+- If shot_description names an object/target — subject action MUST reference that object by noun.
 
 СЕГМЕНТ 3 — ENVIRONMENT:
 - ОБЯЗАТЕЛЬНА микродинамика: dust swirls / torch flames flicker / mist drifts / reflections shimmer
@@ -2575,16 +2634,39 @@ SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовы
 ПРАВИЛА:
 - video_prompt = ОДНА строка, English-only, NO Cyrillic. Никакого markdown и prose.
 - НЕ выдумывай объекты/одежду/текст, которых нет в shot_description.
-- Close-up: фон = blur-hint. Split-screen: обязателен токен "split-screen".
+- Close-up (shot_size includes "close-up" OR "extreme close-up"):
+  MUST — foreground blur only. Include exactly one blur cue in ENVIRONMENT ("shallow depth of field", "soft bokeh", "blurred background").
+  NEVER — room markers, venue words, location context, architectural details.
+  NEVER — words: "room", "hall", "chamber", "office", "kitchen", "corridor", "arena", "stage", "temple", "tomb", "cave", "street", "square", "library", "workshop", "cell".
+- Split-screen: MUST include token "split-screen" verbatim.
 - transition_spec.physics_delta → физическая дельта. transition_spec.affect_delta → дельта лица/взгляда.
 - Субъект = из START/END main_subject. Не подменяй.
+- `world_physics` / `t0_mode` / `pose_signature` are top-level in INPUT — read them directly, do not dig into shot_frame_spec.
+- `world_physics.forbidden_implications` MUST NOT appear in video_prompt.
+- `t0_mode` == "frozen" → SUBJECT segment MUST NOT contain motion verbs (walking/running/descending); use frozen posture wording.
+- `t0_mode` == "early_motion" → SUBJECT MUST show first visible phase, no completed action.
+- `t0_mode` == "mid_action" → SUBJECT MUST show mid-phase, no start-position wording.
 
-SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) все 4 сегмента присутствуют? 3) quality keyword есть?
+EVENT CHOREOGRAPHY (обязательно если есть event/action в transition_spec):
+Если transition_spec.event_type ∈ {impact, projectile, transformation, emergence, reaction}:
+  SUBJECT segment MUST follow structure: [cause] → [effect] → [follow-through]
+  Cause      = initiating action (thrown, released, contacted, opened, entered)
+  Effect     = immediate physical consequence (deforms, shatters, ripples, illuminates, recoils)
+  Follow-through = short residual motion (settles, dissipates, echoes, drifts, stills)
+  Example (impact/ball→window): "ball strikes glass then shards splay outward, dust settling in slow arcs"
+  Example (emergence/door→figure): "figure steps through doorway then hem catches on threshold, coat trailing"
+Если transition_spec пустой — этот блок игнорируется.
+
+CONTINUITY WINDOW (top-level `continuity_window` in INPUT — {prev, curr, next}):
+- `prev.final_action` = last action of previous shot. Current SUBJECT MUST NOT contradict its direction (no teleports, no orientation flips without cause).
+- `next.opening_action` = first action of next shot. If your effect/follow-through can seed it (smoke drifts → next opens on lingering smoke), let it — do not resolve everything back to rest.
+- `continuity_window` is optional context, NOT a mandate — use it to keep motion physically continuous, do not narrate it.
+
+SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) все 4 сегмента присутствуют? 3) quality keyword есть? 4) motion не противоречит prev.final_action?
 """
     payload = {
         "camera_plan": extended_context.get("camera_plan", ""),
         "shot_description": extended_context.get("shot_description", ""),
-        "shot_frame_spec": shot_frame_spec,
         "transition_spec": transition_spec,
         "start_english_prompt": start_llm_result.get("english_prompt", ""),
         "end_english_prompt": end_llm_result.get("english_prompt", ""),
@@ -2592,6 +2674,19 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
         "end_main_subject": end_llm_result.get("main_subject", shot_frame_spec.get("primary_subject", "")),
         "edge_case_rules": shot_type_info.get("edge_case_rules", []),
     }
+    payload["world_physics"] = (
+        shot_frame_spec.get("world_physics")
+        or shot_frame_spec.get("end_state_spec", {}).get("world_physics")
+        or shot_frame_spec.get("start_state_spec", {}).get("world_physics")
+        or {}
+    )
+    payload["t0_mode"] = (
+        shot_frame_spec.get("t0_mode")
+        or shot_frame_spec.get("start_state_spec", {}).get("t0_mode")
+        or ""
+    )
+    payload["pose_signature"] = shot_frame_spec.get("pose_signature") or ""
+    payload["continuity_window"] = extended_context.get("continuity_window") or {}
     try:
         response = call_openai_api(
             prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
@@ -2608,14 +2703,20 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
         video_prompt = " ".join(video_prompt.split())
 
         structure_error = _validate_video_prompt_structure(video_prompt)
-        if structure_error:
+        if structure_error is None:
+            return video_prompt
+
+        last_error = structure_error
+        last_invalid = video_prompt
+        for attempt in range(1, 3):
             logger.warning(
-                "video_prompt structure invalid (%s); retrying with corrective hint",
-                structure_error,
+                "video_prompt structure invalid (%s); retry %d/2 with corrective hint",
+                last_error,
+                attempt,
             )
             corrective_payload = dict(payload)
-            corrective_payload["previous_invalid_video_prompt"] = video_prompt
-            corrective_payload["structure_violation"] = structure_error
+            corrective_payload["previous_invalid_video_prompt"] = last_invalid
+            corrective_payload["structure_violation"] = last_error
             corrective_payload["instruction"] = (
                 "Previous output failed structure check. Return EXACTLY 4 non-empty "
                 "segments separated by ';' in the order CAMERA; SUBJECT; ENVIRONMENT; TEMPO."
@@ -2635,12 +2736,16 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
                 retry_error = _validate_video_prompt_structure(retry_vp)
                 if retry_error is None:
                     return retry_vp
-                logger.warning(
-                    "video_prompt structure still invalid after retry (%s); keeping original",
-                    retry_error,
-                )
+                last_error = retry_error
+                last_invalid = retry_vp
+            else:
+                last_error = "empty response"
+                last_invalid = ""
 
-        return video_prompt
+        logger.error(
+            "video_prompt failed validation after 2 retries; returning None so caller can skip"
+        )
+        return None
     except Exception as e:
         logger.error("❌ Ошибка генерации финального video_prompt: %s", e)
         return None
@@ -2660,6 +2765,7 @@ def _generate_end_shot_artistic(
     """
     
     prompt_language_label = _get_prompt_language_label(language)
+    source_language_label = _get_prompt_language_name(language)
     edit_prefix = _get_prompt_edit_prefix(language)
 
     system_prompt = (
@@ -2676,10 +2782,20 @@ def _generate_end_shot_artistic(
 
 Ты -- креативный директор. Создай финальный english_prompt для END кадра (T=final) и определи тип связи со следующим кадром.
 
-**LANGUAGE CONTRACT:**
-- `english_prompt`, `negative_prompt`, `reference_roles_instruction`, `main_subject`, `final_spatial_composition` -- строго на {prompt_language_label}.
-- `video_prompt` -- ТОЛЬКО на английском языке.
+**LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):**
+- `english_prompt`: ALWAYS in English regardless of source language.
+- `negative_prompt`, `reference_roles_instruction`, `main_subject`, `final_spatial_composition`:
+  in {prompt_language_label} (source language) -- these feed downstream QA.
+- `video_prompt`: English-only (unchanged).
 - Для END-редактирования используй префикс `{edit_prefix}`.
+
+**TEXT-IN-IMAGE RULE (critical):**
+Any visible text/inscription/signage/label/writing that appears IN the rendered image
+MUST be in the source language `{source_language_label}` (NOT translated to English).
+Wrap such text with the marker: [in-image text: "..."].
+Example (source=Russian): wooden sign nailed to door reads [in-image text: "Осторожно, злая собака"]
+Example (source=English): wooden sign nailed to door reads [in-image text: "Beware of dog"]
+NEVER auto-translate signage/labels to English -- source language wins for on-image text.
 
 **ГЛОССАРИЙ:** shot_size = крупность плана; ratio = коэффициент масштабирования; english_prompt = ОДНА команда редактирования; linking = решение о преемственности.
 
@@ -2919,10 +3035,20 @@ removing / approaching / moving toward / drifting / then / after that / continue
 
     user_prompt = f"""Создай финальный промпт для END кадра, который является МОДИФИКАЦИЕЙ START кадра.
 {black_screen_end_block}
-LANGUAGE CONTRACT:
-- `english_prompt`, `negative_prompt`, `reference_roles_instruction`, `main_subject` и `final_spatial_composition` пиши строго на {prompt_language_label}.
-- `video_prompt` оставляй строго на английском языке.
+LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):
+- `english_prompt`: ALWAYS in English regardless of source language.
+- `negative_prompt`, `reference_roles_instruction`, `main_subject`, `final_spatial_composition`:
+  in {prompt_language_label} (source language) -- these feed downstream QA.
+- `video_prompt`: English-only (unchanged).
 - Для END-редактирования используй `{edit_prefix}`.
+
+TEXT-IN-IMAGE RULE (critical):
+Any visible text/inscription/signage/label/writing that appears IN the rendered image
+MUST be in the source language `{source_language_label}` (NOT translated to English).
+Wrap such text with the marker: [in-image text: "..."].
+Example (source=Russian): wooden sign nailed to door reads [in-image text: "Осторожно, злая собака"]
+Example (source=English): wooden sign nailed to door reads [in-image text: "Beware of dog"]
+NEVER auto-translate signage/labels to English -- source language wins for on-image text.
 
 {_build_state_to_image_user_core(
     phase_name="END",
