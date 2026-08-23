@@ -112,6 +112,7 @@ from .research_query import (
 from .schema_research_agent import (
     SchemaResearchDecisionAdapter,
     SchemaResearchDecisionModel,
+    SchemaResearchStopReviewAdapter,
     SchemaResearchValidationFeedback,
 )
 from .semantic_coverage import CoverageInputErrorCode
@@ -142,6 +143,7 @@ from .tool_registry import AdaptiveResearchToolRegistry
 logger = logging.getLogger(__name__)
 
 _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS = 5
+_MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +216,7 @@ class _ResearchLoopCoordinator:
         self._pending_rejected_preflight_assessments: tuple[
             dict[str, object], ...
         ] = ()
+        self._pending_stop_review_hint: str | None = None
 
     async def run(self) -> ResearchLoopOutcome:
         state, failed = self._load_or_save_initial()
@@ -365,7 +368,17 @@ class _ResearchLoopCoordinator:
                     freshness_context=terminal_freshness_context,
                 )
             if _consecutive_non_novel(self._checkpoint_store, state) >= 3:
-                return self._stop(state, ResearchStopReason.STAGNATED)
+                if self._pending_stop_review_hint is None:
+                    context = self._research_context(state, ())
+                    hint, _ = await self._review_stop(
+                        state,
+                        ResearchStopReason.STAGNATED,
+                        context,
+                        self._next_model_attempt(state),
+                    )
+                    if hint is None:
+                        return self._stop(state, ResearchStopReason.STAGNATED)
+                    self._pending_stop_review_hint = hint
 
             if snapshot.planned is None:
                 decision, reason, model_stop_freshness_context = await self._model_decision(
@@ -528,6 +541,7 @@ class _ResearchLoopCoordinator:
         terminal_freshness_context: FreshnessContext | None = None
         rejected_without_progress = 0
         rejection_signatures: set[tuple[str, str]] = set()
+        rejection_counts: dict[tuple[str, str], int] = {}
         validation_feedbacks = (
             (validation_feedback,) if validation_feedback is not None else ()
         )
@@ -541,6 +555,8 @@ class _ResearchLoopCoordinator:
             tuple[CoverageInputErrorCode, tuple[str, ...]] | None
         ) = None
         self._model_stagnation_signatures = ()
+        stop_review_hint = self._pending_stop_review_hint
+        self._pending_stop_review_hint = None
 
         def reject_model_decision(
             feedback: SchemaResearchValidationFeedback,
@@ -564,13 +580,24 @@ class _ResearchLoopCoordinator:
             if feedback not in validation_feedbacks:
                 validation_feedbacks += (feedback,)
             rejected_without_progress += 1
-            rejection_signatures.add((rejection_path, rejection_code or feedback))
-            if rejected_without_progress < _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS:
+            signature = (rejection_path, rejection_code or feedback)
+            rejection_signatures.add(signature)
+            rejection_counts[signature] = rejection_counts.get(signature, 0) + 1
+            repeated_invalid_stop = (
+                rejection_path == "invalid_stop"
+                and rejection_counts[signature]
+                >= _MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS
+            )
+            if (
+                rejected_without_progress < _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS
+                and not repeated_invalid_stop
+            ):
                 return False
             self._model_stagnation_signatures = tuple(sorted(rejection_signatures))
             return True
 
-        for attempt in range(limits.model_calls):
+        attempt = self._next_model_attempt(state)
+        while attempt < limits.model_calls:
             captured: ResearchDecisionV1 | None = None
             feedback_identity: object = (
                 None
@@ -610,6 +637,27 @@ class _ResearchLoopCoordinator:
                 return None, ResearchStopReason.PROTOCOL_FAILURE, None
             if not isinstance(context, str):
                 return None, ResearchStopReason.PROTOCOL_FAILURE, None
+            if stop_review_hint is not None:
+                context += (
+                    "\n\nIndependent stop review allows one normal research turn. "
+                    f"Its non-authoritative hint is: {stop_review_hint}"
+                )
+            if (
+                limits.model_calls >= _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS + 2
+                and not self._stop_review_used_for_revision(state)
+                and not self._model_budget_supports(3)
+            ):
+                stop_review_hint, attempt = await self._review_stop(
+                    state,
+                    ResearchStopReason.BUDGET_EXHAUSTED,
+                    context,
+                    attempt,
+                )
+                if stop_review_hint is None:
+                    return None, ResearchStopReason.BUDGET_EXHAUSTED, None
+                continue
+            if not self._model_budget_supports(1):
+                return None, ResearchStopReason.BUDGET_EXHAUSTED, None
             request_identity = {
                 "research_context": context,
                 "state": state.model_dump(mode="json", by_alias=True),
@@ -625,6 +673,8 @@ class _ResearchLoopCoordinator:
                     rejected_preflight_assessments
                 )
             request_digest = canonical_digest(request_identity)
+            call_attempt = attempt
+            attempt += 1
 
             async def _call(_: object) -> ModelTokenUsage:
                 nonlocal captured
@@ -653,7 +703,7 @@ class _ResearchLoopCoordinator:
                 await execute_model_call_with_budget_async(
                     state.run_id,
                     state.run_incarnation,
-                    _model_call_id(state, attempt),
+                    _model_call_id(state, call_attempt),
                     request_digest,
                     self._model_identity,
                     limits.input_tokens_per_call,
@@ -665,6 +715,7 @@ class _ResearchLoopCoordinator:
                     owner_token_factory=self._model_owner_token_factory,
                     wait=self._model_wait,
                 )
+                stop_review_hint = None
             except _ModelWaitCancelled:
                 return None, ResearchStopReason.CANCELLED, None
             except _ModelWaitDeadline:
@@ -677,6 +728,14 @@ class _ResearchLoopCoordinator:
                 return None, ResearchStopReason.BUDGET_EXHAUSTED, None
             except ContractDecodeError:
                 if reject_model_decision("INVALID_DECISION", "contract_decode"):
+                    stop_review_hint, attempt = await self._review_stop(
+                        state,
+                        ResearchStopReason.STAGNATED,
+                        context,
+                        attempt,
+                    )
+                    if stop_review_hint is not None:
+                        continue
                     return None, ResearchStopReason.STAGNATED, None
                 continue
             except Exception as error:
@@ -696,6 +755,14 @@ class _ResearchLoopCoordinator:
                         if reject_model_decision(
                             "STOP_WITH_PROPOSALS", "stop_with_proposals"
                         ):
+                            stop_review_hint, attempt = await self._review_stop(
+                                state,
+                                ResearchStopReason.STAGNATED,
+                                context,
+                                attempt,
+                            )
+                            if stop_review_hint is not None:
+                                continue
                             return None, ResearchStopReason.STAGNATED, None
                         continue
                     stop_freshness_context = self._freshness_context
@@ -715,8 +782,29 @@ class _ResearchLoopCoordinator:
                             )
                         )
                         if reject_model_decision("INVALID_STOP", "invalid_stop"):
+                            stop_review_hint, attempt = await self._review_stop(
+                                state,
+                                ResearchStopReason.STAGNATED,
+                                context,
+                                attempt,
+                            )
+                            if stop_review_hint is not None:
+                                continue
                             return None, ResearchStopReason.STAGNATED, None
                         continue
+                    requested_stop = _model_stop_reason(captured)
+                    if requested_stop in {
+                        ResearchStopReason.AMBIGUOUS,
+                        ResearchStopReason.UNSUPPORTED,
+                    }:
+                        stop_review_hint, attempt = await self._review_stop(
+                            state,
+                            requested_stop,
+                            context,
+                            attempt,
+                        )
+                        if stop_review_hint is not None:
+                            continue
                     if _model_stop_reason(captured) is ResearchStopReason.COMPLETE:
                         terminal_freshness_context = stop_freshness_context
                 try:
@@ -737,6 +825,14 @@ class _ResearchLoopCoordinator:
                         "research_query_admission",
                         rejection_code,
                     ):
+                        stop_review_hint, attempt = await self._review_stop(
+                            state,
+                            ResearchStopReason.STAGNATED,
+                            context,
+                            attempt,
+                        )
+                        if stop_review_hint is not None:
+                            continue
                         return None, ResearchStopReason.STAGNATED, None
                     continue
                 if not isinstance(captured.next, StopRequest):
@@ -789,6 +885,14 @@ class _ResearchLoopCoordinator:
                                 else "unresolvable_preflight"
                             ),
                         ):
+                            stop_review_hint, attempt = await self._review_stop(
+                                state,
+                                ResearchStopReason.STAGNATED,
+                                context,
+                                attempt,
+                            )
+                            if stop_review_hint is not None:
+                                continue
                             return None, ResearchStopReason.STAGNATED, None
                         continue
                     if preflight_reason is not None:
@@ -799,6 +903,117 @@ class _ResearchLoopCoordinator:
             return None, ResearchStopReason.BUDGET_EXHAUSTED, None
         self._model_stagnation_signatures = ()
         return decision, None, terminal_freshness_context
+
+    def _next_model_attempt(self, state: ResearchState) -> int:
+        prefix = f"research-model-{state.revision}-"
+        review_prefix = f"research-stop-review-{state.revision}-"
+        return sum(
+            record.reservation.call_id.startswith((prefix, review_prefix))
+            for record in self._budget_ledger.load_model_records(
+                state.run_id, state.run_incarnation
+            )
+        )
+
+    def _model_budget_supports(self, calls: int) -> bool:
+        limits = self._policy.model_budget
+        if limits is None:
+            return False
+        budget = completed_model_budget_chain(
+            self._budget_ledger.load_model_records(
+                self._initial_state.run_id, self._initial_state.run_incarnation
+            ),
+            config=self._policy,
+        )
+        return bool(
+            budget.remaining_model_calls >= calls
+            and budget.remaining_input_tokens >= calls * limits.input_tokens_per_call
+            and budget.remaining_output_tokens >= calls * limits.output_tokens_per_call
+            and budget.remaining_total_tokens
+            >= calls * (limits.input_tokens_per_call + limits.output_tokens_per_call)
+        )
+
+    async def _review_stop(
+        self,
+        state: ResearchState,
+        reason: ResearchStopReason,
+        context: str,
+        attempt: int,
+    ) -> tuple[str | None, int]:
+        if self._stop_review_used_for_revision(
+            state
+        ) or not self._model_budget_supports(2):
+            return None, attempt
+        captured = None
+        limits = self._policy.model_budget
+        assert limits is not None
+        reason_text = reason.value
+        if reason is ResearchStopReason.STAGNATED and self._model_stagnation_signatures:
+            reason_text += ":" + json.dumps(
+                self._model_stagnation_signatures,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        request_digest = canonical_digest(
+            {
+                "research_context": context,
+                "review_kind": "research_stop_review",
+                "stop_reason": reason_text,
+                "task": self._task,
+            }
+        )
+
+        async def _call(_: object) -> ModelTokenUsage:
+            nonlocal captured
+
+            async def invoke(_context: object):
+                return await SchemaResearchStopReviewAdapter().review_with_usage(
+                    self._model,
+                    task=self._task,
+                    research_context=context,
+                    stop_reason=reason_text,
+                )
+
+            captured, usage = await execute_step_attempt(
+                "schema research stop review",
+                invoke,
+                None,
+                attempt_timeout=None,
+                deadline=self._deadline,
+            )
+            return usage
+
+        try:
+            await execute_model_call_with_budget_async(
+                state.run_id,
+                state.run_incarnation,
+                _research_stop_review_call_id(state, attempt),
+                request_digest,
+                self._model_identity,
+                limits.input_tokens_per_call,
+                limits.output_tokens_per_call,
+                _call,
+                config=self._policy,
+                ledger=self._budget_ledger,
+                claim_now_ns=self._model_claim_now_ns,
+                owner_token_factory=self._model_owner_token_factory,
+                wait=self._model_wait,
+            )
+        except asyncio.CancelledError:
+            return None, attempt + 1
+        except Exception:
+            return None, attempt + 1
+        if captured is None or captured.decision == "stop_confirmed":
+            return None, attempt + 1
+        return captured.hint, attempt + 1
+
+    def _stop_review_used_for_revision(self, state: ResearchState) -> bool:
+        prefix = f"research-stop-review-{state.revision}-"
+        return any(
+            record.reservation.call_id.startswith(prefix)
+            for record in self._budget_ledger.load_model_records(
+                state.run_id, state.run_incarnation
+            )
+        )
 
     def _failed_probe_feedback_from_replay(
         self, state: ResearchState
@@ -2051,7 +2266,6 @@ def _is_semantically_novel_turn(
     next_state = committed.state
     if any(
         (
-            novelty.added_hypothesis_ids,
             novelty.updated_hypothesis_ids,
             novelty.added_binding_ids,
             novelty.updated_binding_ids,
@@ -2060,45 +2274,37 @@ def _is_semantically_novel_turn(
         )
     ):
         return True
+    if novelty.added_hypothesis_ids:
+        previous_scopes = {
+            canonical_digest(
+                {
+                    "candidate_targets": hypothesis.candidate_targets,
+                    "source_ids": hypothesis.source_ids,
+                }
+            )
+            for hypothesis in state.hypotheses
+            if hypothesis.candidate_targets
+        }
+        added_ids = set(novelty.added_hypothesis_ids)
+        if any(
+            not hypothesis.candidate_targets
+            or canonical_digest(
+                {
+                    "candidate_targets": hypothesis.candidate_targets,
+                    "source_ids": hypothesis.source_ids,
+                }
+            )
+            not in previous_scopes
+            for hypothesis in next_state.hypotheses
+            if hypothesis.hypothesis_id in added_ids
+        ):
+            return True
     if (
         novelty.unresolved_items != state.unresolved_items
         or novelty.stop_reason != state.stop_reason
     ):
         return True
-    previous_ids = {record.evidence_id for record in state.evidence}
-    previous = {_semantic_evidence_fingerprint(item) for item in state.evidence}
-    added = {
-        _semantic_evidence_fingerprint(item)
-        for item in next_state.evidence
-        if item.evidence_id not in previous_ids
-    }
-    return bool(added - previous)
-
-
-def _semantic_evidence_fingerprint(evidence: EvidenceRecord) -> str:
-    observation = json.loads(evidence.observation)
-    if isinstance(observation, dict):
-        observation.pop("invocation_id", None)
-        provenance = observation.get("provenance")
-        if isinstance(provenance, dict):
-            for field_name in (
-                "action_digest",
-                "completed_at",
-                "invocation_id",
-                "started_at",
-            ):
-                provenance.pop(field_name, None)
-    return canonical_digest(
-        {
-            "schema_namespace_version": evidence.schema_namespace_version,
-            "source_kind": evidence.source_kind.value,
-            "target": evidence.target.model_dump(mode="json", by_alias=True),
-            "observation": observation,
-            "validity_scope": evidence.validity_scope.value,
-            "data_snapshot_token": evidence.data_snapshot_token,
-            "strength": evidence.strength,
-        }
-    )
+    return False
 
 
 def _completeness_reason(
@@ -2261,7 +2467,13 @@ def _model_call_id(state: ResearchState, attempt: int) -> str:
     return f"research-model-{state.revision}-{attempt}"
 
 
-_MODEL_CALL_ID = re.compile(r"^research-model-(?P<revision>\d+)-(?P<attempt>\d+)$")
+def _research_stop_review_call_id(state: ResearchState, attempt: int) -> str:
+    return f"research-stop-review-{state.revision}-{attempt}"
+
+
+_MODEL_CALL_ID = re.compile(
+    r"^research-(?:model|stop-review)-(?P<revision>\d+)-(?P<attempt>\d+)$"
+)
 
 
 def _is_async_model(model: object) -> bool:

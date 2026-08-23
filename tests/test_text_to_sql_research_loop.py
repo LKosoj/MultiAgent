@@ -1113,9 +1113,9 @@ def test_model_semantic_stop_rejects_affected_source_subset(
                 policy=_policy(),
             )
         )
-        assert outcome.stop_reason is ResearchStopReason.BUDGET_EXHAUSTED
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
         records = ledger.load_model_records(state.run_id, state.run_incarnation)
-        assert len(records) == 4
+        assert len(records) == 3
         for record in records:
             assert record.reconciliation is not None
             assert record.reconciliation.actual_usage == ModelTokenUsage(
@@ -1372,23 +1372,24 @@ def test_invalid_model_stop_exhausts_bounded_retries_without_state_revision(
         _run(tmp_path, state, model)
     )
     try:
-        assert outcome.stop_reason is ResearchStopReason.BUDGET_EXHAUSTED
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
         assert outcome.final_state.revision == state.revision
-        assert outcome.final_state.budget_state.used_model_calls == 4
-        assert outcome.final_state.budget_state.remaining_model_calls == 0
-        assert outcome.final_state.budget_state.used_model_tokens == 80
-        assert outcome.final_state.budget_state.remaining_model_tokens == 0
+        assert outcome.final_state.budget_state.used_model_calls == 3
+        assert outcome.final_state.budget_state.remaining_model_calls == 1
+        assert outcome.final_state.budget_state.used_model_tokens == 60
+        assert outcome.final_state.budget_state.remaining_model_tokens == 20
         assert outcome.affected_source_ids == ("source-1",)
-        assert calls == 4
+        assert calls == 3
         assert len(prompts) == calls
-        for prompt in prompts[1:]:
+        for prompt in prompts[1:2]:
             instructions = json.loads(prompt)["instructions"]
             assert (
                 "Previous decision rejected: INVALID_STOP. Correct the decision using the "
                 "profile rules and return a replacement typed decision."
                 in instructions
             )
-        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 4
+        assert '"review_kind":"research_stop_review"' in prompts[2]
+        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 3
         assert (
             checkpoint_store.get_snapshot(
                 AdaptiveCheckpointKey(
@@ -1755,14 +1756,12 @@ def test_five_mixed_model_rejections_stop_without_state_progress(
             "code=STOP_WITH_PROPOSALS rejection_path=stop_with_proposals",
             "typed_schema_research_decision retry=true "
             "code=INVALID_STOP rejection_path=invalid_stop",
-            "typed_schema_research_decision retry=true "
-            "code=STOP_WITH_PROPOSALS rejection_path=stop_with_proposals",
         ]
         feedback = [json.loads(prompt)["instructions"] for prompt in prompts]
         assert "STOP_WITH_PROPOSALS" in feedback[1]
         assert "INVALID_STOP" in feedback[2]
         assert "STOP_WITH_PROPOSALS" in feedback[3]
-        assert "INVALID_STOP" in feedback[4]
+        assert '"review_kind":"research_stop_review"' in prompts[4]
         assert (
             checkpoint_store.get_snapshot(
                 AdaptiveCheckpointKey(
@@ -1999,6 +1998,8 @@ def test_rejected_proposal_tool_decision_executes_admissible_baseline(
 
     async def model(prompt: str) -> str:
         prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
         return next(responses)
 
     ledger = AdaptiveBudgetLedger(tmp_path / "assessment-fallback-budget.sqlite")
@@ -2041,7 +2042,7 @@ def test_rejected_proposal_tool_decision_executes_admissible_baseline(
         assert outcome.final_state.hypotheses == state.hypotheses
         assert outcome.final_state.bindings == state.bindings
         assert outcome.final_state.action_history == (*state.action_history, action)
-        assert len(prompts) == 2
+        assert len(prompts) == 3
         assert "cited evidence_id does not exist" in prompts[1]
         assert "missing-evidence" in prompts[1]
         assert registry.adapter.execute_calls == 1
@@ -5022,6 +5023,8 @@ def test_missing_group_order_executes_without_model_correction(
 
     async def model(prompt: str) -> str:
         prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
         if len(prompts) == 1:
             return json.dumps(decision.model_dump(mode="json", by_alias=True))
         assert invocation_ids
@@ -5058,7 +5061,7 @@ def test_missing_group_order_executes_without_model_correction(
         assert outcome.stop_reason is ResearchStopReason.AMBIGUOUS
         assert outcome.final_state.revision == 1
         assert len(invocation_ids) == 1
-        assert len(prompts) == 2
+        assert len(prompts) == 3
         assert "INVALID_RESEARCH_QUERY" not in json.loads(prompts[1])["instructions"]
     finally:
         state_store.close()
@@ -5575,9 +5578,11 @@ def test_cited_ambiguous_stop_is_closed_once(tmp_path, _repeat: int) -> None:
     ledger = AdaptiveBudgetLedger(tmp_path / "ambiguous-budget.sqlite")
     calls = 0
 
-    async def model(_prompt: str) -> str:
+    async def model(prompt: str) -> str:
         nonlocal calls
         calls += 1
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
         return (
             '{"decision_version":1,"proposals":[],"next":'
             '{"next_kind":"stop","reason":"ambiguous",'
@@ -5642,13 +5647,13 @@ def test_cited_ambiguous_stop_is_closed_once(tmp_path, _repeat: int) -> None:
         assert outcome.final_state.revision == state.revision
         assert outcome.final_state.action_history == state.action_history
         assert outcome.final_state.evidence == state.evidence
-        assert outcome.final_state.budget_state.used_model_calls == 2
-        assert outcome.final_state.budget_state.used_model_tokens == 40
+        assert outcome.final_state.budget_state.used_model_calls == 3
+        assert outcome.final_state.budget_state.used_model_tokens == 60
         assert outcome.affected_source_ids == ("source-1",)
         assert outcome.citation_evidence_ids == (citation,)
         assert outcome.ambiguity.model_dump(mode="json") == ambiguity
-        assert calls == 1
-        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 2
+        assert calls == 2
+        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 3
         assert (
             checkpoint_store.get_snapshot(
                 AdaptiveCheckpointKey(
@@ -5690,8 +5695,8 @@ def test_cited_ambiguous_stop_is_closed_once(tmp_path, _repeat: int) -> None:
         )
         assert replay == outcome
         assert replay.ambiguity == outcome.ambiguity
-        assert replay.final_state.budget_state.used_model_calls == 2
-        assert replay.final_state.budget_state.used_model_tokens == 40
+        assert replay.final_state.budget_state.used_model_calls == 3
+        assert replay.final_state.budget_state.used_model_tokens == 60
     finally:
         state_store.close()
         checkpoint_store.close()
@@ -5703,7 +5708,7 @@ def test_duplicate_semantic_action_stagnates_before_second_tool(
     tmp_path, monkeypatch, _repeat: int
 ) -> None:
     loaded_schema, namespace = _fixture_schema()
-    policy = _policy(6)
+    policy = _policy(8)
     state = _policy_state(namespace).model_copy(
         update={"budget_state": initial_budget_state(policy)}
     )
@@ -5787,7 +5792,7 @@ def test_duplicate_semantic_action_stagnates_before_second_tool(
         assert outcome.final_state.revision == 1
         assert len(outcome.final_state.action_history) == 1
         assert len(outcome.final_state.evidence) == 1
-        assert calls == 6
+        assert calls == 7
         assert tool_calls == 1
         assert outcome.rejection_signatures == (
             ("duplicate_action", "DUPLICATE_ACTION"),
@@ -5825,6 +5830,180 @@ def test_duplicate_semantic_action_stagnates_before_second_tool(
             )
         )
         assert replay == outcome
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_stop_review_continue_passes_hint_to_one_normal_research_turn(tmp_path) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    policy = _policy(8)
+    state = _policy_state(namespace).model_copy(
+        update={"budget_state": initial_budget_state(policy)}
+    )
+    calls: list[str] = []
+    invalid_stop = (
+        '{"decision_version":1,"proposals":[],"next":'
+        '{"next_kind":"stop","reason":"ambiguous",'
+        '"source_ids":["source-1"],"citation_evidence_ids":["citation-1"],'
+        '"ambiguity":{"interpretations":["First reading.","Second reading."],'
+        '"citation_evidence_ids":["citation-1"],'
+        '"missing_distinguishing_fact":"The definition is absent."}}}'
+    )
+
+    async def model(prompt: str) -> str:
+        calls.append(prompt)
+        if len(calls) == 3:
+            assert '"review_kind":"research_stop_review"' in prompt
+            return (
+                '{"decision":"continue","hint":'
+                '"Inspect the visible relationship from the supported facts."}'
+            )
+        if len(calls) == 4:
+            assert (
+                "Inspect the visible relationship from the supported facts."
+            ) in prompt
+        return invalid_stop
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            freshness_context=_fixture_freshness(state),
+            registry=_make_registry(namespace),
+            policy=policy,
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert outcome.final_state.revision == 0
+        assert len(calls) == 4
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_stop_review_can_run_again_after_research_progress(
+    tmp_path, monkeypatch
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    policy = _policy(8)
+    state = _policy_state(namespace).model_copy(
+        update={"budget_state": initial_budget_state(policy)}
+    )
+    registry = _make_registry(namespace)
+    tool_decision = _tool_decision("inspect_table", {"table": "public.orders"})
+    prepared = _resolve_fixture(
+        tool_decision,
+        loaded=loaded_schema,
+        namespace=namespace,
+        state=state,
+        registry=registry,
+    )
+    assert prepared.admission.action is not None
+    assert prepared.invocation is not None
+    result = build_probe_result(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=state.revision,
+        schema_namespace_version=state.schema_namespace_version,
+        invocation_id=prepared.invocation.invocation_id,
+        action_digest=prepared.admission.action.action_digest,
+        probe_kind=prepared.admission.action.kind,
+        status=ProbeStatus.SUCCESS,
+        target=prepared.admission.action.target,
+        started_at=_FIXTURE_NOW,
+        completed_at=_FIXTURE_NOW,
+        summary="fixture success",
+        cost=EvidenceCost(
+            wall_clock_ms=0,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=0,
+            rows=1,
+            bytes=11,
+        ),
+        row_count=1,
+        payload={"ok": True},
+    )
+    registry.adapter.result = NormalizedToolResult(
+        "success", result.model_dump(mode="json", by_alias=True)
+    )
+    registry.adapter.recover = lambda _invocation: None
+    ledger = AdaptiveBudgetLedger(tmp_path / "repeated-stop-review-budget.sqlite")
+    execute = _research_loop_module.execute_resolved_research_decision
+
+    def execute_fresh_probe(resolved, tools, *, recover=False):
+        observed = execute(resolved, tools, recover=recover)
+        action = resolved.admission.action
+        assert action is not None
+        charged, _ = execute_probe_with_budget(
+            resolved.admission.state,
+            action,
+            observed.cost,
+            lambda _reservation: observed,
+            config=policy,
+            ledger=ledger,
+            monotonic_ns=lambda: 0,
+            utc_now=lambda: _FIXTURE_NOW,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "repeated-stop-review-tool-owner",
+        )
+        return charged
+
+    monkeypatch.setattr(
+        _research_loop_module, "execute_resolved_research_decision", execute_fresh_probe
+    )
+    calls: list[str] = []
+    invalid_stop = (
+        '{"decision_version":1,"proposals":[],"next":'
+        '{"next_kind":"stop","reason":"ambiguous",'
+        '"source_ids":["source-1"],"citation_evidence_ids":["citation-1"],'
+        '"ambiguity":{"interpretations":["First reading.","Second reading."],'
+        '"citation_evidence_ids":["citation-1"],'
+        '"missing_distinguishing_fact":"The definition is absent."}}}'
+    )
+
+    async def model(prompt: str) -> str:
+        calls.append(prompt)
+        if len(calls) == 3:
+            assert '"review_kind":"research_stop_review"' in prompt
+            return '{"decision":"continue","hint":"Inspect the known relationship."}'
+        if len(calls) == 4:
+            return (
+                '{"decision_version":1,"proposals":[],"next":'
+                '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+                '{"tool_name":"inspect_table","arguments":'
+                '{"table":"public.orders"}}}}'
+            )
+        if len(calls) == 7:
+            assert '"review_kind":"research_stop_review"' in prompt
+            return '{"decision":"stop_confirmed","hint":null}'
+        return invalid_stop
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            freshness_context=_fixture_freshness(state),
+            registry=registry,
+            budget_ledger=ledger,
+            policy=policy,
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert outcome.final_state.revision == 1
+        assert len(calls) == 7
+        assert sum(
+            '"review_kind":"research_stop_review"' in prompt for prompt in calls
+        ) == 2
     finally:
         state_store.close()
         checkpoint_store.close()
@@ -6400,7 +6579,6 @@ def test_observed_replay_mutations_fail_closed(tmp_path, mutation: str) -> None:
     )
     assert prepared.admission.action is not None
     assert prepared.invocation is not None
-    payload = {"status": "matched"}
     result = build_probe_result(
         run_id=state.run_id,
         run_incarnation=state.run_incarnation,
@@ -7793,6 +7971,123 @@ def test_three_repeated_semantic_observations_stop_as_stagnated(
         state_store.close()
         checkpoint_store.close()
         ledger.close()
+
+
+def test_semantic_novelty_ignores_complete_row_subset() -> None:
+    _, namespace = _fixture_schema()
+    state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
+    prior_observation = json.dumps(
+        {
+            "payload": {
+                "columns": ["CustomerID", "Date", "Consumption"],
+                "rows": [
+                    [38508, "201201", 67156.94],
+                    [38508, "201202", 88658.88],
+                ],
+                "schema_namespace_version": state.schema_namespace_version,
+            },
+            "row_count": 2,
+            "truncated": False,
+        }
+    )
+    subset_observation = json.dumps(
+        {
+            "payload": {
+                "columns": ["CustomerID", "Date", "Consumption"],
+                "rows": [[38508, "201201", 67156.94]],
+                "schema_namespace_version": state.schema_namespace_version,
+            },
+            "row_count": 1,
+            "truncated": False,
+        }
+    )
+    prior = state.evidence[0].model_copy(
+        update={"evidence_id": "prior-rows", "observation": prior_observation}
+    )
+    subset = prior.model_copy(
+        update={"evidence_id": "subset-rows", "observation": subset_observation}
+    )
+    current = state.model_copy(update={"evidence": (prior,)})
+    committed = SimpleNamespace(
+        state=state.model_copy(update={"evidence": (prior, subset)}),
+        novelty=SimpleNamespace(
+            added_hypothesis_ids=(),
+            updated_hypothesis_ids=(),
+            added_binding_ids=(),
+            updated_binding_ids=(),
+            added_join_ids=(),
+            updated_join_ids=(),
+            unresolved_items=current.unresolved_items,
+            stop_reason=current.stop_reason,
+        ),
+    )
+
+    assert (
+        _research_loop_module._is_semantically_novel_turn(current, committed)
+        is False
+    )
+
+
+def test_semantic_novelty_ignores_reworded_hypothesis_for_same_targets() -> None:
+    state = _state(required=True)
+    target = TableRef(namespace="main", schema="main", table="yearmonth")
+    prior = Hypothesis(
+        hypothesis_id="hypothesis-prior",
+        source_ids=("source-1",),
+        claim="The monthly value may be in yearmonth.",
+        candidate_targets=(target,),
+        status=HypothesisStatus.PROPOSED,
+        evidence_ids=(),
+    )
+    reworded = prior.model_copy(
+        update={
+            "hypothesis_id": "hypothesis-reworded",
+            "claim": "The yearmonth table may contain the monthly value.",
+        }
+    )
+    current = state.model_copy(update={"hypotheses": (prior,)})
+    committed = SimpleNamespace(
+        state=current.model_copy(update={"hypotheses": (prior, reworded)}),
+        novelty=SimpleNamespace(
+            added_hypothesis_ids=(reworded.hypothesis_id,),
+            updated_hypothesis_ids=(),
+            added_binding_ids=(),
+            updated_binding_ids=(),
+            added_join_ids=(),
+            updated_join_ids=(),
+            unresolved_items=current.unresolved_items,
+            stop_reason=current.stop_reason,
+        ),
+    )
+
+    assert (
+        _research_loop_module._is_semantically_novel_turn(current, committed)
+        is False
+    )
+
+
+def test_semantic_novelty_requires_semantic_change_not_only_new_evidence() -> None:
+    _, namespace = _fixture_schema()
+    observed = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
+    current = observed.model_copy(update={"evidence": ()})
+    committed = SimpleNamespace(
+        state=observed,
+        novelty=SimpleNamespace(
+            added_hypothesis_ids=(),
+            updated_hypothesis_ids=(),
+            added_binding_ids=(),
+            updated_binding_ids=(),
+            added_join_ids=(),
+            updated_join_ids=(),
+            unresolved_items=current.unresolved_items,
+            stop_reason=current.stop_reason,
+        ),
+    )
+
+    assert (
+        _research_loop_module._is_semantically_novel_turn(current, committed)
+        is False
+    )
 
 
 @pytest.mark.parametrize("_repeat", range(20))

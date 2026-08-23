@@ -10,6 +10,7 @@ from pathlib import Path
 from smolagents import ChatMessage, MessageRole
 
 from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
+from custom_tools.text_to_sql.adaptive.models import QuerySpec
 from custom_tools.text_to_sql.adaptive.policy import load_adaptive_policy_config
 from custom_tools.text_to_sql.adaptive.policy import (
     evaluate_research_generation_authority,
@@ -25,11 +26,13 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     load_schema_research_agent_profile,
 )
 from custom_tools.text_to_sql.adaptive.terminal import research_stop_terminal_result
+from custom_tools.text_to_sql.llm_models_config import load_llm_models_config
 from custom_tools.text_to_sql.nlu import NLUProcessor
 from custom_tools.text_to_sql.schema_enricher import SchemaEnricher
 from custom_tools.text_to_sql.schema_loader import SchemaLoader
 from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
 from custom_tools.text_to_sql.schema_namespace import SchemaScope
+from custom_tools.text_to_sql.validators.schema_limiter import SchemaLimiter
 
 from ._text_to_sql_document_authority import (
     live_terminal_document_freshness_context,
@@ -86,6 +89,14 @@ async def run_typed_schema_research(
         run_id=runtime.run_id,
         run_incarnation=runtime.run_incarnation,
         context_documents=runtime.context_documents,
+        schema_context=SchemaLimiter(priority_strategy="fk_centrality").build_schema_summary(
+            loaded_schema.schema,
+            hard_max_chars=int(
+                load_llm_models_config().get(
+                    "schema_linking", "schema_prompt_hard_max_chars"
+                )
+            ),
+        ),
     )
     runtime.research_state_store.save_query_spec(query_spec)
     memory_manager.ensure_schema_indexed_in_memory(

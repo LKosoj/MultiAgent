@@ -79,7 +79,7 @@ from .state import _result_expectation_key
 from .tool_registry import AdaptiveResearchToolContext, AdaptiveResearchToolRegistry
 
 
-_MAX_SCHEMA_RESEARCH_PROMPT_BYTES = 32_768
+_MAX_SCHEMA_RESEARCH_PROMPT_BYTES = 65_536
 
 
 class ProductionResearchAssemblyError(RuntimeError):

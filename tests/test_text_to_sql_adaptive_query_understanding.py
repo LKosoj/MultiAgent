@@ -246,17 +246,16 @@ def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions()
         ) in prompt
         assert (
             "Категория или подтип этой сущности, ограничивающие выбранные строки, "
-            "являются обязательным FILTER с выраженными operator и "
-            "literal_or_reference."
-        ) in prompt
+            "являются обязательным FILTER"
+        ) not in prompt
         assert (
-            "Не дублируй отдельным FILTER фразу, уже входящую в METRIC, если вопрос "
-            "не противопоставляет ей другие строки и явно не требует их исключить."
+            "Не придумывай отсутствующий в вопросе более общий класс, чтобы объявить "
+            "названный тип сущности его категорией или подтипом и создать FILTER."
         ) in prompt
         assert (
             "Явное невременное условие, ограничивающее выбранные строки, является "
             "обязательным FILTER с выраженными operator и literal_or_reference."
-        ) in prompt
+        ) not in prompt
         assert (
             "exact_physical_predicate: true, если контекстный документ явно задаёт "
             "operator и literal_or_reference как физическое представление предиката; "
@@ -277,6 +276,32 @@ def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions()
             "exact_physical_predicate true только этому элементу; остальные части "
             "остаются отдельными и false, пока документ не описал их физическое "
             "представление."
+        ) in prompt
+
+
+def test_adaptive_query_prompts_do_not_duplicate_metric_scope_as_filter() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "What is the total amount spent at retail locations?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "total amount spent at retail locations",
+            normalized_meaning="total spending in the retail-location domain",
+            requested_output=True,
+        )
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert (
+            "Контекст события или источника, уже включённый в смысл METRIC, "
+            "не дублируй отдельным FILTER без самостоятельного условия отбора."
         ) in prompt
 
 
@@ -306,6 +331,34 @@ def test_adaptive_query_prompts_keep_period_in_percentage_denominator() -> None:
             "знаменатель сохраняет этот период. Используй все объекты независимо "
             "от периода только когда вопрос или контекстный документ явно задаёт "
             "такую глобальную базовую группу."
+        ) in prompt
+
+
+def test_adaptive_query_prompts_keep_separate_requested_results() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "What is the total revenue? What was the revenue in April?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "revenue",
+            normalized_meaning="revenue in April",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert (
+            "Если исходный текст содержит несколько самостоятельных вопросов, "
+            "сохрани отдельный requested_output semantic item для результата "
+            "каждого вопроса, даже если показатели похожи."
         ) in prompt
 
 
@@ -514,6 +567,54 @@ def test_nlu_processor_passes_context_documents_to_both_calls(
         response,
         context_documents=context_documents,
     )
+
+
+def test_nlu_processor_passes_trusted_schema_only_to_completeness_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    text = "What is the total amount spent at retail locations?"
+    schema_context = (
+        "TABLE purchases: all recorded purchases at retail locations; "
+        "COLUMNS: amount (money)"
+    )
+    response = _model_response(
+        _model_item(
+            "metric",
+            "total amount spent at retail locations",
+            normalized_meaning="total spending in the retail-location domain",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_openai_api(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(response)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+    monkeypatch.setattr(nlu_module, "_nlu_max_tokens", lambda _key: 321)
+
+    nlu_module.NLUProcessor()._understand_query(
+        text,
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        schema_context=schema_context,
+    )
+
+    assert calls[0]["prompt"] == build_adaptive_query_understanding_prompt(text)
+    assert calls[1]["prompt"] == build_adaptive_query_completeness_prompt(
+        text,
+        response,
+        schema_context=schema_context,
+    )
+    assert "не является отдельным FILTER" in calls[1]["prompt"]
 
 
 def test_nlu_processor_uses_second_response_to_restore_missing_requested_output(

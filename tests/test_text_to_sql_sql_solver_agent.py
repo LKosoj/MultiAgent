@@ -133,6 +133,35 @@ def test_prompt_instructions_show_exact_wire_shapes_for_both_proposals() -> None
     ) in instructions
 
 
+def test_prompt_preserves_common_rowset_for_overall_and_conditional_aggregate() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return total revenue and revenue from completed orders.",
+        solver_context="Both outputs use the same confirmed revenue metric.",
+    )
+    instructions = json.loads(prompt)["instructions"]
+
+    assert "overall aggregate and the same aggregate" in instructions
+    assert "restricted\nby a condition" in instructions
+    assert "common FROM, JOIN, and filter scope" in instructions
+
+
+def test_prompt_preserves_requested_output_order() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return total revenue and then completed-order revenue.",
+        solver_context="Both requested values are supported.",
+    )
+    instructions = json.loads(prompt)["instructions"]
+
+    assert "multiple output values in a stated order" in instructions
+    assert "them in that same order" in instructions
+
+
 def test_sync_callable_is_rejected_before_it_is_called() -> None:
     class SyncModel:
         def __init__(self) -> None:

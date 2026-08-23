@@ -18,6 +18,8 @@ from custom_tools.text_to_sql.adaptive.models import (
     CheckFailureCode,
     DerivedExpressionBinding,
     DocumentRef,
+    EvidenceSourceKind,
+    EvidenceValidityScope,
     ExpressionRef,
     PhysicalColumnBinding,
     PredicateOperator,
@@ -265,6 +267,13 @@ def test_terminal_returns_model_review_receipt_without_persistence(monkeypatch) 
         in prompt["instruction"].lower()
     )
     assert "winning alternative label or role" in prompt["instruction"].lower()
+    assert "row multiplication or surprising result magnitude alone" in prompt[
+        "instruction"
+    ].lower()
+    assert "independently establishes the required result grain" in prompt[
+        "instruction"
+    ].lower()
+    assert "ast and data prove that the sql violates it" in prompt["instruction"].lower()
 
 
 def test_result_review_prompts_for_grain_and_allows_single_observation() -> None:
@@ -762,6 +771,7 @@ def test_result_review_allows_empty_result_for_exact_filter() -> None:
             not exact_filter
             or "An empty result does not by itself contradict"
             not in payload["instruction"]
+            or "auxiliary probe over a different physical column" not in payload["instruction"]
         ):
             return json.dumps(
                 {
@@ -813,6 +823,55 @@ def test_result_review_allows_empty_result_for_exact_filter() -> None:
     assert exact.verdict == "consistent"
     assert mismatch.verdict == "contradicted"
     assert mismatch.source_id == "status-filter"
+
+
+def test_result_review_omits_arbitrary_probe_rows() -> None:
+    state, requirements, candidate, _ = _case()
+    marker = "unrelated-alternative-calculation"
+    probe_evidence = state.evidence[0].model_copy(
+        update={
+            "source_kind": EvidenceSourceKind.PROBE,
+            "observation": json.dumps({"marker": marker}),
+            "validity_scope": EvidenceValidityScope.RUN_ONLY,
+            "data_snapshot_token": None,
+        }
+    )
+    state = state.model_copy(update={"evidence": (probe_evidence,)})
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        if marker in json.dumps(payload["evidence"]):
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "an auxiliary probe suggests another calculation",
+                    "source_id": "source-1",
+                }
+            )
+        return json.dumps({"status": "consistent", "reason": "result matches"})
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=FreshnessContext(
+            evaluated_at=probe_evidence.observed_at,
+            run_id=state.run_id,
+            run_incarnation=state.run_incarnation,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        candidate=candidate,
+        parsed_ast=parse_sql_candidate(SQL, POSTGRES_DSN, candidate.candidate_id),
+        documents=(),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=SQL,
+        execution=_executor_result([["paid"]]),
+    )
+
+    assert receipt.verdict == "consistent"
 
 
 def test_result_review_does_not_treat_related_proxy_as_requested_attribute() -> None:
@@ -1161,6 +1220,63 @@ def test_result_review_rejects_authenticated_unrequested_root_projection_without
 
     assert receipt.verdict == "contradicted"
     assert receipt.source_id == "projection-total"
+    assert receipt.deterministic_failure_code is CheckFailureCode.RESULT_SHAPE_MISMATCH
+    assert calls == 0
+
+
+def test_result_review_rejects_missing_requested_root_projection_without_model() -> None:
+    state = _projection_review_state(requested_output_source_ids=("projection-total",))
+    amount = _coverage_column("items", "amount")
+    period_binding = PhysicalColumnBinding(
+        binding_id="projection-period-total-binding",
+        source_id="projection-total-period",
+        tables=(amount.table,),
+        columns=(amount,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=("projection-total-evidence",),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="coverage",
+        physical_column=amount,
+    )
+    period_item = SemanticItem(
+        source_id="projection-total-period",
+        kind=SemanticItemKind.METRIC,
+        source_text="period total",
+        normalized_meaning="total for the requested period",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(period_binding.binding_id,),
+    )
+    state = state.model_copy(
+        update={
+            "bindings": (*state.bindings, period_binding),
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (*state.query_spec.semantic_items, period_item),
+                    "requested_output_source_ids": (
+                        "projection-total",
+                        "projection-total-period",
+                    ),
+                }
+            ),
+        }
+    )
+    sql = "SELECT SUM(i.amount) AS total FROM items i"
+    calls = 0
+
+    def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps({"status": "consistent", "reason": "ignored output role"})
+
+    receipt = _projection_review(state, sql, model)
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id in {"projection-total", "projection-total-period"}
     assert receipt.deterministic_failure_code is CheckFailureCode.RESULT_SHAPE_MISMATCH
     assert calls == 0
 

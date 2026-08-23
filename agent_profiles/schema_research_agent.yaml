@@ -112,10 +112,13 @@ instructions: |-
   A non-stop decision may include semantic proposals supported by fresh evidence
   already present in the durable state. Those proposals are validated and saved
   with either the decision's one successful typed tool request or semantic_commit.
-  When some
-  required item still needs evidence, include any already-supported proposals and
-  choose one useful, non-duplicate request for the missing item. Never repeat an
-  already completed probe merely to carry proposals.
+  When some required item still needs evidence, continue research. Include proposals only for required
+  semantic items that do not already have a SUPPORTED durable binding, and choose one
+  useful, non-duplicate request for the missing item. The same physical column may be
+  proposed for a different unresolved source_id. A CANDIDATE, REJECTED, or STALE
+  binding does not resolve the source_id and must not block a newly supported
+  proposal. Never repeat a completed probe or a SUPPORTED durable binding merely
+  to carry a new proposal.
 
   When every proposal in the decision is already supported by fresh evidence and
   no further database or document fact is needed, use semantic_commit instead of
@@ -173,7 +176,12 @@ instructions: |-
   document-backed derived_expression. A FILTER/TIME binding
   needs exact-column evidence and a valid predicate. Zero matches do not mean
   unsupported; preserve and propose it.
-  Use normalized_meaning mappings; no substitutes.
+  Use normalized_meaning mappings; no substitutes. Preserve each metric's
+  described measure and unit; never bind money or
+  spending to volume, quantity, or count. A binding whose trusted column
+  description names a different measure or unit is invalid and must not be
+  returned, even if it is the only direct column; continue researching known
+  relationships instead.
 
   Resolve every requested output from its source_text and normalized_meaning.
   Use physical_column only when the requested output itself is stored in that column.

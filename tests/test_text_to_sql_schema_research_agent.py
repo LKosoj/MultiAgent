@@ -18,6 +18,7 @@ import yaml
 from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     SchemaResearchDecisionAdapter,
     SchemaResearchModelResponseError,
+    build_research_stop_review_prompt,
     build_schema_research_prompt,
     load_schema_research_agent_profile,
 )
@@ -352,7 +353,7 @@ def test_profile_describes_semantic_commit_as_third_next_choice() -> None:
     assert "semantic_commit is not a stop reason" in instructions
 
 
-def test_research_prompt_limit_stays_at_32768_bytes_when_input_budget_grows() -> None:
+def test_research_prompt_limit_stays_at_65536_bytes_when_input_budget_grows() -> None:
     """The larger reservation must not enlarge the separately bounded prompt."""
 
     original = _minimal_research_context_policy()
@@ -373,7 +374,7 @@ def test_research_prompt_limit_stays_at_32768_bytes_when_input_budget_grows() ->
         state,
         policy,
         profile=load_schema_research_agent_profile(),
-        task="x" * 17_000,
+        task="x" * 33_000,
         validation_feedback=(),
     )
 
@@ -383,7 +384,7 @@ def test_research_prompt_limit_stays_at_32768_bytes_when_input_budget_grows() ->
             state,
             policy,
             profile=load_schema_research_agent_profile(),
-            task="x" * 33_000,
+            task="x" * 51_000,
             validation_feedback=(),
         )
 
@@ -434,7 +435,7 @@ def test_bounded_context_keeps_selected_preflight_feedback_near_prompt_limit() -
         validation_feedback="UNRESOLVABLE_PREFLIGHT",
     )
 
-    assert 28_000 <= len(prompt.encode("utf-8")) <= 32_768
+    assert 28_000 <= len(prompt.encode("utf-8")) <= 65_536
     assert json.loads(context)["rejected_preflight_assessments"] == [selected]
 
 
@@ -702,6 +703,85 @@ def test_profile_reacquires_omitted_facts_without_guessing_identifiers() -> None
         r"reports omissions.*cite only IDs present.*existing typed probe.*never guess",
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def test_profile_preserves_metric_measure_and_unit() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "Preserve each metric's described measure and unit" in instructions
+    assert "never bind money or spending to volume, quantity, or count." in instructions
+    assert (
+        "A binding whose trusted column description names a different measure or unit "
+        "is invalid and must not be returned"
+    ) in instructions
+
+
+def test_profile_does_not_repeat_durable_bindings_with_one_new_binding() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Include proposals only for required semantic items that do not already have "
+        "a SUPPORTED durable binding"
+        in instructions
+    )
+    assert (
+        "A CANDIDATE, REJECTED, or STALE binding does not resolve the source_id"
+        in instructions
+    )
+    assert (
+        "The same physical column may be proposed for a different unresolved "
+        "source_id"
+        in instructions
+    )
+
+
+def test_stop_review_hint_must_not_contradict_trusted_context() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the requested metric.",
+            research_context='{"schema":{"metric":{"description":"trusted"}}}',
+            stop_reason="stagnated",
+        )
+    )
+
+    assert "must not contradict trusted facts" in prompt["instructions"]
+    assert (
+        "If an unresolved result can be built from an already supported measure "
+        "and confirmed relationships or conditions, return continue"
+        in prompt["instructions"]
+    )
+    assert (
+        "When an already supported measure and a confirmed condition are in different "
+        "tables and a visible shared key or relationship may connect them, return continue "
+        "with a short instruction to investigate that relationship before probing a "
+        "different measure"
+        in prompt["instructions"]
+    )
+    assert (
+        "Do not reject that relationship turn merely because applying the condition "
+        "directly to the measure table has no matching rows; the confirmed condition "
+        "belongs to the other table"
+        in prompt["instructions"]
+    )
+    assert (
+        "If a research probe applies the confirmed condition through that relationship "
+        "and returns a non-empty aggregate of the supported measure, continuation is "
+        "demonstrated"
+        in prompt["instructions"]
+    )
+    assert (
+        "When the supported measure, confirmed condition, and validated relationship "
+        "path are already present, return continue until a research probe has applied "
+        "that condition through the path to the measure"
+        in prompt["instructions"]
+    )
+    assert (
+        "A probe of a different measure does not test that composition"
+        in prompt["instructions"]
+    )
+    assert (
+        "Do not choose or recommend a semantic binding in the hint" in prompt["instructions"]
     )
 
 

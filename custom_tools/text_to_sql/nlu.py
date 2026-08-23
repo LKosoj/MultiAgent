@@ -9,7 +9,6 @@ Fallback-эвристика (``_fallback_extract_intent``/``_fallback_tokenize``
 """
 from __future__ import annotations
 
-import json
 import re
 import logging
 import os
@@ -117,6 +116,7 @@ class NLUProcessor:
         run_id: str,
         run_incarnation: str,
         context_documents: tuple[str, ...] = (),
+        schema_context: str = "",
     ) -> QuerySpec:
         """Build strict adaptive ``QuerySpec`` without schema inference."""
         if call_openai_api is None:
@@ -152,6 +152,7 @@ class NLUProcessor:
                 text,
                 decoded,
                 context_documents=context_documents,
+                schema_context=schema_context,
             ),
             system_prompt=system_prompt,
             max_tokens=max_tokens,

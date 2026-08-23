@@ -15,7 +15,7 @@ from ._sql_ast_models import ParsedSqlCandidate, QueryRole
 from .models import (
     CheckFailureCode,
     Digest,
-    EvidenceRecord,
+    EvidenceSourceKind,
     Id,
     NonEmptyText,
     NonNegativeInt,
@@ -157,15 +157,20 @@ def evaluate_result_review_capability(
     if state.run_id != expected_run_id or candidate.sql != expected_sql:
         raise ValueError("result review capability identity does not match finalizer")
     canonical_execution = _validated_executed_result(execution)
-    if source_id := _unrequested_root_projection_source_id(
+    if source_id := _root_projection_shape_mismatch_source_id(
         state, requirements, candidate, parsed_ast
     ):
+        reason = (
+            "candidate does not project each requested confirmed value separately"
+            if source_id in state.query_spec.requested_output_source_ids
+            else "candidate projects a confirmed value not requested in the output"
+        )
         source_id, evidence_id = _response_target(
             state,
             requirements,
             _ModelReviewResponse(
                 status="contradicted",
-                reason="candidate projects a confirmed value not requested in the output",
+                reason=reason,
                 source_id=source_id,
             ),
         )
@@ -174,7 +179,7 @@ def evaluate_result_review_capability(
             requirements,
             candidate,
             "contradicted",
-            "candidate projects a confirmed value not requested in the output",
+            reason,
             canonical_execution,
             source_id,
             evidence_id,
@@ -202,7 +207,7 @@ def evaluate_result_review_capability(
     )
 
 
-def _unrequested_root_projection_source_id(
+def _root_projection_shape_mismatch_source_id(
     state: ResearchState,
     requirements: CoverageRequirements,
     candidate: SqlCandidate,
@@ -236,6 +241,22 @@ def _unrequested_root_projection_source_id(
     }
     if not requested.issubset(set().union(*root_projection_annotations.values())):
         return None
+    assigned_sources: dict[str, str] = {}
+
+    def assign_projection(source_id: str, visited: set[str]) -> bool:
+        for projection_id, source_ids in root_projection_annotations.items():
+            if source_id not in source_ids or projection_id in visited:
+                continue
+            visited.add(projection_id)
+            assigned_source = assigned_sources.get(projection_id)
+            if assigned_source is None or assign_projection(assigned_source, visited):
+                assigned_sources[projection_id] = source_id
+                return True
+        return False
+
+    for source_id in sorted(requested):
+        if not assign_projection(source_id, set()):
+            return source_id
     for source_ids in root_projection_annotations.values():
         if source_ids and source_ids.isdisjoint(requested):
             return min(source_ids)
@@ -300,6 +321,7 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
         item.model_dump(mode="json")
         for item in value.state.evidence
         if item.evidence_id in selected_ids
+        and item.source_kind is not EvidenceSourceKind.PROBE
     ]
     documents = [
         item.model_dump(mode="json")
@@ -327,6 +349,14 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "FILTER/TIME binding. If the SQL uses the confirmed physical column, operator, "
                 "literals and representation, zero matching rows may be consistent; return "
                 "contradicted only when trusted context proves one of those is wrong. "
+                "An auxiliary probe over a different physical column or predicate cannot "
+                "contradict an exact physical predicate confirmed by a selected binding or "
+                "document. Judge the candidate against the confirmed predicate itself. "
+                "When a selected binding supplies the confirmed relationship used to combine "
+                "a metric and a condition, row multiplication or surprising result magnitude "
+                "alone does not prove that relationship wrong. Still mark the candidate "
+                "contradicted when trusted context independently establishes the required result "
+                "grain and the AST and data prove that the SQL violates it. "
                 "When the "
                 "question requires an entity-level computation over a period, a candidate "
                 "that selects an extremal raw observation without computing that requested "

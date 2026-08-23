@@ -14,7 +14,7 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Literal, Protocol
 
-from pydantic import ValidationError
+from pydantic import ValidationError, model_validator
 
 from .model_budget import ModelTokenUsage
 from .models import NonEmptyText, StrictModel
@@ -106,6 +106,19 @@ class SchemaResearchModelResponse:
     usage: ModelTokenUsage
 
 
+class ResearchStopReview(StrictModel):
+    """Closed answer from the one pre-terminal independent review."""
+
+    decision: Literal["stop_confirmed", "continue"]
+    hint: NonEmptyText | None = None
+
+    @model_validator(mode="after")
+    def validate_hint(self) -> "ResearchStopReview":
+        if (self.decision == "continue") != (self.hint is not None):
+            raise ValueError("only continue requires one research hint")
+        return self
+
+
 class SchemaResearchDecisionModel(Protocol):
     """Minimal provider boundary: one prompt and one raw response."""
 
@@ -119,6 +132,117 @@ class SchemaResearchDecisionModel(Protocol):
         | SchemaResearchModelResponse
         | Awaitable[str | bytes | SchemaResearchModelResponse]
     ): ...
+
+
+async def _call_model_with_usage(
+    model: SchemaResearchDecisionModel,
+    prompt: str,
+) -> tuple[str | bytes, ModelTokenUsage]:
+    await asyncio.sleep(0)
+    response = model(prompt)
+    if inspect.isawaitable(response):
+        response = await response
+    await asyncio.sleep(0)
+    if type(response) is SchemaResearchModelResponse:
+        raw_response = response.raw_response
+        usage = response.usage
+        if type(usage) is not ModelTokenUsage:
+            raise SchemaResearchModelResponseError(
+                "schema-research model usage must be ModelTokenUsage"
+            )
+    else:
+        raw_response = response
+        usage = ModelTokenUsage(input_tokens=None, output_tokens=None)
+    if type(raw_response) not in (bytes, str):
+        raise SchemaResearchModelResponseError(
+            "schema-research model response must be bytes or str"
+        )
+    return raw_response, usage
+
+
+def build_research_stop_review_prompt(
+    *,
+    task: str,
+    research_context: str,
+    stop_reason: str,
+) -> str:
+    """Build the one closed review request without granting authority."""
+
+    for value, name in (
+        (task, "task"),
+        (research_context, "research_context"),
+        (stop_reason, "stop_reason"),
+    ):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+    return json.dumps(
+        {
+            "input": {
+                "research_context": research_context,
+                "stop_reason": stop_reason,
+                "task": task,
+            },
+            "instructions": (
+                "Independently decide only whether research truly must stop or whether "
+                "the existing facts support one more normal research turn. Do not "
+                "generate SQL, invent a separate path, create authority, or override "
+                "Typed checks. A continuation hint must not contradict trusted facts "
+                "in research_context. Do not choose or recommend a semantic binding "
+                "in the hint. If an unresolved result can be built from an "
+                "already supported measure and confirmed relationships or conditions, "
+                "return continue with that short instruction. When an already supported "
+                "measure and a confirmed condition are in different tables and a visible "
+                "shared key or relationship may connect them, return continue with a short "
+                "instruction to investigate that relationship before probing a different "
+                "measure. Do not reject that relationship turn merely because applying the "
+                "condition directly to the measure table has no matching rows; the confirmed "
+                "condition belongs to the other table. When the supported measure, confirmed "
+                "condition, and validated relationship path are already present, return "
+                "continue until a research probe has applied that condition through the path "
+                "to the measure. A probe of a different measure does not test that composition "
+                "and must not be described as doing so. If a research probe applies the "
+                "confirmed condition through that relationship and returns a non-empty "
+                "aggregate of the supported measure, continuation is demonstrated; return "
+                "continue and direct the research agent to resolve the remaining item from "
+                "that tested composition. Do not assume or create the relationship. Return "
+                "exactly one JSON "
+                "object: "
+                '{"decision":"stop_confirmed","hint":null} or '
+                '{"decision":"continue","hint":"short instruction"}.'
+            ),
+            "review_kind": "research_stop_review",
+        },
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+class SchemaResearchStopReviewAdapter:
+    """Perform one independent pre-terminal review without retrying."""
+
+    async def review_with_usage(
+        self,
+        model: SchemaResearchDecisionModel,
+        *,
+        task: str,
+        research_context: str,
+        stop_reason: str,
+    ) -> tuple[ResearchStopReview, ModelTokenUsage]:
+        prompt = build_research_stop_review_prompt(
+            task=task,
+            research_context=research_context,
+            stop_reason=stop_reason,
+        )
+        raw_response, usage = await _call_model_with_usage(model, prompt)
+        try:
+            review = ResearchStopReview.model_validate_json(raw_response)
+        except (ValidationError, ValueError) as error:
+            failure = ContractDecodeError("invalid research stop review")
+            failure.model_usage = usage
+            raise failure from error
+        return review, usage
 
 
 def load_schema_research_agent_profile(
@@ -236,31 +360,13 @@ class SchemaResearchDecisionAdapter:
     ) -> tuple[ResearchDecisionV1, ModelTokenUsage]:
         """Return one parsed decision and its transient model usage."""
 
-        await asyncio.sleep(0)
         prompt = build_schema_research_prompt(
             self._profile,
             task=task,
                 research_context=research_context,
                 validation_feedback=validation_feedback,
         )
-        response = model(prompt)
-        if inspect.isawaitable(response):
-            response = await response
-        await asyncio.sleep(0)
-        if type(response) is SchemaResearchModelResponse:
-            raw_response = response.raw_response
-            usage = response.usage
-            if type(usage) is not ModelTokenUsage:
-                raise SchemaResearchModelResponseError(
-                    "schema-research model usage must be ModelTokenUsage"
-                )
-        else:
-            raw_response = response
-            usage = ModelTokenUsage(input_tokens=None, output_tokens=None)
-        if type(raw_response) not in (bytes, str):
-            raise SchemaResearchModelResponseError(
-                "schema-research model response must be bytes or str"
-            )
+        raw_response, usage = await _call_model_with_usage(model, prompt)
 
         from .research_decision import parse_research_decision
 

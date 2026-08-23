@@ -449,6 +449,20 @@ def test_safe_predicate_subquery_is_admitted() -> None:
     assert admitted.output_columns == ("id",)
 
 
+def test_correlated_predicate_subqueries_resolve_outer_columns_in_outer_scope() -> None:
+    admitted = _admit(
+        "SELECT "
+        "(SELECT COUNT(*) FROM main.orders o WHERE NOT EXISTS ("
+        "SELECT 1 FROM main.customers c WHERE c.id = o.customer_id"
+        ")) AS unmatched_orders, "
+        "(SELECT COUNT(*) FROM main.customers c WHERE c.id = 7 AND EXISTS ("
+        "SELECT 1 FROM main.orders o WHERE o.customer_id = c.id"
+        ")) AS customer_orders LIMIT 1"
+    )
+
+    assert admitted.output_columns == ("unmatched_orders", "customer_orders")
+
+
 def test_scalar_subqueries_without_an_outer_row_source_are_admitted() -> None:
     admitted = _admit(
         "SELECT "

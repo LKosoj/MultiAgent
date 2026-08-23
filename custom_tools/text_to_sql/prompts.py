@@ -52,6 +52,9 @@ def build_adaptive_query_understanding_prompt(
         "- required: true или false;\n"
         "- requested_output: true только если пользователь явно просит вывести "
         "этот элемент в ответе, иначе false;\n"
+        "Если исходный текст содержит несколько самостоятельных вопросов, "
+        "сохрани отдельный requested_output semantic item для результата "
+        "каждого вопроса, даже если показатели похожи.\n"
         "- exact_physical_predicate: true, если контекстный документ явно задаёт "
         "operator и literal_or_reference как физическое представление предиката; "
         "такое явное представление обязательно и не заменяется. Иначе false;\n"
@@ -73,13 +76,10 @@ def build_adaptive_query_understanding_prompt(
         "Существительное, называющее весь тип сущности или домен, само по себе "
         "не является "
         "data FILTER и не превращается в literal для eq.\n"
-        "Категория или подтип этой сущности, ограничивающие выбранные строки, "
-        "являются обязательным FILTER с выраженными operator и "
-        "literal_or_reference.\n"
-        "Не дублируй отдельным FILTER фразу, уже входящую в METRIC, если вопрос "
-        "не противопоставляет ей другие строки и явно не требует их исключить.\n"
-        "Явное невременное условие, ограничивающее выбранные строки, является "
-        "обязательным FILTER с выраженными operator и literal_or_reference.\n"
+        "Не придумывай отсутствующий в вопросе более общий класс, чтобы объявить "
+        "названный тип сущности его категорией или подтипом и создать FILTER.\n"
+        "Контекст события или источника, уже включённый в смысл METRIC, "
+        "не дублируй отдельным FILTER без самостоятельного условия отбора.\n"
         "Если ограничение полностью выражено FORMULA, не добавляй для него FILTER "
         "и не придумывай literal_or_reference.\n"
         "Когда показатель сначала вычисляется на явно названном уровне группировки, "
@@ -120,9 +120,23 @@ def build_adaptive_query_completeness_prompt(
     initial_response: Any,
     *,
     context_documents: tuple[str, ...] = (),
+    schema_context: str = "",
 ) -> str:
     """Prompt for one mandatory correction of an initially valid QuerySpec."""
     escaped_initial_response = json.dumps(initial_response, ensure_ascii=False)
+    escaped_schema_context = json.dumps(schema_context, ensure_ascii=False)
+    schema_guidance = (
+        "Используй доверенное ограниченное описание схемы только чтобы отличить "
+        "описание домена или типа всех записей от условия отбора части строк; "
+        "не добавляй таблицы, колонки или bindings в ответ. Если описание таблицы "
+        "говорит, что все её записи относятся к названному домену или типу события, "
+        "та же фраза внутри METRIC не является отдельным FILTER без самостоятельного "
+        "условия отбора.\n\n"
+        "Доверенное ограниченное описание схемы как JSON string:\n"
+        f"{escaped_schema_context}\n\n"
+        if schema_context
+        else ""
+    )
     return (
         build_adaptive_query_understanding_prompt(
             text,
@@ -133,6 +147,7 @@ def build_adaptive_query_completeness_prompt(
         "покрывать каждый явно запрошенный результат или выходное поле, "
         "показатель, условие, группировку, порядок и limit из исходного текста "
         "и контекстных документов.\n\n"
+        f"{schema_guidance}"
         f"Первоначальный JSON-разбор как JSON object:\n{escaped_initial_response}"
     )
 

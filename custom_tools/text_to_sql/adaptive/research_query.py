@@ -663,6 +663,8 @@ def _resolve_columns(
     outputs: tuple[str, ...],
 ) -> None:
     for column in scope.columns:
+        if _is_resolved_outer_column(scope, column):
+            continue
         if (
             not sources
             and column.find_ancestor(exp.Select) is not scope.expression
@@ -711,6 +713,21 @@ def _resolve_columns(
                 "research_query_column_ambiguous",
                 "unqualified research SQL column is ambiguous",
             )
+
+
+def _is_resolved_outer_column(scope: Scope, column: exp.Column) -> bool:
+    if not any(column is external for external in scope.external_columns):
+        return False
+    qualifier = _canonical_optional_identifier(column.args.get("table"))
+    parent = scope.parent
+    while qualifier and parent is not None:
+        if any(
+            _source_alias_key(alias, node) == qualifier
+            for alias, (node, _) in parent.selected_sources.items()
+        ):
+            return True
+        parent = parent.parent
+    return False
 
 
 def _matching_column(

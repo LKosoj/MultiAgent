@@ -7,6 +7,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from custom_tools.text_to_sql.adaptive.evidence import probe_result_to_evidence
 from custom_tools.text_to_sql.adaptive.models import (
     BudgetState,
@@ -361,6 +363,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
             "run_id": "run-memory",
             "run_incarnation": "incarnation-memory",
             "context_documents": context_documents,
+            "schema_context": "public.revenue(amount:DECIMAL 'Recorded revenue amount')",
         }
     ]
     assert result["ready_for_sql"] is True
