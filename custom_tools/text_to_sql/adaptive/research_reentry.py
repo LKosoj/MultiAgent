@@ -14,6 +14,7 @@ from ._policy_common import BudgetAdmissionError, BudgetExhaustedError
 from .freshness import FreshnessContext
 from .model_budget import ModelUsageBudgetError
 from .models import (
+    BindingStatus,
     ColumnRef,
     DocumentRef,
     DocumentRuleBinding,
@@ -21,6 +22,7 @@ from .models import (
     QueryProbeRef,
     ResearchReentryRecord,
     ResearchReentryStatus,
+    ResearchStopReason,
     ResearchState,
     SolverState,
     StrictModel,
@@ -87,17 +89,32 @@ async def run_targeted_research_reentry(
     is_cancelled: Callable[[], bool],
     id_factory: Callable[[], str],
     commit_solver_admission: SolverAdmissionCommit | None = None,
+    continue_research: Callable[..., object] | None = None,
+    resume_admitted: bool = False,
 ) -> ResearchReentryOutcome:
     """Run exactly one W3 decision and keep every failure logically terminal."""
 
-    admitted = admit_targeted_reentry(
-        solver_state,
-        research_state,
-        missing_evidence_request_id,
-        base_revision=solver_state.revision,
-        id_factory=id_factory,
-    )
-    _commit_admission(admitted, commit_solver_admission)
+    if resume_admitted:
+        records = tuple(
+            record
+            for record in solver_state.research_reentries
+            if record.missing_evidence_request_id == missing_evidence_request_id
+            and record.status is ResearchReentryStatus.ADMITTED
+        )
+        if len(records) != 1:
+            raise ResearchReentryError(
+                "semantic repair recovery requires one admitted re-entry"
+            )
+        admitted = ResearchReentryTransitionResult(solver_state, records[0])
+    else:
+        admitted = admit_targeted_reentry(
+            solver_state,
+            research_state,
+            missing_evidence_request_id,
+            base_revision=solver_state.revision,
+            id_factory=id_factory,
+        )
+        _commit_admission(admitted, commit_solver_admission)
     current_research = research_state
     try:
         if not all(
@@ -131,6 +148,24 @@ async def run_targeted_research_reentry(
             ResearchReentryError,
             "freshness_context",
         )
+        request = next(
+            item
+            for item in admitted.state.missing_evidence_requests
+            if item.missing_evidence_request_id == missing_evidence_request_id
+        )
+        if resume_admitted:
+            if request.repair_kind != "semantic_binding_mismatch":
+                raise ResearchReentryError(
+                    "only semantic binding repair may resume after its durable probe"
+                )
+            return await _complete_semantic_repair(
+                admitted,
+                current_research,
+                research_state,
+                request,
+                freshness,
+                continue_research,
+            )
         authority = revalidate_exact_model(
             requirements,
             CoverageRequirements,
@@ -147,11 +182,6 @@ async def run_targeted_research_reentry(
             raise ResearchReentryError(
                 "requirements must be exact current W4 authority"
             )
-        request = next(
-            item
-            for item in admitted.state.missing_evidence_requests
-            if item.missing_evidence_request_id == missing_evidence_request_id
-        )
         trusted_targets = _trusted_targets(
             request.source_id, current_research, authority
         )
@@ -199,7 +229,10 @@ async def run_targeted_research_reentry(
         if (
             claim is None
             or getattr(resolved, "invocation", None) is None
-            or not _is_allowed_target(claim.target, trusted_targets)
+            or (
+                request.repair_kind != "semantic_binding_mismatch"
+                and not _is_allowed_target(claim.target, trusted_targets)
+            )
         ):
             raise ResearchReentryError(
                 "resolved W3 target is outside trusted research scope"
@@ -251,6 +284,16 @@ async def run_targeted_research_reentry(
                 admitted,
                 current_research,
                 ResearchReentryStatus.TOOL_FAILURE,
+            )
+
+        if request.repair_kind == "semantic_binding_mismatch":
+            return await _complete_semantic_repair(
+                admitted,
+                current_research,
+                research_state,
+                request,
+                freshness,
+                continue_research,
             )
 
         boundary = _boundary_status(deadline, is_cancelled, "research finalization")
@@ -321,6 +364,120 @@ def _commit_admission(
     ):
         raise ResearchReentryError(
             "solver admission commit did not confirm the exact state"
+        )
+
+
+def _continuation_status(reason: ResearchStopReason) -> ResearchReentryStatus:
+    return {
+        ResearchStopReason.BUDGET_EXHAUSTED: ResearchReentryStatus.BUDGET_EXHAUSTED,
+        ResearchStopReason.DEADLINE_EXCEEDED: ResearchReentryStatus.DEADLINE_EXCEEDED,
+        ResearchStopReason.CANCELLED: ResearchReentryStatus.CANCELLED,
+        ResearchStopReason.TOOL_FAILURE: ResearchReentryStatus.TOOL_FAILURE,
+    }.get(reason, ResearchReentryStatus.PROTOCOL_FAILURE)
+
+
+async def _complete_semantic_repair(
+    admitted: ResearchReentryTransitionResult,
+    current: ResearchState,
+    baseline: ResearchState,
+    request,
+    freshness: FreshnessContext,
+    continue_research: Callable[..., object] | None,
+) -> ResearchReentryOutcome:
+    from .research_loop import ResearchLoopOutcome
+
+    if not callable(continue_research):
+        raise ResearchReentryError(
+            "semantic binding repair requires existing research continuation"
+        )
+    continuation = continue_research(current, request)
+    if inspect.isawaitable(continuation):
+        continuation = await continuation
+    if type(continuation) is not ResearchLoopOutcome:
+        raise ResearchReentryError("research continuation returned an invalid outcome")
+    if continuation.stop_reason is not ResearchStopReason.COMPLETE:
+        return _terminal(
+            admitted,
+            continuation.final_state,
+            _continuation_status(continuation.stop_reason),
+        )
+    result = continuation.final_state
+    if result.revision <= current.revision:
+        raise ResearchReentryError(
+            "semantic binding repair requires a later research revision"
+        )
+    _validate_semantic_repair_result(
+        baseline,
+        result,
+        request.source_id,
+        request.repair_binding_id,
+    )
+    refreshed = FreshnessContext(
+        evaluated_at=datetime.now(UTC),
+        run_id=freshness.run_id,
+        run_incarnation=freshness.run_incarnation,
+        schema_namespace_version=freshness.schema_namespace_version,
+        document_sources=freshness.document_sources,
+        data_snapshots=freshness.data_snapshots,
+    )
+    requirements = validate_coverage_inputs(
+        result,
+        refreshed,
+        result.run_id,
+        result.run_incarnation,
+    )
+    finalized = finalize_targeted_reentry(
+        admitted.state,
+        admitted.record.research_reentry_id,
+        ResearchReentryStatus.COMPLETED,
+        base_revision=admitted.state.revision,
+        research_state=result,
+        freshness_context=refreshed,
+        requirements=requirements,
+    )
+    return ResearchReentryOutcome(
+        finalized.state,
+        result,
+        finalized.record,
+        refreshed,
+        requirements,
+    )
+
+
+def _validate_semantic_repair_result(
+    baseline: ResearchState,
+    result: ResearchState,
+    source_id: str,
+    stale_binding_id: str | None,
+) -> None:
+    stale = tuple(
+        binding
+        for binding in result.bindings
+        if binding.binding_id == stale_binding_id
+        and binding.source_id == source_id
+        and binding.status is BindingStatus.STALE
+    )
+    replacements = tuple(
+        binding
+        for binding in result.bindings
+        if binding.source_id == source_id
+        and binding.binding_id != stale_binding_id
+        and binding.status is BindingStatus.SUPPORTED
+    )
+    baseline_other = tuple(
+        binding for binding in baseline.bindings if binding.source_id != source_id
+    )
+    result_other = tuple(
+        binding for binding in result.bindings if binding.source_id != source_id
+    )
+    if (
+        stale_binding_id is None
+        or len(stale) != 1
+        or not replacements
+        or result_other != baseline_other
+    ):
+        raise ResearchReentryError(
+            "semantic binding repair did not replace only the failed source"
         )
 
 

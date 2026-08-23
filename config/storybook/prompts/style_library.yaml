@@ -1,0 +1,256 @@
+# Каталог визуальных стилей для storybook/видео-пайплайна.
+#
+# Зачем: раньше `custom_tools/storybook/style_keeper.py` просил LLM выдумать
+# art_style/palette/lighting/texture «с чистого листа» на каждый проект.
+# Результат не воспроизводился между запусками и не содержал признаков
+# носителя (мазок, зерно, поры кожи) — картинка сваливалась в безликий
+# дефолт генератора.
+#
+# Здесь лежит проверенный набор пресетов: LLM выбирает `style_preset_id`
+# из каталога и дописывает проектную специфику поверх него.
+#
+# Пресеты доменно-нейтральны: это визуальные языки, а не привязка к сюжету
+# (ср. config/storybook/prompts/domain_glossary.yaml — там домен, здесь стиль).
+#
+# Активный профиль выбирается:
+#   1. явный аргумент функций get_active_style_profile/compose_*;
+#   2. env STORYBOOK_STYLE_PROFILE;
+#   3. иначе — "default".
+#
+# Override пути: env STORYBOOK_STYLE_LIBRARY_PATH.
+#
+# Поля пресета:
+#   material_signature — признак носителя (мазок/зерно/фактура). Главная
+#     защита от «пластикового» AI-look: без него модель усредняет стиль.
+#   camera_defaults    — оптика/охват по крупности плана. Конкретный параметр
+#     (85mm f/1.8) работает стабильнее прилагательного («крупный портрет»).
+#   negative_seed      — стилевые запреты, попадают в negative_prompt_list.txt.
+#   pitfalls           — правила для промпт-инженера (что модель ломает чаще
+#     всего именно в этом стиле).
+version: 1
+
+profiles:
+  default:
+    # Пресет, который берётся, если LLM вернул неизвестный style_preset_id.
+    fallback_preset_id: storybook_watercolor
+
+    # Применяется поверх любого пресета.
+    universal_negative_seed:
+      - nsfw
+      - watermark
+      - signature
+      - logo
+      - lowres
+      - jpeg artifacts
+      - distorted hands
+      - extra limbs
+      - extra fingers
+      - deformed face
+      - asymmetric eyes
+      - floating objects
+      - duplicated subject
+
+    universal_pitfalls:
+      - "Не называй художников, студии и фотографов по имени: модель копирует их известную работу целиком. Описывай признак (характер мазка, тип света), а не фамилию."
+      - "Не описывай стиль прилагательными вроде 'красиво' или 'качественно' — это не управляет генерацией. Работает только конкретика носителя, света и оптики."
+      - "Идентичность персонажа фиксируй перед описанием позы и действия, а не после: чем длиннее описание действия, тем выше риск подмены лица и костюма."
+
+    presets:
+      - id: storybook_watercolor
+        title: "Watercolour storybook"
+        when_to_use: "Тёплая детская или семейная история, мягкий тон, сказка, притча."
+        art_style: "hand-painted watercolour children's book illustration"
+        color_palette: ["warm pastel", "muted earth tones", "soft cream base"]
+        composition_rules: ["rule of thirds", "generous negative space", "single clear focal subject"]
+        lighting: "soft diffused daylight, gentle warm key, low-contrast shadows"
+        texture: "cold-pressed paper grain visible through the wash"
+        detail_density: "medium"
+        material_signature: "visible wet-on-wet blooms, uneven pigment edges, granulation in shadows, pencil under-drawing showing through in places"
+        camera_defaults:
+          close_up: "subject fills upper two thirds, hands and face fully inside the frame"
+          medium: "waist-up framing with room above the head"
+          wide: "subject at one third of frame height, environment readable around it"
+        negative_seed:
+          - 3d render
+          - photorealistic
+          - glossy plastic surfaces
+          - harsh digital gradients
+          - heavy uniform black outlines
+          - airbrushed shading
+        pitfalls:
+          - "Без явного указания на разводы и зерно бумаги акварель вырождается в гладкий цифровой градиент — держи material_signature в промпте."
+          - "Не смешивай акварель с толстым контуром: получается стикер, а не иллюстрация."
+
+      - id: gouache_picturebook
+        title: "Opaque gouache picture book"
+        when_to_use: "Плотная, насыщенная книжная иллюстрация; фольклор, приключение, яркий детский разворот."
+        art_style: "opaque gouache picture-book illustration with flat layered shapes"
+        color_palette: ["saturated primaries", "deep teal shadows", "warm ochre highlights"]
+        composition_rules: ["strong silhouette reading", "layered fore/mid/background planes", "flat perspective"]
+        lighting: "graphic light with defined shadow shapes, minimal gradient"
+        texture: "dry-brush drag marks over matte opaque paint"
+        detail_density: "medium-high"
+        material_signature: "visible brush ridges, matte chalky surface, slightly uneven flat fills, hand-cut shape edges"
+        camera_defaults:
+          close_up: "head and shoulders occupying central third, background reduced to two flat planes"
+          medium: "three-quarter figure, two overlapping depth planes"
+          wide: "full scene in three stacked planes, horizon in upper third"
+        negative_seed:
+          - watercolour transparency
+          - photorealistic
+          - lens blur
+          - glossy highlights
+          - noisy digital texture
+        pitfalls:
+          - "Гуашь читается силуэтом: если субъект сливается с фоном по тону, кадр разваливается — держи контраст планов."
+          - "Не добавляй фотографическое боке: плоская заливка и линзовое размытие конфликтуют."
+
+      - id: ink_line_wash
+        title: "Ink line and wash"
+        when_to_use: "Графичная, чуть тревожная или ироничная история; городская проза, детектив для детей, басня."
+        art_style: "pen-and-ink line drawing with limited wash"
+        color_palette: ["black ink", "two-tone limited wash", "paper white"]
+        composition_rules: ["line weight hierarchy", "large empty areas", "off-centre subject"]
+        lighting: "implied light through hatching density, not through colour"
+        texture: "hatching and cross-hatching, ink bleed into fibre"
+        detail_density: "high in subject, sparse in background"
+        material_signature: "varying nib pressure, occasional ink blot, dry line breaks, wash pooling at contour edges"
+        camera_defaults:
+          close_up: "face and hands only, background left as bare paper"
+          medium: "figure to mid-thigh, single anchoring prop"
+          wide: "small figure against sparse architectural lines"
+        negative_seed:
+          - full colour painting
+          - 3d render
+          - soft airbrush
+          - photographic texture
+          - uniform vector lines
+        pitfalls:
+          - "Без разной толщины линии рисунок становится векторным клипартом — задавай иерархию веса линии."
+          - "Заливка не должна закрывать штриховку: свет здесь строится плотностью штриха."
+
+      - id: cel_animation_2d
+        title: "2D cel animation frame"
+        when_to_use: "Динамичная анимационная история, приключение, комедия; кадр как стоп-кадр мультфильма."
+        art_style: "2D cel-animation production frame with clean line art"
+        color_palette: ["clear saturated cel colours", "two-step shadow tone", "bright rim accents"]
+        composition_rules: ["clear staging of the action", "readable silhouette", "background painted softer than characters"]
+        lighting: "two-tone cel shading with a defined shadow terminator"
+        texture: "flat cel fills over a painted background"
+        detail_density: "medium"
+        material_signature: "clean closed line art, hard-edged two-step shadows, characters sharper than the painted background"
+        camera_defaults:
+          close_up: "face fills the frame, background reduced to soft colour field"
+          medium: "figure to knees, action fully staged inside the frame"
+          wide: "establishing layout with painted background depth"
+        negative_seed:
+          - photorealistic skin
+          - 3d render
+          - sketchy unfinished lines
+          - realistic film grain
+          - muddy blended shading
+        pitfalls:
+          - "Cel-стиль ломается от мягких растушёвок: тень должна быть с чёткой границей, максимум два шага."
+          - "Фон, прорисованный так же резко, как персонаж, съедает читаемость кадра."
+
+      - id: stylized_3d_render
+        title: "Stylized 3D animation render"
+        when_to_use: "Современная анимационная история для семейного просмотра, объёмные герои, мягкий свет."
+        art_style: "stylized 3D animation render with appealing proportions"
+        color_palette: ["clean saturated hues", "cool shadow tint", "warm key accent"]
+        composition_rules: ["clear depth staging", "subject separated from background by value", "eye-level framing"]
+        lighting: "three-point setup, soft key with visible rim separation"
+        texture: "subsurface scattering on skin, micro-detail on fabric"
+        detail_density: "high"
+        material_signature: "readable material response: fabric weave, subtle skin translucency, soft contact shadows under every supported object"
+        camera_defaults:
+          close_up: "85mm f/2.0"
+          medium: "50mm f/2.8"
+          wide: "28mm f/5.6"
+        negative_seed:
+          - flat 2d shading
+          - plastic uniform surfaces
+          - missing contact shadows
+          - waxy skin
+          - hard clipping highlights
+        pitfalls:
+          - "Без контактных теней объекты 'висят' над поверхностью — это первый признак сгенерированного 3D."
+          - "Однородный материал на всём кадре читается как пластик: у ткани, кожи и металла должен быть разный отклик на свет."
+
+      - id: cinematic_photoreal
+        title: "Cinematic photoreal"
+        when_to_use: "Игровой кинокадр, драма, взрослая история; нужен киношный свет и оптика."
+        art_style: "cinematic photoreal frame, anamorphic feature-film look"
+        color_palette: ["desaturated mid-tones", "warm practical highlights", "cool shadow roll-off"]
+        composition_rules: ["frame the subject off-centre", "foreground occlusion for depth", "motivated light source in frame"]
+        lighting: "motivated practical key, soft fill, visible falloff"
+        texture: "skin pores, fabric weave, dust in the air"
+        detail_density: "high"
+        material_signature: "visible skin pores and fine facial hair, subtle film grain, uneven specular highlights, slight lens falloff at the edges"
+        camera_defaults:
+          close_up: "85mm f/1.8"
+          medium: "50mm f/2.0"
+          wide: "24mm f/8.0"
+        negative_seed:
+          - illustration
+          - anime
+          - cgi look
+          - plastic airbrushed skin
+          - over-clean symmetrical composition
+          - studio-perfect beauty lighting
+          - hdr halo
+        pitfalls:
+          - "Кожа без пор и кадр без зерна читаются как рендер, даже если всё остальное верно."
+          - "Идеально чистый и симметричный кадр выглядит сгенерированным: оставляй бытовой беспорядок и естественную асимметрию."
+          - "Не смешивай температуру в кельвинах с описанием 'тёплый/холодный' в одном кадре — задавай что-то одно."
+
+      - id: documentary_realism
+        title: "Documentary realism"
+        when_to_use: "Репортажная, бытовая или тревожная сцена; нужна достоверность, а не красота кадра."
+        art_style: "handheld documentary photograph, raw unedited look"
+        color_palette: ["natural unfiltered colour", "available light cast", "no colour grading"]
+        composition_rules: ["imperfect handheld framing", "subject caught mid-situation", "background left as found"]
+        lighting: "available light only, direction consistent with the visible source"
+        texture: "sensor noise in shadows, real surface wear"
+        detail_density: "high"
+        material_signature: "raw unedited photo look, slight handheld tilt, natural clutter and wear left in frame, shadows falling in one consistent direction"
+        camera_defaults:
+          close_up: "50mm f/2.8, slight handheld tilt"
+          medium: "35mm f/4.0"
+          wide: "24mm f/5.6, horizon not perfectly level"
+        negative_seed:
+          - illustration
+          - anime
+          - cgi
+          - studio lighting
+          - over-clean staged composition
+          - poster design
+          - brand text
+          - heavy colour grading
+        pitfalls:
+          - "Документальность держится на несовершенстве: убери 'вылизанность', иначе кадр читается как постановка."
+          - "Тени от разных объектов должны идти в одну сторону — расходящиеся тени сразу выдают генерацию."
+
+      - id: retro_print
+        title: "Retro print / risograph"
+        when_to_use: "Стилизация под печать, ретро-плакат, ироничная или ностальгическая история."
+        art_style: "risograph-style limited-run print illustration"
+        color_palette: ["two or three spot inks", "unprinted paper as the light tone"]
+        composition_rules: ["poster-like flat layout", "bold shapes over detail", "text-free image area"]
+        lighting: "implied by ink density, no photographic light"
+        texture: "halftone dots, slight misregistration between ink layers"
+        detail_density: "low-medium"
+        material_signature: "visible halftone screen, 1-2mm ink layer misregistration, uneven ink coverage, absorbed matte paper surface"
+        camera_defaults:
+          close_up: "subject cropped boldly, one ink dominating"
+          medium: "figure as a flat shape against a single ink field"
+          wide: "poster layout with large flat colour areas"
+        negative_seed:
+          - photorealistic
+          - 3d render
+          - smooth digital gradients
+          - full cmyk photographic colour
+          - glossy finish
+        pitfalls:
+          - "Без смещения слоёв и растровой точки риз-стиль превращается в обычную плоскую вектор-графику."
+          - "Больше трёх красок ломает приём: держи ограниченную палитру."

@@ -20,6 +20,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchState,
     SemanticItemKind,
     SemanticItemStatus,
+    is_binding_free_semantic_item,
 )
 from custom_tools.text_to_sql.adaptive.policy import (
     evaluate_research_generation_authority,
@@ -181,6 +182,55 @@ def test_validated_join_is_eligible_without_legacy_binding_paths() -> None:
     assert tuple(join.join_id for join in authority.requirements.eligible_validated_joins) == (
         "aggregate-bounds",
     )
+
+
+def test_required_formula_does_not_require_a_physical_binding() -> None:
+    state = _state(
+        item_specs=(("formula", True, SemanticItemStatus.UNRESOLVED, ()),),
+        bindings=(),
+        evidence=(),
+        unresolved_items=(),
+    )
+    formula = state.query_spec.semantic_items[0].model_copy(
+        update={"kind": SemanticItemKind.FORMULA}
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula,)}
+            )
+        }
+    )
+
+    authority = evaluate_research_generation_authority(
+        state, _context(), state.run_id, state.run_incarnation
+    )
+
+    assert authority.allowed is True
+    assert authority.requirements is not None
+    assert authority.requirements.required_source_ids == ("formula",)
+    assert authority.requirements.selected_bindings == ()
+
+
+def test_unsupported_formula_still_blocks_generation() -> None:
+    state = _state(
+        item_specs=(("formula", True, SemanticItemStatus.UNSUPPORTED, ()),),
+        bindings=(),
+        evidence=(),
+        unresolved_items=("formula",),
+    )
+    formula = state.query_spec.semantic_items[0].model_copy(
+        update={"kind": SemanticItemKind.FORMULA}
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula,)}
+            )
+        }
+    )
+
+    assert is_binding_free_semantic_item(formula) is False
 
 
 def test_unrelated_validated_join_cannot_satisfy_required_path() -> None:

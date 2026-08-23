@@ -150,6 +150,7 @@ def _state() -> ResearchState:
                 binding_ids=(),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -350,6 +351,7 @@ def _formula_assessment_admission(
         query_id="query-formula",
         original_text="margin other",
         semantic_items=(formula_item, other_item),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -685,7 +687,9 @@ def _join_candidate(
     right: tuple[str, str],
     join_type: str,
     path: tuple[tuple[tuple[str, str], tuple[str, str]], ...],
-) -> JoinCandidate:
+    declared_join_ids: tuple[str, ...] = (),
+    return_admission: bool = False,
+) -> JoinCandidate | object:
     typed_join_type = JoinType(join_type)
     proposal = {
         "proposal_type": "new_join",
@@ -730,9 +734,31 @@ def _join_candidate(
             )
             for table, column in sorted(logical_columns)
         ),
+        declared_join_ids=declared_join_ids,
     )
+    state = _state()
+    if return_admission:
+        evidence = _column_evidence(_column(*left), "evidence-1")
+        certificate_action = ResearchAction(
+            action_id="action-evidence-1",
+            kind=ResearchActionKind.INSPECT_COLUMN,
+            hypothesis_id=None,
+            target=evidence.target,
+            parameters=(),
+            action_digest=canonical_action_digest(
+                kind=ResearchActionKind.INSPECT_COLUMN,
+                hypothesis_id=None,
+                target=evidence.target,
+                parameters=(),
+                expected_revision=0,
+            ),
+            expected_revision=0,
+        )
+        state = apply_research_transition(
+            state, certificate_action, evidence=(evidence,)
+        ).state
     admission = admit_semantic_turn(
-        _state(),
+        state,
         decision,
         batch=batch,
         freshness_context=_context(),
@@ -743,7 +769,63 @@ def _join_candidate(
             parameters=(),
         ),
     )
-    return admission.join_candidates[0]
+    return admission if return_admission else admission.join_candidates[0]
+
+
+def test_new_join_between_existing_columns_is_validated_without_assessment() -> None:
+    candidate = _join_candidate(
+        ("orders", "customer_id"),
+        ("customers", "id"),
+        "inner",
+        (),
+    )
+    declared = _join_candidate(
+        ("orders", "customer_id"),
+        ("customers", "id"),
+        "inner",
+        (),
+        (candidate.join_id,),
+    )
+
+    assert candidate.status is JoinCandidateStatus.VALIDATED
+    assert declared.status is JoinCandidateStatus.VALIDATED
+
+    admission = _join_candidate(
+        ("orders", "customer_id"),
+        ("customers", "id"),
+        "inner",
+        (),
+        (candidate.join_id,),
+        return_admission=True,
+    )
+    assert commit_semantic_turn(admission).state.join_candidates[0].status is (
+        JoinCandidateStatus.VALIDATED
+    )
+
+
+def test_recovery_commits_prepared_validated_join_without_transient_ids() -> None:
+    from dataclasses import replace
+
+    candidate = _join_candidate(
+        ("orders", "customer_id"),
+        ("customers", "id"),
+        "inner",
+        (),
+    )
+    admission = _join_candidate(
+        ("orders", "customer_id"),
+        ("customers", "id"),
+        "inner",
+        (),
+        (candidate.join_id,),
+        return_admission=True,
+    )
+
+    recovered = commit_semantic_turn(
+        replace(admission, declared_join_ids=())
+    ).state
+
+    assert recovered.join_candidates[0].status is JoinCandidateStatus.VALIDATED
 
 
 def test_semantic_reducer_module_exports_closed_admission_api() -> None:
@@ -1378,6 +1460,68 @@ def test_discriminator_certificate_accepts_exact_ordered_values(
     )
 
     assert _discriminator_certificate(binding, cited) is True
+
+
+def test_discriminator_assessment_does_not_require_an_observed_matching_row() -> None:
+    column = _column("events", "occurred_on")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.LIKE,
+        right="2024-06%",
+    )
+    schema = _column_evidence(column, "schema")
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-time",
+        source_id="source-time",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=(schema.evidence_id,),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=column,
+        discriminator_predicate=predicate,
+    )
+
+    assessed = _assess_binding(
+        binding,
+        "consistent",
+        (schema,),
+        {},
+    )
+
+    assert assessed.status is BindingStatus.SUPPORTED
+
+
+@pytest.mark.parametrize("right", (float("nan"), float("inf"), float("-inf")))
+def test_discriminator_certificate_rejects_non_finite_literal(right: float) -> None:
+    column = _column("events", "measurement")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.EQ,
+        right=right,
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-measurement",
+        source_id="source-measurement",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("schema",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=column,
+        discriminator_predicate=predicate,
+    )
+
+    assert _discriminator_certificate(
+        binding,
+        (_column_evidence(column, "schema"),),
+    ) is False
 
 
 @pytest.mark.parametrize(

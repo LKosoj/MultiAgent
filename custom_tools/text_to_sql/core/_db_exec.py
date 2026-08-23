@@ -909,11 +909,11 @@ def _validate_research_query(
     dsn: Optional[str],
     parameters: tuple[QueryParameter, ...],
 ) -> None:
-    """Admit one bounded, projection-explicit read query before any connection.
+    """Admit one bounded read query before any connection.
 
     This deliberately uses the normal dialect resolver and parser instead of
     SQLite syntax.  It is an execution boundary, not a query rewriter: callers
-    must state their own positive SQL LIMIT and a concrete projection.
+    must state their own positive SQL LIMIT.
     """
     from ..dialects import get_sqlglot_dialect
     from ..utils import parse_with_timeout
@@ -964,6 +964,11 @@ def _validate_research_query(
         not (
             isinstance(star.parent, exp.Count)
             and star.parent.this is star
+            or (
+                isinstance(star.parent, exp.Select)
+                and star in star.parent.expressions
+                and all(value is None for value in star.args.values())
+            )
         )
         for star in statement.find_all(exp.Star)
     )

@@ -199,10 +199,14 @@ def live_terminal_document_freshness_context(
     terminals = tuple(
         event for event in events if event.phase.value == "terminal"
     )
-    if len(terminals) != 1 or terminals[0].key.revision != state.revision:
+    matching = tuple(
+        event for event in terminals if event.key.revision == state.revision
+    )
+    if len(matching) != 1:
         raise DocumentAuthorityError("terminal replay input is unavailable")
-    replay_input = checkpoint_store.load_terminal_replay_input(terminals[0].key)
-    _validate_terminal_replay_authority(state, terminals[0].action, replay_input)
+    terminal = matching[0]
+    replay_input = checkpoint_store.load_terminal_replay_input(terminal.key)
+    _validate_terminal_replay_authority(state, terminal.action, replay_input)
     return _revalidated_document_freshness_context(
         runtime,
         state,
@@ -216,7 +220,20 @@ def live_solver_document_freshness_context(
     runtime: object,
     state: ResearchState,
 ) -> FreshnessContext:
-    """Use a terminal or completed re-entry replay input for solver authority."""
+    """Revalidate the persisted solver reference for SQL generation."""
+
+    return _revalidated_document_freshness_context(
+        runtime,
+        state,
+        solver_document_freshness_reference(runtime, state),
+    )
+
+
+def solver_document_freshness_reference(
+    runtime: object,
+    state: ResearchState,
+) -> FreshnessContext:
+    """Return the exact persisted terminal or completed re-entry reference."""
 
     from custom_tools.text_to_sql.adaptive.models import ResearchReentryStatus
     from custom_tools.text_to_sql.adaptive.replay_inputs import (
@@ -238,9 +255,9 @@ def live_solver_document_freshness_context(
     terminals = tuple(
         event for event in events if event.phase is AdaptiveActionPhase.TERMINAL
     )
-    if len(terminals) != 1:
+    if not terminals:
         raise DocumentAuthorityError("research terminal replay input is unavailable")
-    terminal = terminals[0]
+    terminal = terminals[-1]
     replay_input = checkpoint_store.load_terminal_replay_input(terminal.key)
     if type(replay_input) is not ResearchTerminalReplayInput:
         raise DocumentAuthorityError("terminal replay input is unavailable")
@@ -309,7 +326,7 @@ def live_solver_document_freshness_context(
         reference = completed_inputs[0].freshness_context
     else:
         raise DocumentAuthorityError("research state predates terminal replay input")
-    return _revalidated_document_freshness_context(runtime, state, reference)
+    return reference
 
 
 def _revalidated_document_freshness_context(
@@ -462,6 +479,7 @@ __all__ = (
     "live_document_freshness_context",
     "live_solver_document_freshness_context",
     "live_terminal_document_freshness_context",
+    "solver_document_freshness_reference",
     "validated_document_snapshot",
     "validated_document_source_states",
 )

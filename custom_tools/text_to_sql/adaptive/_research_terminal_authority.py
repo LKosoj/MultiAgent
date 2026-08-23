@@ -17,7 +17,7 @@ from .models import (
     JoinCandidateStatus,
     ResearchState,
     ResearchStopReason,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
 )
 from .semantic_coverage import CoverageInputErrorCode
 
@@ -151,7 +151,7 @@ def _affected_source_ids(state: ResearchState) -> tuple[str, ...]:
     for item in state.query_spec.semantic_items:
         if not item.required:
             continue
-        if is_binding_free_structural_limit(item, state.bindings):
+        if is_binding_free_semantic_item(item, state.bindings):
             continue
         selected = [bindings.get(binding_id) for binding_id in item.binding_ids]
         if (

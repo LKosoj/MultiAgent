@@ -5624,6 +5624,64 @@ def test_workflow_result_payload_preserves_validated_identity_only(monkeypatch):
     assert payload["snapshot"]["payload_value"] == "public::content-sentinel"
 
 
+def test_workflow_result_payload_preserves_nested_review_identity(monkeypatch):
+    streamlit_api = _load_light_workflow_streamlit_api()
+    run_id = "terminal-review-run"
+    review_incarnation = "receipt-incarnation"
+    review_digest = "sha256:" + "4111111111111111" + "0" * 48
+
+    def public_transform(value):
+        if isinstance(value, dict):
+            return {key: public_transform(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [public_transform(item) for item in value]
+        if value == review_incarnation:
+            return "public::receipt-incarnation"
+        if value == review_digest:
+            return "sha256:[CARD]" + "0" * 48
+        return value
+
+    monkeypatch.setattr(streamlit_api, "redact_pii_in_payload", public_transform)
+    terminal = _terminal_contract_payload("succeeded", run_id)
+    terminal["result_review"] = {
+        "record_kind": "text2sql_result_review",
+        "run_id": run_id,
+        "run_incarnation": review_incarnation,
+        "research_state_revision": 11,
+        "candidate_id": "candidate-11",
+        "normalized_ast_digest": review_digest,
+        "requirements_digest": "sha256:" + "1" * 64,
+        "source_id": None,
+        "evidence_id": None,
+        "verdict": "consistent",
+        "reason": "review confirmed result",
+        "execution": terminal["execution"],
+        "deterministic_failure_code": None,
+    }
+    terminal = streamlit_api.TextToSqlTerminalResult.from_mapping(terminal).to_mapping()
+
+    payload = streamlit_api._build_workflow_result_event_payload(
+        run_id,
+        terminal,
+        "completed",
+        artifacts={
+            "terminal_outcome": terminal,
+            "final_output": terminal,
+        },
+        snapshot={"workflow_name": "text_to_sql_pipeline"},
+        terminal_outcome=terminal,
+    )
+
+    for terminal_copy in (
+        payload["terminal_outcome"],
+        payload["result"],
+        payload["artifacts"]["terminal_outcome"],
+        payload["artifacts"]["final_output"],
+    ):
+        assert terminal_copy == terminal
+        assert streamlit_api.TextToSqlTerminalResult.from_mapping(terminal_copy)
+
+
 @pytest.mark.parametrize(
     "terminal_location",
     ["top", "result", "artifacts.terminal_outcome", "artifacts.final_output"],
@@ -7371,16 +7429,22 @@ def test_text_to_sql_result_append_failure_publishes_coherent_terminal_failure(
 
     status = manager.get_workflow_status(run_id)
     artifacts = manager.get_workflow_artifacts(run_id)
-    assert status.status == "failed"
-    assert status.terminal_outcome["reason_code"] == "RESULT_PERSISTENCE_FAILED"
-    assert artifacts.terminal_outcome == status.terminal_outcome
-    assert artifacts.final_output == status.terminal_outcome
-    assert manager.active_runs[run_id]["final_output"] == status.terminal_outcome
+    assert status.status == "completed"
+    assert status.terminal_outcome == terminal.to_mapping()
+    assert artifacts.terminal_outcome == terminal.to_mapping()
+    assert artifacts.final_output == terminal.to_mapping()
+    assert manager.active_runs[run_id]["final_output"] == terminal.to_mapping()
     assert len(append_calls) == 2
     assert append_calls[1][0][1] == status.terminal_outcome
-    assert append_calls[1][0][2] == "failed"
+    assert append_calls[1][0][2] == "completed"
     assert append_calls[1][1]["terminal_outcome"] == status.terminal_outcome
     assert append_calls[1][1]["artifacts"]["final_output"] == status.terminal_outcome
+    assert append_calls[1][1]["artifacts"]["metadata"][
+        "result_persistence_diagnostic"
+    ] == {
+        "reason_code": "RESULT_PERSISTENCE_FAILED",
+        "error": "Не удалось записать terminal WORKFLOW_RESULT для workflow",
+    }
 
 
 @pytest.mark.parametrize(
@@ -7941,9 +8005,13 @@ def test_w0_08_persistence_fallback_keeps_result_failure_primary_for_success(
 
     assert len(appended) == 2
     fallback = appended[1][1]
-    assert fallback["terminal_outcome"]["status"] == "failed"
-    assert fallback["terminal_outcome"]["reason_code"] == "RESULT_PERSISTENCE_FAILED"
-    assert fallback["terminal_outcome"]["result_review"] == source_terminal["result_review"]
+    assert fallback["terminal_outcome"] == source_terminal
+    assert fallback["artifacts"]["terminal_outcome"] == source_terminal
+    assert fallback["artifacts"]["final_output"] == source_terminal
+    assert fallback["artifacts"]["metadata"]["result_persistence_diagnostic"] == {
+        "reason_code": "RESULT_PERSISTENCE_FAILED",
+        "error": "Не удалось записать terminal WORKFLOW_RESULT для workflow",
+    }
 
 
 def test_w0_08_missing_terminal_persistence_failure_is_primary(

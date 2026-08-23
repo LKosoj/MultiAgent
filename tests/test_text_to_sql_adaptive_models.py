@@ -100,6 +100,7 @@ def query_spec(*, semantic_items: tuple[SemanticItem, ...] | None = None) -> Que
         query_id=QUERY_ID,
         original_text="sales",
         semantic_items=semantic_items or (item(),),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -431,6 +432,7 @@ def test_query_spec_rejects_invalid_ids_and_digest(field: str, value: str) -> No
         "query_id": QUERY_ID,
         "original_text": "sales",
         "semantic_items": (item(),),
+        "requested_output_source_ids": (),
         "expected_result_shape": ExpectedResultShape.ROWS,
         "global_constraints": (),
     }
@@ -453,6 +455,30 @@ def test_run_incarnation_is_a_canonical_uuid_or_hex_identifier() -> None:
 def test_query_spec_checks_resolved_binding() -> None:
     with pytest.raises(ValidationError, match="binding_ids"):
         item(status=SemanticItemStatus.RESOLVED)
+
+
+def test_query_spec_requires_canonical_requested_output_source_ids() -> None:
+    first = item(source_id="source-1")
+    second = item(source_id="source-2")
+    values = query_spec(semantic_items=(first, second)).model_dump()
+    values["requested_output_source_ids"] = ("source-1",)
+
+    assert QuerySpec(**values).requested_output_source_ids == ("source-1",)
+
+    missing = dict(values)
+    del missing["requested_output_source_ids"]
+    with pytest.raises(ValidationError, match="requested_output_source_ids"):
+        QuerySpec(**missing)
+
+    unknown = dict(values)
+    unknown["requested_output_source_ids"] = ("source-missing",)
+    with pytest.raises(ValidationError, match="required semantic"):
+        QuerySpec(**unknown)
+
+    unordered = dict(values)
+    unordered["requested_output_source_ids"] = ("source-2", "source-1")
+    with pytest.raises(ValidationError, match="sorted"):
+        QuerySpec(**unordered)
 
 
 def test_semantic_item_does_not_require_source_span() -> None:

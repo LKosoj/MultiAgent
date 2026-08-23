@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from custom_tools.text_to_sql import core
-from custom_tools.text_to_sql.adaptive.models import CheckKind
+from custom_tools.text_to_sql.adaptive.models import CheckFailureCode, CheckKind
+from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
 from test_text_to_sql_adaptive_solver import (
     _result_contradiction_receipt,
     _successful_terminal,
@@ -411,6 +412,159 @@ def test_result_contradiction_dispatches_open_checkpoint_without_terminal_apply(
 
     assert result == terminal
     assert captured == [(step, context, "finalize")]
+
+
+@pytest.mark.parametrize(
+    ("verdict", "deterministic_failure_code", "open_repair"),
+    (
+        ("contradicted", CheckFailureCode.RESULT_SHAPE_MISMATCH, True),
+        ("ambiguous", None, True),
+        ("consistent", None, False),
+        ("malformed", None, False),
+        ("timeout", None, False),
+    ),
+)
+def test_open_result_contradiction_checkpoint_requires_actionable_review(
+    monkeypatch,
+    tmp_path,
+    verdict,
+    deterministic_failure_code,
+    open_repair,
+) -> None:
+    from workflow.text_to_sql_adaptive_solver import reconcile_known_finalizer
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime, state, store = _finalizer_runtime(tmp_path)
+    candidate = state.sql_candidates[-1]
+    source_id, evidence_id = (
+        ("status", "evidence-status-value")
+        if verdict in {"contradicted", "ambiguous"}
+        else (None, None)
+    )
+    actionable_receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=candidate.revision,
+        candidate_id=candidate.candidate_id,
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        requirements_digest="sha256:" + "a" * 64,
+        source_id="status",
+        evidence_id="evidence-status-value",
+        verdict="contradicted",
+        reason="synthetic result review",
+        execution=_successful_terminal(state)["execution"],
+        deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+    )
+    reservation = store.reserve_execution(
+        state,
+        action_revision=0,
+        candidate_id=candidate.candidate_id,
+        execution_id="review-replay",
+        request={
+            "operation": "finalize_text_to_sql_run",
+            "sql_query": candidate.sql,
+            "row_limit": 10,
+            "dry_run_only": False,
+        },
+    )
+    checkpoint = reconcile_known_finalizer(
+        store,
+        reservation,
+        state,
+        actionable_receipt.model_dump(mode="json"),
+    )
+    receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=candidate.revision,
+        candidate_id=candidate.candidate_id,
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        requirements_digest="sha256:" + "a" * 64,
+        source_id=source_id,
+        evidence_id=evidence_id,
+        verdict=verdict,
+        reason="synthetic result review",
+        execution=_successful_terminal(state)["execution"],
+        deterministic_failure_code=deterministic_failure_code,
+    )
+    monkeypatch.setattr(
+        store,
+        "load_replay_chain",
+        lambda *_args: SimpleNamespace(
+            run_id=state.run_id,
+            run_incarnation=state.run_incarnation,
+            state_revision=checkpoint.state.revision,
+            state_digest=checkpoint.cursor.state_digest,
+            next_action_revision=checkpoint.cursor.next_action_revision,
+            pending_execution_action_revision=None,
+            terminal=None,
+            actions=(
+                SimpleNamespace(
+                    action_kind="execution",
+                    action_revision=reservation.action_revision,
+                    candidate_id=candidate.candidate_id,
+                    normalized_ast_digest=candidate.normalized_ast_digest,
+                ),
+            ),
+            reconciliations=(
+                SimpleNamespace(
+                    action_revision=reservation.action_revision,
+                    outcome="KNOWN",
+                    result_state_revision=checkpoint.state.revision,
+                    result_state_digest=checkpoint.cursor.state_digest,
+                    result=receipt.model_dump(mode="json"),
+                ),
+            ),
+        ),
+    )
+
+    assert (
+        engine._open_result_contradiction_checkpoint(runtime) == checkpoint
+        if open_repair
+        else engine._open_result_contradiction_checkpoint(runtime) is None
+    )
+
+
+@pytest.mark.parametrize("verdict", ("consistent", "malformed", "timeout"))
+def test_result_contradiction_reducer_rejects_nonactionable_review(
+    tmp_path,
+    verdict,
+) -> None:
+    from workflow._text_to_sql_solver_execution_reducer import (
+        state_after_result_contradiction,
+    )
+
+    _, state, store = _finalizer_runtime(tmp_path)
+    candidate = state.sql_candidates[-1]
+    receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=candidate.revision,
+        candidate_id=candidate.candidate_id,
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        requirements_digest="sha256:" + "a" * 64,
+        source_id=None,
+        evidence_id=None,
+        verdict=verdict,
+        reason="synthetic result review",
+        execution=_successful_terminal(state)["execution"],
+        deterministic_failure_code=None,
+    )
+    reservation = store.reserve_execution(
+        state,
+        action_revision=0,
+        candidate_id=candidate.candidate_id,
+        execution_id="review-reducer",
+        request={
+            "operation": "finalize_text_to_sql_run",
+            "sql_query": candidate.sql,
+            "row_limit": 10,
+            "dry_run_only": False,
+        },
+    )
+
+    with pytest.raises(ValueError, match="not actionable"):
+        state_after_result_contradiction(state, reservation, receipt)
 
 
 def test_fresh_runtime_dispatches_durable_result_contradiction_without_gate(

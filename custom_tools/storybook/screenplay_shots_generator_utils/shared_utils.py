@@ -1600,7 +1600,7 @@ def _build_extended_context(
         if not isinstance(si, dict) or not si:
             return ""
         chunks: List[str] = []
-        for k in ["art_style", "color_palette", "composition_rules", "lighting", "texture", "detail_density", "model"]:
+        for k in ["art_style", "color_palette", "composition_rules", "lighting", "texture", "material_signature", "detail_density", "model"]:
             v = si.get(k)
             if v:
                 chunks.append(str(v))

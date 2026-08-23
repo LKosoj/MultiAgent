@@ -71,6 +71,8 @@ def test_missing_evidence_has_exact_transient_fields() -> None:
         "question",
         "required_evidence_kind",
         "reason",
+        "repair_kind",
+        "repair_binding_id",
     }
     assert proposal.proposal.required_evidence_kind is EvidenceSourceKind.SCHEMA
 

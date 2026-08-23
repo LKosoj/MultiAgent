@@ -225,6 +225,7 @@ class LogicalPredicate(StrictModel):
 class LogicalJoinEdge(StrictModel):
     left: LogicalColumnRef
     right: LogicalColumnRef
+    operator: Literal[PredicateOperator.EQ] = PredicateOperator.EQ
     join_type: JoinType
 
 
@@ -298,6 +299,15 @@ class DiscriminatorValueCandidate(StrictModel):
     kind: Literal["discriminator_value"] = "discriminator_value"
     discriminator_column: LogicalColumnRef
     discriminator_predicate: LogicalPredicate
+    additional_predicates: tuple[LogicalPredicate, ...] = ()
+
+    @field_validator("additional_predicates")
+    @classmethod
+    def normalize_additional_predicates(
+        cls,
+        value: tuple[LogicalPredicate, ...],
+    ) -> tuple[LogicalPredicate, ...]:
+        return _sorted_unique_models(value, "additional_predicates")
 
 
 class DerivedExpressionCandidate(StrictModel):

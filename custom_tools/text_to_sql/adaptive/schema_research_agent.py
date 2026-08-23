@@ -45,6 +45,7 @@ SchemaResearchValidationFeedback = Literal[
     "INVALID_DECISION",
     "DUPLICATE_ACTION",
     "UNRESOLVABLE_PREFLIGHT",
+    "REPEATED_PREFLIGHT_DECISION",
     "INVALID_RESEARCH_QUERY",
     "INVALID_RESEARCH_QUERY_COLUMN",
     "INVALID_RESEARCH_QUERY_DETERMINISM",
@@ -63,7 +64,7 @@ def _validation_feedback_suffix(feedback: SchemaResearchValidationFeedback) -> s
     detail = {
         "DUPLICATE_ACTION": " Use the rejected action details in the research context.",
         "UNRESOLVABLE_PREFLIGHT": (
-            " Use the rejected preflight assessment details in the research context."
+            " Use the rejected preflight proposal details in the research context."
         ),
     }.get(feedback, "")
     if feedback not in {
@@ -72,6 +73,7 @@ def _validation_feedback_suffix(feedback: SchemaResearchValidationFeedback) -> s
         "INVALID_DECISION",
         "DUPLICATE_ACTION",
         "UNRESOLVABLE_PREFLIGHT",
+        "REPEATED_PREFLIGHT_DECISION",
         "INVALID_RESEARCH_QUERY",
         "INVALID_RESEARCH_QUERY_COLUMN",
         "INVALID_RESEARCH_QUERY_DETERMINISM",

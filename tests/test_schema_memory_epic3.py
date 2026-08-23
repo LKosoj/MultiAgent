@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -30,12 +31,98 @@ from custom_tools.text_to_sql.schema_memory import (
     _resolve_chroma_metric,
     _truncate_salt,
 )
+from custom_tools.text_to_sql.schema_namespace import (
+    SchemaNamespace,
+    SchemaScope,
+    canonical_schema_fingerprint,
+)
 
 
 def _prepare_cache_info(cache, entities, schema, dsn: str | None = None):
     import os
 
     return cache.prepare_cache_info(entities, schema, dsn=dsn or os.environ["DB_DSN"])
+
+
+def test_restore_descriptions_from_exact_schema_memory(monkeypatch, tmp_path):
+    schema = {
+        "public.orders": {
+            "description": "",
+            "columns": {
+                "id": {"type": "INTEGER", "description": "Existing ID"},
+                "amount": {"type": "DECIMAL", "description": ""},
+            },
+        }
+    }
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    calls = []
+    records = [
+        {
+            "data": {
+                "schema_version": namespace.version_key,
+                "table_fqn": "public.orders",
+                "table_info": {
+                    "description": "Customer orders",
+                    "columns": [
+                        {"name": "id", "type": "TEXT", "description": "Memory ID"},
+                        {
+                            "name": "amount",
+                            "type": "TEXT",
+                            "description": "Order amount",
+                        },
+                        {"name": "missing", "description": "Not in live schema"},
+                    ],
+                },
+            }
+        }
+    ]
+
+    def get_memory(**kwargs):
+        calls.append(kwargs)
+        return records
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=get_memory,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+
+    restored = SchemaMemoryManager(tmp_path).restore_descriptions_from_memory(
+        namespace,
+        schema,
+    )
+
+    assert restored is True
+    assert schema["public.orders"]["description"] == "Customer orders"
+    assert schema["public.orders"]["columns"]["id"] == {
+        "type": "INTEGER",
+        "description": "Existing ID",
+    }
+    assert schema["public.orders"]["columns"]["amount"] == {
+        "type": "DECIMAL",
+        "description": "Order amount",
+    }
+    assert calls == [
+        {
+            "session_id": namespace.version_key,
+            "agent_name": "Schema-RAG-Agent",
+            "cache_kind": "schema_table",
+            "include_historical": False,
+            "requesting_agent": "Schema-RAG-Agent",
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------

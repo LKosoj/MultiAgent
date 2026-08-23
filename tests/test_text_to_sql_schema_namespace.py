@@ -222,7 +222,7 @@ def test_transient_scope_is_live_only_and_freshness_failure_never_uses_snapshot(
         loader.load_scoped_schema({}, "sqlite:///live.db", persistent)
 
 
-def test_scoped_memory_index_and_search_use_only_namespace_version_key(
+def test_scoped_memory_uses_namespace_identity_and_schema_content_hash(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -235,7 +235,9 @@ def test_scoped_memory_index_and_search_use_only_namespace_version_key(
 
     memory_tools = SimpleNamespace(
         save_memory=save_memory,
-        get_memory=lambda **kwargs: [],
+        get_memory=lambda **kwargs: [
+            {"data": item["data"]} for item in saved
+        ],
         memory_requester_context=lambda _name: __import__("contextlib").nullcontext(),
     )
     monkeypatch.setitem(sys.modules, "memory.tools", memory_tools)
@@ -254,11 +256,27 @@ def test_scoped_memory_index_and_search_use_only_namespace_version_key(
             exact=True,
         ),
     )
+    monkeypatch.setattr(
+        "memory.index_consistency.source_namespace_semantic_ids",
+        lambda **kwargs: (
+            {
+                item["data"]["semantic_id"]  # type: ignore[index]
+                for item in saved
+            },
+            {
+                item["data"]["semantic_id"]  # type: ignore[index]
+                for item in saved
+                if item["data"]["file_hash"]  # type: ignore[index]
+                != kwargs["expected_file_hash"]
+            },
+        ),
+    )
 
     manager = SchemaMemoryManager(tmp_path)
     assert manager.ensure_schema_indexed_in_memory(namespace, _schema()) is True
     assert saved[0]["session_id"] == namespace.version_key
-    assert saved[0]["data"]["file_hash"] == namespace.version_key  # type: ignore[index]
+    assert len(saved[0]["data"]["file_hash"]) == 32  # type: ignore[index]
+    assert saved[0]["data"]["file_hash"] != namespace.version_key  # type: ignore[index]
 
     captured: dict[str, object] = {}
     collection = SimpleNamespace(metadata={"hnsw:space": "cosine"}, configuration=None)

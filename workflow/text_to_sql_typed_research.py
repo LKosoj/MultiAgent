@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
 )
 from custom_tools.text_to_sql.adaptive.terminal import research_stop_terminal_result
 from custom_tools.text_to_sql.nlu import NLUProcessor
+from custom_tools.text_to_sql.schema_enricher import SchemaEnricher
 from custom_tools.text_to_sql.schema_loader import SchemaLoader
 from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
 from custom_tools.text_to_sql.schema_namespace import SchemaScope
@@ -50,12 +52,32 @@ async def run_typed_schema_research(
         raise ValueError("Typed research requires a schema scope")
 
     scope = SchemaScope.from_mapping(runtime.schema_scope)
+    schema_loader = SchemaLoader(Path(__file__).resolve().parents[1])
     loaded_schema = await asyncio.to_thread(
-        SchemaLoader(Path(__file__).resolve().parents[1]).load_scoped_schema,
+        schema_loader.load_scoped_schema,
         {},
         runtime.dsn,
         scope,
     )
+    memory_manager = SchemaMemoryManager(Path(__file__).resolve().parents[1])
+    schema_before_enrichment = copy.deepcopy(loaded_schema.schema)
+    if loaded_schema.source == "live":
+        await asyncio.to_thread(
+            memory_manager.restore_descriptions_from_memory,
+            loaded_schema.namespace,
+            loaded_schema.schema,
+        )
+    await asyncio.to_thread(
+        SchemaEnricher().enrich_descriptions_with_llm,
+        loaded_schema.schema,
+        dsn=runtime.dsn,
+    )
+    if loaded_schema.schema != schema_before_enrichment and not scope.transient:
+        snapshot = schema_loader.file_manager.load_scoped_snapshot(scope)
+        if snapshot is None:
+            raise RuntimeError("Scoped schema snapshot is missing after live load")
+        snapshot["schema_info"] = loaded_schema.schema
+        schema_loader.file_manager.save_scoped_snapshot(scope, snapshot)
     runtime.capture_loaded_schema(loaded_schema)
 
     query_spec = await asyncio.to_thread(
@@ -66,7 +88,6 @@ async def run_typed_schema_research(
         context_documents=runtime.context_documents,
     )
     runtime.research_state_store.save_query_spec(query_spec)
-    memory_manager = SchemaMemoryManager(Path(__file__).resolve().parents[1])
     memory_manager.ensure_schema_indexed_in_memory(
         loaded_schema.namespace,
         loaded_schema.schema,

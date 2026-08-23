@@ -260,6 +260,29 @@ def test_save_successful_sql_good_json_preserves_fields(monkeypatch, tmp_path):
     assert "Предупреждение:" not in content
 
 
+def test_save_successful_sql_treats_masking_as_disabled_by_default(
+    monkeypatch, tmp_path, caplog
+):
+    """Без явного включения audit предупреждает о незамаскированном результате."""
+    import logging
+
+    fake_core = tmp_path / "repo" / "custom_tools" / "text_to_sql" / "core.py"
+    fake_core.parent.mkdir(parents=True)
+    fake_core.write_text("", encoding="utf-8")
+    monkeypatch.setattr(core_module, "__file__", str(fake_core))
+    monkeypatch.delenv("PII_MASKING_ENABLED", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.core._audit"):
+        result = save_successful_sql(
+            sql_query="SELECT 3",
+            execution_result=json.dumps({"success": True, "rows_affected": 1}),
+            dsn="sqlite:///tmp/test-default-pii.db",
+        )
+
+    assert result["status"] == "saved"
+    assert any("PII_MASKING_ENABLED=0" in record.message for record in caplog.records)
+
+
 # === 7.11: transaction + compensation + agent_name =======================
 
 

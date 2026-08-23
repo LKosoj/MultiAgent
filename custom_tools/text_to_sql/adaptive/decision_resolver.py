@@ -67,6 +67,8 @@ from .research_decision import (
     LogicalDocumentTarget,
     LogicalTableRef,
     LogicalTableTarget,
+    NewBindingProposal,
+    NewJoinProposal,
     ResearchDecisionV1,
     SemanticCommitRequest,
     ToolIntent,
@@ -78,6 +80,9 @@ from .semantic_reducer import (
     SemanticTurnAdmission,
     TrustedSemanticBatch,
     TrustedToolClaim,
+    _Resolver as _SemanticResolver,
+    _new_binding,
+    _new_join,
     admit_semantic_turn,
 )
 from .serialization import canonical_digest, canonical_json_bytes
@@ -90,6 +95,14 @@ class DecisionResolverError(ValueError):
 
 class UnresolvableModelDecisionError(DecisionResolverError):
     """The model supplied a reference or semantic claim that cannot be resolved."""
+
+
+class DuplicateExistingBindingProposalError(UnresolvableModelDecisionError):
+    """A new-binding proposal resolves to an already durable binding."""
+
+    def __init__(self, proposal_keys: tuple[str, ...]) -> None:
+        self.proposal_keys = proposal_keys
+        super().__init__("new binding already exists")
 
 
 class DuplicateResearchActionError(DecisionResolverError):
@@ -285,7 +298,17 @@ class _ScopedResolver:
         self._resolved_tables[logical_table] = resolved
         return resolved
 
-    def column(self, logical_table: str, logical_column: str) -> ColumnRef:
+    def column(
+        self,
+        logical_table: str | LogicalColumnRef,
+        logical_column: str | None = None,
+    ) -> ColumnRef:
+        if isinstance(logical_table, LogicalColumnRef):
+            logical_table, logical_column = logical_table.table, logical_table.column
+        if logical_column is None:
+            raise UnresolvableModelDecisionError(
+                "logical column must be exact non-empty text"
+            )
         key = (logical_table, logical_column)
         cached = self._resolved_columns.get(key)
         if cached is not None:
@@ -366,8 +389,15 @@ class _ScopedResolver:
                     )
                     for edge in forward
                 )
-                if join.path == forward or (
-                    join.join_type is JoinType.INNER and join.path == reverse
+                if (
+                    join.left == forward[0].left
+                    and join.right == forward[0].right
+                    and join.path == forward
+                ) or (
+                    join.join_type is JoinType.INNER
+                    and join.left == reverse[0].left
+                    and join.right == reverse[0].right
+                    and join.path == reverse
                 ):
                     self._declared_join_ids.add(join.join_id)
                     return
@@ -454,6 +484,8 @@ def resolve_research_decision(
         _resolve_semantic_value(proposal, resolver)
     bindings_by_id = {item.binding_id: item for item in current.bindings}
     joins_by_id = {item.join_id: item for item in current.join_candidates}
+    proposed_join_ids: dict[str, str] = {}
+    proposed_joins: dict[str, JoinCandidate] = {}
     for proposal in parsed.proposals:
         if (
             isinstance(proposal, BindingAssessment)
@@ -467,7 +499,11 @@ def resolve_research_decision(
             and isinstance(proposal.subject, ExistingJoinRef)
         ):
             resolver.record_declared_join(joins_by_id[proposal.subject.join_id])
-
+        elif isinstance(proposal, NewJoinProposal):
+            join = _new_join(proposal, resolver, current.schema_namespace_version)
+            resolver.record_declared_join(join)
+            proposed_join_ids[proposal.proposal_key] = join.join_id
+            proposed_joins[join.join_id] = join
     decision_digest = canonical_digest(
         parsed.model_dump(mode="json", by_alias=True, warnings="error")
     )
@@ -545,6 +581,24 @@ def resolve_research_decision(
 
     batch = resolver.batch()
     try:
+        semantic_resolver = _SemanticResolver(batch)
+        all_joins = {**joins_by_id, **proposed_joins}
+        duplicate_binding_proposal_keys: list[str] = []
+        for proposal in parsed.proposals:
+            if isinstance(proposal, NewBindingProposal):
+                binding = _new_binding(
+                    proposal,
+                    semantic_resolver,
+                    all_joins,
+                    proposed_join_ids,
+                    current.schema_namespace_version,
+                )
+                if binding.binding_id in bindings_by_id:
+                    duplicate_binding_proposal_keys.append(proposal.proposal_key)
+        if duplicate_binding_proposal_keys:
+            raise DuplicateExistingBindingProposalError(
+                tuple(duplicate_binding_proposal_keys)
+            )
         admission = admit_semantic_turn(
             current,
             parsed,
@@ -553,6 +607,8 @@ def resolve_research_decision(
             tool_claim=tool_claim,
             budget_state=current.budget_state,
         )
+    except DuplicateExistingBindingProposalError:
+        raise
     except SemanticReducerError as exc:
         baseline_next = parsed.next
         if isinstance(baseline_next, ToolIntent):
@@ -621,7 +677,7 @@ def _structural_binding_columns(binding: object) -> tuple[ColumnRef, ...]:
     if isinstance(binding, PhysicalColumnBinding):
         return (binding.physical_column,)
     if isinstance(binding, DiscriminatorValueBinding):
-        return (binding.discriminator_column,)
+        return binding.columns
     if isinstance(binding, DerivedExpressionBinding):
         return binding.input_columns
     if isinstance(binding, VerticalAttributeBinding):

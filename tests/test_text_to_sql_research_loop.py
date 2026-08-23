@@ -423,6 +423,7 @@ def _state(*, required: bool) -> ResearchState:
         query_id="query-1",
         original_text=text,
         semantic_items=items,
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -1846,10 +1847,39 @@ def test_repeated_unresolvable_preflight_records_its_terminal_signature(tmp_path
         ledger.close()
 
 
-def test_assessment_only_tool_decision_executes_admissible_baseline(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "proposal",
+    (
+        {
+            "proposal_type": "hypothesis_assessment",
+            "subject": {
+                "reference_kind": "existing",
+                "hypothesis_id": "hypothesis-1",
+            },
+            "certificate": "consistent",
+            "citation_evidence_ids": ("missing-evidence",),
+        },
+        {
+            "proposal_type": "new_binding",
+            "proposal_key": "proposal:premature-binding",
+            "source_id": "source-1",
+            "candidate": {
+                "kind": "physical_column",
+                "physical_column": {
+                    "table": "public.orders",
+                    "column": "status",
+                },
+            },
+            "join_references": (),
+            "citation_evidence_ids": ("missing-evidence",),
+        },
+    ),
+    ids=("existing-assessment", "new-binding"),
+)
+def test_rejected_proposal_tool_decision_executes_admissible_baseline(
+    tmp_path, monkeypatch, proposal: dict[str, object]
 ) -> None:
-    """A rejected existing-object assessment batch cannot block its valid tool."""
+    """Rejected semantic proposals cannot block their independently valid tool."""
 
     loaded_schema, namespace = _fixture_schema()
     initial = _policy_state(namespace)
@@ -1886,17 +1916,7 @@ def test_assessment_only_tool_decision_executes_admissible_baseline(
     decision = ResearchDecisionV1.model_validate(
         {
             **baseline.model_dump(mode="python"),
-            "proposals": (
-                {
-                    "proposal_type": "hypothesis_assessment",
-                    "subject": {
-                        "reference_kind": "existing",
-                        "hypothesis_id": "hypothesis-1",
-                    },
-                    "certificate": "consistent",
-                    "citation_evidence_ids": ("missing-evidence",),
-                },
-            ),
+            "proposals": (proposal,),
         }
     )
     registry = _make_registry(namespace)
@@ -1962,6 +1982,21 @@ def test_assessment_only_tool_decision_executes_admissible_baseline(
     )
     prompts: list[str] = []
 
+    def research_context(
+        current: ResearchState,
+        feedbacks: tuple[str, ...],
+        rejected_duplicates: tuple[dict[str, object], ...] = (),
+        rejected_preflight_assessments: tuple[dict[str, object], ...] = (),
+    ) -> str:
+        return json.dumps(
+            {
+                "state": canonical_digest(current),
+                "feedbacks": feedbacks,
+                "rejected_duplicates": rejected_duplicates,
+                "rejected_preflight_assessments": rejected_preflight_assessments,
+            }
+        )
+
     async def model(prompt: str) -> str:
         prompts.append(prompt)
         return next(responses)
@@ -1998,18 +2033,61 @@ def test_assessment_only_tool_decision_executes_admissible_baseline(
             loaded_schema=loaded_schema,
             registry=registry,
             budget_ledger=ledger,
+            research_context=research_context,
         )
     )
     try:
         assert outcome.stop_reason is ResearchStopReason.AMBIGUOUS
         assert outcome.final_state.hypotheses == state.hypotheses
+        assert outcome.final_state.bindings == state.bindings
         assert outcome.final_state.action_history == (*state.action_history, action)
         assert len(prompts) == 2
+        assert "cited evidence_id does not exist" in prompts[1]
+        assert "missing-evidence" in prompts[1]
         assert registry.adapter.execute_calls == 1
     finally:
         state_store.close()
         checkpoint_store.close()
         ledger.close()
+
+
+def test_proposal_free_tool_baseline_drops_unpersisted_hypothesis_reference() -> None:
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_hypothesis",
+                    "proposal_key": "proposal:orders",
+                    "source_ids": ("source-1",),
+                    "claim": "orders are relevant",
+                    "candidate_targets": (
+                        {"target_kind": "table", "table": "public.orders"},
+                    ),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": {
+                    "reference_kind": "proposed",
+                    "proposal_key": "proposal:orders",
+                },
+                "intent": {
+                    "tool_name": "inspect_table",
+                    "arguments": {"table": "public.orders"},
+                },
+            },
+        }
+    )
+
+    baseline = _research_loop_module._proposal_free_tool_baseline(decision)
+
+    assert baseline is not None
+    assert baseline.proposals == ()
+    assert type(baseline.next) is type(decision.next)
+    assert baseline.next.hypothesis_ref is None
+    assert baseline.next.intent == decision.next.intent
 
 
 def test_unresolvable_binding_assessment_feedback_names_missing_column_probe(
@@ -2785,6 +2863,525 @@ def test_rejected_preflight_feedback_keeps_the_complete_assessment_batch() -> No
     )
 
 
+def test_rejected_binding_assessment_feedback_names_unknown_binding() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": "binding:unknown",
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == (
+        "referenced binding_id does not exist"
+    )
+
+
+def test_rejected_hypothesis_contradiction_feedback_names_missing_certificate() -> None:
+    """A retry must explain why a hypothesis contradiction was not proved."""
+
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True, hypothesis=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "hypothesis_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "hypothesis_id": "hypothesis-1",
+                    },
+                    "certificate": "contradicted",
+                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "inspect_table",
+                    "arguments": {"table": "public.orders"},
+                },
+            },
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == (
+        "hypothesis contradiction is not proven by cited evidence"
+    )
+
+
+def test_rejected_hypothesis_consistency_feedback_names_missing_certificate() -> None:
+    """A retry must explain why hypothesis support was not proved."""
+
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True, hypothesis=True)
+    unrelated_target = TableRef(
+        namespace="main", schema="public", table="customers"
+    )
+    hypothesis = state.hypotheses[0].model_copy(
+        update={"candidate_targets": (unrelated_target,)}
+    )
+    state = state.model_copy(update={"hypotheses": (hypothesis,)})
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "hypothesis_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "inspect_table",
+                    "arguments": {"table": "public.customers"},
+                },
+            },
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == (
+        "hypothesis consistency is not proven by cited evidence"
+    )
+
+
+def test_rejected_preflight_feedback_keeps_new_binding_proposal_unchanged() -> None:
+    """A rejected new binding is returned verbatim for the bounded retry."""
+
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    citation = state.evidence[0].evidence_id
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:typed-range",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.BETWEEN,
+                            "right": (201201, 201212),
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (citation,),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "inspect_table",
+                    "arguments": {"table": "public.orders"},
+                },
+            },
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback == (
+        {
+            "proposal": decision.proposals[0].model_dump(
+                mode="json", by_alias=True
+            )
+        },
+    )
+
+
+def test_rejected_new_binding_feedback_names_unknown_evidence() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:status-filter",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.EQ,
+                            "right": "open",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": ("evidence:unknown",),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == (
+        "cited evidence_id does not exist"
+    )
+
+
+def test_rejected_assessment_feedback_preserves_unknown_evidence_reason() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True, hypothesis=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "hypothesis_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "hypothesis_id": state.hypotheses[0].hypothesis_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": ("evidence:unknown",),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == (
+        "cited evidence_id does not exist"
+    )
+
+
+def test_rejected_new_binding_feedback_names_unknown_existing_join() -> None:
+    """A retry tells the model to copy a real existing join ID verbatim."""
+
+    _loaded_schema, namespace = _fixture_schema()
+    base = _policy_state(namespace, with_evidence=True)
+    orders = TableRef(namespace="main", schema="public", table="orders")
+    customers = TableRef(namespace="main", schema="public", table="customers")
+    left = ColumnRef(table=orders, column="id")
+    right = ColumnRef(table=customers, column="id")
+    join = JoinCandidate(
+        join_id="join-existing",
+        left=left,
+        right=right,
+        join_type=JoinType.INNER,
+        path=(JoinEdge(left=left, right=right, join_type=JoinType.INNER),),
+        status=JoinCandidateStatus.CANDIDATE,
+        evidence_ids=(base.evidence[0].evidence_id,),
+    )
+    state = base.model_copy(update={"join_candidates": (join,)})
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:status-filter",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.EQ,
+                            "right": "open",
+                        },
+                    },
+                    "join_references": (
+                        {
+                            "reference_kind": "existing",
+                            "join_id": "join-typo",
+                        },
+                    ),
+                    "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback == (
+        {
+            "proposal": decision.proposals[0].model_dump(
+                mode="json", by_alias=True
+            ),
+            "rejection_reason": "referenced join_id does not exist",
+        },
+    )
+
+
+def test_rejected_new_binding_feedback_names_unknown_source() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:status-filter",
+                    "source_id": "source-typo",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.EQ,
+                            "right": "open",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state, decision, _freshness(state), requested_action=None
+    )
+
+    assert feedback[0]["rejection_reason"] == "source_id does not exist"
+
+
+def test_rejected_duplicate_existing_bindings_name_every_exact_new_proposal(
+    tmp_path,
+) -> None:
+    """Every repeated exact binding must receive the closed duplicate reason."""
+
+    loaded_schema, namespace = _fixture_schema()
+    initial = _policy_state(namespace)
+    state = _policy_state(namespace, with_evidence=True)
+    citation = state.evidence[0].evidence_id
+    registry = _make_registry(namespace)
+    new_binding = {
+        "proposal_type": "new_binding",
+        "proposal_key": "proposal:status",
+        "source_id": "source-1",
+        "candidate": {
+            "kind": "physical_column",
+            "physical_column": {
+                "table": "public.orders",
+                "column": "status",
+            },
+        },
+        "join_references": (),
+        "citation_evidence_ids": (citation,),
+    }
+    second_new_binding = {
+        **new_binding,
+        "proposal_key": "proposal:status-copy",
+        "candidate": {
+            "kind": "physical_column",
+            "physical_column": {
+                "table": "public.orders",
+                "column": "id",
+            },
+        },
+    }
+    prepared = _resolve_fixture(
+        ResearchDecisionV1.model_validate(
+            {
+                "decision_version": 1,
+                "proposals": (new_binding, second_new_binding),
+                "next": {"next_kind": "semantic_commit"},
+            }
+        ),
+        loaded=loaded_schema,
+        namespace=namespace,
+        state=state,
+        registry=registry,
+    )
+    bindings = prepared.admission.bindings
+    binding = next(
+        item for item in bindings if item.physical_column.column == "status"
+    )
+    item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "binding_ids": tuple(item.binding_id for item in bindings),
+            "status": SemanticItemStatus.PARTIALLY_RESOLVED,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "bindings": bindings,
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+        }
+    )
+    seed = AdaptiveCheckpointKey(
+        state.run_id, state.run_incarnation, AdaptiveLoopKind.RESEARCH, 0
+    )
+    _seed_honest_v2_history(
+        tmp_path / "adaptive.sqlite",
+        states=(initial, state),
+        events=(
+            (seed, "planned", {"kind": "seed"}),
+            (seed, "observed", {"kind": "seed"}),
+        ),
+    )
+    responses = iter(
+        (
+            json.dumps(
+                {
+                    "decision_version": 1,
+                    "proposals": (
+                        new_binding,
+                        second_new_binding,
+                        {
+                            "proposal_type": "binding_assessment",
+                            "subject": {
+                                "reference_kind": "existing",
+                                "binding_id": binding.binding_id,
+                            },
+                            "certificate": "consistent",
+                            "citation_evidence_ids": (citation,),
+                        },
+                    ),
+                    "next": {"next_kind": "semantic_commit"},
+                }
+            ),
+            json.dumps(
+                {
+                    "decision_version": 1,
+                    "proposals": (),
+                    "next": {
+                        "next_kind": "stop",
+                        "reason": "ambiguous",
+                        "source_ids": ("source-1",),
+                        "citation_evidence_ids": (citation,),
+                        "ambiguity": {
+                            "interpretations": ("First reading.", "Second reading."),
+                            "citation_evidence_ids": (citation,),
+                            "missing_distinguishing_fact": "The definition is absent.",
+                        },
+                    },
+                }
+            ),
+        )
+    )
+    contexts: list[tuple[dict[str, object], ...]] = []
+
+    def research_context(
+        current: ResearchState,
+        _feedbacks: tuple[str, ...],
+        _rejected_duplicates: tuple[dict[str, object], ...] = (),
+        rejected_preflight_assessments: tuple[dict[str, object], ...] = (),
+    ) -> str:
+        contexts.append(rejected_preflight_assessments)
+        return canonical_digest(current)
+
+    async def model(_prompt: str) -> str:
+        return next(responses)
+
+    ledger = AdaptiveBudgetLedger(tmp_path / "duplicate-binding-feedback.sqlite")
+    _seed_prior_model_budget(state, ledger)
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            registry=registry,
+            budget_ledger=ledger,
+            research_context=research_context,
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.AMBIGUOUS
+        duplicate_feedback = tuple(
+            item
+            for item in contexts[1]
+            if item["proposal"].get("proposal_key")
+            in {"proposal:status", "proposal:status-copy"}
+        )
+        assert len(duplicate_feedback) == 2
+        assert all(
+            item["rejection_reason"] == "binding already exists"
+            and "missing_probe" not in item
+            for item in duplicate_feedback
+        )
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 def test_rejected_join_assessment_names_one_missing_relationship_probe() -> None:
     """A rejected direct join assessment keeps its batch and names one probe."""
 
@@ -3274,6 +3871,51 @@ def test_duplicate_rejection_clears_prior_preflight_feedback(tmp_path, monkeypat
         ledger.close()
 
 
+def test_repeated_preflight_rejection_changes_retry_prompt(tmp_path, monkeypatch) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: (
+            "UNRESOLVABLE_PREFLIGHT",
+            None,
+            None,
+            (),
+        ),
+    )
+    prompts: list[str] = []
+
+    async def model(prompt: str) -> str:
+        prompts.append(prompt)
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+        )
+    )
+    try:
+        assert outcome.final_state.bindings == state.bindings
+        assert len(prompts) >= 3
+        assert prompts[1] != prompts[2]
+        assert "REPEATED_PREFLIGHT_DECISION" in prompts[2]
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 @pytest.mark.parametrize(
     (
         "rejection_kind",
@@ -3418,7 +4060,7 @@ def test_invalid_model_decision_is_retried_with_trusted_feedback(
             "intent": {
                 "tool_name": "execute_research_probe",
                 "arguments": {
-                    "sql": "SELECT * FROM public.orders LIMIT 10",
+                    "sql": "SELECT o.* FROM public.orders AS o LIMIT 10",
                     "parameters": [],
                 },
             },
@@ -3525,6 +4167,21 @@ def test_invalid_model_decision_is_retried_with_trusted_feedback(
             }
             for index, table in enumerate(("public.orders", "orders"), start=1)
         ]
+    if rejection_kind in {
+        "missing_source",
+        "missing_hypothesis_source",
+        "missing_join",
+        "missing_proposal_citation",
+        "semantic_admission",
+    }:
+        invalid_next = {
+            "next_kind": "tool",
+            "hypothesis_ref": None,
+            "intent": {
+                "tool_name": "inspect_table",
+                "arguments": {"table": "public.missing"},
+            },
+        }
     responses = iter(
         (
             json.dumps(
@@ -3567,7 +4224,7 @@ def test_invalid_model_decision_is_retried_with_trusted_feedback(
                 run_research_loop(
                     initial_state=state,
                     task="research schema",
-                    research_context=lambda current, _feedbacks: canonical_digest(current),
+                    research_context=lambda current, _feedbacks, *_details: canonical_digest(current),
                     model=model,
                     model_identity="test/model",
                     adapter=SchemaResearchDecisionAdapter(
@@ -3592,7 +4249,7 @@ def test_invalid_model_decision_is_retried_with_trusted_feedback(
         if rejection_kind == "resolver":
             retry_instructions = json.loads(prompts[1])["instructions"]
             assert (
-                "Use the rejected preflight assessment details in the research context."
+                "Use the rejected preflight proposal details in the research context."
                 in retry_instructions
             )
         diagnostics = [
@@ -3764,8 +4421,10 @@ def test_conflicting_model_semantic_commit_is_retried_with_feedback(tmp_path) ->
         ledger.close()
 
 
-def test_conflicting_model_join_proposal_tool_is_retried_before_execution(tmp_path) -> None:
-    """A conflicting join proposal cannot execute its otherwise valid tool."""
+def test_conflicting_model_join_proposal_with_invalid_tool_is_retried(
+    tmp_path,
+) -> None:
+    """A conflicting join and invalid tool are retried without execution."""
 
     loaded_schema, namespace = _fixture_schema()
     initial = _policy_state(namespace)
@@ -3829,48 +4488,11 @@ def test_conflicting_model_join_proposal_tool_is_retried_before_execution(tmp_pa
                 "hypothesis_ref": None,
                 "intent": {
                     "tool_name": "inspect_table",
-                    "arguments": {"table": "public.customers"},
+                    "arguments": {"table": "public.missing"},
                 },
             },
         }
     )
-    prepared = _resolve_fixture(
-        duplicate,
-        loaded=loaded_schema,
-        namespace=namespace,
-        state=state,
-        registry=registry,
-    )
-    assert prepared.admission.action is not None
-    assert prepared.invocation is not None
-    result = build_probe_result(
-        run_id=state.run_id,
-        run_incarnation=state.run_incarnation,
-        revision=state.revision,
-        schema_namespace_version=state.schema_namespace_version,
-        invocation_id=prepared.invocation.invocation_id,
-        action_digest=prepared.admission.action.action_digest,
-        probe_kind=prepared.admission.action.kind,
-        status=ProbeStatus.SUCCESS,
-        target=prepared.admission.action.target,
-        started_at=_FIXTURE_NOW,
-        completed_at=_FIXTURE_NOW,
-        summary="fixture success",
-        cost=EvidenceCost(
-            wall_clock_ms=0,
-            model_calls=0,
-            model_tokens=0,
-            db_probe_ms=0,
-            rows=1,
-            bytes=11,
-        ),
-        row_count=1,
-        payload={"ok": True},
-    )
-    registry.adapter.result = NormalizedToolResult(
-        "success", result.model_dump(mode="json", by_alias=True)
-    )
-    registry.adapter.recover = lambda _invocation: None
     responses = iter(
         (
             json.dumps(duplicate.model_dump(mode="json", by_alias=True)),
@@ -4257,7 +4879,10 @@ def test_invalid_research_query_logs_safe_failure_code(caplog) -> None:
     registry = _make_registry(namespace)
     decision = _tool_decision(
         "execute_research_probe",
-        {"sql": "SELECT * FROM public.orders LIMIT 10", "parameters": []},
+        {
+            "sql": "SELECT o.* FROM public.orders AS o LIMIT 10",
+            "parameters": [],
+        },
     )
 
     with caplog.at_level(logging.WARNING, logger=_research_loop_module.__name__):

@@ -459,7 +459,7 @@ def save_successful_sql(
             # может содержать реальные данные из БД (ФИО, адреса, зарплаты и т.п.).
             # Caller обязан применить pii_masking() ДО вызова save_successful_sql.
             # Предупреждаем только если данные реально будут записаны.
-            if os.getenv("PII_MASKING_ENABLED", "1") == "0":
+            if os.getenv("PII_MASKING_ENABLED", "0") == "0":
                 logger.warning(
                     "save_successful_sql: PII_MASKING_ENABLED=0 — execution_result "
                     "may contain unmasked PII data written to sqlrag artifact %s. "

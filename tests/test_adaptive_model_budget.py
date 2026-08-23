@@ -178,7 +178,7 @@ def test_v1_model_budget_stays_disabled_and_v2_defaults_are_explicit(tmp_path) -
                 ledger=ledger,
             )
         state = initial_model_budget_state(_config())
-        assert state.initial_total_tokens == 524_288
+        assert state.initial_total_tokens == 1_048_576
         assert state.initial_input_tokens == 256 * 16_384
         assert MAX_MODEL_OUTPUT_TOKENS_PER_CALL == 32_000
         assert state.initial_output_tokens == 256 * 32_000

@@ -13,12 +13,15 @@ from workflow.deadline import DeadlineBudget
 
 import custom_tools.text_to_sql.adaptive.research_reentry as reentry_module
 from custom_tools.text_to_sql.adaptive.models import (
+    BindingStatus,
     Hypothesis,
     HypothesisStatus,
     PredicateOperator,
     ResearchReentryStatus,
+    ResearchStopReason,
     ResearchState,
     SemanticItemKind,
+    SemanticItemStatus,
     SolverState,
     SolverStopReason,
     StrictModel,
@@ -69,7 +72,7 @@ def _case():
     )
 
 
-def _stopped(case) -> SolverState:
+def _stopped(case, *, semantic_repair: bool = False) -> SolverState:
     state = SolverState(
         run_id=case.state.run_id,
         run_incarnation=case.state.run_incarnation,
@@ -94,6 +97,12 @@ def _stopped(case) -> SolverState:
                 question="Which evidence should be refreshed?",
                 required_evidence_kind=EvidenceSourceKind.SCHEMA,
                 reason="The solver needs one targeted probe.",
+                repair_kind=(
+                    "semantic_binding_mismatch" if semantic_repair else None
+                ),
+                repair_binding_id=(
+                    case.state.bindings[0].binding_id if semantic_repair else None
+                ),
             ),
         ),
         base_revision=state.revision,
@@ -101,6 +110,7 @@ def _stopped(case) -> SolverState:
         table_namespace="main",
         requirements=case.requirements,
         id_factory=iter(("request-1", "solver-action-1")).__next__,
+        trusted_semantic_repair=semantic_repair,
     ).state
 
 
@@ -138,6 +148,71 @@ def _fresh(case) -> ResearchState:
             ),
         }
     )
+
+
+def _semantic_repair_states(case) -> tuple[ResearchState, ResearchState]:
+    old = case.state.bindings[0]
+    stale = old.model_copy(update={"status": BindingStatus.STALE})
+    bridge_item = case.state.query_spec.semantic_items[0].model_copy(
+        update={"status": SemanticItemStatus.UNRESOLVED, "binding_ids": ()}
+    )
+    bridge = ResearchState.model_validate(
+        {
+            **case.state.model_dump(mode="python"),
+            "revision": case.state.revision + 1,
+            "query_spec": case.state.query_spec.model_copy(
+                update={
+                    "revision": case.state.revision + 1,
+                    "semantic_items": (bridge_item,),
+                }
+            ),
+            "bindings": (stale,),
+            "unresolved_items": (bridge_item.source_id,),
+            "action_history": (
+                *case.state.action_history,
+                research_action(
+                    (("revision", case.state.revision),), index=case.state.revision
+                ),
+            ),
+        }
+    )
+    new_evidence = _schema_evidence(
+        "replacement-binding-evidence",
+        case.requirements.allowed_columns[0],
+        revision=bridge.revision + 1,
+    )
+    replacement = old.model_copy(
+        update={
+            "binding_id": "replacement-binding",
+            "evidence_ids": (new_evidence.evidence_id,),
+        }
+    )
+    final_item = bridge_item.model_copy(
+        update={
+            "status": SemanticItemStatus.RESOLVED,
+            "binding_ids": (replacement.binding_id,),
+        }
+    )
+    final = ResearchState.model_validate(
+        {
+            **bridge.model_dump(mode="python"),
+            "revision": bridge.revision + 1,
+            "query_spec": bridge.query_spec.model_copy(
+                update={
+                    "revision": bridge.revision + 1,
+                    "semantic_items": (final_item,),
+                }
+            ),
+            "evidence": (*bridge.evidence, new_evidence),
+            "bindings": (stale, replacement),
+            "unresolved_items": (),
+            "action_history": (
+                *bridge.action_history,
+                research_action((("revision", bridge.revision),), index=bridge.revision),
+            ),
+        }
+    )
+    return bridge, final
 
 
 def _request_targets(state: SolverState, *targets) -> SolverState:
@@ -344,6 +419,62 @@ async def test_coordinator_makes_one_decision_resolve_probe_and_w3_commit() -> N
     assert outcome.solver_state.action_history == stopped.action_history
     assert outcome.research_state.revision == case.state.revision + 1
     assert outcome.record.status is ResearchReentryStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_semantic_binding_repair_continues_existing_research_until_rebound() -> None:
+    from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
+
+    case = _case()
+    stopped = _stopped(case, semantic_repair=True)
+    bridge, final = _semantic_repair_states(case)
+    target = case.requirements.allowed_columns[0]
+    continued = []
+
+    async def continue_research(state, request):
+        continued.append((state, request))
+        assert state == bridge
+        assert state.bindings[0].status is BindingStatus.STALE
+        assert state.unresolved_items == (request.source_id,)
+        return ResearchLoopOutcome(
+            final_state=final,
+            stop_reason=ResearchStopReason.COMPLETE,
+            affected_source_ids=(),
+            citation_evidence_ids=tuple(
+                evidence.evidence_id for evidence in final.evidence
+            ),
+            ambiguity=None,
+        )
+
+    outcome = await run_targeted_research_reentry(
+        stopped,
+        case.state,
+        "request-1",
+        requirements=case.requirements,
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=lambda **_kwargs: _decision(),
+        resolve_decision=lambda *_args, **_kwargs: SimpleNamespace(
+            tool_claim=SimpleNamespace(target=target),
+            admission=object(),
+            invocation=object(),
+        ),
+        execute_probe=lambda *_args, **_kwargs: SimpleNamespace(
+            status=ProbeStatus.SUCCESS
+        ),
+        commit_research_turn=lambda *_args, **_kwargs: SimpleNamespace(state=bridge),
+        continue_research=continue_research,
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+
+    assert len(continued) == 1
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
+    assert outcome.research_state == final
+    assert outcome.solver_state.stop_reason is None
 
 
 @pytest.mark.asyncio

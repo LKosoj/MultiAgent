@@ -814,6 +814,7 @@ def test_schema_linking_core_passes_explicit_dsn_to_llm_prompt(monkeypatch):
 
 
 def test_schema_linking_redacts_llm_exception_boundary(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     odbc_connect = urllib.parse.quote_plus(
         "DRIVER={ODBC Driver 17};SERVER=db.example.com;UID=alice;PWD=topsecret"
     )
@@ -843,7 +844,8 @@ def test_schema_linking_redacts_llm_exception_boundary(monkeypatch, caplog):
     assert "[EMAIL]" in serialized
 
 
-def test_schema_memory_search_status_redacts_raw_memory_error():
+def test_schema_memory_search_status_redacts_raw_memory_error(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     manager = object.__new__(SchemaMemoryManager)
     raw_dsn = _raw_pyodbc_dsn()
 
@@ -875,6 +877,7 @@ def test_schema_memory_search_requires_explicit_or_runtime_dsn(monkeypatch, tmp_
 
 
 def test_text_to_sql_prompt_builders_redact_user_controlled_values(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql.prompts import (
         build_column_description_prompt_with_context,
         build_schema_linking_prompt,
@@ -943,7 +946,8 @@ def test_text_to_sql_prompt_builders_redact_user_controlled_values(monkeypatch):
     assert "[EMAIL]" in serialized
 
 
-def test_text_to_sql_redaction_sanitizes_dict_keys_across_helpers():
+def test_text_to_sql_redaction_sanitizes_dict_keys_across_helpers(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql.core._sql_generation_api import _redact_sql_api_value
     from custom_tools.text_to_sql.prompts import _redact_prompt_value
     from custom_tools.text_to_sql.sql_generator import _redact_sql_generation_value
@@ -971,6 +975,7 @@ def test_text_to_sql_redaction_sanitizes_dict_keys_across_helpers():
 
 
 def test_sql_generator_context_preview_redacts_runtime_context(caplog, monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
     monkeypatch.setenv("SQL_GENERATION_USE_STRUCTURED_BUILDER", "1")
 
@@ -995,6 +1000,7 @@ def test_sql_generator_context_preview_redacts_runtime_context(caplog, monkeypat
 
 
 def test_sql_generator_direct_prompt_redacts_runtime_context(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
     captured = {}
 
@@ -1030,6 +1036,7 @@ def test_sql_generator_direct_prompt_redacts_runtime_context(monkeypatch):
 
 
 def test_sql_generator_safety_error_redacts_issues(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
     generator = SQLGenerator()
 
@@ -1058,6 +1065,7 @@ def test_sql_generator_safety_error_redacts_issues(monkeypatch, caplog):
 
 
 def test_sql_postprocess_redacts_parser_error(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql import sql_postprocess
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1083,6 +1091,7 @@ def test_sql_postprocess_redacts_parser_error(monkeypatch):
 
 
 def test_sql_postprocess_manual_quoting_redacts_parser_error(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql import sql_postprocess
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1107,6 +1116,7 @@ def test_sql_postprocess_manual_quoting_redacts_parser_error(monkeypatch):
 
 
 def test_sql_postprocess_quote_logs_redacted_sql(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql import sql_postprocess
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1125,6 +1135,7 @@ def test_sql_postprocess_quote_logs_redacted_sql(monkeypatch, caplog):
 
 
 def test_sql_generator_redacts_postprocess_error(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql import sql_postprocess
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1163,6 +1174,7 @@ def test_sql_generator_redacts_postprocess_error(monkeypatch, caplog):
 
 
 def test_schema_validator_redacts_parse_exception(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql.validators import schema_aware
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1189,6 +1201,7 @@ def test_schema_validator_redacts_parse_exception(monkeypatch, caplog):
 
 
 def test_sql_safety_validator_redacts_parse_exception(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     from custom_tools.text_to_sql.validators import safety
 
     raw_dsn = _raw_pyodbc_dsn()
@@ -1604,6 +1617,28 @@ def test_schema_validator_accepts_cte_and_derived_table_alias_columns():
 
     assert cte_result["is_valid"] is True
     assert derived_result["is_valid"] is True
+
+
+def test_schema_validator_accepts_aliasless_derived_output_column():
+    validator = SQLSchemaValidator()
+    schema = {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+
+    result = validator.validate_sql_against_schema(
+        "SELECT MAX(total_amount) FROM "
+        "(SELECT SUM(amount) AS total_amount FROM orders)",
+        schema,
+        dsn="sqlite://",
+    )
+    invalid = validator.validate_sql_against_schema(
+        "SELECT MAX(total_amount) FROM "
+        "(SELECT SUM(missing) AS total_amount FROM orders)",
+        schema,
+        dsn="sqlite://",
+    )
+
+    assert result["is_valid"] is True, result["issues"]
+    assert invalid["is_valid"] is False
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in invalid["issues"])
 
 
 def test_schema_validator_validates_columns_named_like_aggregates():
@@ -2606,3 +2641,20 @@ def test_sql_explain_cascades_llm_audit_failure(monkeypatch):
     assert result["plan"] is None
     issue_types = {issue.get("issue_type") for issue in result.get("issues", [])}
     assert "LLM_AUDIT_FAILED" in issue_types
+
+
+def test_redact_text_masks_pii_only_when_masking_is_enabled(monkeypatch):
+    from custom_tools.text_to_sql.redaction import redact_text
+
+    value = "connect failed postgresql://alice:topsecret@db.example.com/prod person@example.com"
+
+    monkeypatch.delenv("PII_MASKING_ENABLED", raising=False)
+    by_default = redact_text(value)
+    assert "topsecret" not in by_default
+    assert "person@example.com" in by_default
+
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
+    enabled = redact_text(value)
+    assert "topsecret" not in enabled
+    assert "person@example.com" not in enabled
+    assert "[EMAIL]" in enabled

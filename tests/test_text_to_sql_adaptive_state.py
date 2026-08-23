@@ -11,6 +11,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
     BudgetState,
     ColumnRef,
+    DiscriminatorValueBinding,
     EvidenceCost,
     EvidenceRecord,
     EvidenceSourceKind,
@@ -20,8 +21,11 @@ from custom_tools.text_to_sql.adaptive.models import (
     HypothesisStatus,
     JoinCandidate,
     JoinCandidateStatus,
+    JoinEdge,
     JoinType,
     PhysicalColumnBinding,
+    PredicateOperator,
+    PredicateRef,
     QuerySpec,
     ResearchAction,
     ResearchActionKind,
@@ -111,6 +115,7 @@ def _state(**changes) -> ResearchState:
             query_id="query-1",
             original_text="orders",
             semantic_items=(_item(),),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -149,6 +154,7 @@ def test_required_positive_integer_limit_is_resolved_without_binding() -> None:
             query_id="query-limit",
             original_text="highest",
             semantic_items=(limit,),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -203,6 +209,7 @@ def test_bound_positive_integer_limit_with_candidate_binding_stays_unresolved() 
             query_id="query-limit",
             original_text="highest",
             semantic_items=(limit,),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -241,6 +248,7 @@ def test_stale_positive_integer_limit_binding_stays_unresolved_and_is_rejected()
             query_id="query-limit-stale",
             original_text="highest",
             semantic_items=(limit,),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -429,6 +437,31 @@ def test_transition_merges_join_candidates_atomically_with_the_action() -> None:
     assert result.novelty.added_join_ids == ("join-1",)
 
 
+def test_transition_rejects_new_validated_join_without_trusted_declaration() -> None:
+    first_action = _action()
+    state = apply_research_transition(
+        _state(), first_action, evidence=(_evidence(first_action),)
+    ).state
+    left = _column()
+    right = ColumnRef(table=_table(), column="customer_id")
+    join = JoinCandidate(
+        join_id="join-1",
+        left=left,
+        right=right,
+        join_type=JoinType.INNER,
+        path=(JoinEdge(left=left, right=right, join_type=JoinType.INNER),),
+        status=JoinCandidateStatus.VALIDATED,
+        evidence_ids=("evidence-1",),
+    )
+
+    with pytest.raises(ResearchTransitionProtocolError, match="validated"):
+        apply_research_transition(
+            state,
+            _action(action_id="action-2", revision=1, detail="join"),
+            join_candidates=(join,),
+        )
+
+
 def test_transition_rejects_stale_revision_and_duplicate_action_id_or_digest() -> None:
     action = _action()
     with pytest.raises(ResearchTransitionRevisionError, match="expected_revision"):
@@ -601,6 +634,239 @@ def test_transition_rejects_new_noninitial_entities_and_evidence_reordering() ->
             first,
             _action(action_id="action-2", revision=1, detail="reorder"),
             bindings=(_binding(evidence_ids=("evidence-b", "evidence-a")),),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "operator", "query_literal", "physical_literal"),
+    (
+        (SemanticItemKind.FILTER, PredicateOperator.EQ, "discount", "Discount"),
+        (
+            SemanticItemKind.FILTER,
+            PredicateOperator.BETWEEN,
+            (201201, 201212),
+            ("201201", "201212"),
+        ),
+        (
+            SemanticItemKind.TIME,
+            PredicateOperator.BETWEEN,
+            (201201, 201212),
+            ("201201", "201212"),
+        ),
+    ),
+)
+def test_transition_accepts_evidence_backed_physical_predicate_value(
+    kind: SemanticItemKind,
+    operator: PredicateOperator,
+    query_literal: object,
+    physical_literal: object,
+) -> None:
+    item = _item().model_copy(
+        update={
+            "kind": kind,
+            "operator": operator,
+            "literal_or_reference": query_literal,
+        }
+    )
+    state = _state(
+        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
+    )
+    predicate = PredicateRef(
+        left=_column(),
+        operator=operator,
+        right=physical_literal,
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-range",
+        source_id=item.source_id,
+        tables=(_table(),),
+        columns=(_column(),),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=_column(),
+        discriminator_predicate=predicate,
+    )
+
+    action = _action()
+    transitioned = apply_research_transition(
+        state,
+        action,
+        evidence=(_evidence(action),),
+        bindings=(binding,),
+    )
+
+    assert transitioned.state.bindings == (binding,)
+
+
+def test_transition_accepts_time_physical_operator_chosen_from_database_shape() -> None:
+    item = _item().model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "June 2024",
+        }
+    )
+    state = _state(
+        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
+    )
+    predicate = PredicateRef(
+        left=_column(),
+        operator=PredicateOperator.BETWEEN,
+        right=("2024-06-01", "2024-06-30"),
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-calendar-period",
+        source_id=item.source_id,
+        tables=(_table(),),
+        columns=(_column(),),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=_column(),
+        discriminator_predicate=predicate,
+    )
+    action = _action()
+
+    transitioned = apply_research_transition(
+        state,
+        action,
+        evidence=(_evidence(action),),
+        bindings=(binding,),
+    )
+
+    assert transitioned.state.bindings == (binding,)
+
+
+def test_transition_rejects_substitute_for_exact_time_physical_predicate() -> None:
+    item = _item().model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "202406",
+            "exact_physical_predicate": True,
+        }
+    )
+    state = _state(
+        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
+    )
+    predicate = PredicateRef(
+        left=_column(),
+        operator=PredicateOperator.BETWEEN,
+        right=("2024-06-01", "2024-06-30"),
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-substitute-period",
+        source_id=item.source_id,
+        tables=(_table(),),
+        columns=(_column(),),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=_column(),
+        discriminator_predicate=predicate,
+    )
+
+    with pytest.raises(ResearchTransitionProtocolError, match="required operator"):
+        action = _action()
+        apply_research_transition(
+            state,
+            action,
+            evidence=(_evidence(action),),
+            bindings=(binding,),
+        )
+
+
+def test_transition_rejects_new_discriminator_binding_with_wrong_operator() -> None:
+    item = _item().model_copy(
+        update={
+            "kind": SemanticItemKind.FILTER,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "discount",
+        }
+    )
+    state = _state(
+        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
+    )
+    predicate = PredicateRef(
+        left=_column(),
+        operator=PredicateOperator.NEQ,
+        right="Discount",
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-discount",
+        source_id=item.source_id,
+        tables=(_table(),),
+        columns=(_column(),),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=_column(),
+        discriminator_predicate=predicate,
+    )
+
+    with pytest.raises(ResearchTransitionProtocolError, match="required operator"):
+        action = _action()
+        apply_research_transition(
+            state,
+            action,
+            evidence=(_evidence(action),),
+            bindings=(binding,),
+        )
+
+
+def test_transition_rejects_composite_filter_binding() -> None:
+    item = _item().model_copy(
+        update={
+            "kind": SemanticItemKind.FILTER,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "paid",
+        }
+    )
+    state = _state(
+        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
+    )
+    primary = PredicateRef(
+        left=_column(), operator=PredicateOperator.EQ, right="paid"
+    )
+    secondary_column = ColumnRef(table=_table(), column="region")
+    secondary = PredicateRef(
+        left=secondary_column, operator=PredicateOperator.EQ, right="west"
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-composite-filter",
+        source_id=item.source_id,
+        tables=(_table(),),
+        columns=(_column(), secondary_column),
+        predicates=(primary, secondary),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=_column(),
+        discriminator_predicate=primary,
+    )
+
+    with pytest.raises(ResearchTransitionProtocolError, match="required operator"):
+        action = _action()
+        apply_research_transition(
+            state,
+            action,
+            evidence=(_evidence(action),),
+            bindings=(binding,),
         )
 
 

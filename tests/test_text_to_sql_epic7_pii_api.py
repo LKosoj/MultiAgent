@@ -90,6 +90,22 @@ def test_pii_mask_disabled_does_not_require_salt(monkeypatch):
     assert result["reason"] == "masking_disabled"
 
 
+def test_pii_masking_is_disabled_by_default(monkeypatch):
+    """Без явного включения маскирование не выполняется и соль не нужна."""
+    monkeypatch.delenv("PII_MASKING_ENABLED", raising=False)
+    monkeypatch.delenv("PII_MASK_SALT", raising=False)
+
+    result = pii_masking_impl(
+        [["x@y.com"]],
+        ["email"],
+        column_names=["email"],
+    )
+
+    assert result["masked_data"] == [["x@y.com"]]
+    assert result["pii_detected"] is False
+    assert result["reason"] == "masking_disabled"
+
+
 def test_pii_mask_uses_sha256_not_md5(monkeypatch):
     """Маска должна быть SHA-256-производной (стабильна по соли + значению)."""
     import hashlib

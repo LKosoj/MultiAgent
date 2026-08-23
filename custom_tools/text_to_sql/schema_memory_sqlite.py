@@ -470,6 +470,69 @@ class SchemaMemoryManager:
         ranked_tables.sort(key=lambda item: (-item[0], item[1]))
         return [table_fqn for _matched_terms, table_fqn in ranked_tables]
 
+    def restore_descriptions_from_memory(
+        self,
+        namespace: SchemaNamespace,
+        db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> bool:
+        """Fill missing descriptions from the exact persisted schema namespace."""
+        from memory.tools import get_memory, memory_requester_context
+
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_table",
+                include_historical=False,
+                requesting_agent="Schema-RAG-Agent",
+            )
+
+        changed = False
+        for record in records:
+            data = record.get("data") if isinstance(record, dict) else None
+            if (
+                not isinstance(data, dict)
+                or data.get("schema_version") != namespace.version_key
+            ):
+                continue
+            table_fqn = data.get("table_fqn")
+            table_info = data.get("table_info")
+            if (
+                not isinstance(table_fqn, str)
+                or table_fqn not in db_schema
+                or not isinstance(table_info, dict)
+            ):
+                continue
+            table_schema = db_schema[table_fqn]
+            table_description = table_info.get("description")
+            if (
+                not get_table_description(table_schema)
+                and isinstance(table_description, str)
+                and table_description.strip()
+            ):
+                table_schema["description"] = table_description.strip()
+                changed = True
+
+            memory_columns = table_info.get("columns")
+            if not isinstance(memory_columns, list):
+                continue
+            live_columns = get_table_columns(table_schema)
+            for memory_column in memory_columns:
+                if not isinstance(memory_column, dict):
+                    continue
+                name = memory_column.get("name")
+                description = memory_column.get("description")
+                live_column = live_columns.get(name) if isinstance(name, str) else None
+                if (
+                    isinstance(live_column, dict)
+                    and not str(live_column.get("description", "")).strip()
+                    and isinstance(description, str)
+                    and description.strip()
+                ):
+                    live_column["description"] = description.strip()
+                    changed = True
+        return changed
+
     def _observe_vector_readiness(self, memory_manager: Any) -> str:
         """Возвращает явное состояние Chroma, не подменяя им SQLite-готовность."""
         try:
@@ -627,13 +690,9 @@ class SchemaMemoryManager:
         # Меняем формат хэша — старые записи `file_hash` инвалидируются и
         # переиндексируются при следующем вызове (это OK: индекс
         # самовосстанавливается из источника).
-        file_hash = (
-            namespace.version_key
-            if namespace is not None
-            else hashlib.blake2b(
-                normalized_content.encode("utf-8"), digest_size=16
-            ).hexdigest()
-        )
+        file_hash = hashlib.blake2b(
+            normalized_content.encode("utf-8"), digest_size=16
+        ).hexdigest()
 
         # W5-T3: double-checked locking. Без лока ниже сразу два процесса/
         # worker'а могут проскочить is_schema_indexed (оба видят "нет"),
@@ -751,12 +810,13 @@ class SchemaMemoryManager:
                 if expected_table_keys is not None
                 else None
             )
+            source_ids, failed_ids = source_namespace_semantic_ids(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_table",
+                expected_file_hash=file_hash,
+            )
             if vector_readiness != _VECTOR_READY:
-                source_ids, failed_ids = source_namespace_semantic_ids(
-                    session_id=namespace.version_key,
-                    agent_name="Schema-RAG-Agent",
-                    cache_kind="schema_table",
-                )
                 expected_ids = source_ids if expected_ids is None else expected_ids
                 return (
                     bool(expected_ids)
@@ -783,6 +843,8 @@ class SchemaMemoryManager:
             actual_ids = set(reconciliation.indexed_ids)
             sqlite_source_is_complete = (
                 bool(expected_ids)
+                and not failed_ids
+                and expected_ids == source_ids
                 and not reconciliation.failed_ids
                 and expected_ids == set(reconciliation.expected_ids)
                 and (

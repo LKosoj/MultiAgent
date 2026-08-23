@@ -53,6 +53,7 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
 from custom_tools.text_to_sql.adaptive.research_decision import (
     InspectTableIntent,
     ResearchDecisionV1,
+    SampleRowsIntent,
     ToolIntent,
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
@@ -63,7 +64,10 @@ from custom_tools.text_to_sql.adaptive.solver_protocol import (
     MissingEvidenceProposal,
     SolverProposalV1,
 )
-from custom_tools.text_to_sql.adaptive.tool_registry import InspectTableArguments
+from custom_tools.text_to_sql.adaptive.tool_registry import (
+    InspectTableArguments,
+    SampleRowsArguments,
+)
 from test_text_to_sql_solver_runner import _runtime
 from workflow.text_to_sql_typed_runtime import (
     TextToSqlTypedAdmission,
@@ -566,6 +570,103 @@ async def test_targeted_reentry_charges_last_model_call_before_tool_admission(
     )
     assert plan is not None
     assert runtime.research_state_store.is_prepared_targeted_reentry_committed(plan)
+
+
+@pytest.mark.asyncio
+async def test_targeted_reentry_caps_sample_rows_reservation_at_admitted_limit(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    runtime, solver, research, requirements, freshness = _one_remaining_reentry_case(
+        tmp_path
+    )
+    assert research.budget_state.remaining_rows > 50
+    request = solver.missing_evidence_requests[-1].model_copy(
+        update={"required_evidence_kind": EvidenceSourceKind.SAMPLE}
+    )
+    solver = solver.model_copy(
+        update={"missing_evidence_requests": (*solver.missing_evidence_requests[:-1], request)}
+    )
+
+    import custom_tools.text_to_sql.adaptive.probes as probes
+    import custom_tools.text_to_sql.adaptive.schema_research_agent as agent_contracts
+    sample_rows_called = False
+
+    def sample_rows(target, columns, limit, *, runtime, budget):
+        nonlocal sample_rows_called
+        sample_rows_called = True
+        assert limit == 50
+        assert budget.maximum_cost.rows == 50
+        payload = {
+            "columns": list(columns),
+            "probe_kind": budget.action.kind.value,
+            "schema_namespace_version": budget.state.schema_namespace_version,
+            "target": target.model_dump(mode="json", by_alias=True),
+            "rows": [],
+        }
+        return build_probe_result(
+            run_id=budget.state.run_id,
+            run_incarnation=budget.state.run_incarnation,
+            revision=budget.state.revision,
+            schema_namespace_version=budget.state.schema_namespace_version,
+            invocation_id=budget.invocation_id,
+            action_digest=budget.action.action_digest,
+            probe_kind=budget.action.kind,
+            status=ProbeStatus.SUCCESS,
+            target=target,
+            started_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+            summary="synthetic sample rows",
+            cost=EvidenceCost(
+                wall_clock_ms=0,
+                model_calls=0,
+                model_tokens=0,
+                db_probe_ms=0,
+                rows=0,
+                bytes=len(canonical_json_bytes(payload)),
+            ),
+            row_count=0,
+            payload=payload,
+        )
+
+    monkeypatch.setattr(probes, "sample_rows", sample_rows)
+
+    async def model(_prompt: str):
+        return agent_contracts.SchemaResearchModelResponse(
+            raw_response=ResearchDecisionV1.model_validate(
+                {
+                    "proposals": (),
+                    "next": ToolIntent(
+                        hypothesis_ref=None,
+                        intent=SampleRowsIntent(
+                            arguments=SampleRowsArguments(
+                                table="orders",
+                                columns=("status",),
+                                limit=50,
+                            )
+                        ),
+                    ),
+                }
+            ).model_dump_json(),
+            usage=ModelTokenUsage(input_tokens=7, output_tokens=4),
+        )
+
+    outcome = await build_production_reentry_boundary(
+        runtime,
+        table_namespace="main",
+        model=model,
+    )(
+        solver,
+        research,
+        "request-1",
+        requirements=requirements,
+        freshness_context=freshness,
+        commit_solver_admission=lambda transition: transition.state,
+        id_factory=iter(("reentry-sample-rows",)).__next__,
+    )
+
+    assert sample_rows_called
+    assert outcome.record.status is not ResearchReentryStatus.TOOL_FAILURE
 
 
 @pytest.mark.asyncio

@@ -11,6 +11,7 @@ from pydantic import BaseModel, TypeAdapter, ValidationError
 from ._semantic_coverage_boundary import evidence_has_state_authority
 from .models import (
     Binding,
+    BindingStatus,
     DocumentRuleBinding,
     HypothesisStatus,
     Id,
@@ -24,7 +25,7 @@ from .models import (
     SolverStopReason,
     StrictModel,
     TargetRef,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
 )
 from .freshness import (
     FreshnessContext,
@@ -115,6 +116,7 @@ def apply_solver_proposal(
     table_namespace: str,
     requirements: CoverageRequirements,
     id_factory: Callable[[], str],
+    trusted_semantic_repair: bool = False,
 ) -> SolverTransitionResult:
     """Accept exactly one solver proposal without running checks or SQL."""
 
@@ -136,6 +138,14 @@ def apply_solver_proposal(
 
     if state.stop_reason is not None:
         raise SolverConflictError("SolverState is already stopped")
+    if (
+        type(proposal.proposal) is MissingEvidenceProposal
+        and proposal.proposal.repair_kind is not None
+        and not trusted_semantic_repair
+    ):
+        raise SolverProtocolError(
+            "semantic binding repair requires a trusted result review"
+        )
     if len(state.sql_candidates) >= 8 and isinstance(
         proposal.proposal, SqlCandidateProposal
     ):
@@ -390,6 +400,12 @@ def finalize_targeted_reentry(
     current = state.research_reentries[record_index]
     if current.status is not ResearchReentryStatus.ADMITTED:
         raise SolverConflictError("research re-entry is already terminal")
+    request = next(
+        item
+        for item in state.missing_evidence_requests
+        if item.missing_evidence_request_id == current.missing_evidence_request_id
+    )
+    semantic_repair = request.repair_kind == "semantic_binding_mismatch"
 
     result_revision: int | None = None
     evidence_ids: tuple[str, ...] = ()
@@ -421,7 +437,11 @@ def finalize_targeted_reentry(
             research_state.run_id != state.run_id
             or research_state.run_incarnation != state.run_incarnation
             or research_state.schema_namespace_version != state.schema_namespace_version
-            or research_state.revision != current.research_base_revision + 1
+            or (
+                research_state.revision <= current.research_base_revision
+                if semantic_repair
+                else research_state.revision != current.research_base_revision + 1
+            )
         ):
             raise SolverValidationError(
                 "research result is stale or has wrong identity"
@@ -448,34 +468,52 @@ def finalize_targeted_reentry(
         )
         if not selected:
             raise SolverProtocolError("W4 authority does not select the request source")
+        if semantic_repair:
+            stale = tuple(
+                binding
+                for binding in research_state.bindings
+                if binding.binding_id == request.repair_binding_id
+                and binding.source_id == current.source_id
+                and binding.status is BindingStatus.STALE
+            )
+            if len(stale) != 1 or any(
+                binding.binding_id == request.repair_binding_id
+                for binding in selected
+            ):
+                raise SolverProtocolError(
+                    "semantic repair did not replace the stale binding"
+                )
         baseline = set(current.baseline_evidence_ids)
         new_evidence = tuple(
             item for item in research_state.evidence if item.evidence_id not in baseline
-        )
-        request = next(
-            item
-            for item in state.missing_evidence_requests
-            if item.missing_evidence_request_id == current.missing_evidence_request_id
         )
         source_targets = _source_reentry_targets(
             research_state,
             selected,
             current.source_id,
         )
-        if not new_evidence or any(
-            item.source_kind is not request.required_evidence_kind
-            or not evidence_has_state_authority(item, research_state)
-            or item.observed_at > freshness_context.evaluated_at
-            or item.created_at > freshness_context.evaluated_at
-            or evaluate_evidence_freshness(item, freshness_context).status
-            is not FreshnessStatus.FRESH
-            or not any(_exact_value(item.target, target) for target in source_targets)
+        selected_evidence_ids = {
+            evidence_id for binding in selected for evidence_id in binding.evidence_ids
+        }
+        eligible_new_evidence = tuple(
+            item
             for item in new_evidence
+            if (not semantic_repair or item.evidence_id in selected_evidence_ids)
+            and (semantic_repair or item.source_kind is request.required_evidence_kind)
+            and evidence_has_state_authority(item, research_state)
+            and item.observed_at <= freshness_context.evaluated_at
+            and item.created_at <= freshness_context.evaluated_at
+            and evaluate_evidence_freshness(item, freshness_context).status
+            is FreshnessStatus.FRESH
+            and any(_exact_value(item.target, target) for target in source_targets)
+        )
+        if not eligible_new_evidence or (
+            not semantic_repair and len(eligible_new_evidence) != len(new_evidence)
         ):
             raise SolverValidationError(
                 "research result has no eligible fresh evidence for the request source"
             )
-        evidence_ids = tuple(sorted(item.evidence_id for item in new_evidence))
+        evidence_ids = tuple(sorted(item.evidence_id for item in eligible_new_evidence))
         result_revision = research_state.revision
         next_stop_reason = None
     elif any(
@@ -600,6 +638,8 @@ def _apply_missing_evidence_proposal(
         candidate_targets=(),
         required_evidence_kind=proposal.required_evidence_kind,
         reason=proposal.reason,
+        repair_kind=proposal.repair_kind,
+        repair_binding_id=proposal.repair_binding_id,
     )
     action = SolverAction(
         action_id=action_id,
@@ -664,7 +704,7 @@ def _validate_transition_authority(
         sorted(
             item.source_id
             for item in state.query_spec.semantic_items
-            if item.required and not is_binding_free_structural_limit(item)
+            if item.required and not is_binding_free_semantic_item(item)
         )
     ):
         raise SolverProtocolError("requirements selected bindings do not match authority")

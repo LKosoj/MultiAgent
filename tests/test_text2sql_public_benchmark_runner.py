@@ -554,7 +554,7 @@ def test_bwrap_manifest_uses_v2_execution_policy_from_source_snapshot(
         "adaptive_policy": {
             "policy_version": 2,
             "wall_clock": {"wall_clock_seconds": 14_400},
-            "resource_limits": {"model_tokens": 524_288, "db_probe_ms": 14_400_000},
+            "resource_limits": {"model_tokens": 1_048_576, "db_probe_ms": 14_400_000},
             "operation_counts": {
                 "actions": 512,
                 "model_decisions": 256,
@@ -566,7 +566,7 @@ def test_bwrap_manifest_uses_v2_execution_policy_from_source_snapshot(
                 "model_calls": 256,
                 "input_tokens_per_call": 16_384,
                 "output_tokens_per_call": 32_000,
-                "total_tokens": 524_288,
+                "total_tokens": 1_048_576,
             },
         },
         "workflow_retry_policy": {

@@ -89,7 +89,7 @@ class PreparedTargetedReentryCommit(StrictModel):
 class RecoveredTargetedReentry:
     solver_state: SolverState
     research_state: ResearchState
-    requirements: CoverageRequirements
+    requirements: CoverageRequirements | None
     freshness: FreshnessContext
     record: ResearchReentryRecord
 
@@ -177,6 +177,20 @@ def recover_prepared_targeted_reentry(
         document_sources=freshness.document_sources,
         data_snapshots=freshness.data_snapshots,
     )
+    request = next(
+        item
+        for item in solver_state.missing_evidence_requests
+        if item.missing_evidence_request_id == record.missing_evidence_request_id
+    )
+    if request.repair_kind == "semantic_binding_mismatch":
+        state_store.commit_prepared_targeted_reentry(plan, successor)
+        return RecoveredTargetedReentry(
+            solver_state=solver_state,
+            research_state=successor,
+            requirements=None,
+            freshness=refreshed,
+            record=record,
+        )
     requirements = validate_coverage_inputs(
         successor,
         refreshed,

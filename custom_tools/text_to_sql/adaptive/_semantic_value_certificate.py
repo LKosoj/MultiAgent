@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from .models import (
     ColumnRef,
     EvidenceRecord,
@@ -73,6 +75,49 @@ def predicate_has_exact_value_certificate(
     )
 
 
+def predicate_has_valid_literal(predicate: PredicateRef) -> bool:
+    """Validate a discriminator predicate without requiring a matching row."""
+
+    if type(predicate.left) is not ColumnRef:
+        return False
+    if predicate.operator in {
+        PredicateOperator.IS_NULL,
+        PredicateOperator.IS_NOT_NULL,
+    }:
+        return predicate.right is None
+    if predicate.operator in {
+        PredicateOperator.IN,
+        PredicateOperator.NOT_IN,
+    }:
+        return (
+            type(predicate.right) is tuple
+            and bool(predicate.right)
+            and all(_is_non_null_literal(value) for value in predicate.right)
+        )
+    if predicate.operator is PredicateOperator.BETWEEN:
+        return (
+            type(predicate.right) is tuple
+            and len(predicate.right) == 2
+            and all(_is_non_null_literal(value) for value in predicate.right)
+        )
+    if predicate.operator is PredicateOperator.LIKE:
+        return type(_literal_value(predicate.right)) is str
+    return type(predicate.right) is not tuple and _is_non_null_literal(
+        predicate.right
+    )
+
+
+def _is_non_null_literal(value: object) -> bool:
+    literal = _literal_value(value)
+    return type(literal) in {str, int, float, bool} and (
+        type(literal) is not float or math.isfinite(literal)
+    )
+
+
+def _literal_value(value: object) -> object:
+    return value.value if type(value) is LiteralValue else value
+
+
 def evidence_observes_exact_column(
     record: EvidenceRecord,
     column: ColumnRef,
@@ -131,4 +176,5 @@ __all__ = [
     "evidence_observes_exact_column",
     "evidence_observes_exact_value",
     "predicate_has_exact_value_certificate",
+    "predicate_has_valid_literal",
 ]

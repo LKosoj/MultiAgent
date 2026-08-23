@@ -135,6 +135,7 @@ class TestWorkflowStreamlitAPI:
 
     def test_workflow_result_event_store_masks_pii(self, monkeypatch, tmp_path):
         """WORKFLOW_RESULT не должен сохранять raw PII/DSN в AG-UI EventStore."""
+        monkeypatch.setenv("PII_MASKING_ENABLED", "1")
         from backend.fastapi_app.agui.store import EventStore
         import workflow.streamlit_api as streamlit_api
 

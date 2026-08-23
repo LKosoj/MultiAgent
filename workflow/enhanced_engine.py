@@ -1547,6 +1547,11 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 return None
         except (TypeError, ValueError):
             return None
+        if (
+            type(receipt) is ResultReviewReceipt
+            and receipt.verdict not in {"contradicted", "ambiguous"}
+        ):
+            return None
         candidates = tuple(
             item
             for item in checkpoint.state.sql_candidates

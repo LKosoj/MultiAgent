@@ -552,6 +552,8 @@ def _sanitize_report_b64_gzip(b64: Any) -> Any:
 
 
 def _mask_pii_text(value: str) -> str:
+    if os.getenv("PII_MASKING_ENABLED", "0") != "1":
+        return value
     jur = _load_active_pii_jurisdiction()
     masked = value
     for rule in jur.sync_masking_rules:

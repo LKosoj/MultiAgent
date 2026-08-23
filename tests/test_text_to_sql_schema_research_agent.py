@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import re
@@ -26,10 +27,20 @@ from custom_tools.text_to_sql.adaptive.production_research import (
 from custom_tools.text_to_sql.adaptive._policy_common import BudgetAdmissionError
 from custom_tools.text_to_sql.adaptive.semantic_coverage import CoverageInputErrorCode
 from custom_tools.text_to_sql.adaptive.models import (
+    ColumnRef,
+    EvidenceCost,
+    EvidenceRecord,
+    EvidenceSourceKind,
+    EvidenceValidityScope,
     ExpectedResultShape,
+    JoinCandidate,
+    JoinCandidateStatus,
+    JoinEdge,
+    JoinType,
     PredicateOperator,
     QuerySpec,
     ResearchState,
+    TableRef,
 )
 from custom_tools.text_to_sql.adaptive.policy import (
     AdaptivePolicyConfig,
@@ -155,6 +166,7 @@ def _minimal_research_state(policy: AdaptivePolicyConfig) -> ResearchState:
         query_id="document-metadata-query",
         original_text="list documented rules",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -426,6 +438,158 @@ def test_bounded_context_keeps_selected_preflight_feedback_near_prompt_limit() -
     assert json.loads(context)["rejected_preflight_assessments"] == [selected]
 
 
+def test_bounded_context_keeps_compact_candidate_join_when_evidence_does_not_fit() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    table = TableRef(namespace="main", schema=None, table="orders")
+    customer = TableRef(namespace="main", schema=None, table="customers")
+    left = ColumnRef(table=table, column="customer_id")
+    right = ColumnRef(table=customer, column="id")
+    evidence = EvidenceRecord(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=0,
+        schema_namespace_version=state.schema_namespace_version,
+        evidence_id="evidence-join",
+        source_kind=EvidenceSourceKind.SCHEMA,
+        target=table,
+        action_digest="sha256:" + "b" * 64,
+        observation="x" * 5_000,
+        validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
+        data_snapshot_token=None,
+        observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+        strength=1.0,
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=0,
+            bytes=5_000,
+        ),
+    )
+    join = JoinCandidate(
+        join_id="join-pending",
+        left=left,
+        right=right,
+        join_type=JoinType.INNER,
+        path=(JoinEdge(left=left, right=right),),
+        status=JoinCandidateStatus.CANDIDATE,
+        evidence_ids=(evidence.evidence_id,),
+    )
+    state = state.model_copy(
+        update={"evidence": (evidence,), "join_candidates": (join,)}
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+        )
+    )
+
+    assert context["state"]["join_candidates"] == [
+        join.model_dump(mode="json", by_alias=True)
+    ]
+    assert context["state"]["evidence"] == []
+
+
+def test_bounded_context_prioritizes_schema_for_validated_join_endpoint() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    events = TableRef(namespace="main", schema=None, table="events")
+    locations = TableRef(namespace="main", schema=None, table="locations")
+    event_location = ColumnRef(table=events, column="location_id")
+    location_id = ColumnRef(table=locations, column="id")
+    relationship = EvidenceRecord(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=0,
+        schema_namespace_version=state.schema_namespace_version,
+        evidence_id="relationship-evidence",
+        source_kind=EvidenceSourceKind.SCHEMA,
+        target=events,
+        action_digest="sha256:" + "b" * 64,
+        observation="declared relationship",
+        validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
+        data_snapshot_token=None,
+        observed_at=datetime(2026, 8, 20, tzinfo=UTC),
+        strength=1.0,
+        created_at=datetime(2026, 8, 20, tzinfo=UTC),
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=0,
+            bytes=21,
+        ),
+    )
+    endpoint_schema = EvidenceRecord(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=1,
+        schema_namespace_version=state.schema_namespace_version,
+        evidence_id="endpoint-schema-evidence",
+        source_kind=EvidenceSourceKind.SCHEMA,
+        target=locations,
+        action_digest="sha256:" + "c" * 64,
+        observation="direct output attribute; " * 50,
+        validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
+        data_snapshot_token=None,
+        observed_at=datetime(2026, 8, 21, tzinfo=UTC),
+        strength=1.0,
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=1,
+            bytes=1_250,
+        ),
+    )
+    join = JoinCandidate(
+        join_id="validated-join",
+        left=event_location,
+        right=location_id,
+        join_type=JoinType.INNER,
+        path=(JoinEdge(left=event_location, right=location_id),),
+        status=JoinCandidateStatus.VALIDATED,
+        evidence_ids=(relationship.evidence_id,),
+    )
+    state = state.model_copy(
+        update={
+            "revision": 2,
+            "evidence": (relationship, endpoint_schema),
+            "join_candidates": (join,),
+        }
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+        )
+    )
+
+    assert join.model_dump(mode="json", by_alias=True) in context["state"][
+        "join_candidates"
+    ]
+    assert endpoint_schema.evidence_id in {
+        item["evidence_id"] for item in context["state"]["evidence"]
+    }
+
+
 def test_legacy_schema_rag_profile_keeps_its_tool_calling_contract() -> None:
     with (PROFILES_DIR / "schema_rag_agent.yaml").open(encoding="utf-8") as stream:
         legacy = yaml.safe_load(stream)
@@ -487,6 +651,23 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
     assert (
         "For a requested derived alternative label or role, use derived_expression with "
         "exact document evidence and its input columns."
+        in instructions
+    )
+
+
+def test_profile_checks_visible_direct_output_matches_before_unsupported() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Before unsupported for a rejected output binding, probe visible columns matching "
+        "by name or description and reachable through known relationships from confirmed "
+        "conditions."
+        in instructions
+    )
+    assert (
+        "When the named entity table has no direct output attribute, prefer a directly "
+        "named or described candidate on a reachable related table over an indirect proxy, "
+        "without requiring the physical table's entity label to repeat the question wording."
         in instructions
     )
 
@@ -566,6 +747,13 @@ def test_profile_states_stop_invariants_before_any_correction() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert re.search(
+        r"\bQUERY_REQUIREMENT_INCOMPLETE\b.*\bsupported bindings\b.*"
+        r"\bjoin_path\b.*\bnew_binding\b.*\bjoin_references\b.*"
+        r"\bvalidated join IDs\b",
+        instructions,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    assert re.search(
         r"\bambiguous or unsupported\b.*\bcitation_evidence_ids\b.*\bfresh evidence\b",
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
@@ -604,7 +792,9 @@ def test_profile_discloses_closed_research_query_output_contract() -> None:
 
     assert (
         "Every output SELECT scope must output 1..20 columns with unique non-empty "
-        "names; a plain column may use its own name. Unnamed computed expressions are "
+        "names; a plain column may use its own name. Plain SELECT * is allowed only "
+        "when the loaded scoped schema expands it to 1..20 uniquely named columns; "
+        "qualified or dynamic star forms are forbidden. Unnamed computed expressions are "
         "allowed in nested SELECTs that are not CTE or derived FROM row sources, and "
         "for individual Window projections."
     ) in instructions
@@ -635,13 +825,14 @@ def test_profile_discloses_predicate_query_and_binding_assessment_rules() -> Non
         "existing typed research tool."
     ) in instructions
     assert (
-        "A formula needs read_schema_evidence, then derived_expression backed by "
-        "the exact document excerpt and input columns."
+        "Query formula needs no binding; verify physical inputs."
     ) in instructions
     assert (
-        "A discriminator FILTER assessment needs exact-column evidence plus "
-        "positive value/predicate evidence; otherwise inspect or search with an "
-        "existing tool."
+        "Only external rules need document-backed derived_expression."
+    ) in instructions
+    assert (
+        "A FILTER/TIME binding needs exact-column evidence and a valid predicate. "
+        "Zero matches do not mean unsupported"
     ) in instructions
 
 
@@ -740,7 +931,7 @@ def test_profile_documents_proposal_shapes_with_one_parseable_example() -> None:
         "reference: existing(hypothesis_id | binding_id | join_id) | proposed(proposal_key)",
         "physical_column(physical_column: table, column)",
         "vertical_attribute(entity_table, entity_key, attribute_catalog_table, attribute_catalog_key, attribute_name_predicate, value_table, value_entity_key, value_attribute_key, value_predicate)",
-        "discriminator_value(discriminator_column, discriminator_predicate)",
+        "discriminator_value(discriminator_column, discriminator_predicate[, additional_predicates])",
         'derived_expression: {"kind":"derived_expression",',
         "document_rule(document_id, rule_id, rule_text)",
         "citation_evidence_ids: non-empty unique evidence IDs from current state",
@@ -911,6 +1102,7 @@ def test_prompt_keeps_untrusted_task_and_context_inside_one_json_envelope() -> N
         "INVALID_STOP",
         "INVALID_DECISION",
         "UNRESOLVABLE_PREFLIGHT",
+        "REPEATED_PREFLIGHT_DECISION",
         "RAW_RESEARCH_QUERY_LIMIT",
         "PROBE_UNAVAILABLE",
     ),
@@ -965,7 +1157,12 @@ def test_validation_feedback_changes_only_trusted_instructions(feedback: str) ->
             "UNRESOLVABLE_PREFLIGHT",
             "Previous decision rejected: UNRESOLVABLE_PREFLIGHT. Correct the decision "
             "using the profile rules and return a replacement typed decision. Use the "
-            "rejected preflight assessment details in the research context.",
+            "rejected preflight proposal details in the research context.",
+        ),
+        (
+            "REPEATED_PREFLIGHT_DECISION",
+            "Previous decision rejected: REPEATED_PREFLIGHT_DECISION. Correct "
+            "the decision using the profile rules and return a replacement typed decision.",
         ),
         (
             "INVALID_RESEARCH_QUERY",
@@ -1043,7 +1240,7 @@ def test_unresolvable_preflight_feedback_requests_discovery_without_json_repair(
     assert instructions.endswith(
         "Previous decision rejected: UNRESOLVABLE_PREFLIGHT. Correct the decision "
         "using the profile rules and return a replacement typed decision. Use the "
-        "rejected preflight assessment details in the research context."
+        "rejected preflight proposal details in the research context."
     )
 
 
@@ -1056,6 +1253,46 @@ def test_profile_explains_rejected_preflight_assessment_batch() -> None:
     assert "use its existing_evidence_id exactly for that matching assessment" in instructions
     assert "do not repeat a probe for that fact" in instructions
     assert "exactly that existing tool request next with proposals: []" in instructions
+    assert (
+        "remove the bad optional reference or replace it by copying an existing "
+        "durable join_id verbatim"
+        in instructions
+    )
+    assert "referenced binding_id does not exist" in instructions
+    assert "source_id does not exist" in instructions
+    assert "copy an existing durable source_id verbatim" in instructions
+    assert "cited evidence_id does not exist" in instructions
+    assert "copy a durable citation_evidence_id verbatim" in instructions
+    assert "binding already exists" in instructions
+    assert "omit that new_binding" in instructions
+
+
+def test_profile_requires_exact_durable_evidence_ids_after_invalid_stop() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "After INVALID_STOP without invalid_stop_generation_authority, copy every "
+        "citation_evidence_id exactly from the durable state"
+        in instructions
+    )
+
+
+def test_profile_requires_physical_values_for_new_predicate_bindings() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "For FILTER with a literal value, use discriminator_value" in instructions
+    assert "For TIME, use DB-confirmed predicate(s)" in instructions
+    assert "putting extra column predicates in additional_predicates" in instructions
+    assert "Put literals directly in right, never {\"value\": ...}" in instructions
+    assert "rejected new_binding proposal is included unchanged" in instructions
+    assert "a replacement exactly repeated an already rejected decision" in instructions
+    assert "Do not return that decision again" in instructions
+
+
+def test_profile_preserves_explicit_physical_mapping_from_document() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "Use normalized_meaning mappings; no substitutes" in instructions
 
 
 def test_profile_explains_exact_hypothesis_consistency_certificate() -> None:
@@ -1065,6 +1302,17 @@ def test_profile_explains_exact_hypothesis_consistency_certificate() -> None:
     assert "closed payload status=matched" in instructions
     assert "execute_research_probe rowsets do not qualify" in instructions
     assert "omit the assessment and do not repeat consistent" in instructions
+    assert "hypothesis consistency is not proven by cited evidence" in instructions
+    assert "hypothesis contradiction is not proven by cited evidence" in instructions
+    assert "omit the contradicted assessment" in instructions
+
+
+def test_profile_explains_exact_hypothesis_contradiction_certificate() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "hypothesis contradiction is not proven by cited evidence" in instructions
+    assert "omit the contradicted assessment" in instructions
+    assert "execute_research_probe rowsets do not prove contradiction" in instructions
 
 
 def test_duplicate_action_feedback_requires_a_different_existing_action() -> None:

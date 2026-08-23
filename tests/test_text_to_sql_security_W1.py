@@ -64,6 +64,7 @@ def _disable_fullname_globally(monkeypatch):
     чтобы regex'ы не пересекались. Локальный тест A2 на ФИО снимает override.
     """
     from custom_tools.text_to_sql.core import _pii
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     # W4: _ru_fullname_enabled принимает опциональный pre-loaded jur
     # (pii_mask_sync вызывает его как _ru_fullname_enabled(jur)).
     monkeypatch.setattr(_pii, "_ru_fullname_enabled", lambda *_a, **_k: False)

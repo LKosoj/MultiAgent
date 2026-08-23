@@ -25,7 +25,10 @@ from custom_tools.text_to_sql.adaptive.models import (
 )
 from custom_tools.text_to_sql.adaptive.policy import canonical_action_digest
 from custom_tools.text_to_sql.adaptive.probes import ProbeStatus, build_probe_result
-from custom_tools.text_to_sql.adaptive.serialization import canonical_json_bytes
+from custom_tools.text_to_sql.adaptive.serialization import (
+    canonical_digest,
+    canonical_json_bytes,
+)
 from custom_tools.text_to_sql.schema_loader import LoadedSchema
 from custom_tools.text_to_sql.schema_namespace import (
     SchemaNamespace,
@@ -79,6 +82,7 @@ def _query_spec() -> QuerySpec:
                 binding_ids=(),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -219,6 +223,14 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     )
 
     class MemoryManager:
+        def restore_descriptions_from_memory(self, namespace, schema):
+            calls.append(("restore", namespace, schema))
+            schema["public.revenue"]["description"] = "Monthly revenue records"
+            schema["public.revenue"]["columns"]["amount"]["description"] = (
+                "Recorded revenue amount"
+            )
+            return True
+
         def ensure_schema_indexed_in_memory(self, namespace, schema):
             calls.append(("ensure", namespace, schema))
             return True
@@ -236,10 +248,29 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
 
     class Loader:
         def __init__(self, _repo_root):
-            pass
+            self.file_manager = SimpleNamespace(
+                load_scoped_snapshot=lambda _scope: {
+                    "snapshot_version": 1,
+                    "schema_scope": loaded.namespace.scope.to_mapping(),
+                    "schema_fingerprint": loaded.namespace.schema_fingerprint,
+                    "schema_info": {"public.revenue": {"columns": {}}},
+                },
+                save_scoped_snapshot=lambda scope, snapshot: calls.append(
+                    ("save_snapshot", scope, snapshot)
+                ),
+            )
 
         def load_scoped_schema(self, *_args):
             return loaded
+
+    class Enricher:
+        def enrich_descriptions_with_llm(self, schema, *, dsn=None):
+            calls.append(("enrich", schema, dsn))
+            assert schema["public.revenue"]["description"] == "Monthly revenue records"
+            assert (
+                schema["public.revenue"]["columns"]["amount"]["description"]
+                == "Recorded revenue amount"
+            )
 
     async def run_research(**kwargs):
         captured.update(kwargs)
@@ -250,6 +281,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         )
 
     monkeypatch.setattr(typed_research, "SchemaLoader", Loader)
+    monkeypatch.setattr(typed_research, "SchemaEnricher", Enricher, raising=False)
     monkeypatch.setattr(
         typed_research,
         "SchemaMemoryManager",
@@ -292,13 +324,22 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         lambda *_args: SimpleNamespace(allowed=True),
     )
 
-    result = asyncio.run(
-        typed_research.run_typed_schema_research(
-            _runtime(loaded, context_documents=context_documents)
-        )
-    )
+    runtime = _runtime(loaded, context_documents=context_documents)
+    result = asyncio.run(typed_research.run_typed_schema_research(runtime))
 
     assert calls == [
+        ("restore", loaded.namespace, loaded.schema),
+        ("enrich", loaded.schema, _runtime(loaded).dsn),
+        (
+            "save_snapshot",
+            loaded.namespace.scope,
+            {
+                "snapshot_version": 1,
+                "schema_scope": loaded.namespace.scope.to_mapping(),
+                "schema_fingerprint": loaded.namespace.schema_fingerprint,
+                "schema_info": loaded.schema,
+            },
+        ),
         ("ensure", loaded.namespace, loaded.schema),
         ("find", ("monthly revenue", "revenue"), loaded.namespace),
         ("find_facts", ("monthly revenue", "revenue"), loaded.namespace),
@@ -307,6 +348,13 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     assert captured["semantic_table_hints"] == ("public.revenue",)
     assert captured["verified_probe_fact_hints"] == (
         {"probe_kind": "sample_rows", "summary": "recent revenue rows"},
+    )
+    assert runtime.loaded_schema_digest == canonical_digest(
+        {
+            "namespace_version": loaded.namespace.version_key,
+            "schema": loaded.schema,
+            "source": loaded.source,
+        }
     )
     assert understanding_calls == [
         {

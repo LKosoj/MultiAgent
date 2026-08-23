@@ -20,6 +20,7 @@ from ._semantic_value_certificate import (
     evidence_observes_exact_column,
     evidence_observes_exact_value,
     predicate_has_exact_value_certificate,
+    predicate_has_valid_literal,
 )
 from .evidence import probe_result_to_evidence
 from .freshness import FreshnessContext, FreshnessStatus, evaluate_evidence_freshness
@@ -166,6 +167,7 @@ class SemanticTurnAdmission:
     bindings: tuple[BindingBase, ...]
     join_candidates: tuple[JoinCandidate, ...]
     budget_state: BudgetState | None
+    declared_join_ids: tuple[Id, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,7 +260,13 @@ def admit_semantic_turn(
             proposal_ids[proposal.proposal_key] = item.hypothesis_id
             new_hypotheses.append(item)
         elif isinstance(proposal, NewJoinProposal):
-            item = _new_join(proposal, resolver, current.schema_namespace_version)
+            item = _new_join(
+                proposal,
+                resolver,
+                current.schema_namespace_version,
+            )
+            if item.join_id in joins_by_id:
+                raise SemanticReducerError("new join already exists")
             proposal_ids[proposal.proposal_key] = item.join_id
             new_joins.append(item)
     _require_unique_ids(
@@ -345,6 +353,7 @@ def admit_semantic_turn(
         ),
         tuple(sorted((*new_joins, *updates_joins), key=lambda item: item.join_id)),
         budget_state,
+        batch.declared_join_ids,
     )
 
 
@@ -402,6 +411,17 @@ def commit_semantic_turn(
                 admission.action,
                 created,
             )
+    declared_join_ids = tuple(
+        sorted(
+            set(admission.declared_join_ids).union(
+                item.join_id
+                for item in admission.join_candidates
+                if item.status is JoinCandidateStatus.VALIDATED
+                and item.join_id
+                not in {candidate.join_id for candidate in admission.state.join_candidates}
+            )
+        )
+    )
     transition = apply_research_transition(
         admission.state,
         admission.action,
@@ -411,6 +431,7 @@ def commit_semantic_turn(
         bindings=admission.bindings,
         join_candidates=admission.join_candidates,
         budget_state=admission.budget_state,
+        declared_join_ids=declared_join_ids,
     )
     return SemanticCommitResult(transition.state, transition.novelty, transition)
 
@@ -495,7 +516,9 @@ def _new_hypothesis(
 
 
 def _new_join(
-    proposal: NewJoinProposal, resolver: _Resolver, schema: str
+    proposal: NewJoinProposal,
+    resolver: _Resolver,
+    schema: str,
 ) -> JoinCandidate:
     left, right = resolver.column(proposal.left), resolver.column(proposal.right)
     path = tuple(
@@ -508,6 +531,7 @@ def _new_join(
     )
     if not path:
         path = (JoinEdge(left=left, right=right, join_type=proposal.join_type),)
+    endpoints_match = path[0].left == left and path[0].right == right
     if proposal.join_type is JoinType.INNER and _target_key(right) < _target_key(left):
         left, right = right, left
         oriented_path = path if _is_composite_relation(path) else tuple(reversed(path))
@@ -532,7 +556,11 @@ def _new_join(
         right=right,
         join_type=proposal.join_type,
         path=path,
-        status=JoinCandidateStatus.CANDIDATE,
+        status=(
+            JoinCandidateStatus.VALIDATED
+            if endpoints_match
+            else JoinCandidateStatus.CANDIDATE
+        ),
         evidence_ids=tuple(sorted(proposal.citation_evidence_ids)),
     )
 
@@ -654,28 +682,42 @@ def _new_binding(
             **common,
         )
     if isinstance(candidate, DiscriminatorValueCandidate):
-        column, predicate = (
-            resolver.column(candidate.discriminator_column),
+        column = resolver.column(candidate.discriminator_column)
+        predicates = (
             resolver.predicate(candidate.discriminator_predicate),
+            *(
+                resolver.predicate(predicate)
+                for predicate in candidate.additional_predicates
+            ),
         )
-        if predicate.left != column:
+        if predicates[0].left != column:
             raise SemanticReducerError(
                 "discriminator predicate must use its discriminator column"
             )
+        if len(set(predicates)) != len(predicates):
+            raise SemanticReducerError("discriminator predicates must be unique")
+        columns = tuple(dict.fromkeys(predicate.left for predicate in predicates))
+        tables = tuple(dict.fromkeys(item.table for item in columns))
         payload = {
             "schema": schema,
             "kind": candidate.kind,
             "source": proposal.source_id,
-            "column": _target_data(column),
-            "predicate": predicate.model_dump(mode="json"),
         }
+        if len(predicates) == 1:
+            payload["column"] = _target_data(column)
+            payload["predicate"] = predicates[0].model_dump(mode="json")
+        else:
+            payload["columns"] = [_target_data(item) for item in columns]
+            payload["predicates"] = [
+                item.model_dump(mode="json") for item in predicates
+            ]
         return DiscriminatorValueBinding(
             binding_id=_stable_id("binding", payload),
-            tables=(column.table,),
-            columns=(column,),
-            predicates=(predicate,),
+            tables=tables,
+            columns=columns,
+            predicates=predicates,
             discriminator_column=column,
-            discriminator_predicate=predicate,
+            discriminator_predicate=predicates[0],
             **common,
         )
     if isinstance(candidate, DerivedExpressionCandidate):
@@ -975,14 +1017,14 @@ def _discriminator_certificate(
     *,
     schema_columns: tuple[ColumnRef, ...] = (),
 ) -> bool:
-    schema = _schema_or_evidence_column(
-        item.discriminator_column,
-        cited,
-        schema_columns,
-    )
-    return schema and _positive_predicate_certificate(
-        item.discriminator_predicate,
-        cited,
+    return all(
+        _schema_or_evidence_column(
+            predicate.left,
+            cited,
+            schema_columns,
+        )
+        and predicate_has_valid_literal(predicate)
+        for predicate in item.predicates
     )
 
 

@@ -37,6 +37,7 @@ from .models import (
     DocumentRuleBinding,
     EvidenceCost,
     EvidenceRecord,
+    EvidenceSourceKind,
     HypothesisStatus,
     JoinCandidateStatus,
     QuerySpec,
@@ -46,7 +47,7 @@ from .models import (
     SemanticItemStatus,
     PhysicalColumnBinding,
     VerticalAttributeBinding,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
     is_structurally_resolved_limit,
 )
 from .policy import AdaptivePolicyConfig, BudgetAdmissionError, initial_budget_state
@@ -113,6 +114,7 @@ class ProductionResearchAssembly:
     policy: AdaptivePolicyConfig
     deadline: DeadlineBudget
     is_cancelled: Callable[[], bool]
+    semantic_repair_continuation: bool
 
     def loop_arguments(self) -> dict[str, object]:
         return {
@@ -131,6 +133,7 @@ class ProductionResearchAssembly:
             "policy": self.policy,
             "deadline": self.deadline,
             "is_cancelled": self.is_cancelled,
+            "semantic_repair_continuation": self.semantic_repair_continuation,
         }
 
 
@@ -154,6 +157,7 @@ def assemble_production_research(
     policy: AdaptivePolicyConfig,
     deadline: DeadlineBudget,
     is_cancelled: Callable[[], bool],
+    semantic_repair_continuation: bool = False,
 ) -> ProductionResearchAssembly:
     """Wire trusted captured inputs to the existing adaptive research loop."""
 
@@ -341,6 +345,7 @@ def assemble_production_research(
         policy=policy,
         deadline=deadline,
         is_cancelled=is_cancelled,
+        semantic_repair_continuation=semantic_repair_continuation,
     )
 
 
@@ -472,7 +477,7 @@ def _build_initial_research_state(
                     item.source_id
                     for item in namespaced_query.semantic_items
                     if item.required
-                    and not is_binding_free_structural_limit(item)
+                    and not is_binding_free_semantic_item(item)
                 )
             ),
             action_history=(),
@@ -701,6 +706,7 @@ def _model_binding_view(
     elif isinstance(binding, DiscriminatorValueBinding):
         view["discriminator_column"] = full_payload["discriminator_column"]
         view["discriminator_predicate"] = full_payload["discriminator_predicate"]
+        view["predicates"] = full_payload["predicates"]
     elif isinstance(binding, DerivedExpressionBinding):
         for name in ("expression", "document", "rule_excerpt", "input_columns"):
             view[name] = full_payload[name]
@@ -941,6 +947,21 @@ def _fill_bounded_state_view(
         if include_source(source_id, unresolved_id=source_id):
             included_source_ids.add(source_id)
 
+    remaining_endpoint_tables = {
+        column.table
+        for item in active_joins
+        if item.status is JoinCandidateStatus.VALIDATED
+        for column in (item.left, item.right)
+    }
+    for evidence in sorted(state.evidence, key=_evidence_sort_key):
+        if (
+            evidence.source_kind is EvidenceSourceKind.SCHEMA
+            and evidence.target in remaining_endpoint_tables
+        ):
+            remaining_endpoint_tables.remove(evidence.target)
+            if include("evidence", evidence_by_id[evidence.evidence_id]):
+                included_evidence_ids.add(evidence.evidence_id)
+
     for item in active_joins:
         if item.status is JoinCandidateStatus.VALIDATED:
             if not include(
@@ -970,7 +991,10 @@ def _fill_bounded_state_view(
             include("bindings", binding_by_id[item.binding_id], item.evidence_ids)
     for item in active_joins:
         if item.status is JoinCandidateStatus.CANDIDATE:
-            include("join_candidates", join_by_id[item.join_id], item.evidence_ids)
+            if not include(
+                "join_candidates", join_by_id[item.join_id], item.evidence_ids
+            ):
+                include("join_candidates", join_by_id[item.join_id])
 
     expectation_payloads = state_payload["result_expectations"]
     assert type(expectation_payloads) is list

@@ -417,6 +417,7 @@ def _state(
         query_id="query-policy",
         original_text="orders",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -615,7 +616,7 @@ def test_policy_config_closes_every_budget_dimension() -> None:
         config.resource_limits.db_probe_ms,
     ) == (14_400, 14_400_000)
     assert config.policy_version == 2
-    assert config.resource_limits.model_tokens == 524_288
+    assert config.resource_limits.model_tokens == 1_048_576
     assert config.operation_counts.actions == 512
     assert config.operation_counts.model_decisions == 256
     assert config.operation_counts.db_probes == 384
@@ -626,7 +627,7 @@ def test_policy_config_closes_every_budget_dimension() -> None:
     assert config.model_budget.model_calls == 256
     assert config.model_budget.input_tokens_per_call == 16_384
     assert config.model_budget.output_tokens_per_call == 32_000
-    assert config.model_budget.total_tokens == 524_288
+    assert config.model_budget.total_tokens == 1_048_576
     with pytest.raises(ValidationError):
         config.resource_limits.db_probe_ms = 1
 

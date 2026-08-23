@@ -11,8 +11,9 @@ from pydantic import model_validator
 
 from ._semantic_coverage_boundary import evidence_has_state_authority
 from ._sql_ast_identity import semantic_candidate_digest, source_sql_digest
-from ._sql_ast_models import ParsedSqlCandidate
+from ._sql_ast_models import ParsedSqlCandidate, QueryRole
 from .models import (
+    CheckFailureCode,
     Digest,
     EvidenceRecord,
     Id,
@@ -22,9 +23,13 @@ from .models import (
     SqlCandidate,
     StrictModel,
 )
-from .result_validation import _validated_executed_result
+from .result_validation import (
+    _requirements_match_persisted_freshness,
+    _validated_executed_result,
+)
 from .freshness import FreshnessContext
-from .semantic_coverage import CoverageRequirements, validate_coverage_inputs
+from .semantic_coverage import CoverageRequirements
+from .semantic_plan import build_semantic_ast
 from .serialization import canonical_json_bytes
 
 
@@ -46,10 +51,25 @@ class ResultReviewReceipt(StrictModel):
     verdict: Literal["consistent", "contradicted", "ambiguous", "malformed", "timeout"]
     reason: NonEmptyText
     execution: dict[str, object]
+    deterministic_failure_code: Literal[
+        CheckFailureCode.RESULT_SHAPE_MISMATCH
+    ] | None
+    repair_kind: Literal["semantic_binding_mismatch"] | None = None
 
     @model_validator(mode="after")
     def validate_reentry_target(self) -> "ResultReviewReceipt":
         target = (self.source_id, self.evidence_id)
+        if self.deterministic_failure_code is not None and (
+            self.verdict != "contradicted" or target[0] is None or target[1] is None
+        ):
+            raise ValueError("deterministic result review repair requires contradiction target")
+        if self.repair_kind is not None and (
+            self.verdict not in {"contradicted", "ambiguous"}
+            or target[0] is None
+            or target[1] is None
+            or self.deterministic_failure_code is not None
+        ):
+            raise ValueError("semantic binding repair requires one model review target")
         if self.verdict == "consistent":
             if target != (None, None):
                 raise ValueError("consistent review must not have a repair target")
@@ -65,6 +85,7 @@ class _ModelReviewResponse(StrictModel):
     status: Literal["consistent", "contradicted", "ambiguous"]
     reason: NonEmptyText
     source_id: Id | None = None
+    repair_kind: Literal["semantic_binding_mismatch"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +157,29 @@ def evaluate_result_review_capability(
     if state.run_id != expected_run_id or candidate.sql != expected_sql:
         raise ValueError("result review capability identity does not match finalizer")
     canonical_execution = _validated_executed_result(execution)
+    if source_id := _unrequested_root_projection_source_id(
+        state, requirements, candidate, parsed_ast
+    ):
+        source_id, evidence_id = _response_target(
+            state,
+            requirements,
+            _ModelReviewResponse(
+                status="contradicted",
+                reason="candidate projects a confirmed value not requested in the output",
+                source_id=source_id,
+            ),
+        )
+        return _receipt(
+            state,
+            requirements,
+            candidate,
+            "contradicted",
+            "candidate projects a confirmed value not requested in the output",
+            canonical_execution,
+            source_id,
+            evidence_id,
+            deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+        )
     try:
         response = _parse_response(value.model(_prompt(value, canonical_execution)))
     except Exception as exc:
@@ -154,7 +198,48 @@ def evaluate_result_review_capability(
         canonical_execution,
         source_id,
         evidence_id,
+        repair_kind=response.repair_kind,
     )
+
+
+def _unrequested_root_projection_source_id(
+    state: ResearchState,
+    requirements: CoverageRequirements,
+    candidate: SqlCandidate,
+    parsed_ast: ParsedSqlCandidate,
+) -> str | None:
+    namespaces = {table.namespace for table in requirements.allowed_tables}
+    if len(namespaces) != 1:
+        raise ValueError("candidate table namespace is invalid")
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        state.query_spec,
+        requirements,
+        next(iter(namespaces)),
+    )
+    root_scope_ids = {
+        scope.scope_id
+        for scope in parsed_ast.scopes
+        if scope.parent_scope_id is None and scope.query_role is QueryRole.ROOT
+    }
+    requested = set(state.query_spec.requested_output_source_ids)
+    annotations_by_node: dict[str, set[str]] = {}
+    for annotation in semantic_ast.coverage.annotations:
+        annotations_by_node.setdefault(annotation.node_id, set()).update(
+            annotation.source_ids
+        )
+    root_projection_annotations = {
+        projection.node_id: annotations_by_node.get(projection.node_id, set())
+        for projection in parsed_ast.projections
+        if projection.scope_id in root_scope_ids
+    }
+    if not requested.issubset(set().union(*root_projection_annotations.values())):
+        return None
+    for source_ids in root_projection_annotations.values():
+        if source_ids and source_ids.isdisjoint(requested):
+            return min(source_ids)
+    return None
 
 
 def _validated_inputs(state, requirements, freshness_context, candidate, parsed_ast):
@@ -166,9 +251,7 @@ def _validated_inputs(state, requirements, freshness_context, candidate, parsed_
         or type(parsed_ast) is not ParsedSqlCandidate
     ):
         raise TypeError("result review inputs require exact contract types")
-    if requirements != validate_coverage_inputs(
-        state, freshness_context, state.run_id, state.run_incarnation
-    ):
+    if not _requirements_match_persisted_freshness(requirements, freshness_context):
         raise ValueError("result review requirements do not match research authority")
     if (
         candidate.revision != requirements.state_revision
@@ -230,9 +313,47 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "Use only this trusted context. Inspect the question, SQL, AST, "
                 "bindings, evidence, documents, columns and data. Never generate, "
                 "rewrite or execute SQL. Return only JSON with status, short reason, "
-                "and source_id. source_id must be null for consistent and one supplied "
+                "source_id and repair_kind. source_id must be null for consistent and one supplied "
                 "binding source_id for contradicted or ambiguous. Check the exact answer "
-                "form and projection requested by the question and documents. When the "
+                "form and projection requested by the question and documents. An "
+                "expression.expression in a derived binding is a model hypothesis copied "
+                "from expression_claim, not evidence that the SQL performs that computation; "
+                "never use it to resolve a conflict with the question, "
+                "required semantic roles, documents, AST or returned rows. When the "
+                "candidate projects an auxiliary computation solely because it is needed "
+                "for ordering or grouping, do not treat it as requested unless the question "
+                "or documents explicitly request it; mark that extra projection contradicted. "
+                "An empty result does not by itself contradict the question or a required "
+                "FILTER/TIME binding. If the SQL uses the confirmed physical column, operator, "
+                "literals and representation, zero matching rows may be consistent; return "
+                "contradicted only when trusted context proves one of those is wrong. "
+                "When the "
+                "question requires an entity-level computation over a period, a candidate "
+                "that selects an extremal raw observation without computing that requested "
+                "grain cannot be consistent: return contradicted when trusted evidence "
+                "resolves the mismatch, otherwise return ambiguous targeting the relevant "
+                "supplied binding. This does not require a particular SQL aggregation or "
+                "grouping syntax; an explicitly requested single record/entity-time "
+                "extremum may be consistent. For other requested entity or time semantics, "
+                "compare them with the table/data grain and aggregation and grouping in the AST. "
+                "Check every required binding in its requested semantic role, not merely whether "
+                "its columns appear somewhere in the SQL. A required grouping dimension must "
+                "participate in the computation at that grouping grain; its column appearing only "
+                "in a filter or another role does not satisfy it. "
+                "A related or correlated attribute is not the requested attribute unless trusted "
+                "schema or documents explicitly establish their exact semantic equivalence. A "
+                "selected binding and its status do not prove that semantic "
+                "equivalence by themselves; when cited evidence describes only the proxy, return "
+                "ambiguous targeting that supplied binding and set repair_kind to "
+                "semantic_binding_mismatch. Otherwise repair_kind must be null. "
+                "Do not infer that a metric is already aggregated at that required grain from "
+                "table or column names or from one period value. Unless trusted evidence explicitly "
+                "proves that grain, treat an AST that does not compute it as ambiguous. "
+                "The order and scope of nested operations may change their meaning. Compare "
+                "aggregates, extrema, filters and groupings with the exact computation requested "
+                "by the question and documents instead of treating the presence of the same "
+                "operations as proof of equivalence. Return contradicted only when trusted context "
+                "proves the mismatch, otherwise ambiguous. When the "
                 "question compares a finite set of explicitly described alternatives and "
                 "asks which alternative wins an extreme metric, the result must return "
                 "the winning alternative label or role, not an inner entity, unless the "
@@ -261,7 +382,18 @@ def _parse_response(value: object) -> _ModelReviewResponse:
     return _ModelReviewResponse.model_validate_json(value)
 
 
-def _receipt(state, requirements, candidate, verdict, reason, execution, source_id=None, evidence_id=None) -> ResultReviewReceipt:
+def _receipt(
+    state,
+    requirements,
+    candidate,
+    verdict,
+    reason,
+    execution,
+    source_id=None,
+    evidence_id=None,
+    deterministic_failure_code=None,
+    repair_kind=None,
+) -> ResultReviewReceipt:
     if verdict in {"consistent", "malformed", "timeout"}:
         return ResultReviewReceipt(
             run_id=state.run_id, run_incarnation=state.run_incarnation,
@@ -270,6 +402,8 @@ def _receipt(state, requirements, candidate, verdict, reason, execution, source_
             requirements_digest=requirements.requirements_digest,
             source_id=None, evidence_id=None, verdict=verdict,
             reason=reason, execution=execution,
+            deterministic_failure_code=deterministic_failure_code,
+            repair_kind=repair_kind,
         )
     if source_id is None or evidence_id is None:
         raise ValueError("review reentry verdict requires a trusted repair target")
@@ -285,6 +419,8 @@ def _receipt(state, requirements, candidate, verdict, reason, execution, source_
         verdict=verdict,
         reason=reason,
         execution=execution,
+        deterministic_failure_code=deterministic_failure_code,
+        repair_kind=repair_kind,
     )
 
 

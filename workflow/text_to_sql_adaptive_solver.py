@@ -8,8 +8,10 @@ import json
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from typing import cast
 
 from custom_tools.text_to_sql.adaptive.models import (
+    CheckFailureCode,
     CheckKind,
     CheckStatus,
     ResearchReentryStatus,
@@ -81,6 +83,10 @@ SolverProposalBoundary = Callable[
     [SolverState, CoverageRequirements],
     Awaitable[SolverProposalV1],
 ]
+SolverRepairProposalBoundary = Callable[
+    [SolverState, CoverageRequirements, ResultReviewReceipt],
+    Awaitable[SolverProposalV1],
+]
 SolverReentryBoundary = Callable[..., Awaitable[object]]
 
 
@@ -91,7 +97,10 @@ def _result_reentry_receipt(value: object) -> ResultContradictionReceipt | Resul
     if value.get("record_kind") == "text2sql_result_contradiction":
         return ResultContradictionReceipt.model_validate_json(canonical)
     if value.get("record_kind") == "text2sql_result_review":
-        return ResultReviewReceipt.model_validate_json(canonical)
+        receipt = ResultReviewReceipt.model_validate_json(canonical)
+        if receipt.verdict not in {"contradicted", "ambiguous"}:
+            raise ValueError("result review receipt is not actionable")
+        return receipt
     raise ValueError("result reentry receipt kind is invalid")
 
 
@@ -162,8 +171,9 @@ async def run_production_adaptive_sql_generation(
     async def propose(
         state: SolverState,
         requirements: CoverageRequirements,
+        repair_receipt: ResultReviewReceipt | None = None,
     ) -> SolverProposalV1:
-        solver_context = _solver_context(runtime, state, requirements)
+        solver_context = _solver_context(runtime, state, requirements, repair_receipt)
         return await adapter.propose(
             task=runtime.query,
             solver_context=solver_context,
@@ -201,63 +211,83 @@ async def run_adaptive_sql_generation(
     from ._text_to_sql_document_authority import (
         DocumentAuthorityError,
         live_solver_document_freshness_context,
+        solver_document_freshness_reference,
     )
 
     try:
-        freshness = live_solver_document_freshness_context(runtime, research)
+        current_freshness = live_solver_document_freshness_context(runtime, research)
     except DocumentAuthorityError:
         recovery_base = _recoverable_reentry_base_state(runtime, checkpoint, research)
         if recovery_base is None:
             raise
         research = recovery_base
-        freshness = live_solver_document_freshness_context(runtime, research)
+        current_freshness = live_solver_document_freshness_context(runtime, research)
+    validate_coverage_inputs(
+        research,
+        current_freshness,
+        runtime.run_id,
+        runtime.run_incarnation,
+    )
+    freshness = solver_document_freshness_reference(runtime, research)
     requirements = validate_coverage_inputs(
         research,
         freshness,
         runtime.run_id,
         runtime.run_incarnation,
     )
+    repair_receipt = None
     if checkpoint is not None:
-        persisted_requirements = _result_contradiction_requirements(
+        persisted_reentry = _result_contradiction_requirements(
             store,
             checkpoint,
             research,
         )
-        if persisted_requirements is not None:
-            checkpoint = _commit_result_contradiction_missing_evidence(
-                runtime,
-                store,
-                checkpoint,
-                research,
-                persisted_requirements,
-                table_namespace=table_namespace,
-            )
+        if persisted_reentry is not None:
+            persisted_requirements, receipt = persisted_reentry
+            if (
+                type(receipt) is ResultReviewReceipt
+                and receipt.deterministic_failure_code
+                is CheckFailureCode.RESULT_SHAPE_MISMATCH
+            ):
+                repair_receipt = receipt
+            else:
+                checkpoint = _commit_result_contradiction_missing_evidence(
+                    runtime,
+                    store,
+                    checkpoint,
+                    research,
+                    persisted_requirements,
+                    table_namespace=table_namespace,
+                )
     if checkpoint is None:
         initial = _initial_solver_state(research)
         store.initialize(initial)
         checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
         if checkpoint is None:
             raise RuntimeError("solver checkpoint initialization was not durable")
-    (
-        checkpoint,
-        research,
-        requirements,
-        freshness,
-        resumed,
-    ) = await _resume_open_generation(
-        runtime,
-        store,
-        checkpoint,
-        research,
-        requirements,
-        freshness,
-        reenter,
-        id_factory,
-        safety_policy,
-        row_limit,
-        dry_run_only,
-        table_namespace,
-    )
+    if repair_receipt is None:
+        (
+            checkpoint,
+            research,
+            requirements,
+            freshness,
+            resumed,
+        ) = await _resume_open_generation(
+            runtime,
+            store,
+            checkpoint,
+            research,
+            requirements,
+            freshness,
+            reenter,
+            id_factory,
+            safety_policy,
+            row_limit,
+            dry_run_only,
+            table_namespace,
+        )
+    else:
+        resumed = None
     if resumed is not None:
         return resumed
 
@@ -274,7 +304,9 @@ async def run_adaptive_sql_generation(
             table_namespace,
             propose,
             id_factory,
+            repair_receipt,
         )
+        repair_receipt = None
         model_turns += 1
         if proposal_failure is not None:
             return _stop_and_project(
@@ -354,6 +386,23 @@ async def _resume_open_generation(
     except Exception:
         recovered = None
     if recovered is not None:
+        if recovered.record.status is ResearchReentryStatus.ADMITTED:
+            runtime.verified_research_state = recovered.research_state
+            resumed = await _run_reentry(
+                runtime,
+                store,
+                checkpoint,
+                recovered.research_state,
+                requirements,
+                recovered.freshness,
+                reenter,
+                id_factory,
+                resume_admitted=True,
+            )
+            if resumed[0].state.research_reentries[-1].status is not ResearchReentryStatus.COMPLETED:
+                terminal = _seal_stopped_generation(runtime, store, resumed[0])
+                return (*resumed, terminal)
+            return (*resumed, None)
         replay_input = (
             _completed_reentry_replay_input(
                 recovered.record,
@@ -381,9 +430,19 @@ async def _resume_open_generation(
         if recovered.record.status is not ResearchReentryStatus.COMPLETED:
             terminal = _seal_stopped_generation(runtime, store, checkpoint)
             return checkpoint, research, requirements, freshness, terminal
-        from ._text_to_sql_document_authority import live_solver_document_freshness_context
+        from ._text_to_sql_document_authority import (
+            live_solver_document_freshness_context,
+            solver_document_freshness_reference,
+        )
 
-        freshness = live_solver_document_freshness_context(runtime, research)
+        current_freshness = live_solver_document_freshness_context(runtime, research)
+        validate_coverage_inputs(
+            research,
+            current_freshness,
+            research.run_id,
+            research.run_incarnation,
+        )
+        freshness = solver_document_freshness_reference(runtime, research)
         requirements = validate_coverage_inputs(
             research,
             freshness,
@@ -531,9 +590,21 @@ async def _commit_next_solver_proposal(
     table_namespace,
     propose,
     id_factory,
+    repair_receipt,
 ):
     try:
-        proposal = await propose(checkpoint.state, requirements)
+        if repair_receipt is None:
+            proposal = await propose(checkpoint.state, requirements)
+        else:
+            proposal = await cast(SolverRepairProposalBoundary, propose)(
+                checkpoint.state,
+                requirements,
+                repair_receipt,
+            )
+            if type(proposal.proposal) is not SqlCandidateProposal:
+                raise SolverProtocolError(
+                    "deterministic result shape repair requires a SQL candidate"
+                )
         transition = apply_solver_proposal(
             checkpoint.state,
             proposal,
@@ -614,18 +685,23 @@ def _production_json_model(runtime, profile_model, label, system_prompt):
     return model
 
 
-def _solver_context(runtime, state, requirements) -> str:
+def _solver_context(runtime, state, requirements, repair_receipt=None) -> str:
     policy = runtime.verified_research_policy
     limits = getattr(policy, "model_budget", None)
     input_tokens = getattr(limits, "input_tokens_per_call", None)
     if type(input_tokens) is not int or input_tokens <= 0:
         raise TypeError("adaptive solver requires configured model limits")
-    payload = canonical_json_bytes(
-        {
-            "coverage_requirements": requirements.model_dump(mode="json"),
-            "solver_state": state.model_dump(mode="json"),
-        }
-    )
+    if repair_receipt is not None and type(repair_receipt) is not ResultReviewReceipt:
+        raise TypeError("solver repair receipt must be an exact ResultReviewReceipt")
+    payload_data = {
+        "coverage_requirements": requirements.model_dump(mode="json"),
+        "solver_state": state.model_dump(mode="json"),
+    }
+    if repair_receipt is not None:
+        payload_data["deterministic_sql_repair_receipt"] = repair_receipt.model_dump(
+            mode="json"
+        )
+    payload = canonical_json_bytes(payload_data)
     if len(payload) > input_tokens * 4:
         raise ValueError("adaptive solver context exceeds configured model input")
     return payload.decode("utf-8")
@@ -793,6 +869,7 @@ async def _run_reentry(
     freshness,
     reenter,
     id_factory,
+    resume_admitted=False,
 ):
     request = checkpoint.state.missing_evidence_requests[-1]
 
@@ -816,14 +893,19 @@ async def _run_reentry(
         )
         return checkpoint.state
 
+    reentry_kwargs = {
+        "requirements": requirements,
+        "freshness_context": freshness,
+        "commit_solver_admission": commit_admission,
+        "id_factory": id_factory,
+    }
+    if resume_admitted:
+        reentry_kwargs["resume_admitted"] = True
     outcome = await reenter(
         checkpoint.state,
         research,
         request.missing_evidence_request_id,
-        requirements=requirements,
-        freshness_context=freshness,
-        commit_solver_admission=commit_admission,
-        id_factory=id_factory,
+        **reentry_kwargs,
     )
     before = checkpoint.state
     replay_input = (
@@ -853,9 +935,22 @@ async def _run_reentry(
     rebuilt = outcome.requirements
     if refreshed is None or rebuilt is None:
         raise RuntimeError("completed re-entry omitted replay authority")
-    from ._text_to_sql_document_authority import live_solver_document_freshness_context
+    from ._text_to_sql_document_authority import (
+        live_solver_document_freshness_context,
+        solver_document_freshness_reference,
+    )
 
-    refreshed = live_solver_document_freshness_context(
+    current_freshness = live_solver_document_freshness_context(
+        runtime,
+        outcome.research_state,
+    )
+    validate_coverage_inputs(
+        outcome.research_state,
+        current_freshness,
+        outcome.research_state.run_id,
+        outcome.research_state.run_incarnation,
+    )
+    refreshed = solver_document_freshness_reference(
         runtime,
         outcome.research_state,
     )
@@ -1066,7 +1161,7 @@ def _result_contradiction_requirements(
     store: AdaptiveSolverCheckpointStore,
     checkpoint: SolverCheckpoint,
     research: ResearchState,
-) -> CoverageRequirements | None:
+) -> tuple[CoverageRequirements, ResultContradictionReceipt | ResultReviewReceipt] | None:
     if type(store) is not AdaptiveSolverCheckpointStore:
         raise TypeError("store must be an exact AdaptiveSolverCheckpointStore")
     if type(checkpoint) is not SolverCheckpoint:
@@ -1162,7 +1257,7 @@ def _result_contradiction_requirements(
             matches.append(replay)
     if len(matches) != 1:
         raise ValueError("result-contradiction proposal replay is invalid")
-    return matches[0].requirements
+    return matches[0].requirements, receipt
 
 
 def _commit_result_contradiction_missing_evidence(
@@ -1324,14 +1419,37 @@ def _commit_result_contradiction_missing_evidence(
         f"result-contradiction-request-{generated_digest}",
         f"result-contradiction-action-{generated_digest}",
     )
+    question = (
+        receipt.reason
+        if type(receipt) is ResultReviewReceipt
+        else "Recheck the trusted evidence for this result review."
+    )
+    reason = (
+        receipt.reason
+        if type(receipt) is ResultReviewReceipt
+        else "The executed result needs another targeted evidence check."
+    )
+    repair_binding_id = None
+    repair_kind = receipt.repair_kind if type(receipt) is ResultReviewReceipt else None
+    if repair_kind is not None:
+        repair_bindings = tuple(
+            binding
+            for binding in requirements.selected_bindings
+            if binding.source_id == source_id and evidence_id in binding.evidence_ids
+        )
+        if len(repair_bindings) != 1:
+            raise ValueError("semantic repair target is not one selected binding")
+        repair_binding_id = repair_bindings[0].binding_id
     proposal = SolverProposalV1(
         proposal_version=1,
         proposal=MissingEvidenceProposal(
             proposal_kind="missing_evidence",
             source_id=source_id,
-            question="Recheck the trusted evidence for this result review.",
+            question=question,
             required_evidence_kind=evidence[0].source_kind,
-            reason="The executed result needs another targeted evidence check.",
+            reason=reason,
+            repair_kind=repair_kind,
+            repair_binding_id=repair_binding_id,
         ),
     )
     transition = apply_solver_proposal(
@@ -1342,6 +1460,7 @@ def _commit_result_contradiction_missing_evidence(
         table_namespace=table_namespace,
         requirements=requirements,
         id_factory=iter(generated_ids).__next__,
+        trusted_semantic_repair=repair_kind is not None,
     )
     return store.commit_non_execution(
         checkpoint.state,

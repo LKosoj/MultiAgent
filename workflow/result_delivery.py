@@ -615,7 +615,6 @@ def _apply_text_to_sql_terminal_failure(
         if (
             reason_code == "RESULT_PERSISTENCE_FAILED"
             and source is not None
-            and source["status"] in {"failed", "abstained", "cancelled", "timed_out"}
         ):
             # A terminal result already proves the workflow outcome. A delivery
             # failure is only secondary evidence and must not rewrite that proof.
@@ -836,10 +835,9 @@ def _transform_workflow_result_event_payload(
                     "workflow result transform changed terminal copy shape"
                 )
             container = nested
-        terminal_copy = container.get(path[-1])
-        if not isinstance(terminal_copy, dict):
+        if not isinstance(container.get(path[-1]), dict):
             raise RuntimeError("workflow result transform changed terminal copy shape")
-        terminal_copy["run_id"] = run_id
+        container[path[-1]] = _terminal_outcome_mapping(authoritative_terminal)
     if has_config_versions:
         transformed_artifacts = transformed.get("artifacts")
         if not isinstance(transformed_artifacts, dict):

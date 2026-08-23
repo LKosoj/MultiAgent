@@ -246,6 +246,10 @@ class SemanticItem(StrictModel):
     source_text: NonEmptyText
     normalized_meaning: NonEmptyText | None
     required: bool
+    exact_physical_predicate: bool = Field(
+        default=False,
+        exclude_if=lambda value: value is False,
+    )
     operator: PredicateOperator | None
     literal_or_reference: (
         PredicateOperand | tuple[LiteralValue | str | int | float | bool, ...] | None
@@ -290,11 +294,25 @@ def is_binding_free_structural_limit(
     return not any(binding.source_id == item.source_id for binding in bindings)
 
 
+def is_binding_free_semantic_item(
+    item: SemanticItem,
+    bindings: tuple[BindingBase, ...] | None = None,
+) -> bool:
+    return (
+        item.required
+        and item.kind is SemanticItemKind.FORMULA
+        and item.status
+        in {SemanticItemStatus.UNRESOLVED, SemanticItemStatus.RESOLVED}
+        and not item.binding_ids
+    ) or is_binding_free_structural_limit(item, bindings)
+
+
 class QuerySpec(ContractModel):
     contract_name: Literal["query_spec"] = "query_spec"
     query_id: Id
     original_text: NonEmptyText
     semantic_items: tuple[SemanticItem, ...]
+    requested_output_source_ids: tuple[Id, ...]
     expected_result_shape: ExpectedResultShape
     global_constraints: tuple[PredicateRef, ...]
 
@@ -305,6 +323,17 @@ class QuerySpec(ContractModel):
             if item.source_id in source_ids:
                 raise ValueError("semantic_items source_id must be unique")
             source_ids.add(item.source_id)
+        require_canonical_ids(
+            self.requested_output_source_ids,
+            "QuerySpec requested_output_source_ids",
+        )
+        required_source_ids = {
+            item.source_id for item in self.semantic_items if item.required
+        }
+        if not set(self.requested_output_source_ids).issubset(required_source_ids):
+            raise ValueError(
+                "requested_output_source_ids must reference required semantic items"
+            )
         return self
 
 
@@ -789,7 +818,7 @@ class ResearchState(ContractModel):
                 item.source_id
                 for item in self.query_spec.semantic_items
                 if item.required
-                and not is_binding_free_structural_limit(item, self.bindings)
+                and not is_binding_free_semantic_item(item, self.bindings)
                 and not any(
                     binding.status is BindingStatus.SUPPORTED
                     for binding in bindings_by_source[item.source_id]
@@ -921,6 +950,14 @@ class MissingEvidenceRequest(ContractModel):
     candidate_targets: tuple[TargetRef, ...]
     required_evidence_kind: EvidenceSourceKind
     reason: NonEmptyText
+    repair_kind: Literal["semantic_binding_mismatch"] | None = None
+    repair_binding_id: Id | None = None
+
+    @model_validator(mode="after")
+    def validate_repair_target(self) -> MissingEvidenceRequest:
+        if (self.repair_kind is None) != (self.repair_binding_id is None):
+            raise ValueError("semantic repair kind and binding ID must be provided together")
+        return self
 
 
 class ResearchReentryStatus(StrEnum):

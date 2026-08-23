@@ -738,6 +738,7 @@ def _state(evidence: tuple[EvidenceRecord, ...]) -> ResearchState:
             query_id="query-1",
             original_text="orders",
             semantic_items=(item,),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),

@@ -31,6 +31,7 @@ from ._semantic_coverage_footprint import (
 from ._semantic_value_certificate import (
     ExactValueCertificateError,
     predicate_has_exact_value_certificate,
+    predicate_has_valid_literal,
 )
 from .freshness import (
     FreshnessContext,
@@ -61,7 +62,7 @@ from .models import (
     StrictModel,
     TableRef,
     VerticalAttributeBinding,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
 )
 from .serialization import canonical_digest
 
@@ -265,7 +266,7 @@ def _validate_coverage_inputs(
     incomplete_sources = tuple(
         item.source_id
         for item in required_items
-        if not is_binding_free_structural_limit(item, current.bindings)
+        if not is_binding_free_semantic_item(item, current.bindings)
         and (
             item.status is not SemanticItemStatus.RESOLVED
             or item.source_id in current.unresolved_items
@@ -295,7 +296,7 @@ def _validate_coverage_inputs(
     stale_sources: list[str] = []
     invalid_sources: list[str] = []
     for item in required_items:
-        if is_binding_free_structural_limit(item, current.bindings):
+        if is_binding_free_semantic_item(item, current.bindings):
             continue
         bindings_for_source = tuple(
             bindings_by_id.get(binding_id) for binding_id in item.binding_ids
@@ -539,7 +540,7 @@ def _binding_proves_required_predicate(
 
     if isinstance(binding, DiscriminatorValueBinding):
         source_predicate = binding.discriminator_predicate
-        predicates = (source_predicate,)
+        predicates = binding.predicates
     elif isinstance(binding, VerticalAttributeBinding):
         if item.kind is not SemanticItemKind.FILTER:
             return False
@@ -557,22 +558,65 @@ def _binding_proves_required_predicate(
     if (
         item.operator is None
         or not _filter_right_is_valid(item.operator, item.literal_or_reference)
+        or not _filter_right_is_valid(
+            source_predicate.operator,
+            source_predicate.right,
+        )
         or (
             isinstance(binding, VerticalAttributeBinding)
             and source_predicate.operator not in supported_operators
         )
     ):
         return False
-    try:
-        required_predicate = PredicateRef(
-            left=source_predicate.left,
-            operator=item.operator,
-            right=item.literal_or_reference,
+    if isinstance(binding, DiscriminatorValueBinding):
+        exact_query_match = False
+        if item.exact_physical_predicate:
+            try:
+                required_predicate = PredicateRef(
+                    left=binding.discriminator_column,
+                    operator=item.operator,
+                    right=item.literal_or_reference,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                exact_query_match = len(predicates) == 1 and predicate_matches(
+                    required_predicate,
+                    source_predicate,
+                )
+        requirement_matches = (
+            bool(predicates)
+            and predicates[0] == source_predicate
+            and source_predicate.left == binding.discriminator_column
+            and (
+                (item.exact_physical_predicate and exact_query_match)
+                or (
+                    not item.exact_physical_predicate
+                    and item.kind is SemanticItemKind.TIME
+                )
+                or (
+                    not item.exact_physical_predicate
+                    and len(predicates) == 1
+                    and source_predicate.operator is item.operator
+                )
+            )
         )
-    except (TypeError, ValueError):
-        return False
+    else:
+        try:
+            required_predicate = PredicateRef(
+                left=source_predicate.left,
+                operator=item.operator,
+                right=item.literal_or_reference,
+            )
+        except (TypeError, ValueError):
+            return False
+        requirement_matches = predicate_matches(required_predicate, source_predicate)
+    if isinstance(binding, DiscriminatorValueBinding):
+        return requirement_matches and all(
+            predicate_has_valid_literal(predicate) for predicate in predicates
+        )
     try:
-        return predicate_matches(required_predicate, source_predicate) and all(
+        return requirement_matches and all(
             predicate_has_exact_value_certificate(predicate, citations)
             for predicate in predicates
         )

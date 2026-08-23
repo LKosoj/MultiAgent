@@ -60,6 +60,7 @@ def _query_spec(
         query_id="query-1",
         original_text=original_text,
         semantic_items=tuple(items),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

@@ -37,12 +37,16 @@ def _item(
     operator=None,
     status: str = "unresolved",
     required: bool = True,
+    requested_output: bool = False,
+    exact_physical_predicate: bool = False,
 ) -> dict[str, object]:
     return {
         "kind": kind,
         "source_text": source_text,
         "normalized_meaning": normalized_meaning,
         "required": required,
+        "requested_output": requested_output,
+        "exact_physical_predicate": exact_physical_predicate,
         "operator": operator,
         "literal_or_reference": literal_or_reference,
         "status": status,
@@ -62,12 +66,16 @@ def _model_item(
     operator=None,
     status: str = "unresolved",
     required: bool = True,
+    requested_output: bool = False,
+    exact_physical_predicate: bool = False,
 ) -> dict[str, object]:
     return {
         "kind": kind,
         "source_text": source_text,
         "normalized_meaning": normalized_meaning,
         "required": required,
+        "requested_output": requested_output,
+        "exact_physical_predicate": exact_physical_predicate,
         "operator": operator,
         "literal_or_reference": literal_or_reference,
         "status": status,
@@ -80,10 +88,126 @@ def _model_response(
     return _response(*items, shape=shape)
 
 
+def _output_item(
+    kind: str,
+    source_text: str,
+    *,
+    requested_output: object,
+    normalized_meaning: str | None,
+) -> dict[str, object]:
+    item = _item(kind, 0, 0, source_text, normalized_meaning=normalized_meaning)
+    item["requested_output"] = requested_output
+    return item
+
+
 def test_nlu_processor_does_not_expose_public_adaptive_method() -> None:
     from custom_tools.text_to_sql.nlu import NLUProcessor
 
     assert not hasattr(NLUProcessor, "understand_query")
+
+
+@pytest.mark.parametrize("requested_output", (None, "true", 1))
+def test_query_understanding_requires_boolean_requested_output(
+    requested_output: object,
+) -> None:
+    response = _response(
+        _output_item(
+            "dimension",
+            "account",
+            requested_output=requested_output,
+            normalized_meaning="account identity",
+        )
+    )
+
+    with pytest.raises(QueryUnderstandingDecodeError, match="requested_output"):
+        understand_query(
+            "Which account?",
+            run_id=RUN_ID,
+            run_incarnation=INCARNATION,
+            response=response,
+        )
+
+
+@pytest.mark.parametrize("exact_physical_predicate", (None, "true", 1))
+def test_query_understanding_requires_boolean_exact_physical_predicate(
+    exact_physical_predicate: object,
+) -> None:
+    response = _response(
+        _item(
+            "time",
+            0,
+            0,
+            "June 2024",
+            normalized_meaning="year-month value 202406",
+            operator="eq",
+            literal_or_reference="202406",
+        )
+    )
+    response["semantic_items"][0]["exact_physical_predicate"] = (
+        exact_physical_predicate
+    )
+
+    with pytest.raises(
+        QueryUnderstandingDecodeError, match="exact_physical_predicate"
+    ):
+        understand_query(
+            "June 2024",
+            run_id=RUN_ID,
+            run_incarnation=INCARNATION,
+            response=response,
+        )
+
+
+def test_query_understanding_persists_exact_physical_predicate() -> None:
+    response = _response(
+        _item(
+            "time",
+            0,
+            0,
+            "June 2024",
+            normalized_meaning="year-month value 202406",
+            operator="eq",
+            literal_or_reference="202406",
+            exact_physical_predicate=True,
+        )
+    )
+
+    spec = understand_query(
+        "June 2024",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=response,
+    )
+
+    assert spec.semantic_items[0].exact_physical_predicate is True
+    assert spec.semantic_items[0].model_dump()["exact_physical_predicate"] is True
+
+
+def test_query_understanding_persists_only_requested_output_source_ids() -> None:
+    spec = understand_query(
+        "Which account has the lowest total?",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=_response(
+            _output_item(
+                "metric",
+                "total",
+                requested_output=False,
+                normalized_meaning="total amount",
+            ),
+            _output_item(
+                "dimension",
+                "account",
+                requested_output=True,
+                normalized_meaning="account identity",
+            ),
+        ),
+    )
+
+    expected = tuple(
+        item.source_id for item in spec.semantic_items if item.source_text == "account"
+    )
+    assert spec.requested_output_source_ids == expected
 
 
 def test_adaptive_query_understanding_prompt_keeps_entity_nouns_and_formula_restrictions_out_of_filters() -> None:
@@ -92,13 +216,97 @@ def test_adaptive_query_understanding_prompt_keeps_entity_nouns_and_formula_rest
     prompt = build_adaptive_query_understanding_prompt("compare extreme values")
 
     assert (
-        "Существительное, называющее сущность или домен, само по себе не является "
+        "Существительное, называющее весь тип сущности или домен, само по себе "
+        "не является "
         "data FILTER и не превращается в literal для eq."
     ) in prompt
     assert (
         "Если ограничение полностью выражено FORMULA, не добавляй для него FILTER "
         "и не придумывай literal_or_reference."
     ) in prompt
+
+
+def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    initial_prompt = build_adaptive_query_understanding_prompt("show the total in a category")
+    completeness_prompt = build_adaptive_query_completeness_prompt(
+        "show the total in a category",
+        _model_response(_model_item("metric", "total", normalized_meaning="total")),
+    )
+
+    for prompt in (initial_prompt, completeness_prompt):
+        assert (
+            "Существительное, называющее весь тип сущности или домен, само по себе "
+            "не является "
+            "data FILTER и не превращается в literal для eq."
+        ) in prompt
+        assert (
+            "Категория или подтип этой сущности, ограничивающие выбранные строки, "
+            "являются обязательным FILTER с выраженными operator и "
+            "literal_or_reference."
+        ) in prompt
+        assert (
+            "Не дублируй отдельным FILTER фразу, уже входящую в METRIC, если вопрос "
+            "не противопоставляет ей другие строки и явно не требует их исключить."
+        ) in prompt
+        assert (
+            "Явное невременное условие, ограничивающее выбранные строки, является "
+            "обязательным FILTER с выраженными operator и literal_or_reference."
+        ) in prompt
+        assert (
+            "exact_physical_predicate: true, если контекстный документ явно задаёт "
+            "operator и literal_or_reference как физическое представление предиката; "
+            "такое явное представление обязательно и не заменяется. Иначе false"
+        ) in prompt
+        assert (
+            "Если контекстный документ описывает, как значение физически хранится в "
+            "БД, например кодируется частями строки, и из этого получены operator или "
+            "literal_or_reference, exact_physical_predicate обязан быть true."
+        ) in prompt
+        assert (
+            "Логический период или условие без описания физического хранения не делает "
+            "exact_physical_predicate true."
+        ) in prompt
+        assert (
+            "Если документ задаёт физическое представление только одной части "
+            "составного времени, создай для неё отдельный TIME и ставь "
+            "exact_physical_predicate true только этому элементу; остальные части "
+            "остаются отдельными и false, пока документ не описал их физическое "
+            "представление."
+        ) in prompt
+
+
+def test_adaptive_query_prompts_keep_period_in_percentage_denominator() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "What percentage of accounts had status A during April?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "percentage of accounts",
+            normalized_meaning="percentage of accounts with status A in April",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert (
+            "Для доли или процента объектов с признаком в явно заданном периоде "
+            "знаменатель сохраняет этот период. Используй все объекты независимо "
+            "от периода только когда вопрос или контекстный документ явно задаёт "
+            "такую глобальную базовую группу."
+        ) in prompt
 
 
 def test_adaptive_query_understanding_prompt_does_not_treat_interrogatives_as_inner_identity_request() -> None:
@@ -115,6 +323,88 @@ def test_adaptive_query_understanding_prompt_does_not_treat_interrogatives_as_in
         "сущности; внутренний identity или attribute нужен только когда исходный "
         "вопрос или контекстный документ прямо называет имя, ID или атрибут."
     ) in prompt
+
+
+def test_adaptive_query_completeness_prompt_requires_dimension_for_generic_extremum_entity() -> None:
+    from custom_tools.text_to_sql.prompts import build_adaptive_query_completeness_prompt
+
+    prompt = build_adaptive_query_completeness_prompt(
+        "Which item has the lowest measurement?",
+        _model_response(
+            _model_item("metric", "measurement", normalized_meaning="measurement"),
+            _model_item(
+                "ordering",
+                "lowest",
+                normalized_meaning="ascending order",
+                literal_or_reference="asc",
+            ),
+        ),
+    )
+
+    assert (
+        "Когда вопрос спрашивает, какая сущность, человек или вещь достигает "
+        "экстремума показателя, добавь обязательный DIMENSION для требуемого "
+        "выходного объекта"
+    ) in prompt
+
+
+def test_adaptive_query_prompts_preserve_named_computation_grain() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "highest weekly revenue",
+            normalized_meaning="maximum weekly revenue",
+        )
+    )
+    prompts = (
+        build_adaptive_query_understanding_prompt("What is the highest weekly revenue?"),
+        build_adaptive_query_completeness_prompt(
+            "What is the highest weekly revenue?",
+            initial,
+        ),
+    )
+
+    for prompt in prompts:
+        assert (
+            "показатель сначала вычисляется на явно названном уровне группировки, "
+            "а затем сравнивается или агрегируется между группами"
+        ) in prompt
+        assert "обязательный DIMENSION для уровня группировки" in prompt
+        assert "обязательную FORMULA для полного порядка вычислений" in prompt
+        assert "не предполагай, что одна строка БД уже соответствует этому уровню" in prompt
+
+
+def test_adaptive_query_prompts_do_not_invent_aggregation_for_event_participant() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Which account made a payment of 42 on the specified date?"
+    initial = _model_response(
+        _model_item("dimension", "account", normalized_meaning="account"),
+        _model_item("filter", "payment of 42", normalized_meaning="payment equals 42"),
+    )
+    prompts = (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    )
+
+    for prompt in prompts:
+        assert (
+            "сущности в событии с числовым условием само по себе не "
+            "означает агрегацию или группировку"
+        ) in prompt
+        assert (
+            "DIMENSION уровня вычисления и FORMULA добавляй только при явно "
+            "запрошенной агрегации, группировке или последовательности вычислений"
+        ) in prompt
+        assert "Явно названные сумма, итог или уровень группировки" in prompt
 
 
 def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
@@ -346,6 +636,8 @@ def test_nlu_processor_derives_unique_unicode_span_from_source_text_with_mandato
             "source_text": "sales",
             "normalized_meaning": "sales",
             "required": True,
+            "requested_output": True,
+            "exact_physical_predicate": False,
             "operator": None,
             "literal_or_reference": None,
             "status": "unresolved",
@@ -382,6 +674,8 @@ def test_nlu_processor_uses_completeness_call_for_repeated_source_text(
             "source_text": "sales",
             "normalized_meaning": "sales",
             "required": True,
+            "requested_output": True,
+            "exact_physical_predicate": False,
             "operator": None,
             "literal_or_reference": None,
             "status": "unresolved",

@@ -101,14 +101,13 @@ class SchemaEnricher:
     def __init__(self):
         self._cached_schema = None
 
-    def enrich_descriptions_with_llm(self, schema_obj: Dict[str, Dict[str, Dict[str, Any]]]) -> None:
+    def enrich_descriptions_with_llm(
+        self,
+        schema_obj: Dict[str, Dict[str, Dict[str, Any]]],
+        *,
+        dsn: Optional[str] = None,
+    ) -> None:
         """Обогащает отсутствующие описания колонок через LLM.
-
-        ПРИМЕЧАНИЕ (deprecated/unconnected): метод реализован и покрыт тестами,
-        однако НЕ подключён к prod-пайплайну (вызывается только из tests/ и
-        описан в doc/TEXT_TO_SQL.md). Не достраивать функционал в рамках этого
-        файла — это отдельная feature work. Рассинхрон с doc/TEXT_TO_SQL.md
-        зафиксирован как deferred: правка doc вне владения данной задачи.
 
         Поведение ошибок (EPIC 3.10):
 
@@ -184,10 +183,18 @@ class SchemaEnricher:
                 # когда реализация поддерживает этот kwarg. В тестах метод часто
                 # monkeypatch'ится простой lambda(table_name), поэтому сохраняем
                 # обратную совместимость по сигнатуре.
-                if "schema_obj" in inspect.signature(self.get_table_sample_data).parameters:
-                    sample_result = self.get_table_sample_data(table_name, schema_obj=schema_obj)
-                else:
-                    sample_result = self.get_table_sample_data(table_name)
+                sample_parameters = inspect.signature(
+                    self.get_table_sample_data
+                ).parameters
+                sample_kwargs: Dict[str, Any] = {}
+                if "dsn" in sample_parameters:
+                    sample_kwargs["dsn"] = dsn
+                if "schema_obj" in sample_parameters:
+                    sample_kwargs["schema_obj"] = schema_obj
+                sample_result = self.get_table_sample_data(
+                    table_name,
+                    **sample_kwargs,
+                )
                 sample_data = sample_result.get('sample_rows', []) if isinstance(sample_result, dict) else sample_result
                 column_stats = sample_result.get('column_stats', {}) if isinstance(sample_result, dict) else {}
                 fk_previews = sample_result.get('fk_previews', {}) if isinstance(sample_result, dict) else {}
@@ -213,7 +220,7 @@ class SchemaEnricher:
                 resp = call_openai_api(
                     prompt=prompt,
                     system_prompt="Ты эксперт по базам данных. Анализируй контекст и генерируй точные описания колонок. Верни только JSON.",
-                    max_tokens=8000,  # Больше токенов для контекстного анализа
+                    max_tokens=16000,
                     response_format={"type": "json_object"}
                 )
 

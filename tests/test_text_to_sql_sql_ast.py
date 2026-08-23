@@ -378,6 +378,18 @@ def test_derived_relation_links_parent_and_child_scope() -> None:
     )
 
 
+def test_derived_relation_without_alias_uses_an_internal_role() -> None:
+    parsed = _parse(
+        "SELECT MAX(total_amount) FROM "
+        "(SELECT SUM(o.amount) AS total_amount FROM orders o GROUP BY o.category)"
+    )
+
+    assert len(parsed.derived_relations) == 1
+    derived = parsed.derived_relations[0]
+    assert derived.source_alias
+    assert derived.source_alias == derived.relation_id
+
+
 @pytest.mark.parametrize(
     ("sql", "role"),
     [

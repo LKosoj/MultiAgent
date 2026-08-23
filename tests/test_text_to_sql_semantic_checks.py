@@ -47,7 +47,12 @@ POSTGRES_DSN,
     column,
     inner_join,
 )
-from text_to_sql_semantic_coverage_helpers import INCARNATION, RUN_ID, _context
+from text_to_sql_semantic_coverage_helpers import (
+    INCARNATION,
+    RUN_ID,
+    _context,
+    _value_evidence,
+)
 
 
 SQLITE_DSN = "sqlite:////tmp/text2sql-semantic-checks.db"
@@ -365,6 +370,38 @@ def test_sqlite_unique_casefold_table_matches_authorized_spelling() -> None:
                 "player_name",
                 table="Player",
                 literal=1,
+            ),
+        ),
+        dsn=SQLITE_DSN,
+    )
+
+    result = evaluate_semantic_authority_checks(case.check_input, case.state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_sqlite_unqualified_intermediate_join_table_is_authorized() -> None:
+    customer_join = JoinEdge(
+        left=column("transactions_1k", "CustomerID", schema="main"),
+        right=column("yearmonth", "CustomerID", schema="main"),
+    )
+    product_join = JoinEdge(
+        left=column("products", "ProductID", schema="main"),
+        right=column("transactions_1k", "ProductID", schema="main"),
+    )
+    case = build_case(
+        "SELECT products.Description FROM yearmonth "
+        "JOIN transactions_1k "
+        "ON transactions_1k.CustomerID = yearmonth.CustomerID "
+        "JOIN products ON products.ProductID = transactions_1k.ProductID",
+        (
+            _item(
+                "description",
+                SemanticItemKind.DIMENSION,
+                "Description",
+                table="products",
+                schema="main",
+                join_path=(product_join, customer_join),
             ),
         ),
         dsn=SQLITE_DSN,
@@ -845,6 +882,74 @@ def test_sqlite_mixed_case_physical_and_filter_columns_are_authorized() -> None:
     assert result.failure_code is None
 
 
+def test_sqlite_casefolded_validated_join_endpoint_is_authorized() -> None:
+    join = inner_join("customers", "CustomerID", "yearmonth", "CustomerID")
+    case = build_case(
+        "SELECT ym.Consumption FROM customers AS c JOIN yearmonth AS ym "
+        "ON c.CustomerID = ym.customerid",
+        (
+            _item("segment", SemanticItemKind.DIMENSION, "Segment", table="customers"),
+            _item(
+                "consumption",
+                SemanticItemKind.METRIC,
+                "Consumption",
+                table="yearmonth",
+                join_path=(join,),
+            ),
+        ),
+        dsn="sqlite://",
+    )
+
+    result = evaluate_semantic_authority_checks(case.check_input, case.state, "sqlite://")
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_sqlite_casefolding_does_not_authorize_unrelated_join_column() -> None:
+    join = inner_join("customers", "CustomerID", "yearmonth", "CustomerID")
+    case = build_case(
+        "SELECT ym.Consumption FROM customers AS c JOIN yearmonth AS ym "
+        "ON c.otherid = ym.CustomerID",
+        (
+            _item("segment", SemanticItemKind.DIMENSION, "Segment", table="customers"),
+            _item(
+                "consumption",
+                SemanticItemKind.METRIC,
+                "Consumption",
+                table="yearmonth",
+                join_path=(join,),
+            ),
+        ),
+        dsn="sqlite://",
+    )
+
+    result = evaluate_semantic_authority_checks(case.check_input, case.state, "sqlite://")
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
+
+
+def test_postgres_casefolded_validated_join_endpoint_stays_unauthorized() -> None:
+    join = inner_join("customers", "CustomerID", "yearmonth", "CustomerID")
+    case = build_case(
+        "SELECT ym.Consumption FROM customers AS c JOIN yearmonth AS ym "
+        "ON c.CustomerID = ym.customerid",
+        (
+            _item("segment", SemanticItemKind.DIMENSION, "Segment", table="customers"),
+            _item(
+                "consumption",
+                SemanticItemKind.METRIC,
+                "Consumption",
+                table="yearmonth",
+                join_path=(join,),
+            ),
+        ),
+    )
+
+    assert _evaluate(case).failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
+
+
 def test_postgres_mixed_case_physical_column_remains_unauthorized() -> None:
     case = build_case(
         "SELECT currency FROM customers",
@@ -955,6 +1060,148 @@ def test_authority_gate_checks_literals_inside_any_expression() -> None:
         _evaluate(unknown).failure_code
         is CheckFailureCode.UNAUTHORIZED_LITERAL
     )
+
+
+@pytest.mark.parametrize(
+    ("literal", "expected_status", "expected_failure"),
+    (
+        ("small_business", CheckStatus.PASSED, None),
+        (
+            "enterprise",
+            CheckStatus.FAILED,
+            CheckFailureCode.UNAUTHORIZED_LITERAL,
+        ),
+    ),
+)
+def test_eligible_exact_value_evidence_authorizes_equality_literal(
+    literal: str,
+    expected_status: CheckStatus,
+    expected_failure: CheckFailureCode | None,
+) -> None:
+    state = build_state(
+        (
+            _item(
+                "active",
+                SemanticItemKind.FILTER,
+                "status",
+                operator=PredicateOperator.EQ,
+                literal="active",
+            ),
+            _item("tier", SemanticItemKind.DIMENSION, "tier"),
+        )
+    )
+    evidence_id = "evidence-tier-exact-value"
+    tier_column = column("orders", "tier")
+    payload = state.model_dump(mode="python")
+    payload.update(
+        evidence=(*state.evidence, _value_evidence(evidence_id, tier_column, "small_business")),
+        bindings=tuple(
+            binding.model_copy(
+                update={"evidence_ids": (*binding.evidence_ids, evidence_id)}
+            )
+            if binding.source_id == "tier"
+            else binding
+            for binding in state.bindings
+        ),
+    )
+    state = ResearchState.model_validate(payload)
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    sql = (
+        "SELECT o.tier FROM orders AS o "
+        f"WHERE o.status = 'active' AND o.tier = '{literal}'"
+    )
+    parsed_ast = parse_sql_candidate(sql, POSTGRES_DSN, f"exact-value-{literal}")
+    candidate = SqlCandidate(
+        candidate_id=f"exact-value-{literal}",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        state.query_spec,
+        requirements,
+        "main",
+    )
+
+    result = evaluate_semantic_authority_checks(
+        SemanticCheckInput(
+            semantic_ast=semantic_ast,
+            query_spec=state.query_spec,
+            requirements=requirements,
+        ),
+        state,
+        POSTGRES_DSN,
+    )
+
+    assert evidence_id in requirements.eligible_evidence_ids
+    assert result.status is expected_status
+    assert result.failure_code is expected_failure
+
+
+def test_exact_value_evidence_does_not_authorize_join_only_column() -> None:
+    join = inner_join("accounts", "AccountID", "events", "AccountID")
+    state = build_state(
+        (
+            _item("account", SemanticItemKind.DIMENSION, "name", table="accounts"),
+            _item(
+                "amount",
+                SemanticItemKind.METRIC,
+                "amount",
+                table="events",
+                join_path=(join,),
+            ),
+        )
+    )
+    evidence_id = "evidence-account-id-exact-value"
+    account_id = column("accounts", "AccountID")
+    payload = state.model_dump(mode="python")
+    payload.update(
+        evidence=(*state.evidence, _value_evidence(evidence_id, account_id, 123)),
+        bindings=tuple(
+            binding.model_copy(
+                update={"evidence_ids": (*binding.evidence_ids, evidence_id)}
+            )
+            if binding.source_id == "account"
+            else binding
+            for binding in state.bindings
+        ),
+    )
+    state = ResearchState.model_validate(payload)
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    sql = (
+        "SELECT e.amount FROM accounts AS a JOIN events AS e "
+        "ON a.AccountID = e.AccountID WHERE a.AccountID = 123"
+    )
+    parsed_ast = parse_sql_candidate(sql, "sqlite://", "join-only-exact-value")
+    candidate = SqlCandidate(
+        candidate_id="join-only-exact-value",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+
+    result = evaluate_semantic_authority_checks(
+        SemanticCheckInput(
+            semantic_ast=build_semantic_ast(
+                candidate,
+                parsed_ast,
+                state.query_spec,
+                requirements,
+                "main",
+            ),
+            query_spec=state.query_spec,
+            requirements=requirements,
+        ),
+        state,
+        "sqlite://",
+    )
+
+    assert account_id not in requirements.allowed_columns
+    assert evidence_id in requirements.eligible_evidence_ids
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
 
 
 @pytest.mark.parametrize(

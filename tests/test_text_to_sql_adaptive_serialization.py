@@ -111,6 +111,7 @@ def _query_spec(*, resolved: bool = False) -> QuerySpec:
                 binding_ids=("binding-1",) if resolved else (),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -897,6 +898,7 @@ def test_query_spec_roundtrip_has_no_source_span_field() -> None:
                 binding_ids=(),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

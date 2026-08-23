@@ -177,6 +177,8 @@ def test_value_grounding_fk_label_to_id_maps_text_to_code(tmp_path):
 
 
 def test_value_grounding_lookup_errors_fail_open_and_mask_dsn(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
+
     def fail_get_plugin(_dsn):
         raise RuntimeError(
             "lookup failed for person@example.com +7 (495) 123-45-67 "

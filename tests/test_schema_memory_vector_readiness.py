@@ -161,6 +161,17 @@ def test_schema_rows_remain_authoritative_for_every_non_ready_vector_state(
     manager = SchemaMemoryManager(tmp_path)
 
     assert manager.ensure_schema_indexed_in_memory(namespace, schema) is True
+    conn = handler.get_connection()
+    try:
+        stored = json.loads(
+            conn.execute(
+                "SELECT data FROM agent_memory WHERE session_id = ?",
+                (namespace.version_key,),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    file_hash = stored["file_hash"]
     reject_chroma_probe = True
     chroma_probe_calls = 0
     for readiness in (
@@ -172,7 +183,7 @@ def test_schema_rows_remain_authoritative_for_every_non_ready_vector_state(
         handler.set_vector_readiness(readiness, "test")
         assert manager.is_schema_indexed(
             namespace,
-            namespace.version_key,
+            file_hash,
             expected_count=1,
             expected_table_keys=("orders",),
         ) is True
@@ -266,6 +277,7 @@ def test_vector_readiness_probe_errors_fall_back_to_sqlite(monkeypatch, tmp_path
         data={
             "cache_kind": "schema_table",
             "semantic_id": canonical_schema_table_id(namespace.version_key, "orders"),
+            "file_hash": "content-hash",
         },
     )
 
@@ -304,7 +316,7 @@ def test_vector_readiness_probe_errors_fall_back_to_sqlite(monkeypatch, tmp_path
     assert manager.last_vector_reason == "tactical_collection_probe_failed"
     assert manager.is_schema_indexed(
         namespace,
-        namespace.version_key,
+        "content-hash",
         expected_count=1,
         expected_table_keys=("orders",),
     ) is True
@@ -324,7 +336,11 @@ def test_search_failure_marks_vector_stale_then_sqlite_check_skips_chroma(
         handler,
         session_id=namespace.version_key,
         agent_name="Schema-RAG-Agent",
-        data={"cache_kind": "schema_table", "semantic_id": semantic_id},
+        data={
+            "cache_kind": "schema_table",
+            "semantic_id": semantic_id,
+            "file_hash": "content-hash",
+        },
     )
 
     class BrokenCollection:
@@ -352,7 +368,7 @@ def test_search_failure_marks_vector_stale_then_sqlite_check_skips_chroma(
     assert manager.last_search_status == "vector_stale"
     assert manager.is_schema_indexed(
         namespace,
-        namespace.version_key,
+        "content-hash",
         expected_count=1,
         expected_table_keys=("orders",),
     ) is True
@@ -388,6 +404,42 @@ def test_schema_cache_hit_does_not_depend_on_vector_readiness(monkeypatch):
     )
 
     assert cache.load_from_cache(info) == cached
+
+
+def test_scoped_schema_memory_rejects_changed_file_content(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import memory.index_consistency as consistency_module
+    import memory.manager as manager_module
+
+    namespace = _namespace()
+    handler = _disabled_handler(monkeypatch, tmp_path)
+    _save_schema_row(
+        handler,
+        session_id=namespace.version_key,
+        agent_name="Schema-RAG-Agent",
+        data={
+            "cache_kind": "schema_table",
+            "semantic_id": canonical_schema_table_id(
+                namespace.version_key,
+                "orders",
+            ),
+            "file_hash": "old-content-hash",
+        },
+    )
+    fake_memory_manager = SimpleNamespace(db_handler=handler)
+    monkeypatch.setattr(manager_module, "memory_manager", fake_memory_manager)
+    monkeypatch.setattr(consistency_module, "memory_manager", fake_memory_manager)
+
+    manager = SchemaMemoryManager(tmp_path)
+
+    assert manager.is_schema_indexed(
+        namespace,
+        "new-content-hash",
+        expected_count=1,
+        expected_table_keys=("orders",),
+    ) is False
 
 
 def test_rebuild_marks_vector_stale_when_interrupted(monkeypatch):

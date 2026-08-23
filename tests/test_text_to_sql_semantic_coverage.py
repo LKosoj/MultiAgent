@@ -49,6 +49,8 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
     ResearchTerminalReplayInput,
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
+    CoverageInputError,
+    CoverageInputErrorCode,
     validate_coverage_inputs,
 )
 from custom_tools.text_to_sql.adaptive.serialization import (
@@ -357,6 +359,7 @@ def _research_state(
                     binding_ids=(binding.binding_id,),
                 ),
             ),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -400,6 +403,56 @@ def test_exact_fresh_search_value_suffices_without_inspect_column() -> None:
     )
 
     assert requirements.selected_bindings == (binding,)
+
+
+def test_exact_time_physical_predicate_rejects_substitute_at_coverage() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    (binding,) = state.bindings
+    substitute = PredicateRef(
+        left=binding.discriminator_column,
+        operator=PredicateOperator.BETWEEN,
+        right=("2024-06-01", "2024-06-30"),
+    )
+    binding = canonical_binding(
+        binding.model_copy(
+            update={
+                "predicates": (substitute,),
+                "discriminator_predicate": substitute,
+            }
+        )
+    )
+    item = item.model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "202406",
+            "exact_physical_predicate": True,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (binding,),
+        }
+    )
+
+    with pytest.raises(CoverageInputError) as raised:
+        validate_coverage_inputs(
+            state,
+            FreshnessContext(
+                evaluated_at=_OBSERVED_AT,
+                run_id=_RUN_ID,
+                run_incarnation=_INCARNATION,
+                schema_namespace_version=state.schema_namespace_version,
+            ),
+            _RUN_ID,
+            _INCARNATION,
+        )
+
+    assert raised.value.code is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
 
 
 def _create_fixture(

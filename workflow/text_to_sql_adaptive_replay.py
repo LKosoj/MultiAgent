@@ -231,7 +231,11 @@ def _load_authorities(
         AdaptiveLoopKind.RESEARCH,
     )
     terminal_event = next(
-        (event for event in events if event.phase is AdaptiveActionPhase.TERMINAL),
+        (
+            event
+            for event in reversed(events)
+            if event.phase is AdaptiveActionPhase.TERMINAL
+        ),
         None,
     )
     terminal_input = (
@@ -357,7 +361,18 @@ def _research_event_index(
     authorities: _ReplayAuthorities,
 ) -> dict[tuple[int, AdaptiveActionPhase], AdaptiveCheckpointEvent]:
     events: dict[tuple[int, AdaptiveActionPhase], AdaptiveCheckpointEvent] = {}
+    terminal_revisions = tuple(
+        event.key.revision
+        for event in authorities.research_events
+        if event.phase is AdaptiveActionPhase.TERMINAL
+    )
+    final_terminal_revision = terminal_revisions[-1] if terminal_revisions else None
     for event in authorities.research_events:
+        if (
+            event.phase is AdaptiveActionPhase.TERMINAL
+            and event.key.revision != final_terminal_revision
+        ):
+            continue
         key = (event.key.revision, event.phase)
         if key in events:
             raise ReplayContractError("research journal event identity is duplicated")
@@ -406,9 +421,9 @@ def _research_terminal(
     )
     if not events:
         return None
-    if len(events) != 1 or not snapshots:
+    if not snapshots:
         raise ReplayContractError("research terminal journal is inconsistent")
-    event = events[0]
+    event = events[-1]
     if event.key.revision != snapshots[-1].state.revision:
         raise ReplayContractError("research terminal revision is not final")
     if authorities.research_terminal_input is None and any(

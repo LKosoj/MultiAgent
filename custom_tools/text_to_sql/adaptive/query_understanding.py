@@ -36,6 +36,8 @@ _ITEM_FIELDS = frozenset(
         "source_text",
         "normalized_meaning",
         "required",
+        "requested_output",
+        "exact_physical_predicate",
         "operator",
         "literal_or_reference",
         "status",
@@ -74,9 +76,17 @@ def understand_query(
     ):
         raise QueryUnderstandingDecodeError("semantic_items must be an array")
 
-    items = tuple(
+    decoded_items = tuple(
         _decode_item(query_id, raw_item, raw_ordinal)
         for raw_ordinal, raw_item in enumerate(raw_items)
+    )
+    items = tuple(item for item, _ in decoded_items)
+    requested_output_source_ids = tuple(
+        sorted(
+            item.source_id
+            for item, requested_output in decoded_items
+            if requested_output
+        )
     )
     ordered_items = tuple(
         sorted(
@@ -98,6 +108,7 @@ def understand_query(
             query_id=query_id,
             original_text=text,
             semantic_items=ordered_items,
+            requested_output_source_ids=requested_output_source_ids,
             expected_result_shape=shape,
             global_constraints=(),
         )
@@ -107,7 +118,9 @@ def understand_query(
         ) from exc
 
 
-def _decode_item(query_id: str, raw_item: object, raw_ordinal: int) -> SemanticItem:
+def _decode_item(
+    query_id: str, raw_item: object, raw_ordinal: int
+) -> tuple[SemanticItem, bool]:
     if not isinstance(raw_item, Mapping):
         raise QueryUnderstandingDecodeError("semantic item must be an object")
     _require_exact_keys(raw_item, _ITEM_FIELDS, "semantic item")
@@ -130,6 +143,18 @@ def _decode_item(query_id: str, raw_item: object, raw_ordinal: int) -> SemanticI
     required = raw_item["required"]
     if type(required) is not bool:
         raise QueryUnderstandingDecodeError("required must be a boolean")
+    requested_output = raw_item["requested_output"]
+    if type(requested_output) is not bool:
+        raise QueryUnderstandingDecodeError("requested_output must be a boolean")
+    if requested_output and not required:
+        raise QueryUnderstandingSemanticError(
+            "requested_output semantic items must be required"
+        )
+    exact_physical_predicate = raw_item["exact_physical_predicate"]
+    if type(exact_physical_predicate) is not bool:
+        raise QueryUnderstandingDecodeError(
+            "exact_physical_predicate must be a boolean"
+        )
     operator_value = raw_item["operator"]
     operator = (
         None
@@ -140,6 +165,13 @@ def _decode_item(query_id: str, raw_item: object, raw_ordinal: int) -> SemanticI
             "semantic item operator",
         )
     )
+    if exact_physical_predicate and (
+        kind not in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+        or operator is None
+    ):
+        raise QueryUnderstandingSemanticError(
+            "exact_physical_predicate requires FILTER or TIME with an operator"
+        )
     literal = _decode_literal(raw_item["literal_or_reference"])
     source_id = _stable_id(
         "semantic",
@@ -151,16 +183,20 @@ def _decode_item(query_id: str, raw_item: object, raw_ordinal: int) -> SemanticI
             "raw_ordinal": raw_ordinal,
         },
     )
-    return SemanticItem(
-        source_id=source_id,
-        kind=kind,
-        source_text=source_text,
-        normalized_meaning=normalized,
-        required=required,
-        operator=operator,
-        literal_or_reference=literal,
-        status=status,
-        binding_ids=(),
+    return (
+        SemanticItem(
+            source_id=source_id,
+            kind=kind,
+            source_text=source_text,
+            normalized_meaning=normalized,
+            required=required,
+            exact_physical_predicate=exact_physical_predicate,
+            operator=operator,
+            literal_or_reference=literal,
+            status=status,
+            binding_ids=(),
+        ),
+        requested_output,
     )
 
 

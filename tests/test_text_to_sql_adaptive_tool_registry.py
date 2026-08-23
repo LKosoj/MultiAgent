@@ -668,7 +668,10 @@ def test_raw_unsafe_query_is_claimed_once_and_returns_typed_failure_with_one_liv
                 replace(
                     _invocation(
                         "execute_research_probe",
-                        {"sql": "SELECT * FROM sales_fact LIMIT 2", "parameters": []},
+                        {
+                            "sql": "SELECT s.* FROM sales_fact AS s LIMIT 2",
+                            "parameters": [],
+                        },
                     ),
                     run_id=RUN_ID,
                     run_incarnation=INCARNATION,

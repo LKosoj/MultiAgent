@@ -7,24 +7,28 @@ from typing import Iterable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from ._semantic_matching import predicate_matches
 from .evidence import evidence_source_kind_for_action
 from .models import (
     BindingBase,
     BindingStatus,
     BudgetState,
+    DiscriminatorValueBinding,
     EvidenceRecord,
     Hypothesis,
     HypothesisStatus,
     JoinCandidate,
     JoinCandidateStatus,
+    PredicateRef,
     ResearchAction,
     ResearchState,
     ResultExpectation,
     ResearchStopReason,
     QuerySpec,
     SemanticItem,
+    SemanticItemKind,
     SemanticItemStatus,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
     is_structurally_resolved_limit,
 )
 from ._semantic_resolution import derive_semantic_resolution
@@ -117,6 +121,7 @@ def apply_research_transition(
     result_expectations: Iterable[ResultExpectation] = (),
     budget_state: BudgetState | None = None,
     stop_reason: ResearchStopReason | None = None,
+    declared_join_ids: tuple[str, ...] = (),
 ) -> ResearchTransitionResult:
     """Append one action and its derived facts without any runtime side effects."""
 
@@ -169,6 +174,11 @@ def apply_research_transition(
         incoming_hypotheses,
     )
     incoming_bindings = _validated_bindings(bindings)
+    _validate_new_predicate_bindings(
+        current.query_spec,
+        current.bindings,
+        incoming_bindings,
+    )
     merged_bindings, added_bindings, updated_bindings = _merge_bindings(
         current.bindings,
         incoming_bindings,
@@ -182,6 +192,7 @@ def apply_research_transition(
     merged_joins, added_joins, updated_joins = _merge_joins(
         current.join_candidates,
         incoming_joins,
+        declared_join_ids=declared_join_ids,
     )
 
     hypothesis_ids = {item.hypothesis_id for item in merged_hypotheses}
@@ -501,6 +512,64 @@ def _merge_bindings(
     return merged, tuple(added), tuple(updated)
 
 
+def _validate_new_predicate_bindings(
+    query_spec: QuerySpec,
+    existing: tuple[BindingBase, ...],
+    incoming: tuple[BindingBase, ...],
+) -> None:
+    existing_ids = {binding.binding_id for binding in existing}
+    items = {item.source_id: item for item in query_spec.semantic_items}
+    for binding in incoming:
+        item = items.get(binding.source_id)
+        if (
+            binding.binding_id in existing_ids
+            or not isinstance(binding, DiscriminatorValueBinding)
+            or item is None
+            or not item.required
+            or item.kind not in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+        ):
+            continue
+        primary_matches_column = (
+            bool(binding.predicates)
+            and binding.predicates[0] == binding.discriminator_predicate
+            and binding.discriminator_predicate.left == binding.discriminator_column
+        )
+        exact_query_match = False
+        if item.exact_physical_predicate and item.operator is not None:
+            try:
+                required_predicate = PredicateRef(
+                    left=binding.discriminator_column,
+                    operator=item.operator,
+                    right=item.literal_or_reference,
+                )
+            except (TypeError, ValueError):
+                pass
+            else:
+                exact_query_match = len(binding.predicates) == 1 and predicate_matches(
+                    required_predicate,
+                    binding.discriminator_predicate,
+                )
+        filter_matches_query = (
+            item.kind is SemanticItemKind.FILTER
+            and len(binding.predicates) == 1
+            and item.operator is not None
+            and binding.discriminator_predicate.operator is item.operator
+            and (not item.exact_physical_predicate or exact_query_match)
+        )
+        time_has_physical_predicates = (
+            item.kind is SemanticItemKind.TIME
+            and item.operator is not None
+            and bool(binding.predicates)
+            and (not item.exact_physical_predicate or exact_query_match)
+        )
+        if not primary_matches_column or not (
+            filter_matches_query or time_has_physical_predicates
+        ):
+            raise ResearchTransitionProtocolError(
+                "new discriminator binding must match the required operator and column"
+            )
+
+
 def _validate_binding_update(previous: BindingBase, replacement: BindingBase) -> None:
     """Allow only the reducer's candidate-to-supported certificate annotation."""
 
@@ -536,6 +605,8 @@ def _validate_binding_update(previous: BindingBase, replacement: BindingBase) ->
 def _merge_joins(
     existing: tuple[JoinCandidate, ...],
     incoming: tuple[JoinCandidate, ...],
+    *,
+    declared_join_ids: tuple[str, ...] = (),
 ) -> tuple[tuple[JoinCandidate, ...], tuple[str, ...], tuple[str, ...]]:
     """Merge append-only join candidates without changing their physical shape."""
 
@@ -546,7 +617,12 @@ def _merge_joins(
     for item in incoming:
         previous = by_id.get(item.join_id)
         if previous is None:
-            if item.status is not JoinCandidateStatus.CANDIDATE:
+            if item.status is JoinCandidateStatus.VALIDATED:
+                if item.join_id not in declared_join_ids:
+                    raise ResearchTransitionProtocolError(
+                        "new validated join requires a trusted declaration"
+                    )
+            elif item.status is not JoinCandidateStatus.CANDIDATE:
                 raise ResearchTransitionProtocolError(
                     "new join must start as candidate"
                 )
@@ -693,7 +769,7 @@ def _derive_unresolved_items(
             for item in query_spec.semantic_items
             if (
                 item.required
-                and not is_binding_free_structural_limit(item, bindings)
+                and not is_binding_free_semantic_item(item, bindings)
                 and supported_by_source[item.source_id] == 0
             )
         )

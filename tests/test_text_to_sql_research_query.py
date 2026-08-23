@@ -297,7 +297,6 @@ def test_quoted_schema_identifiers_keep_exact_case_semantics() -> None:
 @pytest.mark.parametrize(
     ("sql", "code", "parameters"),
     [
-        ("SELECT * FROM main.orders LIMIT 1", "research_query_star", ()),
         ("DELETE FROM main.orders", "research_query_not_select", ()),
         (
             "WITH changed AS (DELETE FROM main.orders RETURNING id) "
@@ -326,7 +325,7 @@ def test_quoted_schema_identifiers_keep_exact_case_semantics() -> None:
         ("SELECT id FROM main.orders WHERE status = :status ORDER BY id LIMIT 1", "research_query_parameters", ("open",)),
     ],
 )
-def test_statement_limit_star_and_placeholder_contracts_fail_closed(sql, code, parameters) -> None:
+def test_statement_limit_and_placeholder_contracts_fail_closed(sql, code, parameters) -> None:
     _reject(sql, code, parameters)
 
 
@@ -448,6 +447,17 @@ def test_safe_predicate_subquery_is_admitted() -> None:
     )
 
     assert admitted.output_columns == ("id",)
+
+
+def test_scalar_subqueries_without_an_outer_row_source_are_admitted() -> None:
+    admitted = _admit(
+        "SELECT "
+        "(SELECT COUNT(*) FROM main.orders WHERE status = 'open') AS open_count, "
+        "(SELECT MAX(id) FROM main.orders) AS maximum_id "
+        "LIMIT 1"
+    )
+
+    assert admitted.output_columns == ("open_count", "maximum_id")
 
 
 @pytest.mark.parametrize(
@@ -700,10 +710,25 @@ def test_bare_count_star_is_an_admitted_single_row_aggregate(dialect: str) -> No
     assert admitted.output_columns == ("row_count",)
 
 
+def test_single_source_star_uses_the_trusted_schema_output_columns() -> None:
+    admitted = _admit("SELECT * FROM main.orders LIMIT 3")
+
+    assert admitted.output_columns == ("id", "customer_id", "status")
+
+
+def test_single_source_star_keeps_the_existing_output_column_bound() -> None:
+    columns = {f"column_{index}": {"type": "INTEGER"} for index in range(21)}
+
+    _reject(
+        "SELECT * FROM main.wide_table LIMIT 1",
+        "research_query_output",
+        schema={"main.wide_table": {"columns": columns}},
+    )
+
+
 @pytest.mark.parametrize(
     ("sql", "dialect"),
     (
-        ("SELECT * FROM main.orders LIMIT 1", "sqlite"),
         ("SELECT o.* FROM main.orders AS o LIMIT 1", "sqlite"),
         ("SELECT COUNT(o.*) AS n FROM main.orders AS o LIMIT 1", "sqlite"),
         ("SELECT SUM(*) AS n FROM main.orders LIMIT 1", "sqlite"),
@@ -711,7 +736,7 @@ def test_bare_count_star_is_an_admitted_single_row_aggregate(dialect: str) -> No
         ("SELECT * EXCEPT (status) FROM main.orders LIMIT 1", "bigquery"),
     ),
 )
-def test_non_count_stars_remain_outside_the_research_contract(
+def test_qualified_and_dynamic_stars_remain_outside_the_research_contract(
     sql: str,
     dialect: str,
 ) -> None:
@@ -903,6 +928,7 @@ def _state(namespace: SchemaNamespace, config: AdaptivePolicyConfig) -> Research
             query_id="raw-query",
             original_text="bounded raw research query",
             semantic_items=(),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=(),
         ),
@@ -1202,7 +1228,11 @@ def test_unquoted_uppercase_sqlite_columns_execute_with_canonical_shape(tmp_path
 @pytest.mark.parametrize(
     ("sql", "failure_code", "suffix"),
     [
-        ("SELECT * FROM sales_fact LIMIT 2", "research_query_star", "star"),
+        (
+            "SELECT s.* FROM sales_fact AS s LIMIT 2",
+            "research_query_star",
+            "star",
+        ),
         ("DELETE FROM sales_fact", "research_query_not_select", "mutation"),
         (
             "SELECT sale_id FROM sales_fact ORDER BY sale_id",

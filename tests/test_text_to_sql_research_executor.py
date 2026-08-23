@@ -113,7 +113,6 @@ def _policy(profile: str):
         "INSERT INTO items(id) VALUES (1)",
         "DROP TABLE items",
         "WITH changed AS (DELETE FROM items RETURNING id) SELECT id FROM changed LIMIT 1",
-        "SELECT * FROM items LIMIT 1",
         "SELECT items.* FROM items LIMIT 1",
         "SELECT id FROM items",
         "SELECT id FROM items LIMIT 0",
@@ -186,14 +185,9 @@ def test_research_rejects_nested_into_and_locks_before_connection(monkeypatch, s
             "duckdb:///tmp/research.db",
             "SELECT COLUMNS('^id$') FROM items LIMIT 1",
         ),
-        (
-            "impala://user:pass@db/research",
-            "WITH values_cte AS (SELECT * FROM items) "
-            "SELECT id FROM values_cte LIMIT 1",
-        ),
     ],
 )
-def test_research_rejects_recursive_and_dynamic_star_forms_before_connection(
+def test_research_rejects_dynamic_star_forms_before_connection(
     monkeypatch,
     dsn,
     sql,
@@ -254,6 +248,23 @@ def test_research_accepts_count_star_across_dialects(monkeypatch, dsn, sql):
 
     result = QueryExecutor(get_plugin=lambda _dsn: plugin).execute(
         _research_request(sql, row_limit=1, dsn=dsn)
+    )
+
+    assert result.success is True, result.outcome["error_message"]
+    assert ("execute", sql, 1) in plugin.calls
+
+
+def test_research_executes_plain_star_after_scoped_admission(monkeypatch):
+    sql = "SELECT * FROM items LIMIT 1"
+    monkeypatch.setattr(
+        core_facade,
+        "sql_safety_check",
+        lambda *_args, **_kwargs: {"is_safe": True, "issues": []},
+    )
+    plugin = _ResearchPlugin()
+
+    result = QueryExecutor(get_plugin=lambda _dsn: plugin).execute(
+        _research_request(sql, row_limit=1)
     )
 
     assert result.success is True, result.outcome["error_message"]

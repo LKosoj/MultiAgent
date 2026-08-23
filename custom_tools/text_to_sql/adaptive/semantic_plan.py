@@ -27,7 +27,7 @@ from .models import (
     SqlCandidate,
     TableRef,
     VerticalAttributeBinding,
-    is_binding_free_structural_limit,
+    is_binding_free_semantic_item,
 )
 from .semantic_coverage import CoverageRequirements
 
@@ -419,10 +419,13 @@ def _binding_targets(
                 allowed_columns=allowed_columns,
                 dialect=dialect,
             )) is not None
-            and predicate_matches(
-                binding.discriminator_predicate,
-                actual,
-                unordered_between=_is_symmetric_between(atom.expression),
+            and any(
+                predicate_matches(
+                    required,
+                    actual,
+                    unordered_between=_is_symmetric_between(atom.expression),
+                )
+                for required in binding.predicates
             )
         )
         targets.update(
@@ -432,7 +435,10 @@ def _binding_targets(
                 expression, relation_tables, scope_id=scope_id,
                 allowed_columns=allowed_columns, dialect=dialect,
             )) is not None
-            and predicate_matches(binding.discriminator_predicate, actual)
+            and any(
+                predicate_matches(required, actual)
+                for required in binding.predicates
+            )
         )
         targets.update(
             (node_id, "expression", 0, path)
@@ -446,10 +452,13 @@ def _binding_targets(
                 allowed_columns=allowed_columns,
                 dialect=dialect,
             )) is not None
-            and predicate_matches(
-                binding.discriminator_predicate,
-                actual,
-                unordered_between=_is_symmetric_between(condition),
+            and any(
+                predicate_matches(
+                    required,
+                    actual,
+                    unordered_between=_is_symmetric_between(condition),
+                )
+                for required in binding.predicates
             )
         )
     elif type(binding) is VerticalAttributeBinding:
@@ -874,7 +883,7 @@ def _validated_inputs(
         raise ValueError("unknown limit requires one positive outer literal LIMIT")
     items = {item.source_id: item for item in required}
     binding_required_source_ids = tuple(
-        item.source_id for item in required if not is_binding_free_structural_limit(item)
+        item.source_id for item in required if not is_binding_free_semantic_item(item)
     )
     bindings_by_source = {
         source_id: tuple(

@@ -4,7 +4,7 @@ wall_clock:
   wall_clock_seconds: 14400
 
 resource_limits:
-  model_tokens: 524288
+  model_tokens: 1048576
   # DB work cannot outlive the global 14400-second research deadline.
   db_probe_ms: 14400000
 
@@ -24,4 +24,4 @@ model_budget:
   model_calls: 256
   input_tokens_per_call: 16384
   output_tokens_per_call: 32000
-  total_tokens: 524288
+  total_tokens: 1048576

@@ -338,13 +338,14 @@ def pii_masking(
             но ``column_names is None`` — индексы нельзя разрешить.
 
     Environment Variables:
-        PII_MASKING_ENABLED: "0" для полного отключения PII маскирования.
+        PII_MASKING_ENABLED: "1" для явного включения PII маскирования;
+            по умолчанию маскирование выключено.
         PII_DETECTION_SENSITIVITY: "low"/"medium"/"high" для AUTO режима.
         PII_MASK_SALT: обязательная соль для хэширования значений
             (fail-fast если unset на момент реального маскирования).
     """
     # Проверяем отключение PII маскирования
-    if os.getenv("PII_MASKING_ENABLED", "1") == "0":
+    if os.getenv("PII_MASKING_ENABLED", "0") == "0":
         logger.info("PII masking disabled by environment variable")
         return {
             "masked_data": data,

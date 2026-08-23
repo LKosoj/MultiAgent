@@ -177,6 +177,7 @@ def _initial_state(
         query_id="query-1",
         original_text=text,
         semantic_items=(item,),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -219,6 +220,7 @@ def test_initial_research_state_resolves_binding_free_positive_integer_limit() -
         query_id="query-limit",
         original_text="highest",
         semantic_items=(limit,),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -254,6 +256,7 @@ def test_initial_research_state_defers_binding_free_unknown_limit() -> None:
         query_id="query-unknown-limit",
         original_text="highest",
         semantic_items=(limit,),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -1227,6 +1230,7 @@ def test_bounded_context_is_deterministic_across_persisted_active_fact_order() -
         query_id="bounded-order-query",
         original_text=text,
         semantic_items=items,
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -1307,6 +1311,7 @@ def test_bounded_production_context_stays_within_synthetic_envelope() -> None:
         query_id="synthetic-query",
         original_text="request",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

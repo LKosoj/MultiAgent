@@ -266,13 +266,17 @@ class AdaptiveStateStore:
         expected_revision: int | None,
         action: Any,
         artifact_digest: str | None = None,
+        semantic_repair_continuation: bool = False,
     ) -> AdaptiveCheckpointEvent:
+        if type(semantic_repair_continuation) is not bool:
+            raise TypeError("semantic_repair_continuation must be bool")
         return self._append(
             key,
             AdaptiveActionPhase.PLANNED,
             expected_revision=expected_revision,
             action=action,
             artifact_digest=artifact_digest,
+            semantic_repair_continuation=semantic_repair_continuation,
         )
 
     def record_observed(
@@ -314,6 +318,7 @@ class AdaptiveStateStore:
         expected_revision: int | None,
         action: Any,
         replay_input: ResearchTerminalReplayInput,
+        semantic_repair_continuation: bool = False,
     ) -> AdaptiveCheckpointEvent:
         """Atomically record one research terminal and its freshness input."""
 
@@ -321,6 +326,8 @@ class AdaptiveStateStore:
             raise ValueError("replayable terminal requires the research loop")
         if type(replay_input) is not ResearchTerminalReplayInput:
             raise TypeError("replay_input must be ResearchTerminalReplayInput")
+        if type(semantic_repair_continuation) is not bool:
+            raise TypeError("semantic_repair_continuation must be bool")
         checked = deserialize_replay_input(serialize_replay_input(replay_input))
         if type(checked) is not ResearchTerminalReplayInput:
             raise TypeError("replay_input must be ResearchTerminalReplayInput")
@@ -336,6 +343,7 @@ class AdaptiveStateStore:
             action=action,
             artifact_digest=None,
             replay_input=checked,
+            semantic_repair_continuation=semantic_repair_continuation,
         )
 
     def load_terminal_replay_input(
@@ -473,7 +481,18 @@ class AdaptiveStateStore:
         action: Any,
         artifact_digest: str | None,
         replay_input: ResearchTerminalReplayInput | None = None,
+        semantic_repair_continuation: bool = False,
     ) -> AdaptiveCheckpointEvent:
+        if semantic_repair_continuation and (
+            phase not in {
+                AdaptiveActionPhase.PLANNED,
+                AdaptiveActionPhase.TERMINAL,
+            }
+            or key.loop_kind is not AdaptiveLoopKind.RESEARCH
+        ):
+            raise ValueError(
+                "only a planned or terminal research checkpoint may continue after terminal"
+            )
         if replay_input is not None and (
             phase is not AdaptiveActionPhase.TERMINAL
             or key.loop_kind is not AdaptiveLoopKind.RESEARCH
@@ -535,12 +554,24 @@ class AdaptiveStateStore:
                     "new research terminal requires replay input"
                 )
 
-            if self._terminal_revision(connection, key) is not None:
-                raise AdaptiveCheckpointCasError(
-                    "terminal checkpoint closes this loop incarnation"
-                )
-
             current_revision = self._current_revision(connection, key)
+            terminal_revision = self._terminal_revision(connection, key)
+            closed_revision = (
+                terminal_revision
+                if terminal_revision is not None
+                and terminal_revision >= current_revision
+                else None
+            )
+            if closed_revision is not None:
+                if not (
+                    semantic_repair_continuation
+                    and expected_revision == closed_revision
+                    and key.revision == closed_revision + 1
+                ):
+                    raise AdaptiveCheckpointCasError(
+                        "terminal checkpoint closes this loop incarnation"
+                    )
+                current_revision = closed_revision
             if phase is AdaptiveActionPhase.PLANNED:
                 expected_current = (
                     -1 if expected_revision is None else expected_revision
@@ -554,17 +585,7 @@ class AdaptiveStateStore:
                     )
                 if (
                     key.revision > 0
-                    and self._read_event(
-                        connection,
-                        AdaptiveCheckpointKey(
-                            key.run_id,
-                            key.run_incarnation,
-                            key.loop_kind,
-                            key.revision - 1,
-                        ),
-                        AdaptiveActionPhase.OBSERVED,
-                    )
-                    is None
+                    and not self._previous_revision_is_closed(connection, key)
                 ):
                     raise AdaptiveCheckpointCasError(
                         "previous revision must be observed before planning next revision"
@@ -590,17 +611,7 @@ class AdaptiveStateStore:
                     )
                 if (
                     key.revision > 0
-                    and self._read_event(
-                        connection,
-                        AdaptiveCheckpointKey(
-                            key.run_id,
-                            key.run_incarnation,
-                            key.loop_kind,
-                            key.revision - 1,
-                        ),
-                        AdaptiveActionPhase.OBSERVED,
-                    )
-                    is None
+                    and not self._previous_revision_is_closed(connection, key)
                 ):
                     raise AdaptiveCheckpointCasError(
                         "previous revision must be observed before terminal checkpoint"
@@ -1220,6 +1231,7 @@ class AdaptiveStateStore:
             """
             SELECT revision, action_json, action_digest FROM adaptive_checkpoint_events
             WHERE run_id = ? AND run_incarnation = ? AND loop_kind = ? AND phase = 'terminal'
+            ORDER BY revision DESC
             LIMIT 1
             """,
             (key.run_id, key.run_incarnation, key.loop_kind.value),
@@ -1228,6 +1240,25 @@ class AdaptiveStateStore:
             return None
         _validated_stored_action(row)
         return int(row["revision"])
+
+    @staticmethod
+    def _previous_revision_is_closed(
+        connection: sqlite3.Connection,
+        key: AdaptiveCheckpointKey,
+    ) -> bool:
+        previous = AdaptiveCheckpointKey(
+            key.run_id,
+            key.run_incarnation,
+            key.loop_kind,
+            key.revision - 1,
+        )
+        return any(
+            AdaptiveStateStore._read_event(connection, previous, phase) is not None
+            for phase in (
+                AdaptiveActionPhase.OBSERVED,
+                AdaptiveActionPhase.TERMINAL,
+            )
+        )
 
     @staticmethod
     def _event_from_row(
@@ -1271,21 +1302,34 @@ def _validate_complete_event_chain(
     for revision, phases in phases_by_revision.items():
         is_last = revision == revisions[-1]
         if phases == [AdaptiveActionPhase.TERMINAL]:
-            if not is_last:
-                raise ValueError("terminal checkpoint must be final")
+            if not is_last and phases_by_revision[revision + 1][0] not in {
+                AdaptiveActionPhase.PLANNED,
+                AdaptiveActionPhase.TERMINAL,
+            }:
+                raise ValueError(
+                    "continued checkpoint segment must start planned or terminal"
+                )
             continue
         allowed = [AdaptiveActionPhase.PLANNED]
         if not is_last:
             allowed.append(AdaptiveActionPhase.OBSERVED)
         if phases == allowed:
             continue
+        if phases == [
+            AdaptiveActionPhase.PLANNED,
+            AdaptiveActionPhase.OBSERVED,
+            AdaptiveActionPhase.TERMINAL,
+        ]:
+            if not is_last and phases_by_revision[revision + 1][0] not in {
+                AdaptiveActionPhase.PLANNED,
+                AdaptiveActionPhase.TERMINAL,
+            }:
+                raise ValueError(
+                    "continued checkpoint segment must start planned or terminal"
+                )
+            continue
         if is_last and phases in (
             [AdaptiveActionPhase.PLANNED, AdaptiveActionPhase.OBSERVED],
-            [
-                AdaptiveActionPhase.PLANNED,
-                AdaptiveActionPhase.OBSERVED,
-                AdaptiveActionPhase.TERMINAL,
-            ],
         ):
             continue
         raise ValueError("checkpoint phases are incomplete or out of order")

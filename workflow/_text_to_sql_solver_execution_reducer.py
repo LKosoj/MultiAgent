@@ -196,6 +196,11 @@ def state_after_result_contradiction(
 
     if type(receipt) not in {ResultContradictionReceipt, ResultReviewReceipt}:
         raise TypeError("receipt must be an exact result reentry receipt")
+    if (
+        type(receipt) is ResultReviewReceipt
+        and receipt.verdict not in {"contradicted", "ambiguous"}
+    ):
+        raise ValueError("result review receipt is not actionable")
     source_id = (
         receipt.finding.expectation.source_id
         if type(receipt) is ResultContradictionReceipt

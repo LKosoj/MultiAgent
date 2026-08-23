@@ -100,15 +100,18 @@ class CTECollector:
             )
             row_source_names.add(real_name)
 
-        for subquery in scope.find_all(exp.Subquery):
+        for index, subquery in enumerate(scope.find_all(exp.Subquery)):
             if subquery.find_ancestor(exp.Select) is not scope:
                 continue
             alias = getattr(subquery, "alias", None)
             select_expr = getattr(subquery, "this", None)
             select_like = (getattr(exp, "Select", type(None)),) + _set_operation_classes()
-            if alias and isinstance(select_expr, select_like):
-                row_sources[str(alias)] = self.row_source_columns(subquery, select_expr, db_schema)
-                row_source_names.add(str(alias))
+            if isinstance(select_expr, select_like):
+                visible_name = str(alias) if alias else f"__derived_{index}"
+                row_sources[visible_name] = self.row_source_columns(
+                    subquery, select_expr, db_schema
+                )
+                row_source_names.add(visible_name)
             for pivot in subquery.args.get("pivots") or ():
                 pivot_alias = getattr(pivot, "alias", None)
                 columns = {

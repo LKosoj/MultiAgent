@@ -395,6 +395,7 @@ def _state(
             query_id="coverage-query",
             original_text=original_text,
             semantic_items=tuple(semantic_items),
+            requested_output_source_ids=(),
             expected_result_shape=ExpectedResultShape.ROWS,
             global_constraints=global_constraints,
         ),

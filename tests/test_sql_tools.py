@@ -72,6 +72,7 @@ def _raw_pyodbc_dsn() -> str:
 
 
 def test_get_distinct_values_redacts_exception_boundary(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     def fail_get_plugin(dsn):
@@ -91,6 +92,7 @@ def test_get_distinct_values_redacts_exception_boundary(monkeypatch, caplog):
 
 
 def test_get_distinct_values_redacts_plugin_error_message(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     class Plugin(_AdmittedPluginDouble):
@@ -126,6 +128,7 @@ def test_get_distinct_values_redacts_plugin_error_message(monkeypatch):
 
 
 def test_get_distinct_values_redacts_success_values(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     class Plugin(_AdmittedPluginDouble):
@@ -166,6 +169,7 @@ def test_get_distinct_values_redacts_success_values(monkeypatch):
 
 
 def test_sql_safety_check_redacts_llm_audit_failure(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     def fail_llm(**kwargs):
@@ -191,6 +195,7 @@ def test_sql_safety_check_redacts_llm_audit_failure(monkeypatch, caplog):
 
 
 def test_code_formatter_redacts_sqlglot_exception_and_sql(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     def fail_parse(*_args, **_kwargs):
@@ -211,6 +216,7 @@ def test_code_formatter_redacts_sqlglot_exception_and_sql(monkeypatch, caplog):
 
 
 def test_schema_info_redacts_exception_boundary(monkeypatch, caplog):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     raw_dsn = _raw_pyodbc_dsn()
 
     class FailingLoader:

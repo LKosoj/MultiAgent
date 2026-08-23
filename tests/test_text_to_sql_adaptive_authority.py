@@ -395,7 +395,7 @@ def test_null_filter_with_non_null_query_right_is_deferred(
     assert decision.affected_source_ids == ("source-a",)
 
 
-def test_is_not_null_filter_is_deferred_without_a_reducer_proof_contract() -> None:
+def test_is_not_null_filter_does_not_require_an_observed_matching_row() -> None:
     column = _column("orders", "cancelled_at")
     predicate = PredicateRef(
         left=column,
@@ -403,15 +403,14 @@ def test_is_not_null_filter_is_deferred_without_a_reducer_proof_contract() -> No
         right=None,
     )
     schema_evidence = _schema_evidence("cancelled-schema", column)
-    value_evidence = _value_evidence("cancelled-value", column, "2026-07-31")
     binding = _discriminator_binding(
         column,
         predicate,
-        (schema_evidence.evidence_id, value_evidence.evidence_id),
+        (schema_evidence.evidence_id,),
     )
     state = _required_filter_state(
         binding,
-        (schema_evidence, value_evidence),
+        (schema_evidence,),
         None,
         PredicateOperator.IS_NOT_NULL,
     )
@@ -420,9 +419,9 @@ def test_is_not_null_filter_is_deferred_without_a_reducer_proof_contract() -> No
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_mixed_type_in_filter_requires_exact_evidence_for_every_value() -> None:
@@ -599,37 +598,33 @@ def test_discriminator_between_filter_accepts_without_exact_typed_endpoints(
         (PredicateOperator.LIKE, "premium%"),
     ),
 )
-def test_filter_operator_without_a_reducer_proof_contract_is_deferred(
+def test_filter_operator_does_not_require_an_observed_matching_row(
     operator: PredicateOperator,
     right: object,
 ) -> None:
     column = _column("orders", "tier")
     predicate = PredicateRef(left=column, operator=operator, right=right)
     schema_evidence = _schema_evidence("tier-schema", column)
-    evidence = [schema_evidence]
-    values = right if type(right) is tuple else (right,)
-    for index, value in enumerate(values, start=1):
-        evidence.append(_value_evidence(f"tier-value-{index}", column, value))
     binding = _discriminator_binding(
         column,
         predicate,
-        tuple(item.evidence_id for item in evidence),
+        (schema_evidence.evidence_id,),
     )
-    state = _required_filter_state(binding, evidence, right, operator)
+    state = _required_filter_state(binding, (schema_evidence,), right, operator)
 
     decision = evaluate_research_generation_authority(
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 @pytest.mark.parametrize(
     "case", ("wrong-value", "wrong-column", "wrong-type", "missing")
 )
-def test_value_filter_requires_exact_value_column_and_type(case: str) -> None:
+def test_value_filter_ignores_unrelated_observed_values(case: str) -> None:
     column = _column("orders", "tier")
     literal: str | int = 1 if case == "wrong-type" else "premium"
     predicate = PredicateRef(
@@ -662,9 +657,9 @@ def test_value_filter_requires_exact_value_column_and_type(case: str) -> None:
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_value_filter_with_stale_value_evidence_is_deferred() -> None:

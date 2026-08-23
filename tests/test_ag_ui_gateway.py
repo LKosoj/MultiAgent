@@ -23,6 +23,11 @@ from backend.fastapi_app.agui.models import RunAgentInput
 from backend.fastapi_app.agui.store import EventStore
 
 
+@pytest.fixture(autouse=True)
+def _enable_pii_masking(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
+
+
 def test_agui_redaction_facade_exports_service_symbols():
     from backend.fastapi_app.agui import redaction
 
@@ -222,6 +227,35 @@ def test_agui_pii_redaction_uses_configured_sync_masking_rules(monkeypatch):
 
     monkeypatch.delenv("PII_JURISDICTION", raising=False)
     pii_categories_config.reset_cache()
+
+
+def test_agui_pii_redaction_is_opt_in_and_preserves_technical_ids(monkeypatch):
+    from backend.fastapi_app.agui.redaction import _redact_payload, redact_pii_in_payload
+
+    binding_id = (
+        "binding:410e8bd5b63a351740954782352c4a7594f2bd34c215fa3197af4dbe3b7bdbc7"
+    )
+    payload = {
+        "binding_id": binding_id,
+        "dsn": "postgresql://admin:s3cret@db.example.com/app",
+    }
+
+    for disabled in (None, "0"):
+        if disabled is None:
+            monkeypatch.delenv("PII_MASKING_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("PII_MASKING_ENABLED", disabled)
+        redacted = redact_pii_in_payload(_redact_payload(payload))
+        assert redacted["binding_id"] == binding_id
+        assert "s3cret" not in redacted["dsn"]
+
+
+def test_agui_pii_redaction_masks_only_when_enabled(monkeypatch):
+    from backend.fastapi_app.agui.redaction import redact_pii_in_payload
+
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
+
+    assert redact_pii_in_payload("4111 1111 1111 1111") == "[CARD]"
 
 
 def test_agui_pii_redaction_reuses_sanitized_shared_container():

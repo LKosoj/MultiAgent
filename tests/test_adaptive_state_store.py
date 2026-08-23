@@ -41,6 +41,7 @@ def _record_terminal(
     *,
     expected_revision: int | None,
     action: object,
+    semantic_repair_continuation: bool = False,
 ):
     return store.record_replayable_terminal(
         key,
@@ -54,6 +55,7 @@ def _record_terminal(
                 schema_namespace_version="schema:0123456789abcdef",
             )
         ),
+        semantic_repair_continuation=semantic_repair_continuation,
     )
 
 
@@ -210,6 +212,84 @@ def test_next_planned_revision_requires_observed_and_terminal_closes_loop(
     )
     with pytest.raises(AdaptiveCheckpointCasError, match="closes"):
         store.record_planned(second, expected_revision=0, action={"tool": "next"})
+
+
+def test_semantic_repair_continues_in_new_segment_without_changing_terminal(
+    tmp_path,
+) -> None:
+    path = tmp_path / "state.db"
+    store = AdaptiveStateStore(path)
+    first = _key()
+    original_terminal = _record_terminal(
+        store,
+        first,
+        expected_revision=None,
+        action={"reason": "complete"},
+    )
+
+    continued = store.record_planned(
+        _key(1),
+        expected_revision=0,
+        action={"tool": "inspect"},
+        semantic_repair_continuation=True,
+    )
+    restarted = AdaptiveStateStore(path)
+    assert restarted.record_planned(
+        _key(1),
+        expected_revision=0,
+        action={"tool": "inspect"},
+        semantic_repair_continuation=True,
+    ) == continued
+    restarted.record_observed(
+        _key(1), expected_revision=1, action={"rows": 1}
+    )
+    _record_terminal(
+        restarted,
+        _key(2),
+        expected_revision=1,
+        action={"reason": "complete"},
+    )
+
+    assert restarted.get_snapshot(first).terminal == original_terminal
+    assert [
+        (event.key.revision, event.phase)
+        for event in restarted.load_run_events(
+            first.run_id,
+            first.run_incarnation,
+            first.loop_kind,
+        )
+    ] == [
+        (0, AdaptiveActionPhase.TERMINAL),
+        (1, AdaptiveActionPhase.PLANNED),
+        (1, AdaptiveActionPhase.OBSERVED),
+        (2, AdaptiveActionPhase.TERMINAL),
+    ]
+
+
+def test_semantic_repair_may_close_new_segment_without_another_probe(tmp_path) -> None:
+    store = AdaptiveStateStore(tmp_path / "state.db")
+    _record_terminal(
+        store,
+        _key(),
+        expected_revision=None,
+        action={"reason": "complete"},
+    )
+
+    _record_terminal(
+        store,
+        _key(1),
+        expected_revision=0,
+        action={"reason": "complete"},
+        semantic_repair_continuation=True,
+    )
+
+    assert [
+        event.key.revision
+        for event in store.load_run_events(
+            "run-1", "inc-1", AdaptiveLoopKind.RESEARCH
+        )
+        if event.phase is AdaptiveActionPhase.TERMINAL
+    ] == [0, 1]
 
 
 def test_terminal_can_close_the_next_revision_without_a_tool_call(tmp_path) -> None:

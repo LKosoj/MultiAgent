@@ -417,9 +417,13 @@ class _FactBuilder:
             )
 
         for index, (alias, source_alias, node, source, output_visible, pivot) in enumerate(ordered_sources):
-            if not alias or alias in all_aliases:
-                raise unsupported("duplicate or empty relation alias is unsupported")
             relation_id = f"{scope_id}:relation:{index}"
+            if not alias:
+                if source_alias or not isinstance(node, exp.Subquery):
+                    raise unsupported("empty relation alias is unsupported")
+                alias = relation_id
+            if alias in all_aliases:
+                raise unsupported("duplicate or empty relation alias is unsupported")
             all_aliases[alias] = relation_id
             if output_visible:
                 aliases[alias] = relation_id
@@ -591,8 +595,11 @@ class _FactBuilder:
                 raise unsupported("derived relation has an unsupported shape")
             relation_alias = owner.args.get("alias")
             if (
-                not isinstance(relation_alias, exp.TableAlias)
-                or not isinstance(relation_alias.this, exp.Identifier)
+                relation_alias is not None
+                and (
+                    not isinstance(relation_alias, exp.TableAlias)
+                    or not isinstance(relation_alias.this, exp.Identifier)
+                )
                 or any(
                     value
                     for name, value in owner.args.items()

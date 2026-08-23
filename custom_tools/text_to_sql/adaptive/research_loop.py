@@ -39,6 +39,7 @@ from ..schema_loader import LoadedSchema
 from .decision_resolver import (
     DecisionExecutionError,
     DecisionResolverError,
+    DuplicateExistingBindingProposalError,
     DuplicateResearchActionError,
     ResolvedResearchDecision,
     UnresolvableModelDecisionError,
@@ -73,6 +74,7 @@ from .policy import (
     validate_state_model_budget_policy,
 )
 from .probes import ProbeResult, ProbeStatus, deserialize_probe_result
+from .provenance import parse_probe_observation
 from .replay_inputs import (
     ResearchSemanticReplayInput,
     ResearchTerminalReplayInput,
@@ -80,10 +82,13 @@ from .replay_inputs import (
 from .research_decision import (
     BindingAssessment,
     ExistingBindingRef,
+    ExistingHypothesisRef,
     ExistingJoinRef,
     ExecuteResearchProbeIntent,
     HypothesisAssessment,
     JoinAssessment,
+    NewBindingProposal,
+    ProposedHypothesisRef,
     ResearchDecisionV1,
     SemanticCommitRequest,
     StopRequest,
@@ -94,7 +99,10 @@ from ._semantic_value_certificate import (
     evidence_observes_exact_column,
     evidence_observes_exact_value,
 )
-from .semantic_reducer import _declared_join_certificate
+from .semantic_reducer import (
+    _declared_join_certificate,
+    _negative_hypothesis_certificate,
+)
 from .research_query import (
     RawResearchQuery,
     ResearchQueryAdmissionError,
@@ -180,6 +188,7 @@ class _ResearchLoopCoordinator:
         model_claim_now_ns: Callable[[], int],
         model_owner_token_factory: Callable[[], str],
         model_wait: Callable[[float], Awaitable[None]] | None,
+        semantic_repair_continuation: bool = False,
     ) -> None:
         self._initial_state = _revalidate_state(initial_state)
         self._task = _require_text(task, "task")
@@ -199,8 +208,12 @@ class _ResearchLoopCoordinator:
         self._model_claim_now_ns = model_claim_now_ns
         self._model_owner_token_factory = model_owner_token_factory
         self._model_wait = model_wait or self._wait_for_model_follower
+        self._semantic_repair_continuation = semantic_repair_continuation
         self._latest_state = self._initial_state
         self._model_stagnation_signatures: tuple[tuple[str, str], ...] = ()
+        self._pending_rejected_preflight_assessments: tuple[
+            dict[str, object], ...
+        ] = ()
 
     async def run(self) -> ResearchLoopOutcome:
         state, failed = self._load_or_save_initial()
@@ -519,7 +532,11 @@ class _ResearchLoopCoordinator:
             (validation_feedback,) if validation_feedback is not None else ()
         )
         rejected_duplicate_actions: tuple[dict[str, object], ...] = ()
-        rejected_preflight_assessments: tuple[dict[str, object], ...] = ()
+        rejected_preflight_assessments = (
+            self._pending_rejected_preflight_assessments
+        )
+        self._pending_rejected_preflight_assessments = ()
+        last_unresolvable_decision_digest: str | None = None
         invalid_stop_generation_authority: (
             tuple[CoverageInputErrorCode, tuple[str, ...]] | None
         ) = None
@@ -732,7 +749,7 @@ class _ResearchLoopCoordinator:
                         self._preflight_model_decision(state, captured)
                     )
                     if preflight_feedback is not None:
-                        baseline = _assessment_only_tool_baseline(captured)
+                        baseline = _proposal_free_tool_baseline(captured)
                         if (
                             preflight_feedback == "UNRESOLVABLE_PREFLIGHT"
                             and baseline is not None
@@ -743,11 +760,24 @@ class _ResearchLoopCoordinator:
                             if baseline_feedback is None:
                                 if baseline_reason is not None:
                                     return None, baseline_reason, None
+                                self._pending_rejected_preflight_assessments = (
+                                    rejected_assessments
+                                )
                                 decision = baseline
                                 break
                         if rejected_action is not None:
                             rejected_duplicate_actions += (rejected_action,)
                         if preflight_feedback == "UNRESOLVABLE_PREFLIGHT":
+                            decision_digest = canonical_digest(
+                                captured.model_dump(mode="json", by_alias=True)
+                            )
+                            if decision_digest == last_unresolvable_decision_digest:
+                                repeated_feedback = (
+                                    "REPEATED_PREFLIGHT_DECISION"
+                                )
+                                if repeated_feedback not in validation_feedbacks:
+                                    validation_feedbacks += (repeated_feedback,)
+                            last_unresolvable_decision_digest = decision_digest
                             rejected_preflight_assessments = rejected_assessments
                         else:
                             rejected_preflight_assessments = ()
@@ -856,7 +886,7 @@ class _ResearchLoopCoordinator:
                     self._preflight_requested_action(state, decision),
                 ),
             )
-        except UnresolvableModelDecisionError:
+        except UnresolvableModelDecisionError as error:
             return (
                 "UNRESOLVABLE_PREFLIGHT",
                 None,
@@ -866,6 +896,11 @@ class _ResearchLoopCoordinator:
                     decision,
                     self._freshness_context,
                     self._preflight_requested_action(state, decision),
+                    duplicate_existing_binding_proposal_keys=(
+                        error.proposal_keys
+                        if isinstance(error, DuplicateExistingBindingProposalError)
+                        else ()
+                    ),
                 ),
             )
         except DuplicateResearchActionError as error:
@@ -963,6 +998,7 @@ class _ResearchLoopCoordinator:
                 _checkpoint_key(state),
                 expected_revision=None if state.revision == 0 else state.revision - 1,
                 action=_planned_action(resolved),
+                semantic_repair_continuation=self._semantic_repair_continuation,
             )
         except (AdaptiveCheckpointError, TypeError, ValueError) as error:
             logger.warning(
@@ -1217,6 +1253,7 @@ class _ResearchLoopCoordinator:
                 replay_input=ResearchTerminalReplayInput(
                     freshness_context=terminal_freshness_context,
                 ),
+                semantic_repair_continuation=self._semantic_repair_continuation,
             )
         except (
             AdaptiveCheckpointCasError,
@@ -1321,6 +1358,7 @@ async def run_research_loop(
     model_claim_now_ns: Callable[[], int] = time.time_ns,
     model_owner_token_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     model_wait: Callable[[float], Awaitable[None]] | None = None,
+    semantic_repair_continuation: bool = False,
 ) -> ResearchLoopOutcome:
     """Run private schema research coordination without taking SQL authority."""
 
@@ -1343,6 +1381,7 @@ async def run_research_loop(
         model_claim_now_ns=model_claim_now_ns,
         model_owner_token_factory=model_owner_token_factory,
         model_wait=model_wait,
+        semantic_repair_continuation=semantic_repair_continuation,
     )
     try:
         return await coordinator.run()
@@ -1438,11 +1477,18 @@ def _rejected_preflight_assessment_context(
     decision: ResearchDecisionV1,
     freshness_context: FreshnessContext,
     requested_action: ResearchAction | None,
+    *,
+    duplicate_existing_binding_proposal_keys: tuple[str, ...] = (),
 ) -> tuple[dict[str, object], ...]:
-    """Describe rejected assessments and one deterministic missing probe."""
+    """Describe rejected proposals and one deterministic missing probe."""
 
     bindings = {binding.binding_id: binding for binding in state.bindings}
+    hypotheses = {
+        hypothesis.hypothesis_id: hypothesis for hypothesis in state.hypotheses
+    }
     joins = {join.join_id: join for join in state.join_candidates}
+    source_ids = {item.source_id for item in state.query_spec.semantic_items}
+    durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
     try:
         fresh_evidence = tuple(
             evidence
@@ -1457,12 +1503,92 @@ def _rejected_preflight_assessment_context(
     join_candidates: list[tuple[TableRef, dict[str, object], dict[str, object]]] = []
     for proposal in decision.proposals:
         if not isinstance(
-            proposal, (BindingAssessment, JoinAssessment, HypothesisAssessment)
+            proposal,
+            (
+                BindingAssessment,
+                JoinAssessment,
+                HypothesisAssessment,
+                NewBindingProposal,
+            ),
         ):
             continue
         item: dict[str, object] = {
             "proposal": proposal.model_dump(mode="json", by_alias=True),
         }
+        if any(
+            evidence_id not in durable_evidence_ids
+            for evidence_id in proposal.citation_evidence_ids
+        ):
+            item["rejection_reason"] = "cited evidence_id does not exist"
+        if isinstance(proposal, NewBindingProposal):
+            if (
+                proposal.source_id not in source_ids
+                and "rejection_reason" not in item
+            ):
+                item["rejection_reason"] = "source_id does not exist"
+            if (
+                proposal.proposal_key in duplicate_existing_binding_proposal_keys
+                and "rejection_reason" not in item
+            ):
+                item["rejection_reason"] = "binding already exists"
+            if any(
+                isinstance(reference, ExistingJoinRef)
+                and reference.join_id not in joins
+                for reference in proposal.join_references
+            ) and "rejection_reason" not in item:
+                item["rejection_reason"] = "referenced join_id does not exist"
+            rejected.append(item)
+            continue
+        if "rejection_reason" in item:
+            rejected.append(item)
+            continue
+        if (
+            isinstance(proposal, BindingAssessment)
+            and isinstance(proposal.subject, ExistingBindingRef)
+            and proposal.subject.binding_id not in bindings
+        ):
+            item["rejection_reason"] = "referenced binding_id does not exist"
+            rejected.append(item)
+            continue
+        if (
+            isinstance(proposal, HypothesisAssessment)
+            and proposal.certificate == "consistent"
+            and isinstance(proposal.subject, ExistingHypothesisRef)
+        ):
+            hypothesis = hypotheses.get(proposal.subject.hypothesis_id)
+            cited = tuple(
+                record
+                for record in fresh_evidence
+                if record.evidence_id in proposal.citation_evidence_ids
+            )
+            if hypothesis is not None and not any(
+                record.target in hypothesis.candidate_targets
+                and (observation := parse_probe_observation(record.observation))
+                is not None
+                and isinstance(observation.payload, dict)
+                and observation.payload.get("status") == "matched"
+                for record in cited
+            ):
+                item["rejection_reason"] = (
+                    "hypothesis consistency is not proven by cited evidence"
+                )
+        if (
+            isinstance(proposal, HypothesisAssessment)
+            and proposal.certificate == "contradicted"
+            and isinstance(proposal.subject, ExistingHypothesisRef)
+        ):
+            hypothesis = hypotheses.get(proposal.subject.hypothesis_id)
+            cited = tuple(
+                record
+                for record in fresh_evidence
+                if record.evidence_id in proposal.citation_evidence_ids
+            )
+            if hypothesis is not None and not _negative_hypothesis_certificate(
+                hypothesis, cited
+            ):
+                item["rejection_reason"] = (
+                    "hypothesis contradiction is not proven by cited evidence"
+                )
         if (
             proposal.certificate == "consistent"
             and isinstance(proposal.subject, ExistingBindingRef)
@@ -1571,7 +1697,7 @@ def _missing_binding_column_probe(
     if isinstance(binding, PhysicalColumnBinding):
         columns = (binding.physical_column,)
     elif isinstance(binding, DiscriminatorValueBinding):
-        columns = (binding.discriminator_column,)
+        columns = binding.columns
     elif isinstance(binding, DerivedExpressionBinding):
         columns = binding.input_columns
     else:
@@ -1620,61 +1746,62 @@ def _missing_binding_column_probe(
         )
     if not isinstance(binding, DiscriminatorValueBinding):
         return None
-    column = binding.discriminator_column
     try:
-        if not any(
-            evidence_observes_exact_column(record, column) for record in evidence
-        ):
-            return None
-        predicate = binding.discriminator_predicate
-        if predicate.operator is PredicateOperator.EQ:
-            values = (predicate.right,)
-        elif predicate.operator is PredicateOperator.IN and isinstance(
-            predicate.right, tuple
-        ):
-            values = predicate.right
-        elif predicate.operator is PredicateOperator.IS_NULL:
-            values = (None,)
-        else:
-            return None
-        for value in values:
-            exact_value = value.value if type(value) is LiteralValue else value
-            if type(exact_value) not in {str, int, float, bool, type(None)}:
-                return None
-            if type(exact_value) is float and not math.isfinite(exact_value):
-                return None
+        for predicate in binding.predicates:
+            column = predicate.left
             if not any(
-                evidence_observes_exact_value(record, column, exact_value)
+                evidence_observes_exact_column(record, column)
                 for record in evidence
-            ) and not any(
-                action.kind is ResearchActionKind.SEARCH_VALUE
-                and action.target == column
-                and any(
-                    name == "value"
-                    and type(attempted_value) is type(exact_value)
-                    and attempted_value == exact_value
-                    for name, attempted_value in action.parameters
-                )
-                for action in action_history
             ):
-                table = column.table
-                logical_table = (
-                    f"{table.schema_name}.{table.table}"
-                    if table.schema_name is not None
-                    else table.table
-                )
-                return (
-                    column,
-                    {
-                        "tool_name": "search_value",
-                        "arguments": {
-                            "table": logical_table,
-                            "column": column.column,
-                            "value": exact_value,
-                            "top_k": 1,
+                return None
+            if predicate.operator is PredicateOperator.EQ:
+                values = (predicate.right,)
+            elif predicate.operator is PredicateOperator.IN and isinstance(
+                predicate.right, tuple
+            ):
+                values = predicate.right
+            elif predicate.operator is PredicateOperator.IS_NULL:
+                values = (None,)
+            else:
+                continue
+            for value in values:
+                exact_value = value.value if type(value) is LiteralValue else value
+                if type(exact_value) not in {str, int, float, bool, type(None)}:
+                    return None
+                if type(exact_value) is float and not math.isfinite(exact_value):
+                    return None
+                if not any(
+                    evidence_observes_exact_value(record, column, exact_value)
+                    for record in evidence
+                ) and not any(
+                    action.kind is ResearchActionKind.SEARCH_VALUE
+                    and action.target == column
+                    and any(
+                        name == "value"
+                        and type(attempted_value) is type(exact_value)
+                        and attempted_value == exact_value
+                        for name, attempted_value in action.parameters
+                    )
+                    for action in action_history
+                ):
+                    table = column.table
+                    logical_table = (
+                        f"{table.schema_name}.{table.table}"
+                        if table.schema_name is not None
+                        else table.table
+                    )
+                    return (
+                        column,
+                        {
+                            "tool_name": "search_value",
+                            "arguments": {
+                                "table": logical_table,
+                                "column": column.column,
+                                "value": exact_value,
+                                "top_k": 1,
+                            },
                         },
-                    },
-                )
+                    )
     except ExactValueCertificateError:
         return None
     return None
@@ -1993,18 +2120,15 @@ def _model_stop_reason(decision: ResearchDecisionV1) -> ResearchStopReason:
     }[reason]
 
 
-def _assessment_only_tool_baseline(
+def _proposal_free_tool_baseline(
     decision: ResearchDecisionV1,
 ) -> ResearchDecisionV1 | None:
     if not isinstance(decision.next, ToolIntent) or not decision.proposals:
         return None
-    if not all(
-        isinstance(item, (HypothesisAssessment, BindingAssessment, JoinAssessment))
-        and item.subject.reference_kind == "existing"
-        for item in decision.proposals
-    ):
-        return None
-    return decision.model_copy(update={"proposals": ()})
+    next_request = decision.next
+    if isinstance(decision.next.hypothesis_ref, ProposedHypothesisRef):
+        next_request = decision.next.model_copy(update={"hypothesis_ref": None})
+    return decision.model_copy(update={"proposals": (), "next": next_request})
 
 
 def _model_research_query_admission_feedback(

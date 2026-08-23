@@ -15,13 +15,17 @@ from custom_tools.text_to_sql.adaptive.decision_resolver import (
 )
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
+    DiscriminatorValueBinding,
     JoinType,
     PredicateOperator,
     TableRef,
 )
 from custom_tools.text_to_sql.adaptive.research_decision import ResearchDecisionV1
-from custom_tools.text_to_sql.adaptive.semantic_reducer import SemanticReducerError
-from custom_tools.text_to_sql.adaptive.semantic_reducer import commit_semantic_turn
+from custom_tools.text_to_sql.adaptive.semantic_reducer import (
+    SemanticReducerError,
+    _stable_id,
+    commit_semantic_turn,
+)
 from tests.text_to_sql_decision_resolver_helpers import (
     TOOL_ARGUMENTS,
     freshness as _freshness,
@@ -355,6 +359,60 @@ def test_model_semantic_admission_error_is_retryable() -> None:
         )
 
 
+def test_new_binding_precheck_preserves_retryable_semantic_errors() -> None:
+    loaded, namespace = _schema()
+    state = _state(namespace, with_evidence=True, required=False)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:paid-status",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "public.orders", "column": "id"},
+                            "operator": PredicateOperator.EQ,
+                            "right": "paid",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "inspect_column",
+                    "arguments": {
+                        "table": "public.orders",
+                        "column": "status",
+                    },
+                },
+            },
+        },
+        strict=True,
+    )
+
+    with pytest.raises(
+        UnresolvableModelDecisionError,
+        match="model semantic decision is not admissible",
+    ):
+        resolve_research_decision(
+            state,
+            decision,
+            loaded_schema=loaded,
+            freshness_context=_freshness(state),
+            registry=_registry(namespace),
+        )
+
+
 def _semantic_commit(proposals: tuple[dict[str, object], ...]) -> ResearchDecisionV1:
     return ResearchDecisionV1.model_validate(
         {"proposals": proposals, "next": {"next_kind": "semantic_commit"}},
@@ -377,6 +435,53 @@ def _commit_candidate(
         registry=_registry(namespace),
     )
     return commit_semantic_turn(resolved.admission).state
+
+
+def test_single_predicate_discriminator_keeps_legacy_binding_id() -> None:
+    loaded, namespace = _schema()
+    state = _commit_candidate(
+        _state(namespace, with_evidence=True, required=False),
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:paid-status",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.EQ,
+                            "right": "paid",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded=loaded,
+        namespace=namespace,
+    )
+    binding = state.bindings[0]
+
+    assert binding.binding_id == _stable_id(
+        "binding",
+        {
+            "schema": state.schema_namespace_version,
+            "kind": "discriminator_value",
+            "source": "source-1",
+            "column": binding.discriminator_column.model_dump(mode="json"),
+            "predicate": binding.discriminator_predicate.model_dump(mode="json"),
+        },
+    )
 
 
 def test_loaded_schema_supports_physical_column_without_inspect_column() -> None:
@@ -479,6 +584,7 @@ def test_loaded_schema_validates_declared_fk_without_inspect_relationships() -> 
         namespace=namespace,
     )
     join = candidate_state.join_candidates[0]
+    assert join.status.value == "validated"
     assessment = _semantic_commit(
         (
             {
@@ -503,6 +609,226 @@ def test_loaded_schema_validates_declared_fk_without_inspect_relationships() -> 
 
     assert resolved.invocation is None
     assert resolved.admission.join_candidates[0].status.value == "validated"
+
+
+def test_loaded_schema_accepts_eq_in_join_path() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.orders": {
+                "columns": {"customer_id": {"type": "INTEGER"}},
+            },
+            "public.customers": {"columns": {"id": {"type": "INTEGER"}}},
+        }
+    )
+    state = _state(namespace, with_evidence=True, required=False)
+
+    resolved = resolve_research_decision(
+        state,
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "new_join",
+                    "proposal_key": "proposal:orders-customer",
+                    "left": {"table": "public.orders", "column": "customer_id"},
+                    "right": {"table": "public.customers", "column": "id"},
+                    "join_type": JoinType.INNER,
+                    "path": (
+                        {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "customer_id",
+                            },
+                            "right": {
+                                "table": "public.customers",
+                                "column": "id",
+                            },
+                            "operator": PredicateOperator.EQ,
+                            "join_type": JoinType.INNER,
+                        },
+                    ),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.join_candidates[0].status.value == "validated"
+
+
+def test_loaded_schema_allows_join_between_existing_columns_without_fk() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.orders": {
+                "columns": {"customer_id": {"type": "INTEGER"}},
+            },
+            "public.customers": {"columns": {"id": {"type": "INTEGER"}}},
+        }
+    )
+    state = _state(namespace, with_evidence=True, required=False)
+
+    resolved = resolve_research_decision(
+        state,
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "new_join",
+                    "proposal_key": "proposal:orders-customer",
+                    "left": {"table": "public.orders", "column": "customer_id"},
+                    "right": {"table": "public.customers", "column": "id"},
+                    "join_type": JoinType.INNER,
+                    "path": (),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.join_candidates[0].status.value == "validated"
+
+
+def test_loaded_schema_validates_composite_declared_fk_without_inspect_relationships() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.orders": {
+                "columns": {
+                    "customer_a": {"type": "INTEGER"},
+                    "customer_b": {"type": "INTEGER"},
+                },
+                "foreign_keys": {
+                    "complete": True,
+                    "constraints": [
+                        {
+                            "constraint_id": "orders_customer",
+                            "to_table": "public.customers",
+                            "column_pairs": [
+                                {"from_column": "customer_a", "to_column": "id_a"},
+                                {"from_column": "customer_b", "to_column": "id_b"},
+                            ],
+                        }
+                    ],
+                },
+            },
+            "public.customers": {
+                "columns": {
+                    "id_a": {"type": "INTEGER"},
+                    "id_b": {"type": "INTEGER"},
+                }
+            },
+        }
+    )
+    state = _state(namespace, with_evidence=True, required=False)
+    resolved = resolve_research_decision(
+        state,
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "new_join",
+                    "proposal_key": "proposal:orders-customer",
+                    "left": {"table": "public.orders", "column": "customer_a"},
+                    "right": {"table": "public.customers", "column": "id_a"},
+                    "join_type": JoinType.INNER,
+                    "path": (
+                        {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "customer_a",
+                            },
+                            "right": {
+                                "table": "public.customers",
+                                "column": "id_a",
+                            },
+                            "join_type": JoinType.INNER,
+                        },
+                        {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "customer_b",
+                            },
+                            "right": {
+                                "table": "public.customers",
+                                "column": "id_b",
+                            },
+                            "join_type": JoinType.INNER,
+                        },
+                    ),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.join_candidates[0].status.value == "validated"
+
+
+def test_loaded_schema_does_not_validate_fk_with_mismatched_join_endpoints() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.orders": {
+                "columns": {
+                    "id": {"type": "INTEGER"},
+                    "customer_id": {"type": "INTEGER"},
+                },
+                "foreign_keys": {
+                    "complete": True,
+                    "constraints": [
+                        {
+                            "constraint_id": "orders_customer",
+                            "to_table": "public.customers",
+                            "column_pairs": [
+                                {
+                                    "from_column": "customer_id",
+                                    "to_column": "id",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            },
+            "public.customers": {"columns": {"id": {"type": "INTEGER"}}},
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_join",
+                "proposal_key": "proposal:mismatched-endpoints",
+                "left": {"table": "public.orders", "column": "id"},
+                "right": {"table": "public.customers", "column": "id"},
+                "join_type": JoinType.INNER,
+                "path": (
+                    {
+                        "left": {
+                            "table": "public.orders",
+                            "column": "customer_id",
+                        },
+                        "right": {"table": "public.customers", "column": "id"},
+                        "join_type": JoinType.INNER,
+                    },
+                ),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    state = _state(namespace, with_evidence=True, required=False)
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.join_candidates[0].status.value == "candidate"
 
 
 def test_loaded_schema_rejects_missing_physical_column() -> None:
@@ -535,7 +861,7 @@ def test_loaded_schema_rejects_missing_physical_column() -> None:
         )
 
 
-def test_loaded_schema_does_not_certify_discriminator_literal_or_inferred_join() -> None:
+def test_loaded_schema_does_not_certify_discriminator_literal() -> None:
     loaded, namespace = _schema(
         {
             "public.orders": {
@@ -577,17 +903,72 @@ def test_loaded_schema_does_not_certify_discriminator_literal_or_inferred_join()
         loaded=loaded,
         namespace=namespace,
     )
-    inferred_join_state = _commit_candidate(
+    with pytest.raises(UnresolvableModelDecisionError):
+        resolve_research_decision(
+            discriminator_state,
+            _semantic_commit(
+                (
+                    {
+                        "proposal_type": "binding_assessment",
+                        "subject": {
+                            "reference_kind": "existing",
+                            "binding_id": discriminator_state.bindings[0].binding_id,
+                        },
+                        "certificate": "consistent",
+                        "citation_evidence_ids": ("evidence-1",),
+                    },
+                )
+            ),
+            loaded_schema=loaded,
+            freshness_context=_freshness(discriminator_state),
+            registry=_registry(namespace),
+        )
+
+
+def test_resolver_preserves_all_physical_predicates_of_calendar_binding() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.orders": {"columns": {"id": {"type": "INTEGER"}}},
+            "public.events": {
+                "columns": {
+                    "year": {"type": "INTEGER"},
+                    "month": {"type": "INTEGER"},
+                }
+            },
+        }
+    )
+    initial = _state(namespace, with_evidence=True, required=False)
+    state = _commit_candidate(
         initial,
         _semantic_commit(
             (
                 {
-                    "proposal_type": "new_join",
-                    "proposal_key": "proposal:inferred-join",
-                    "left": {"table": "public.orders", "column": "customer_id"},
-                    "right": {"table": "public.customers", "column": "id"},
-                    "join_type": JoinType.INNER,
-                    "path": (),
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:calendar-period",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.events",
+                            "column": "year",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "public.events", "column": "year"},
+                            "operator": PredicateOperator.EQ,
+                            "right": 2024,
+                        },
+                        "additional_predicates": (
+                            {
+                                "left": {
+                                    "table": "public.events",
+                                    "column": "month",
+                                },
+                                "operator": PredicateOperator.EQ,
+                                "right": 6,
+                            },
+                        ),
+                    },
+                    "join_references": (),
                     "citation_evidence_ids": ("evidence-1",),
                 },
             )
@@ -596,40 +977,13 @@ def test_loaded_schema_does_not_certify_discriminator_literal_or_inferred_join()
         namespace=namespace,
     )
 
-    for state, proposal in (
-        (
-            discriminator_state,
-            {
-                "proposal_type": "binding_assessment",
-                "subject": {
-                    "reference_kind": "existing",
-                    "binding_id": discriminator_state.bindings[0].binding_id,
-                },
-                "certificate": "consistent",
-                "citation_evidence_ids": ("evidence-1",),
-            },
-        ),
-        (
-            inferred_join_state,
-            {
-                "proposal_type": "join_assessment",
-                "subject": {
-                    "reference_kind": "existing",
-                    "join_id": inferred_join_state.join_candidates[0].join_id,
-                },
-                "certificate": "consistent",
-                "citation_evidence_ids": ("evidence-1",),
-            },
-        ),
-    ):
-        with pytest.raises(UnresolvableModelDecisionError):
-            resolve_research_decision(
-                state,
-                _semantic_commit((proposal,)),
-                loaded_schema=loaded,
-                freshness_context=_freshness(state),
-                registry=_registry(namespace),
-            )
+    binding = state.bindings[0]
+    assert isinstance(binding, DiscriminatorValueBinding)
+    assert tuple(column.column for column in binding.columns) == ("year", "month")
+    assert tuple(predicate.left.column for predicate in binding.predicates) == (
+        "year",
+        "month",
+    )
 
 
 def test_trusted_semantic_admission_error_remains_terminal(monkeypatch) -> None:

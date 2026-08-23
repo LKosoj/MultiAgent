@@ -155,6 +155,7 @@ def source_namespace_semantic_ids(
     session_id: str,
     agent_name: str,
     cache_kind: str,
+    expected_file_hash: str | None = None,
 ) -> tuple[set[str], set[str]]:
     """Возвращает валидные semantic ID из SQLite, не обращаясь к Chroma.
 
@@ -169,6 +170,12 @@ def source_namespace_semantic_ids(
         cache_kind=cache_kind,
     )
     grouped, failed = _group_source_rows(rows, cache_kind)
+    if expected_file_hash is not None:
+        failed.update(
+            semantic_id
+            for semantic_id, row in grouped.items()
+            if row.data.get("file_hash") != expected_file_hash
+        )
     failed.update(malformed)
     return set(grouped), failed
 

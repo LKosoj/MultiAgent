@@ -232,6 +232,7 @@ def _state() -> ResearchState:
         query_id="query-1",
         original_text="orders",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -297,6 +298,7 @@ def _schema_state(namespace: SchemaNamespace) -> ResearchState:
         query_id="schema-query",
         original_text="inspect schema",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

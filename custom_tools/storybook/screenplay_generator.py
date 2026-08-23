@@ -869,6 +869,7 @@ def screenplay_generator_tool(
             str(style_data.get("composition_rules", "")),
             str(style_data.get("lighting", "")),
             str(style_data.get("texture", "")),
+            str(style_data.get("material_signature", "")),
             str(style_data.get("detail_density", "")),
             str(style_data.get("model", ""))
         ]).strip() + (f". Не используй {str(style_data.get('do_not_include', ''))}" if style_data.get('do_not_include') else ""),

@@ -274,12 +274,22 @@ def binding_footprint(
             (binding.attribute_name_predicate, binding.value_predicate),
         )
     if type(binding) is DiscriminatorValueBinding:
-        if binding.discriminator_predicate.left != binding.discriminator_column:
+        if (
+            not binding.predicates
+            or binding.predicates[0] != binding.discriminator_predicate
+            or binding.discriminator_predicate.left != binding.discriminator_column
+        ):
             raise FootprintError("discriminator predicate uses another column")
+        predicates = (
+            binding.discriminator_predicate,
+            *canonical_unique(binding.predicates[1:]),
+        )
+        columns = tuple(dict.fromkeys(predicate.left for predicate in predicates))
+        tables = tuple(dict.fromkeys(column.table for column in columns))
         return (
-            (binding.discriminator_column.table,),
-            (binding.discriminator_column,),
-            (binding.discriminator_predicate,),
+            tables,
+            columns,
+            predicates,
         )
     if type(binding) is DerivedExpressionBinding:
         input_columns = binding.input_columns

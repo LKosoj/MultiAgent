@@ -5,6 +5,7 @@ from __future__ import annotations
 from workflow.deadline import DeadlineBudget
 
 from .result_review import _ModelReviewResponse, create_result_review_capability
+from .result_validation_runtime import _persisted_sql_proposal_requirements
 
 
 INVALID_RESULT_REVIEW_RUNTIME = object()
@@ -17,7 +18,7 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
         from agent_command import create_text_to_sql_model
         from utils import call_openai_api
         from workflow._text_to_sql_document_authority import (
-            live_solver_document_freshness_context,
+            solver_document_freshness_reference,
         )
         from workflow.text_to_sql_typed_runtime import (
             TextToSqlTypedRuntime,
@@ -31,7 +32,6 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
             ResearchStopReason,
             SolverState,
         )
-        from .semantic_coverage import validate_coverage_inputs
         from .sql_ast import parse_sql_candidate
 
         state = getattr(runtime, "verified_research_state", None)
@@ -86,10 +86,13 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
             or candidate.sql != sql_query
         ):
             raise ValueError("verified solver candidate does not match finalizer")
-        freshness = live_solver_document_freshness_context(runtime, state)
-        requirements = validate_coverage_inputs(
-            state, freshness, state.run_id, state.run_incarnation
+        requirements = _persisted_sql_proposal_requirements(
+            runtime,
+            state,
+            solver_state,
+            candidate,
         )
+        freshness = solver_document_freshness_reference(runtime, state)
         parsed_ast = parse_sql_candidate(candidate.sql, dsn, candidate.candidate_id)
         review_schema = _ModelReviewResponse.model_json_schema()
         review_schema["required"] = list(review_schema["properties"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from pathlib import Path
 import time
 
 from custom_tools.text_to_sql.adaptive.data_probes import DataProbeRuntime
@@ -12,23 +13,27 @@ from custom_tools.text_to_sql.adaptive.decision_resolver import (
     resolve_research_decision,
 )
 from custom_tools.text_to_sql.adaptive.models import (
+    BindingStatus,
     EvidenceCost,
+    ResearchActionKind,
     ResearchState,
 )
-from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
 from custom_tools.text_to_sql.adaptive.policy import (
     BudgetAdmissionError,
     execute_model_call_with_budget_async,
     reserve_probe_budget,
 )
 from custom_tools.text_to_sql.adaptive.production_research import (
+    assemble_production_research,
     stable_schema_research_model_identity,
 )
 from custom_tools.text_to_sql.adaptive.research_decision import ResearchDecisionV1
 from custom_tools.text_to_sql.adaptive.research_loop import (
     _model_call_id,
     _state_with_reconciled_model_budget,
+    run_research_loop,
 )
+from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
 from custom_tools.text_to_sql.adaptive.research_reentry import (
     _research_context,
     _trusted_targets,
@@ -64,13 +69,14 @@ class _CapturedSchemaLoader:
 
 
 class _TargetedProbeBudgetFactory:
-    def __init__(self, runtime: object, research: ResearchState) -> None:
+    def __init__(self, runtime: object, research: ResearchState, request: object) -> None:
         self.runtime = runtime
         self.store_base_research = research
         self.research = research
         self.resolved = None
         self.solver_admission = None
         self.plan = None
+        self.request = request
 
     def bind(self, resolved: object) -> None:
         self.resolved = resolved
@@ -102,7 +108,11 @@ class _TargetedProbeBudgetFactory:
                 model_calls=0,
                 model_tokens=0,
                 db_probe_ms=remaining.remaining_db_probe_ms,
-                rows=remaining.remaining_rows,
+                rows=(
+                    min(remaining.remaining_rows, dict(action.parameters)["limit"])
+                    if action.kind is ResearchActionKind.SAMPLE_ROWS
+                    else remaining.remaining_rows
+                ),
                 bytes=remaining.remaining_bytes,
             ),
             config=self.runtime.verified_research_policy,
@@ -134,7 +144,11 @@ class _TargetedProbeBudgetFactory:
             projected_research_digest=canonical_digest(self.research),
             action=action,
             hypotheses=resolved.admission.hypotheses,
-            bindings=resolved.admission.bindings,
+            bindings=_semantic_repair_bindings(
+                resolved.admission.bindings,
+                self.research,
+                self.request,
+            ),
             join_candidates=resolved.admission.join_candidates,
             invocation_id=invocation.invocation_id,
             reservation_digest=reservation.reservation_digest,
@@ -164,12 +178,48 @@ def build_production_reentry_boundary(
         freshness_context,
         commit_solver_admission,
         id_factory,
+        resume_admitted=False,
     ):
         from custom_tools.text_to_sql.adaptive.semantic_coverage import (
             validate_coverage_inputs,
         )
         from ._text_to_sql_document_authority import live_document_freshness_context
 
+        request = next(
+            item
+            for item in solver_state.missing_evidence_requests
+            if item.missing_evidence_request_id == missing_evidence_request_id
+        )
+        async def continue_research(state, repair_request):
+            return await _continue_production_research(
+                runtime,
+                table_namespace,
+                model,
+                profile,
+                state,
+                repair_request,
+            )
+        if resume_admitted:
+            outcome = await run_targeted_research_reentry(
+                solver_state,
+                research_state,
+                missing_evidence_request_id,
+                requirements=requirements,
+                freshness_context=freshness_context,
+                loaded_schema=runtime.loaded_schema,
+                registry=object(),
+                decision_model_type=ResearchDecisionV1,
+                propose_decision=lambda **_kwargs: None,
+                resolve_decision=lambda *_args, **_kwargs: None,
+                execute_probe=lambda *_args, **_kwargs: None,
+                commit_research_turn=lambda *_args, **_kwargs: None,
+                deadline=runtime.deadline,
+                is_cancelled=runtime.is_cancelled,
+                id_factory=id_factory,
+                continue_research=continue_research,
+                resume_admitted=True,
+            )
+            return outcome
         freshness_context = live_document_freshness_context(runtime, research_state)
         requirements = validate_coverage_inputs(
             research_state,
@@ -177,7 +227,7 @@ def build_production_reentry_boundary(
             research_state.run_id,
             research_state.run_incarnation,
         )
-        factory = _TargetedProbeBudgetFactory(runtime, research_state)
+        factory = _TargetedProbeBudgetFactory(runtime, research_state, request)
         registry = _registry(runtime, table_namespace, factory)
 
         def commit_admission(transition):
@@ -267,7 +317,15 @@ def build_production_reentry_boundary(
             ):
                 raise RuntimeError("targeted probe budget is not reconciled")
             committed = commit_semantic_turn(
-                replace(admission, budget_state=record.reconciliation.budget_after),
+                replace(
+                    admission,
+                    bindings=_semantic_repair_bindings(
+                        admission.bindings,
+                        admission.state,
+                        request,
+                    ),
+                    budget_state=record.reconciliation.budget_after,
+                ),
                 probe_result=probe_result,
             )
             plan = factory.plan
@@ -296,6 +354,7 @@ def build_production_reentry_boundary(
             is_cancelled=runtime.is_cancelled,
             id_factory=id_factory,
             commit_solver_admission=commit_admission,
+            continue_research=continue_research,
         )
         projected = _state_with_reconciled_model_budget(
             outcome.research_state,
@@ -317,6 +376,74 @@ def build_production_reentry_boundary(
         )
 
     return reenter
+
+
+async def _continue_production_research(
+    runtime,
+    table_namespace,
+    model,
+    profile,
+    state,
+    repair_request,
+):
+    terms = tuple(
+        dict.fromkeys(
+            term
+            for item in state.query_spec.semantic_items
+            if item.source_id == repair_request.source_id
+            for term in (item.source_text, item.normalized_meaning)
+            if isinstance(term, str) and term.strip()
+        )
+    )
+    memory = SchemaMemoryManager(Path(__file__).resolve().parents[1])
+    assembly = assemble_production_research(
+        initial_state=state,
+        query=repair_request.question,
+        loaded_schema=runtime.loaded_schema,
+        semantic_table_hints=tuple(
+            memory.find_semantic_relevant_tables(
+                terms,
+                namespace=runtime.loaded_schema.namespace,
+            )
+        ),
+        verified_probe_fact_hints=tuple(
+            memory.find_verified_probe_facts(terms, runtime.loaded_schema.namespace)
+        ),
+        documents=runtime.document_snapshot,
+        dsn=runtime.dsn,
+        scope=runtime.loaded_schema.namespace.scope,
+        table_namespace=table_namespace,
+        model=model,
+        model_identity=stable_schema_research_model_identity(profile.model),
+        profile=profile,
+        state_store=runtime.research_state_store,
+        checkpoint_store=runtime.checkpoint_store,
+        budget_ledger=runtime.budget_ledger,
+        policy=runtime.verified_research_policy,
+        deadline=runtime.deadline,
+        is_cancelled=runtime.is_cancelled,
+        semantic_repair_continuation=True,
+    )
+    result = await run_research_loop(**assembly.loop_arguments())
+    memory.save_verified_probe_facts(runtime.loaded_schema.namespace, result.final_state)
+    return result
+
+
+def _semantic_repair_bindings(bindings, state, request):
+    if getattr(request, "repair_kind", None) != "semantic_binding_mismatch":
+        return bindings
+    matches = tuple(
+        binding
+        for binding in state.bindings
+        if binding.binding_id == request.repair_binding_id
+        and binding.source_id == request.source_id
+        and binding.status is BindingStatus.SUPPORTED
+    )
+    if len(matches) != 1 or any(
+        binding.binding_id == request.repair_binding_id for binding in bindings
+    ):
+        raise RuntimeError("semantic repair binding is not the exact supported binding")
+    return (*bindings, matches[0].model_copy(update={"status": BindingStatus.STALE}))
 
 
 async def settle_incomplete_reentry_model_call(

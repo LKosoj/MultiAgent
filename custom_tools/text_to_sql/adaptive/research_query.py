@@ -383,12 +383,17 @@ def _validate_closed_ast(tree: exp.Select) -> None:
             isinstance(star.parent, exp.Count)
             and star.parent.this is star
             and all(value is None for value in star.args.values())
+            or (
+                isinstance(star.parent, exp.Select)
+                and star in star.parent.expressions
+                and all(value is None for value in star.args.values())
+            )
         )
         for star in tree.find_all(exp.Star)
     ):
         raise ResearchQueryAdmissionError(
             "research_query_star",
-            "research SQL star is allowed only as bare COUNT(*)",
+            "research SQL star must be a plain SELECT * or bare COUNT(*)",
         )
     if tree.find(*_SET_OPERATIONS) is not None:
         raise ResearchQueryAdmissionError(
@@ -445,6 +450,7 @@ def _resolve_scopes(
         sources = _scope_sources(scope, schema, scope_outputs)
         outputs = _output_columns(
             scope.expression,
+            sources=sources,
             nested_non_row_source=scope.is_subquery,
             dialect=dialect,
         )
@@ -569,6 +575,7 @@ def _physical_source(table: exp.Table, schema: Mapping[str, object]) -> _Source:
 def _output_columns(
     select: exp.Select,
     *,
+    sources: Mapping[str, _Source],
     nested_non_row_source: bool,
     dialect: str,
 ) -> tuple[str, ...]:
@@ -592,6 +599,18 @@ def _output_columns(
     outputs = []
     output_keys = set()
     for index, projection in enumerate(select.expressions, start=1):
+        if isinstance(projection, exp.Star):
+            for source in sources.values():
+                for output in source.columns:
+                    key = output.casefold()
+                    if key in output_keys:
+                        raise ResearchQueryAdmissionError(
+                            "research_query_output",
+                            "research SQL output aliases must be unique",
+                        )
+                    outputs.append(output)
+                    output_keys.add(key)
+            continue
         if isinstance(projection, exp.Alias):
             identifier = projection.args.get("alias")
         elif isinstance(projection, exp.Column):
@@ -621,6 +640,11 @@ def _output_columns(
             "research_query_output",
             "research SQL output aliases must be unique",
         )
+    if not 1 <= len(outputs) <= _MAX_OUTPUT_COLUMNS:
+        raise ResearchQueryAdmissionError(
+            "research_query_output",
+            "research SQL output exceeds its closed column bound",
+        )
     return tuple(outputs)
 
 
@@ -639,6 +663,11 @@ def _resolve_columns(
     outputs: tuple[str, ...],
 ) -> None:
     for column in scope.columns:
+        if (
+            not sources
+            and column.find_ancestor(exp.Select) is not scope.expression
+        ):
+            continue
         if column.db or column.catalog:
             raise ResearchQueryAdmissionError(
                 "research_query_column",

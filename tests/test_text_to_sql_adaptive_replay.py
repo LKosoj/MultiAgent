@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import base64
 from datetime import UTC, datetime
 from hashlib import sha256
 
@@ -57,6 +58,7 @@ def _query_spec(*, revision: int, incarnation: str = INCARNATION) -> QuerySpec:
         query_id="query-replay-001",
         original_text="sales",
         semantic_items=(),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )
@@ -674,6 +676,127 @@ def test_verified_terminal_evidence_replays_through_legacy_execution_result(
         == checkpoint.terminal.terminal_digest
     )
     assert _replay_trusted(first).status is HistoricalReplayStatus.VERIFIED
+
+
+@pytest.mark.parametrize(
+    ("verdict", "deterministic_failure_code", "open_repair"),
+    (
+        ("contradicted", "RESULT_SHAPE_MISMATCH", True),
+        ("ambiguous", None, True),
+        ("consistent", None, False),
+        ("malformed", None, False),
+        ("timeout", None, False),
+    ),
+)
+def test_result_review_replay_opens_only_actionable_receipts(
+    tmp_path,
+    verdict,
+    deterministic_failure_code,
+    open_repair,
+) -> None:
+    from types import SimpleNamespace
+
+    from custom_tools.text_to_sql.adaptive.models import CheckFailureCode
+    from custom_tools.text_to_sql.adaptive.replay_contract import (
+        CanonicalReplayBlob,
+        FinalizerExecutionRequest,
+        SolverExecutionReconciliation,
+        SolverExecutionReplayAction,
+        SolverExecutionReplayStep,
+        _result_contradiction_receipt,
+        durable_action_digest,
+        sha256_digest,
+        validate_solver_chain,
+    )
+    from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
+    from test_text_to_sql_adaptive_solver import (
+        _persisted_result_contradiction_checkpoint,
+    )
+
+    _, _, _, _, _, receipt, reservation, _ = (
+        _persisted_result_contradiction_checkpoint(
+            tmp_path,
+            result_review_reason="an auxiliary output is not requested",
+            deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+        )
+    )
+    source_id, evidence_id = (
+        (receipt.source_id, receipt.evidence_id)
+        if verdict in {"contradicted", "ambiguous"}
+        else (None, None)
+    )
+    review = ResultReviewReceipt(
+        run_id=receipt.run_id,
+        run_incarnation=receipt.run_incarnation,
+        research_state_revision=receipt.research_state_revision,
+        candidate_id=receipt.candidate_id,
+        normalized_ast_digest=receipt.normalized_ast_digest,
+        requirements_digest=receipt.requirements_digest,
+        source_id=source_id,
+        evidence_id=evidence_id,
+        verdict=verdict,
+        reason=receipt.reason,
+        execution=receipt.execution,
+        deterministic_failure_code=(
+            CheckFailureCode.RESULT_SHAPE_MISMATCH
+            if deterministic_failure_code is not None
+            else None
+        ),
+    )
+    receipt_bytes = canonical_json_bytes(review.model_dump(mode="json"))
+    action = SolverExecutionReplayAction(
+        candidate_id=review.candidate_id,
+        execution_id=reservation.execution_id,
+        normalized_ast_digest=review.normalized_ast_digest,
+        request=FinalizerExecutionRequest(
+            sql_query=review.execution["sql_query"],
+            row_limit=review.execution["applied_row_limit"],
+            dry_run_only=review.execution["dry_run_only"],
+        ),
+    )
+    step = SolverExecutionReplayStep(
+        action_revision=0,
+        base_state_revision=0,
+        base_state_digest="sha256:" + "a" * 64,
+        action=action,
+        action_digest=durable_action_digest(action),
+        reconciliation=SolverExecutionReconciliation(
+            outcome="KNOWN",
+            result_state_revision=1,
+            result_state_digest="sha256:" + "b" * 64,
+            result=CanonicalReplayBlob(
+                digest=sha256_digest(receipt_bytes),
+                byte_count=len(receipt_bytes),
+                content_base64=base64.b64encode(receipt_bytes).decode("ascii"),
+            ),
+            created_at_ns=0,
+        ),
+        created_at_ns=0,
+    )
+
+    payload = SimpleNamespace(
+        solver_snapshots=(
+            SimpleNamespace(
+                state=SimpleNamespace(revision=0, stop_reason=None),
+                digest=step.base_state_digest,
+                source_action_revision=None,
+            ),
+            SimpleNamespace(
+                state=SimpleNamespace(revision=1, stop_reason=None),
+                digest=step.reconciliation.result_state_digest,
+                source_action_revision=0,
+            ),
+        ),
+        solver_steps=(step,),
+        solver_terminal=None,
+    )
+    if open_repair:
+        assert _result_contradiction_receipt(step) == review
+        validate_solver_chain(payload)
+    else:
+        assert _result_contradiction_receipt(step) is None
+        with pytest.raises(ValueError, match="requires terminal authority"):
+            validate_solver_chain(payload)
 
 
 def test_workflow_builds_same_replay_artifact_from_durable_stores_twice(

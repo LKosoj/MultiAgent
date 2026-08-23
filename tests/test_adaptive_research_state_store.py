@@ -72,6 +72,7 @@ def _query_spec(*, revision: int = 0, text: str = "sales") -> QuerySpec:
                 binding_ids=(),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

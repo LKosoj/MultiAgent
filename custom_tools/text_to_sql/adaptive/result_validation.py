@@ -36,7 +36,8 @@ from .result_expectations import (
     derive_result_expectations,
 )
 from .semantic_plan import predicate_from_expression
-from .semantic_coverage import CoverageRequirements, validate_coverage_inputs
+from ._semantic_coverage_footprint import normalized_freshness_digest
+from .semantic_coverage import CoverageRequirements
 from .serialization import CanonicalJsonError, canonical_json_bytes
 
 
@@ -206,13 +207,8 @@ def _validated_result_validation_inputs(
     candidate = _revalidate(candidate, SqlCandidate, "candidate")
     if type(parsed_ast) is not ParsedSqlCandidate:
         raise TypeError("parsed_ast must be ParsedSqlCandidate")
-    if requirements != validate_coverage_inputs(
-        state,
-        freshness_context,
-        state.run_id,
-        state.run_incarnation,
-    ):
-        raise ValueError("requirements do not match current research authority")
+    if not _requirements_match_persisted_freshness(requirements, freshness_context):
+        raise ValueError("requirements do not match persisted research authority")
     if (
         candidate.revision != requirements.state_revision
         or parsed_ast.candidate_id != candidate.candidate_id
@@ -222,6 +218,17 @@ def _validated_result_validation_inputs(
     ):
         raise ValueError("candidate and parsed AST identities contradict each other")
     return state, requirements, freshness_context, candidate, parsed_ast
+
+
+def _requirements_match_persisted_freshness(
+    requirements: CoverageRequirements,
+    freshness_context: FreshnessContext,
+) -> bool:
+    """Bind post-execution checks to their persisted research authority."""
+
+    return requirements.freshness_digest == normalized_freshness_digest(
+        freshness_context
+    )
 
 
 def validate_execution_result_expectations(

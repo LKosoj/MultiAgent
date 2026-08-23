@@ -7,9 +7,12 @@ from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
 )
 from custom_tools.text_to_sql.adaptive.checks import SemanticCheckInput
 from custom_tools.text_to_sql.adaptive.models import (
+    BindingStatus,
     CheckFailureCode,
     CheckStatus,
+    DiscriminatorValueBinding,
     ExpectedResultShape,
+    PredicateRef,
     PredicateOperator,
     ResearchState,
     SemanticItemKind,
@@ -27,8 +30,10 @@ from text_to_sql_semantic_checks_helpers import (
     RUN_ID,
     ItemSpec,
     _context,
+    _schema_evidence,
     _value_evidence,
     build_state,
+    column,
 )
 
 
@@ -39,6 +44,8 @@ def _in_case(
     literal: object = ("gold", "silver"),
     evidence_values: tuple[object, ...] = ("gold", "silver"),
     kind: SemanticItemKind = SemanticItemKind.FILTER,
+    binding_literal: object | None = None,
+    binding_operator: PredicateOperator | None = None,
     include_semantic_ast: bool = False,
 ):
     item = ItemSpec(
@@ -51,6 +58,33 @@ def _in_case(
     )
     seed = build_state((item,), shape=ExpectedResultShape.ROWS)
     binding = seed.bindings[0]
+    if binding_literal is not None:
+        predicate = PredicateRef(
+            left=binding.discriminator_column,
+            operator=binding_operator or operator,
+            right=binding_literal,
+        )
+        binding = canonical_binding(
+            binding.model_copy(
+                update={
+                    "predicates": (predicate,),
+                    "discriminator_predicate": predicate,
+                }
+            )
+        )
+        seed = seed.model_copy(
+            update={
+                "query_spec": seed.query_spec.model_copy(
+                    update={
+                        "semantic_items": (
+                            seed.query_spec.semantic_items[0].model_copy(
+                                update={"binding_ids": (binding.binding_id,)}
+                            ),
+                        )
+                    }
+                )
+            }
+        )
     values = tuple(
         _value_evidence(
             f"evidence-tier-{value}", binding.discriminator_column, value
@@ -118,6 +152,26 @@ def _in_case(
         POSTGRES_DSN,
     )
     return (result, semantic_ast) if include_semantic_ast else result
+
+
+def test_physical_filter_value_may_differ_from_query_literal() -> None:
+    accepted = _in_case(
+        "SELECT o.tier FROM orders o WHERE o.tier = 'Discount'",
+        operator=PredicateOperator.EQ,
+        literal="discount",
+        binding_literal="Discount",
+        evidence_values=("Discount",),
+    )
+    query_spelling = _in_case(
+        "SELECT o.tier FROM orders o WHERE o.tier = 'discount'",
+        operator=PredicateOperator.EQ,
+        literal="discount",
+        binding_literal="Discount",
+        evidence_values=("Discount",),
+    )
+
+    assert accepted.status is CheckStatus.PASSED
+    assert query_spelling.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
 
 
 def test_in_list_reordering_and_duplicates_preserve_authority() -> None:
@@ -262,6 +316,43 @@ def test_time_between_requires_exact_discriminator_predicate_match() -> None:
 
 
 @pytest.mark.parametrize(
+    ("sql", "binding_operator", "binding_literal", "evidence_values"),
+    (
+        (
+            "SELECT o.tier FROM orders o "
+            "WHERE o.tier BETWEEN '2024-06-01' AND '2024-06-30'",
+            PredicateOperator.BETWEEN,
+            ("2024-06-01", "2024-06-30"),
+            (),
+        ),
+        (
+            "SELECT o.tier FROM orders o WHERE o.tier = 202406",
+            PredicateOperator.EQ,
+            202406,
+            (202406,),
+        ),
+    ),
+)
+def test_time_uses_database_physical_representation(
+    sql: str,
+    binding_operator: PredicateOperator,
+    binding_literal: object,
+    evidence_values: tuple[object, ...],
+) -> None:
+    result = _in_case(
+        sql,
+        operator=PredicateOperator.EQ,
+        literal="June 2024",
+        kind=SemanticItemKind.TIME,
+        binding_operator=binding_operator,
+        binding_literal=binding_literal,
+        evidence_values=evidence_values,
+    )
+
+    assert result.status is CheckStatus.PASSED
+
+
+@pytest.mark.parametrize(
     ("operator", "sql", "wrong_sql"),
     (
         (PredicateOperator.GT, "o.tier > 1", "o.tier > 2"),
@@ -314,6 +405,65 @@ def test_time_between_does_not_require_bounds_as_observed_values() -> None:
     assert wrong_endpoint.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
 
 
+@pytest.mark.parametrize(
+    ("kind", "operator", "literal", "sql", "wrong_sql"),
+    (
+        (
+            SemanticItemKind.FILTER,
+            PredicateOperator.EQ,
+            "202406",
+            "o.tier = '202406'",
+            "o.tier = '202407'",
+        ),
+        (
+            SemanticItemKind.FILTER,
+            PredicateOperator.LIKE,
+            "active%",
+            "o.tier LIKE 'active%'",
+            "o.tier LIKE 'inactive%'",
+        ),
+        (
+            SemanticItemKind.TIME,
+            PredicateOperator.EQ,
+            "202406",
+            "o.tier = '202406'",
+            "o.tier = '202407'",
+        ),
+        (
+            SemanticItemKind.TIME,
+            PredicateOperator.LIKE,
+            "2024-06%",
+            "o.tier LIKE '2024-06%'",
+            "o.tier LIKE '2024-07%'",
+        ),
+    ),
+)
+def test_filter_predicates_do_not_require_an_observed_matching_row(
+    kind: SemanticItemKind,
+    operator: PredicateOperator,
+    literal: str,
+    sql: str,
+    wrong_sql: str,
+) -> None:
+    accepted = _in_case(
+        f"SELECT o.tier FROM orders o WHERE {sql}",
+        operator=operator,
+        literal=literal,
+        evidence_values=(),
+        kind=kind,
+    )
+    wrong_literal = _in_case(
+        f"SELECT o.tier FROM orders o WHERE {wrong_sql}",
+        operator=operator,
+        literal=literal,
+        evidence_values=(),
+        kind=kind,
+    )
+
+    assert accepted.status is CheckStatus.PASSED
+    assert wrong_literal.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+
+
 def test_between_column_bound_remains_an_unauthorized_column() -> None:
     result = _in_case(
         "SELECT o.tier FROM orders o WHERE o.tier BETWEEN 1 AND o.other_tier",
@@ -338,3 +488,95 @@ def test_time_between_column_bound_remains_an_unauthorized_column() -> None:
 
     assert result.status is CheckStatus.FAILED
     assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
+
+
+def _split_calendar_time_case(sql: str):
+    seed = build_state(
+        (
+            ItemSpec(
+                "calendar-period",
+                SemanticItemKind.FILTER,
+                "events",
+                "year",
+                operator=PredicateOperator.EQ,
+                literal="June 2024",
+            ),
+        ),
+        shape=ExpectedResultShape.ROWS,
+    )
+    year = column("events", "year")
+    month = column("events", "month")
+    predicates = (
+        PredicateRef(left=year, operator=PredicateOperator.EQ, right=2024),
+        PredicateRef(left=month, operator=PredicateOperator.EQ, right=6),
+    )
+    evidence = (
+        _schema_evidence("evidence-year-schema", year),
+        _schema_evidence("evidence-month-schema", month),
+        _value_evidence("evidence-year-value", year, 2024),
+        _value_evidence("evidence-month-value", month, 6),
+    )
+    binding = canonical_binding(
+        DiscriminatorValueBinding(
+            binding_id="binding-calendar-period",
+            source_id="calendar-period",
+            tables=(year.table,),
+            columns=(year, month),
+            predicates=predicates,
+            join_path=(),
+            evidence_ids=tuple(item.evidence_id for item in evidence),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="split-calendar-time-test",
+            discriminator_column=year,
+            discriminator_predicate=predicates[0],
+        )
+    )
+    semantic_item = seed.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "binding_ids": (binding.binding_id,),
+        }
+    )
+    state = ResearchState.model_validate(
+        {
+            **seed.model_dump(mode="python"),
+            "query_spec": seed.query_spec.model_copy(
+                update={"semantic_items": (semantic_item,)}
+            ),
+            "evidence": evidence,
+            "bindings": (binding,),
+        }
+    )
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    parsed_ast = parse_sql_candidate(sql, POSTGRES_DSN, "candidate-split-time")
+    candidate = SqlCandidate(
+        candidate_id="candidate-split-time",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        state.query_spec,
+        requirements,
+        "main",
+    )
+    return evaluate_semantic_authority_checks(
+        SemanticCheckInput(semantic_ast, state.query_spec, requirements),
+        state,
+        POSTGRES_DSN,
+    )
+
+
+def test_split_calendar_time_requires_every_physical_predicate() -> None:
+    accepted = _split_calendar_time_case(
+        "SELECT e.year FROM events e WHERE e.year = 2024 AND e.month = 6"
+    )
+    missing_month = _split_calendar_time_case(
+        "SELECT e.year FROM events e WHERE e.year = 2024"
+    )
+
+    assert accepted.status is CheckStatus.PASSED
+    assert missing_month.status is not CheckStatus.PASSED

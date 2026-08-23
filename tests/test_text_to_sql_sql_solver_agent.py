@@ -127,6 +127,10 @@ def test_prompt_instructions_show_exact_wire_shapes_for_both_proposals() -> None
         '{"proposal_version":1,"proposal":{"proposal_kind":"missing_evidence","source_id":"source-id","question":"question","required_evidence_kind":"schema","reason":"reason"}}'
         in instructions
     )
+    assert (
+        "required_evidence_kind must be exactly one of schema, catalog, profile, "
+        "sample, value_search, probe, document."
+    ) in instructions
 
 
 def test_sync_callable_is_rejected_before_it_is_called() -> None:

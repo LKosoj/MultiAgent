@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from ..dialects import get_sqlglot_dialect
 from ._semantic_matching import predicate_matches
+from ._semantic_value_certificate import predicate_has_exact_value_certificate
 from ._semantic_coverage_footprint import (
     canonical_binding,
     canonical_join,
@@ -24,7 +25,9 @@ from .models import (
     CheckStatus,
     ColumnRef,
     DerivedExpressionBinding,
+    EvidenceSourceKind,
     JoinCandidateStatus,
+    PredicateOperator,
     PredicateRef,
     QuerySpec,
     RepairKind,
@@ -32,6 +35,7 @@ from .models import (
     SemanticItem,
     SemanticItemKind,
     TableRef,
+    is_binding_free_semantic_item,
     is_binding_free_structural_limit,
 )
 from .semantic_coverage import CoverageRequirements
@@ -102,7 +106,10 @@ def evaluate_semantic_authority_checks(
         for code in _AUTHORITY_FAILURE_ORDER:
             if (result := checks[code](context)) is not None:
                 return result
-            if code is CheckFailureCode.UNAUTHORIZED_LITERAL and _missing_required_filter(context):
+            if (
+                code is CheckFailureCode.UNAUTHORIZED_LITERAL
+                and _missing_required_predicate(context)
+            ):
                 raise _SemanticInputError()
         return _passed(candidate_id)
     except _SemanticInputError as exc:
@@ -152,7 +159,7 @@ def _validated_context(
     binding_required_source_ids = {
         item.source_id
         for item in required_items
-        if not is_binding_free_structural_limit(item)
+        if not is_binding_free_semantic_item(item)
     }
     bindings = {
         source_id: tuple(
@@ -165,10 +172,23 @@ def _validated_context(
     if set(bindings) != binding_required_source_ids:
         raise _SemanticInputError()
     reachable_scope_ids = _reachable_scope_ids(ast.parsed_ast)
+    authority_tables = tuple(
+        dict.fromkeys(
+            (
+                *requirements.allowed_tables,
+                *(
+                    table
+                    for path in requirements.allowed_join_paths
+                    for edge in path
+                    for table in (edge.left.table, edge.right.table)
+                ),
+            )
+        )
+    )
     resolved_tables = _relation_tables(
         ast.parsed_ast,
         ast.table_namespace,
-        requirements.allowed_tables,
+        authority_tables,
         ast.parsed_ast.dialect,
     )
     relation_tables = {
@@ -177,10 +197,23 @@ def _validated_context(
         if scan.scope_id in reachable_scope_ids
     }
     active_ast = _active_ast(ast.parsed_ast, reachable_scope_ids)
+    authority_columns = tuple(
+        dict.fromkeys(
+            (
+                *requirements.allowed_columns,
+                *(
+                    column
+                    for join in requirements.eligible_validated_joins
+                    for edge in join.path
+                    for column in (edge.left, edge.right)
+                ),
+            )
+        )
+    )
     columns = collect_ast_columns(
         active_ast,
         relation_tables,
-        allowed_columns=requirements.allowed_columns,
+        allowed_columns=authority_columns,
         dialect=ast.parsed_ast.dialect,
     )
     authority_predicates = tuple(
@@ -193,7 +226,7 @@ def _validated_context(
             index,
             expression,
             relation_tables,
-            requirements.allowed_columns,
+            authority_columns,
             ast.parsed_ast.dialect,
             {
                 scan.relation_id: scan.scope_id
@@ -235,10 +268,10 @@ def _validate_requirements_state_membership(
             if binding.source_id == item.source_id
         )
         for item in items
-        if not is_binding_free_structural_limit(item)
+        if not is_binding_free_semantic_item(item)
     }
     for item in items:
-        if is_binding_free_structural_limit(item):
+        if is_binding_free_semantic_item(item):
             continue
         supported = tuple(
             sorted(
@@ -274,13 +307,16 @@ def _unauthorized_table(context: _SemanticContext) -> CheckResult | None:
     return _failure(context, CheckFailureCode.UNAUTHORIZED_TABLE, nodes=nodes) if nodes else None
 
 
-def _missing_required_filter(context: _SemanticContext) -> bool:
+def _missing_required_predicate(context: _SemanticContext) -> bool:
     covered_source_ids = {
         source_id
         for annotation in context.check_input.semantic_ast.coverage.annotations
         for source_id in annotation.source_ids
     }
-    for item in context.items_by_kind[SemanticItemKind.FILTER]:
+    for item in (
+        *context.items_by_kind[SemanticItemKind.FILTER],
+        *context.items_by_kind[SemanticItemKind.TIME],
+    ):
         for binding in context.bindings_by_source[item.source_id]:
             if binding.predicates:
                 if not all(
@@ -418,11 +454,26 @@ def _required_predicates(context: _SemanticContext) -> tuple[tuple[str, Predicat
 
 def _unauthorized_authority_literal(context: _SemanticContext) -> CheckResult | None:
     allowed = tuple(predicate for _, predicate in _required_predicates(context)) + tuple(context.requirements.allowed_predicates)
+    eligible_evidence_ids = set(context.requirements.eligible_evidence_ids)
+    exact_value_evidence = tuple(
+        record
+        for record in context.state.evidence
+        if record.evidence_id in eligible_evidence_ids
+        and record.source_kind is EvidenceSourceKind.VALUE_SEARCH
+    )
     nodes = tuple(
         item.node_id
         for item in context.authority_predicates
         if _predicate_has_literal(item.predicate)
         and not _derived_formula_annotation_authorizes_literal(context, item)
+        and not (
+            item.predicate.left in context.requirements.allowed_columns
+            and item.predicate.operator is PredicateOperator.EQ
+            and predicate_has_exact_value_certificate(
+                item.predicate,
+                exact_value_evidence,
+            )
+        )
         and not any(
             _predicate_is_authorized(expected, item)
             for expected in allowed

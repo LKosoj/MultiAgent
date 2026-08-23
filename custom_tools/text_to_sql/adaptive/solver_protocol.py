@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal, TypeAlias
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
 from .models import EvidenceSourceKind, Id, NonEmptyText, StrictModel
 from .serialization import _register_internal_decode_models
@@ -29,6 +29,14 @@ class MissingEvidenceProposal(StrictModel):
     question: NonEmptyText
     required_evidence_kind: EvidenceSourceKind
     reason: NonEmptyText
+    repair_kind: Literal["semantic_binding_mismatch"] | None = None
+    repair_binding_id: Id | None = None
+
+    @model_validator(mode="after")
+    def validate_repair_target(self) -> "MissingEvidenceProposal":
+        if (self.repair_kind is None) != (self.repair_binding_id is None):
+            raise ValueError("semantic repair kind and binding ID must be provided together")
+        return self
 
 
 SolverProposal: TypeAlias = Annotated[

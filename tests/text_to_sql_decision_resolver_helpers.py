@@ -155,6 +155,7 @@ def query(schema_namespace_version: str, *, required: bool = True) -> QuerySpec:
                 binding_ids=(),
             ),
         ),
+        requested_output_source_ids=(),
         expected_result_shape=ExpectedResultShape.ROWS,
         global_constraints=(),
     )

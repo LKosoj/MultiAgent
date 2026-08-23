@@ -648,13 +648,26 @@ def _result_contradiction_receipt(
         return None
     if (
         type(value) is not dict
-        or value.get("record_kind") != "text2sql_result_contradiction"
+        or value.get("record_kind")
+        not in {"text2sql_result_contradiction", "text2sql_result_review"}
     ):
         return None
+    from .result_review import ResultReviewReceipt
     from .result_validation import ResultContradictionReceipt
 
     try:
-        return ResultContradictionReceipt.model_validate_json(canonical_json_bytes(value))
+        receipt_type = (
+            ResultContradictionReceipt
+            if value["record_kind"] == "text2sql_result_contradiction"
+            else ResultReviewReceipt
+        )
+        receipt = receipt_type.model_validate_json(canonical_json_bytes(value))
+        if (
+            type(receipt) is ResultReviewReceipt
+            and receipt.verdict not in {"contradicted", "ambiguous"}
+        ):
+            return None
+        return receipt
     except (CanonicalJsonError, ValidationError):
         return None
 

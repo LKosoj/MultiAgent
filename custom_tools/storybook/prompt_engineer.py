@@ -6,6 +6,7 @@ from typing import Dict, Any, List
 from utils import call_openai_api, parse_llm_json
 from agent_command import model_code
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.style_library_config import compose_style_directives
 
 logger = logging.getLogger(__name__)
 
@@ -983,6 +984,7 @@ def _finalize_prompt_from_frame_spec(
 - Readable texts из `current_frame_spec.hidden_readable_texts` не делай видимыми и не замещай переводами.
 - `negative_prompt` должен оставаться кратким, визуальным и не должен запрещать ни один обязательный факт из `must_show`, `prop_states` и `visible_readable_texts`.
 - Если в кадре есть разрешённые readable texts, запрещай только лишние/неавторизованные надписи, но не сам факт readable text.
+- Не удаляй признак носителя (фактура, мазок, зерно) и параметры оптики: без них кадр теряет стиль.
 - Удали случайные narrative- и prose-хвосты. Оставь один чистый still-frame prompt.
 """
     repaired = parse_llm_json(
@@ -1112,6 +1114,7 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
 
 **Шаг 2 -- ENGLISH_PROMPT (единая команда редактирования):**
 - Шаблон: Действие + Объект + Позиция + Стиль + Освещение + Перспектива.
+- Блок "Стиль" опирается на STYLE MATERIALITY из Layer C: признак носителя обязателен в каждом промпте, оптику и охват бери по крупности плана. Параметр (85mm f/1.8) точнее прилагательного ("крупный портрет").
 - Один still frame T=0: только одновременно видимые в кадре элементы. Процессные фразы переводи в наблюдаемое состояние.
 - Один главный субъект (primary_subject); остальные -- supporting elements.
 - Ensemble-режим (`scene_mode == "ensemble"`): главный субъект -- событийное ядро, не observer. `observer_characters` вторичны. `visible_characters` остаются различимыми, не схлопывай ensemble до одного наблюдателя.
@@ -1164,8 +1167,11 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
 - Мультимодальность: "Combine character and location images; роли референсов в порядке reference_image_paths".
 
 Противоречия: "facing camera" + "looking at [object]" запрещено одновременно.
+
+__STYLE_DIRECTIVES__
     """
     system = system.replace("__PROMPT_LANGUAGE_LABEL__", prompt_language_label)
+    system = system.replace("__STYLE_DIRECTIVES__", compose_style_directives(style_images))
 
     # Батчинг: разбиваем на группы по BATCH_SIZE страниц для стабильного качества
     BATCH_SIZE = 5

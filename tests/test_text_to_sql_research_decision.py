@@ -262,6 +262,42 @@ def test_all_five_candidate_binding_variants_are_transient_and_logical() -> None
             assert forbidden not in dumped
 
 
+def test_time_discriminator_candidate_accepts_additional_physical_predicates() -> None:
+    decision = _parse(
+        _decision(
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:calendar-period",
+                "source_id": SOURCE_ID,
+                "candidate": {
+                    "kind": "discriminator_value",
+                    "discriminator_column": {"table": "events", "column": "year"},
+                    "discriminator_predicate": {
+                        "left": {"table": "events", "column": "year"},
+                        "operator": "eq",
+                        "right": 2024,
+                    },
+                    "additional_predicates": [
+                        {
+                            "left": {"table": "events", "column": "month"},
+                            "operator": "eq",
+                            "right": 6,
+                        }
+                    ],
+                },
+                "join_references": [],
+                "citation_evidence_ids": [EVIDENCE_ID],
+            }
+        )
+    )
+
+    proposal = decision.proposals[0]
+    assert isinstance(proposal, NewBindingProposal)
+    assert [
+        predicate.left.column for predicate in proposal.candidate.additional_predicates
+    ] == ["month"]
+
+
 def _logical_predicate(operator: str, right: object) -> LogicalPredicate:
     return LogicalPredicate.model_validate_json(
         json.dumps(
