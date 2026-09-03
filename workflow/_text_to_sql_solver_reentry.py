@@ -14,9 +14,20 @@ from custom_tools.text_to_sql.adaptive.decision_resolver import (
 )
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
+    DiscriminatorValueBinding,
     EvidenceCost,
+    EvidenceSourceKind,
+    PhysicalColumnBinding,
+    PredicateOperator,
+    PredicateRef,
     ResearchActionKind,
     ResearchState,
+    SemanticItemKind,
+)
+from custom_tools.text_to_sql.adaptive.probes import (
+    ProbeResult,
+    ProbeStatus,
+    read_probe_payload,
 )
 from custom_tools.text_to_sql.adaptive.policy import (
     BudgetAdmissionError,
@@ -61,6 +72,7 @@ from .adaptive_budget_ledger import EXECUTION_CLAIM_LEASE_NS
 from ._text_to_sql_reentry_recovery import (
     build_prepared_targeted_reentry_commit,
 )
+from .text_to_sql_typed_research import _research_stop_review_model
 
 
 class _CapturedSchemaLoader:
@@ -323,6 +335,7 @@ def build_production_reentry_boundary(
                         admission.bindings,
                         admission.state,
                         request,
+                        probe_result,
                     ),
                     budget_state=record.reconciliation.budget_after,
                 ),
@@ -396,6 +409,9 @@ async def _continue_production_research(
         )
     )
     memory = SchemaMemoryManager(Path(__file__).resolve().parents[1])
+    limits = runtime.verified_research_policy.model_budget
+    if limits is None:
+        raise BudgetAdmissionError("targeted research has no model budget")
     assembly = assemble_production_research(
         initial_state=state,
         query=repair_request.question,
@@ -408,6 +424,12 @@ async def _continue_production_research(
         ),
         verified_probe_fact_hints=tuple(
             memory.find_verified_probe_facts(terms, runtime.loaded_schema.namespace)
+        ),
+        approved_semantic_fact_hints=tuple(
+            memory.find_approved_semantic_facts(
+                terms,
+                runtime.loaded_schema.namespace,
+            )
         ),
         documents=runtime.document_snapshot,
         dsn=runtime.dsn,
@@ -423,27 +445,156 @@ async def _continue_production_research(
         deadline=runtime.deadline,
         is_cancelled=runtime.is_cancelled,
         semantic_repair_continuation=True,
+        # Independent stop-review model: reuse the typed-research JSON-schema
+        # route so ResearchStopReview (a flat model without $defs) does not get
+        # forced through the ResearchDecisionV1-shaped response_format.
+        stop_review_model=_research_stop_review_model(
+            profile.model, limits.output_tokens_per_call, state.run_id
+        ),
     )
     result = await run_research_loop(**assembly.loop_arguments())
     memory.save_verified_probe_facts(runtime.loaded_schema.namespace, result.final_state)
     return result
 
 
-def _semantic_repair_bindings(bindings, state, request):
-    if getattr(request, "repair_kind", None) != "semantic_binding_mismatch":
-        return bindings
-    matches = tuple(
-        binding
-        for binding in state.bindings
-        if binding.binding_id == request.repair_binding_id
-        and binding.source_id == request.source_id
-        and binding.status is BindingStatus.SUPPORTED
-    )
-    if len(matches) != 1 or any(
-        binding.binding_id == request.repair_binding_id for binding in bindings
+def _semantic_repair_bindings(
+    bindings, state, request, probe_result: ProbeResult | None = None
+):
+    updated = bindings
+    if getattr(request, "repair_kind", None) == "semantic_binding_mismatch":
+        matches = tuple(
+            binding
+            for binding in state.bindings
+            if binding.binding_id == request.repair_binding_id
+            and binding.source_id == request.source_id
+            and binding.status is BindingStatus.SUPPORTED
+        )
+        if len(matches) != 1 or any(
+            binding.binding_id == request.repair_binding_id for binding in bindings
+        ):
+            raise RuntimeError(
+                "semantic repair binding is not the exact supported binding"
+            )
+        updated = (*bindings, matches[0].model_copy(update={"status": BindingStatus.STALE}))
+    if (
+        probe_result is not None
+        and request.required_evidence_kind is EvidenceSourceKind.VALUE_SEARCH
+        and probe_result.probe_kind
+        in {ResearchActionKind.SEARCH_VALUE, ResearchActionKind.DISTINCT_VALUES}
+        and probe_result.status is ProbeStatus.SUCCESS
     ):
-        raise RuntimeError("semantic repair binding is not the exact supported binding")
-    return (*bindings, matches[0].model_copy(update={"status": BindingStatus.STALE}))
+        available = {binding.binding_id: binding for binding in state.bindings}
+        available.update({binding.binding_id: binding for binding in updated})
+        matches = tuple(
+            binding
+            for binding in available.values()
+            if binding.source_id == request.source_id
+            and binding.status is BindingStatus.SUPPORTED
+            and probe_result.target in binding.columns
+        )
+        if len(matches) != 1:
+            raise RuntimeError("value evidence has no exact supported binding")
+        match = matches[0]
+        evidence_ids = (*match.evidence_ids, probe_result.invocation_id)
+        source_item = next(
+            item
+            for item in state.query_spec.semantic_items
+            if item.source_id == request.source_id
+        )
+        payload = read_probe_payload(probe_result)
+        rows = payload.get("rows") if isinstance(payload, dict) else None
+        columns = payload.get("columns") if isinstance(payload, dict) else None
+        has_exact_row = (
+            isinstance(rows, list)
+            and len(rows) == 1
+            and isinstance(rows[0], list)
+            and len(rows[0]) == 1
+            and columns == [probe_result.target.column]
+        )
+        exact_value = rows[0][0] if has_exact_row else None
+        materialize_predicate = (
+            isinstance(match, PhysicalColumnBinding)
+            and probe_result.probe_kind is ResearchActionKind.SEARCH_VALUE
+            and source_item.required
+            and source_item.kind is SemanticItemKind.FILTER
+            and source_item.operator is None
+            and probe_result.row_count == 1
+            and has_exact_row
+        )
+        predicate_authority = getattr(request, "predicate_authority", None)
+        if predicate_authority is not None:
+            if (
+                not isinstance(match, PhysicalColumnBinding)
+                or source_item.kind is not SemanticItemKind.DIMENSION
+                or predicate_authority.left != match.physical_column
+                or predicate_authority.operator is not PredicateOperator.EQ
+                or predicate_authority.right != exact_value
+                or probe_result.probe_kind is not ResearchActionKind.SEARCH_VALUE
+                or probe_result.row_count != 1
+                or not has_exact_row
+            ):
+                raise RuntimeError("predicate authority has no exact value evidence")
+            preserved = match.model_copy(update={"evidence_ids": evidence_ids})
+            predicate_binding = DiscriminatorValueBinding(
+                binding_id=(
+                    f"{match.binding_id}-predicate-"
+                    f"{canonical_digest(predicate_authority)[7:23]}"
+                ),
+                source_id=match.source_id,
+                tables=match.tables,
+                columns=match.columns,
+                predicates=(predicate_authority,),
+                join_path=match.join_path,
+                evidence_ids=(probe_result.invocation_id,),
+                confidence=match.confidence,
+                status=BindingStatus.CANDIDATE,
+                validator_rule=None,
+                discriminator_column=match.physical_column,
+                discriminator_predicate=predicate_authority,
+            )
+            updated = tuple(
+                preserved if binding.binding_id == match.binding_id else binding
+                for binding in updated
+            )
+            if all(binding.binding_id != match.binding_id for binding in updated):
+                updated = (*updated, preserved)
+            return (*updated, predicate_binding)
+        if materialize_predicate:
+            operator = (
+                PredicateOperator.IS_NULL
+                if exact_value is None
+                else PredicateOperator.EQ
+            )
+            predicate = PredicateRef(
+                left=match.physical_column,
+                operator=operator,
+                right=None if exact_value is None else exact_value,
+            )
+            replacement = DiscriminatorValueBinding(
+                binding_id=match.binding_id,
+                source_id=match.source_id,
+                tables=match.tables,
+                columns=match.columns,
+                predicates=(predicate,),
+                join_path=match.join_path,
+                evidence_ids=evidence_ids,
+                confidence=match.confidence,
+                status=match.status,
+                validator_rule="semantic-certificate:v1:discriminator_value",
+                discriminator_column=match.physical_column,
+                discriminator_predicate=predicate,
+            )
+        else:
+            replacement = match.model_copy(update={"evidence_ids": evidence_ids})
+        updated = tuple(
+            replacement
+            if binding.binding_id == match.binding_id
+            else binding
+            for binding in updated
+        )
+        if all(binding.binding_id != match.binding_id for binding in updated):
+            updated = (*updated, replacement)
+    return updated
 
 
 async def settle_incomplete_reentry_model_call(
@@ -492,6 +643,7 @@ async def settle_incomplete_reentry_model_call(
     context = _research_context(
         request,
         _trusted_targets(request.source_id, research_state, requirements),
+        research_state,
     )
     profile = load_schema_research_agent_profile()
     expected = (

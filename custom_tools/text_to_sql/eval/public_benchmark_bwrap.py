@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
+import re
+import shutil
 import socket
 from typing import Any, Callable, Mapping
 
@@ -17,6 +20,7 @@ from .sandbox import (
     verify_shared_schema_memory,
 )
 from . import public_benchmark_artifacts as artifacts
+from ..schema_namespace import SchemaScope
 from scripts import text2sql_public_benchmark as runner
 
 CANONICAL_CASE_COUNTS = runner.CANONICAL_CASE_COUNTS
@@ -85,6 +89,56 @@ def _sandbox_runtime_env(args: argparse.Namespace) -> dict[str, str]:
     return values
 
 
+def seed_case_schema_snapshot(*, state_root: Path, case_root: Path, dsn: str) -> None:
+    """Copy the latest matching schema snapshot after empty-history validation."""
+
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "text2sql-benchmark",
+            "access_scope_id": "owner:text2sql-benchmark",
+            "connection_view_id": (
+                "dsn:" + hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:16]
+            ),
+            "transient": False,
+        }
+    )
+    filename = f"schema-v1-{scope.scope_key}.json"
+    candidates: list[tuple[str, int, str, Path]] = []
+    for path in state_root.rglob(filename):
+        if path.is_symlink() or not path.is_file() or case_root in path.parents:
+            continue
+        try:
+            snapshot = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            not isinstance(snapshot, dict)
+            or snapshot.get("snapshot_version") != 1
+            or snapshot.get("schema_scope") != scope.to_mapping()
+            or not isinstance(snapshot.get("schema_info"), dict)
+        ):
+            continue
+        captured_at = snapshot.get("captured_at")
+        if not isinstance(captured_at, str):
+            continue
+        relative = path.relative_to(state_root)
+        candidates.append(
+            (
+                captured_at,
+                -len(relative.parts),
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+                path,
+            )
+        )
+    if not candidates:
+        return
+    source = max(candidates)[-1]
+    destination = case_root / "sqlrag" / filename
+    shutil.copyfile(source, destination)
+    destination.chmod(0o600)
+
+
 def _run_case_in_sandbox(
     case: runner.BenchmarkCase,
     *,
@@ -99,6 +153,7 @@ def _run_case_in_sandbox(
     run_scope: str,
 ) -> tuple[dict[str, Any], dict[str, object]]:
     _verify_database_digest(case, expected_database_digest)
+    case_dsn = f"sqlite:////benchmark-input/{case.database_id}.sqlite"
     case_root = _case_state_root(
         state_root,
         benchmark=args.dataset,
@@ -134,6 +189,11 @@ def _run_case_in_sandbox(
             spec=spec,
         )
         persist_receipt(receipt)
+        seed_case_schema_snapshot(
+            state_root=state_root,
+            case_root=case_root,
+            dsn=case_dsn,
+        )
 
     def start_case() -> dict[str, Any]:
         client = runner._client(f"http://127.0.0.1:{spec.port}", token)
@@ -142,7 +202,7 @@ def _run_case_in_sandbox(
             raise RuntimeError("sandbox benchmark principal must have the admin role")
         connection = client.register_connection(
             display_name=f"{args.dataset}:{case.database_id}",
-            dsn=f"sqlite:////benchmark-input/{case.database_id}.sqlite",
+            dsn=case_dsn,
             owner_subject="text2sql-benchmark",
             tenant_id="text2sql-benchmark",
             enabled_for_user=True,
@@ -209,9 +269,10 @@ def _runtime_evidence(
 ) -> dict[str, Any]:
     outcome = observation.get("outcome")
     terminal_available = isinstance(outcome, Mapping)
+    run_id = observation.get("run_id") if terminal_available else None
     terminal = {
         "availability": "available" if terminal_available else "unavailable",
-        "run_id": observation.get("run_id") if terminal_available else None,
+        "run_id": run_id,
         "run_incarnation": None,
         "run_incarnation_availability": "unavailable",
         "reason_code": outcome.get("reason_code") if terminal_available else None,
@@ -270,6 +331,9 @@ def _runtime_evidence(
             "availability": "verified",
             "rejection_signatures": stagnation_receipt["rejection_signatures"],
         }
+    unavailable["model_calls_tokens_cost_receipts"] = (
+        _model_calls_tokens_cost_receipts_evidence(run_id, spec)
+    )
     return {
         "schema_version": 2,
         "status": "incomplete",
@@ -281,6 +345,165 @@ def _runtime_evidence(
             "availability": "available",
             "digest": _files_digest(spec.case_root),
         },
+    }
+
+
+_MODEL_CALL_STEP_RE = re.compile(r"^(?P<step>.+)-\d+-\d+\Z")
+
+
+def _model_call_step(call_id: str) -> str:
+    """Strip a trailing ``-<revision>-<attempt>`` suffix off a model-call id.
+
+    E.g. ``"research-stop-review-2-3"`` -> ``"research-stop-review"``. Call ids
+    that do not end in two dash-separated integers are returned unchanged;
+    this deliberately does not hardcode any specific step-name prefix.
+    """
+
+    match = _MODEL_CALL_STEP_RE.match(call_id)
+    return match.group("step") if match is not None else call_id
+
+
+def _empty_model_call_totals() -> dict[str, int]:
+    return {
+        "call_count": 0,
+        "reconciled_call_count": 0,
+        # Of the reconciled calls, how many were charged at the reserved
+        # maximum because the provider did not report real usage (see
+        # ModelCallReconciliation.usage_was_conservative). Lets a reader
+        # distinguish measured cost from an upper-bound estimate.
+        "conservative_call_count": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "charged_input_tokens": 0,
+        "charged_output_tokens": 0,
+        "charged_total_tokens": 0,
+    }
+
+
+def _model_calls_tokens_cost_receipts_evidence(
+    run_id: str | None,
+    spec: BwrapSandboxSpec,
+) -> dict[str, Any]:
+    """Read the model-call budget ledger the sandboxed run already wrote.
+
+    ``finalize_text_to_sql_run`` does not have access to the ledger, so this
+    reopens a second, independent ``AdaptiveBudgetLedger`` instance against
+    the already-written ``workflow_state.db`` under the case workspace,
+    post-hoc on the host once the sandbox process has exited. This mirrors
+    the reopen-an-existing-ledger-file pattern already used in
+    ``tests/test_adaptive_model_budget.py``.
+    """
+
+    import sqlite3
+
+    from custom_tools.text_to_sql.adaptive.policy import BudgetAdmissionError
+    from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
+
+    if not isinstance(run_id, str) or not run_id:
+        return {"availability": "unavailable", "reason": "run_id_unavailable"}
+    db_path = spec.case_root / "workspace" / "workflow_state.db"
+    if not db_path.is_file():
+        return {"availability": "unavailable", "reason": "ledger_database_missing"}
+
+    # workflow/state_files.py::prepare_sqlite_file (invoked from
+    # AdaptiveBudgetLedger.__init__) performs TOCTOU-safe validation of the
+    # already-written ledger file (symlink/hardlink/ownership races) and
+    # raises plain ValueError for those checks -- not just the OSError,
+    # RuntimeError, sqlite3.Error, and BudgetAdmissionError already caught
+    # here. Because db_path is always a well-formed Path we constructed
+    # ourselves, a ValueError here can only come from that race-detection
+    # path, not from a malformed argument, so it is safe to fold into this
+    # best-effort telemetry catch alongside the others.
+    try:
+        ledger = AdaptiveBudgetLedger(db_path)
+    except (BudgetAdmissionError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        return {"availability": "unavailable", "reason": "ledger_unreadable"}
+    try:
+        run_incarnations = ledger.list_model_run_incarnations(run_id)
+        if not run_incarnations:
+            return {
+                "availability": "unavailable",
+                "reason": "no_model_calls_recorded",
+            }
+        calls: list[dict[str, Any]] = []
+        by_step: dict[str, dict[str, int]] = {}
+        totals = _empty_model_call_totals()
+        for run_incarnation in run_incarnations:
+            for record in ledger.load_model_records(run_id, run_incarnation):
+                reservation = record.reservation
+                step = _model_call_step(reservation.call_id)
+                usage = record.result.usage if record.result is not None else None
+                input_tokens = usage.input_tokens if usage is not None else None
+                output_tokens = usage.output_tokens if usage is not None else None
+                reconciliation = record.reconciliation
+                charged_total = (
+                    reconciliation.charged_total_tokens
+                    if reconciliation is not None
+                    else None
+                )
+                # None means "not yet reconciled" (unknown), as distinct from
+                # a reconciled call known to be either measured (False) or
+                # conservative (True).
+                usage_was_conservative = (
+                    reconciliation.usage_was_conservative
+                    if reconciliation is not None
+                    else None
+                )
+                calls.append(
+                    {
+                        "call_id": reservation.call_id,
+                        "step": step,
+                        "run_incarnation": run_incarnation,
+                        "model_identity": reservation.model_identity,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "charged_total": charged_total,
+                        "usage_was_conservative": usage_was_conservative,
+                        "started_at_ns": (
+                            record.started.started_at_ns
+                            if record.started is not None
+                            else None
+                        ),
+                        "duration_ns": None,
+                    }
+                )
+                step_totals = by_step.setdefault(step, _empty_model_call_totals())
+                for bucket in (step_totals, totals):
+                    bucket["call_count"] += 1
+                    if reconciliation is not None:
+                        bucket["reconciled_call_count"] += 1
+                        bucket["charged_input_tokens"] += (
+                            reconciliation.charged_input_tokens
+                        )
+                        bucket["charged_output_tokens"] += (
+                            reconciliation.charged_output_tokens
+                        )
+                        bucket["charged_total_tokens"] += charged_total
+                        if usage_was_conservative:
+                            bucket["conservative_call_count"] += 1
+                    if input_tokens is not None:
+                        bucket["input_tokens"] += input_tokens
+                    if output_tokens is not None:
+                        bucket["output_tokens"] += output_tokens
+    except (BudgetAdmissionError, OSError, RuntimeError, ValueError, sqlite3.Error):
+        return {"availability": "unavailable", "reason": "ledger_unreadable"}
+    finally:
+        ledger.close()
+
+    return {
+        "availability": "available",
+        # v2 adds "conservative_call_count" to by_step/totals and
+        # "usage_was_conservative" to each call; existing field names and
+        # meanings are unchanged.
+        "schema_version": 2,
+        "run_id": run_id,
+        "run_incarnations": list(run_incarnations),
+        "by_step": by_step,
+        "totals": totals,
+        "calls": sorted(
+            calls, key=lambda call: (call["run_incarnation"], call["call_id"])
+        ),
+        "duration_ns_availability": "unavailable",
     }
 
 

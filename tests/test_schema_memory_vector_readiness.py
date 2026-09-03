@@ -77,10 +77,12 @@ def test_sqlite_starts_when_chroma_is_explicitly_disabled(monkeypatch, tmp_path)
 def test_sqlite_starts_when_chroma_constructor_fails(monkeypatch, tmp_path):
     from memory import database as database_module
 
+    monkeypatch.setenv("OPENAI_API_BASE_DB", "http://gateway.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY_DB", "test-key")
     monkeypatch.setattr(
         database_module,
-        "SentenceTransformer",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("model unavailable")),
+        "OpenAI",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("gateway unavailable")),
     )
     handler = database_module.DatabaseHandler(
         db_path=str(tmp_path / "memory.sqlite"),
@@ -98,15 +100,22 @@ def test_sqlite_starts_when_chroma_constructor_fails(monkeypatch, tmp_path):
 def test_corrupt_chroma_metadata_is_stale_not_ready(monkeypatch, tmp_path):
     from memory import database as database_module
 
-    class FakeModel:
-        def get_sentence_embedding_dimension(self):
-            return 5
-
     class FakeClient:
         def get_or_create_collection(self, *_args, **_kwargs):
             return SimpleNamespace(metadata=object())
 
-    monkeypatch.setattr(database_module, "SentenceTransformer", lambda *_args, **_kwargs: FakeModel())
+    class FakeOpenAI:
+        def __init__(self, **_kwargs):
+            self.embeddings = SimpleNamespace(
+                create=lambda **_kwargs: SimpleNamespace(
+                    model="gateway-embedding-v1",
+                    data=[SimpleNamespace(embedding=[0.0] * 5)],
+                )
+            )
+
+    monkeypatch.setenv("OPENAI_API_BASE_DB", "http://gateway.test/v1")
+    monkeypatch.setenv("OPENAI_API_KEY_DB", "test-key")
+    monkeypatch.setattr(database_module, "OpenAI", FakeOpenAI)
     monkeypatch.setattr(
         database_module.chromadb,
         "PersistentClient",

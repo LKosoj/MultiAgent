@@ -49,6 +49,7 @@ from .decision_resolver import (
 from .freshness import FreshnessContext, FreshnessStatus, evaluate_evidence_freshness
 from .model_budget import ModelTokenUsage
 from .models import (
+    BindingStatus,
     BudgetState,
     ColumnRef,
     DiscriminatorValueBinding,
@@ -63,6 +64,7 @@ from .models import (
     ResearchActionKind,
     ResearchState,
     ResearchStopReason,
+    SemanticItemKind,
     TableRef,
 )
 from .policy import (
@@ -144,6 +146,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS = 5
 _MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS = 2
+_MAX_REPEATED_MODEL_REJECTIONS_WITHOUT_PROGRESS = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +159,7 @@ class ResearchLoopOutcome:
     citation_evidence_ids: tuple[str, ...]
     ambiguity: AmbiguityReport | None
     rejection_signatures: tuple[tuple[str, str], ...] = ()
+    freshness_context: FreshnessContext | None = None
 
 
 class _ModelWaitCancelled(Exception):
@@ -191,11 +195,13 @@ class _ResearchLoopCoordinator:
         model_owner_token_factory: Callable[[], str],
         model_wait: Callable[[float], Awaitable[None]] | None,
         semantic_repair_continuation: bool = False,
+        stop_review_model: SchemaResearchDecisionModel | None = None,
     ) -> None:
         self._initial_state = _revalidate_state(initial_state)
         self._task = _require_text(task, "task")
         self._research_context = research_context
         self._model = model
+        self._stop_review_model = model if stop_review_model is None else stop_review_model
         self._model_identity = _require_text(model_identity, "model_identity")
         self._adapter = adapter
         self._loaded_schema = loaded_schema
@@ -227,36 +233,48 @@ class _ResearchLoopCoordinator:
         except (AdaptiveResearchStateStoreError, TypeError, ValueError):
             return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
         while True:
-            key = _checkpoint_key(state)
             try:
+                key = self._action_checkpoint_key(state)
                 snapshot = self._checkpoint_store.get_snapshot(key)
             except AdaptiveCheckpointError:
                 return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
             recover_planned = snapshot.planned is not None
             if snapshot.terminal is not None:
                 try:
-                    freshness_context = self._terminal_replay_freshness_context(key)
-                    if freshness_context is None:
-                        return self._outcome(
-                            state,
-                            ResearchStopReason.PROTOCOL_FAILURE,
-                        )
-                    state = _state_with_reconciled_model_budget(
-                        state, self._budget_ledger, self._policy
-                    )
-                    state = self._state_with_terminal_probe_budget(state, snapshot)
-                except (
-                    AdaptiveCheckpointError,
-                    BudgetAdmissionError,
-                    TypeError,
-                    ValueError,
-                ):
+                    terminal = _terminal_envelope(snapshot.terminal.action, state)
+                except (TypeError, ValidationError, ValueError):
                     return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
-                return self._outcome_from_terminal(
-                    state,
-                    snapshot.terminal.action,
-                    freshness_context,
+                continue_unbound_formula = (
+                    self._semantic_repair_continuation
+                    and terminal["reason"] == ResearchStopReason.COMPLETE.value
+                    and _has_pending_required_formula_continuation(state)
                 )
+                if continue_unbound_formula:
+                    snapshot = replace(snapshot, terminal=None)
+                else:
+                    try:
+                        freshness_context = self._terminal_replay_freshness_context(key)
+                        if freshness_context is None:
+                            return self._outcome(
+                                state,
+                                ResearchStopReason.PROTOCOL_FAILURE,
+                            )
+                        state = _state_with_reconciled_model_budget(
+                            state, self._budget_ledger, self._policy
+                        )
+                        state = self._state_with_terminal_probe_budget(state, snapshot)
+                    except (
+                        AdaptiveCheckpointError,
+                        BudgetAdmissionError,
+                        TypeError,
+                        ValueError,
+                    ):
+                        return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
+                    return self._outcome_from_terminal(
+                        state,
+                        snapshot.terminal.action,
+                        freshness_context,
+                    )
 
             if snapshot.observed is not None:
                 aborted = _abort_reason(snapshot.observed.action)
@@ -362,11 +380,26 @@ class _ResearchLoopCoordinator:
                     affected_source_ids=terminal_authority.affected_source_ids,
                 )
             if terminal_reason is ResearchStopReason.COMPLETE:
-                return self._stop(
-                    state,
-                    terminal_reason,
-                    freshness_context=terminal_freshness_context,
+                pending_formula_continuation = (
+                    self._semantic_repair_continuation
+                    and _has_pending_required_formula_continuation(state)
                 )
+                selected_binding_ids = {
+                    binding_id
+                    for item in state.query_spec.semantic_items
+                    if item.required
+                    for binding_id in item.binding_ids
+                }
+                if not pending_formula_continuation and not any(
+                    binding.status is BindingStatus.CANDIDATE
+                    and binding.binding_id in selected_binding_ids
+                    for binding in state.bindings
+                ):
+                    return self._stop(
+                        state,
+                        terminal_reason,
+                        freshness_context=terminal_freshness_context,
+                    )
             if _consecutive_non_novel(self._checkpoint_store, state) >= 3:
                 if self._pending_stop_review_hint is None:
                     context = self._research_context(state, ())
@@ -542,6 +575,8 @@ class _ResearchLoopCoordinator:
         rejected_without_progress = 0
         rejection_signatures: set[tuple[str, str]] = set()
         rejection_counts: dict[tuple[str, str], int] = {}
+        last_rejection_signature: tuple[str, str] | None = None
+        consecutive_rejections = 0
         validation_feedbacks = (
             (validation_feedback,) if validation_feedback is not None else ()
         )
@@ -570,6 +605,7 @@ class _ResearchLoopCoordinator:
             ],
             rejection_code: str | None = None,
         ) -> bool:
+            nonlocal consecutive_rejections, last_rejection_signature
             nonlocal rejected_without_progress, validation_feedbacks
             logger.warning(
                 "typed_schema_research_decision retry=true "
@@ -583,14 +619,24 @@ class _ResearchLoopCoordinator:
             signature = (rejection_path, rejection_code or feedback)
             rejection_signatures.add(signature)
             rejection_counts[signature] = rejection_counts.get(signature, 0) + 1
+            if signature == last_rejection_signature:
+                consecutive_rejections += 1
+            else:
+                last_rejection_signature = signature
+                consecutive_rejections = 1
             repeated_invalid_stop = (
                 rejection_path == "invalid_stop"
                 and rejection_counts[signature]
                 >= _MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS
             )
+            repeated_rejection = (
+                consecutive_rejections
+                >= _MAX_REPEATED_MODEL_REJECTIONS_WITHOUT_PROGRESS
+            )
             if (
                 rejected_without_progress < _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS
                 and not repeated_invalid_stop
+                and not repeated_rejection
             ):
                 return False
             self._model_stagnation_signatures = tuple(sorted(rejection_signatures))
@@ -885,6 +931,29 @@ class _ResearchLoopCoordinator:
                                 else "unresolvable_preflight"
                             ),
                         ):
+                            try:
+                                if rejected_preflight_assessments:
+                                    context = self._research_context(
+                                        state,
+                                        validation_feedbacks,
+                                        rejected_duplicate_actions,
+                                        rejected_preflight_assessments,
+                                    )
+                                elif rejected_duplicate_actions:
+                                    context = self._research_context(
+                                        state,
+                                        validation_feedbacks,
+                                        rejected_duplicate_actions,
+                                    )
+                                else:
+                                    context = self._research_context(
+                                        state,
+                                        validation_feedbacks,
+                                    )
+                            except BudgetAdmissionError:
+                                return None, ResearchStopReason.BUDGET_EXHAUSTED, None
+                            except Exception:
+                                return None, ResearchStopReason.PROTOCOL_FAILURE, None
                             stop_review_hint, attempt = await self._review_stop(
                                 state,
                                 ResearchStopReason.STAGNATED,
@@ -967,7 +1036,7 @@ class _ResearchLoopCoordinator:
 
             async def invoke(_context: object):
                 return await SchemaResearchStopReviewAdapter().review_with_usage(
-                    self._model,
+                    self._stop_review_model,
                     task=self._task,
                     research_context=context,
                     stop_reason=reason_text,
@@ -1000,7 +1069,12 @@ class _ResearchLoopCoordinator:
             )
         except asyncio.CancelledError:
             return None, attempt + 1
-        except Exception:
+        except Exception as error:
+            logger.warning(
+                "typed_schema_research_stop_review retry=false "
+                "code=PROVIDER_OR_ADAPTER error_class=%s",
+                type(error).__name__,
+            )
             return None, attempt + 1
         if captured is None or captured.decision == "stop_confirmed":
             return None, attempt + 1
@@ -1111,11 +1185,12 @@ class _ResearchLoopCoordinator:
                     decision,
                     self._freshness_context,
                     self._preflight_requested_action(state, decision),
-                    duplicate_existing_binding_proposal_keys=(
-                        error.proposal_keys
+                    duplicate_existing_binding_ids_by_proposal_key=(
+                        error.existing_binding_ids_by_proposal_key
                         if isinstance(error, DuplicateExistingBindingProposalError)
                         else ()
                     ),
+                    exact_column=error.exact_column,
                 ),
             )
         except DuplicateResearchActionError as error:
@@ -1159,6 +1234,7 @@ class _ResearchLoopCoordinator:
         state: ResearchState,
         decision: ResearchDecisionV1,
     ) -> ResolvedResearchDecision:
+        decision = _normalize_model_source_ids(state, decision)
         admitted_state = _state_with_reconciled_model_budget(
             state,
             self._budget_ledger,
@@ -1209,9 +1285,10 @@ class _ResearchLoopCoordinator:
         if reason is not None:
             return reason
         try:
+            key = self._action_checkpoint_key(state)
             self._checkpoint_store.record_planned(
-                _checkpoint_key(state),
-                expected_revision=None if state.revision == 0 else state.revision - 1,
+                key,
+                expected_revision=None if key.revision == 0 else key.revision - 1,
                 action=_planned_action(resolved),
                 semantic_repair_continuation=self._semantic_repair_continuation,
             )
@@ -1324,8 +1401,9 @@ class _ResearchLoopCoordinator:
             "resolution_digest": resolved.resolution_digest,
         }
         try:
+            key = self._action_checkpoint_key(state)
             self._checkpoint_store.record_observed(
-                _checkpoint_key(state), expected_revision=state.revision, action=action
+                key, expected_revision=key.revision, action=action
             )
         except (AdaptiveCheckpointError, TypeError, ValueError):
             return ResearchStopReason.PROTOCOL_FAILURE
@@ -1340,14 +1418,24 @@ class _ResearchLoopCoordinator:
         probe_result: ProbeResult | None,
     ) -> ResearchStopReason | None:
         try:
-            snapshot = self._checkpoint_store.get_snapshot(
-                _checkpoint_key(previous)
-            )
-            if (
-                snapshot.planned is None
-                or snapshot.observed is None
-                or admission.budget_state is None
-            ):
+            snapshot = None
+            current_key = _checkpoint_key(previous)
+            action_key = self._action_checkpoint_key(previous)
+            for key in dict.fromkeys((current_key, action_key)):
+                candidate = self._checkpoint_store.get_snapshot(key)
+                if candidate.planned is None or candidate.observed is None:
+                    continue
+                planned = _planned_envelope(candidate.planned.action)
+                observed = candidate.observed.action
+                if (
+                    planned["resolution_digest"] == resolved.resolution_digest
+                    and isinstance(observed, dict)
+                    and observed.get("resolution_digest")
+                    == resolved.resolution_digest
+                ):
+                    snapshot = candidate
+                    break
+            if snapshot is None or admission.budget_state is None:
                 return ResearchStopReason.PROTOCOL_FAILURE
             replay_input = ResearchSemanticReplayInput(
                 decision=resolved.decision,
@@ -1408,7 +1496,10 @@ class _ResearchLoopCoordinator:
         if (reason is ResearchStopReason.AMBIGUOUS) != (ambiguity is not None):
             reason = ResearchStopReason.PROTOCOL_FAILURE
             ambiguity = None
-        key = _checkpoint_key(state)
+        try:
+            key = self._terminal_checkpoint_key(state)
+        except AdaptiveCheckpointError:
+            return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
         terminal = {
             "affected_source_ids": list(affected),
             "ambiguity": (
@@ -1430,22 +1521,35 @@ class _ResearchLoopCoordinator:
         try:
             snapshot = self._checkpoint_store.get_snapshot(key)
             if snapshot.terminal is not None:
-                stored_freshness_context = self._terminal_replay_freshness_context(key)
-                if stored_freshness_context is None:
-                    return self._outcome(
-                        state,
-                        ResearchStopReason.PROTOCOL_FAILURE,
-                    )
-                return self._outcome_from_terminal(
-                    state,
+                stored_terminal = _terminal_envelope(
                     snapshot.terminal.action,
-                    stored_freshness_context,
+                    state,
                 )
+                continue_unbound_formula = (
+                    self._semantic_repair_continuation
+                    and stored_terminal["reason"]
+                    == ResearchStopReason.COMPLETE.value
+                    and _has_pending_required_formula_continuation(state)
+                )
+                if not continue_unbound_formula:
+                    stored_freshness_context = (
+                        self._terminal_replay_freshness_context(key)
+                    )
+                    if stored_freshness_context is None:
+                        return self._outcome(
+                            state,
+                            ResearchStopReason.PROTOCOL_FAILURE,
+                        )
+                    return self._outcome_from_terminal(
+                        state,
+                        snapshot.terminal.action,
+                        stored_freshness_context,
+                    )
             if snapshot.planned is not None and snapshot.observed is None:
                 planned = _planned_envelope(snapshot.planned.action)
                 self._checkpoint_store.record_observed(
                     key,
-                    expected_revision=state.revision,
+                    expected_revision=key.revision,
                     action={
                         "action": planned["action"],
                         "contract_version": 1,
@@ -1458,11 +1562,11 @@ class _ResearchLoopCoordinator:
             self._checkpoint_store.record_replayable_terminal(
                 key,
                 expected_revision=(
-                    state.revision
+                    key.revision
                     if snapshot.planned is not None
                     else None
-                    if state.revision == 0
-                    else state.revision - 1
+                    if key.revision == 0
+                    else key.revision - 1
                 ),
                 action=terminal,
                 replay_input=ResearchTerminalReplayInput(
@@ -1488,7 +1592,41 @@ class _ResearchLoopCoordinator:
                 if reason is ResearchStopReason.STAGNATED
                 else ()
             ),
+            freshness_context=terminal_freshness_context,
         )
+
+    def _action_checkpoint_key(self, state: ResearchState) -> AdaptiveCheckpointKey:
+        key = _checkpoint_key(state)
+        if not self._semantic_repair_continuation:
+            return key
+        snapshot = self._checkpoint_store.get_snapshot(key)
+        if snapshot.terminal is not None:
+            terminal = _terminal_envelope(snapshot.terminal.action, state)
+            if not (
+                terminal["reason"] == ResearchStopReason.COMPLETE.value
+                and _has_pending_required_formula_continuation(state)
+            ):
+                return key
+            return replace(key, revision=key.revision + 1)
+        if snapshot.planned is not None and snapshot.observed is not None:
+            return replace(key, revision=key.revision + 1)
+        return key
+
+    def _terminal_checkpoint_key(
+        self, state: ResearchState
+    ) -> AdaptiveCheckpointKey:
+        key = _checkpoint_key(state)
+        if not self._semantic_repair_continuation:
+            return key
+        snapshot = self._checkpoint_store.get_snapshot(key)
+        if snapshot.terminal is None:
+            return key
+        terminal = _terminal_envelope(snapshot.terminal.action, state)
+        if terminal["reason"] != ResearchStopReason.COMPLETE.value or not (
+            _has_pending_required_formula_continuation(state)
+        ):
+            return key
+        return replace(key, revision=key.revision + 1)
 
     def _terminal_replay_freshness_context(
         self,
@@ -1550,6 +1688,7 @@ class _ResearchLoopCoordinator:
             rejection_signatures=tuple(
                 tuple(item) for item in terminal["rejection_signatures"]
             ),
+            freshness_context=freshness_context,
         )
 
 
@@ -1574,6 +1713,7 @@ async def run_research_loop(
     model_owner_token_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     model_wait: Callable[[float], Awaitable[None]] | None = None,
     semantic_repair_continuation: bool = False,
+    stop_review_model: SchemaResearchDecisionModel | None = None,
 ) -> ResearchLoopOutcome:
     """Run private schema research coordination without taking SQL authority."""
 
@@ -1597,6 +1737,7 @@ async def run_research_loop(
         model_owner_token_factory=model_owner_token_factory,
         model_wait=model_wait,
         semantic_repair_continuation=semantic_repair_continuation,
+        stop_review_model=stop_review_model,
     )
     try:
         return await coordinator.run()
@@ -1604,6 +1745,24 @@ async def run_research_loop(
         return coordinator._stop(  # noqa: SLF001 - closed cancellation result
             coordinator._latest_state, ResearchStopReason.CANCELLED
         )
+
+
+def _has_pending_required_formula_continuation(state: ResearchState) -> bool:
+    formula_source_ids = {
+        item.source_id
+        for item in state.query_spec.semantic_items
+        if item.required and item.kind is SemanticItemKind.FORMULA
+    }
+    return any(
+        item.required
+        and item.kind is SemanticItemKind.FORMULA
+        and not item.binding_ids
+        for item in state.query_spec.semantic_items
+    ) or any(
+        binding.status is BindingStatus.CANDIDATE
+        and binding.source_id in formula_source_ids
+        for binding in state.bindings
+    )
 
 
 def _state_with_reconciled_model_budget(
@@ -1687,13 +1846,44 @@ def _duplicate_action_context(action: ResearchAction) -> dict[str, object]:
     }
 
 
+def _normalize_model_source_ids(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+) -> ResearchDecisionV1:
+    source_ids = tuple(
+        item.source_id for item in state.query_spec.semantic_items
+    )
+    proposals = []
+    changed = False
+    for proposal in decision.proposals:
+        if isinstance(proposal, NewBindingProposal) and proposal.source_id not in source_ids:
+            matches = tuple(
+                source_id
+                for source_id in source_ids
+                if len(source_id) == len(proposal.source_id)
+                and sum(
+                    left != right
+                    for left, right in zip(source_id, proposal.source_id, strict=True)
+                )
+                == 1
+            )
+            if len(matches) == 1:
+                proposal = proposal.model_copy(update={"source_id": matches[0]})
+                changed = True
+        proposals.append(proposal)
+    if not changed:
+        return decision
+    return decision.model_copy(update={"proposals": tuple(proposals)})
+
+
 def _rejected_preflight_assessment_context(
     state: ResearchState,
     decision: ResearchDecisionV1,
     freshness_context: FreshnessContext,
     requested_action: ResearchAction | None,
     *,
-    duplicate_existing_binding_proposal_keys: tuple[str, ...] = (),
+    duplicate_existing_binding_ids_by_proposal_key: tuple[tuple[str, str], ...] = (),
+    exact_column: ColumnRef | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Describe rejected proposals and one deterministic missing probe."""
 
@@ -1702,7 +1892,13 @@ def _rejected_preflight_assessment_context(
         hypothesis.hypothesis_id: hypothesis for hypothesis in state.hypotheses
     }
     joins = {join.join_id: join for join in state.join_candidates}
-    source_ids = {item.source_id for item in state.query_spec.semantic_items}
+    source_items = {
+        item.source_id: item for item in state.query_spec.semantic_items
+    }
+    source_ids = set(source_items)
+    existing_binding_id_by_proposal_key = dict(
+        duplicate_existing_binding_ids_by_proposal_key
+    )
     durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
     try:
         fresh_evidence = tuple(
@@ -1735,23 +1931,68 @@ def _rejected_preflight_assessment_context(
             for evidence_id in proposal.citation_evidence_ids
         ):
             item["rejection_reason"] = "cited evidence_id does not exist"
+            item["available_evidence_ids"] = sorted(durable_evidence_ids)
         if isinstance(proposal, NewBindingProposal):
             if (
                 proposal.source_id not in source_ids
                 and "rejection_reason" not in item
             ):
                 item["rejection_reason"] = "source_id does not exist"
+                item["available_source_ids"] = sorted(source_ids)
             if (
-                proposal.proposal_key in duplicate_existing_binding_proposal_keys
+                proposal.proposal_key in existing_binding_id_by_proposal_key
                 and "rejection_reason" not in item
             ):
                 item["rejection_reason"] = "binding already exists"
+                item["existing_binding_id"] = existing_binding_id_by_proposal_key[
+                    proposal.proposal_key
+                ]
             if any(
                 isinstance(reference, ExistingJoinRef)
                 and reference.join_id not in joins
                 for reference in proposal.join_references
             ) and "rejection_reason" not in item:
                 item["rejection_reason"] = "referenced join_id does not exist"
+            source_item = source_items.get(proposal.source_id)
+            if (
+                "rejection_reason" not in item
+                and source_item is not None
+                and source_item.required
+                and source_item.kind is SemanticItemKind.FILTER
+                and source_item.operator is None
+                and proposal.candidate.kind == "discriminator_value"
+            ):
+                item["rejection_reason"] = (
+                    "FILTER without operator cannot use discriminator_value"
+                )
+            if (
+                "rejection_reason" not in item
+                and exact_column is not None
+                and _new_binding_references_case_only_column(proposal, exact_column)
+            ):
+                item["rejection_reason"] = "logical column differs by case"
+                item["exact_column"] = exact_column.model_dump(
+                    mode="json", by_alias=True
+                )
+                if not any(
+                    action.kind is ResearchActionKind.INSPECT_COLUMN
+                    and action.target == exact_column
+                    and action.parameters == ()
+                    for action in state.action_history
+                ):
+                    candidates.append(
+                        (
+                            exact_column,
+                            item,
+                            {
+                                "tool_name": "inspect_column",
+                                "arguments": {
+                                    "table": _logical_table_name(exact_column.table),
+                                    "column": exact_column.column,
+                                },
+                            },
+                        )
+                    )
             rejected.append(item)
             continue
         if "rejection_reason" in item:
@@ -1765,6 +2006,13 @@ def _rejected_preflight_assessment_context(
             item["rejection_reason"] = "referenced binding_id does not exist"
             rejected.append(item)
             continue
+        if (
+            isinstance(proposal, BindingAssessment)
+            and proposal.certificate == "contradicted"
+        ):
+            item["rejection_reason"] = (
+                "binding contradiction is not a permitted certificate"
+            )
         if (
             isinstance(proposal, HypothesisAssessment)
             and proposal.certificate == "consistent"
@@ -1900,6 +2148,40 @@ def _rejected_preflight_assessment_context(
     return tuple(
         sorted(rejected, key=lambda item: canonical_digest(item["proposal"]))
     )
+
+
+def _new_binding_references_case_only_column(
+    proposal: NewBindingProposal,
+    exact_column: ColumnRef,
+) -> bool:
+    """Match the rejected typed column reference without rewriting it."""
+
+    table = exact_column.table
+    names = {table.table}
+    if table.schema_name is not None:
+        names.add(f"{table.schema_name}.{table.table}")
+
+    def contains(value: object) -> bool:
+        if isinstance(value, dict):
+            logical_table = value.get("table")
+            logical_column = value.get("column")
+            if (
+                logical_table in names
+                and type(logical_column) is str
+                and logical_column != exact_column.column
+                and logical_column.casefold() == exact_column.column.casefold()
+            ):
+                return True
+            return any(contains(item) for item in value.values())
+        if isinstance(value, tuple):
+            return any(contains(item) for item in value)
+        return False
+
+    return contains(proposal.candidate.model_dump(mode="python"))
+
+
+def _logical_table_name(table: TableRef) -> str:
+    return f"{table.schema_name}.{table.table}" if table.schema_name else table.table
 
 
 def _missing_binding_column_probe(

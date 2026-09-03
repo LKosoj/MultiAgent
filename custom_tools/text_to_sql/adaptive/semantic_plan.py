@@ -527,6 +527,46 @@ def _binding_targets(
             )
         )
     elif type(binding) is DerivedExpressionBinding:
+        input_columns = set(binding.input_columns)
+        for predicate in (
+            parsed_ast.predicates
+            if item.kind
+            in {
+                SemanticItemKind.FILTER,
+                SemanticItemKind.FORMULA,
+                SemanticItemKind.METRIC,
+            }
+            else ()
+        ):
+            atom_columns = tuple(
+                (
+                    atom,
+                    _formula_candidate_columns(
+                        atom.expression,
+                        parsed_ast,
+                        relation_tables,
+                        allowed_columns,
+                        dialect,
+                    ),
+                )
+                for atom in predicate.atoms
+            )
+            targets.update(
+                (
+                    predicate.node_id,
+                    "expression",
+                    0,
+                    next(
+                        path
+                        for path, expression in _expression_paths(
+                            predicate.expression
+                        )
+                        if expression == atom.expression
+                    ),
+                )
+                for atom, columns in atom_columns
+                if columns and columns.issubset(input_columns)
+            )
         if item.kind is SemanticItemKind.ORDERING:
             targets.update(
                 (ordering.node_id, "expression", 0, ())
@@ -570,7 +610,32 @@ def _binding_targets(
             if ordering.expression in candidate_expressions:
                 targets.add((ordering.node_id, "expression", 0, ()))
     elif type(binding) is PhysicalColumnBinding:
-        if item.kind is SemanticItemKind.LIMIT:
+        if item.kind is SemanticItemKind.FORMULA:
+            for predicate in parsed_ast.predicates:
+                for atom in predicate.atoms:
+                    if _formula_candidate_columns(
+                        atom.expression,
+                        parsed_ast,
+                        relation_tables,
+                        allowed_columns,
+                        dialect,
+                    ) != {binding.physical_column}:
+                        continue
+                    targets.add(
+                        (
+                            predicate.node_id,
+                            "expression",
+                            0,
+                            next(
+                                path
+                                for path, expression in _expression_paths(
+                                    predicate.expression
+                                )
+                                if expression == atom.expression
+                            ),
+                        )
+                    )
+        elif item.kind is SemanticItemKind.LIMIT:
             targets.update((limit.node_id, None, None, ()) for limit in parsed_ast.limits)
         else:
             for node_id, field, index, expression in _physical_expression_owners(

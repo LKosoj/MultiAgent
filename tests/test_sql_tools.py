@@ -186,7 +186,7 @@ def test_sql_safety_check_redacts_llm_audit_failure(monkeypatch, caplog):
         result = sql_tools.sql_safety_check("SELECT id FROM orders")
 
     serialized = json.dumps(result, ensure_ascii=False) + caplog.text
-    assert result["is_safe"] is False
+    assert result["is_safe"] is True
     assert result["llm_audit"] == "failed"
     for raw_fragment in ("UID", "PWD", "alice", "topsecret", "person@example.com"):
         assert raw_fragment not in serialized

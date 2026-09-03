@@ -29,6 +29,7 @@ from custom_tools.text_to_sql.utils import (
     mask_dsn,
     mask_dsn_value,
 )
+from custom_tools.text_to_sql.redaction import redact_text
 
 
 class _AdmittedPluginDouble:
@@ -75,6 +76,13 @@ def test_mask_dsn_uri_empty_username_password_masked():
     assert "topsecret" not in masked
     assert "://:topsecret@" not in masked
     assert "postgresql://***:***@host:5432/db" in masked
+
+
+def test_redact_text_preserves_sql_identifier_assignments(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "0")
+    sql = "SELECT COUNT(*) FROM events WHERE UserId = '17'"
+
+    assert redact_text(sql) == sql
 
 
 def test_mask_dsn_in_arbitrary_text_strips_password():

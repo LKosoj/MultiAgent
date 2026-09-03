@@ -29,6 +29,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     EvidenceSourceKind,
     EvidenceValidityScope,
     ExpectedResultShape,
+    PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
     QuerySpec,
@@ -49,8 +50,6 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
     ResearchTerminalReplayInput,
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
-    CoverageInputError,
-    CoverageInputErrorCode,
     validate_coverage_inputs,
 )
 from custom_tools.text_to_sql.adaptive.serialization import (
@@ -98,7 +97,7 @@ _RUN_ID = "w6-07-run"
 _INCARNATION = "w6-07-incarnation"
 _GOOD_SQL = "SELECT o.status FROM orders AS o WHERE o.status = 'active'"
 _GOOD_SQL_ORDERED = _GOOD_SQL + " ORDER BY o.id"
-_MISSING_FILTER_SQL = "SELECT o.status FROM orders AS o"
+_UNKNOWN_COLUMN_SQL = "SELECT o.unknown_column FROM orders AS o"
 _UNSAFE_SQL = _GOOD_SQL_ORDERED
 _EXPLAIN_FAIL_SQL = _GOOD_SQL.replace("o.status FROM", "o.status, o.status FROM")
 _MODEL_LIMIT = 8
@@ -405,7 +404,7 @@ def test_exact_fresh_search_value_suffices_without_inspect_column() -> None:
     assert requirements.selected_bindings == (binding,)
 
 
-def test_exact_time_physical_predicate_rejects_substitute_at_coverage() -> None:
+def test_researched_time_physical_predicate_is_accepted_at_coverage() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (item,) = state.query_spec.semantic_items
     (binding,) = state.bindings
@@ -439,20 +438,190 @@ def test_exact_time_physical_predicate_rejects_substitute_at_coverage() -> None:
         }
     )
 
-    with pytest.raises(CoverageInputError) as raised:
-        validate_coverage_inputs(
-            state,
-            FreshnessContext(
-                evaluated_at=_OBSERVED_AT,
-                run_id=_RUN_ID,
-                run_incarnation=_INCARNATION,
-                schema_namespace_version=state.schema_namespace_version,
-            ),
-            _RUN_ID,
-            _INCARNATION,
-        )
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
 
-    assert raised.value.code is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+    assert requirements.selected_bindings == (binding,)
+
+
+def test_requested_time_output_does_not_require_a_predicate() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (schema_evidence,) = (
+        evidence
+        for evidence in state.evidence
+        if evidence.source_kind is EvidenceSourceKind.SCHEMA
+    )
+    column = _column()
+    binding = canonical_binding(
+        PhysicalColumnBinding(
+            binding_id="binding-date-output",
+            source_id="date-output",
+            tables=(column.table,),
+            columns=(column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=(schema_evidence.evidence_id,),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="w6-07",
+            physical_column=column,
+        )
+    )
+    item = SemanticItem(
+        source_id="date-output",
+        kind=SemanticItemKind.TIME,
+        source_text="payment date",
+        normalized_meaning="date returned in the result",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(binding.binding_id,),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (item,),
+                    "requested_output_source_ids": (item.source_id,),
+                }
+            ),
+            "evidence": (schema_evidence,),
+            "bindings": (binding,),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (binding,)
+
+
+def test_relational_filter_without_operator_does_not_require_a_predicate() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (schema_evidence,) = (
+        evidence
+        for evidence in state.evidence
+        if evidence.source_kind is EvidenceSourceKind.SCHEMA
+    )
+    column = _column()
+    binding = canonical_binding(
+        PhysicalColumnBinding(
+            binding_id="binding-related-owner",
+            source_id="related-owner",
+            tables=(column.table,),
+            columns=(column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=(schema_evidence.evidence_id,),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="w6-07",
+            physical_column=column,
+        )
+    )
+    item = SemanticItem(
+        source_id="related-owner",
+        kind=SemanticItemKind.FILTER,
+        source_text="owner related to the selected record",
+        normalized_meaning="select the owner through the confirmed relationship",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(binding.binding_id,),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "evidence": (schema_evidence,),
+            "bindings": (binding,),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (binding,)
+
+
+def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    (binding,) = state.bindings
+    secondary_column = ColumnRef(table=binding.tables[0], column="region")
+    primary = binding.discriminator_predicate.model_copy(update={"right": "Elijah"})
+    secondary = PredicateRef(
+        left=secondary_column,
+        operator=PredicateOperator.EQ,
+        right="Allen",
+    )
+    binding = canonical_binding(
+        binding.model_copy(
+            update={
+                "columns": (binding.discriminator_column, secondary_column),
+                "predicates": (primary, secondary),
+                "discriminator_predicate": primary,
+            }
+        )
+    )
+    item = item.model_copy(
+        update={
+            "literal_or_reference": ("Elijah", "Allen"),
+            "exact_physical_predicate": True,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (binding,),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (binding,)
 
 
 def _create_fixture(
@@ -570,6 +739,8 @@ def _runtime(
     )
     runtime.loaded_schema = loaded_schema
     runtime.verified_research_state = research
+    if research.revision == 0:
+        _persist_research_baseline(store, research)
     return runtime, store
 
 
@@ -578,10 +749,18 @@ def _persist_research_baseline(
 ) -> None:
     research_store = AdaptiveResearchStateStore(store.db_path)
     try:
-        research_store.save_query_spec(research_state.query_spec)
-        research_store.save_research_state(
-            research_state, expected_previous_revision=None
+        existing = research_store.load_research_state(
+            research_state.run_id,
+            research_state.run_incarnation,
+            revision=research_state.revision,
         )
+        if existing is None:
+            research_store.save_query_spec(research_state.query_spec)
+            research_store.save_research_state(
+                research_state, expected_previous_revision=None
+            )
+        else:
+            assert existing == research_state
     finally:
         research_store.close()
 
@@ -722,11 +901,12 @@ def _failed_execution_terminal(run_id: str, sql: str) -> dict[str, object]:
         "execution": execution,
         "audit": {"status": "logged", "log_id": "audit-1"},
         "persistence": {"status": "not_attempted"},
+        "result_review": {},
         "ambiguity": None,
     }
 
 
-def test_semantic_failure_is_repaired_by_a_second_candidate(
+def test_schema_failure_is_repaired_by_a_second_candidate(
     monkeypatch, tmp_path
 ) -> None:
     runtime, store = _runtime(tmp_path)
@@ -735,7 +915,7 @@ def test_semantic_failure_is_repaired_by_a_second_candidate(
 
     output = _run_generation(
         runtime,
-        (_sql(_MISSING_FILTER_SQL), _sql(_GOOD_SQL)),
+        (_sql(_UNKNOWN_COLUMN_SQL), _sql(_GOOD_SQL)),
         ledger,
     )
 
@@ -744,8 +924,8 @@ def test_semantic_failure_is_repaired_by_a_second_candidate(
     assert checkpoint is not None
     checks = _checks_by_candidate(checkpoint.state)
     first, second = checkpoint.state.sql_candidates
-    assert checks[first.candidate_id][-1].check_kind is CheckKind.SEMANTIC
-    assert checks[first.candidate_id][-1].status is CheckStatus.INCONCLUSIVE
+    assert checks[first.candidate_id][-1].check_kind is CheckKind.SCHEMA
+    assert checks[first.candidate_id][-1].status is CheckStatus.FAILED
     assert tuple(item.check_kind for item in checks[second.candidate_id]) == (
         CheckKind.SAFETY,
         CheckKind.SCHEMA,
@@ -762,9 +942,9 @@ def test_normalized_duplicate_stagnates_without_second_gate_run(
     runtime, store = _runtime(tmp_path)
     ledger = _SqliteCallLedger(tmp_path / "calls.sqlite")
     _install_tool_boundaries(monkeypatch, ledger)
-    equivalent = " select o.status from orders o "
+    equivalent = _UNKNOWN_COLUMN_SQL
 
-    _run_generation(runtime, (_sql(_MISSING_FILTER_SQL), _sql(equivalent)), ledger)
+    _run_generation(runtime, (_sql(_UNKNOWN_COLUMN_SQL), _sql(equivalent)), ledger)
 
     checkpoint = store.load(_RUN_ID, _INCARNATION)
     assert checkpoint is not None and checkpoint.terminal is not None
@@ -1029,7 +1209,7 @@ def test_model_turn_budget_stops_before_ninth_call(monkeypatch, tmp_path) -> Non
     ledger = _SqliteCallLedger(tmp_path / "calls.sqlite")
     _install_tool_boundaries(monkeypatch, ledger)
     proposals = tuple(
-        _sql(_MISSING_FILTER_SQL + f" ORDER BY o.id LIMIT {index}")
+        _sql(_UNKNOWN_COLUMN_SQL + f" ORDER BY o.id LIMIT {index}")
         for index in range(1, _MODEL_LIMIT + 1)
     )
 

@@ -51,7 +51,7 @@ class SchemaLimiter:
     ):
         self.desc_limit = int(os.getenv("SCHEMA_DESC_LIMIT", "120"))
         if max_tables is None:
-            self.max_tables = int(os.getenv("SCHEMA_MAX_TABLES", "50"))
+            self.max_tables = int(os.getenv("SCHEMA_MAX_TABLES", "10"))
         else:
             self.max_tables = int(max_tables)
         self.max_columns = int(os.getenv("SCHEMA_MAX_COLUMNS", "20"))
@@ -351,6 +351,7 @@ class SchemaLimiter:
         normalized_description = SchemaLimiter._normalize_match_text(
             metadata.get("description", "") or ""
         )
+        identifier_tokens = SchemaLimiter._identifier_tokens(column_name)
         for term in query_terms:
             if not isinstance(term, str):
                 continue
@@ -364,12 +365,33 @@ class SchemaLimiter:
                 return True
             if padded_term in f" {normalized_description} ":
                 return True
+            for identifier_token in identifier_tokens[:1]:
+                for term_token in SchemaLimiter._identifier_tokens(term):
+                    if (
+                        len(identifier_token) in {3, 4}
+                        and len(term_token) >= len(identifier_token) + 3
+                        and term_token.startswith(identifier_token)
+                    ):
+                        return True
         return False
 
     @staticmethod
     def _normalize_match_text(value: Any) -> str:
         normalized = unicodedata.normalize("NFKC", str(value)).casefold()
         return " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
+
+    @staticmethod
+    def _identifier_tokens(value: Any) -> tuple[str, ...]:
+        normalized = unicodedata.normalize("NFKC", str(value))
+        return tuple(
+            token.casefold()
+            for identifier in re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)
+            for token in re.findall(
+                r"[A-Z]+(?=[A-Z][a-z]|\d|$)|[A-Z]?[a-z]+|\d+",
+                identifier,
+            )
+            if not token.isdigit()
+        )
 
     def enforce_row_limit(
         self,

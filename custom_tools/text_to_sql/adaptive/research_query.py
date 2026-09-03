@@ -112,6 +112,8 @@ class _DerivedResearchQuery:
 @dataclass(frozen=True, slots=True)
 class _Source:
     columns: tuple[str, ...]
+    database: str | None = None
+    table: str | None = None
 
 
 def admit_research_query(
@@ -569,7 +571,11 @@ def _physical_source(table: exp.Table, schema: Mapping[str, object]) -> _Source:
             "research_query_table",
             "research SQL table metadata is unavailable",
         )
-    return _Source(tuple(columns))
+    return _Source(
+        tuple(columns),
+        database=canonical_parts[-2] if len(canonical_parts) >= 2 else None,
+        table=canonical_parts[-1],
+    )
 
 
 def _output_columns(
@@ -670,7 +676,7 @@ def _resolve_columns(
             and column.find_ancestor(exp.Select) is not scope.expression
         ):
             continue
-        if column.db or column.catalog:
+        if column.catalog:
             raise ResearchQueryAdmissionError(
                 "research_query_column",
                 "research SQL column uses an unsupported database or catalog qualifier",
@@ -691,6 +697,16 @@ def _resolve_columns(
                     "research_query_column",
                     "research SQL column qualifier is not a row source",
                 )
+            if column.db and (
+                source.database is None
+                or source.table is None
+                or not _identifier_matches(column.args.get("db"), source.database)
+                or not _identifier_matches(column.args.get("table"), source.table)
+            ):
+                raise ResearchQueryAdmissionError(
+                    "research_query_column",
+                    "research SQL column uses an unsupported database or catalog qualifier",
+                )
             actual = _matching_column(identifier, source.columns)
             if actual is None:
                 raise ResearchQueryAdmissionError(
@@ -698,6 +714,11 @@ def _resolve_columns(
                     "research SQL column is absent from its row source",
                 )
             continue
+        if column.db:
+            raise ResearchQueryAdmissionError(
+                "research_query_column",
+                "research SQL column uses an unsupported database or catalog qualifier",
+            )
         matches = [
             (alias, actual)
             for alias, source in sources.items()

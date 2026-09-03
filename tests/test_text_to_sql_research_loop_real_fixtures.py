@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import custom_tools.text_to_sql.adaptive.production_research as production_research
+import custom_tools.text_to_sql.adaptive.research_loop as research_loop_module
 from custom_tools.text_to_sql.adaptive.freshness import (
     DocumentSourceAvailability,
     FreshnessContext,
@@ -76,6 +77,7 @@ from custom_tools.text_to_sql.adaptive.research_loop import (
     _state_with_reconciled_model_budget,
     run_research_loop,
 )
+from custom_tools.text_to_sql.adaptive.semantic_reducer import commit_semantic_turn
 from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     SchemaResearchDecisionAdapter,
     build_schema_research_prompt,
@@ -546,7 +548,7 @@ def test_bounded_context_keeps_distinct_result_expectation_identities() -> None:
     ] == [("namespace-a", "schema-a"), ("namespace-b", "schema-b")]
 
 
-def test_bounded_context_omits_source_with_binding_bundle_that_does_not_fit() -> None:
+def test_bounded_context_keeps_unresolved_source_when_binding_bundle_does_not_fit() -> None:
     policy = _bounded_context_policy(5_000)
     base = _initial_state("bounded-binding-bundle", "sha256:" + "a" * 64, policy)
     table = TableRef(namespace="main", schema=None, table="orders")
@@ -584,14 +586,13 @@ def test_bounded_context_omits_source_with_binding_bundle_that_does_not_fit() ->
     _, payload = _context_payload(state, policy)
     included = payload["state"]
 
-    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]] == []
-    assert included["bindings"] == []
+    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]] == [
+        "source-1"
+    ]
+    assert included["unresolved_items"] == ["source-1"]
+    assert [item["binding_id"] for item in included["bindings"]] == ["binding-1"]
     assert included["evidence"] == []
-    assert payload["omitted"] == {
-        "semantic_items": 1,
-        "evidence": 1,
-        "bindings": 1,
-    }
+    assert payload["omitted"] == {"evidence": 1}
 
 
 def test_bounded_context_prioritizes_validated_join_over_supported_binding_bundle() -> None:
@@ -1991,6 +1992,233 @@ def test_production_registry_decodes_durable_planned_actions(tmp_path: Path) -> 
         ["silver"],
     ]
     assert len(ledger.load_records(state.run_id, state.run_incarnation)) == 1
+
+
+def test_production_registry_uses_continuation_segment_after_complete(
+    tmp_path: Path,
+) -> None:
+    policy = _policy(actions=15)
+    database = create_sqlite_adaptive_fixture(
+        "F02_VERTICAL_EAV",
+        tmp_path / "fixture.sqlite",
+    )
+    dsn = f"sqlite://{database}"
+    scope = _scope()
+    loaded = SchemaLoader(tmp_path / "schema-cache").load_scoped_schema(
+        {},
+        dsn,
+        scope,
+    )
+    schema_version = f"sha256:{loaded.namespace.version_key}"
+    state = _initial_state("formula-continuation", schema_version, policy)
+    formula = SemanticItem(
+        source_id="formula-1",
+        kind=SemanticItemKind.FORMULA,
+        source_text="amount above the computed average",
+        normalized_meaning="amount > AVG(amount)",
+        required=True,
+        operator=PredicateOperator.GT,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula,)}
+            ),
+            "unresolved_items": (),
+        }
+    )
+    state_path = tmp_path / "production-state.sqlite"
+    state_store = AdaptiveResearchStateStore(state_path)
+    checkpoint_store = AdaptiveStateStore(state_path)
+    ledger = AdaptiveBudgetLedger(state_path)
+    profile = load_schema_research_agent_profile()
+    deadline = DeadlineBudget.from_duration(60)
+    state_store.save_research_state(state, expected_previous_revision=None)
+
+    async def no_model(_prompt: str) -> str:
+        raise AssertionError("ordinary formula authority must complete automatically")
+
+    common = {
+        "initial_state": state,
+        "query": state.query_spec.original_text,
+        "loaded_schema": loaded,
+        "dsn": dsn,
+        "scope": scope,
+        "table_namespace": "main",
+        "model": no_model,
+        "model_identity": stable_schema_research_model_identity(profile.model),
+        "profile": profile,
+        "state_store": state_store,
+        "checkpoint_store": checkpoint_store,
+        "budget_ledger": ledger,
+        "policy": policy,
+        "deadline": deadline,
+        "is_cancelled": lambda: False,
+    }
+    try:
+        first = asyncio.run(
+            run_research_loop(
+                **assemble_production_research(**common).loop_arguments()
+            )
+        )
+        assert first.stop_reason is ResearchStopReason.COMPLETE
+
+        assembly = assemble_production_research(
+            **common,
+            semantic_repair_continuation=True,
+        )
+        decision = parse_research_decision(
+            _tool(
+                "inspect_column",
+                {"table": "member", "column": "member_label"},
+            )
+        )
+        resolved = resolve_research_decision(
+            state,
+            decision,
+            loaded_schema=loaded,
+            freshness_context=assembly.freshness_context,
+            registry=assembly.registry,
+            deadline=deadline,
+        )
+        checkpoint_store.record_planned(
+            AdaptiveCheckpointKey(
+                state.run_id,
+                state.run_incarnation,
+                AdaptiveLoopKind.RESEARCH,
+                state.revision + 1,
+            ),
+            expected_revision=state.revision,
+            action=_planned_action(resolved),
+            semantic_repair_continuation=True,
+        )
+        token = set_tool_runtime_context(
+            {"supervisor_evidence": SupervisorExecutionEvidence("production-loop", 1)}
+        )
+        try:
+            result = execute_resolved_research_decision(resolved, assembly.registry)
+        finally:
+            reset_tool_runtime_context(token)
+
+        assert result is not None
+        assert result.status.value == "success"
+
+        coordinator = research_loop_module._ResearchLoopCoordinator(
+            **assembly.loop_arguments(),
+            model_claim_now_ns=lambda: 0,
+            model_owner_token_factory=lambda: "owner",
+            model_wait=None,
+        )
+        admission = coordinator._admission_with_reconciled_budget(resolved)
+        committed = commit_semantic_turn(admission, probe_result=result)
+        assert coordinator._record_observed(state, resolved, result, True) is None
+        assert (
+            coordinator._save_semantic_transition(
+                state,
+                committed.state,
+                resolved,
+                admission,
+                result,
+            )
+            is None
+        )
+
+        semantic_decision = parse_research_decision(
+            json.dumps(
+                {
+                    "decision_version": 1,
+                    "proposals": [
+                        {
+                            "proposal_type": "new_binding",
+                            "proposal_key": "proposal:formula-input",
+                            "source_id": formula.source_id,
+                            "candidate": {
+                                "kind": "physical_column",
+                                "physical_column": {
+                                    "table": "member",
+                                    "column": "member_label",
+                                },
+                            },
+                            "join_references": [],
+                            "citation_evidence_ids": [
+                                committed.state.evidence[-1].evidence_id
+                            ],
+                        }
+                    ],
+                    "next": {"next_kind": "semantic_commit"},
+                }
+            )
+        )
+        semantic_resolved = resolve_research_decision(
+            committed.state,
+            semantic_decision,
+            loaded_schema=loaded,
+            freshness_context=assembly.freshness_context,
+            registry=assembly.registry,
+            deadline=deadline,
+        )
+        assert coordinator._record_planned(committed.state, semantic_resolved) is None
+        semantic_admission = semantic_resolved.admission
+        semantic_committed = commit_semantic_turn(semantic_admission)
+        assert (
+            coordinator._record_observed(
+                committed.state,
+                semantic_resolved,
+                None,
+                True,
+            )
+            is None
+        )
+        assert (
+            coordinator._save_semantic_transition(
+                committed.state,
+                semantic_committed.state,
+                semantic_resolved,
+                semantic_admission,
+                None,
+            )
+            is None
+        )
+
+        second_decision = parse_research_decision(
+            _tool(
+                "inspect_column",
+                {"table": "member", "column": "member_id"},
+            )
+        )
+        second_resolved = resolve_research_decision(
+            semantic_committed.state,
+            second_decision,
+            loaded_schema=loaded,
+            freshness_context=assembly.freshness_context,
+            registry=assembly.registry,
+            deadline=deadline,
+        )
+        assert (
+            coordinator._record_planned(semantic_committed.state, second_resolved)
+            is None
+        )
+
+        token = set_tool_runtime_context(
+            {"supervisor_evidence": SupervisorExecutionEvidence("production-loop", 2)}
+        )
+        try:
+            second_result = execute_resolved_research_decision(
+                second_resolved,
+                assembly.registry,
+            )
+        finally:
+            reset_tool_runtime_context(token)
+
+        assert second_result is not None
+        assert second_result.status.value == "success"
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
 
 
 def test_production_research_assembles_available_document_freshness(tmp_path: Path) -> None:

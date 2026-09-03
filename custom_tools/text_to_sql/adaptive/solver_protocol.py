@@ -6,7 +6,7 @@ from typing import Annotated, Literal, TypeAlias
 
 from pydantic import Field, model_validator
 
-from .models import EvidenceSourceKind, Id, NonEmptyText, StrictModel
+from .models import EvidenceSourceKind, Id, NonEmptyText, PredicateRef, StrictModel
 from .serialization import _register_internal_decode_models
 
 
@@ -31,11 +31,14 @@ class MissingEvidenceProposal(StrictModel):
     reason: NonEmptyText
     repair_kind: Literal["semantic_binding_mismatch"] | None = None
     repair_binding_id: Id | None = None
+    predicate_authority: PredicateRef | None = None
 
     @model_validator(mode="after")
     def validate_repair_target(self) -> "MissingEvidenceProposal":
         if (self.repair_kind is None) != (self.repair_binding_id is None):
             raise ValueError("semantic repair kind and binding ID must be provided together")
+        if self.predicate_authority is not None and self.repair_kind is not None:
+            raise ValueError("predicate authority cannot be combined with semantic repair")
         return self
 
 

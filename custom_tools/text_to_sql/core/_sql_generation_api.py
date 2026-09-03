@@ -310,8 +310,8 @@ def _run_llm_safety_audit_with_timeout(
 ) -> Dict[str, object]:
     """Запускает _run_llm_safety_audit с таймаутом (EPIC 7.4 / W1-T3).
 
-    На таймауте бросает TimeoutError; вызывающий обязан явно пометить
-    запрос как LLM_AUDIT_TIMEOUT/unsafe, не скрывая деградацию LLM-аудита.
+    На таймауте бросает TimeoutError; вызывающий явно сохраняет
+    LLM_AUDIT_TIMEOUT как неблокирующую advisory-проблему.
 
     W1-T3: при перегрузке пула (queue >= max_workers*2) — RuntimeError
     "LLM safety pool overloaded" без silent skip.
@@ -742,8 +742,11 @@ def sql_safety_check(
     default 30c) и кешируется по SHA256(sql_query) в течение TTL
     (TEXT_TO_SQL_LLM_SAFETY_TTL_S, default 300c). Кешируем только успешные
     результаты, чтобы не залипнуть в unsafe навсегда при временном сбое LLM.
-    Таймаут НЕ даёт silent fallback: запрос помечается unsafe с явным
-    issue_type=LLM_AUDIT_TIMEOUT.
+    Таймаут НЕ скрывается: успешная статическая проверка сохраняется, а
+    деградация фиксируется как неблокирующий LLM_AUDIT_TIMEOUT. Runtime-сбой
+    самого LLM-вызова (RuntimeError/JSONDecodeError/ValueError) аналогично
+    fail-open: static-safe результат не откатывается, сбой фиксируется как
+    неблокирующий LLM_AUDIT_FAILED.
 
     W9-A10: orchestrator явно разделяет два слоя:
       * static (``sql_validator.validate``) — regex + sqlglot AST, БЕЗ LLM.
@@ -827,18 +830,19 @@ def sql_safety_check(
     # TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_S секунд (по умолчанию 60),
     # не порождаем новую LLM-задачу.
     if _llm_safety_timeout_cache_check(cache_key):
-        safety_result["is_safe"] = False
-        safety_result["safety_status"] = "failed"
+        safety_result["safety_status"] = "safe"
         safety_result["llm_audit"] = "timeout"
         safety_result["llm_audit_error"] = "repeated timeout (negative-TTL cache hit)"
-        safety_result.setdefault("issues", []).append({
+        advisory_issues.append({
             "issue_type": "LLM_AUDIT_TIMEOUT",
             "description": "LLM-based safety audit recently timed out; skipping retry.",
+            "blocking": False,
         })
         return safety_result
 
     # Дополнительный LLM-аудит: содержательные LLM-находки идут в advisory,
-    # но runtime-сбой самого LLM-аудита остаётся fail-closed.
+    # и runtime-сбой самого LLM-аудита тоже fail-open (не блокирует
+    # static-safe SQL) — см. except-ветку ниже, паттерн как у TimeoutError.
     # except перехватывает ТОЛЬКО реальные runtime-ошибки LLM-вызова, а не
     # программные баги (ValueError из контракт-проверок выше).
     try:
@@ -860,19 +864,19 @@ def sql_safety_check(
     except TimeoutError as e:
         safe_error = str(_redact_sql_api_value(e))
         logger.error("LLM safety audit timed out: %s", safe_error)
-        safety_result["is_safe"] = False
-        safety_result["safety_status"] = "failed"
+        safety_result["safety_status"] = "safe"
         safety_result["llm_audit"] = "timeout"
         safety_result["llm_audit_error"] = safe_error
-        safety_result["issues"].append({
+        advisory_issues.append({
             "issue_type": "LLM_AUDIT_TIMEOUT",
             "description": f"LLM-based safety audit timed out: {safe_error}",
+            "blocking": False,
         })
         # M6: кешируем факт таймаута в negative-TTL кэш, чтобы повторные
         # запросы того же SQL не порождали новых LLM-задач во время деградации.
-        # Defense-in-depth: ошибка наполнения кэша (например, невалидный
-        # TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX) не должна вылетать наружу —
-        # safety_result уже помечен fail-closed (failed/timeout), кэш опционален.
+        # Ошибка наполнения кэша (например, невалидный
+        # TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_CACHE_MAX) не должна вылетать наружу:
+        # деградация уже записана в advisory_issues, кэш опционален.
         try:
             _llm_safety_timeout_cache_put(cache_key)
         except Exception as cache_exc:  # noqa: BLE001 — кэш best-effort
@@ -889,15 +893,18 @@ def sql_safety_check(
         # они должны падать наружу и быть пойманы тестами/мониторингом.
         # Контракт-проверка `is_safe` вынесена ВЫШЕ try, чтобы её ValueError
         # тоже падал наружу как программный баг валидатора.
+        # W0-0.5: fail-open (как и TimeoutError выше) — static-safe результат
+        # не откатываем, сбой самого LLM-аудита фиксируется как неблокирующий
+        # advisory-issue, а не как блокирующий issue.
         safe_error = str(_redact_sql_api_value(e))
         logger.error("LLM safety audit failed: %s", safe_error)
-        safety_result["is_safe"] = False
-        safety_result["safety_status"] = "failed"
+        safety_result["safety_status"] = "safe"
         safety_result["llm_audit"] = "failed"
         safety_result["llm_audit_error"] = safe_error
-        safety_result["issues"].append({
+        advisory_issues.append({
             "issue_type": "LLM_AUDIT_FAILED",
             "description": f"LLM-based safety audit failed: {safe_error}",
+            "blocking": False,
         })
 
     return safety_result

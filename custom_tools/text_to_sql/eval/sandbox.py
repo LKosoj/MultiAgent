@@ -86,7 +86,13 @@ _RESERVED_RUNTIME_ENV = frozenset(
 )
 _SENSITIVE_ENV_PARTS = frozenset({"TOKEN", "SECRET", "PASSWORD", "API_KEY"})
 _SCHEMA_CACHE_KINDS = frozenset(
-    {"schema_table", "schema_ready", "schema_probe_fact"}
+    {
+        "schema_table",
+        "schema_ready",
+        "schema_probe_fact",
+        "schema_semantic_fact",
+        "successful_sql_example",
+    }
 )
 _T = TypeVar("_T")
 

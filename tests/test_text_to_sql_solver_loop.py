@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from custom_tools.text_to_sql.adaptive.models import (
+    CheckFailureCode,
     CheckKind,
     CheckResult,
     CheckStatus,
@@ -18,6 +19,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchReentryStatus,
     SolverState,
     SolverStopReason,
+    SemanticItemStatus,
 )
 from custom_tools.text_to_sql.adaptive.freshness import (
     DataSnapshotStatus,
@@ -246,17 +248,20 @@ def test_live_and_replay_share_exact_pure_proposal_reducer(proposal_kind) -> Non
     assert replayed.action == live.action
 
 
-def _fresh_research(case) -> ResearchState:
+def _fresh_research(case, *, revision: int = 2) -> ResearchState:
     target = case.requirements.allowed_columns[0]
-    evidence = _schema_evidence("fresh-evidence", target, revision=2)
+    evidence = _schema_evidence("fresh-evidence", target, revision=revision)
     return ResearchState.model_validate(
         {
             **case.state.model_dump(mode="python"),
-            "revision": 2,
+            "revision": revision,
             "evidence": (*case.state.evidence, evidence),
             "action_history": (
                 *case.state.action_history,
-                research_action((("revision", 1),), index=1),
+                *(
+                    research_action((("revision", index),), index=index)
+                    for index in range(1, revision)
+                ),
             ),
         }
     )
@@ -388,6 +393,83 @@ def test_targeted_reentry_completed_requires_fresh_canonical_w4_authority() -> N
     assert finalized.state.stop_reason is None
     assert finalized.record.research_result_revision == fresh.revision
     assert finalized.record.evidence_ids == ("fresh-evidence",)
+
+
+def test_formula_reentry_refreshes_query_spec_before_sql_proposal() -> None:
+    case = build_case(
+        "SELECT AVG(o.amount) FROM orders o",
+        (
+            ItemSpec(
+                source_id="formula",
+                kind=SemanticItemKind.FORMULA,
+                table="orders",
+                column="amount",
+            ),
+        ),
+    )
+    requested = _apply(
+        _state(case, revision=0),
+        _missing("formula"),
+        case,
+        _ids("request-1", "action-1"),
+    ).state
+    stale_query_spec = case.query_spec.model_copy(
+        update={
+            "semantic_items": (
+                case.query_spec.semantic_items[0].model_copy(
+                    update={
+                        "binding_ids": (),
+                        "status": SemanticItemStatus.UNRESOLVED,
+                    }
+                ),
+            )
+        }
+    )
+    stale_research = case.state.model_copy(
+        update={
+            "query_spec": stale_query_spec,
+            "bindings": (),
+            "unresolved_items": (),
+        }
+    )
+    requested = requested.model_copy(update={"query_spec": stale_query_spec})
+    admitted = admit_targeted_reentry(
+        requested,
+        stale_research,
+        "request-1",
+        base_revision=requested.revision,
+        id_factory=_ids("reentry-1"),
+    ).state
+    fresh = _fresh_research(case, revision=5)
+    fresh_requirements = validate_coverage_inputs(
+        fresh,
+        coverage_context(),
+        fresh.run_id,
+        fresh.run_incarnation,
+    )
+    resumed = finalize_targeted_reentry(
+        admitted,
+        "reentry-1",
+        ResearchReentryStatus.COMPLETED,
+        base_revision=admitted.revision,
+        research_state=fresh,
+        freshness_context=coverage_context(),
+        requirements=fresh_requirements,
+    ).state
+
+    transition = apply_solver_proposal(
+        resumed,
+        _sql("SELECT AVG(o.amount) FROM orders o"),
+        base_revision=resumed.revision,
+        dsn=POSTGRES_DSN,
+        table_namespace="main",
+        requirements=fresh_requirements,
+        id_factory=_ids("candidate-1", "action-2"),
+    )
+
+    assert transition.state.sql_candidates[-1].sql == (
+        "SELECT AVG(o.amount) FROM orders o"
+    )
 
 
 def test_targeted_reentry_rejects_new_unavailable_evidence() -> None:
@@ -783,6 +865,131 @@ def test_equivalent_sql_dedupes_by_existing_w5_digest_without_mutation() -> None
         )
 
     assert first.model_dump(mode="python") == before
+
+
+def test_failed_candidate_allows_same_semantics_with_corrected_sql_text() -> None:
+    case = _case()
+    first = _apply(
+        _state(case),
+        _sql("SELECT status FROM orders WHERE status = 'active'"),
+        case,
+        _ids("candidate-1", "action-1"),
+    ).state
+    failed_schema_check = CheckResult(
+        check_id="check-1",
+        candidate_id="candidate-1",
+        check_kind=CheckKind.SCHEMA,
+        status=CheckStatus.FAILED,
+        failure_code=CheckFailureCode.SCHEMA_REJECTED,
+        affected_source_ids=(),
+        affected_ast_node_ids=(),
+        observed_error="Column reference is ambiguous.",
+        required_change="Qualify the column reference.",
+    )
+    first = SolverState.model_validate(
+        {
+            **first.model_dump(mode="python"),
+            "check_results": (failed_schema_check,),
+        }
+    )
+
+    second = _apply(
+        first,
+        _sql("SELECT orders.status FROM orders WHERE orders.status = 'active'"),
+        case,
+        _ids("candidate-2", "action-2"),
+    ).state
+
+    assert tuple(item.candidate_id for item in second.sql_candidates) == (
+        "candidate-1",
+        "candidate-2",
+    )
+    second_failed_schema_check = failed_schema_check.model_copy(
+        update={"check_id": "check-2", "candidate_id": "candidate-2"}
+    )
+    second = SolverState.model_validate(
+        {
+            **second.model_dump(mode="python"),
+            "check_results": (*second.check_results, second_failed_schema_check),
+        }
+    )
+
+    with pytest.raises(SolverConflictError):
+        _apply(
+            second,
+            _sql("SELECT status FROM orders WHERE status = 'active'"),
+            case,
+            _ids("candidate-3", "action-3"),
+        )
+
+
+def test_failed_candidate_allows_exact_retry_after_completed_research_reentry() -> None:
+    case = _case()
+    sql = "SELECT status FROM orders WHERE status = 'active'"
+    first = _apply(
+        _state(case),
+        _sql(sql),
+        case,
+        _ids("candidate-1", "action-1"),
+    ).state
+    failed_check = CheckResult(
+        check_id="check-1",
+        candidate_id="candidate-1",
+        check_kind=CheckKind.SEMANTIC,
+        status=CheckStatus.FAILED,
+        failure_code=CheckFailureCode.UNAUTHORIZED_LITERAL,
+        affected_source_ids=(),
+        affected_ast_node_ids=("ast:projection:literal",),
+        observed_error="The literal lacks evidence.",
+        required_change="Research the literal value.",
+    )
+    checked = SolverState.model_validate(
+        {
+            **first.model_dump(mode="python"),
+            "check_results": (failed_check,),
+        }
+    )
+    requested = _apply(
+        checked,
+        _missing(),
+        case,
+        _ids("request-1", "action-2"),
+    ).state
+    admitted = admit_targeted_reentry(
+        requested,
+        case.state,
+        "request-1",
+        base_revision=requested.revision,
+        id_factory=_ids("reentry-1"),
+    ).state
+    fresh = _fresh_research(case)
+    fresh_requirements = validate_coverage_inputs(
+        fresh,
+        coverage_context(),
+        fresh.run_id,
+        fresh.run_incarnation,
+    )
+    resumed = finalize_targeted_reentry(
+        admitted,
+        "reentry-1",
+        ResearchReentryStatus.COMPLETED,
+        base_revision=admitted.revision,
+        research_state=fresh,
+        freshness_context=coverage_context(),
+        requirements=fresh_requirements,
+    ).state
+
+    retried = _apply(
+        resumed,
+        _sql(sql),
+        SimpleNamespace(requirements=fresh_requirements),
+        _ids("candidate-2", "action-3"),
+    ).state
+
+    assert tuple(item.candidate_id for item in retried.sql_candidates) == (
+        "candidate-1",
+        "candidate-2",
+    )
 
 
 def test_structural_sql_change_appends_and_preserves_prior_checks_and_results() -> None:

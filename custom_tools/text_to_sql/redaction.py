@@ -477,8 +477,7 @@ def _redact_embedded_json_text(value: str) -> str:
 
 def _redact_text_raw(value: str) -> str:
     def _is_sensitive_text_assignment_key(key: Any) -> bool:
-        normalized = _normalize_sensitive_key(key)
-        return normalized in _DSN_NAMESPACE_SECRET_KEYS or _is_sensitive_key(key)
+        return _is_sensitive_key(key)
 
     redacted = _redact_json_document(value)
     if redacted != value:

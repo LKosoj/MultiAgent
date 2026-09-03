@@ -18,7 +18,10 @@ from workflow.adaptive_state_store import (
 from workflow.deadline import DeadlineBudget
 
 from ..schema_loader import LoadedSchema
+from ..schema_memory import SemanticFact
+from ..schema_metadata import get_foreign_key_constraints
 from ..schema_namespace import SchemaScope
+from ..validators.schema_limiter import SchemaLimiter
 from ._semantic_value_certificate import (
     ExactValueCertificateError,
     evidence_observes_exact_column,
@@ -44,6 +47,7 @@ from .models import (
     ResearchAction,
     ResearchActionKind,
     ResearchState,
+    SemanticItemKind,
     SemanticItemStatus,
     PhysicalColumnBinding,
     VerticalAttributeBinding,
@@ -115,6 +119,7 @@ class ProductionResearchAssembly:
     deadline: DeadlineBudget
     is_cancelled: Callable[[], bool]
     semantic_repair_continuation: bool
+    stop_review_model: SchemaResearchDecisionModel | None = None
 
     def loop_arguments(self) -> dict[str, object]:
         return {
@@ -134,7 +139,39 @@ class ProductionResearchAssembly:
             "deadline": self.deadline,
             "is_cancelled": self.is_cancelled,
             "semantic_repair_continuation": self.semantic_repair_continuation,
+            "stop_review_model": self.stop_review_model,
         }
+
+
+def _bounded_hierarchical_table_hints(
+    schema: Mapping[str, object],
+    table_hints: tuple[str, ...],
+    *,
+    maximum_tables: int,
+) -> tuple[str, ...]:
+    """Keep retrieved tables and their immediate FK neighbours within one bound."""
+
+    if not table_hints or maximum_tables <= 0:
+        return ()
+    selected: list[str] = []
+    neighbours: dict[str, set[str]] = {name: set() for name in schema}
+    for source_table in schema:
+        for constraint in get_foreign_key_constraints(source_table, schema):
+            target_table = constraint["to_table"]
+            assert isinstance(target_table, str)
+            neighbours[source_table].add(target_table)
+            neighbours[target_table].add(source_table)
+    for table_name in dict.fromkeys(table_hints):
+        if len(selected) >= maximum_tables:
+            break
+        if table_name not in selected:
+            selected.append(table_name)
+        for neighbour in sorted(neighbours[table_name]):
+            if len(selected) >= maximum_tables:
+                break
+            if neighbour not in selected:
+                selected.append(neighbour)
+    return tuple(selected)
 
 
 def assemble_production_research(
@@ -144,6 +181,7 @@ def assemble_production_research(
     loaded_schema: LoadedSchema,
     semantic_table_hints: tuple[str, ...] = (),
     verified_probe_fact_hints: tuple[dict[str, object], ...] = (),
+    approved_semantic_fact_hints: tuple[SemanticFact, ...] = (),
     documents: tuple[SchemaEvidenceDocument, ...] = (),
     dsn: str,
     scope: SchemaScope,
@@ -158,6 +196,7 @@ def assemble_production_research(
     deadline: DeadlineBudget,
     is_cancelled: Callable[[], bool],
     semantic_repair_continuation: bool = False,
+    stop_review_model: SchemaResearchDecisionModel | None = None,
 ) -> ProductionResearchAssembly:
     """Wire trusted captured inputs to the existing adaptive research loop."""
 
@@ -174,6 +213,15 @@ def assemble_production_research(
         type(fact) is not dict for fact in verified_probe_fact_hints
     ):
         raise TypeError("verified_probe_fact_hints must be fact dictionaries")
+    if type(approved_semantic_fact_hints) is not tuple or any(
+        type(fact) is not SemanticFact
+        or fact.status != "approved"
+        or fact.table_fqn not in loaded_schema.schema
+        for fact in approved_semantic_fact_hints
+    ):
+        raise TypeError(
+            "approved_semantic_fact_hints must be approved captured schema facts"
+        )
     if type(documents) is not tuple or any(
         type(document) is not SchemaEvidenceDocument for document in documents
     ):
@@ -193,9 +241,16 @@ def assemble_production_research(
         raise ProductionResearchAssemblyError("research task must be non-empty text")
     if not callable(model) or not callable(is_cancelled):
         raise TypeError("model and cancellation boundary must be callable")
+    if stop_review_model is not None and not callable(stop_review_model):
+        raise TypeError("stop_review_model must be callable")
     if not isinstance(profile, SchemaResearchAgentProfile):
         raise TypeError("profile must be SchemaResearchAgentProfile")
     model_identity = _require_stable_model_identity(model_identity, profile.model)
+    semantic_table_hints = _bounded_hierarchical_table_hints(
+        loaded_schema.schema,
+        semantic_table_hints,
+        maximum_tables=SchemaLimiter().max_tables,
+    )
 
     loader = _CapturedSchemaOnlyLoader()
     schema_runtime = SchemaProbeRuntime(
@@ -229,35 +284,59 @@ def assemble_production_research(
         )
         if current is None:
             raise ProductionResearchAssemblyError("research state is not durable")
-        snapshot = checkpoint_store.get_snapshot(
-            AdaptiveCheckpointKey(
-                current.run_id,
-                current.run_incarnation,
-                AdaptiveLoopKind.RESEARCH,
-                current.revision,
-            )
+        checkpoint_key = AdaptiveCheckpointKey(
+            current.run_id,
+            current.run_incarnation,
+            AdaptiveLoopKind.RESEARCH,
+            current.revision,
         )
-        if snapshot.planned is None or not isinstance(snapshot.planned.action, dict):
-            raise ProductionResearchAssemblyError(
-                "planned research action is not durable"
+        checkpoint_keys = (checkpoint_key,)
+        if semantic_repair_continuation:
+            checkpoint_keys += (
+                AdaptiveCheckpointKey(
+                    current.run_id,
+                    current.run_incarnation,
+                    AdaptiveLoopKind.RESEARCH,
+                    current.revision + 1,
+                ),
             )
-        envelope = snapshot.planned.action
-        action_payload = envelope.get("action")
-        invocation_id = envelope.get("invocation_id")
-        if not isinstance(action_payload, dict) or not isinstance(invocation_id, str):
-            raise ProductionResearchAssemblyError("planned research action is malformed")
-        action = ResearchAction.model_validate_json(
-            canonical_json_bytes(action_payload),
-            strict=True,
-        )
-        if (
-            action.kind is not kind
-            or action.target != target
-            or action.parameters != parameters
-        ):
+        matches: list[tuple[ResearchAction, str]] = []
+        for key in checkpoint_keys:
+            snapshot = checkpoint_store.get_snapshot(key)
+            if snapshot.planned is None:
+                continue
+            envelope = snapshot.planned.action
+            if not isinstance(envelope, dict):
+                raise ProductionResearchAssemblyError(
+                    "planned research action is malformed"
+                )
+            action_payload = envelope.get("action")
+            if not isinstance(action_payload, dict):
+                raise ProductionResearchAssemblyError(
+                    "planned research action is malformed"
+                )
+            candidate = ResearchAction.model_validate_json(
+                canonical_json_bytes(action_payload),
+                strict=True,
+            )
+            if candidate.kind is ResearchActionKind.SEMANTIC_COMMIT:
+                continue
+            invocation_id = envelope.get("invocation_id")
+            if not isinstance(invocation_id, str):
+                raise ProductionResearchAssemblyError(
+                    "planned research action is malformed"
+                )
+            if (
+                candidate.kind is kind
+                and candidate.target == target
+                and candidate.parameters == parameters
+            ):
+                matches.append((candidate, invocation_id))
+        if len(matches) != 1:
             raise ProductionResearchAssemblyError(
                 "registry call differs from the durable planned action"
             )
+        action, invocation_id = matches[0]
         admitted = _state_with_reconciled_model_budget(
             current,
             budget_ledger,
@@ -312,8 +391,10 @@ def assemble_production_research(
             rejected_preflight_assessments=rejected_preflight_assessments,
             invalid_stop_generation_authority=invalid_stop_generation_authority,
             documents=documents,
-            semantic_table_hints=semantic_table_hints[:5],
+            semantic_table_hints=semantic_table_hints,
             verified_probe_fact_hints=verified_probe_fact_hints[:5],
+            approved_semantic_fact_hints=approved_semantic_fact_hints,
+            semantic_repair_continuation=semantic_repair_continuation,
         )
 
     return ProductionResearchAssembly(
@@ -346,6 +427,7 @@ def assemble_production_research(
         deadline=deadline,
         is_cancelled=is_cancelled,
         semantic_repair_continuation=semantic_repair_continuation,
+        stop_review_model=stop_review_model,
     )
 
 
@@ -355,6 +437,7 @@ async def run_production_schema_research(
     loaded_schema: LoadedSchema,
     semantic_table_hints: tuple[str, ...] = (),
     verified_probe_fact_hints: tuple[dict[str, object], ...] = (),
+    approved_semantic_fact_hints: tuple[SemanticFact, ...] = (),
     documents: tuple[SchemaEvidenceDocument, ...] = (),
     dsn: str,
     scope: SchemaScope,
@@ -369,6 +452,7 @@ async def run_production_schema_research(
     profile: SchemaResearchAgentProfile,
     is_cancelled: Callable[[], bool],
     loop_runner: Callable[..., Awaitable[ResearchLoopOutcome]],
+    stop_review_model: SchemaResearchDecisionModel | None = None,
 ) -> ResearchLoopOutcome:
     """Build trusted production dependencies and invoke the existing loop once."""
 
@@ -392,6 +476,7 @@ async def run_production_schema_research(
         loaded_schema=loaded_schema,
         semantic_table_hints=semantic_table_hints,
         verified_probe_fact_hints=verified_probe_fact_hints,
+        approved_semantic_fact_hints=approved_semantic_fact_hints,
         documents=documents,
         dsn=dsn,
         scope=scope,
@@ -405,6 +490,7 @@ async def run_production_schema_research(
         policy=policy,
         deadline=deadline,
         is_cancelled=is_cancelled,
+        stop_review_model=stop_review_model,
     )
     return await loop_runner(**assembly.loop_arguments())
 
@@ -508,6 +594,44 @@ def _require_stable_model_identity(model_identity: str, profile_model: str) -> s
     return expected
 
 
+def _derived_metric_continuation_after_invalid_stop(
+    state: ResearchState,
+    invalid_stop_generation_authority: tuple[CoverageInputErrorCode, tuple[str, ...]],
+) -> dict[str, object] | None:
+    """Return the one needed next research step for an incomplete metric result."""
+
+    reason_code, affected_source_ids = invalid_stop_generation_authority
+    if (
+        reason_code is not CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+        or state.result_expectations
+        or not any(
+            join.status is JoinCandidateStatus.VALIDATED
+            for join in state.join_candidates
+        )
+        or any(
+            item.status is not SemanticItemStatus.RESOLVED
+            for item in state.query_spec.semantic_items
+        )
+    ):
+        return None
+    metric_source_ids = sorted(
+        item.source_id
+        for item in state.query_spec.semantic_items
+        if item.kind is SemanticItemKind.METRIC
+        and item.source_id in affected_source_ids
+    )
+    if not metric_source_ids:
+        return None
+    return {
+        "kind": "derive_metric_result",
+        "source_ids": metric_source_ids,
+        "instruction": (
+            "Do not stop. Use one admissible research decision to establish the "
+            "derived metric result."
+        ),
+    }
+
+
 def _bounded_research_context(
     loaded_schema: LoadedSchema,
     state: ResearchState,
@@ -524,11 +648,14 @@ def _bounded_research_context(
     documents: tuple[SchemaEvidenceDocument, ...] = (),
     semantic_table_hints: tuple[str, ...] = (),
     verified_probe_fact_hints: tuple[dict[str, object], ...] = (),
+    approved_semantic_fact_hints: tuple[SemanticFact, ...] = (),
+    semantic_repair_continuation: bool = False,
 ) -> str:
     """Return the bounded, deterministic model view of the durable state."""
 
     if policy.model_budget is None:
         raise ProductionResearchAssemblyError("research policy has no model budget")
+    semantic_table_hints = semantic_table_hints[: SchemaLimiter().max_tables]
     maximum_bytes = policy.result_volume.inline_bytes
     maximum_prompt_bytes = _MAX_SCHEMA_RESEARCH_PROMPT_BYTES
 
@@ -594,17 +721,30 @@ def _bounded_research_context(
             "reason_code": reason_code.value,
             "affected_source_ids": list(sorted(affected_source_ids)),
         }
+        if continuation := _derived_metric_continuation_after_invalid_stop(
+            state, invalid_stop_generation_authority
+        ):
+            context["required_continuation"] = continuation
     if semantic_table_hints:
         context["semantic_table_hints"] = list(semantic_table_hints)
+    research_schema = (
+        {
+            table_name: loaded_schema.schema[table_name]
+            for table_name in semantic_table_hints
+        }
+        if semantic_table_hints
+        else loaded_schema.schema
+    )
     _fill_bounded_state_view(
         state,
         state_payload,
         state_view,
         context,
-        loaded_schema.schema,
+        research_schema,
         policy,
         maximum_bytes,
         fits_prompt,
+        semantic_repair_continuation,
     )
     if verified_probe_fact_hints:
         included_hints: list[dict[str, object]] = []
@@ -612,7 +752,7 @@ def _bounded_research_context(
         for hint in verified_probe_fact_hints:
             included_hints.append(hint)
             if _encode_context(
-                loaded_schema.schema,
+                research_schema,
                 context,
                 policy,
                 maximum_bytes,
@@ -622,9 +762,37 @@ def _bounded_research_context(
                 break
         if not included_hints:
             context.pop("verified_probe_fact_hints")
+    if approved_semantic_fact_hints:
+        included_facts: list[dict[str, object]] = []
+        context["approved_semantic_fact_hints"] = included_facts
+        for fact in sorted(
+            approved_semantic_fact_hints,
+            key=lambda item: (
+                item.table_fqn,
+                item.column or "",
+                item.subject,
+                item.fact_kind,
+                item.source,
+                str(item.value),
+            ),
+        ):
+            if fact.table_fqn not in research_schema:
+                continue
+            included_facts.append(fact.model_dump(mode="json"))
+            if _encode_context(
+                research_schema,
+                context,
+                policy,
+                maximum_bytes,
+                fits_prompt,
+            ) is None:
+                included_facts.pop()
+                break
+        if not included_facts:
+            context.pop("approved_semantic_fact_hints")
     _refresh_omitted_counts(state_payload, state_view, context)
     encoded = _encode_context(
-        loaded_schema.schema,
+        research_schema,
         context,
         policy,
         maximum_bytes,
@@ -745,6 +913,7 @@ def _fill_bounded_state_view(
     policy: AdaptivePolicyConfig,
     maximum_bytes: int,
     fits_prompt: Callable[[bytes], bool],
+    semantic_repair_continuation: bool,
 ) -> None:
     """Pack complete facts in the deterministic order required for a decision."""
 
@@ -890,7 +1059,15 @@ def _fill_bounded_state_view(
             for binding in bindings_for_source
             for evidence_id in binding.evidence_ids
         ):
-            return False
+            return (
+                include(
+                    "semantic_items",
+                    semantic_by_id[source_id],
+                    unresolved_id=unresolved_id,
+                )
+                if unresolved_id is not None
+                else False
+            )
 
         query_view = view["query_spec"]
         assert type(query_view) is dict
@@ -927,8 +1104,15 @@ def _fill_bounded_state_view(
             return True
         for _ in added_evidence_ids:
             evidence_values.pop()
+        if unresolved_id is not None and encode_current() is not None:
+            included_binding_ids.update(
+                binding.binding_id for binding in bindings_for_source
+            )
+            return True
         for _ in bindings_for_source:
             binding_values.pop()
+        if unresolved_id is not None and encode_current() is not None:
+            return True
         semantic_items.pop()
         if unresolved_id is not None:
             unresolved_values = view["unresolved_items"]
@@ -937,13 +1121,25 @@ def _fill_bounded_state_view(
         _refresh_omitted_counts(state_payload, view, context)
         return False
 
+    continuation_sources = {
+        item.source_id
+        for item in state.query_spec.semantic_items
+        if semantic_repair_continuation
+        and item.required
+        and item.kind is SemanticItemKind.FORMULA
+        and not item.binding_ids
+    }
+    included_source_ids: set[str] = set()
+    for source_id in sorted(continuation_sources):
+        if include_source(source_id):
+            included_source_ids.add(source_id)
+
     unresolved = {
         item.source_id
         for item in state.query_spec.semantic_items
         if item.required and item.source_id in state.unresolved_items
     }
-    included_source_ids: set[str] = set()
-    for source_id in sorted(unresolved):
+    for source_id in sorted(unresolved - included_source_ids):
         if include_source(source_id, unresolved_id=source_id):
             included_source_ids.add(source_id)
 

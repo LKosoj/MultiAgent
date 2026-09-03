@@ -556,6 +556,8 @@ def _run_data_probe(
                     rows,
                     query.profile_sample_limit,
                 )
+            if kind is ResearchActionKind.SEARCH_VALUE:
+                payload["requested_value"] = action_parameters[1][1]
             payload_bytes = canonical_json_bytes(payload)
             cost = _cost(
                 started_ns,

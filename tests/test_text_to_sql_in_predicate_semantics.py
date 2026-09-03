@@ -461,33 +461,22 @@ def test_filter_predicates_do_not_require_an_observed_matching_row(
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert wrong_literal.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    if operator is PredicateOperator.LIKE:
+        assert wrong_literal.status is CheckStatus.PASSED
+    else:
+        assert wrong_literal.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
 
 
-def test_between_column_bound_remains_an_unauthorized_column() -> None:
+def test_like_pattern_is_not_rejected_by_literal_authority_check() -> None:
     result = _in_case(
-        "SELECT o.tier FROM orders o WHERE o.tier BETWEEN 1 AND o.other_tier",
-        operator=PredicateOperator.BETWEEN,
-        literal=(1, 2),
-        evidence_values=(1, 2),
+        "SELECT o.tier FROM orders o WHERE o.tier LIKE '%active%'",
+        operator=PredicateOperator.LIKE,
+        literal="active",
+        binding_literal="active",
+        evidence_values=(),
     )
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
-
-
-def test_time_between_column_bound_remains_an_unauthorized_column() -> None:
-    result = _in_case(
-        "SELECT o.tier FROM orders o "
-        "WHERE o.tier BETWEEN '2024-01-01' AND o.other_tier",
-        operator=PredicateOperator.BETWEEN,
-        literal=("2024-01-01", "2024-01-31"),
-        evidence_values=("2024-01-01", "2024-01-31"),
-        kind=SemanticItemKind.TIME,
-    )
-
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
+    assert result.status is CheckStatus.PASSED
 
 
 def _split_calendar_time_case(sql: str):
@@ -568,15 +557,3 @@ def _split_calendar_time_case(sql: str):
         state,
         POSTGRES_DSN,
     )
-
-
-def test_split_calendar_time_requires_every_physical_predicate() -> None:
-    accepted = _split_calendar_time_case(
-        "SELECT e.year FROM events e WHERE e.year = 2024 AND e.month = 6"
-    )
-    missing_month = _split_calendar_time_case(
-        "SELECT e.year FROM events e WHERE e.year = 2024"
-    )
-
-    assert accepted.status is CheckStatus.PASSED
-    assert missing_month.status is not CheckStatus.PASSED

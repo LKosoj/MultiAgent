@@ -165,12 +165,15 @@ def _decode_item(
             "semantic item operator",
         )
     )
-    if exact_physical_predicate and (
-        kind not in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
-        or operator is None
-    ):
+    if kind not in {
+        SemanticItemKind.FILTER,
+        SemanticItemKind.TIME,
+        SemanticItemKind.FORMULA,
+    }:
+        exact_physical_predicate = False
+    if exact_physical_predicate and operator is None:
         raise QueryUnderstandingSemanticError(
-            "exact_physical_predicate requires FILTER or TIME with an operator"
+            "exact_physical_predicate requires FILTER, TIME, or FORMULA with an operator"
         )
     literal = _decode_literal(raw_item["literal_or_reference"])
     source_id = _stable_id(
@@ -238,7 +241,9 @@ def _enum_value(enum_type: type[Any], value: object, label: str) -> Any:
 
 
 def _require_exact_keys(
-    value: Mapping[str, object], expected: frozenset[str], label: str
+    value: Mapping[str, object],
+    expected: frozenset[str],
+    label: str,
 ) -> None:
     if set(value) != expected:
         raise QueryUnderstandingDecodeError(

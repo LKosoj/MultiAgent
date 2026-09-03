@@ -141,8 +141,8 @@ def test_sql_safety_check_cache_ttl_zero_disables_cache(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_sql_safety_check_timeout_marks_unsafe(monkeypatch):
-    """Таймаут на LLM-аудите → is_safe=False, issue_type=LLM_AUDIT_TIMEOUT."""
+def test_sql_safety_check_timeout_keeps_static_safe_result(monkeypatch):
+    """Сбой advisory-аудита не отменяет успешную статическую проверку."""
     _clear_llm_safety_cache()
     monkeypatch.setenv("TEXT_TO_SQL_LLM_SAFETY_TIMEOUT_S", "0.3")
 
@@ -154,10 +154,32 @@ def test_sql_safety_check_timeout_marks_unsafe(monkeypatch):
     sql_validator = core_module.sql_validator
 
     result = sql_safety_check("SELECT 7 FROM dual_timeout_test", sql_validator=sql_validator)
-    assert result["is_safe"] is False
+    assert result["is_safe"] is True
     assert result["llm_audit"] == "timeout"
-    issue_types = {i.get("issue_type") for i in result.get("issues", [])}
+    issue_types = {i.get("issue_type") for i in result.get("advisory_issues", [])}
     assert "LLM_AUDIT_TIMEOUT" in issue_types
+
+
+def test_sql_safety_check_runtime_error_keeps_static_safe_result(monkeypatch):
+    """W0-0.5: RuntimeError советника не отменяет успешную статическую проверку (fail-open)."""
+    _clear_llm_safety_cache()
+
+    def boom(**kwargs):
+        raise RuntimeError("advisor down")
+
+    monkeypatch.setattr(core_module, "call_openai_api", boom)
+    sql_validator = core_module.sql_validator
+
+    result = sql_safety_check(
+        "SELECT 7 FROM dual_runtime_error_test", sql_validator=sql_validator
+    )
+    assert result["is_safe"] is True
+    assert result["safety_status"] == "safe"
+    assert result["llm_audit"] == "failed"
+    advisory_issue_types = {i.get("issue_type") for i in result.get("advisory_issues", [])}
+    assert "LLM_AUDIT_FAILED" in advisory_issue_types
+    blocking_issue_types = {i.get("issue_type") for i in result.get("issues", [])}
+    assert "LLM_AUDIT_FAILED" not in blocking_issue_types
 
 
 def test_sql_safety_check_timeout_not_cached(monkeypatch):

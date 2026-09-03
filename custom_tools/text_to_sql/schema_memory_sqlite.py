@@ -20,6 +20,7 @@ import os
 import sys
 import json
 import time
+import math
 import hashlib
 import logging
 import sqlite3
@@ -27,7 +28,9 @@ import threading
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Sequence
+
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from .schema_memory_chroma import _resolve_chroma_metric, _distance_to_similarity
 from .schema_metadata import is_pk, is_fk
@@ -60,6 +63,78 @@ def _redact_schema_memory_value(value: Any) -> Any:
 _PERSISTED_DATA_PROBE_KINDS = frozenset(
     {"profile_column", "sample_rows", "search_value", "distinct_values"}
 )
+
+
+class SemanticFact(BaseModel):
+    """A durable, schema-scoped semantic fact."""
+
+    model_config = ConfigDict(frozen=True)
+
+    subject: Literal["table", "column"]
+    table_fqn: str
+    column: str | None = None
+    fact_kind: Literal["description", "example"]
+    value: str | int | float | bool | None
+    source: Literal["file", "typed_probe"]
+    status: Literal["approved", "candidate"]
+
+    @field_validator("table_fqn")
+    @classmethod
+    def _require_table_fqn(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("table_fqn must be non-empty")
+        return value
+
+    @field_validator("column")
+    @classmethod
+    def _normalize_column(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("column must be non-empty when provided")
+        return value
+
+    @field_validator("value")
+    @classmethod
+    def _require_finite_float(cls, value: str | int | float | bool | None) -> str | int | float | bool | None:
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("semantic fact values must be finite")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_subject(self) -> "SemanticFact":
+        if self.subject == "column" and self.column is None:
+            raise ValueError("column facts require column")
+        if self.subject == "table" and self.column is not None:
+            raise ValueError("table facts must not include column")
+        if self.fact_kind == "description" and (
+            not isinstance(self.value, str) or not self.value.strip()
+        ):
+            raise ValueError("description facts require a non-empty text value")
+        return self
+
+
+def _semantic_fact_key(fact: SemanticFact) -> str:
+    from .adaptive.serialization import canonical_digest
+
+    return "text2sql-semantic-fact-v1-" + canonical_digest(
+        fact.model_dump(mode="json")
+    ).removeprefix("sha256:")
+
+
+def _semantic_fact_source_digest(facts: Sequence[SemanticFact]) -> str:
+    from .adaptive.serialization import canonical_digest
+
+    return canonical_digest(
+        sorted(
+            (fact.model_dump(mode="json") for fact in facts),
+            key=lambda fact: json.dumps(fact, ensure_ascii=False, sort_keys=True),
+        )
+    )
+
+
+def _semantic_file_snapshot_key(source_digest: str) -> str:
+    return "text2sql-semantic-file-snapshot-v1-" + source_digest.removeprefix(
+        "sha256:"
+    )
 
 
 def _probe_fact_key(fact: dict[str, Any]) -> str:
@@ -123,6 +198,45 @@ def _verified_probe_facts(
             }
         )
     return facts
+
+
+def _approved_semantic_facts_from_probe_fact(
+    fact: dict[str, Any],
+) -> tuple[SemanticFact, ...]:
+    """Promote direct, complete column-value probes into approved examples."""
+    if fact.get("probe_kind") not in {"search_value", "distinct_values"}:
+        return ()
+    target = fact.get("target")
+    payload = fact.get("payload")
+    if not isinstance(target, dict) or not isinstance(payload, dict):
+        return ()
+    table_ref = target.get("table")
+    column = target.get("column")
+    values = payload.get("values")
+    if not isinstance(table_ref, dict) or not isinstance(column, str):
+        return ()
+    table_parts = [
+        table_ref.get(name)
+        for name in ("namespace", "schema", "table")
+        if isinstance(table_ref.get(name), str) and table_ref[name]
+    ]
+    if not table_parts or not isinstance(values, list):
+        return ()
+    return tuple(
+        SemanticFact(
+            subject="column",
+            table_fqn=".".join(table_parts),
+            column=column,
+            fact_kind="example",
+            value=value,
+            source="typed_probe",
+            status="approved",
+        )
+        for value in values
+        if value is None
+        or isinstance(value, (str, int, bool))
+        or (isinstance(value, float) and math.isfinite(value))
+    )
 
 
 # === W2-T1: Кастомные исключения для fail-fast индексации схемы ===
@@ -1558,6 +1672,239 @@ class SchemaMemoryManager:
             )
             if type(saved_step) is not int or saved_step < 0:
                 raise SchemaIndexingError("verified Typed probe fact was not persisted")
+            self.save_approved_semantic_facts(
+                namespace,
+                _approved_semantic_facts_from_probe_fact(fact),
+            )
+
+    def find_approved_semantic_facts(
+        self,
+        terms: Sequence[str],
+        namespace: SchemaNamespace,
+    ) -> List[SemanticFact]:
+        """Read matching approved facts from one exact schema namespace."""
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        normalized_terms = tuple(
+            dict.fromkeys(
+                term.casefold()
+                for term in terms
+                if isinstance(term, str) and term.strip()
+            )
+        )
+        if not normalized_terms:
+            return []
+        from memory.tools import get_memory, memory_requester_context
+
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_semantic_fact",
+                requesting_agent="Schema-RAG-Agent",
+            )
+        latest_file_snapshot: tuple[int, str] | None = None
+        candidates: list[tuple[int, str, int, str, SemanticFact]] = []
+        for sequence, record in enumerate(records):
+            data = record.get("data") if isinstance(record, dict) else None
+            if (
+                not isinstance(data, dict)
+                or data.get("schema_version") != namespace.version_key
+            ):
+                continue
+            step = record.get("step") if isinstance(record, dict) else None
+            sequence_or_step = step if isinstance(step, int) else sequence
+            if data.get("is_file_snapshot") is True:
+                source_digest = data.get("source_digest")
+                if (
+                    isinstance(source_digest, str)
+                    and data.get("cache_key")
+                    == _semantic_file_snapshot_key(source_digest)
+                    and (
+                        latest_file_snapshot is None
+                        or sequence_or_step > latest_file_snapshot[0]
+                    )
+                ):
+                    latest_file_snapshot = (sequence_or_step, source_digest)
+                continue
+            try:
+                fact = SemanticFact.model_validate(data.get("fact"))
+            except (TypeError, ValueError):
+                continue
+            if fact.status != "approved":
+                continue
+            key = data.get("cache_key")
+            if not isinstance(key, str) or key != _semantic_fact_key(fact):
+                continue
+            rendered = json.dumps(
+                fact.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+            ).casefold()
+            candidates.append(
+                (
+                    sum(term in rendered for term in normalized_terms),
+                    key,
+                    sequence_or_step,
+                    data.get("source_digest") if isinstance(data.get("source_digest"), str) else key,
+                    fact,
+                )
+            )
+        latest_file_source: dict[tuple[str, str, str | None, str], tuple[int, str]] = {}
+        for _score, _key, step, source_digest, fact in candidates:
+            if fact.source != "file":
+                continue
+            identity = (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
+            previous = latest_file_source.get(identity)
+            if previous is None or step > previous[0]:
+                latest_file_source[identity] = (step, source_digest)
+        return [
+            fact
+            for _score, _key, _step, source_digest, fact in sorted(
+                candidates, key=lambda item: (-item[0], item[1])
+            )
+            if _score
+            if fact.source != "file"
+            or (
+                source_digest == latest_file_snapshot[1]
+                if latest_file_snapshot is not None
+                else source_digest
+                == latest_file_source[
+                    (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
+                ][1]
+            )
+        ]
+
+    def save_approved_semantic_facts(
+        self,
+        namespace: SchemaNamespace,
+        facts: Sequence[SemanticFact],
+    ) -> None:
+        """Persist each approved fact once in the existing schema memory."""
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        from memory.tools import get_memory, memory_requester_context, save_memory
+
+        facts = tuple(facts)
+        for fact in facts:
+            if not isinstance(fact, SemanticFact):
+                raise TypeError("facts must contain SemanticFact values")
+            if fact.status != "approved":
+                raise ValueError("only approved semantic facts may be persisted")
+        file_facts = tuple(fact for fact in facts if fact.source == "file")
+        if file_facts:
+            self.replace_file_semantic_facts(namespace, file_facts)
+            facts = tuple(fact for fact in facts if fact.source != "file")
+
+        for fact in facts:
+            fact_key = _semantic_fact_key(fact)
+            with memory_requester_context("Schema-RAG-Agent"):
+                existing = get_memory(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_semantic_fact",
+                    cache_key=fact_key,
+                    requesting_agent="Schema-RAG-Agent",
+                )
+            if any(
+                isinstance(record, dict)
+                and isinstance(record.get("data"), dict)
+                and record["data"].get("fact") == fact.model_dump(mode="json")
+                for record in existing
+            ):
+                continue
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_semantic_fact",
+                    "cache_key": fact_key,
+                    "cache_source": "typed_semantic_fact",
+                    "schema_version": namespace.version_key,
+                    "source_digest": None,
+                    "fact": fact.model_dump(mode="json"),
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError("approved semantic fact was not persisted")
+
+    def replace_file_semantic_facts(
+        self,
+        namespace: SchemaNamespace,
+        facts: Sequence[SemanticFact],
+    ) -> None:
+        """Replace the current file-owned fact snapshot, including an empty one."""
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        facts = tuple(facts)
+        for fact in facts:
+            if not isinstance(fact, SemanticFact) or fact.source != "file":
+                raise TypeError("file snapshots must contain file SemanticFact values")
+            if fact.status != "approved":
+                raise ValueError("only approved semantic facts may be persisted")
+        from memory.tools import get_memory, memory_requester_context, save_memory
+
+        file_source_digest = _semantic_fact_source_digest(facts)
+        snapshot_key = _semantic_file_snapshot_key(file_source_digest)
+        with memory_requester_context("Schema-RAG-Agent"):
+            existing = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_semantic_fact",
+                cache_key=snapshot_key,
+                requesting_agent="Schema-RAG-Agent",
+            )
+        if not any(
+            isinstance(record, dict)
+            and isinstance(record.get("data"), dict)
+            and record["data"].get("is_file_snapshot") is True
+            and record["data"].get("source_digest") == file_source_digest
+            for record in existing
+        ):
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_semantic_fact",
+                    "cache_key": snapshot_key,
+                    "cache_source": "typed_semantic_fact",
+                    "schema_version": namespace.version_key,
+                    "is_file_snapshot": True,
+                    "source_digest": file_source_digest,
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError("semantic file snapshot was not persisted")
+
+        for fact in facts:
+            fact_key = _semantic_fact_key(fact)
+            with memory_requester_context("Schema-RAG-Agent"):
+                existing = get_memory(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_semantic_fact",
+                    cache_key=fact_key,
+                    requesting_agent="Schema-RAG-Agent",
+                )
+            if any(
+                isinstance(record, dict)
+                and isinstance(record.get("data"), dict)
+                and record["data"].get("fact") == fact.model_dump(mode="json")
+                for record in existing
+            ):
+                continue
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_semantic_fact",
+                    "cache_key": fact_key,
+                    "cache_source": "typed_semantic_fact",
+                    "schema_version": namespace.version_key,
+                    "source_digest": file_source_digest,
+                    "fact": fact.model_dump(mode="json"),
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError("approved semantic fact was not persisted")
 
     def set_schema_ready_marker(
         self,

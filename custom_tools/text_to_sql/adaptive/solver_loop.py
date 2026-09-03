@@ -13,12 +13,15 @@ from .models import (
     Binding,
     BindingStatus,
     DocumentRuleBinding,
+    EvidenceSourceKind,
     HypothesisStatus,
     Id,
     MissingEvidenceRequest,
+    QueryProbeRef,
     ResearchReentryRecord,
     ResearchReentryStatus,
     ResearchState,
+    SemanticItemKind,
     SolverAction,
     SolverActionKind,
     SolverState,
@@ -117,6 +120,7 @@ def apply_solver_proposal(
     requirements: CoverageRequirements,
     id_factory: Callable[[], str],
     trusted_semantic_repair: bool = False,
+    trusted_predicate_authority: bool = False,
 ) -> SolverTransitionResult:
     """Accept exactly one solver proposal without running checks or SQL."""
 
@@ -145,6 +149,14 @@ def apply_solver_proposal(
     ):
         raise SolverProtocolError(
             "semantic binding repair requires a trusted result review"
+        )
+    if (
+        type(proposal.proposal) is MissingEvidenceProposal
+        and proposal.proposal.predicate_authority is not None
+        and not trusted_predicate_authority
+    ):
+        raise SolverProtocolError(
+            "predicate authority requires a trusted result review"
         )
     if len(state.sql_candidates) >= 8 and isinstance(
         proposal.proposal, SqlCandidateProposal
@@ -406,10 +418,26 @@ def finalize_targeted_reentry(
         if item.missing_evidence_request_id == current.missing_evidence_request_id
     )
     semantic_repair = request.repair_kind == "semantic_binding_mismatch"
+    request_item = next(
+        item
+        for item in state.query_spec.semantic_items
+        if item.source_id == request.source_id
+    )
+    formula_continuation = (
+        request.repair_kind is None
+        and request_item.kind is SemanticItemKind.FORMULA
+        and not request_item.binding_ids
+    )
+    research_continuation = (
+        semantic_repair
+        or formula_continuation
+        or request.predicate_authority is not None
+    )
 
     result_revision: int | None = None
     evidence_ids: tuple[str, ...] = ()
     next_stop_reason = SolverStopReason.MISSING_EVIDENCE
+    next_query_spec = state.query_spec
     if status is ResearchReentryStatus.COMPLETED:
         if research_state is None or freshness_context is None or requirements is None:
             raise SolverProtocolError(
@@ -439,7 +467,7 @@ def finalize_targeted_reentry(
             or research_state.schema_namespace_version != state.schema_namespace_version
             or (
                 research_state.revision <= current.research_base_revision
-                if semantic_repair
+                if research_continuation
                 else research_state.revision != current.research_base_revision + 1
             )
         ):
@@ -487,6 +515,9 @@ def finalize_targeted_reentry(
         new_evidence = tuple(
             item for item in research_state.evidence if item.evidence_id not in baseline
         )
+        evidence_pool = (
+            research_state.evidence if research_continuation else new_evidence
+        )
         source_targets = _source_reentry_targets(
             research_state,
             selected,
@@ -497,18 +528,36 @@ def finalize_targeted_reentry(
         }
         eligible_new_evidence = tuple(
             item
-            for item in new_evidence
-            if (not semantic_repair or item.evidence_id in selected_evidence_ids)
-            and (semantic_repair or item.source_kind is request.required_evidence_kind)
+            for item in evidence_pool
+            if (
+                not research_continuation
+                or item.evidence_id in selected_evidence_ids
+            )
+            and (
+                research_continuation
+                or item.source_kind is request.required_evidence_kind
+            )
             and evidence_has_state_authority(item, research_state)
             and item.observed_at <= freshness_context.evaluated_at
             and item.created_at <= freshness_context.evaluated_at
             and evaluate_evidence_freshness(item, freshness_context).status
             is FreshnessStatus.FRESH
-            and any(_exact_value(item.target, target) for target in source_targets)
+            and (
+                research_continuation
+                or (
+                    (
+                        request.required_evidence_kind is EvidenceSourceKind.PROBE
+                        and type(item.target) is QueryProbeRef
+                    )
+                    or any(
+                        _exact_value(item.target, target) for target in source_targets
+                    )
+                )
+            )
         )
         if not eligible_new_evidence or (
-            not semantic_repair and len(eligible_new_evidence) != len(new_evidence)
+            not research_continuation
+            and len(eligible_new_evidence) != len(new_evidence)
         ):
             raise SolverValidationError(
                 "research result has no eligible fresh evidence for the request source"
@@ -516,6 +565,7 @@ def finalize_targeted_reentry(
         evidence_ids = tuple(sorted(item.evidence_id for item in eligible_new_evidence))
         result_revision = research_state.revision
         next_stop_reason = None
+        next_query_spec = research_state.query_spec
     elif any(
         value is not None for value in (research_state, freshness_context, requirements)
     ):
@@ -535,6 +585,7 @@ def finalize_targeted_reentry(
         {
             **state.model_dump(mode="python"),
             "revision": state.revision + 1,
+            "query_spec": next_query_spec,
             "research_reentries": tuple(records),
             "stop_reason": next_stop_reason,
         }
@@ -577,7 +628,7 @@ def _apply_sql_proposal(
 ) -> SolverTransitionResult:
     from ._sql_ast_identity import semantic_candidate_digest, source_sql_digest
     from ._sql_ast_models import ParsedSqlCandidate
-    from .models import SqlCandidate
+    from .models import CheckStatus, SqlCandidate
 
     candidate_id, action_id = generated_ids
     if (
@@ -593,9 +644,41 @@ def _apply_sql_proposal(
         normalized_ast_digest=parsed_candidate.candidate_digest,
         revision=requirements.state_revision,
     )
-    if any(
-        item.normalized_ast_digest == candidate.normalized_ast_digest
-        for item in state.sql_candidates
+    matching_candidate = next(
+        (
+            item
+            for item in reversed(state.sql_candidates)
+            if item.normalized_ast_digest == candidate.normalized_ast_digest
+        ),
+        None,
+    )
+    exact_candidate = next(
+        (item for item in reversed(state.sql_candidates) if item.sql == candidate.sql),
+        None,
+    )
+    exact_retry_after_research = (
+        exact_candidate is not None
+        and any(
+            check.candidate_id == exact_candidate.candidate_id
+            and check.status is CheckStatus.FAILED
+            for check in state.check_results
+        )
+        and any(
+            reentry.status is ResearchReentryStatus.COMPLETED
+            and reentry.research_result_revision is not None
+            and candidate.revision
+            >= reentry.research_result_revision
+            > exact_candidate.revision
+            for reentry in state.research_reentries
+        )
+    )
+    if (exact_candidate is not None and not exact_retry_after_research) or (
+        matching_candidate is not None
+        and not any(
+            check.candidate_id == matching_candidate.candidate_id
+            and check.status is CheckStatus.FAILED
+            for check in state.check_results
+        )
     ):
         raise SolverConflictError("SQL candidate normalized_ast_digest already exists")
     action = SolverAction(
@@ -640,6 +723,7 @@ def _apply_missing_evidence_proposal(
         reason=proposal.reason,
         repair_kind=proposal.repair_kind,
         repair_binding_id=proposal.repair_binding_id,
+        predicate_authority=proposal.predicate_authority,
     )
     action = SolverAction(
         action_id=action_id,
@@ -688,7 +772,6 @@ def _validate_transition_authority(
         or requirements.run_incarnation != state.run_incarnation
         or requirements.schema_namespace_version != state.schema_namespace_version
         or requirements.state_revision < state.query_spec.revision
-        or requirements.state_revision > state.revision
         or requirements.expected_result_shape != state.query_spec.expected_result_shape
         or requirements.required_source_ids
         != tuple(

@@ -48,6 +48,7 @@ from .models import (
     ResearchAction,
     ResearchActionKind,
     ResearchState,
+    SemanticItem,
     TableRef,
     TargetRef,
     VerticalAttributeBinding,
@@ -275,6 +276,9 @@ def admit_semantic_turn(
     )
     _require_unique_ids((item.join_id for item in new_joins), "join")
     all_joins = {**joins_by_id, **{item.join_id: item for item in new_joins}}
+    semantic_items_by_source = {
+        item.source_id: item for item in current.query_spec.semantic_items
+    }
     for proposal in decision.proposals:
         if isinstance(proposal, NewBindingProposal):
             item = _new_binding(
@@ -283,6 +287,7 @@ def admit_semantic_turn(
                 all_joins,
                 proposal_ids,
                 current.schema_namespace_version,
+                semantic_items_by_source.get(proposal.source_id),
             )
             proposal_ids[proposal.proposal_key] = item.binding_id
             new_bindings.append(item)
@@ -330,6 +335,7 @@ def admit_semantic_turn(
                     proposal.certificate,
                     cited,
                     declared_join_ids=batch.declared_join_ids,
+                    schema_columns=batch.schema_columns,
                 )
             )
 
@@ -531,6 +537,22 @@ def _new_join(
     )
     if not path:
         path = (JoinEdge(left=left, right=right, join_type=proposal.join_type),)
+    if proposal.join_type is JoinType.INNER and not _is_composite_relation(path):
+        oriented_path = [path[0]]
+        for edge in path[1:]:
+            previous = oriented_path[-1]
+            if (
+                edge.join_type is JoinType.INNER
+                and previous.right.table == edge.right.table
+                and edge.left.table != edge.right.table
+            ):
+                edge = JoinEdge(
+                    left=edge.right,
+                    right=edge.left,
+                    join_type=edge.join_type,
+                )
+            oriented_path.append(edge)
+        path = tuple(oriented_path)
     endpoints_match = path[0].left == left and path[0].right == right
     if proposal.join_type is JoinType.INNER and _target_key(right) < _target_key(left):
         left, right = right, left
@@ -588,6 +610,7 @@ def _new_binding(
     joins: Mapping[str, JoinCandidate],
     proposal_ids: Mapping[str, str],
     schema: str,
+    semantic_item: SemanticItem | None,
 ) -> BindingBase:
     candidate = proposal.candidate
     referenced = tuple(
@@ -616,6 +639,8 @@ def _new_binding(
             "source": proposal.source_id,
             "column": _target_data(column),
         }
+        if join_path:
+            payload["joins"] = [_edge_data(edge) for edge in join_path]
         return PhysicalColumnBinding(
             binding_id=_stable_id("binding", payload),
             tables=(column.table,),
@@ -683,8 +708,17 @@ def _new_binding(
         )
     if isinstance(candidate, DiscriminatorValueCandidate):
         column = resolver.column(candidate.discriminator_column)
+        discriminator_predicate = resolver.predicate(
+            candidate.discriminator_predicate
+        )
+        if semantic_item is not None and semantic_item.exact_physical_predicate:
+            discriminator_predicate = PredicateRef(
+                left=column,
+                operator=semantic_item.operator,
+                right=semantic_item.literal_or_reference,
+            )
         predicates = (
-            resolver.predicate(candidate.discriminator_predicate),
+            discriminator_predicate,
             *(
                 resolver.predicate(predicate)
                 for predicate in candidate.additional_predicates
@@ -711,6 +745,8 @@ def _new_binding(
             payload["predicates"] = [
                 item.model_dump(mode="json") for item in predicates
             ]
+        if join_path:
+            payload["joins"] = [_edge_data(edge) for edge in join_path]
         return DiscriminatorValueBinding(
             binding_id=_stable_id("binding", payload),
             tables=tables,
@@ -743,6 +779,8 @@ def _new_binding(
             "rule_excerpt": candidate.rule_excerpt,
             "inputs": [_target_data(item) for item in inputs],
         }
+        if join_path:
+            payload["joins"] = [_edge_data(edge) for edge in join_path]
         return DerivedExpressionBinding(
             binding_id=_stable_id("binding", payload),
             tables=tuple(
@@ -1023,7 +1061,16 @@ def _discriminator_certificate(
             cited,
             schema_columns,
         )
-        and predicate_has_valid_literal(predicate)
+        and (
+            _positive_predicate_certificate(predicate, cited)
+            if predicate.operator
+            in {
+                PredicateOperator.EQ,
+                PredicateOperator.IN,
+                PredicateOperator.IS_NULL,
+            }
+            else predicate_has_valid_literal(predicate)
+        )
         for predicate in item.predicates
     )
 
@@ -1220,11 +1267,16 @@ def _assess_join(
     cited: tuple[EvidenceRecord, ...],
     *,
     declared_join_ids: tuple[Id, ...] = (),
+    schema_columns: tuple[ColumnRef, ...] = (),
 ) -> JoinCandidate:
     if certificate == "insufficient":
         return item
     if certificate == "consistent" and (
         item.join_id in declared_join_ids
+        or all(
+            edge.left in schema_columns and edge.right in schema_columns
+            for edge in item.path
+        )
         or any(_declared_join_certificate(item, record) for record in cited)
     ):
         return item.model_copy(

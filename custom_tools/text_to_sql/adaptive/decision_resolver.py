@@ -70,7 +70,6 @@ from .research_decision import (
     NewBindingProposal,
     NewJoinProposal,
     ResearchDecisionV1,
-    SemanticCommitRequest,
     ToolIntent,
 )
 from .semantic_reducer import (
@@ -96,12 +95,25 @@ class DecisionResolverError(ValueError):
 class UnresolvableModelDecisionError(DecisionResolverError):
     """The model supplied a reference or semantic claim that cannot be resolved."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        exact_column: ColumnRef | None = None,
+    ) -> None:
+        self.exact_column = exact_column
+        super().__init__(message)
+
 
 class DuplicateExistingBindingProposalError(UnresolvableModelDecisionError):
     """A new-binding proposal resolves to an already durable binding."""
 
-    def __init__(self, proposal_keys: tuple[str, ...]) -> None:
-        self.proposal_keys = proposal_keys
+    def __init__(
+        self, existing_binding_ids_by_proposal_key: tuple[tuple[str, str], ...]
+    ) -> None:
+        self.existing_binding_ids_by_proposal_key = (
+            existing_binding_ids_by_proposal_key
+        )
         super().__init__("new binding already exists")
 
 
@@ -332,7 +344,12 @@ class _ScopedResolver:
         ]
         if len(exact) != 1 or len(folded) != 1:
             raise UnresolvableModelDecisionError(
-                "logical column is missing, ambiguous, or differs by case"
+                "logical column is missing, ambiguous, or differs by case",
+                exact_column=(
+                    ColumnRef(table=table, column=folded[0])
+                    if not exact and len(folded) == 1
+                    else None
+                ),
             )
         resolved = ColumnRef(table=table, column=exact[0])
         self._resolved_columns[key] = resolved
@@ -498,7 +515,11 @@ def resolve_research_decision(
             isinstance(proposal, JoinAssessment)
             and isinstance(proposal.subject, ExistingJoinRef)
         ):
-            resolver.record_declared_join(joins_by_id[proposal.subject.join_id])
+            join = joins_by_id[proposal.subject.join_id]
+            for edge in join.path:
+                resolver.record_existing_physical_column(edge.left)
+                resolver.record_existing_physical_column(edge.right)
+            resolver.record_declared_join(join)
         elif isinstance(proposal, NewJoinProposal):
             join = _new_join(proposal, resolver, current.schema_namespace_version)
             resolver.record_declared_join(join)
@@ -583,7 +604,10 @@ def resolve_research_decision(
     try:
         semantic_resolver = _SemanticResolver(batch)
         all_joins = {**joins_by_id, **proposed_joins}
-        duplicate_binding_proposal_keys: list[str] = []
+        semantic_items_by_source = {
+            item.source_id: item for item in current.query_spec.semantic_items
+        }
+        duplicate_existing_binding_ids_by_proposal_key: list[tuple[str, str]] = []
         for proposal in parsed.proposals:
             if isinstance(proposal, NewBindingProposal):
                 binding = _new_binding(
@@ -592,12 +616,15 @@ def resolve_research_decision(
                     all_joins,
                     proposed_join_ids,
                     current.schema_namespace_version,
+                    semantic_items_by_source.get(proposal.source_id),
                 )
                 if binding.binding_id in bindings_by_id:
-                    duplicate_binding_proposal_keys.append(proposal.proposal_key)
-        if duplicate_binding_proposal_keys:
+                    duplicate_existing_binding_ids_by_proposal_key.append(
+                        (proposal.proposal_key, binding.binding_id)
+                    )
+        if duplicate_existing_binding_ids_by_proposal_key:
             raise DuplicateExistingBindingProposalError(
-                tuple(duplicate_binding_proposal_keys)
+                tuple(sorted(duplicate_existing_binding_ids_by_proposal_key))
             )
         admission = admit_semantic_turn(
             current,

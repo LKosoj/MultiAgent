@@ -19,7 +19,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 import uuid
 
 
@@ -87,6 +87,7 @@ CANONICAL_CASE_COUNTS = {"bird": 500, "spider": 135}
 CANONICAL_RELEASE_DATASET_ORDER = release_support.CANONICAL_RELEASE_DATASET_ORDER
 RELEASE_POLICY_PATH = REPO_ROOT / "config/text_to_sql/public_benchmark_release_policy.json"
 EARLY_STOP_AWAITING_DECISION = 2
+STALE_TRACE_SECONDS = 300.0
 _SCHEMA_ABSTENTION_REASONS = frozenset(
     {
         "SCHEMA_CLARIFICATION_REQUIRED",
@@ -614,6 +615,83 @@ class ObservationWriter:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+
+
+class BenchmarkRunWatcher:
+    """Emit the runner's observable run milestones while it polls one case."""
+
+    def __init__(
+        self,
+        run_id: str,
+        emit: Callable[[dict[str, object]], None],
+        *,
+        stale_after_seconds: float = STALE_TRACE_SECONDS,
+    ) -> None:
+        self._run_id = run_id
+        self._emit = emit
+        self._stale_after_seconds = stale_after_seconds
+        self._last_status: str | None = None
+        self._last_progress_at: float | None = None
+        self._stale_reported = False
+
+    def observe(self, status: str, *, observed_at: float) -> None:
+        if status != self._last_status:
+            self._last_status = status
+            self._last_progress_at = observed_at
+            self._stale_reported = False
+            self._emit(
+                {
+                    "event": "workflow_checkpoint",
+                    "run_id": self._run_id,
+                    "workflow_status": status,
+                }
+            )
+        elif (
+            self._last_progress_at is not None
+            and not self._stale_reported
+            and observed_at - self._last_progress_at >= self._stale_after_seconds
+        ):
+            self._stale_reported = True
+            self._emit(
+                {
+                    "event": "stale_trace",
+                    "run_id": self._run_id,
+                    "workflow_status": status,
+                    "stale_seconds": observed_at - self._last_progress_at,
+                }
+            )
+
+    def sql_execution(self, *, executed: bool) -> None:
+        self._emit(
+            {
+                "event": "sql_execution",
+                "run_id": self._run_id,
+                "executed": executed,
+            }
+        )
+
+    def terminal(self, status: str) -> None:
+        self._emit(
+            {
+                "event": "terminal",
+                "run_id": self._run_id,
+                "workflow_status": status,
+            }
+        )
+
+    def runner_exit(self, observation_status: str, runner_error: str | None) -> None:
+        self._emit(
+            {
+                "event": "runner_exit",
+                "run_id": self._run_id,
+                "observation_status": observation_status,
+                "runner_error": runner_error,
+            }
+        )
+
+
+def _emit_benchmark_watch_event(event: dict[str, object]) -> None:
+    print(json.dumps(event, sort_keys=True), flush=True)
 
 
 def _client(base_url: str, token: str) -> TextToSqlApiClient:

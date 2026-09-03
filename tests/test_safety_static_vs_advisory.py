@@ -194,3 +194,97 @@ def test_orchestrator_calls_llm_when_static_safe(monkeypatch) -> None:
     assert result["is_safe"] is True
     assert result["llm_audit"] == "ok"
     assert calls["n"] == 1, "orchestrator must call LLM when static safe"
+
+
+# === 5. W0-0.5: LLM-аудит fail-open при runtime-сбое советника ==============
+def test_orchestrator_static_unsafe_still_blocks_after_fail_open_change(monkeypatch) -> None:
+    """W0-0.5: LLM-аудит стал fail-open при runtime-сбое, но ранний return при
+
+    static-unsafe остался нетронутым — LLM по-прежнему не вызывается вообще.
+    """
+    from custom_tools.text_to_sql.core._sql_generation_api import (
+        _clear_llm_safety_cache,
+        sql_safety_check,
+    )
+    from custom_tools.text_to_sql import core as core_facade
+
+    _clear_llm_safety_cache()
+    calls = {"n": 0}
+
+    def fake_llm(**kwargs):
+        calls["n"] += 1
+        return '{"issues": []}'
+
+    monkeypatch.setattr(core_facade, "call_openai_api", fake_llm)
+
+    sql_validator = core_facade.sql_validator
+    result = sql_safety_check(
+        "DROP TABLE orchestrator_static_unsafe_test", sql_validator=sql_validator
+    )
+
+    assert result["is_safe"] is False
+    assert result.get("safety_status") == "unsafe"
+    assert result.get("llm_audit") == "skipped_static_unsafe"
+    assert calls["n"] == 0, "static-unsafe SQL must still block without calling LLM"
+
+
+def test_orchestrator_llm_finding_is_advisory_only_when_static_safe(monkeypatch) -> None:
+    """Содержательная LLM-находка (llm_audit='ok') идёт в advisory_issues,
+
+    blocking=False, и не блокирует is_safe/issues (см. W0-0.5).
+    """
+    from custom_tools.text_to_sql.core._sql_generation_api import (
+        _clear_llm_safety_cache,
+        sql_safety_check,
+    )
+    from custom_tools.text_to_sql import core as core_facade
+
+    _clear_llm_safety_cache()
+
+    def with_finding(**kwargs):
+        return (
+            '{"issues": [{"issue_type": "PERF_WARNING",'
+            ' "description": "Full table scan likely"}]}'
+        )
+
+    monkeypatch.setattr(core_facade, "call_openai_api", with_finding)
+
+    sql_validator = core_facade.sql_validator
+    result = sql_safety_check(
+        "SELECT * FROM orchestrator_advisory_finding_test", sql_validator=sql_validator
+    )
+
+    assert result["is_safe"] is True
+    assert result["llm_audit"] == "ok"
+    assert result.get("issues", []) == []
+    matching = [
+        i for i in result.get("advisory_issues", [])
+        if i.get("issue_type") == "LLM_PERF_WARNING"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["blocking"] is False
+
+
+def test_orchestrator_propagates_programming_bugs_from_advisor(monkeypatch) -> None:
+    """Программные баги советника (не в узком except-списке) должны падать наружу,
+
+    а не маскироваться под LLM_AUDIT_FAILED (см. W0-0.5).
+    """
+    from custom_tools.text_to_sql.core._sql_generation_api import (
+        _clear_llm_safety_cache,
+        sql_safety_check,
+    )
+    from custom_tools.text_to_sql import core as core_facade
+
+    _clear_llm_safety_cache()
+
+    def boom(**kwargs):
+        raise AttributeError("programming bug in advisor")
+
+    monkeypatch.setattr(core_facade, "call_openai_api", boom)
+
+    sql_validator = core_facade.sql_validator
+    with pytest.raises(AttributeError):
+        sql_safety_check(
+            "SELECT 1 FROM orchestrator_attribute_error_test", sql_validator=sql_validator
+        )

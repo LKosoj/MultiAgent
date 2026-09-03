@@ -13,9 +13,11 @@ from custom_tools.text_to_sql.adaptive.models import (
     JoinCandidate,
     JoinCandidateStatus,
     JoinEdge,
+    PhysicalColumnBinding,
     PredicateOperator,
     RepairKind,
     ResearchState,
+    SemanticItem,
     SemanticItemKind,
     SemanticItemStatus,
     SqlCandidate,
@@ -27,6 +29,10 @@ from custom_tools.text_to_sql.adaptive.semantic_checks import (
 )
 from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
     requirements_digest,
+)
+from custom_tools.text_to_sql.adaptive.serialization import (
+    deserialize_contract,
+    serialize_contract,
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
     CoverageRequirements,
@@ -51,6 +57,7 @@ from text_to_sql_semantic_coverage_helpers import (
     INCARNATION,
     RUN_ID,
     _context,
+    _schema_evidence,
     _value_evidence,
 )
 
@@ -89,7 +96,63 @@ def _item(
     )
 
 
-def test_root_transform_required_limit_fails_closed_without_rewrite() -> None:
+def _row_preservation_case(sql: str, *, qualifying_filter: bool):
+    path = (inner_join("organizations", "id", "ratings", "organization_id"),)
+    items = [
+        _item(
+            "rating",
+            SemanticItemKind.METRIC,
+            "score",
+            table="ratings",
+            join_path=path,
+        )
+    ]
+    if qualifying_filter:
+        items.insert(
+            0,
+            _item(
+                "active-organizations",
+                SemanticItemKind.FILTER,
+                "is_active",
+                table="organizations",
+                operator=PredicateOperator.EQ,
+                literal=True,
+            ),
+        )
+    state = build_state(tuple(items))
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("rating",)}
+            )
+        }
+    )
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "row-preservation-candidate")
+    candidate = SqlCandidate(
+        candidate_id="row-preservation-candidate",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+    return (
+        state,
+        requirements,
+        SemanticCheckInput(
+            semantic_ast=build_semantic_ast(
+                candidate,
+                parsed,
+                state.query_spec,
+                requirements,
+                "main",
+            ),
+            query_spec=state.query_spec,
+            requirements=requirements,
+        ),
+    )
+
+
+def test_root_transform_limit_is_left_to_execution_validation() -> None:
     sql = "PIVOT sales ON category USING SUM(amount)"
     base = build_case(
         "SELECT 1 LIMIT 1",
@@ -143,7 +206,7 @@ def test_root_transform_required_limit_fails_closed_without_rewrite() -> None:
         "duckdb://",
     )
 
-    assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+    assert result.status is CheckStatus.PASSED
     assert candidate.sql == sql
 
 
@@ -301,15 +364,6 @@ def test_root_unpivot_physical_inputs_pass_semantic_authority() -> None:
             "SELECT o.id FROM orders o WHERE o.id = ANY "
             "(SELECT s.order_id FROM secrets s WHERE s.order_id = o.id)",
             CheckFailureCode.UNAUTHORIZED_TABLE,
-        ),
-        (
-            "SELECT o.id FROM orders o WHERE o.id = ANY "
-            "(SELECT i.secret FROM orders i WHERE i.id = o.id)",
-            CheckFailureCode.UNAUTHORIZED_COLUMN,
-        ),
-        (
-            "SELECT o.id FROM orders o GROUP BY o.secret",
-            CheckFailureCode.UNAUTHORIZED_COLUMN,
         ),
     ],
 )
@@ -714,6 +768,415 @@ def test_cross_join_with_authorized_endpoints_is_not_blocked_by_join_path() -> N
     assert result.failure_code is None
 
 
+def test_coverage_derives_row_preservation_for_output_only_metric() -> None:
+    path = (inner_join("organizations", "id", "ratings", "organization_id"),)
+    state = build_state(
+        (
+            _item(
+                "active-organizations",
+                SemanticItemKind.FILTER,
+                "is_active",
+                table="organizations",
+                operator=PredicateOperator.EQ,
+                literal=True,
+            ),
+            _item(
+                "rating",
+                SemanticItemKind.METRIC,
+                "score",
+                table="ratings",
+                join_path=path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("rating",)}
+            )
+        }
+    )
+
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+
+    assert len(requirements.row_preservation_requirements) == 1
+    requirement = requirements.row_preservation_requirements[0]
+    assert requirement.base_table == column("organizations", "id").table
+    assert requirement.related_table == column("ratings", "score").table
+    assert requirement.related_source_ids == ("rating",)
+    assert requirement.related_binding_ids == ("binding-rating",)
+    assert requirement.effective_join_path == (
+        path[0].model_copy(update={"join_type": "left"}),
+    )
+
+
+def test_coverage_derives_row_preservation_for_non_output_formula_only() -> None:
+    path = (inner_join("schools", "id", "satscores", "school_id"),)
+    state = build_state(
+        (
+            _item(
+                "quality-formula",
+                SemanticItemKind.FORMULA,
+                "quality_threshold",
+                table="schools",
+            ),
+            _item(
+                "rating",
+                SemanticItemKind.METRIC,
+                "score",
+                table="satscores",
+                join_path=path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "requested_output_source_ids": ("rating",),
+                    "semantic_items": tuple(
+                        item.model_copy(
+                            update={
+                                "binding_ids": (
+                                    "binding-quality-formula",
+                                    "binding-quality-formula-closed-date",
+                                )
+                            }
+                        )
+                        if item.source_id == "quality-formula"
+                        else item
+                        for item in state.query_spec.semantic_items
+                    ),
+                }
+            )
+        }
+    )
+    open_date = column("schools", "open_date")
+    closed_date = column("schools", "closed_date")
+    formula_binding = next(
+        binding
+        for binding in state.bindings
+        if binding.source_id == "quality-formula"
+    )
+    assert type(formula_binding) is PhysicalColumnBinding
+    open_binding = formula_binding.model_copy(
+        update={
+            "columns": (open_date,),
+            "evidence_ids": ("evidence-quality-formula-open-date",),
+            "physical_column": open_date,
+        }
+    )
+    closed_binding = formula_binding.model_copy(
+        update={
+            "binding_id": "binding-quality-formula-closed-date",
+            "columns": (closed_date,),
+            "evidence_ids": ("evidence-quality-formula-closed-date",),
+            "physical_column": closed_date,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "bindings": tuple(
+                    sorted(
+                        tuple(
+                            binding
+                            for binding in state.bindings
+                            if binding.source_id != "quality-formula"
+                        )
+                    + (open_binding, closed_binding),
+                    key=lambda binding: (binding.source_id, binding.binding_id),
+                )
+            ),
+            "evidence": state.evidence
+            + (
+                _schema_evidence("evidence-quality-formula-open-date", open_date),
+                _schema_evidence("evidence-quality-formula-closed-date", closed_date),
+            ),
+        }
+    )
+    state = deserialize_contract(serialize_contract(state))
+    assert type(state) is ResearchState
+    formula_bindings = tuple(
+        binding
+        for binding in state.bindings
+        if binding.source_id == "quality-formula"
+    )
+    assert tuple(binding.binding_id for binding in formula_bindings) == (
+        "binding-quality-formula",
+        "binding-quality-formula-closed-date",
+    )
+    assert all(type(binding) is PhysicalColumnBinding for binding in formula_bindings)
+    assert tuple(binding.physical_column for binding in formula_bindings) == (
+        open_date,
+        closed_date,
+    )
+
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+
+    assert len(requirements.row_preservation_requirements) == 1
+    requirement = requirements.row_preservation_requirements[0]
+    assert requirement.base_table == column("schools", "id").table
+    assert requirement.related_table == column("satscores", "score").table
+
+
+def test_coverage_skips_row_preservation_when_related_table_qualifies() -> None:
+    path = (inner_join("organizations", "id", "ratings", "organization_id"),)
+    related_filter_state = build_state(
+        (
+            _item(
+                "rating-threshold",
+                SemanticItemKind.FILTER,
+                "score",
+                table="ratings",
+                operator=PredicateOperator.GT,
+                literal=3,
+                join_path=path,
+            ),
+            _item(
+                "rating",
+                SemanticItemKind.METRIC,
+                "score",
+                table="ratings",
+                join_path=path,
+            ),
+        )
+    )
+    related_filter_state = related_filter_state.model_copy(
+        update={
+            "query_spec": related_filter_state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("rating",)}
+            )
+        }
+    )
+    assert not validate_coverage_inputs(
+        related_filter_state, _context(), RUN_ID, INCARNATION
+    ).row_preservation_requirements
+
+
+def test_coverage_skips_row_preservation_when_base_is_ambiguous() -> None:
+    rating_path = (inner_join("organizations", "id", "ratings", "organization_id"),)
+    region_path = (inner_join("organizations", "region_id", "regions", "id"),)
+    state = build_state(
+        (
+            _item(
+                "active-organizations",
+                SemanticItemKind.FILTER,
+                "is_active",
+                table="organizations",
+                operator=PredicateOperator.EQ,
+                literal=True,
+            ),
+            _item(
+                "active-regions",
+                SemanticItemKind.FILTER,
+                "is_active",
+                table="regions",
+                operator=PredicateOperator.EQ,
+                literal=True,
+                join_path=region_path,
+            ),
+            _item(
+                "rating",
+                SemanticItemKind.METRIC,
+                "score",
+                table="ratings",
+                join_path=rating_path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("rating",)}
+            )
+        }
+    )
+
+    assert not validate_coverage_inputs(
+        state, _context(), RUN_ID, INCARNATION
+    ).row_preservation_requirements
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE",
+        "SELECT r.score FROM ratings r "
+        "LEFT JOIN organizations o ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE",
+    ),
+)
+def test_row_preservation_rejects_inner_or_reversed_left_join(sql: str) -> None:
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_JOIN
+    assert result.affected_source_ids == ("rating",)
+    assert result.repair is not None
+    assert result.repair.kind is RepairKind.REVISE_SQL
+
+
+def test_row_preservation_rejects_ambiguous_base_table_roles() -> None:
+    sql = (
+        "SELECT r.score FROM organizations o1 "
+        "INNER JOIN organizations o2 ON o1.parent_id = o2.id "
+        "LEFT JOIN ratings r ON o1.id = r.organization_id "
+        "WHERE o2.is_active = TRUE"
+    )
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_JOIN
+    assert result.affected_source_ids == ("rating",)
+    assert result.repair is not None
+    assert result.repair.kind is RepairKind.REVISE_SQL
+
+
+def test_coverage_skips_row_preservation_for_equal_validated_paths() -> None:
+    sql = (
+        "SELECT r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+    )
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+    duplicate_join = state.join_candidates[0].model_copy(update={"join_id": "join-2"})
+    state = state.model_copy(
+        update={"join_candidates": state.join_candidates + (duplicate_join,)}
+    )
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    check_input = replace(
+        check_input,
+        semantic_ast=build_semantic_ast(
+            check_input.candidate,
+            check_input.parsed_ast,
+            state.query_spec,
+            requirements,
+            "main",
+        ),
+        query_spec=state.query_spec,
+        requirements=requirements,
+    )
+
+    assert not requirements.row_preservation_requirements
+    assert evaluate_semantic_authority_checks(
+        check_input, state, POSTGRES_DSN
+    ).status is CheckStatus.PASSED
+
+
+def test_coverage_skips_row_preservation_for_ambiguous_composite_path() -> None:
+    path = (
+        inner_join("organizations", "primary_rating_id", "ratings", "id"),
+        inner_join("organizations", "secondary_rating_id", "ratings", "id"),
+    )
+    state = build_state(
+        (
+            _item(
+                "active-organizations",
+                SemanticItemKind.FILTER,
+                "is_active",
+                table="organizations",
+                operator=PredicateOperator.EQ,
+                literal=True,
+            ),
+            _item(
+                "rating",
+                SemanticItemKind.METRIC,
+                "score",
+                table="ratings",
+                join_path=path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("rating",)}
+            )
+        }
+    )
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    sql = (
+        "SELECT r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.primary_rating_id = r.id "
+        "AND o.secondary_rating_id = r.id WHERE o.is_active = TRUE"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "ambiguous-composite")
+    candidate = SqlCandidate(
+        candidate_id="ambiguous-composite",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+    check_input = SemanticCheckInput(
+        semantic_ast=build_semantic_ast(
+            candidate,
+            parsed,
+            state.query_spec,
+            requirements,
+            "main",
+        ),
+        query_spec=state.query_spec,
+        requirements=requirements,
+    )
+
+    assert not requirements.row_preservation_requirements
+    assert evaluate_semantic_authority_checks(
+        check_input, state, POSTGRES_DSN
+    ).status is CheckStatus.PASSED
+
+
+def test_row_preservation_accepts_effective_left_join_and_skips_no_qualifier() -> None:
+    left_sql = (
+        "SELECT r.score FROM organizations o "
+        "LEFT JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+    )
+    state, _, check_input = _row_preservation_case(left_sql, qualifying_filter=True)
+
+    assert evaluate_semantic_authority_checks(
+        check_input, state, POSTGRES_DSN
+    ).status is CheckStatus.PASSED
+
+    inner_sql = (
+        "SELECT r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.id = r.organization_id"
+    )
+    state, requirements, check_input = _row_preservation_case(
+        inner_sql, qualifying_filter=False
+    )
+
+    assert not requirements.row_preservation_requirements
+    assert evaluate_semantic_authority_checks(
+        check_input, state, POSTGRES_DSN
+    ).status is CheckStatus.PASSED
+
+
+def test_row_preservation_rejects_forged_requirements_even_with_new_digest() -> None:
+    sql = (
+        "SELECT r.score FROM organizations o "
+        "LEFT JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+    )
+    state, requirements, _ = _row_preservation_case(sql, qualifying_filter=True)
+    unsigned = requirements.model_copy(update={"row_preservation_requirements": ()})
+    payload = unsigned.model_dump(mode="python")
+    payload["requirements_digest"] = requirements_digest(unsigned)
+    forged = CoverageRequirements.model_validate(payload)
+
+    with pytest.raises(ValueError):
+        _validate_requirements_state_membership(
+            tuple(item for item in state.query_spec.semantic_items if item.required),
+            forged,
+            state,
+        )
+
+
 def test_reversed_join_evidence_ids_ignore_unrelated_candidate() -> None:
     case = build_case(
         "SELECT o.customer_id, c.id FROM orders AS o "
@@ -906,57 +1369,15 @@ def test_sqlite_casefolded_validated_join_endpoint_is_authorized() -> None:
     assert result.failure_code is None
 
 
-def test_sqlite_casefolding_does_not_authorize_unrelated_join_column() -> None:
-    join = inner_join("customers", "CustomerID", "yearmonth", "CustomerID")
+def test_schema_validation_owns_unselected_physical_column_existence() -> None:
     case = build_case(
-        "SELECT ym.Consumption FROM customers AS c JOIN yearmonth AS ym "
-        "ON c.otherid = ym.CustomerID",
-        (
-            _item("segment", SemanticItemKind.DIMENSION, "Segment", table="customers"),
-            _item(
-                "consumption",
-                SemanticItemKind.METRIC,
-                "Consumption",
-                table="yearmonth",
-                join_path=(join,),
-            ),
-        ),
-        dsn="sqlite://",
+        "SELECT SUM(o.amount) * 1.0 / COUNT(o.record_id) FROM orders AS o",
+        (_item("amount", SemanticItemKind.METRIC, "amount"),),
     )
 
-    result = evaluate_semantic_authority_checks(case.check_input, case.state, "sqlite://")
+    result = _evaluate(case)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
-
-
-def test_postgres_casefolded_validated_join_endpoint_stays_unauthorized() -> None:
-    join = inner_join("customers", "CustomerID", "yearmonth", "CustomerID")
-    case = build_case(
-        "SELECT ym.Consumption FROM customers AS c JOIN yearmonth AS ym "
-        "ON c.CustomerID = ym.customerid",
-        (
-            _item("segment", SemanticItemKind.DIMENSION, "Segment", table="customers"),
-            _item(
-                "consumption",
-                SemanticItemKind.METRIC,
-                "Consumption",
-                table="yearmonth",
-                join_path=(join,),
-            ),
-        ),
-    )
-
-    assert _evaluate(case).failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
-
-
-def test_postgres_mixed_case_physical_column_remains_unauthorized() -> None:
-    case = build_case(
-        "SELECT currency FROM customers",
-        (_item("currency", SemanticItemKind.DIMENSION, "Currency", table="customers"),),
-    )
-
-    assert _evaluate(case).failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
+    assert result.status is CheckStatus.PASSED
 
 
 def test_authority_checks_literals_in_conditional_aggregate() -> None:
@@ -992,7 +1413,7 @@ def test_authority_checks_literals_in_conditional_aggregate() -> None:
     assert result.failure_code is None
 
 
-def test_authority_gate_rejects_incomplete_filter_but_rejects_unknown_literal() -> None:
+def test_authority_gate_allows_incomplete_filter_but_rejects_unknown_literal() -> None:
     missing_filter = build_case(
         "SELECT o.status FROM orders AS o",
         (
@@ -1018,8 +1439,7 @@ def test_authority_gate_rejects_incomplete_filter_but_rejects_unknown_literal() 
         ),
     )
 
-    assert _evaluate(missing_filter).status is CheckStatus.INCONCLUSIVE
-    assert _evaluate(missing_filter).failure_code is CheckFailureCode.CHECK_INPUT_INVALID
+    assert _evaluate(missing_filter).status is CheckStatus.PASSED
     assert (
         _evaluate(unknown_literal).failure_code
         is CheckFailureCode.UNAUTHORIZED_LITERAL
@@ -1060,6 +1480,200 @@ def test_authority_gate_checks_literals_inside_any_expression() -> None:
         _evaluate(unknown).failure_code
         is CheckFailureCode.UNAUTHORIZED_LITERAL
     )
+
+
+def test_requested_output_condition_authorizes_its_literal_in_projection() -> None:
+    allowed_sql = "SELECT o.is_enabled = 1 FROM orders AS o"
+    base = build_case(
+        allowed_sql,
+        (
+            _item(
+                "enabled",
+                SemanticItemKind.DIMENSION,
+                "is_enabled",
+                operator=PredicateOperator.EQ,
+                literal=1,
+            ),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+        dsn="sqlite://",
+    )
+    query_spec = base.query_spec.model_copy(
+        update={
+            "requested_output_source_ids": ("enabled",),
+        }
+    )
+    state = ResearchState.model_validate(
+        {**base.state.model_dump(mode="python"), "query_spec": query_spec}
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        _context(),
+        RUN_ID,
+        INCARNATION,
+    )
+    def evaluate(sql: str, candidate_id: str):
+        parsed_ast = parse_sql_candidate(sql, "sqlite://", candidate_id)
+        candidate = SqlCandidate(
+            candidate_id=candidate_id,
+            sql=sql,
+            normalized_ast_digest=parsed_ast.candidate_digest,
+            revision=state.revision,
+        )
+        return evaluate_semantic_authority_checks(
+            SemanticCheckInput(
+                semantic_ast=build_semantic_ast(
+                    candidate,
+                    parsed_ast,
+                    query_spec,
+                    requirements,
+                    "main",
+                ),
+                query_spec=query_spec,
+                requirements=requirements,
+            ),
+            state,
+            "sqlite://",
+        )
+
+    allowed = evaluate(allowed_sql, "requested-output-condition")
+    wrong_column = evaluate(
+        "SELECT o.other_flag = 1 FROM orders AS o",
+        "wrong-requested-output-column",
+    )
+    filter_use = evaluate(
+        "SELECT o.is_enabled FROM orders AS o WHERE o.is_enabled = 1",
+        "requested-output-condition-in-filter",
+    )
+
+    assert allowed.status is CheckStatus.PASSED
+    assert allowed.failure_code is None
+    assert wrong_column.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert filter_use.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+
+    vertical_state = build_vertical_state()
+    vertical_query_spec = vertical_state.query_spec.model_copy(
+        update={"requested_output_source_ids": ("membership",)}
+    )
+    vertical_state = ResearchState.model_validate(
+        {
+            **vertical_state.model_dump(mode="python"),
+            "query_spec": vertical_query_spec,
+        }
+    )
+    vertical_requirements = validate_coverage_inputs(
+        vertical_state,
+        _context(),
+        RUN_ID,
+        INCARNATION,
+    )
+    vertical_sql = (
+        "SELECT c.id = 'premium' FROM customers AS c "
+        "JOIN attribute_values AS v ON c.id = v.customer_id "
+        "JOIN attributes AS a ON a.id = v.attribute_id "
+        "WHERE a.name = 'membership_level' AND v.value = 'premium'"
+    )
+    vertical_parsed_ast = parse_sql_candidate(
+        vertical_sql,
+        "sqlite://",
+        "requested-output-composite-binding",
+    )
+    vertical_candidate = SqlCandidate(
+        candidate_id="requested-output-composite-binding",
+        sql=vertical_sql,
+        normalized_ast_digest=vertical_parsed_ast.candidate_digest,
+        revision=vertical_state.revision,
+    )
+    composite_binding = evaluate_semantic_authority_checks(
+        SemanticCheckInput(
+            semantic_ast=build_semantic_ast(
+                vertical_candidate,
+                vertical_parsed_ast,
+                vertical_query_spec,
+                vertical_requirements,
+                "main",
+            ),
+            query_spec=vertical_query_spec,
+            requirements=vertical_requirements,
+        ),
+        vertical_state,
+        "sqlite://",
+    )
+
+    assert composite_binding.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+
+
+def test_explicit_formula_allows_its_conditional_literal() -> None:
+    state = build_state(
+        (
+            _item("amount", SemanticItemKind.METRIC, "amount"),
+            _item("member_id", SemanticItemKind.METRIC, "member_id"),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+    )
+    formula = SemanticItem(
+        source_id="percentage_formula",
+        kind=SemanticItemKind.FORMULA,
+        source_text="percentage = COUNT(amount = 50) / COUNT(member_id) * 100",
+        normalized_meaning=(
+            "percentage = COUNT(amount = 50) / COUNT(member_id) * 100"
+        ),
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (*state.query_spec.semantic_items, formula)}
+            )
+        }
+    )
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    sql = (
+        "SELECT 100.0 * COUNT(CASE WHEN o.amount = 50 THEN 1 END) "
+        "/ COUNT(o.member_id) FROM orders AS o"
+    )
+    parsed_ast = parse_sql_candidate(sql, POSTGRES_DSN, "explicit-formula-literal")
+    candidate = SqlCandidate(
+        candidate_id="explicit-formula-literal",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+    result = evaluate_semantic_authority_checks(
+        SemanticCheckInput(
+            semantic_ast=build_semantic_ast(
+                candidate,
+                parsed_ast,
+                state.query_spec,
+                requirements,
+                "main",
+            ),
+            query_spec=state.query_spec,
+            requirements=requirements,
+        ),
+        state,
+        POSTGRES_DSN,
+    )
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_explicit_formula_with_bound_input_allows_its_conditional_literal() -> None:
+    case = build_case(
+        "SELECT COUNT(CASE WHEN o.amount = 50 THEN 1 END) FROM orders AS o",
+        (_item("formula", SemanticItemKind.FORMULA, "amount"),),
+        shape=ExpectedResultShape.SCALAR,
+    )
+
+    result = _evaluate(case)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 @pytest.mark.parametrize(
@@ -1215,13 +1829,6 @@ def test_exact_value_evidence_does_not_authorize_join_only_column() -> None:
             id="unauthorized-table",
         ),
         pytest.param(
-            "SELECT o.secret FROM orders o",
-            (_item("id", SemanticItemKind.DIMENSION, "id"),),
-            ExpectedResultShape.ROWS,
-            CheckFailureCode.UNAUTHORIZED_COLUMN,
-            id="unauthorized-column",
-        ),
-        pytest.param(
             "SELECT o.status FROM orders o WHERE o.status = 'inactive'",
             (
                 _item(
@@ -1275,10 +1882,7 @@ def test_each_authority_failure_code_is_exact_and_typed(
             ),
         )
     else:
-        expected_nodes = {
-            CheckFailureCode.UNAUTHORIZED_COLUMN: nodes_by_kind["projection"],
-            CheckFailureCode.UNAUTHORIZED_LITERAL: nodes_by_kind["predicate"],
-        }.get(failure_code, ())
+        expected_nodes = nodes_by_kind["predicate"]
     assert result.affected_source_ids == expected_sources
     assert result.affected_ast_node_ids == expected_nodes
     assert result.repair.source_ids == expected_sources

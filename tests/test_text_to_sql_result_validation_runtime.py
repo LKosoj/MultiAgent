@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import json
 from dataclasses import replace
 
 import pytest
@@ -386,13 +387,49 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
     )
     runtime, _ = _runtime_with_persisted_candidate(tmp_path / "active", deadline=deadline)
     runtime.verified_research_policy = load_adaptive_policy_config()
+    runtime.loaded_schema = replace(
+        runtime.loaded_schema,
+        schema={
+            "main.orders": {
+                "description": "Event-specific order records.",
+                "columns": {
+                    "status": {"type": "TEXT", "description": "Order status."},
+                    "account_id": {
+                        "type": "INTEGER",
+                        "constraint_type": "FK",
+                        "references": "accounts.id",
+                    },
+                },
+            },
+            "main.accounts": {
+                "description": "Permanent account attributes.",
+                "columns": {
+                    "id": {"type": "INTEGER", "constraint_type": "PK"},
+                    "status": {
+                        "type": "TEXT",
+                        "description": "Permanent account status.",
+                    },
+                },
+            },
+            **{
+                f"main.unrelated_{index}": {
+                    "description": "Unrelated table.",
+                    "columns": {"id": {"type": "INTEGER"}},
+                }
+                for index in range(12)
+            },
+        },
+    )
     provider_calls: list[dict[str, object]] = []
+    provider_names: list[str] = []
     review_calls: list[object] = []
 
     monkeypatch.setattr(
         agent_command,
         "create_text_to_sql_model",
-        lambda _name, **kwargs: provider_calls.append(kwargs) or object(),
+        lambda name, **kwargs: (
+            provider_names.append(name), provider_calls.append(kwargs), object()
+        )[-1],
     )
     monkeypatch.setattr(
         utils,
@@ -412,6 +449,7 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
     )
 
     assert receipt.verdict == "consistent"
+    assert provider_names == ["model_hard"]
     assert provider_calls == [
         {
             "max_tokens": runtime.verified_research_policy.model_budget.output_tokens_per_call,
@@ -421,6 +459,8 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
         }
     ]
     assert len(review_calls) == 1
+    review_prompt = json.loads(review_calls[0]["prompt"])
+    assert set(review_prompt["schema"]) == {"main.orders", "main.accounts"}
     response_format = review_calls[0]["response_format"]
     assert response_format["type"] == "json_schema"
     assert response_format["json_schema"]["name"] == "ModelReviewResponse"
@@ -429,7 +469,17 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
         "status",
         "reason",
         "source_id",
+        "repair_kind",
+        "repair_binding_id",
     ]
+    assert response_format["json_schema"]["schema"]["properties"]["source_id"] == {
+        "anyOf": [
+            {"enum": ["status"], "type": "string"},
+            {"type": "null"},
+        ],
+        "default": None,
+        "title": "Source Id",
+    }
 
     expired_runtime, _ = _runtime_with_persisted_candidate(
         tmp_path / "expired",

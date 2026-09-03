@@ -222,10 +222,8 @@ def _run_solver_candidate_pre_execution_gates(
     if blocked or next_index == len(_GATE_ORDER):
         return current
 
-    semantic_input = (
-        None
-        if next_index > _GATE_ORDER.index(CheckKind.SEMANTIC)
-        else _rebuild_semantic_input(
+    def rebuild_semantic_input() -> SemanticCheckInput:
+        return _rebuild_semantic_input(
             current,
             candidate_id,
             research,
@@ -233,11 +231,11 @@ def _run_solver_candidate_pre_execution_gates(
             dsn,
             parsed_candidate,
         )
-    )
+
     return _run_pre_execution_stages(
         current,
         next_index,
-        semantic_input,
+        rebuild_semantic_input,
         research,
         loaded_schema,
         dsn,
@@ -292,7 +290,7 @@ def _validate_open_gate_state(state: SolverState) -> None:
 def _run_pre_execution_stages(
     state: SolverState,
     next_index: int,
-    semantic_input: SemanticCheckInput | None,
+    rebuild_semantic_input: Callable[[], SemanticCheckInput],
     research_state: ResearchState,
     loaded_schema: LoadedSchema,
     dsn: str,
@@ -303,6 +301,7 @@ def _run_pre_execution_stages(
     commit_transition: CommitTransition,
 ) -> SolverState:
     candidate = state.sql_candidates[-1]
+    semantic_input: SemanticCheckInput | None = None
 
     def semantic_stage() -> CheckResult:
         if semantic_input is None:
@@ -358,6 +357,8 @@ def _run_pre_execution_stages(
     for index, (kind, checker) in enumerate(stages):
         if index < next_index:
             continue
+        if kind is CheckKind.SEMANTIC:
+            semantic_input = rebuild_semantic_input()
         current, passed = _run_checker_stage(
             current,
             kind,

@@ -24,10 +24,12 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
 )
 from custom_tools.text_to_sql.adaptive.production_research import (
     _bounded_research_context,
+    _bounded_hierarchical_table_hints,
 )
 from custom_tools.text_to_sql.adaptive._policy_common import BudgetAdmissionError
 from custom_tools.text_to_sql.adaptive.semantic_coverage import CoverageInputErrorCode
 from custom_tools.text_to_sql.adaptive.models import (
+    BindingStatus,
     ColumnRef,
     EvidenceCost,
     EvidenceRecord,
@@ -39,8 +41,12 @@ from custom_tools.text_to_sql.adaptive.models import (
     JoinEdge,
     JoinType,
     PredicateOperator,
+    PhysicalColumnBinding,
     QuerySpec,
     ResearchState,
+    SemanticItem,
+    SemanticItemKind,
+    SemanticItemStatus,
     TableRef,
 )
 from custom_tools.text_to_sql.adaptive.policy import (
@@ -61,6 +67,7 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     ContractDecodeError,
     ContractValidationError,
 )
+from custom_tools.text_to_sql.schema_memory import SemanticFact
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -234,6 +241,46 @@ def test_initial_research_context_lists_sorted_document_metadata_without_content
     assert "secret zeta formula" not in json.dumps(context)
 
 
+def test_formula_continuation_keeps_target_formula_in_bounded_context() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    formula = SemanticItem(
+        source_id="formula-1",
+        kind=SemanticItemKind.FORMULA,
+        source_text="amount above the computed average",
+        normalized_meaning="amount > AVG(amount)",
+        required=True,
+        operator=PredicateOperator.GT,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula,)}
+            )
+        }
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={"orders": {"columns": {"amount": {}}}}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Find the physical inputs for the formula",
+            validation_feedback=(),
+            semantic_repair_continuation=True,
+        )
+    )
+
+    semantic_items = context["state"]["query_spec"]["semantic_items"]
+    assert len(semantic_items) == 1
+    assert semantic_items[0]["source_id"] == formula.source_id
+    assert semantic_items[0]["kind"] == SemanticItemKind.FORMULA.value
+
+
 def test_semantic_table_hints_are_bounded_context_only_not_authority() -> None:
     policy = _minimal_research_context_policy()
     state = _minimal_research_state(policy)
@@ -268,6 +315,116 @@ def test_semantic_table_hints_are_bounded_context_only_not_authority() -> None:
     assert "semantic_table_hints" not in empty_search_context
 
 
+def test_semantic_table_hints_include_one_fk_neighbor_within_bound() -> None:
+    schema = {
+        "sales.orders": {
+            "columns": {
+                "customer_id": {"references": "sales.customers(id)"},
+            },
+        },
+        "sales.customers": {"columns": {"id": {}}},
+        "sales.audit": {"columns": {"id": {}}},
+    }
+
+    assert _bounded_hierarchical_table_hints(
+        schema,
+        ("sales.orders", "sales.audit"),
+        maximum_tables=2,
+    ) == ("sales.orders", "sales.customers")
+
+
+def test_approved_semantic_facts_are_context_only_and_bounded() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="orders",
+        column="status",
+        fact_kind="example",
+        value="paid",
+        source="typed_probe",
+        status="approved",
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={"orders": {"columns": {"status": {}}}}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+            semantic_table_hints=("orders",),
+            approved_semantic_fact_hints=(fact,),
+        )
+    )
+
+    assert context["approved_semantic_fact_hints"] == [fact.model_dump(mode="json")]
+    assert context["state"]["evidence"] == []
+    assert context["state"]["bindings"] == []
+
+
+def test_semantic_table_hints_limit_inline_schema_details() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    schema = {
+        "event_entries": {"columns": {"entity_code": {}}},
+        **{
+            f"related_{index}": {"columns": {"value": {}}}
+            for index in range(1, 7)
+        },
+        "entities": {"columns": {"code": {}}},
+        "related_8": {"columns": {"value": {}}},
+        "related_9": {"columns": {"value": {}}},
+        "least_relevant": {"columns": {"value": {}}},
+    }
+    hints = tuple(schema)
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema=schema),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Return the entity's permanent code for one event entry.",
+            validation_feedback=(),
+            semantic_table_hints=hints,
+        )
+    )
+
+    assert set(context["schema"]) == set(hints[:10])
+    assert "entities" in context["schema"]
+    assert "least_relevant" not in json.dumps(context["schema"])
+
+
+def test_profile_distinguishes_entity_attribute_from_event_snapshot() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "requested as an attribute of a named entity" in instructions
+    assert (
+        "inspect the named entity table before committing the binding"
+        in instructions
+    )
+    assert "preserve the output described in the qualifying row scope" in instructions
+    assert (
+        "only when the question explicitly requests a current, canonical, or persistent "
+        "attribute"
+        in instructions
+    )
+    assert "prove the attributes equivalent at that qualifying row scope" in instructions
+    assert "Within that scope, prefer a full label over a partial or nullable label" in instructions
+    assert (
+        "a label explicitly described as full or official for the row supplying a required "
+        "condition or formula is the row-local output"
+        in instructions
+    )
+    assert (
+        "Do not replace it with a generic or nullable entity or master relation name merely "
+        "because that relation is the named entity table"
+        in instructions
+    )
+
+
 def test_invalid_complete_generation_authority_is_bounded_retry_context_only() -> None:
     policy = _minimal_research_context_policy()
     state = _minimal_research_state(policy)
@@ -291,7 +448,257 @@ def test_invalid_complete_generation_authority_is_bounded_retry_context_only() -
         "reason_code": "QUERY_REQUIREMENT_INCOMPLETE",
         "affected_source_ids": ["source-a", "source-b"],
     }
+    assert "required_continuation" not in context
     assert "invalid_stop_generation_authority" not in state.model_dump()
+
+
+def test_invalid_stop_with_resolved_metric_gets_derived_metric_continuation() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    molecule = TableRef(namespace="main", schema=None, table="molecule")
+    bond = TableRef(namespace="main", schema=None, table="bond")
+    oxygen = ColumnRef(table=molecule, column="oxygen_atoms")
+    bond_type = ColumnRef(table=bond, column="bond_type")
+    evidence = EvidenceRecord(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=0,
+        schema_namespace_version=state.schema_namespace_version,
+        evidence_id="schema-evidence",
+        source_kind=EvidenceSourceKind.SCHEMA,
+        target=molecule,
+        action_digest="sha256:" + "b" * 64,
+        observation="molecule oxygen atoms and bond type",
+        validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
+        data_snapshot_token=None,
+        observed_at=datetime(2026, 9, 1, tzinfo=UTC),
+        strength=1.0,
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=0,
+            bytes=36,
+        ),
+    )
+    metric_binding = PhysicalColumnBinding(
+        binding_id="metric-binding",
+        source_id="average-oxygen",
+        tables=(molecule,),
+        columns=(oxygen,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="schema column",
+        physical_column=oxygen,
+    )
+    filter_binding = PhysicalColumnBinding(
+        binding_id="filter-binding",
+        source_id="single-bond",
+        tables=(bond,),
+        columns=(bond_type,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="schema column",
+        physical_column=bond_type,
+    )
+    join = JoinCandidate(
+        join_id="molecule-bond",
+        left=ColumnRef(table=bond, column="molecule_id"),
+        right=ColumnRef(table=molecule, column="id"),
+        join_type=JoinType.INNER,
+        path=(
+            JoinEdge(
+                left=ColumnRef(table=bond, column="molecule_id"),
+                right=ColumnRef(table=molecule, column="id"),
+            ),
+        ),
+        status=JoinCandidateStatus.VALIDATED,
+        evidence_ids=(evidence.evidence_id,),
+    )
+    metric = SemanticItem(
+        source_id="average-oxygen",
+        kind=SemanticItemKind.METRIC,
+        source_text="average oxygen atoms",
+        normalized_meaning="AVG(oxygen_atoms)",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(metric_binding.binding_id,),
+    )
+    filter_item = SemanticItem(
+        source_id="single-bond",
+        kind=SemanticItemKind.FILTER,
+        source_text="single bonded",
+        normalized_meaning="bond_type equals single",
+        required=True,
+        operator=PredicateOperator.EQ,
+        literal_or_reference="-",
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(filter_binding.binding_id,),
+    )
+    query = QuerySpec.model_validate(
+        {
+            **state.query_spec.model_dump(mode="python", round_trip=True),
+            "semantic_items": (metric, filter_item),
+            "requested_output_source_ids": (metric.source_id,),
+        }
+    )
+    state = ResearchState(
+        **{
+            **state.model_dump(mode="python", round_trip=True),
+            "query_spec": query,
+            "evidence": (evidence,),
+            "bindings": (metric_binding, filter_binding),
+            "join_candidates": (join,),
+        }
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Calculate the average number of oxygen atoms in single-bonded molecules.",
+            validation_feedback=("INVALID_STOP",),
+            invalid_stop_generation_authority=(
+                CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
+                (filter_item.source_id, metric.source_id),
+            ),
+        )
+    )
+
+    assert state.unresolved_items == ()
+    assert state.result_expectations == ()
+    assert context["required_continuation"] == {
+        "kind": "derive_metric_result",
+        "source_ids": [metric.source_id],
+        "instruction": (
+            "Do not stop. Use one admissible research decision to establish the "
+            "derived metric result."
+        ),
+    }
+
+
+def test_invalid_stop_without_validated_join_does_not_request_derived_metric_result() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    metrics = TableRef(namespace="main", schema=None, table="metrics")
+    filters = TableRef(namespace="main", schema=None, table="filters")
+    metric_column = ColumnRef(table=metrics, column="amount")
+    filter_column = ColumnRef(table=filters, column="status")
+    evidence = EvidenceRecord(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=0,
+        schema_namespace_version=state.schema_namespace_version,
+        evidence_id="schema-evidence",
+        source_kind=EvidenceSourceKind.SCHEMA,
+        target=metrics,
+        action_digest="sha256:" + "b" * 64,
+        observation="metric and filter columns",
+        validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
+        data_snapshot_token=None,
+        observed_at=datetime(2026, 9, 1, tzinfo=UTC),
+        strength=1.0,
+        created_at=datetime(2026, 9, 1, tzinfo=UTC),
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=0,
+            bytes=25,
+        ),
+    )
+    metric_binding = PhysicalColumnBinding(
+        binding_id="metric-binding",
+        source_id="metric",
+        tables=(metrics,),
+        columns=(metric_column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="schema column",
+        physical_column=metric_column,
+    )
+    filter_binding = PhysicalColumnBinding(
+        binding_id="filter-binding",
+        source_id="filter",
+        tables=(filters,),
+        columns=(filter_column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="schema column",
+        physical_column=filter_column,
+    )
+    metric = SemanticItem(
+        source_id="metric",
+        kind=SemanticItemKind.METRIC,
+        source_text="average amount",
+        normalized_meaning="AVG(amount)",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(metric_binding.binding_id,),
+    )
+    filter_item = SemanticItem(
+        source_id="filter",
+        kind=SemanticItemKind.FILTER,
+        source_text="selected rows",
+        normalized_meaning="status equals selected",
+        required=True,
+        operator=PredicateOperator.EQ,
+        literal_or_reference="selected",
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(filter_binding.binding_id,),
+    )
+    query = state.query_spec.model_copy(
+        update={
+            "semantic_items": (metric, filter_item),
+            "requested_output_source_ids": (metric.source_id,),
+        }
+    )
+    state = ResearchState(
+        **{
+            **state.model_dump(mode="python", round_trip=True),
+            "query_spec": query,
+            "evidence": (evidence,),
+            "bindings": (metric_binding, filter_binding),
+        }
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Calculate the average amount for selected rows.",
+            validation_feedback=("INVALID_STOP",),
+            invalid_stop_generation_authority=(
+                CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
+                (filter_item.source_id, metric.source_id),
+            ),
+        )
+    )
+
+    assert "required_continuation" not in context
 
 
 def test_research_context_serializes_targetless_semantic_commit_action() -> None:
@@ -351,6 +758,28 @@ def test_profile_describes_semantic_commit_as_third_next_choice() -> None:
 
     assert "three next choices" in instructions
     assert "semantic_commit is not a stop reason" in instructions
+
+
+def test_profile_requires_following_stop_review_hint_before_semantic_commit() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When an Independent stop review hint is present, follow that hint in the "
+        "next decision before semantic_commit unless the hint itself explicitly "
+        "requires a corrected semantic_commit"
+        in instructions
+    )
+
+
+def test_profile_requires_exact_document_excerpt_for_derived_expression() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a document-backed derived_expression, copy rule_excerpt as one exact "
+        "contiguous substring of the cited document, including its original spacing "
+        "and punctuation; do not normalize or rephrase it"
+        in instructions
+    )
 
 
 def test_research_prompt_limit_stays_at_65536_bytes_when_input_budget_grows() -> None:
@@ -626,10 +1055,30 @@ def test_profile_directs_literal_filters_to_typed_value_bindings() -> None:
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
     )
-    assert re.search(
-        r"\bphysical_column\b.*\bno predicate\b.*\bnever use it\b.*\bfilter\b",
-        instructions,
-        flags=re.IGNORECASE | re.DOTALL,
+
+
+def test_profile_preserves_confirmed_like_pattern_in_predicate_binding() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For LIKE, preserve the wildcard placement from QuerySpec normalized_meaning "
+        "and a successful confirming probe in discriminator_predicate.right"
+        in instructions
+    )
+
+
+def test_profile_limits_proposals_to_the_current_task() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Limit proposals and assessments to semantic items needed to answer the "
+        "supplied task"
+        in instructions
+    )
+    assert (
+        "When the task asks to repair one semantic item, do not propose or assess "
+        "bindings for other semantic items"
+        in instructions
     )
 
 
@@ -644,6 +1093,21 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
         "Use physical_column only when the requested output itself is stored in that column."
         in instructions
     )
+
+
+def test_profile_preserves_qualifying_rows_when_related_output_is_optional() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Before new_join, identify the relation that qualifies the rows. A required:true "
+        "requested output, including a METRIC, requires returning its column but does not "
+        "make that relation qualifying. If all row conditions are on A and B only supplies "
+        "a projected output, emit LEFT with A left and B right. Use INNER join only when B "
+        "participates in row qualification or the question explicitly requires a matching or "
+        "nonempty B value. Distinguish NULL in a matched B row from absence of a B row, and "
+        "reject a reversed LEFT join."
+        in instructions
+    )
     assert (
         "Do not substitute an inner entity name, ID, or attribute for a requested derived "
         "alternative label or role."
@@ -652,6 +1116,30 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
     assert (
         "For a requested derived alternative label or role, use derived_expression with "
         "exact document evidence and its input columns."
+        in instructions
+    )
+
+
+def test_profile_keeps_named_entity_as_percentage_population() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a percentage or rate of named entities, bind the counted population to "
+        "those entities. If the qualifying attribute is stored in a related table, "
+        "join that table; do not replace the population with rows of the attribute table."
+        in instructions
+    )
+
+
+def test_profile_does_not_sum_identifiers_for_entity_percentage() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "In formula shorthand, an unqualified identifier belongs to the population "
+        "entity named by the request, not automatically to the table that stores the "
+        "qualifying attribute. For a percentage of entities, count qualifying "
+        "identifiers; do not sum their numeric values unless the request explicitly "
+        "asks for a sum of identifiers."
         in instructions
     )
 
@@ -715,6 +1203,63 @@ def test_profile_preserves_metric_measure_and_unit() -> None:
         "A binding whose trusted column description names a different measure or unit "
         "is invalid and must not be returned"
     ) in instructions
+
+
+def test_profile_binds_every_physical_input_of_a_formula() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For every physical input column of a formula, including a formula with only "
+        "one physical input column, create a separate SUPPORTED binding under the "
+        "formula's own source_id before complete"
+        in instructions
+    )
+    assert (
+        "Using a column only inside execute_research_probe does not make it available "
+        "to the SQL solver"
+        in instructions
+    )
+    assert (
+        "For a computed FILTER or TIME backed by a context rule, create one "
+        "derived_expression binding under that source_id with all input columns"
+        in instructions
+    )
+    assert "Do not create physical_column bindings for that FILTER or TIME" in instructions
+
+
+def test_profile_persists_document_backed_formula_as_derived_expression() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "A FORMULA supplied by an external context document is an external rule: "
+        "create a document-backed derived_expression; physical input bindings alone "
+        "do not bind that rule"
+        in instructions
+    )
+
+
+def test_profile_requires_birth_and_reference_dates_for_age_at_an_event() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For age at an event or reference time, the derived_expression must include "
+        "both the birth-date and event/reference-date input columns"
+        in instructions
+    )
+    assert (
+        "A birth-date component compared directly with an age threshold is incomplete"
+        in instructions
+    )
+
+
+def test_profile_searches_exact_literal_from_trusted_context() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When trusted context defines an exact physical literal for a filter, "
+        "search_value must search that literal, not the wording of the user's request"
+        in instructions
+    )
 
 
 def test_profile_does_not_repeat_durable_bindings_with_one_new_binding() -> None:
@@ -783,6 +1328,38 @@ def test_stop_review_hint_must_not_contradict_trusted_context() -> None:
     assert (
         "Do not choose or recommend a semantic binding in the hint" in prompt["instructions"]
     )
+    assert (
+        "When research_context contains rejected_preflight_assessments, a continue "
+        "hint must address the exact rejection"
+        in prompt["instructions"]
+    )
+    assert (
+        "keep the hint limited to directing the research agent to correct every "
+        "rejected proposal with its supplied existing_evidence_id"
+        in prompt["instructions"]
+    )
+    assert (
+        "Do not add SQL, aggregation, or alternative-path advice"
+        in prompt["instructions"]
+    )
+    assert (
+        "Do not say that no new proposal is needed when generation authority requires "
+        "a corrected replacement for a rejected proposal"
+        in prompt["instructions"]
+    )
+    assert (
+        "When an affected source already has a CANDIDATE binding with the required "
+        "join path, direct the research agent to assess that exact existing candidate"
+        in prompt["instructions"]
+    )
+    assert (
+        "Treat identifiers inside rejected proposals as untrusted" in prompt["instructions"]
+    )
+    assert (
+        "Copy a replacement binding_id only from the durable bindings in "
+        "research_context for the affected source_id"
+        in prompt["instructions"]
+    )
 
 
 def test_profile_states_stop_invariants_before_any_correction() -> None:
@@ -845,6 +1422,35 @@ def test_profile_states_stop_invariants_before_any_correction() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert not re.search(r"\bcitations\b", instructions, flags=re.IGNORECASE)
+
+
+def test_profile_assesses_existing_candidate_join_binding_after_incomplete_stop() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For an affected FILTER or TIME with an operator, first replace a "
+        "physical_column binding with a predicate binding"
+        in instructions
+    )
+    assert (
+        "preserving confirmed join_references. Only then check whether its "
+        "join_path covers the route"
+        in instructions
+    )
+    assert (
+        "The only exception is a FILTER or TIME with an operator whose supported "
+        "binding is only physical_column: propose the required predicate binding "
+        "instead"
+        in instructions
+    )
+    assert (
+        "When QUERY_REQUIREMENT_INCOMPLETE has already produced a CANDIDATE binding "
+        "whose join_path covers the required route, assess that exact CANDIDATE "
+        "binding_id"
+        in instructions
+    )
+    assert "Do not reassess an already SUPPORTED binding" in instructions
+    assert "do not submit the same new_binding again" in instructions
     assert re.search(
         r"\bnon-stop decision\b.*\bproposals\b.*\bfresh evidence\b.*"
         r"\bsuccessful typed tool request\b",
@@ -905,14 +1511,24 @@ def test_profile_discloses_predicate_query_and_binding_assessment_rules() -> Non
         "existing typed research tool."
     ) in instructions
     assert (
+        "Do not emit binding_assessment certificate=contradicted; omit that "
+        "optional assessment instead."
+    ) in instructions
+    assert (
         "Query formula needs no binding; verify physical inputs."
     ) in instructions
     assert (
         "Only external rules need document-backed derived_expression."
     ) in instructions
     assert (
-        "A FILTER/TIME binding needs exact-column evidence and a valid predicate. "
+        "A FILTER/TIME binding with an operator needs exact-column evidence and a valid "
+        "predicate. "
         "Zero matches do not mean unsupported"
+    ) in instructions
+    assert (
+        "When rejected feedback supplies existing_binding_id, assess only that exact "
+        "existing binding when fresh evidence permits; otherwise omit the duplicate "
+        "new_binding proposal."
     ) in instructions
 
 
@@ -993,6 +1609,17 @@ def test_profile_requires_logical_string_table_fields_not_physical_objects() -> 
     ) in instructions
 
 
+def test_profile_matches_targeted_reentry_tool_to_required_evidence_kind() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When research_context contains required_evidence_kind, choose a tool that "
+        "produces exactly that evidence kind: probe requires execute_research_probe; "
+        "value_search requires search_value or get_distinct_values"
+        in instructions
+    )
+
+
 def test_profile_documents_proposal_shapes_with_one_parseable_example() -> None:
     from custom_tools.text_to_sql.adaptive.research_decision import (
         parse_research_decision,
@@ -1035,6 +1662,19 @@ def test_profile_documents_proposal_shapes_with_one_parseable_example() -> None:
     }
     assert decision.next.next_kind == "tool"
     assert decision.next.hypothesis_ref.reference_kind == "proposed"
+
+
+def test_profile_documents_join_path_edge_as_objects_not_evidence_ids() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        'Join path edge: {"left":{"table":"TABLE_FROM_CURRENT_CONTEXT",'
+        '"column":"LEFT_COLUMN_FROM_CURRENT_CONTEXT"},"right":'
+        '{"table":"TABLE_FROM_CURRENT_CONTEXT","column":'
+        '"RIGHT_COLUMN_FROM_CURRENT_CONTEXT"},"operator":"eq",'
+        '"join_type":"inner"}. path is an array of these objects, not evidence IDs.'
+        in instructions
+    )
 
 
 def test_profile_discloses_flat_derived_expression_candidate_example() -> None:
@@ -1345,6 +1985,9 @@ def test_profile_explains_rejected_preflight_assessment_batch() -> None:
     assert "copy a durable citation_evidence_id verbatim" in instructions
     assert "binding already exists" in instructions
     assert "omit that new_binding" in instructions
+    assert "logical column differs by case" in instructions
+    assert "replace every affected column reference by exact_column verbatim" in instructions
+    assert "execute only missing_probe before repeating the binding" in instructions
 
 
 def test_profile_requires_exact_durable_evidence_ids_after_invalid_stop() -> None:
@@ -1361,6 +2004,20 @@ def test_profile_requires_physical_values_for_new_predicate_bindings() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
     assert "For FILTER with a literal value, use discriminator_value" in instructions
+    assert "For FILTER without an operator or literal, use physical_column" in instructions
+    assert (
+        "For an operator-less FILTER, first support its physical_column, then use "
+        "search_value or get_distinct_values on that exact column before proposing a "
+        "discriminator_value with EQ, IN, or IS_NULL and citing the exact-value evidence"
+        in instructions
+    )
+    assert "A literal in execute_research_probe WHERE is not literal authority" in instructions
+    assert "attach the confirmed join_references" in instructions
+    assert (
+        "A FILTER/TIME binding with an operator needs exact-column evidence and a "
+        "valid predicate"
+        in instructions
+    )
     assert "For TIME, use DB-confirmed predicate(s)" in instructions
     assert "putting extra column predicates in additional_predicates" in instructions
     assert "Put literals directly in right, never {\"value\": ...}" in instructions
@@ -1373,6 +2030,94 @@ def test_profile_preserves_explicit_physical_mapping_from_document() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
     assert "Use normalized_meaning mappings; no substitutes" in instructions
+    assert (
+        "When normalized_meaning explicitly names a loaded schema column, inspect "
+        "and bind that column; do not replace it with a semantically similar column"
+        in instructions
+    )
+    assert (
+        "When exact_physical_predicate is true, discriminator_predicate must use "
+        "the QuerySpec operator and literal on that explicitly named column; do not "
+        "translate the literal to a code in another column"
+        in instructions
+    )
+    assert (
+        "When a trusted document explicitly names a formula input and the loaded "
+        "schema contains a same-named column whose description matches that measure, "
+        "inspect and bind that column before replacing it with an indirect computed "
+        "proxy"
+        in instructions
+    )
+
+
+def test_profile_uses_described_relationship_when_multiple_foreign_keys_exist() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When multiple declared foreign keys connect the same required tables and "
+        "trusted descriptions distinguish their roles, use the relationship whose "
+        "described role matches the requested entity relationship. A column named "
+        "as a formula input does not by itself select the join key"
+        in instructions
+    )
+
+
+def test_profile_distinguishes_direct_participation_from_shared_parent_membership() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When a question counts entities that participate in qualifying related "
+        "records, distinguish direct participation from merely sharing a parent. "
+        "Before choosing a path through a shared parent, use inspect_relationships first "
+        "for the counted entity and then for the qualifying record, even when the first "
+        "inspection already shows a shared-parent path. If either inspection finds "
+        "an association table linking them, use the confirmed path through that table; "
+        "do not infer direct participation from a shared parent key. A path through the "
+        "parent remains valid when the question explicitly asks for all entities in a "
+        "qualifying parent"
+        in instructions
+    )
+
+
+def test_profile_keeps_unspecified_entity_output_as_its_identifier() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When the requested output is the entity itself and neither source_text nor "
+        "normalized_meaning names a specific descriptive attribute, bind the entity's "
+        "primary identifier. Use a name, title, label, or description only when that "
+        "attribute is requested"
+        in instructions
+    )
+
+
+def test_profile_reconciles_document_notation_with_database_values() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a categorical filter, when literal notation from a context document "
+        "differs from the supplied column examples, do not copy that notation into "
+        "a discriminator predicate. Use get_distinct_values for only that column, "
+        "then bind DB-confirmed physical values that preserve the document meaning. "
+        "Do not apply this rule to ordinary numeric thresholds or when "
+        "exact_physical_predicate is true"
+        in instructions
+    )
+
+
+def test_profile_reconciles_derived_expression_format_with_observed_values() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When fresh rowset evidence contains values for a derived_expression input, "
+        "compare those values with every physical-format and fixed-position claim "
+        "before marking the binding consistent. If observed component widths or "
+        "delimiters do not match, omit consistent and propose a new binding for the "
+        "same source_id based on the observed representation; a CANDIDATE binding "
+        "does not block that replacement. Do not infer fixed positions from a "
+        "display-format label when observed values vary in width"
+        in instructions
+    )
 
 
 def test_profile_explains_exact_hypothesis_consistency_certificate() -> None:
@@ -1975,6 +2720,141 @@ def test_runtime_model_enforces_exact_typed_decision_schema(
 
     assert_discriminator_fields_are_required(schema)
     assert parse_research_decision(response.raw_response).next.next_kind == "tool"
+
+
+def test_runtime_stop_review_model_enforces_exact_typed_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent_command
+    from smolagents import ChatMessage, MessageRole
+    from workflow.text_to_sql_typed_research import _research_stop_review_model
+
+    payload = json.dumps({"decision": "continue", "hint": "short instruction"})
+    captured: dict[str, object] = {}
+
+    class Provider:
+        def __call__(self, messages: object, **kwargs: object) -> ChatMessage:
+            captured["messages"] = messages
+            captured.update(kwargs)
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=payload,
+                token_usage=SimpleNamespace(input_tokens=17, output_tokens=9),
+            )
+
+    monkeypatch.setattr(
+        agent_command,
+        "create_text_to_sql_model",
+        lambda _name, **_kwargs: Provider(),
+    )
+
+    response = asyncio.run(
+        _research_stop_review_model("model_code", 1024)("research prompt")
+    )
+
+    assert response.raw_response == payload
+    response_format = captured["response_format"]
+    assert isinstance(response_format, dict)
+    assert response_format["type"] == "json_schema"
+    json_schema = response_format["json_schema"]
+    assert isinstance(json_schema, dict)
+    assert json_schema["name"] == "ResearchStopReview"
+    assert json_schema["strict"] is True
+    schema = json_schema["schema"]
+    assert isinstance(schema, dict)
+    assert set(schema["properties"]) == {"decision", "hint"}
+
+
+def test_research_model_and_stop_review_model_use_different_response_formats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: the two providers must not share one response_format."""
+
+    import agent_command
+    from smolagents import ChatMessage, MessageRole
+    from workflow.text_to_sql_typed_research import (
+        _research_model,
+        _research_stop_review_model,
+    )
+
+    captured: dict[str, object] = {}
+
+    class Provider:
+        def __init__(self, payload: str) -> None:
+            self._payload = payload
+
+        def __call__(self, _messages: object, **kwargs: object) -> ChatMessage:
+            captured["response_format"] = kwargs["response_format"]
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=self._payload,
+                token_usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    monkeypatch.setattr(
+        agent_command,
+        "create_text_to_sql_model",
+        lambda _name, **_kwargs: Provider(_decision_payload()),
+    )
+    asyncio.run(_research_model("model_code", 1024)("research prompt"))
+    decision_response_format = captured["response_format"]
+
+    monkeypatch.setattr(
+        agent_command,
+        "create_text_to_sql_model",
+        lambda _name, **_kwargs: Provider(
+            json.dumps({"decision": "stop_confirmed", "hint": None})
+        ),
+    )
+    asyncio.run(_research_stop_review_model("model_code", 1024)("research prompt"))
+    stop_review_response_format = captured["response_format"]
+
+    assert decision_response_format != stop_review_response_format
+    assert decision_response_format["json_schema"]["name"] == "ResearchDecisionV1"
+    assert stop_review_response_format["json_schema"]["name"] == "ResearchStopReview"
+
+
+def test_stop_review_adapter_accepts_stop_review_model_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop-review provider's output must decode without ContractDecodeError."""
+
+    import agent_command
+    from smolagents import ChatMessage, MessageRole
+    from custom_tools.text_to_sql.adaptive.schema_research_agent import (
+        SchemaResearchStopReviewAdapter,
+    )
+    from workflow.text_to_sql_typed_research import _research_stop_review_model
+
+    payload = json.dumps({"decision": "continue", "hint": "short instruction"})
+
+    class Provider:
+        def __call__(self, _messages: object, **_kwargs: object) -> ChatMessage:
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content=payload,
+                token_usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+
+    monkeypatch.setattr(
+        agent_command,
+        "create_text_to_sql_model",
+        lambda _name, **_kwargs: Provider(),
+    )
+
+    model = _research_stop_review_model("model_code", 1024)
+    review, usage = asyncio.run(
+        SchemaResearchStopReviewAdapter().review_with_usage(
+            model,
+            task="find total revenue",
+            research_context="{}",
+            stop_reason="ambiguous",
+        )
+    )
+
+    assert review.decision == "continue"
+    assert review.hint == "short instruction"
+    assert usage == ModelTokenUsage(input_tokens=1, output_tokens=1)
 
 
 def test_model_code_defaults_do_not_override_typed_research_parameters(

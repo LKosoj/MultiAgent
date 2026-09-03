@@ -58,6 +58,9 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     SerializationLimits,
     canonical_json_bytes,
 )
+from custom_tools.text_to_sql.adaptive._semantic_value_certificate import (
+    evidence_observes_exact_value,
+)
 from custom_tools.text_to_sql.adaptive.state import apply_research_transition
 
 from custom_tools.text_to_sql.adaptive.semantic_reducer import (
@@ -263,6 +266,34 @@ def _value_evidence(column: ColumnRef, value: object, evidence_id: str):
         column,
         {"columns": [column.column], "rows": [[value]]},
         evidence_id=evidence_id,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"columns": ["status"], "rows": [["active"]]},
+        {
+            "columns": ["status"],
+            "rows": [["active"]],
+            "requested_value": "inactive",
+        },
+    ),
+)
+def test_search_value_exact_return_remains_a_value_certificate(
+    payload: dict[str, object],
+) -> None:
+    column = _column("events", "status")
+
+    assert evidence_observes_exact_value(
+        _evidence(
+            ResearchActionKind.SEARCH_VALUE,
+            column,
+            payload,
+            evidence_id="search-value-exact-return",
+        ),
+        column,
+        "active",
     )
 
 
@@ -1292,6 +1323,33 @@ def test_inner_multi_hop_reverse_has_one_id_and_canonical_path() -> None:
     assert different_order.join_id != forward.join_id
 
 
+def test_inner_multi_hop_mixed_edge_orientation_has_canonical_path() -> None:
+    forward_path = (
+        (("opaque_alpha", "alpha_id"), ("opaque_beta", "alpha_id")),
+        (("opaque_beta", "beta_id"), ("opaque_gamma", "beta_id")),
+    )
+    mixed_path = (
+        (("opaque_alpha", "alpha_id"), ("opaque_beta", "alpha_id")),
+        (("opaque_gamma", "beta_id"), ("opaque_beta", "beta_id")),
+    )
+
+    forward = _join_candidate(
+        ("opaque_alpha", "alpha_id"),
+        ("opaque_gamma", "beta_id"),
+        "inner",
+        forward_path,
+    )
+    mixed = _join_candidate(
+        ("opaque_alpha", "alpha_id"),
+        ("opaque_gamma", "beta_id"),
+        "inner",
+        mixed_path,
+    )
+
+    assert mixed.path == forward.path
+    assert mixed.join_id == forward.join_id
+
+
 def test_vertical_certificate_requires_the_two_exact_opaque_eav_joins() -> None:
     binding, cited, joins = _vertical_fixture()
 
@@ -1522,6 +1580,80 @@ def test_discriminator_certificate_rejects_non_finite_literal(right: float) -> N
         binding,
         (_column_evidence(column, "schema"),),
     ) is False
+
+
+@pytest.mark.parametrize(
+    ("operator", "right", "expected"),
+    (
+        (PredicateOperator.EQ, "open", False),
+        (PredicateOperator.IN, ("open", "closed"), False),
+        (PredicateOperator.IS_NULL, None, False),
+        (PredicateOperator.GT, 10, True),
+        (PredicateOperator.BETWEEN, (10, 20), True),
+    ),
+)
+def test_discriminator_certificate_requires_value_evidence_only_for_discrete_operators(
+    operator: PredicateOperator,
+    right: object,
+    expected: bool,
+) -> None:
+    column = _column("events", "measurement")
+    predicate = PredicateRef(left=column, operator=operator, right=right)
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-measurement",
+        source_id="source-measurement",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("schema",),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=column,
+        discriminator_predicate=predicate,
+    )
+
+    assert _discriminator_certificate(
+        binding,
+        (),
+        schema_columns=(column,),
+    ) is expected
+
+
+def test_discriminator_certificate_rejects_schema_or_probe_literal_without_value_search() -> None:
+    column = _column("events", "status")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.EQ,
+        right="active",
+    )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-status",
+        source_id="source-status",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=("schema", "probe", "value"),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=column,
+        discriminator_predicate=predicate,
+    )
+    schema = _column_evidence(column, "schema")
+    probe = _evidence(
+        ResearchActionKind.EXECUTE_PROBE,
+        column,
+        {"columns": [column.column], "rows": [["active"]]},
+        evidence_id="probe",
+    )
+    value = _value_evidence(column, "active", "value")
+
+    assert _discriminator_certificate(binding, (schema,)) is False
+    assert _discriminator_certificate(binding, (schema, probe)) is False
+    assert _discriminator_certificate(binding, (schema, value)) is True
 
 
 @pytest.mark.parametrize(
@@ -1916,6 +2048,79 @@ def test_new_binding_cannot_be_assessed_in_the_same_decision() -> None:
                 parameters=(),
             ),
         )
+
+
+def test_new_discriminator_binding_preserves_exact_query_predicate() -> None:
+    state = _state()
+    semantic_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "exact_physical_predicate": True,
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "2042-03-04 05:06:07.0",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (semantic_item,)}
+            )
+        }
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:exact-filter",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "logical",
+                            "column": "recorded_at",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "logical", "column": "recorded_at"},
+                            "operator": PredicateOperator.EQ,
+                            "right": "2042-03-04 05:06:07",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            ),
+            "next": _tool_decision().next.model_dump(mode="python"),
+        }
+    )
+
+    admission = admit_semantic_turn(
+        state,
+        decision,
+        batch=TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(
+                ResolvedColumn(
+                    logical_table="logical",
+                    logical_column="recorded_at",
+                    physical_column=_column("records", "recorded_at"),
+                ),
+            ),
+        ),
+        freshness_context=_context(),
+        tool_claim=TrustedToolClaim(
+            action_id="action-1",
+            tool_name="inspect_table",
+            target=_table("orders"),
+            parameters=(),
+        ),
+    )
+
+    binding = admission.bindings[0]
+    assert isinstance(binding, DiscriminatorValueBinding)
+    assert binding.discriminator_predicate.right == "2042-03-04 05:06:07.0"
+    assert binding.predicates[0] == binding.discriminator_predicate
 
 
 def test_resolved_physical_id_collision_is_rejected_deterministically() -> None:

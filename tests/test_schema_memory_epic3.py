@@ -125,6 +125,137 @@ def test_restore_descriptions_from_exact_schema_memory(monkeypatch, tmp_path):
     ]
 
 
+def test_approved_semantic_facts_round_trip_in_the_exact_namespace(
+    monkeypatch,
+    tmp_path,
+):
+    """Approved typed facts are reusable only inside their schema namespace."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    schema = {
+        "public.orders": {
+            "columns": {"amount": {"type": "DECIMAL"}},
+        }
+    }
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+
+    def get_memory(**kwargs):
+        return [
+            {"data": record}
+            for record in saved
+            if record["schema_version"] == kwargs["session_id"]
+            and record["cache_kind"] == kwargs["cache_kind"]
+        ]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=get_memory,
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="description",
+        value="Net invoice amount",
+        source="file",
+        status="approved",
+    )
+    manager = SchemaMemoryManager(tmp_path)
+
+    manager.save_approved_semantic_facts(namespace, (fact,))
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [fact]
+
+    replacement = fact.model_copy(update={"value": "Corrected amount"})
+    manager.save_approved_semantic_facts(namespace, (replacement,))
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == []
+    assert manager.find_approved_semantic_facts(("amount",), namespace) == [
+        replacement
+    ]
+
+
+def test_semantic_fact_rejects_non_finite_example_values() -> None:
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    with pytest.raises(ValueError, match="finite"):
+        SemanticFact(
+            subject="column",
+            table_fqn="public.orders",
+            column="amount",
+            fact_kind="example",
+            value=float("nan"),
+            source="file",
+            status="approved",
+        )
+
+
+def test_empty_file_snapshot_supersedes_previous_file_facts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Removing a file fact must stop it from being returned."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    manager = SchemaMemoryManager(tmp_path)
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="description",
+        value="Net invoice amount",
+        source="file",
+        status="approved",
+    )
+
+    manager.replace_file_semantic_facts(namespace, (fact,))
+    manager.replace_file_semantic_facts(namespace, ())
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == []
+
+
 # ---------------------------------------------------------------------------
 # T3.4 — legacy/new формат схемы через helper'ы
 # ---------------------------------------------------------------------------

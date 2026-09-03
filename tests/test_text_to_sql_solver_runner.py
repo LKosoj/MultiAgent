@@ -402,6 +402,109 @@ def test_pre_execution_runner_stops_after_explain_without_execution(monkeypatch)
     assert result.execution_results == ()
 
 
+def test_pre_execution_runner_commits_schema_failure_before_semantic_rebuild(
+    monkeypatch,
+):
+    state, research_state, requirements, loaded_schema = _runtime()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: {
+            "is_valid": False,
+            "issues": [
+                {
+                    "issue_type": "UNKNOWN_COLUMN",
+                    "description": "Column is not present in the selected table",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner._rebuild_semantic_input",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("semantic input rebuilt before schema passed")
+        ),
+    )
+
+    def commit(transition):
+        calls.append(transition.check_result.check_kind.value)
+        return transition.state
+
+    result = run_solver_candidate_pre_execution_gates(
+        state,
+        candidate_id="candidate-1",
+        research_state=research_state,
+        requirements=requirements,
+        loaded_schema=loaded_schema,
+        dsn=POSTGRES_DSN,
+        safety_policy=load_startup_safety_policy(),
+        row_limit=10,
+        dry_run_only=False,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+        commit_transition=commit,
+    )
+
+    assert calls == ["safety", "schema"]
+    assert result.check_results[-1].status is CheckStatus.FAILED
+
+
+def test_pre_execution_runner_propagates_semantic_rebuild_failure_after_schema(
+    monkeypatch,
+):
+    state, research_state, requirements, loaded_schema = _runtime()
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: {"is_valid": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner._rebuild_semantic_input",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            SolverRunnerValidationError("semantic authority is invalid")
+        ),
+    )
+
+    with pytest.raises(
+        SolverRunnerValidationError, match="semantic authority is invalid"
+    ):
+        run_solver_candidate_pre_execution_gates(
+            state,
+            candidate_id="candidate-1",
+            research_state=research_state,
+            requirements=requirements,
+            loaded_schema=loaded_schema,
+            dsn=POSTGRES_DSN,
+            safety_policy=load_startup_safety_policy(),
+            row_limit=10,
+            dry_run_only=False,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+            commit_transition=lambda transition: transition.state,
+        )
+
+
 def test_runner_resume_blocker_and_commit_mismatch_do_not_recall_prior_gate(
     monkeypatch,
 ):

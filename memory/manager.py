@@ -176,7 +176,7 @@ class MemoryManager:
 
         try:
             embedding = self.db_handler.embedding_model.encode(clean_text, convert_to_tensor=False)
-            return embedding.tolist()
+            return embedding.tolist() if hasattr(embedding, "tolist") else list(embedding)
         except Exception as exc:
             logger.warning("Embedding computation failed (purpose=%s): %r", purpose, exc)
             raise EmbeddingFailedError(

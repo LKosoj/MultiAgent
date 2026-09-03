@@ -23,6 +23,7 @@ import os
 import json
 import random
 import logging
+import logging.handlers
 import re
 import copy
 import threading
@@ -35,6 +36,8 @@ from httpx import HTTPStatusError, ReadTimeout, ConnectTimeout, TimeoutException
 from types import SimpleNamespace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+
+from llm_call_context import get_llm_call_context
 
 
 def _compute_backoff_delay(retry_delay_base: float, attempt: int) -> float:
@@ -265,6 +268,51 @@ def _parse_retry_after(response) -> Optional[float]:
         return None
 
 
+def _int_env(name: str, default: int) -> int:
+    """Читает целочисленную env-переменную; на некорректное значение — тихий fallback на дефолт.
+
+    Логирование ответов модели — вспомогательная диагностика, а не критический путь,
+    поэтому в отличие от audit-логгера (см. custom_tools/text_to_sql/core/_audit.py)
+    здесь не делаем fail-fast: битый env не должен ронять основной retry/fallback поток.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+_response_log_handler: Optional["logging.handlers.RotatingFileHandler"] = None
+_response_log_handler_lock = threading.Lock()
+
+
+def _get_response_log_handler() -> "logging.handlers.RotatingFileHandler":
+    """Ленивый синглтон RotatingFileHandler для logs/llm_responses/responses.jsonl.
+
+    Один JSON-объект на строку (JSONL) вместо файла на каждый ответ — так решается
+    проблема 1632 файлов/19 МБ от прежней схемы логирования "один файл на ответ".
+    """
+    global _response_log_handler
+    with _response_log_handler_lock:
+        if _response_log_handler is None:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            logs_dir = os.path.join(base_dir, "logs", "llm_responses")
+            os.makedirs(logs_dir, exist_ok=True)
+            log_path = os.path.join(logs_dir, "responses.jsonl")
+            handler = logging.handlers.RotatingFileHandler(
+                log_path,
+                maxBytes=_int_env("LLM_RESPONSE_LOG_MAX_BYTES", 5242880),
+                backupCount=_int_env("LLM_RESPONSE_LOG_BACKUPS", 3),
+                encoding="utf-8",
+                delay=True,  # не открывать файл до первой записи
+            )
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            _response_log_handler = handler
+        return _response_log_handler
+
+
 class RetryOpenAIServerModel:
     """
     Wrapper для OpenAIServerModel с автоматическими повторными попытками
@@ -303,7 +351,7 @@ class RetryOpenAIServerModel:
         self.api_base = api_base
         self.api_key = api_key
         self.kwargs = kwargs
-        self.debug_logging = debug_logging
+        self.debug_logging = debug_logging or os.getenv("LLM_RESPONSE_LOGGING_ENABLED", "0") == "1"
         if timeout_seconds is not None and (
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
@@ -985,53 +1033,95 @@ class RetryOpenAIServerModel:
         except Exception as e:
             return {"normalize_error": str(e), "text": str(response)[:500]}
 
-    def _write_response_log(self, response: Any, attempt: int, model_id: str) -> None:
+    def _extract_usage_before_defaults(self, response: Any) -> Optional[Dict[str, Any]]:
         """
-        Записывает ответ модели в файл JSON. Один ответ = один файл с меткой времени в имени.
+        Извлекает usage из ответа модели ДО вызова _inject_usage_defaults, чтобы в логах
+        можно было отличить "провайдер не вернул usage вовсе" (None) от "вернул нули".
+
+        Проверяет те же источники, что и _inject_usage_defaults: ChatMessage.token_usage,
+        response.usage, response.raw.usage (объект или dict).
         """
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        logs_dir = os.path.join(base_dir, "logs", "llm_responses")
-        os.makedirs(logs_dir, exist_ok=True)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        safe_model = (model_id or "unknown").replace('/', '_').replace(':', '_')
-        filename = f"{ts}_attempt{attempt + 1}_{safe_model}.json"
-        file_path = os.path.join(logs_dir, filename)
-
         try:
-            payload = {
-                "timestamp": ts,
-                "model_id": model_id,
-                "attempt": attempt + 1,
-                "current_model_index": self.current_model_index,
-                "response": self._normalize_response_for_logging(response),
-            }
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            # Если не удалось записать нормальный лог, записываем лог об ошибке
-            try:
-                error_payload = {
-                    "timestamp": ts,
-                    "model_id": model_id,
-                    "attempt": attempt + 1,
-                    "current_model_index": self.current_model_index,
-                    "logging_error": str(e),
-                    "response_type": type(response).__name__,
-                    "response_str": str(response)
+            if isinstance(response, ChatMessage):
+                token_usage = getattr(response, "token_usage", None)
+                if token_usage is None:
+                    return None
+                return {
+                    "input_tokens": getattr(token_usage, "input_tokens", None),
+                    "output_tokens": getattr(token_usage, "output_tokens", None),
                 }
-                
-                error_filename = f"{ts}_attempt{attempt + 1}_{safe_model}_ERROR.json"
-                error_file_path = os.path.join(logs_dir, error_filename)
-                
-                with open(error_file_path, "w", encoding="utf-8") as f:
-                    json.dump(error_payload, f, ensure_ascii=False, indent=2)
-                    
-                logger.debug(f"Записан лог об ошибке логирования: {error_filename}")
-            except Exception as final_e:
-                # Если и это не сработало, только тогда логируем в debug
-                logger.debug(f"Критическая ошибка логирования ответа модели: {e}, финальная ошибка: {final_e}")
+
+            usage = getattr(response, "usage", None) if hasattr(response, "usage") else None
+            if usage is None and isinstance(response, dict):
+                usage = response.get("usage")
+            if usage is None and hasattr(response, "raw") and getattr(response, "raw") is not None:
+                raw_obj = getattr(response, "raw")
+                usage = raw_obj.get("usage") if isinstance(raw_obj, dict) else getattr(raw_obj, "usage", None)
+            if usage is None:
+                return None
+            if isinstance(usage, dict):
+                return {
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                }
+            return {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+            }
+        except Exception:
+            return None
+
+    def _write_response_log(
+        self,
+        *,
+        status: str,
+        model_id: str,
+        attempt: int,
+        latency_ms: float,
+        response: Any = None,
+        usage: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Пишет одну JSON-строку (успех или провал попытки вызова модели) в
+        logs/llm_responses/responses.jsonl через ротирующийся хендлер (см.
+        _get_response_log_handler). Никогда не поднимает исключение наружу —
+        логирование ответа не должно ломать retry/fallback поток.
+        """
+        try:
+            call_context = get_llm_call_context()
+            payload = {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": call_context.get("run_id"),
+                "step_name": call_context.get("step_name"),
+                "status": status,
+                "model_id": model_id,
+                "attempt": attempt,
+                "current_model_index": self.current_model_index,
+                "latency_ms": latency_ms,
+                "usage": usage,
+                "error": error,
+                "response": self._normalize_response_for_logging(response) if response is not None else None,
+            }
+            line = json.dumps(payload, ensure_ascii=False, default=str)
+
+            handler = _get_response_log_handler()
+            record = logger.makeRecord(
+                name=logger.name,
+                level=logging.INFO,
+                fn=__file__,
+                lno=0,
+                msg=line,
+                args=(),
+                exc_info=None,
+            )
+            with handler.lock:
+                if handler.shouldRollover(record):
+                    handler.doRollover()
+                handler.emit(record)
+                handler.flush()
+        except Exception as e:
+            logger.debug(f"Не удалось записать лог ответа модели: {e}")
     
     def _should_retry(self, error: Exception) -> bool:
         """
@@ -1467,11 +1557,13 @@ class RetryOpenAIServerModel:
             # Пытаемся выполнить запрос с текущей моделью
             switched_model = False
             for attempt in range(self.max_retries + 1):
+                response = None
+                attempt_start = time.perf_counter()
                 try:
                     # Логируем попытку (кроме первой)
                     if attempt > 0:
                         logger.info(f"Повторная попытка {attempt + 1}/{self.max_retries + 1} для модели {current_model_id}")
-                    
+
                     # Выполняем запрос
                     #logger.info(f"Запрос: {messages}, {kwargs}")
                     normalized_messages = self._normalize_messages_for_model(messages)
@@ -1479,13 +1571,6 @@ class RetryOpenAIServerModel:
                     response = self._normalize_response_content(response)
                     response = self._apply_tool_call_recovery(response, kwargs)
 
-                    # Пишем лог ответа (один файл на ответ)
-                    if self.debug_logging:
-                        try:
-                            self._write_response_log(response, attempt, current_model_id)
-                        except Exception as log_err:
-                            logger.debug(f"Не удалось записать лог ответа модели: {log_err}")
-                    
                     # Проверяем, что модель вернула не None
                     if response is None:
                         raise Exception(f"Модель {current_model_id} вернула None")
@@ -1545,11 +1630,37 @@ class RetryOpenAIServerModel:
                     elif self.current_model_index != original_model_index:
                         logger.info(f"Запрос успешен с fallback моделью {current_model_id}")
                     
+                    # Пишем лог успешного ответа (истинная точка успеха, после всех проверок)
+                    if self.debug_logging:
+                        self._write_response_log(
+                            status="success",
+                            model_id=current_model_id,
+                            attempt=attempt + 1,
+                            latency_ms=(time.perf_counter() - attempt_start) * 1000,
+                            response=response,
+                            usage=self._extract_usage_before_defaults(response),
+                            error=None,
+                        )
+
                     # Нормализуем usage/token_usage перед возвратом
                     return self._inject_usage_defaults(response)
-                    
+
                 except Exception as e:
                     last_exception = e
+
+                    # Пишем лог провалившейся попытки: retry, переключение на fallback,
+                    # терминальное исчерпание и "ответ получен, но не прошёл валидацию"
+                    # все проходят через эту единственную точку.
+                    if self.debug_logging:
+                        self._write_response_log(
+                            status="failure",
+                            model_id=current_model_id,
+                            attempt=attempt + 1,
+                            latency_ms=(time.perf_counter() - attempt_start) * 1000,
+                            response=response,
+                            usage=self._extract_usage_before_defaults(response) if response is not None else None,
+                            error=str(e),
+                        )
 
                     # Специальная обработка: max_tokens слишком большой при огромном входе.
                     # Это НЕ повод переключать модель/ждать — просто уменьшаем max_tokens и повторяем.

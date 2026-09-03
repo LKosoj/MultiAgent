@@ -1074,3 +1074,180 @@ async def test_enhanced_workflow_step_substitutes_metadata_before_agent_executio
 
     assert result.status.value == "completed"
     assert result.output == dsn
+
+
+@pytest.mark.asyncio
+async def test_execute_step_with_policy_success_records_resource_usage(stub_mcp_tools):
+    """W0-0.3: успешный шаг должен заполнять resource_usage['duration_seconds']."""
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    class PolicyEngine:
+        def get_budget(self, scope, step):
+            return None
+
+    async def execute_agent(step, context, task, plan, budget):
+        return "ok"
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    engine.policy_engine = PolicyEngine()
+    engine._execute_enhanced_agent_step = execute_agent
+
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_step_with_policy(step, context, None, 1)
+
+    assert result.status.value == "completed"
+    assert "duration_seconds" in result.resource_usage
+    assert isinstance(result.resource_usage["duration_seconds"], float)
+    assert result.resource_usage["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_execute_step_with_policy_failure_records_resource_usage(stub_mcp_tools):
+    """W0-0.3: упавший шаг тоже должен заполнять resource_usage['duration_seconds']."""
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    class PolicyEngine:
+        def get_budget(self, scope, step):
+            return None
+
+    async def execute_agent(step, context, task, plan, budget):
+        raise RuntimeError("boom")
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    engine.policy_engine = PolicyEngine()
+    engine._execute_enhanced_agent_step = execute_agent
+
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_step_with_policy(step, context, None, 1)
+
+    assert result.status.value == "failed"
+    assert "duration_seconds" in result.resource_usage
+    assert isinstance(result.resource_usage["duration_seconds"], float)
+    assert result.resource_usage["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_execute_enhanced_step_circuit_breaker_open_records_resource_usage(
+    stub_mcp_tools,
+):
+    """W0-0.3: короткое замыкание circuit breaker тоже заполняет resource_usage."""
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    engine.budget_manager = types.SimpleNamespace(
+        create_step_budget=lambda *a, **k: None,
+    )
+    engine.circuit_breaker_manager = types.SimpleNamespace(
+        is_agent_available=lambda agent_type: False,
+    )
+
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_enhanced_step(step, context, {})
+
+    assert result.status.value == "failed"
+    assert result.error_class == "circuit_breaker_open"
+    assert "duration_seconds" in result.resource_usage
+    assert isinstance(result.resource_usage["duration_seconds"], float)
+    assert result.resource_usage["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_execute_enhanced_step_loop_detected_records_resource_usage(stub_mcp_tools):
+    """W0-0.3: короткое замыкание loop detector тоже заполняет resource_usage."""
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    engine.budget_manager = types.SimpleNamespace(
+        create_step_budget=lambda *a, **k: None,
+    )
+    engine.circuit_breaker_manager = types.SimpleNamespace(
+        is_agent_available=lambda agent_type: True,
+    )
+    engine.loop_detector = types.SimpleNamespace(
+        is_step_in_loop=lambda workflow_id, step_id: (True, "pattern-x"),
+        get_loop_prevention_suggestion=lambda workflow_id, step_id: "try something else",
+    )
+
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_enhanced_step(step, context, {})
+
+    assert result.status.value == "failed"
+    assert result.error_class == "loop_detected"
+    assert "duration_seconds" in result.resource_usage
+    assert isinstance(result.resource_usage["duration_seconds"], float)
+    assert result.resource_usage["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_execute_enhanced_step_top_level_exception_records_resource_usage(
+    stub_mcp_tools,
+):
+    """W0-0.3: верхнеуровневое исключение (после circuit breaker/loop detector)
+    тоже заполняет resource_usage."""
+    from workflow.enhanced_engine import EnhancedWorkflowEngine
+    from workflow.models import WorkflowContext, WorkflowStep
+
+    async def failing_execute_with_retry(**kwargs):
+        raise RuntimeError("retry engine exploded")
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    engine.budget_manager = types.SimpleNamespace(
+        create_step_budget=lambda *a, **k: None,
+    )
+    engine.circuit_breaker_manager = types.SimpleNamespace(
+        is_agent_available=lambda agent_type: True,
+    )
+    engine.loop_detector = types.SimpleNamespace(
+        is_step_in_loop=lambda workflow_id, step_id: (False, None),
+    )
+    engine.retry_engine = types.SimpleNamespace(
+        execute_with_retry=failing_execute_with_retry,
+    )
+
+    step = WorkflowStep(
+        id="sql_generation",
+        task="generate",
+        step_type="agent",
+        agent_type="sql_generator_agent",
+    )
+    context = WorkflowContext(workflow_id="wf-1", session_id="session-1")
+
+    result = await engine._execute_enhanced_step(step, context, {})
+
+    assert result.status.value == "failed"
+    assert result.error_class == "execution_error"
+    assert "duration_seconds" in result.resource_usage
+    assert isinstance(result.resource_usage["duration_seconds"], float)
+    assert result.resource_usage["duration_seconds"] >= 0

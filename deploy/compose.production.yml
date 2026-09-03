@@ -25,6 +25,7 @@ x-backend: &backend
     AG_UI_AUTH_TOKEN_MAP_FILE: /run/secrets/ag_ui_auth_token_map
     API_GRACEFUL_TIMEOUT_SECONDS: "45"
     HF_TOKEN_FILE: /run/secrets/hf_token
+    OPENAI_API_BASE_DB: ${OPENAI_API_BASE_DB:?OPENAI_API_BASE_DB is required}
     OPENAI_API_KEY_DB_FILE: /run/secrets/openai_api_key_db
     OPENAI_API_KEY_FILE: /run/secrets/openai_api_key
     SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}

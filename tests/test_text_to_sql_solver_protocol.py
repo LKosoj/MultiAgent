@@ -73,8 +73,27 @@ def test_missing_evidence_has_exact_transient_fields() -> None:
         "reason",
         "repair_kind",
         "repair_binding_id",
+        "predicate_authority",
     }
     assert proposal.proposal.required_evidence_kind is EvidenceSourceKind.SCHEMA
+
+
+def test_missing_evidence_preserves_typed_predicate_authority() -> None:
+    payload = _missing_payload()
+    payload["proposal"]["predicate_authority"] = {
+        "left": {
+            "table": {"namespace": "main", "schema_name": None, "table": "orders"},
+            "column": "status",
+        },
+        "operator": "eq",
+        "right": "active",
+    }
+
+    proposal = parse_solver_proposal(json.dumps(payload))
+
+    assert proposal.proposal.predicate_authority is not None
+    assert proposal.proposal.predicate_authority.left.column == "status"
+    assert proposal.proposal.predicate_authority.right == "active"
 
 
 @pytest.mark.parametrize(

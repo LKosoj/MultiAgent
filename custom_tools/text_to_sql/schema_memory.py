@@ -36,6 +36,7 @@ from .schema_memory_chroma import (
     _resolve_chroma_metric,
 )
 from .schema_memory_sqlite import (
+    SemanticFact,
     SchemaIndexingError,
     SchemaIndexingMemoryUnavailable,
     SchemaMemoryManager,
@@ -44,6 +45,7 @@ from .schema_memory_sqlite import (
 __all__ = [
     # Классы (внешний контракт)
     "SchemaMemoryManager",
+    "SemanticFact",
     "SchemaCacheManager",
     "SchemaCacheCorrupted",
     # W2-T1: индексация схемы — кастомные исключения fail-fast

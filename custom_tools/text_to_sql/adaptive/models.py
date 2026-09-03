@@ -952,11 +952,14 @@ class MissingEvidenceRequest(ContractModel):
     reason: NonEmptyText
     repair_kind: Literal["semantic_binding_mismatch"] | None = None
     repair_binding_id: Id | None = None
+    predicate_authority: PredicateRef | None = None
 
     @model_validator(mode="after")
     def validate_repair_target(self) -> MissingEvidenceRequest:
         if (self.repair_kind is None) != (self.repair_binding_id is None):
             raise ValueError("semantic repair kind and binding ID must be provided together")
+        if self.predicate_authority is not None and self.repair_kind is not None:
+            raise ValueError("predicate authority cannot be combined with semantic repair")
         return self
 
 
@@ -1072,8 +1075,6 @@ class SolverState(ContractModel):
             raise ValueError(
                 "SolverState query_spec schema_namespace_version must match state"
             )
-        if self.query_spec.revision > self.revision:
-            raise ValueError("SolverState query_spec revision cannot be in the future")
         source_ids = {item.source_id for item in self.query_spec.semantic_items}
         candidate_ids = unique_ids(
             self.sql_candidates, "candidate_id", "sql_candidates"
@@ -1091,13 +1092,6 @@ class SolverState(ContractModel):
             "research_reentry_id",
             "research_reentries",
         )
-        candidate_digests = tuple(
-            candidate.normalized_ast_digest for candidate in self.sql_candidates
-        )
-        if len(candidate_digests) != len(set(candidate_digests)):
-            raise ValueError(
-                "SolverState normalized_ast_digest must be globally unique"
-            )
         if len(self.sql_candidates) > 8:
             raise ValueError("SolverState supports at most 8 SQL candidates")
         execution_candidate_ids = tuple(
@@ -1107,9 +1101,6 @@ class SolverState(ContractModel):
             raise ValueError(
                 "SolverState allows at most one ExecutionResult per candidate"
             )
-        for candidate in self.sql_candidates:
-            if candidate.revision > self.revision:
-                raise ValueError("SqlCandidate revision cannot be in the future")
         for check in self.check_results:
             if check.candidate_id not in candidate_ids:
                 raise ValueError("CheckResult candidate_id must reference SqlCandidate")

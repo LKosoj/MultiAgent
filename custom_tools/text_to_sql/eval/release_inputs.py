@@ -32,7 +32,13 @@ from .official_evaluator_contracts import (
 from .sandbox import SandboxError, resolve_safe_regular_file
 CANONICAL_RELEASE_DATASET_ORDER = ("bird", "spider")
 _SCHEMA_CACHE_KINDS = frozenset(
-    {"schema_table", "schema_ready", "schema_probe_fact"}
+    {
+        "schema_table",
+        "schema_ready",
+        "schema_probe_fact",
+        "schema_semantic_fact",
+        "successful_sql_example",
+    }
 )
 
 
@@ -101,7 +107,9 @@ def schema_memory_source_identity(source: Path | None) -> dict[str, str]:
 def filter_schema_memory_copy(root: Path) -> None:
     """Remove non-schema records from a release-local schema-memory copy."""
 
-    for database_root in _schema_memory_database_roots(root):
+    database_roots = _schema_memory_database_roots(root)
+    schema_snapshots = _schema_snapshot_paths(root)
+    for database_root in database_roots:
         for path in database_root.iterdir():
             if path.name in {"smolagents_memory.db", "chromadb"}:
                 continue
@@ -115,6 +123,18 @@ def filter_schema_memory_copy(root: Path) -> None:
         chromadb_root = database_root / "chromadb"
         if chromadb_root.is_dir() and any(chromadb_root.iterdir()):
             _filter_schema_memory_chroma(chromadb_root)
+    protected = set(database_roots) | set(schema_snapshots)
+    for database_root in database_roots:
+        protected.update(database_root.parents)
+    for schema_snapshot in schema_snapshots:
+        protected.update(schema_snapshot.parents)
+    for path in sorted(root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if path in protected or any(database_root in path.parents for database_root in database_roots):
+            continue
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def _schema_memory_database_roots(root: Path) -> tuple[Path, ...]:
@@ -125,6 +145,16 @@ def _schema_memory_database_roots(root: Path) -> tuple[Path, ...]:
         path.parent for path in root.rglob("chromadb") if path.is_dir()
     )
     return tuple(sorted(roots, key=lambda item: item.as_posix()))
+
+
+def _schema_snapshot_paths(root: Path) -> tuple[Path, ...]:
+    snapshots: list[Path] = []
+    for path in root.rglob("schema-v1-*.json"):
+        if path.is_symlink():
+            raise SandboxError("schema snapshot source is unsafe")
+        if path.is_file() and path.parent.name == "sqlrag":
+            snapshots.append(path)
+    return tuple(sorted(snapshots, key=lambda item: item.as_posix()))
 
 
 def _filter_schema_memory_sqlite(database: Path) -> None:
@@ -174,6 +204,14 @@ def _filter_schema_memory_chroma(chromadb_root: Path) -> None:
 
 def _transferable_schema_records(root: Path) -> list[dict[str, object]]:
     records: list[dict[str, object]] = []
+    for snapshot in _schema_snapshot_paths(root):
+        records.append(
+            {
+                "store": "schema_snapshot",
+                "path": snapshot.relative_to(root).as_posix(),
+                "sha256": sha256_file(snapshot),
+            }
+        )
     for database_root in _schema_memory_database_roots(root):
         relative_root = database_root.relative_to(root).as_posix()
         database = database_root / "smolagents_memory.db"

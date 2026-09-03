@@ -2,13 +2,69 @@
 
 from __future__ import annotations
 
+from llm_call_context import llm_call_context
+
 from workflow.deadline import DeadlineBudget
 
-from .result_review import _ModelReviewResponse, create_result_review_capability
+from custom_tools.text_to_sql.schema_loader import LoadedSchema
+from custom_tools.text_to_sql.schema_metadata import get_foreign_key_constraints
+from custom_tools.text_to_sql.validators import SchemaLimiter
+
+from .result_review import (
+    RESULT_REVIEW_RUNTIME_KEY,
+    _ModelReviewResponse,
+    create_result_review_capability,
+)
+from .semantic_coverage import CoverageRequirements
 from .result_validation_runtime import _persisted_sql_proposal_requirements
 
 
 INVALID_RESULT_REVIEW_RUNTIME = object()
+
+
+def _bounded_review_schema(
+    loaded: LoadedSchema,
+    requirements: CoverageRequirements,
+    question: str,
+) -> dict[str, object]:
+    schema = loaded.schema
+    if type(schema) is not dict:
+        raise TypeError("loaded schema is invalid")
+
+    selected: list[str] = []
+    for table in requirements.allowed_tables:
+        matches = [
+            name
+            for name in schema
+            if name.split(".")[-1] == table.table
+            and (
+                table.schema_name is None
+                or (
+                    len(name.split(".")) > 1
+                    and name.split(".")[-2] == table.schema_name
+                )
+            )
+        ]
+        if len(matches) != 1:
+            raise ValueError("allowed table does not resolve uniquely in loaded schema")
+        if matches[0] not in selected:
+            selected.append(matches[0])
+
+    neighbors: set[str] = set()
+    selected_set = set(selected)
+    for source_name in schema:
+        for constraint in get_foreign_key_constraints(source_name, schema):
+            target_name = constraint["to_table"]
+            if source_name in selected_set and target_name not in selected_set:
+                neighbors.add(target_name)
+            if target_name in selected_set and source_name not in selected_set:
+                neighbors.add(source_name)
+
+    relevant = {name: schema[name] for name in (*selected, *sorted(neighbors))}
+    return SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        relevant,
+        query_terms=question.split(),
+    )
 
 
 def build_result_review_runtime(runtime: object, *, sql_query: object) -> object:
@@ -94,8 +150,19 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
         )
         freshness = solver_document_freshness_reference(runtime, state)
         parsed_ast = parse_sql_candidate(candidate.sql, dsn, candidate.candidate_id)
+        schema = _bounded_review_schema(
+            runtime.loaded_schema,
+            requirements,
+            runtime.query,
+        )
         review_schema = _ModelReviewResponse.model_json_schema()
         review_schema["required"] = list(review_schema["properties"])
+        review_schema["properties"]["source_id"]["anyOf"][0] = {
+            "enum": sorted(
+                {binding.source_id for binding in requirements.selected_bindings}
+            ),
+            "type": "string",
+        }
         response_format = {
             "type": "json_schema",
             "json_schema": {
@@ -112,20 +179,23 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
                 "text_to_sql_result_review_call"
             )
             provider = create_text_to_sql_model(
-                "model_code",
+                "model_hard",
                 max_tokens=output_tokens,
                 temperature=0.3,
                 timeout_seconds=timeout_seconds,
                 client_max_retries=0,
             )
-            response = call_openai_api(
-                prompt=prompt,
-                model=provider,
-                max_tokens=output_tokens,
-                temperature=0.3,
-                max_retries=0,
-                response_format=response_format,
-            )
+            with llm_call_context(
+                run_id=runtime.run_id, step_name=RESULT_REVIEW_RUNTIME_KEY
+            ):
+                response = call_openai_api(
+                    prompt=prompt,
+                    model=provider,
+                    max_tokens=output_tokens,
+                    temperature=0.3,
+                    max_retries=0,
+                    response_format=response_format,
+                )
             deadline.require_remaining("text_to_sql_result_review_response")
             if type(response) is bytes:
                 response = response.decode("utf-8", errors="strict")
@@ -143,6 +213,7 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
             parsed_ast=parsed_ast,
             documents=runtime.document_snapshot,
             model=review,
+            schema=schema,
         )
     except Exception:
         return INVALID_RESULT_REVIEW_RUNTIME

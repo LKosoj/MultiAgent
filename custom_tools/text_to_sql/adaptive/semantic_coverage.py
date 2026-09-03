@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from enum import StrEnum
+import heapq
 import math
 from typing import NoReturn
 
@@ -51,6 +52,7 @@ from .models import (
     JoinCandidate,
     JoinCandidateStatus,
     JoinEdge,
+    JoinType,
     LiteralValue,
     NonNegativeInt,
     PredicateOperator,
@@ -64,7 +66,7 @@ from .models import (
     VerticalAttributeBinding,
     is_binding_free_semantic_item,
 )
-from .serialization import canonical_digest
+from .serialization import canonical_digest, canonical_json_bytes
 
 
 class CoverageInputErrorCode(StrEnum):
@@ -91,6 +93,35 @@ class CoverageInputError(ValueError):
         super().__init__(code.value)
 
 
+class RowPreservationRequirement(StrictModel):
+    """One proven outer-join obligation for an output-only relation."""
+
+    base_table: TableRef
+    related_table: TableRef
+    related_source_ids: tuple[Id, ...]
+    related_binding_ids: tuple[Id, ...]
+    effective_join_path: tuple[JoinEdge, ...]
+
+    @model_validator(mode="after")
+    def validate_deterministic_shape(self) -> RowPreservationRequirement:
+        _require_sorted_unique(self.related_source_ids, "related source IDs")
+        _require_sorted_unique(self.related_binding_ids, "related binding IDs")
+        if self.base_table == self.related_table or not self.effective_join_path:
+            raise ValueError("row preservation requirement must connect distinct tables")
+        if any(edge.join_type is not JoinType.LEFT for edge in self.effective_join_path):
+            raise ValueError("row preservation effective path must use LEFT joins")
+        if self.effective_join_path[0].left.table != self.base_table:
+            raise ValueError("row preservation path must start at the base table")
+        if self.effective_join_path[-1].right.table != self.related_table:
+            raise ValueError("row preservation path must end at the related table")
+        if any(
+            left.right.table != right.left.table
+            for left, right in zip(self.effective_join_path, self.effective_join_path[1:])
+        ):
+            raise ValueError("row preservation path must be contiguous")
+        return self
+
+
 class CoverageRequirements(StrictModel):
     """Immutable inputs authorized for later coverage checks.
 
@@ -106,6 +137,7 @@ class CoverageRequirements(StrictModel):
     required_source_ids: tuple[Id, ...]
     selected_bindings: tuple[Binding, ...]
     eligible_validated_joins: tuple[JoinCandidate, ...]
+    row_preservation_requirements: tuple[RowPreservationRequirement, ...]
     eligible_evidence_ids: tuple[Id, ...]
     allowed_tables: tuple[TableRef, ...]
     allowed_columns: tuple[ColumnRef, ...]
@@ -139,6 +171,10 @@ class CoverageRequirements(StrictModel):
             != self.selected_bindings
         ):
             raise ValueError("selected binding footprints must be canonical")
+        if self.row_preservation_requirements != tuple(
+            sorted(self.row_preservation_requirements, key=canonical_json_bytes)
+        ):
+            raise ValueError("row preservation requirements must use canonical order")
         footprint = derive_coverage_footprint(
             self.selected_bindings,
             self.eligible_validated_joins,
@@ -414,9 +450,15 @@ def _validate_coverage_inputs(
     predicate_sources = tuple(
         item.source_id
         for item in required_items
-        if item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
-        and any(
-            not _binding_proves_required_predicate(
+        if (
+            item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+            and (
+                item.operator is not None
+                or item.literal_or_reference is not None
+            )
+        )
+        and not any(
+            _binding_proves_required_predicate(
                 item,
                 bindings_by_id[binding_id],
                 binding_citations[binding_id],
@@ -467,19 +509,8 @@ def _validate_coverage_inputs(
             incomplete_join_sources,
         )
 
-    selected_table_digests = {
-        canonical_digest(table)
-        for binding in selected
-        for table in binding.tables
-    }
     for candidate in canonical_joins:
         if candidate.status is not JoinCandidateStatus.VALIDATED:
-            continue
-        if any(
-            canonical_digest(table) not in selected_table_digests
-            for edge in candidate.path
-            for table in (edge.left.table, edge.right.table)
-        ):
             continue
         citations = _revalidate_citations(candidate.evidence_ids, evidence_by_id)
         if any(not evidence_has_state_authority(item, current) for item in citations):
@@ -495,9 +526,21 @@ def _validate_coverage_inputs(
     selected_bindings = tuple(
         sorted(selected, key=lambda binding: (binding.source_id, binding.binding_id))
     )
+    protected_join_ids = {
+        candidate.join_id
+        for item in selected_bindings
+        if item.join_path
+        for candidate in eligible_joins
+        if matching_join_offsets(candidate, item.join_path)
+    }
+    eligible_by_id = _shortest_connecting_joins(
+        selected_bindings,
+        tuple({candidate.join_id: candidate for candidate in eligible_joins}.values()),
+        protected_join_ids,
+    )
     footprint = derive_coverage_footprint(
         selected_bindings,
-        tuple(eligible_joins),
+        tuple(eligible_by_id.values()),
     )
     disconnected_sources = disconnected_binding_source_ids(
         selected_bindings,
@@ -508,6 +551,12 @@ def _validate_coverage_inputs(
             CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
             disconnected_sources,
         )
+    row_preservation_requirements = _derive_row_preservation_requirements(
+        current.query_spec,
+        required_items,
+        selected_bindings,
+        footprint.eligible_validated_joins,
+    )
     requirements = {
         "run_id": current.run_id,
         "run_incarnation": current.run_incarnation,
@@ -516,6 +565,7 @@ def _validate_coverage_inputs(
         "required_source_ids": required_source_ids,
         "selected_bindings": selected_bindings,
         "eligible_validated_joins": footprint.eligible_validated_joins,
+        "row_preservation_requirements": row_preservation_requirements,
         "eligible_evidence_ids": footprint.eligible_evidence_ids,
         "allowed_tables": footprint.allowed_tables,
         "allowed_columns": footprint.allowed_columns,
@@ -529,6 +579,241 @@ def _validate_coverage_inputs(
         **requirements,
         requirements_digest=canonical_digest(requirements),
     )
+
+
+def _derive_row_preservation_requirements(
+    query_spec,
+    required_items: tuple[SemanticItem, ...],
+    selected_bindings: tuple[Binding, ...],
+    eligible_joins: tuple[JoinCandidate, ...],
+) -> tuple[RowPreservationRequirement, ...]:
+    requested_source_ids = set(query_spec.requested_output_source_ids)
+    bindings_by_source = {
+        source_id: tuple(
+            binding for binding in selected_bindings if binding.source_id == source_id
+        )
+        for source_id in {item.source_id for item in required_items}
+    }
+    qualifying_items = tuple(
+        item
+        for item in required_items
+        if item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+        or (
+            item.source_id not in requested_source_ids
+            and (
+                item.kind is SemanticItemKind.FORMULA
+                or item.operator is not None
+                or item.literal_or_reference is not None
+            )
+        )
+    )
+    base_tables = {
+        table
+        for item in qualifying_items
+        for binding in bindings_by_source[item.source_id]
+        for table in binding.tables
+    }
+    if len(base_tables) != 1:
+        return ()
+    base_table = next(iter(base_tables))
+    qualifying_tables = {
+        table
+        for item in qualifying_items
+        for binding in bindings_by_source[item.source_id]
+        for table in binding.tables
+    }
+    grouped: dict[bytes, tuple[TableRef, list[str], list[str]]] = {}
+    for item in required_items:
+        if item.source_id not in requested_source_ids:
+            continue
+        bindings = bindings_by_source[item.source_id]
+        tables = {table for binding in bindings for table in binding.tables}
+        if len(tables) != 1:
+            continue
+        related_table = next(iter(tables))
+        if related_table == base_table or related_table in qualifying_tables:
+            continue
+        key = canonical_json_bytes(related_table)
+        table, source_ids, binding_ids = grouped.setdefault(
+            key, (related_table, [], [])
+        )
+        source_ids.append(item.source_id)
+        binding_ids.extend(binding.binding_id for binding in bindings)
+
+    requirements: list[RowPreservationRequirement] = []
+    for related_table, source_ids, binding_ids in grouped.values():
+        effective_join_path = _unique_effective_left_path(
+            base_table,
+            related_table,
+            eligible_joins,
+        )
+        if effective_join_path is None:
+            continue
+        requirements.append(
+            RowPreservationRequirement(
+                base_table=base_table,
+                related_table=related_table,
+                related_source_ids=tuple(sorted(source_ids)),
+                related_binding_ids=tuple(sorted(binding_ids)),
+                effective_join_path=effective_join_path,
+            )
+        )
+    return tuple(sorted(requirements, key=canonical_json_bytes))
+
+
+def _unique_effective_left_path(
+    base_table: TableRef,
+    related_table: TableRef,
+    eligible_joins: tuple[JoinCandidate, ...],
+) -> tuple[JoinEdge, ...] | None:
+    paths = tuple(
+        path
+        for candidate in eligible_joins
+        if (path := _orient_left_path(candidate.path, base_table, related_table)) is not None
+    )
+    return paths[0] if len(paths) == 1 else None
+
+
+def _orient_left_path(
+    path: tuple[JoinEdge, ...],
+    base_table: TableRef,
+    related_table: TableRef,
+) -> tuple[JoinEdge, ...] | None:
+    remaining = list(path)
+    current = base_table
+    oriented: list[JoinEdge] = []
+    while remaining:
+        choices = [
+            (index, edge, False)
+            for index, edge in enumerate(remaining)
+            if edge.left.table == current
+        ] + [
+            (index, edge, True)
+            for index, edge in enumerate(remaining)
+            if edge.right.table == current
+        ]
+        if len(choices) != 1:
+            return None
+        index, edge, reverse = choices[0]
+        remaining.pop(index)
+        if reverse:
+            edge = edge.model_copy(
+                update={"left": edge.right, "right": edge.left, "join_type": JoinType.LEFT}
+            )
+        else:
+            edge = edge.model_copy(update={"join_type": JoinType.LEFT})
+        oriented.append(edge)
+        current = edge.right.table
+    return tuple(oriented) if current == related_table else None
+
+
+def _shortest_connecting_joins(
+    selected_bindings: tuple[Binding, ...],
+    eligible_joins: tuple[JoinCandidate, ...],
+    protected_join_ids: set[str],
+) -> dict[str, JoinCandidate]:
+    required_tables = {
+        table for binding in selected_bindings for table in binding.tables
+    }
+    selected = {
+        candidate.join_id: candidate
+        for candidate in eligible_joins
+        if candidate.join_id in protected_join_ids
+    }
+    if len(required_tables) < 2:
+        return selected
+
+    root = min(required_tables, key=canonical_json_bytes)
+    while True:
+        connected = _reachable_join_tables(root, tuple(selected.values()))
+        missing = required_tables - connected
+        if not missing:
+            return selected
+
+        path = _shortest_join_path(
+            connected,
+            missing,
+            eligible_joins,
+        )
+        if not path:
+            return selected
+        selected.update((candidate.join_id, candidate) for candidate in path)
+
+
+def _reachable_join_tables(
+    root: TableRef,
+    joins: tuple[JoinCandidate, ...],
+) -> set[TableRef]:
+    adjacency: dict[TableRef, set[TableRef]] = {}
+    for candidate in joins:
+        for edge in candidate.path:
+            adjacency.setdefault(edge.left.table, set()).add(edge.right.table)
+            adjacency.setdefault(edge.right.table, set()).add(edge.left.table)
+    seen = {root}
+    pending = [root]
+    while pending:
+        table = pending.pop()
+        for neighbor in adjacency.get(table, ()):
+            if neighbor not in seen:
+                seen.add(neighbor)
+                pending.append(neighbor)
+    return seen
+
+
+def _shortest_join_path(
+    sources: set[TableRef],
+    targets: set[TableRef],
+    joins: tuple[JoinCandidate, ...],
+) -> tuple[JoinCandidate, ...]:
+    adjacency: dict[TableRef, list[tuple[TableRef, JoinCandidate]]] = {}
+    for candidate in joins:
+        adjacency.setdefault(candidate.left.table, []).append(
+            (candidate.right.table, candidate)
+        )
+        adjacency.setdefault(candidate.right.table, []).append(
+            (candidate.left.table, candidate)
+        )
+    for neighbors in adjacency.values():
+        neighbors.sort(
+            key=lambda item: (
+                canonical_json_bytes(item[1].path),
+                item[1].join_id,
+                canonical_json_bytes(item[0]),
+            )
+        )
+
+    pending: list[
+        tuple[int, tuple[tuple[bytes, str], ...], bytes, TableRef, tuple[JoinCandidate, ...]]
+    ] = []
+    best: dict[TableRef, tuple[int, tuple[tuple[bytes, str], ...]]] = {}
+    for source in sorted(sources, key=canonical_json_bytes):
+        key = (0, ())
+        best[source] = key
+        heapq.heappush(pending, (0, (), canonical_json_bytes(source), source, ()))
+
+    while pending:
+        distance, signature, _, table, path = heapq.heappop(pending)
+        if best.get(table) != (distance, signature):
+            continue
+        if table in targets:
+            return path
+        for neighbor, candidate in adjacency.get(table, ()):
+            candidate_key = (canonical_json_bytes(candidate.path), candidate.join_id)
+            next_key = (distance + len(candidate.path), signature + (candidate_key,))
+            if neighbor in best and best[neighbor] <= next_key:
+                continue
+            best[neighbor] = next_key
+            heapq.heappush(
+                pending,
+                (
+                    next_key[0],
+                    next_key[1],
+                    canonical_json_bytes(neighbor),
+                    neighbor,
+                    (*path, candidate),
+                ),
+            )
+    return ()
 
 
 def _binding_proves_required_predicate(
@@ -557,7 +842,6 @@ def _binding_proves_required_predicate(
         return False
     if (
         item.operator is None
-        or not _filter_right_is_valid(item.operator, item.literal_or_reference)
         or not _filter_right_is_valid(
             source_predicate.operator,
             source_predicate.right,
@@ -569,39 +853,14 @@ def _binding_proves_required_predicate(
     ):
         return False
     if isinstance(binding, DiscriminatorValueBinding):
-        exact_query_match = False
-        if item.exact_physical_predicate:
-            try:
-                required_predicate = PredicateRef(
-                    left=binding.discriminator_column,
-                    operator=item.operator,
-                    right=item.literal_or_reference,
-                )
-            except (TypeError, ValueError):
-                pass
-            else:
-                exact_query_match = len(predicates) == 1 and predicate_matches(
-                    required_predicate,
-                    source_predicate,
-                )
         requirement_matches = (
             bool(predicates)
             and predicates[0] == source_predicate
             and source_predicate.left == binding.discriminator_column
-            and (
-                (item.exact_physical_predicate and exact_query_match)
-                or (
-                    not item.exact_physical_predicate
-                    and item.kind is SemanticItemKind.TIME
-                )
-                or (
-                    not item.exact_physical_predicate
-                    and len(predicates) == 1
-                    and source_predicate.operator is item.operator
-                )
-            )
         )
     else:
+        if not _filter_right_is_valid(item.operator, item.literal_or_reference):
+            return False
         try:
             required_predicate = PredicateRef(
                 left=source_predicate.left,
@@ -759,5 +1018,6 @@ __all__ = [
     "CoverageInputError",
     "CoverageInputErrorCode",
     "CoverageRequirements",
+    "RowPreservationRequirement",
     "validate_coverage_inputs",
 ]

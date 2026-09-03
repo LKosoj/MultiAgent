@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
+import sqlite3
 import time
 from typing import Awaitable, Protocol
 import uuid
@@ -293,10 +294,21 @@ def _settle_model_result(
     usage: ModelTokenUsage,
 ) -> ModelCallReconciliation:
     result = _model_result(started, claim_generation, usage)
-    stored = ledger.record_model_result(result, owner_token=owner_token)
-    return ledger.record_model_reconciliation(
-        reconcile_model_call_usage(stored), stored
-    )
+    for attempt in range(2):
+        try:
+            stored = ledger.record_model_result(result, owner_token=owner_token)
+            return ledger.record_model_reconciliation(
+                reconcile_model_call_usage(stored), stored
+            )
+        except sqlite3.OperationalError as error:
+            error_code = getattr(error, "sqlite_errorcode", None)
+            is_io_error = (
+                isinstance(error_code, int)
+                and error_code & 0xFF == sqlite3.SQLITE_IOERR
+            ) or str(error).casefold() == "disk i/o error"
+            if attempt or not is_io_error:
+                raise
+    raise AssertionError("unreachable")
 
 
 def _claim_model_execution_step(

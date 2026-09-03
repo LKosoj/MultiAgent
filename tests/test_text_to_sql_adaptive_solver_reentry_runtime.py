@@ -13,15 +13,22 @@ import pytest
 import custom_tools.text_to_sql.adaptive.research_reentry as reentry_module
 from custom_tools.text_to_sql.adaptive._policy_model_budget import _model_started
 from custom_tools.text_to_sql.adaptive.models import (
+    BindingStatus,
+    DiscriminatorValueBinding,
     EvidenceCost,
     EvidenceSourceKind,
+    PhysicalColumnBinding,
+    PredicateOperator,
+    PredicateRef,
     ResearchAction,
     ResearchActionKind,
     ResearchReentryStatus,
     ResearchState,
+    SemanticItemKind,
     SolverState,
 )
 from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
+from custom_tools.text_to_sql.adaptive.evidence import probe_result_to_evidence
 from custom_tools.text_to_sql.adaptive.freshness import FreshnessContext
 from custom_tools.text_to_sql.adaptive.policy import (
     canonical_action_digest,
@@ -48,6 +55,7 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     serialize_contract,
 )
 from custom_tools.text_to_sql.adaptive.schema_research_agent import (
+    ResearchStopReview,
     load_schema_research_agent_profile,
 )
 from custom_tools.text_to_sql.adaptive.research_decision import (
@@ -86,6 +94,7 @@ from workflow.adaptive_state_store import (
     AdaptiveStateStore,
 )
 from workflow.deadline import DeadlineBudget
+from workflow.text_to_sql_typed_research import _typed_response_format
 
 
 def test_solver_and_targeted_reentry_preserve_typed_model_parameters(
@@ -131,6 +140,7 @@ def test_solver_and_targeted_reentry_preserve_typed_model_parameters(
     agent_command._get_model.cache_clear()
     try:
         runtime = SimpleNamespace(
+            run_id="test-run",
             verified_research_policy=load_adaptive_policy_config(),
         )
         asyncio.run(
@@ -191,6 +201,7 @@ def test_solver_and_targeted_reentry_pass_yaml_profile_as_system_prompt(
     agent_command._get_model.cache_clear()
     try:
         runtime = SimpleNamespace(
+            run_id="test-run",
             verified_research_policy=load_adaptive_policy_config(),
         )
         solver_profile = load_sql_solver_agent_profile()
@@ -489,6 +500,332 @@ def _one_remaining_reentry_case(tmp_path):
     return runtime, solver, research, requirements, freshness
 
 
+def test_value_search_reentry_cites_matching_supported_binding(tmp_path) -> None:
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    binding = requirements.selected_bindings[0]
+    target = binding.columns[0]
+    request = solver.missing_evidence_requests[-1].model_copy(
+        update={
+            "source_id": binding.source_id,
+            "required_evidence_kind": EvidenceSourceKind.VALUE_SEARCH,
+        }
+    )
+    payload = {"columns": [target.column], "rows": [["active"]]}
+    result = build_probe_result(
+        run_id=research.run_id,
+        run_incarnation=research.run_incarnation,
+        revision=research.revision,
+        schema_namespace_version=research.schema_namespace_version,
+        invocation_id="reentry-value-evidence",
+        action_digest=canonical_digest({"probe": "value-search"}),
+        probe_kind=ResearchActionKind.SEARCH_VALUE,
+        status=ProbeStatus.SUCCESS,
+        target=target,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        summary="exact value found",
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=1,
+            bytes=len(canonical_json_bytes(payload)),
+        ),
+        row_count=1,
+        payload=payload,
+    )
+
+    import workflow._text_to_sql_solver_reentry as production_reentry
+
+    updated = production_reentry._semantic_repair_bindings(
+        (),
+        research,
+        request,
+        result,
+    )
+
+    updated_binding = next(item for item in updated if item.binding_id == binding.binding_id)
+    assert result.invocation_id in updated_binding.evidence_ids
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()
+
+
+def test_value_search_reentry_cites_distinct_values_evidence(tmp_path) -> None:
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    original = requirements.selected_bindings[0]
+    target = original.columns[0]
+    binding = PhysicalColumnBinding(
+        binding_id="physical-status-distinct-values",
+        source_id=original.source_id,
+        tables=original.tables,
+        columns=(target,),
+        predicates=(),
+        join_path=original.join_path,
+        evidence_ids=original.evidence_ids,
+        confidence=original.confidence,
+        status=original.status,
+        validator_rule=original.validator_rule,
+        physical_column=target,
+    )
+    query_spec = research.query_spec.model_copy(
+        update={
+            "semantic_items": tuple(
+                item.model_copy(
+                    update={
+                        "operator": None,
+                        "literal_or_reference": None,
+                        "binding_ids": (binding.binding_id,),
+                    }
+                )
+                if item.source_id == binding.source_id
+                else item
+                for item in research.query_spec.semantic_items
+            )
+        }
+    )
+    research = ResearchState.model_validate(
+        {
+            **research.model_dump(mode="python"),
+            "query_spec": query_spec,
+            "bindings": (binding,),
+        }
+    )
+    request = solver.missing_evidence_requests[-1].model_copy(
+        update={
+            "source_id": binding.source_id,
+            "required_evidence_kind": EvidenceSourceKind.VALUE_SEARCH,
+        }
+    )
+    payload = {"columns": [target.column], "rows": [["active"]]}
+    result = build_probe_result(
+        run_id=research.run_id,
+        run_incarnation=research.run_incarnation,
+        revision=research.revision,
+        schema_namespace_version=research.schema_namespace_version,
+        invocation_id="reentry-distinct-values-evidence",
+        action_digest=canonical_digest({"probe": "distinct-values"}),
+        probe_kind=ResearchActionKind.DISTINCT_VALUES,
+        status=ProbeStatus.SUCCESS,
+        target=target,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        summary="distinct values found",
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=1,
+            bytes=len(canonical_json_bytes(payload)),
+        ),
+        row_count=1,
+        payload=payload,
+    )
+
+    import workflow._text_to_sql_solver_reentry as production_reentry
+
+    updated = production_reentry._semantic_repair_bindings(
+        (),
+        research,
+        request,
+        result,
+    )
+
+    updated_binding = next(item for item in updated if item.binding_id == binding.binding_id)
+    assert isinstance(updated_binding, PhysicalColumnBinding)
+    assert result.invocation_id in updated_binding.evidence_ids
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()
+
+
+def test_value_search_reentry_materializes_exact_filter_predicate(tmp_path) -> None:
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    original = requirements.selected_bindings[0]
+    column = original.columns[0]
+    physical = PhysicalColumnBinding(
+        binding_id="physical-status",
+        source_id=original.source_id,
+        tables=original.tables,
+        columns=(column,),
+        predicates=(),
+        join_path=original.join_path,
+        evidence_ids=original.evidence_ids,
+        confidence=original.confidence,
+        status=original.status,
+        validator_rule=original.validator_rule,
+        physical_column=column,
+    )
+    query_spec = research.query_spec.model_copy(
+        update={
+            "semantic_items": tuple(
+                item.model_copy(
+                    update={
+                        "operator": None,
+                        "literal_or_reference": None,
+                        "binding_ids": (physical.binding_id,),
+                    }
+                )
+                if item.source_id == physical.source_id
+                else item
+                for item in research.query_spec.semantic_items
+            )
+        }
+    )
+    research = ResearchState.model_validate(
+        {
+            **research.model_dump(mode="python"),
+            "query_spec": query_spec,
+            "bindings": (physical,),
+        }
+    )
+    request = solver.missing_evidence_requests[-1].model_copy(
+        update={
+            "source_id": physical.source_id,
+            "required_evidence_kind": EvidenceSourceKind.VALUE_SEARCH,
+        }
+    )
+    action = ResearchAction(
+        action_id="reentry-exact-filter-action",
+        kind=ResearchActionKind.SEARCH_VALUE,
+        hypothesis_id=None,
+        target=column,
+        parameters=(("top_k", 1), ("value", "active")),
+        action_digest=canonical_action_digest(
+            kind=ResearchActionKind.SEARCH_VALUE,
+            hypothesis_id=None,
+            target=column,
+            parameters=(("top_k", 1), ("value", "active")),
+            expected_revision=research.revision,
+        ),
+        expected_revision=research.revision,
+    )
+    payload = {"columns": [column.column], "rows": [["active"]]}
+    result = build_probe_result(
+        run_id=research.run_id,
+        run_incarnation=research.run_incarnation,
+        revision=research.revision,
+        schema_namespace_version=research.schema_namespace_version,
+        invocation_id="reentry-exact-filter-value",
+        action_digest=action.action_digest,
+        probe_kind=ResearchActionKind.SEARCH_VALUE,
+        status=ProbeStatus.SUCCESS,
+        target=column,
+        started_at=datetime.now(UTC),
+        completed_at=datetime.now(UTC),
+        summary="exact filter value found",
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=1,
+            bytes=len(canonical_json_bytes(payload)),
+        ),
+        row_count=1,
+        payload=payload,
+    )
+
+    import workflow._text_to_sql_solver_reentry as production_reentry
+
+    updated = production_reentry._semantic_repair_bindings(
+        (),
+        research,
+        request,
+        result,
+    )
+
+    predicate_binding = next(
+        item for item in updated if isinstance(item, DiscriminatorValueBinding)
+    )
+    assert predicate_binding.discriminator_column == column
+    assert predicate_binding.discriminator_predicate.operator is PredicateOperator.EQ
+    assert predicate_binding.discriminator_predicate.right == "active"
+    assert result.invocation_id in predicate_binding.evidence_ids
+    from custom_tools.text_to_sql.adaptive.state import (
+        ResearchTransitionConflictError,
+        _merge_bindings,
+    )
+
+    with pytest.raises(
+        ResearchTransitionConflictError,
+        match="binding kind is immutable",
+    ):
+        _merge_bindings((physical,), updated)
+    evidence = probe_result_to_evidence(result, action)
+    assert evidence is not None
+    merged, added, changed = _merge_bindings((physical,), updated, (evidence,))
+    assert merged == (predicate_binding,)
+    assert added == ()
+    assert changed == (physical.binding_id,)
+
+    dimension_spec = research.query_spec.model_copy(
+        update={
+            "semantic_items": tuple(
+                item.model_copy(
+                    update={
+                        "kind": SemanticItemKind.DIMENSION,
+                        "operator": None,
+                        "literal_or_reference": None,
+                        "binding_ids": (physical.binding_id,),
+                    }
+                )
+                if item.source_id == physical.source_id
+                else item
+                for item in research.query_spec.semantic_items
+            )
+        }
+    )
+    dimension_research = ResearchState.model_validate(
+        {
+            **research.model_dump(mode="python"),
+            "query_spec": dimension_spec,
+            "bindings": (physical,),
+        }
+    )
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.EQ,
+        right="active",
+    )
+    predicate_request = request.model_copy(
+        update={"predicate_authority": predicate}
+    )
+    predicate_updated = production_reentry._semantic_repair_bindings(
+        (),
+        dimension_research,
+        predicate_request,
+        result,
+    )
+
+    assert len(predicate_updated) == 2
+    preserved = next(
+        item for item in predicate_updated if item.binding_id == physical.binding_id
+    )
+    predicate_binding = next(
+        item
+        for item in predicate_updated
+        if isinstance(item, DiscriminatorValueBinding)
+    )
+    assert isinstance(preserved, PhysicalColumnBinding)
+    assert preserved.status is BindingStatus.SUPPORTED
+    assert predicate_binding.binding_id != physical.binding_id
+    assert predicate_binding.status is BindingStatus.CANDIDATE
+    assert predicate_binding.discriminator_predicate == predicate
+    assert result.invocation_id in predicate_binding.evidence_ids
+    merged, added, changed = _merge_bindings(
+        (physical,), predicate_updated, (evidence,)
+    )
+    assert {item.binding_id for item in merged} == {
+        physical.binding_id,
+        predicate_binding.binding_id,
+    }
+    assert added == (predicate_binding.binding_id,)
+    assert changed == (physical.binding_id,)
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()
+
+
 @pytest.mark.asyncio
 async def test_targeted_reentry_charges_last_model_call_before_tool_admission(
     tmp_path,
@@ -682,7 +1019,11 @@ async def test_targeted_reentry_replay_settles_started_model_without_provider(
         research,
         requirements,
     )
-    research_context = reentry_module._research_context(request, trusted_targets)
+    research_context = reentry_module._research_context(
+        request,
+        trusted_targets,
+        research,
+    )
     limits = runtime.verified_research_policy.model_budget
     assert limits is not None
     profile = load_schema_research_agent_profile()
@@ -848,3 +1189,109 @@ async def test_targeted_reentry_leaves_closed_w3_checkpoint_untouched(tmp_path) 
     assert checkpoint_store.list_events(closed_key) == before
     assert checkpoint_store.get_snapshot(closed_key).planned is None
     assert checkpoint_store.get_snapshot(closed_key).observed is None
+
+
+@pytest.mark.asyncio
+async def test_reentry_continuation_routes_stop_review_through_its_own_model(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Research continuation on the targeted re-entry path must review its stop
+    decision through a dedicated ResearchStopReview json_schema route, not the
+    ResearchDecisionV1 route the research-decision model uses. Reusing the
+    research-decision model for the stop review is the same class of defect
+    W0-0.4 fixed on the direct typed-research path (a flat model without
+    $defs forced through a response_format shaped for a different, nested
+    model)."""
+
+    runtime, solver, research, _requirements, _freshness = _one_remaining_reentry_case(
+        tmp_path
+    )
+    request = solver.missing_evidence_requests[-1]
+    profile = load_schema_research_agent_profile()
+
+    import agent_command
+    import workflow._text_to_sql_solver_reentry as production_reentry
+
+    class _NoOpMemoryManager:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def find_semantic_relevant_tables(self, *_args, **_kwargs):
+            return ()
+
+        def find_verified_probe_facts(self, *_args, **_kwargs):
+            return ()
+
+        def find_approved_semantic_facts(self, *_args, **_kwargs):
+            return ()
+
+    monkeypatch.setattr(production_reentry, "SchemaMemoryManager", _NoOpMemoryManager)
+
+    class _StoppedBeforeLoop(Exception):
+        """Raised once the loop assembly is reached, to avoid running it."""
+
+    captured_assembly: dict[str, object] = {}
+
+    def fake_assemble(**kwargs):
+        captured_assembly.update(kwargs)
+        raise _StoppedBeforeLoop
+
+    monkeypatch.setattr(
+        production_reentry, "assemble_production_research", fake_assemble
+    )
+
+    captured_provider_calls: list[dict[str, object]] = []
+
+    class _FakeProvider:
+        def __call__(self, messages, *, max_tokens, temperature, response_format):
+            captured_provider_calls.append(
+                {
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                    "temperature": temperature,
+                    "response_format": response_format,
+                }
+            )
+            return '{"decision":"stop_confirmed","hint":null}'
+
+    monkeypatch.setattr(
+        agent_command,
+        "create_text_to_sql_model",
+        lambda *_args, **_kwargs: _FakeProvider(),
+    )
+
+    async def research_decision_model(_prompt: str) -> str:
+        raise AssertionError(
+            "this test only exercises the continuation's model wiring"
+        )
+
+    with pytest.raises(_StoppedBeforeLoop):
+        await production_reentry._continue_production_research(
+            runtime,
+            "main",
+            research_decision_model,
+            profile,
+            research,
+            request,
+        )
+
+    assert "stop_review_model" in captured_assembly
+    stop_review_model = captured_assembly["stop_review_model"]
+    assert stop_review_model is not None
+    assert stop_review_model is not research_decision_model
+
+    response = await stop_review_model("stop review prompt")
+    assert response.raw_response == '{"decision":"stop_confirmed","hint":null}'
+
+    assert len(captured_provider_calls) == 1
+    observed_response_format = captured_provider_calls[0]["response_format"]
+    assert observed_response_format == _typed_response_format(
+        ResearchStopReview, "ResearchStopReview"
+    )
+    assert observed_response_format["type"] == "json_schema"
+    assert observed_response_format["json_schema"]["name"] == "ResearchStopReview"
+    assert observed_response_format != {"type": "json_object"}
+
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()

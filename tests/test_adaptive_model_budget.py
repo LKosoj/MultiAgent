@@ -179,7 +179,7 @@ def test_v1_model_budget_stays_disabled_and_v2_defaults_are_explicit(tmp_path) -
             )
         state = initial_model_budget_state(_config())
         assert state.initial_total_tokens == 1_048_576
-        assert state.initial_input_tokens == 256 * 16_384
+        assert state.initial_input_tokens == 256 * 32_768
         assert MAX_MODEL_OUTPUT_TOKENS_PER_CALL == 32_000
         assert state.initial_output_tokens == 256 * 32_000
     finally:
@@ -850,6 +850,92 @@ def test_result_write_failure_preserves_provider_error_and_started_record(
         assert record.started is not None
         assert record.result is None
         assert record.reconciliation is None
+    finally:
+        ledger.close()
+
+
+def test_transient_sqlite_io_result_write_is_settled_without_replaying_provider(
+    tmp_path,
+) -> None:
+    class _TransientResultWriteLedger(AdaptiveBudgetLedger):
+        def __init__(self, db_path) -> None:
+            self.result_write_attempts = 0
+            super().__init__(db_path)
+
+        def record_model_result(self, result, *, owner_token):
+            self.result_write_attempts += 1
+            if self.result_write_attempts == 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return super().record_model_result(result, owner_token=owner_token)
+
+    ledger = _TransientResultWriteLedger(tmp_path / "transient-result-write.sqlite")
+    calls = 0
+
+    def execute(_reservation):
+        nonlocal calls
+        calls += 1
+        return ModelTokenUsage(input_tokens=101, output_tokens=23)
+
+    try:
+        reconciliation = execute_model_call_with_budget(
+            RUN_ID,
+            INCARNATION,
+            "transient-result-write",
+            _request_digest("transient-result-write"),
+            MODEL_IDENTITY,
+            200,
+            100,
+            execute,
+            config=_config(),
+            ledger=ledger,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "transient-result-write-owner",
+        )
+        assert calls == 1
+        assert ledger.result_write_attempts == 2
+        assert reconciliation.actual_usage == ModelTokenUsage(
+            input_tokens=101, output_tokens=23
+        )
+    finally:
+        ledger.close()
+
+
+def test_non_io_sqlite_result_write_is_not_retried(tmp_path) -> None:
+    class _LockedResultWriteLedger(AdaptiveBudgetLedger):
+        def __init__(self, db_path) -> None:
+            self.result_write_attempts = 0
+            super().__init__(db_path)
+
+        def record_model_result(self, result, *, owner_token):
+            self.result_write_attempts += 1
+            raise sqlite3.OperationalError("database is locked")
+
+    ledger = _LockedResultWriteLedger(tmp_path / "locked-result-write.sqlite")
+    calls = 0
+
+    def execute(_reservation):
+        nonlocal calls
+        calls += 1
+        return ModelTokenUsage(input_tokens=101, output_tokens=23)
+
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            execute_model_call_with_budget(
+                RUN_ID,
+                INCARNATION,
+                "locked-result-write",
+                _request_digest("locked-result-write"),
+                MODEL_IDENTITY,
+                200,
+                100,
+                execute,
+                config=_config(),
+                ledger=ledger,
+                claim_now_ns=lambda: 1,
+                owner_token_factory=lambda: "locked-result-write-owner",
+            )
+        assert calls == 1
+        assert ledger.result_write_attempts == 1
     finally:
         ledger.close()
 
@@ -2050,3 +2136,70 @@ def test_partial_v2_schema_fails_typed_without_mutating_v1_and_can_retry(
         assert connection.execute(
             "SELECT value FROM adaptive_budget_meta WHERE key = 'schema_version'"
         ).fetchone() == (ADAPTIVE_BUDGET_SCHEMA_VERSION,)
+
+
+def test_list_model_run_incarnations_returns_distinct_sorted_incarnations(
+    tmp_path,
+) -> None:
+    ledger = AdaptiveBudgetLedger(tmp_path / "run-incarnations.sqlite")
+    try:
+        for incarnation, call_id in (
+            ("incarnation-b", "call-1"),
+            ("incarnation-b", "call-2"),
+            ("incarnation-a", "call-1"),
+        ):
+            execute_model_call_with_budget(
+                RUN_ID,
+                incarnation,
+                call_id,
+                _request_digest(call_id),
+                MODEL_IDENTITY,
+                200,
+                100,
+                lambda _reservation: ModelTokenUsage(input_tokens=1, output_tokens=1),
+                config=_config(),
+                ledger=ledger,
+                claim_now_ns=lambda: 1,
+                owner_token_factory=lambda: "owner",
+            )
+
+        assert ledger.list_model_run_incarnations(RUN_ID) == (
+            "incarnation-a",
+            "incarnation-b",
+        )
+    finally:
+        ledger.close()
+
+
+def test_list_model_run_incarnations_returns_empty_tuple_for_unknown_run_id(
+    tmp_path,
+) -> None:
+    ledger = AdaptiveBudgetLedger(tmp_path / "run-incarnations-unknown.sqlite")
+    try:
+        execute_model_call_with_budget(
+            RUN_ID,
+            INCARNATION,
+            "call-1",
+            _request_digest("call-1"),
+            MODEL_IDENTITY,
+            200,
+            100,
+            lambda _reservation: ModelTokenUsage(input_tokens=1, output_tokens=1),
+            config=_config(),
+            ledger=ledger,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "owner",
+        )
+
+        assert ledger.list_model_run_incarnations("unknown-run") == ()
+    finally:
+        ledger.close()
+
+
+def test_list_model_run_incarnations_rejects_empty_run_id(tmp_path) -> None:
+    ledger = AdaptiveBudgetLedger(tmp_path / "run-incarnations-invalid.sqlite")
+    try:
+        with pytest.raises(ValueError, match="run_id"):
+            ledger.list_model_run_incarnations("")
+    finally:
+        ledger.close()

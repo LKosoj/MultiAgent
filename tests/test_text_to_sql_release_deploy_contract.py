@@ -103,6 +103,9 @@ def test_deploy_images_entrypoint_and_compose_are_process_isolated() -> None:
     assert services["api"]["environment"]["TEXT2SQL_TARGET_POLICY_SHA256"].startswith(
         "${TEXT2SQL_TARGET_POLICY_SHA256:?"
     )
+    assert services["api"]["environment"]["OPENAI_API_BASE_DB"].startswith(
+        "${OPENAI_API_BASE_DB:?"
+    )
     assert {"text2sql-data", "text2sql-memory", "text2sql-logs"} <= set(
         compose["volumes"]
     )

@@ -38,6 +38,7 @@ CANONICAL_RUNTIME_SOURCE_PATHS = (
     Path("scripts/summarize_text2sql_public_benchmark.py"),
     Path("configuration_api.py"),
     Path("html_utils.py"),
+    Path("llm_call_context.py"),
     Path("logging_setup.py"),
     Path("retry_openai_model.py"),
     Path("tool_manager.py"),

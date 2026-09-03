@@ -58,7 +58,12 @@ def _freshness() -> FreshnessContext:
     )
 
 
-def _research_replay_case():
+def _research_replay_case(
+    *,
+    before=None,
+    tool_name: str = "inspect_table",
+    tool_arguments: dict[str, object] | None = None,
+):
     from custom_tools.text_to_sql.adaptive.replay_inputs import (
         ResearchSemanticReplayInput,
     )
@@ -67,13 +72,25 @@ def _research_replay_case():
     )
 
     loaded, namespace = schema()
-    before = make_state(namespace)
-    decision = tool_decision("inspect_table", {"table": "public.orders"})
+    if before is None:
+        before = make_state(namespace)
+    decision = tool_decision(
+        tool_name,
+        tool_arguments or {"table": "public.orders"},
+    )
     resolved = resolve(decision, loaded=loaded, namespace=namespace, state=before)
     action = resolved.admission.action
     invocation = resolved.invocation
     assert action is not None
     assert invocation is not None
+    payload = {}
+    if tool_name == "inspect_column":
+        payload = {
+            "schema_namespace_version": before.schema_namespace_version,
+            "status": "matched",
+            "column": action.target.model_dump(mode="json", by_alias=True),
+            "metadata": {},
+        }
     probe_result = build_probe_result(
         run_id=before.run_id,
         run_incarnation=before.run_incarnation,
@@ -93,10 +110,17 @@ def _research_replay_case():
             model_tokens=0,
             db_probe_ms=1,
             rows=0,
-            bytes=2,
+            bytes=len(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ),
         ),
         row_count=0,
-        payload={},
+        payload=payload,
     )
     after = commit_semantic_turn(
         resolved.admission,
@@ -115,7 +139,13 @@ def _research_replay_case():
     return before, after, replay_input
 
 
-def _record_research_journal(path, before, replay_input):
+def _record_research_journal(
+    path,
+    before,
+    replay_input,
+    *,
+    semantic_repair_continuation: bool = False,
+):
     from custom_tools.text_to_sql.adaptive.semantic_reducer import (
         admit_semantic_turn,
         commit_semantic_turn,
@@ -159,6 +189,7 @@ def _record_research_journal(path, before, replay_input):
             "resolution_digest": resolution_digest,
             "state_digest": canonical_digest(before),
         },
+        semantic_repair_continuation=semantic_repair_continuation,
     )
     observed = checkpoint.record_observed(
         key,
@@ -646,6 +677,80 @@ def test_research_successor_and_replay_input_commit_atomically(tmp_path) -> None
             after,
             expected_previous_revision=before.revision,
         )
+
+
+def test_research_transition_after_prepared_reentry_uses_current_segment_journal(
+    tmp_path,
+) -> None:
+    from custom_tools.text_to_sql.adaptive.replay_inputs import (
+        ResearchTerminalReplayInput,
+    )
+    from custom_tools.text_to_sql.adaptive.serialization import canonical_digest
+    from workflow._text_to_sql_reentry_recovery import (
+        build_prepared_targeted_reentry_commit,
+    )
+
+    path = tmp_path / "research-after-prepared-reentry.db"
+    store = AdaptiveResearchStateStore(path)
+    before, bridge, _ = _research_replay_case()
+    store.save_research_state(before, expected_previous_revision=None)
+    checkpoint = AdaptiveStateStore(path)
+    checkpoint.record_replayable_terminal(
+        AdaptiveCheckpointKey(
+            before.run_id,
+            before.run_incarnation,
+            AdaptiveLoopKind.RESEARCH,
+            before.revision,
+        ),
+        expected_revision=None,
+        action={"kind": "research_terminal", "reason": "COMPLETE"},
+        replay_input=ResearchTerminalReplayInput(
+            freshness_context=freshness(before)
+        ),
+    )
+    bridge_action = bridge.action_history[-1]
+    plan = build_prepared_targeted_reentry_commit(
+        run_id=before.run_id,
+        run_incarnation=before.run_incarnation,
+        research_reentry_id="reentry-1",
+        missing_evidence_request_id="request-1",
+        source_id="source-1",
+        ordinal=1,
+        base_solver_revision=1,
+        solver_admission_digest="sha256:" + "a" * 64,
+        store_base_research_revision=before.revision,
+        store_base_research_digest=canonical_digest(before),
+        projected_research=before,
+        projected_research_digest=canonical_digest(before),
+        action=bridge_action,
+        hypotheses=(),
+        bindings=(),
+        join_candidates=(),
+        invocation_id="invocation-prepared",
+        reservation_digest="sha256:" + "b" * 64,
+        policy_digest="sha256:" + "c" * 64,
+        schema_namespace_version=before.schema_namespace_version,
+    )
+    store.prepare_targeted_reentry_commit(plan)
+    store.commit_prepared_targeted_reentry(plan, bridge)
+
+    _, successor, replay_input = _research_replay_case(
+        before=bridge,
+        tool_name="inspect_column",
+        tool_arguments={"table": "public.orders", "column": "status"},
+    )
+    replay_input = _record_research_journal(
+        path,
+        bridge,
+        replay_input,
+        semantic_repair_continuation=True,
+    )
+
+    assert store.save_replayable_semantic_transition(
+        bridge,
+        successor,
+        replay_input,
+    ) == successor
 
 
 def test_research_first_commit_rejects_unlinked_journal_digests(tmp_path) -> None:
@@ -1278,3 +1383,66 @@ def test_reentry_completed_replay_uses_independent_research_snapshot(tmp_path) -
             },
             replay_input=replay_input,
         )
+
+
+def test_completed_reentry_replay_input_uses_durable_research_snapshot(
+    tmp_path,
+) -> None:
+    from custom_tools.text_to_sql.adaptive.models import ResearchReentryStatus
+    from custom_tools.text_to_sql.adaptive.semantic_coverage import (
+        validate_coverage_inputs,
+    )
+    from custom_tools.text_to_sql.adaptive.serialization import canonical_digest
+    from workflow.text_to_sql_adaptive_solver import (
+        _completed_reentry_replay_input,
+    )
+
+    solver_store, research, authority, _, admitted = _solver_reentry_case(tmp_path)
+    _, durable, research_replay_input = _research_replay_case(before=research)
+    research_store = AdaptiveResearchStateStore(solver_store.db_path)
+    research_replay_input = _record_research_journal(
+        solver_store.db_path,
+        research,
+        research_replay_input,
+    )
+    research_store.save_replayable_semantic_transition(
+        research,
+        durable,
+        research_replay_input,
+    )
+    projected_budget = durable.budget_state.model_copy(
+        update={
+            "used_model_calls": durable.budget_state.used_model_calls + 1,
+            "remaining_model_calls": durable.budget_state.remaining_model_calls - 1,
+        }
+    )
+    projected = durable.model_copy(update={"budget_state": projected_budget})
+    completed = admitted.record.model_copy(
+        update={
+            "status": ResearchReentryStatus.COMPLETED,
+            "research_result_revision": durable.revision,
+        }
+    )
+    context = freshness(durable)
+    projected_authority = validate_coverage_inputs(
+        projected,
+        context,
+        projected.run_id,
+        projected.run_incarnation,
+    )
+
+    replay_input = _completed_reentry_replay_input(
+        completed,
+        projected,
+        context,
+        projected_authority,
+        research_state_store=research_store,
+    )
+
+    assert replay_input.research_state_digest == canonical_digest(durable)
+    assert replay_input.requirements == validate_coverage_inputs(
+        durable,
+        context,
+        durable.run_id,
+        durable.run_incarnation,
+    )

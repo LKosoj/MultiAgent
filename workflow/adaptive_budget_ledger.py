@@ -218,6 +218,21 @@ class AdaptiveBudgetLedger:
         with self._connection() as connection:
             return _load_model_records(connection, run_id, run_incarnation)
 
+    def list_model_run_incarnations(self, run_id: str) -> tuple[str, ...]:
+        if not isinstance(run_id, str) or not run_id:
+            raise ValueError("run_id is required")
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT run_incarnation
+                FROM {_MODEL_EVENT_TABLE}
+                WHERE run_id = ?
+                ORDER BY run_incarnation
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(row["run_incarnation"] for row in rows)
+
     def record_model_reservation(
         self,
         reservation: ModelCallReservation,

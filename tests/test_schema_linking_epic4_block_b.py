@@ -97,8 +97,10 @@ def _make_core(relevant_tables=None, *, llm_caller=None) -> SchemaLinkingCore:
 def test_llm_models_config_loader(tmp_path, monkeypatch):
     """Loader читает yaml, возвращает активный профиль, и поддерживает env-override."""
     cfg_path = tmp_path / "llm.yaml"
-    # W6-T3: REQUIRED_SECTIONS включает `nlu` (intent_max_tokens / nlp_max_tokens),
-    # поэтому тестовый default-профиль обязан содержать эту секцию.
+    # W6-T3: REQUIRED_SECTIONS требует наличия секции `nlu` в default-профиле
+    # (набор конкретных ключей внутри секции не валидируется — см.
+    # LLMModelsConfig.__init__). `custom_probe_max_tokens` ниже — произвольный
+    # ключ, проверяющий, что profile.get() читает любые значения секции.
     cfg_path.write_text(
         "version: 1\n"
         "profiles:\n"
@@ -110,7 +112,7 @@ def test_llm_models_config_loader(tmp_path, monkeypatch):
         "      max_tokens: 8000\n"
         "    nlu:\n"
         "      intent_max_tokens: 700\n"
-        "      nlp_max_tokens: 1500\n",
+        "      custom_probe_max_tokens: 1500\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))
@@ -122,7 +124,7 @@ def test_llm_models_config_loader(tmp_path, monkeypatch):
     assert profile.get("schema_linking", "schema_prompt_hard_max_chars") == 32000
     assert profile.get("sql_generation", "max_tokens") == 8000
     assert profile.get("nlu", "intent_max_tokens") == 700
-    assert profile.get("nlu", "nlp_max_tokens") == 1500
+    assert profile.get("nlu", "custom_probe_max_tokens") == 1500
 
 
 def test_llm_models_config_fails_fast_when_missing(tmp_path, monkeypatch):
@@ -130,6 +132,23 @@ def test_llm_models_config_fails_fast_when_missing(tmp_path, monkeypatch):
     llm_models_config.reset_cache()
     with pytest.raises(FileNotFoundError):
         llm_models_config.load_llm_models_config()
+
+
+def test_llm_models_yaml_has_no_dead_nlp_max_tokens_key():
+    """Regression guard (W0-0.7): ``nlp_max_tokens`` — мёртвый ключ, ничем
+    в рантайме не читается (единственный consumer секции ``nlu`` —
+    ``custom_tools/text_to_sql/nlu.py::_nlu_max_tokens``, который читает
+    только ``query_understanding_max_tokens`` и ``intent_max_tokens``).
+    Удалён из config/text_to_sql/llm_models.yaml в обоих профилях; тест
+    не даёт ему незаметно вернуться. Грузит реальный yaml через дефолтный
+    путь (без env-override) — используем autouse ``_reset_caches``.
+    """
+    for profile_name in ("default", "muni_ru"):
+        profile = llm_models_config.get_active_profile(profile_name)
+        assert not profile.has("nlu", "nlp_max_tokens"), (
+            f"profile '{profile_name}': dead key 'nlp_max_tokens' must not "
+            "reappear in llm_models.yaml"
+        )
 
 
 def test_linking_cache_hash_tracks_llm_model_profile_and_path(monkeypatch):
@@ -435,8 +454,7 @@ def test_max_tokens_from_llm_models_config(monkeypatch, tmp_path):
         "    sql_generation:\n"
         "      max_tokens: 9999\n"
         "    nlu:\n"
-        "      intent_max_tokens: 700\n"
-        "      nlp_max_tokens: 1500\n",
+        "      intent_max_tokens: 700\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))
@@ -480,8 +498,7 @@ def test_mandatory_schema_over_profile_hard_cap_skips_llm(monkeypatch, tmp_path)
         "    sql_generation:\n"
         "      max_tokens: 9999\n"
         "    nlu:\n"
-        "      intent_max_tokens: 700\n"
-        "      nlp_max_tokens: 1500\n",
+        "      intent_max_tokens: 700\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))

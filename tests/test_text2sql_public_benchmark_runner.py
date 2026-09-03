@@ -19,6 +19,7 @@ from custom_tools.text_to_sql.eval import release_inputs
 from custom_tools.text_to_sql.eval import release_diagnostics
 from custom_tools.text_to_sql.eval import release_bundle_execution as bundle_execution
 from custom_tools.text_to_sql.eval import public_benchmark_artifacts
+from custom_tools.text_to_sql.eval import public_benchmark_bwrap
 from custom_tools.text_to_sql.eval import public_benchmark_bwrap_execution as bwrap_execution
 from custom_tools.text_to_sql.eval.public_benchmark_bwrap_execution import (
     BwrapBenchmarkExecution,
@@ -55,6 +56,32 @@ from scripts.text2sql_public_benchmark import (
 )
 from streamlit_app.text_to_sql_client import TextToSqlResult
 from custom_tools.text_to_sql.eval.sandbox import prepare_case_overlays
+from custom_tools.text_to_sql.adaptive.model_budget import (
+    ModelBudgetLimits,
+    ModelTokenUsage,
+)
+from custom_tools.text_to_sql.adaptive.policy import (
+    MAX_ACTIONS,
+    MAX_DB_PROBE_MS,
+    MAX_DB_PROBES,
+    MAX_INLINE_BYTES,
+    MAX_MODEL_CALLS_V2,
+    MAX_MODEL_INPUT_TOKENS_PER_CALL,
+    MAX_MODEL_OUTPUT_TOKENS_PER_CALL,
+    MAX_MODEL_TOTAL_TOKENS,
+    MAX_RETURNED_ROWS,
+    MAX_SAMPLE_ROWS,
+    MAX_WALL_CLOCK_SECONDS,
+    AdaptivePolicyConfig,
+    OperationCountBudget,
+    PerActionBudget,
+    ResourceBudget,
+    ResultVolumeBudget,
+    WallClockBudget,
+    execute_model_call_with_budget,
+)
+from custom_tools.text_to_sql.adaptive.serialization import canonical_digest
+from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
 
 
 def _sqlite_file(path: Path) -> None:
@@ -437,6 +464,43 @@ def test_run_case_fetches_terminal_outcome_after_transport_error(
     assert "raw" not in observation["outcome"]
 
 
+def test_run_watcher_reports_checkpoint_execution_terminal_exit_and_stale_trace() -> None:
+    events: list[dict[str, object]] = []
+    watcher = benchmark_runner.BenchmarkRunWatcher(
+        "run-1",
+        events.append,
+        stale_after_seconds=30.0,
+    )
+
+    watcher.observe("running", observed_at=10.0)
+    watcher.observe("running", observed_at=40.0)
+    watcher.sql_execution(executed=True)
+    watcher.terminal("finished")
+    watcher.runner_exit("completed", None)
+
+    assert events == [
+        {
+            "event": "workflow_checkpoint",
+            "run_id": "run-1",
+            "workflow_status": "running",
+        },
+        {
+            "event": "stale_trace",
+            "run_id": "run-1",
+            "workflow_status": "running",
+            "stale_seconds": 30.0,
+        },
+        {"event": "sql_execution", "run_id": "run-1", "executed": True},
+        {"event": "terminal", "run_id": "run-1", "workflow_status": "finished"},
+        {
+            "event": "runner_exit",
+            "run_id": "run-1",
+            "observation_status": "completed",
+            "runner_error": None,
+        },
+    ]
+
+
 def test_manifest_records_verifiable_pipeline_provenance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -564,7 +628,7 @@ def test_bwrap_manifest_uses_v2_execution_policy_from_source_snapshot(
             "per_action": {"sample_rows": 50},
             "model_budget": {
                 "model_calls": 256,
-                "input_tokens_per_call": 16_384,
+                "input_tokens_per_call": 32_768,
                 "output_tokens_per_call": 32_000,
                 "total_tokens": 1_048_576,
             },
@@ -901,7 +965,15 @@ def test_empty_history_receipt_is_persisted_before_sandbox_process(
         receipts.append(receipt)
         events.append("persisted")
 
+    def seed_schema(**_kwargs: object) -> None:
+        events.append("schema")
+
     monkeypatch.setattr(benchmark_runner, "SandboxCaseRunner", FakeRunner)
+    monkeypatch.setattr(
+        bwrap_execution.facade,
+        "seed_case_schema_snapshot",
+        seed_schema,
+    )
     expected_database_digest = hashlib.sha256(database.read_bytes()).hexdigest()
 
     with pytest.raises(RuntimeError, match="stop before API"):
@@ -918,7 +990,7 @@ def test_empty_history_receipt_is_persisted_before_sandbox_process(
             run_scope="diagnostic_subset",
         )
 
-    assert events == ["persisted", "process"]
+    assert events == ["persisted", "schema", "process"]
     assert receipts[0]["verification_status"] == "verified_empty"
 
 
@@ -1369,6 +1441,440 @@ def test_runtime_evidence_rejects_mismatched_typed_receipt(
     assert evidence["semantic_evidence_authority"] == {
         "availability": "unavailable"
     }
+
+
+def _model_budget_policy_config() -> AdaptivePolicyConfig:
+    limits = ModelBudgetLimits(
+        model_calls=MAX_MODEL_CALLS_V2,
+        input_tokens_per_call=MAX_MODEL_INPUT_TOKENS_PER_CALL,
+        output_tokens_per_call=MAX_MODEL_OUTPUT_TOKENS_PER_CALL,
+        total_tokens=MAX_MODEL_TOTAL_TOKENS,
+    )
+    return AdaptivePolicyConfig(
+        policy_version=2,
+        wall_clock=WallClockBudget(wall_clock_seconds=MAX_WALL_CLOCK_SECONDS),
+        resource_limits=ResourceBudget(
+            model_tokens=limits.total_tokens,
+            db_probe_ms=MAX_DB_PROBE_MS,
+        ),
+        operation_counts=OperationCountBudget(
+            actions=MAX_ACTIONS,
+            model_decisions=limits.model_calls,
+            db_probes=MAX_DB_PROBES,
+        ),
+        result_volume=ResultVolumeBudget(
+            returned_rows=MAX_RETURNED_ROWS,
+            inline_bytes=MAX_INLINE_BYTES,
+        ),
+        per_action=PerActionBudget(sample_rows=MAX_SAMPLE_ROWS),
+        model_budget=limits,
+    )
+
+
+def _record_model_call(
+    ledger: AdaptiveBudgetLedger,
+    *,
+    run_id: str,
+    run_incarnation: str,
+    call_id: str,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    execute_model_call_with_budget(
+        run_id,
+        run_incarnation,
+        call_id,
+        canonical_digest({"call_id": call_id}),
+        "provider/model-v1",
+        200,
+        100,
+        lambda _reservation: ModelTokenUsage(
+            input_tokens=input_tokens, output_tokens=output_tokens
+        ),
+        config=_model_budget_policy_config(),
+        ledger=ledger,
+        claim_now_ns=lambda: 1,
+        owner_token_factory=lambda: "owner",
+    )
+
+
+def _record_model_call_conservative(
+    ledger: AdaptiveBudgetLedger,
+    *,
+    run_id: str,
+    run_incarnation: str,
+    call_id: str,
+) -> None:
+    """Record a call whose provider never reported usage (charged at max)."""
+    execute_model_call_with_budget(
+        run_id,
+        run_incarnation,
+        call_id,
+        canonical_digest({"call_id": call_id}),
+        "provider/model-v1",
+        200,
+        100,
+        lambda _reservation: ModelTokenUsage(
+            input_tokens=None, output_tokens=None
+        ),
+        config=_model_budget_policy_config(),
+        ledger=ledger,
+        claim_now_ns=lambda: 1,
+        owner_token_factory=lambda: "owner",
+    )
+
+
+def test_runtime_evidence_reports_model_calls_tokens_cost_receipts(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    ledger = AdaptiveBudgetLedger(workspace / "workflow_state.db")
+    try:
+        _record_model_call(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-1",
+            call_id="research-model-2-3",
+            input_tokens=101,
+            output_tokens=23,
+        )
+        _record_model_call(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-1",
+            call_id="research-stop-review-4-5",
+            input_tokens=17,
+            output_tokens=9,
+        )
+    finally:
+        ledger.close()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    receipts = evidence["model_calls_tokens_cost_receipts"]
+    assert receipts["availability"] == "available"
+    assert receipts["schema_version"] == 2
+    assert receipts["run_id"] == "run-1"
+    assert receipts["run_incarnations"] == ["incarnation-1"]
+    assert receipts["by_step"]["research-model"] == {
+        "call_count": 1,
+        "reconciled_call_count": 1,
+        "conservative_call_count": 0,
+        "input_tokens": 101,
+        "output_tokens": 23,
+        "charged_input_tokens": 101,
+        "charged_output_tokens": 23,
+        "charged_total_tokens": 124,
+    }
+    assert receipts["by_step"]["research-stop-review"] == {
+        "call_count": 1,
+        "reconciled_call_count": 1,
+        "conservative_call_count": 0,
+        "input_tokens": 17,
+        "output_tokens": 9,
+        "charged_input_tokens": 17,
+        "charged_output_tokens": 9,
+        "charged_total_tokens": 26,
+    }
+    assert receipts["totals"] == {
+        "call_count": 2,
+        "reconciled_call_count": 2,
+        "conservative_call_count": 0,
+        "input_tokens": 118,
+        "output_tokens": 32,
+        "charged_input_tokens": 118,
+        "charged_output_tokens": 32,
+        "charged_total_tokens": 150,
+    }
+    assert len(receipts["calls"]) == 2
+    for call in receipts["calls"]:
+        assert set(call) == {
+            "call_id",
+            "step",
+            "run_incarnation",
+            "model_identity",
+            "input_tokens",
+            "output_tokens",
+            "charged_total",
+            "usage_was_conservative",
+            "started_at_ns",
+            "duration_ns",
+        }
+        assert call["duration_ns"] is None
+        assert call["usage_was_conservative"] is False
+    assert receipts["duration_ns_availability"] == "unavailable"
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_missing_ledger(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    case_root.mkdir()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    assert evidence["model_calls_tokens_cost_receipts"] == {
+        "availability": "unavailable",
+        "reason": "ledger_database_missing",
+    }
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_no_run_id(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    case_root.mkdir()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {"run_id": "run-1"},
+        SimpleNamespace(case_root=case_root),
+    )
+
+    assert evidence["model_calls_tokens_cost_receipts"] == {
+        "availability": "unavailable",
+        "reason": "run_id_unavailable",
+    }
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_multiple_incarnations(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    ledger = AdaptiveBudgetLedger(workspace / "workflow_state.db")
+    try:
+        _record_model_call(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-a",
+            call_id="research-model-1-1",
+            input_tokens=10,
+            output_tokens=5,
+        )
+        _record_model_call(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-b",
+            call_id="research-model-1-1",
+            input_tokens=7,
+            output_tokens=3,
+        )
+    finally:
+        ledger.close()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    receipts = evidence["model_calls_tokens_cost_receipts"]
+    assert receipts["availability"] == "available"
+    assert receipts["run_incarnations"] == ["incarnation-a", "incarnation-b"]
+    assert receipts["totals"]["call_count"] == 2
+    assert receipts["totals"]["reconciled_call_count"] == 2
+    assert receipts["totals"]["input_tokens"] == 17
+    assert receipts["totals"]["output_tokens"] == 8
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_conservative_usage(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    ledger = AdaptiveBudgetLedger(workspace / "workflow_state.db")
+    try:
+        _record_model_call(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-1",
+            call_id="research-model-1-1",
+            input_tokens=101,
+            output_tokens=23,
+        )
+        _record_model_call_conservative(
+            ledger,
+            run_id="run-1",
+            run_incarnation="incarnation-1",
+            call_id="research-model-2-2",
+        )
+    finally:
+        ledger.close()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    receipts = evidence["model_calls_tokens_cost_receipts"]
+    step_totals = receipts["by_step"]["research-model"]
+    assert step_totals["call_count"] == 2
+    assert step_totals["reconciled_call_count"] == 2
+    assert step_totals["conservative_call_count"] == 1
+    # The conservative call has no real usage, so it is charged at its
+    # reservation maximum (200 in / 100 out); the aggregate mixes that
+    # estimate in with the other call's measured 101/23.
+    assert step_totals["charged_input_tokens"] == 101 + 200
+    assert step_totals["charged_output_tokens"] == 23 + 100
+    assert receipts["totals"]["conservative_call_count"] == 1
+
+    calls_by_id = {call["call_id"]: call for call in receipts["calls"]}
+    assert calls_by_id["research-model-1-1"]["usage_was_conservative"] is False
+    assert calls_by_id["research-model-2-2"]["usage_was_conservative"] is True
+    # A conservative call's usage was never reported by the provider, so
+    # the per-call measured token counts stay None (unlike charged_total,
+    # which is always populated once reconciled).
+    assert calls_by_id["research-model-2-2"]["input_tokens"] is None
+    assert calls_by_id["research-model-2-2"]["output_tokens"] is None
+    assert calls_by_id["research-model-2-2"]["charged_total"] == 300
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_no_model_calls_recorded(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    # A freshly created ledger has valid schema but no recorded model calls.
+    ledger = AdaptiveBudgetLedger(workspace / "workflow_state.db")
+    ledger.close()
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    assert evidence["model_calls_tokens_cost_receipts"] == {
+        "availability": "unavailable",
+        "reason": "no_model_calls_recorded",
+    }
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_ledger_unreadable_symlink(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    target = workspace / "target.sqlite"
+    target.write_bytes(b"SQLite format 3\x00" + b"\x00" * 2048)
+    # Path.is_file() follows the symlink to a real file, so this passes the
+    # early existence check; AdaptiveBudgetLedger then opens the ledger path
+    # itself with O_NOFOLLOW (workflow/state_files.py) and raises a plain
+    # ValueError for the symlink. Before the fix that ValueError was not
+    # caught here and would have crashed artifact finalization.
+    (workspace / "workflow_state.db").symlink_to(target)
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    assert evidence["model_calls_tokens_cost_receipts"] == {
+        "availability": "unavailable",
+        "reason": "ledger_unreadable",
+    }
+
+
+def test_runtime_evidence_model_calls_tokens_cost_receipts_ledger_unreadable_corrupt_file(
+    tmp_path: Path,
+) -> None:
+    case_root = tmp_path / "case-state"
+    workspace = case_root / "workspace"
+    workspace.mkdir(parents=True, mode=0o700)
+    workspace.chmod(0o700)
+    # Not a valid SQLite file; AdaptiveBudgetLedger's PRAGMA journal_mode
+    # probe raises sqlite3.DatabaseError while reading the header.
+    (workspace / "workflow_state.db").write_bytes(b"not a sqlite database")
+
+    evidence = benchmark_runner._runtime_evidence(
+        {
+            "run_id": "run-1",
+            "outcome": {
+                "status": "abstained",
+                "reason_code": "SCHEMA_CLARIFICATION_REQUIRED",
+            },
+        },
+        SimpleNamespace(case_root=case_root),
+    )
+
+    assert evidence["model_calls_tokens_cost_receipts"] == {
+        "availability": "unavailable",
+        "reason": "ledger_unreadable",
+    }
+
+
+@pytest.mark.parametrize(
+    ("call_id", "expected_step"),
+    [
+        # No trailing "-<int>-<int>" suffix at all: returned unchanged.
+        ("research-stop-review", "research-stop-review"),
+        # Only one trailing integer: the suffix pattern needs two, so this
+        # is also returned unchanged.
+        ("research-2", "research-2"),
+        # Two trailing integers are stripped, even when the step name
+        # itself is hyphenated.
+        ("research-model-2-3", "research-model"),
+        # A number embedded earlier in the id does not count as the
+        # trailing suffix when the id does not itself end in two integers.
+        ("research-2-model", "research-2-model"),
+        ("", ""),
+    ],
+)
+def test_model_call_step_strips_trailing_revision_attempt_suffix(
+    call_id: str, expected_step: str
+) -> None:
+    assert public_benchmark_bwrap._model_call_step(call_id) == expected_step
 
 
 def test_release_plan_is_complete_ordered_and_uses_three_frozen_seeds() -> None:
@@ -3205,6 +3711,29 @@ def test_diagnostic_bwrap_seeds_only_transferable_schema_memory(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "prior-state" / "schema-memory"
+    prior_run = source / "bird-r1-old"
+    prior_run.mkdir(parents=True)
+    (prior_run / "workflow_state.db").write_bytes(b"old workflow state")
+    schema_snapshot = prior_run / "sqlrag" / "schema-v1-synthetic.json"
+    schema_snapshot.parent.mkdir()
+    schema_snapshot.write_text(
+        json.dumps(
+            {
+                "snapshot_version": 1,
+                "schema_scope": {
+                    "serialization_version": 1,
+                    "tenant_id": "text2sql-benchmark",
+                    "access_scope_id": "owner:text2sql-benchmark",
+                    "connection_view_id": "dsn:synthetic",
+                    "transient": False,
+                },
+                "captured_at": "2026-08-29T00:00:00+00:00",
+                "schema_fingerprint": "a" * 64,
+                "schema_info": {"items": {"id": {"type": "INTEGER"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
     database_root = source / "tiny" / "digest"
     database_root.mkdir(parents=True)
     database = database_root / "smolagents_memory.db"
@@ -3264,7 +3793,69 @@ def test_diagnostic_bwrap_seeds_only_transferable_schema_memory(
         ]
         assert connection.execute("SELECT * FROM strategic_memory").fetchall() == []
         assert connection.execute("SELECT * FROM successful_sql").fetchall() == []
+    assert (
+        execution.state_root
+        / "schema-memory"
+        / prior_run.name
+        / "sqlrag"
+        / schema_snapshot.name
+    ).read_bytes() == schema_snapshot.read_bytes()
     assert {path.name for path in execution.state_root.iterdir()} == {"schema-memory"}
+
+
+def test_case_reuses_latest_scoped_schema_snapshot_after_empty_history(
+    tmp_path: Path,
+) -> None:
+    from custom_tools.text_to_sql.schema_namespace import SchemaScope
+
+    state_root = tmp_path / "state"
+    case_root = state_root / "bird-r1-current"
+    (case_root / "sqlrag").mkdir(parents=True)
+    dsn = "sqlite:////benchmark-input/example.sqlite"
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "text2sql-benchmark",
+            "access_scope_id": "owner:text2sql-benchmark",
+            "connection_view_id": (
+                "dsn:" + hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:16]
+            ),
+            "transient": False,
+        }
+    )
+    filename = f"schema-v1-{scope.scope_key}.json"
+    older = state_root / "bird-r1-previous" / "sqlrag" / filename
+    latest = state_root / "schema-memory" / "nested" / "old" / "sqlrag" / filename
+    for path, captured_at, description in (
+        (older, "2026-08-28T00:00:00+00:00", "older description"),
+        (latest, "2026-08-29T00:00:00+00:00", "latest description"),
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "snapshot_version": 1,
+                    "schema_scope": scope.to_mapping(),
+                    "captured_at": captured_at,
+                    "schema_fingerprint": "a" * 64,
+                    "schema_info": {
+                        "items": {"id": {"description": description}}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    bwrap_execution.facade.seed_case_schema_snapshot(
+        state_root=state_root,
+        case_root=case_root,
+        dsn=dsn,
+    )
+
+    copied = json.loads((case_root / "sqlrag" / filename).read_text(encoding="utf-8"))
+    assert copied["schema_info"]["items"]["id"]["description"] == (
+        "latest description"
+    )
 
 
 def test_release_legs_keep_new_state_roots_but_share_seeded_schema_memory(

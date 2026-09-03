@@ -16,14 +16,18 @@ from .model_budget import ModelUsageBudgetError
 from .models import (
     BindingStatus,
     ColumnRef,
+    DiscriminatorValueBinding,
     DocumentRef,
     DocumentRuleBinding,
+    EvidenceSourceKind,
     HypothesisStatus,
     QueryProbeRef,
     ResearchReentryRecord,
     ResearchReentryStatus,
     ResearchStopReason,
     ResearchState,
+    SemanticItemKind,
+    PhysicalColumnBinding,
     SolverState,
     StrictModel,
     TableRef,
@@ -154,17 +158,29 @@ async def run_targeted_research_reentry(
             if item.missing_evidence_request_id == missing_evidence_request_id
         )
         if resume_admitted:
-            if request.repair_kind != "semantic_binding_mismatch":
+            formula_needs_continuation = _formula_needs_research_continuation(
+                request.source_id,
+                admitted.state,
+                request.required_evidence_kind,
+            )
+            if (
+                request.repair_kind != "semantic_binding_mismatch"
+                and not formula_needs_continuation
+                and request.predicate_authority is None
+            ):
                 raise ResearchReentryError(
-                    "only semantic binding repair may resume after its durable probe"
+                    "only research continuation may resume after its durable admission"
                 )
-            return await _complete_semantic_repair(
+            return await _complete_research_continuation(
                 admitted,
                 current_research,
                 research_state,
                 request,
                 freshness,
                 continue_research,
+                allow_current_result=(
+                    formula_needs_continuation or request.predicate_authority is not None
+                ),
             )
         authority = revalidate_exact_model(
             requirements,
@@ -181,6 +197,19 @@ async def run_targeted_research_reentry(
         if not exact_value(authority, rebuilt):
             raise ResearchReentryError(
                 "requirements must be exact current W4 authority"
+            )
+        if _formula_needs_research_continuation(
+            request.source_id,
+            admitted.state,
+            request.required_evidence_kind,
+        ):
+            return await _complete_research_continuation(
+                admitted,
+                current_research,
+                research_state,
+                request,
+                freshness,
+                continue_research,
             )
         trusted_targets = _trusted_targets(
             request.source_id, current_research, authority
@@ -199,7 +228,11 @@ async def run_targeted_research_reentry(
         _require_model_capacity(current_research)
         decision = propose_decision(
             task=request.question,
-            research_context=_research_context(request, trusted_targets),
+            research_context=_research_context(
+                request,
+                trusted_targets,
+                current_research,
+            ),
         )
         if inspect.isawaitable(decision):
             decision = await decision
@@ -232,6 +265,10 @@ async def run_targeted_research_reentry(
             or (
                 request.repair_kind != "semantic_binding_mismatch"
                 and not _is_allowed_target(claim.target, trusted_targets)
+                and not (
+                    type(claim.target) is QueryProbeRef
+                    and request.required_evidence_kind is EvidenceSourceKind.PROBE
+                )
             )
         ):
             raise ResearchReentryError(
@@ -286,8 +323,11 @@ async def run_targeted_research_reentry(
                 ResearchReentryStatus.TOOL_FAILURE,
             )
 
-        if request.repair_kind == "semantic_binding_mismatch":
-            return await _complete_semantic_repair(
+        if (
+            request.repair_kind == "semantic_binding_mismatch"
+            or request.predicate_authority is not None
+        ):
+            return await _complete_research_continuation(
                 admitted,
                 current_research,
                 research_state,
@@ -376,19 +416,21 @@ def _continuation_status(reason: ResearchStopReason) -> ResearchReentryStatus:
     }.get(reason, ResearchReentryStatus.PROTOCOL_FAILURE)
 
 
-async def _complete_semantic_repair(
+async def _complete_research_continuation(
     admitted: ResearchReentryTransitionResult,
     current: ResearchState,
     baseline: ResearchState,
     request,
     freshness: FreshnessContext,
     continue_research: Callable[..., object] | None,
+    *,
+    allow_current_result: bool = False,
 ) -> ResearchReentryOutcome:
     from .research_loop import ResearchLoopOutcome
 
     if not callable(continue_research):
         raise ResearchReentryError(
-            "semantic binding repair requires existing research continuation"
+            "binding repair requires existing research continuation"
         )
     continuation = continue_research(current, request)
     if inspect.isawaitable(continuation):
@@ -402,24 +444,29 @@ async def _complete_semantic_repair(
             _continuation_status(continuation.stop_reason),
         )
     result = continuation.final_state
-    if result.revision <= current.revision:
+    if result.revision < current.revision or (
+        result.revision == current.revision and not allow_current_result
+    ):
         raise ResearchReentryError(
-            "semantic binding repair requires a later research revision"
+            "binding repair requires a later research revision"
         )
-    _validate_semantic_repair_result(
-        baseline,
-        result,
-        request.source_id,
-        request.repair_binding_id,
-    )
-    refreshed = FreshnessContext(
-        evaluated_at=datetime.now(UTC),
-        run_id=freshness.run_id,
-        run_incarnation=freshness.run_incarnation,
-        schema_namespace_version=freshness.schema_namespace_version,
-        document_sources=freshness.document_sources,
-        data_snapshots=freshness.data_snapshots,
-    )
+    if request.repair_kind == "semantic_binding_mismatch":
+        _validate_semantic_repair_result(
+            baseline,
+            result,
+            request.source_id,
+            request.repair_binding_id,
+        )
+    elif request.predicate_authority is not None:
+        _validate_predicate_authority_result(
+            baseline,
+            result,
+            request.source_id,
+            request.predicate_authority,
+        )
+    else:
+        _validate_unbound_formula_result(baseline, result, request.source_id)
+    refreshed = continuation.freshness_context or freshness
     requirements = validate_coverage_inputs(
         result,
         refreshed,
@@ -442,6 +489,99 @@ async def _complete_semantic_repair(
         refreshed,
         requirements,
     )
+
+
+def _formula_needs_research_continuation(
+    source_id: str,
+    state: SolverState,
+    required_evidence_kind: EvidenceSourceKind,
+) -> bool:
+    item = next(
+        (item for item in state.query_spec.semantic_items if item.source_id == source_id),
+        None,
+    )
+    return (
+        item is not None
+        and item.kind is SemanticItemKind.FORMULA
+        and (
+            not item.binding_ids
+            or required_evidence_kind is EvidenceSourceKind.SCHEMA
+        )
+    )
+
+
+def _validate_predicate_authority_result(
+    baseline: ResearchState,
+    result: ResearchState,
+    source_id: str,
+    predicate_authority,
+) -> None:
+    original = tuple(
+        binding
+        for binding in baseline.bindings
+        if binding.source_id == source_id
+        and isinstance(binding, PhysicalColumnBinding)
+        and binding.status is BindingStatus.SUPPORTED
+        and binding.physical_column == predicate_authority.left
+    )
+    predicate_bindings = tuple(
+        binding
+        for binding in result.bindings
+        if binding.source_id == source_id
+        and isinstance(binding, DiscriminatorValueBinding)
+        and binding.status is BindingStatus.SUPPORTED
+        and binding.discriminator_predicate == predicate_authority
+    )
+    item = next(
+        (item for item in result.query_spec.semantic_items if item.source_id == source_id),
+        None,
+    )
+    if (
+        len(original) != 1
+        or len(predicate_bindings) != 1
+        or item is None
+        or not {
+            original[0].binding_id,
+            predicate_bindings[0].binding_id,
+        }.issubset(item.binding_ids)
+    ):
+        raise ResearchReentryError(
+            "predicate continuation did not retain the dimension and exact value binding"
+        )
+
+
+def _validate_unbound_formula_result(
+    baseline: ResearchState,
+    result: ResearchState,
+    source_id: str,
+) -> None:
+    item = next(
+        (item for item in result.query_spec.semantic_items if item.source_id == source_id),
+        None,
+    )
+    supported = tuple(
+        binding
+        for binding in result.bindings
+        if binding.source_id == source_id
+        and binding.status is BindingStatus.SUPPORTED
+    )
+    baseline_other = tuple(
+        binding for binding in baseline.bindings if binding.source_id != source_id
+    )
+    result_other = tuple(
+        binding for binding in result.bindings if binding.source_id != source_id
+    )
+    if (
+        item is None
+        or not supported
+        or not set(item.binding_ids).intersection(
+            binding.binding_id for binding in supported
+        )
+        or result_other[: len(baseline_other)] != baseline_other
+    ):
+        raise ResearchReentryError(
+            "formula continuation did not preserve existing sources or bind the missing source"
+        )
 
 
 def _validate_semantic_repair_result(
@@ -474,7 +614,7 @@ def _validate_semantic_repair_result(
         stale_binding_id is None
         or len(stale) != 1
         or not replacements
-        or result_other != baseline_other
+        or result_other[: len(baseline_other)] != baseline_other
     ):
         raise ResearchReentryError(
             "semantic binding repair did not replace only the failed source"
@@ -552,10 +692,21 @@ def _is_allowed_target(candidate, trusted_targets) -> bool:
     return any(exact_value(candidate, trusted) for trusted in trusted_targets)
 
 
-def _research_context(request, trusted_targets) -> str:
+def _research_context(request, trusted_targets, research_state) -> str:
+    completed_actions = tuple(
+        {
+            "kind": action.kind.value,
+            "target": action.target.model_dump(mode="json", by_alias=True),
+            "parameters": action.parameters,
+        }
+        for action in research_state.action_history
+        if _is_allowed_target(action.target, trusted_targets)
+    )
     return canonical_json_bytes(
         {
+            "completed_actions": completed_actions,
             "missing_evidence_request_id": request.missing_evidence_request_id,
+            "predicate_authority": request.predicate_authority,
             "required_evidence_kind": request.required_evidence_kind,
             "source_id": request.source_id,
             "trusted_targets": trusted_targets,

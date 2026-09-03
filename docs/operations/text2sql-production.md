@@ -17,6 +17,7 @@ is production-ready.
    export BACKEND_IMAGE='sha256:<64-hex>'
    export FRONTEND_IMAGE='sha256:<64-hex>'
    export TEXT2SQL_PUBLIC_API_URL='https://text2sql.example/api'
+   export OPENAI_API_BASE_DB='https://gateway.example/v1'
    export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
    export NEXT_BUILD_ID="$(git rev-parse HEAD)"
    ```
@@ -27,6 +28,8 @@ is production-ready.
 3. Provide readable secret files through `AG_UI_AUTH_TOKEN_MAP_FILE`,
    `HF_TOKEN_FILE`, `OPENAI_API_KEY_FILE`, and `OPENAI_API_KEY_DB_FILE`.
    Never put their values in Compose YAML or evidence JSON.
+   `OPENAI_API_BASE_DB` is a required non-secret variable. Schema memory uses
+   its `llmgateway/embedding` selector and does not load a local embedding model.
 4. Validate Compose and run the B-owned `migrate` service:
 
    ```bash

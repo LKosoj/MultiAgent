@@ -836,6 +836,20 @@ def test_case_inside_aggregate_is_structural_sql_not_a_function_call() -> None:
     assert admitted.output_columns == ("open_orders", "closed_orders")
 
 
+def test_schema_qualified_columns_are_admitted_for_the_matching_physical_tables() -> None:
+    admitted = _admit(
+        "SELECT "
+        "SUM(CASE WHEN main.orders.status = 'open' THEN 1 ELSE 0 END) AS open_orders, "
+        "COUNT(DISTINCT CASE WHEN main.customers.name = 'A' "
+        "THEN main.orders.customer_id END) AS named_customers "
+        "FROM main.orders "
+        "JOIN main.customers ON main.orders.customer_id = main.customers.id "
+        "LIMIT 1"
+    )
+
+    assert admitted.output_columns == ("open_orders", "named_customers")
+
+
 @pytest.mark.parametrize("dialect", ["sqlite", "postgres", "mysql"])
 def test_dialect_specific_parsers_admit_the_same_closed_query_shape(dialect) -> None:
     admitted = _admit(

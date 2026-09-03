@@ -16,6 +16,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     JoinEdge,
     JoinType,
     LiteralValue,
+    PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
     ResearchActionKind,
@@ -360,10 +361,63 @@ def test_discriminator_null_filter_requires_schema_and_exact_null_value() -> Non
     assert decision.requirements.allowed_predicates == (predicate,)
 
 
+def test_filter_allows_supporting_physical_column_alongside_predicate_binding() -> None:
+    column = _column("orders", "completed_at")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.IS_NOT_NULL,
+        right=None,
+    )
+    schema_evidence = _schema_evidence("completed-schema", column)
+    value_evidence = _value_evidence("completed-value", column, "09:30")
+    discriminator = _discriminator_binding(
+        column,
+        predicate,
+        (schema_evidence.evidence_id, value_evidence.evidence_id),
+    )
+    physical = PhysicalColumnBinding(
+        binding_id="physical-binding",
+        source_id="source-a",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(schema_evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="coverage",
+        physical_column=column,
+    )
+    state = _with_required_filter(
+        _state(
+            item_specs=(
+                (
+                    "source-a",
+                    True,
+                    SemanticItemStatus.RESOLVED,
+                    tuple(sorted((discriminator.binding_id, physical.binding_id))),
+                ),
+            ),
+            bindings=(discriminator, physical),
+            evidence=(schema_evidence, value_evidence),
+        ),
+        None,
+        PredicateOperator.IS_NOT_NULL,
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
+
+
 @pytest.mark.parametrize(
     "operator", (PredicateOperator.IS_NULL, PredicateOperator.IS_NOT_NULL)
 )
-def test_null_filter_with_non_null_query_right_is_deferred(
+def test_supported_null_predicate_is_authoritative_despite_stale_query_literal(
     operator: PredicateOperator,
 ) -> None:
     column = _column("orders", "cancelled_at")
@@ -390,9 +444,9 @@ def test_null_filter_with_non_null_query_right_is_deferred(
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_is_not_null_filter_does_not_require_an_observed_matching_row() -> None:
@@ -776,7 +830,7 @@ def test_vertical_null_filter_rejects_other_value_or_type(
     assert decision.affected_source_ids == ("source-a",)
 
 
-def test_vertical_null_filter_requires_every_schema_fact() -> None:
+def test_vertical_null_filter_uses_the_supported_binding_footprint() -> None:
     state, _, _ = _vertical_filter_state(
         value_operator=PredicateOperator.IS_NULL,
         query_right=None,
@@ -788,9 +842,8 @@ def test_vertical_null_filter_requires_every_schema_fact() -> None:
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
 
 
 def test_vertical_null_filter_requires_both_validated_joins() -> None:
@@ -1097,6 +1150,212 @@ def test_missing_or_disconnected_validated_join_is_deferred() -> None:
         is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
     )
     assert disconnected_decision.affected_source_ids == ("source-a", "source-b")
+
+
+def test_validated_joins_through_bridge_table_allow_generation() -> None:
+    left_column = _column("table-source-a", "column-source-a")
+    right_column = _column("table-source-b", "column-source-b")
+    left_edge = JoinEdge(
+        left=_column("table-source-a", "id"),
+        right=_column("bridge_records", "left_id"),
+        join_type=JoinType.INNER,
+    )
+    right_edge = JoinEdge(
+        left=_column("table-source-b", "id"),
+        right=_column("bridge_records", "right_id"),
+        join_type=JoinType.INNER,
+    )
+    unrelated_edge = JoinEdge(
+        left=_column("table-source-a", "id"),
+        right=_column("unrelated_records", "left_id"),
+        join_type=JoinType.INNER,
+    )
+    evidence = (
+        _schema_evidence("left-evidence", left_column),
+        _schema_evidence("right-evidence", right_column),
+        _schema_evidence(
+            "left-join-evidence",
+            left_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+        _schema_evidence(
+            "right-join-evidence",
+            right_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+        _schema_evidence(
+            "unrelated-join-evidence",
+            unrelated_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+    )
+    state = _state(
+        item_specs=(
+            ("source-a", True, SemanticItemStatus.RESOLVED, ("binding-a",)),
+            ("source-b", True, SemanticItemStatus.RESOLVED, ("binding-b",)),
+        ),
+        bindings=(
+            _physical_binding("source-a", "binding-a", "left-evidence"),
+            _physical_binding("source-b", "binding-b", "right-evidence"),
+        ),
+        evidence=evidence,
+        joins=(
+            _join_candidate("left-join", (left_edge,), "left-join-evidence"),
+            _join_candidate("right-join", (right_edge,), "right-join-evidence"),
+            _join_candidate(
+                "unrelated-join", (unrelated_edge,), "unrelated-join-evidence"
+            ),
+        ),
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is True
+    assert decision.reason is None
+    assert decision.requirements is not None
+    assert tuple(
+        join.join_id for join in decision.requirements.eligible_validated_joins
+    ) == ("left-join", "right-join")
+
+
+def test_direct_validated_join_is_preferred_over_bridge_route() -> None:
+    left_column = _column("table-source-a", "column-source-a")
+    right_column = _column("table-source-b", "column-source-b")
+    direct_edge = JoinEdge(
+        left=_column("table-source-a", "id"),
+        right=_column("table-source-b", "id"),
+        join_type=JoinType.INNER,
+    )
+    left_bridge_edge = JoinEdge(
+        left=_column("table-source-a", "id"),
+        right=_column("bridge_records", "left_id"),
+        join_type=JoinType.INNER,
+    )
+    right_bridge_edge = JoinEdge(
+        left=_column("table-source-b", "id"),
+        right=_column("bridge_records", "right_id"),
+        join_type=JoinType.INNER,
+    )
+    evidence = (
+        _schema_evidence("left-evidence", left_column),
+        _schema_evidence("right-evidence", right_column),
+        _schema_evidence(
+            "direct-evidence",
+            direct_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+        _schema_evidence(
+            "left-bridge-evidence",
+            left_bridge_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+        _schema_evidence(
+            "right-bridge-evidence",
+            right_bridge_edge.left.table,
+            kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+        ),
+    )
+    state = _state(
+        item_specs=(
+            ("source-a", True, SemanticItemStatus.RESOLVED, ("binding-a",)),
+            ("source-b", True, SemanticItemStatus.RESOLVED, ("binding-b",)),
+        ),
+        bindings=(
+            _physical_binding("source-a", "binding-a", "left-evidence"),
+            _physical_binding("source-b", "binding-b", "right-evidence"),
+        ),
+        evidence=evidence,
+        joins=(
+            _join_candidate("z-direct", (direct_edge,), "direct-evidence"),
+            _join_candidate(
+                "a-bridge-left", (left_bridge_edge,), "left-bridge-evidence"
+            ),
+            _join_candidate(
+                "b-bridge-right", (right_bridge_edge,), "right-bridge-evidence"
+            ),
+        ),
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert tuple(
+        join.join_id for join in decision.requirements.eligible_validated_joins
+    ) == ("z-direct",)
+
+
+def test_shortest_validated_bridge_route_limits_join_authority() -> None:
+    left_column = _column("table-source-a", "column-source-a")
+    right_column = _column("table-source-b", "column-source-b")
+    edges = {
+        "a-z": JoinEdge(
+            left=_column("table-source-a", "id"),
+            right=_column("z_records", "a_id"),
+            join_type=JoinType.INNER,
+        ),
+        "b-y": JoinEdge(
+            left=_column("table-source-b", "id"),
+            right=_column("y_records", "b_id"),
+            join_type=JoinType.INNER,
+        ),
+        "x-y": JoinEdge(
+            left=_column("x_records", "y_id"),
+            right=_column("y_records", "id"),
+            join_type=JoinType.INNER,
+        ),
+        "x-z": JoinEdge(
+            left=_column("x_records", "z_id"),
+            right=_column("z_records", "id"),
+            join_type=JoinType.INNER,
+        ),
+        "y-z": JoinEdge(
+            left=_column("y_records", "z_id"),
+            right=_column("z_records", "id"),
+            join_type=JoinType.INNER,
+        ),
+    }
+    evidence = [
+        _schema_evidence("left-evidence", left_column),
+        _schema_evidence("right-evidence", right_column),
+    ]
+    joins = []
+    for join_id, edge in edges.items():
+        evidence_id = f"{join_id}-evidence"
+        evidence.append(
+            _schema_evidence(
+                evidence_id,
+                edge.left.table,
+                kind=ResearchActionKind.INSPECT_RELATIONSHIPS,
+            )
+        )
+        joins.append(_join_candidate(join_id, (edge,), evidence_id))
+    state = _state(
+        item_specs=(
+            ("source-a", True, SemanticItemStatus.RESOLVED, ("binding-a",)),
+            ("source-b", True, SemanticItemStatus.RESOLVED, ("binding-b",)),
+        ),
+        bindings=(
+            _physical_binding("source-a", "binding-a", "left-evidence"),
+            _physical_binding("source-b", "binding-b", "right-evidence"),
+        ),
+        evidence=tuple(evidence),
+        joins=tuple(joins),
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert {
+        join.join_id for join in decision.requirements.eligible_validated_joins
+    } == {"a-z", "b-y", "y-z"}
 
 
 def test_stale_data_evidence_is_deferred() -> None:

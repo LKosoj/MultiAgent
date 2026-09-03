@@ -153,6 +153,18 @@ def test_priority_strategy_env_override(monkeypatch):
     assert list(limited.keys()) == ["hub"]
 
 
+def test_default_table_limit_keeps_ten_tables(monkeypatch):
+    monkeypatch.delenv("SCHEMA_MAX_TABLES", raising=False)
+    schema = {
+        f"table_{index:02d}": _table({"id": {"type": "INTEGER"}})
+        for index in range(11)
+    }
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(schema)
+
+    assert list(limited) == [f"table_{index:02d}" for index in range(10)]
+
+
 def test_query_relevant_column_after_soft_prefix_is_retained(monkeypatch):
     monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "20")
     columns = {
@@ -200,6 +212,38 @@ def test_table_name_and_raw_substring_do_not_make_columns_mandatory(monkeypatch)
     assert list(limited["revenue"]["columns"]) == ["ordinary"]
     assert diagnostics["tables"]["revenue"]["mandatory_columns"] == 0
     assert diagnostics["soft_limit_overflow"] is False
+
+
+def test_bounded_identifier_abbreviations_keep_late_numbered_output_slots(monkeypatch):
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+
+    limited = SchemaLimiter(priority_strategy="insertion").limit_schema_for_prompt(
+        {
+            "contacts": _table(
+                {
+                    "early_note": {"type": "TEXT"},
+                    "RespGiven1": {"type": "TEXT"},
+                    "RespFamily1": {"type": "TEXT"},
+                    "RespGiven2": {"type": "TEXT"},
+                    "RespFamily2": {"type": "TEXT"},
+                    "RespGiven3": {"type": "TEXT"},
+                    "RespFamily3": {"type": "TEXT"},
+                    "OtherRespGiven1": {"type": "TEXT"},
+                    "ContactRespFamily3": {"type": "TEXT"},
+                }
+            )
+        },
+        query_terms=["responsible"],
+    )
+
+    assert list(limited["contacts"]["columns"]) == [
+        "RespGiven1",
+        "RespFamily1",
+        "RespGiven2",
+        "RespFamily2",
+        "RespGiven3",
+        "RespFamily3",
+    ]
 
 
 def test_key_and_query_columns_overflow_soft_budget_explicitly(monkeypatch):

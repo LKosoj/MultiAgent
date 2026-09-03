@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import re
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -22,11 +23,13 @@ from custom_tools.text_to_sql.adaptive.production_research import (
 from custom_tools.text_to_sql.adaptive.research_loop import run_research_loop
 from custom_tools.text_to_sql.adaptive.research_decision import ResearchDecisionV1
 from custom_tools.text_to_sql.adaptive.schema_research_agent import (
+    ResearchStopReview,
     SchemaResearchModelResponse,
     load_schema_research_agent_profile,
 )
 from custom_tools.text_to_sql.adaptive.terminal import research_stop_terminal_result
 from custom_tools.text_to_sql.llm_models_config import load_llm_models_config
+from llm_call_context import llm_call_context
 from custom_tools.text_to_sql.nlu import NLUProcessor
 from custom_tools.text_to_sql.schema_enricher import SchemaEnricher
 from custom_tools.text_to_sql.schema_loader import SchemaLoader
@@ -91,6 +94,10 @@ async def run_typed_schema_research(
         context_documents=runtime.context_documents,
         schema_context=SchemaLimiter(priority_strategy="fk_centrality").build_schema_summary(
             loaded_schema.schema,
+            query_terms=_schema_prompt_query_terms(
+                runtime.query,
+                runtime.context_documents,
+            ),
             hard_max_chars=int(
                 load_llm_models_config().get(
                     "schema_linking", "schema_prompt_hard_max_chars"
@@ -102,6 +109,10 @@ async def run_typed_schema_research(
     memory_manager.ensure_schema_indexed_in_memory(
         loaded_schema.namespace,
         loaded_schema.schema,
+    )
+    memory_manager.replace_file_semantic_facts(
+        loaded_schema.namespace,
+        loaded_schema.semantic_facts,
     )
     semantic_table_hints = tuple(
         memory_manager.find_semantic_relevant_tables(
@@ -115,18 +126,30 @@ async def run_typed_schema_research(
             loaded_schema.namespace,
         )
     )
+    approved_semantic_fact_hints = tuple(
+        memory_manager.find_approved_semantic_facts(
+            _query_spec_terms(query_spec),
+            loaded_schema.namespace,
+        )
+    )
 
     policy = load_adaptive_policy_config()
     profile = load_schema_research_agent_profile()
     if policy.model_budget is None:
         raise ValueError("Typed research requires a model budget")
-    model = _research_model(profile.model, policy.model_budget.output_tokens_per_call)
+    model = _research_model(
+        profile.model, policy.model_budget.output_tokens_per_call, runtime.run_id
+    )
+    stop_review_model = _research_stop_review_model(
+        profile.model, policy.model_budget.output_tokens_per_call, runtime.run_id
+    )
     try:
         outcome = await run_production_schema_research(
             query_spec=query_spec,
             loaded_schema=loaded_schema,
             semantic_table_hints=semantic_table_hints,
             verified_probe_fact_hints=verified_probe_fact_hints,
+            approved_semantic_fact_hints=approved_semantic_fact_hints,
             documents=runtime.document_snapshot,
             dsn=runtime.dsn,
             scope=scope,
@@ -141,6 +164,7 @@ async def run_typed_schema_research(
             profile=profile,
             is_cancelled=runtime.is_cancelled,
             loop_runner=run_research_loop,
+            stop_review_model=stop_review_model,
         )
     except asyncio.CancelledError:
         runtime.mark_cancelled()
@@ -195,6 +219,19 @@ def _query_spec_terms(query_spec: QuerySpec) -> tuple[str, ...]:
     )
 
 
+def _schema_prompt_query_terms(
+    question: str,
+    context_documents: tuple[str, ...],
+) -> tuple[str, ...]:
+    return tuple(
+        dict.fromkeys(
+            token
+            for text in (question, *context_documents)
+            for token in re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+        )
+    )
+
+
 def default_table_namespace(dsn: str) -> str:
     import db_plugins
 
@@ -208,16 +245,9 @@ def default_table_namespace(dsn: str) -> str:
     return default
 
 
-def _research_model(profile_model: str, output_tokens: int):
-    from agent_command import create_text_to_sql_model
-
-    provider = create_text_to_sql_model(
-        profile_model,
-        max_tokens=output_tokens,
-        temperature=0.3,
-    )
-    schema = ResearchDecisionV1.model_json_schema()
-    definitions = schema["$defs"]
+def _typed_response_format(model_type: type, name: str) -> dict[str, object]:
+    schema = model_type.model_json_schema()
+    definitions = schema.get("$defs", {})
     pending: list[object] = [schema]
     while pending:
         node = pending.pop()
@@ -236,14 +266,30 @@ def _research_model(profile_model: str, output_tokens: int):
             pending.extend(node.values())
         elif isinstance(node, list):
             pending.extend(node)
-    response_format = {
+    return {
         "type": "json_schema",
         "json_schema": {
-            "name": "ResearchDecisionV1",
+            "name": name,
             "strict": True,
             "schema": schema,
         },
     }
+
+
+def _typed_schema_model(
+    profile_model: str,
+    output_tokens: int,
+    response_format: dict[str, object],
+    run_id: str | None = None,
+    step_name: str | None = None,
+):
+    from agent_command import create_text_to_sql_model
+
+    provider = create_text_to_sql_model(
+        profile_model,
+        max_tokens=output_tokens,
+        temperature=0.3,
+    )
 
     async def model(prompt: str) -> SchemaResearchModelResponse:
         messages = [
@@ -256,13 +302,14 @@ def _research_model(profile_model: str, output_tokens: int):
             ),
             ChatMessage(role=MessageRole.USER, content=prompt),
         ]
-        response = await asyncio.to_thread(
-            provider,
-            messages,
-            max_tokens=output_tokens,
-            temperature=0.3,
-            response_format=response_format,
-        )
+        with llm_call_context(run_id=run_id, step_name=step_name):
+            response = await asyncio.to_thread(
+                provider,
+                messages,
+                max_tokens=output_tokens,
+                temperature=0.3,
+                response_format=response_format,
+            )
         if type(response) in (bytes, str):
             raw_response = response
         elif isinstance(response, ChatMessage):
@@ -286,6 +333,28 @@ def _research_model(profile_model: str, output_tokens: int):
         )
 
     return model
+
+
+def _research_model(profile_model: str, output_tokens: int, run_id: str | None = None):
+    return _typed_schema_model(
+        profile_model,
+        output_tokens,
+        _typed_response_format(ResearchDecisionV1, "ResearchDecisionV1"),
+        run_id,
+        "schema-research",
+    )
+
+
+def _research_stop_review_model(
+    profile_model: str, output_tokens: int, run_id: str | None = None
+):
+    return _typed_schema_model(
+        profile_model,
+        output_tokens,
+        _typed_response_format(ResearchStopReview, "ResearchStopReview"),
+        run_id,
+        "schema-research-stop-review",
+    )
 
 
 def _provider_model_usage(response: object) -> ModelTokenUsage:

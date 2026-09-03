@@ -216,8 +216,30 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     import workflow.text_to_sql_typed_research as typed_research
 
     loaded = _loaded_schema()
+    monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
+    loaded.schema["public.revenue"]["columns"].update(
+        {
+            "RespGiven1": {"type": "TEXT"},
+            "RespFamily1": {"type": "TEXT"},
+            "RespGiven2": {"type": "TEXT"},
+            "RespFamily2": {"type": "TEXT"},
+            "RespGiven3": {"type": "TEXT"},
+            "RespFamily3": {"type": "TEXT"},
+        }
+    )
+    loaded = LoadedSchema(
+        loaded.schema,
+        SchemaNamespace(
+            loaded.namespace.scope,
+            canonical_schema_fingerprint(loaded.schema),
+        ),
+        loaded.source,
+    )
     query_spec = _query_spec()
-    context_documents = ("Return the winning alternative label.",)
+    context_documents = (
+        "Return the winning alternative label.",
+        "Responsible contacts use given and family values.",
+    )
     calls: list[tuple[str, object]] = []
     captured: dict[str, object] = {}
     final_state = SimpleNamespace(
@@ -235,6 +257,9 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
 
         def ensure_schema_indexed_in_memory(self, namespace, schema):
             calls.append(("ensure", namespace, schema))
+
+        def replace_file_semantic_facts(self, namespace, facts):
+            calls.append(("save_semantic_facts", namespace, facts))
             return True
 
         def find_semantic_relevant_tables(self, terms, namespace=None):
@@ -244,6 +269,10 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         def find_verified_probe_facts(self, terms, namespace):
             calls.append(("find_facts", tuple(terms), namespace))
             return [{"probe_kind": "sample_rows", "summary": "recent revenue rows"}]
+
+        def find_approved_semantic_facts(self, terms, namespace):
+            calls.append(("find_semantic_facts", tuple(terms), namespace))
+            return []
 
         def save_verified_probe_facts(self, namespace, state):
             calls.append(("save_facts", namespace, state))
@@ -309,6 +338,9 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         lambda: SimpleNamespace(model="test-model"),
     )
     monkeypatch.setattr(typed_research, "_research_model", lambda *_args: object())
+    monkeypatch.setattr(
+        typed_research, "_research_stop_review_model", lambda *_args: object()
+    )
     monkeypatch.setattr(typed_research, "run_production_schema_research", run_research)
     monkeypatch.setattr(
         typed_research,
@@ -343,14 +375,18 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
             },
         ),
         ("ensure", loaded.namespace, loaded.schema),
+        ("save_semantic_facts", loaded.namespace, ()),
         ("find", ("monthly revenue", "revenue"), loaded.namespace),
         ("find_facts", ("monthly revenue", "revenue"), loaded.namespace),
+        ("find_semantic_facts", ("monthly revenue", "revenue"), loaded.namespace),
         ("save_facts", loaded.namespace, final_state),
     ]
     assert captured["semantic_table_hints"] == ("public.revenue",)
     assert captured["verified_probe_fact_hints"] == (
         {"probe_kind": "sample_rows", "summary": "recent revenue rows"},
     )
+    assert captured["approved_semantic_fact_hints"] == ()
+    assert captured["stop_review_model"] is not None
     assert runtime.loaded_schema_digest == canonical_digest(
         {
             "namespace_version": loaded.namespace.version_key,
@@ -358,14 +394,21 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
             "source": loaded.source,
         }
     )
-    assert understanding_calls == [
-        {
-            "run_id": "run-memory",
-            "run_incarnation": "incarnation-memory",
-            "context_documents": context_documents,
-            "schema_context": "public.revenue(amount:DECIMAL 'Recorded revenue amount')",
-        }
-    ]
+    assert len(understanding_calls) == 1
+    assert understanding_calls[0]["run_id"] == "run-memory"
+    assert understanding_calls[0]["run_incarnation"] == "incarnation-memory"
+    assert understanding_calls[0]["context_documents"] == context_documents
+    schema_context = understanding_calls[0]["schema_context"]
+    assert "amount:DECIMAL 'Recorded revenue amount'" in schema_context
+    for column in (
+        "RespGiven1",
+        "RespFamily1",
+        "RespGiven2",
+        "RespFamily2",
+        "RespGiven3",
+        "RespFamily3",
+    ):
+        assert f"{column}:TEXT" in schema_context
     assert result["ready_for_sql"] is True
 
 
@@ -439,3 +482,103 @@ def test_probe_fact_manager_uses_exact_namespace_and_skips_existing_fact(
     manager.save_verified_probe_facts(namespace, state)
     assert all(call["session_id"] == namespace.version_key for call in calls)
     assert all(call["cache_kind"] == "schema_probe_fact" for call in calls)
+
+
+def test_verified_column_value_probe_is_promoted_to_an_approved_semantic_fact(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
+    from memory import tools as memory_tools
+
+    namespace = _loaded_schema().namespace
+    state = _probe_fact_state(namespace, kind=ResearchActionKind.SEARCH_VALUE)
+    saved: list[dict[str, object]] = []
+
+    def get_memory(**kwargs):
+        return [
+            {"data": data}
+            for data in saved
+            if data["schema_version"] == kwargs["session_id"]
+            and data["cache_kind"] == kwargs["cache_kind"]
+        ]
+
+    monkeypatch.setattr(memory_tools, "get_memory", get_memory)
+    monkeypatch.setattr(
+        memory_tools,
+        "save_memory",
+        lambda **kwargs: saved.append(kwargs["data"]) or 1,
+    )
+    manager = SchemaMemoryManager(Path(tmp_path))
+
+    manager.save_verified_probe_facts(namespace, state)
+
+    facts = manager.find_approved_semantic_facts(("revenue",), namespace)
+    assert [(fact.source, fact.fact_kind, fact.value) for fact in facts] == [
+        ("typed_probe", "example", "revenue"),
+    ]
+
+
+def test_probe_promotion_ignores_non_finite_example_values() -> None:
+    from custom_tools.text_to_sql.schema_memory_sqlite import (
+        _approved_semantic_facts_from_probe_fact,
+    )
+
+    facts = _approved_semantic_facts_from_probe_fact(
+        {
+            "probe_kind": "distinct_values",
+            "target": {
+                "table": {"namespace": "public", "schema": None, "table": "revenue"},
+                "column": "amount",
+            },
+            "payload": {"values": [1.0, float("nan"), float("inf"), -float("inf")]},
+        }
+    )
+
+    assert [fact.value for fact in facts] == [1.0]
+
+
+def test_non_promotable_probe_does_not_replace_file_semantic_facts(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from custom_tools.text_to_sql.schema_memory import SemanticFact, SchemaMemoryManager
+    from memory import tools as memory_tools
+
+    namespace = _loaded_schema().namespace
+    saved: list[dict[str, object]] = []
+
+    def get_memory(**kwargs):
+        return [
+            {"data": data}
+            for data in saved
+            if data["schema_version"] == kwargs["session_id"]
+            and data["cache_kind"] == kwargs["cache_kind"]
+        ]
+
+    monkeypatch.setattr(memory_tools, "get_memory", get_memory)
+    monkeypatch.setattr(
+        memory_tools,
+        "save_memory",
+        lambda **kwargs: saved.append(kwargs["data"]) or 1,
+    )
+    manager = SchemaMemoryManager(Path(tmp_path))
+    file_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.revenue",
+        column="amount",
+        fact_kind="description",
+        value="Net invoice amount",
+        source="file",
+        status="approved",
+    )
+
+    manager.replace_file_semantic_facts(namespace, (file_fact,))
+    manager.save_verified_probe_facts(
+        namespace,
+        _probe_fact_state(namespace, kind=ResearchActionKind.PROFILE_COLUMN),
+    )
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [
+        file_fact
+    ]

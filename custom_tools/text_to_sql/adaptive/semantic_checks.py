@@ -27,6 +27,7 @@ from .models import (
     DerivedExpressionBinding,
     EvidenceSourceKind,
     JoinCandidateStatus,
+    PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
     QuerySpec,
@@ -34,25 +35,22 @@ from .models import (
     ResearchState,
     SemanticItem,
     SemanticItemKind,
+    SemanticItemStatus,
     TableRef,
     is_binding_free_semantic_item,
-    is_binding_free_structural_limit,
 )
 from .semantic_coverage import CoverageRequirements
 from .semantic_plan import (
-    AstColumnOccurrence,
     _relation_tables,
     _resolve_column_ref,
-    collect_ast_columns,
     predicate_from_expression,
 )
 
 
 _AUTHORITY_FAILURE_ORDER = (
     CheckFailureCode.UNAUTHORIZED_TABLE,
-    CheckFailureCode.UNAUTHORIZED_COLUMN,
+    CheckFailureCode.UNAUTHORIZED_JOIN,
     CheckFailureCode.UNAUTHORIZED_LITERAL,
-    CheckFailureCode.LIMIT_MISMATCH,
 )
 
 
@@ -77,7 +75,9 @@ class _SemanticContext:
     bindings_by_source: dict[str, tuple[object, ...]]
     items_by_kind: dict[SemanticItemKind, tuple[SemanticItem, ...]]
     tables: tuple[tuple[str, TableRef], ...]
-    columns: tuple[AstColumnOccurrence, ...]
+    relation_tables: dict[str, TableRef]
+    joins: tuple[object, ...]
+    root_scope_ids: frozenset[str]
     authority_predicates: tuple[_PredicateOccurrence, ...]
 
 
@@ -99,18 +99,12 @@ def evaluate_semantic_authority_checks(
         context = _validated_context(check_input, research_state, dsn)
         checks = {
             CheckFailureCode.UNAUTHORIZED_TABLE: _unauthorized_table,
-            CheckFailureCode.UNAUTHORIZED_COLUMN: _unauthorized_column,
+            CheckFailureCode.UNAUTHORIZED_JOIN: _unauthorized_join,
             CheckFailureCode.UNAUTHORIZED_LITERAL: _unauthorized_authority_literal,
-            CheckFailureCode.LIMIT_MISMATCH: _limit_mismatch,
         }
         for code in _AUTHORITY_FAILURE_ORDER:
             if (result := checks[code](context)) is not None:
                 return result
-            if (
-                code is CheckFailureCode.UNAUTHORIZED_LITERAL
-                and _missing_required_predicate(context)
-            ):
-                raise _SemanticInputError()
         return _passed(candidate_id)
     except _SemanticInputError as exc:
         return _inconclusive(candidate_id, exc.ast_node_ids)
@@ -210,12 +204,6 @@ def _validated_context(
             )
         )
     )
-    columns = collect_ast_columns(
-        active_ast,
-        relation_tables,
-        allowed_columns=authority_columns,
-        dialect=ast.parsed_ast.dialect,
-    )
     authority_predicates = tuple(
         occurrence
         for node_id, scope_id, field, index, expression in _all_active_expressions(active_ast)
@@ -248,7 +236,13 @@ def _validated_context(
             (fact.node_id, relation_tables[fact.relation_id])
             for fact in active_ast.table_scans
         ),
-        columns=columns.occurrences,
+        relation_tables=relation_tables,
+        joins=tuple(active_ast.joins),
+        root_scope_ids=frozenset(
+            scope.scope_id
+            for scope in active_ast.scopes
+            if scope.parent_scope_id is None and scope.query_role.value == "root"
+        ),
         authority_predicates=authority_predicates,
     )
 
@@ -296,6 +290,16 @@ def _validate_requirements_state_membership(
     }
     if any(known_joins.get(item.join_id) != item for item in requirements.eligible_validated_joins):
         raise _SemanticInputError()
+    from .semantic_coverage import _derive_row_preservation_requirements
+
+    expected_row_requirements = _derive_row_preservation_requirements(
+        state.query_spec,
+        items,
+        requirements.selected_bindings,
+        requirements.eligible_validated_joins,
+    )
+    if requirements.row_preservation_requirements != expected_row_requirements:
+        raise _SemanticInputError()
 
 
 def _unauthorized_table(context: _SemanticContext) -> CheckResult | None:
@@ -307,38 +311,92 @@ def _unauthorized_table(context: _SemanticContext) -> CheckResult | None:
     return _failure(context, CheckFailureCode.UNAUTHORIZED_TABLE, nodes=nodes) if nodes else None
 
 
-def _missing_required_predicate(context: _SemanticContext) -> bool:
-    covered_source_ids = {
-        source_id
-        for annotation in context.check_input.semantic_ast.coverage.annotations
-        for source_id in annotation.source_ids
+def _unauthorized_join(context: _SemanticContext) -> CheckResult | None:
+    if not context.requirements.row_preservation_requirements:
+        return None
+    source_ids: list[str] = []
+    node_ids: list[str] = []
+    for requirement in context.requirements.row_preservation_requirements:
+        mismatches = _row_preservation_join_mismatches(requirement, context)
+        if mismatches is None:
+            continue
+        source_ids.extend(requirement.related_source_ids)
+        node_ids.extend(mismatches)
+    return (
+        _failure(
+            context,
+            CheckFailureCode.UNAUTHORIZED_JOIN,
+            sources=tuple(source_ids),
+            nodes=tuple(node_ids),
+        )
+        if source_ids
+        else None
+    )
+
+
+def _row_preservation_join_mismatches(requirement, context: _SemanticContext):
+    base_relation_ids = {
+        relation_id
+        for join in context.joins
+        if join.scope_id in context.root_scope_ids
+        for relation_id in (join.relation_id, *join.left_relation_ids)
+        if context.relation_tables.get(relation_id) == requirement.base_table
     }
-    for item in (
-        *context.items_by_kind[SemanticItemKind.FILTER],
-        *context.items_by_kind[SemanticItemKind.TIME],
-    ):
-        for binding in context.bindings_by_source[item.source_id]:
-            if binding.predicates:
-                if not all(
-                    any(
-                        _predicate_is_authorized(predicate, occurrence)
-                        for occurrence in context.authority_predicates
-                    )
-                    for predicate in binding.predicates
-                ):
-                    return True
-            elif item.source_id not in covered_source_ids:
-                return True
+    if len(base_relation_ids) != 1:
+        return ()
+    node_ids: list[str] = []
+    used_node_ids: set[str] = set()
+    for edge in requirement.effective_join_path:
+        candidates = [
+            join
+            for join in context.joins
+            if join.scope_id in context.root_scope_ids
+            and join.node_id not in used_node_ids
+            and _join_condition_has_edge(join, edge, context)
+        ]
+        if len(candidates) != 1:
+            return tuple(node_ids)
+        join = candidates[0]
+        used_node_ids.add(join.node_id)
+        node_ids.append(join.node_id)
+        options = dict(join.options.attributes) if join.options is not None else {}
+        if (
+            context.relation_tables.get(join.relation_id) != edge.right.table
+            or not any(
+                context.relation_tables.get(relation_id) == edge.left.table
+                for relation_id in join.left_relation_ids
+            )
+            or options.get("side") != "LEFT"
+        ):
+            return tuple(node_ids)
+    return None
+
+
+def _join_condition_has_edge(join, edge, context: _SemanticContext) -> bool:
+    if join.condition is None:
+        return False
+    expected = PredicateRef(
+        left=edge.left,
+        operator=edge.operator,
+        right=edge.right,
+    )
+    pending = [join.condition]
+    while pending:
+        expression = pending.pop()
+        try:
+            actual = predicate_from_expression(
+                expression,
+                context.relation_tables,
+                scope_id=join.scope_id,
+                allowed_columns=(edge.left, edge.right),
+                dialect=context.check_input.parsed_ast.dialect,
+            )
+        except (TypeError, ValueError):
+            actual = None
+        if actual is not None and predicate_matches(expected, actual):
+            return True
+        pending.extend(child for _, _, child in getattr(expression, "children", ()))
     return False
-
-
-def _unauthorized_column(context: _SemanticContext) -> CheckResult | None:
-    allowed = set(context.requirements.allowed_columns)
-    for path in context.requirements.allowed_join_paths:
-        for edge in path:
-            allowed.update((edge.left, edge.right))
-    nodes = tuple(item.node_id for item in context.columns if item.column not in allowed)
-    return _failure(context, CheckFailureCode.UNAUTHORIZED_COLUMN, nodes=nodes) if nodes else None
 
 
 def _all_active_expressions(parsed_ast: object):
@@ -465,7 +523,10 @@ def _unauthorized_authority_literal(context: _SemanticContext) -> CheckResult | 
         item.node_id
         for item in context.authority_predicates
         if _predicate_has_literal(item.predicate)
+        and item.predicate.operator is not PredicateOperator.LIKE
+        and not _binding_free_formula_authorizes_literal(context, item)
         and not _derived_formula_annotation_authorizes_literal(context, item)
+        and not _requested_output_authorizes_literal(context, item)
         and not (
             item.predicate.left in context.requirements.allowed_columns
             and item.predicate.operator is PredicateOperator.EQ
@@ -480,6 +541,39 @@ def _unauthorized_authority_literal(context: _SemanticContext) -> CheckResult | 
         )
     )
     return _failure(context, CheckFailureCode.UNAUTHORIZED_LITERAL, nodes=nodes) if nodes else None
+
+
+def _requested_output_authorizes_literal(
+    context: _SemanticContext,
+    occurrence: _PredicateOccurrence,
+) -> bool:
+    if occurrence.node_id not in {
+        projection.node_id
+        for projection in context.check_input.parsed_ast.projections
+    }:
+        return False
+    requested_source_ids = set(context.query_spec.requested_output_source_ids)
+    for item in context.query_spec.semantic_items:
+        if (
+            item.source_id not in requested_source_ids
+            or item.operator is None
+            or item.literal_or_reference is None
+        ):
+            continue
+        for binding in context.bindings_by_source.get(item.source_id, ()):
+            if type(binding) is not PhysicalColumnBinding:
+                continue
+            try:
+                expected = PredicateRef(
+                    left=binding.physical_column,
+                    operator=item.operator,
+                    right=item.literal_or_reference,
+                )
+            except (ValidationError, TypeError, ValueError):
+                continue
+            if _predicate_is_authorized(expected, occurrence):
+                return True
+    return False
 
 
 def _predicate_has_literal(predicate: PredicateRef) -> bool:
@@ -497,14 +591,43 @@ def _predicate_is_authorized(
     )
 
 
+def _binding_free_formula_authorizes_literal(
+    context: _SemanticContext,
+    occurrence: _PredicateOccurrence,
+) -> bool:
+    if not any(
+        item.required
+        and item.status
+        in {SemanticItemStatus.UNRESOLVED, SemanticItemStatus.RESOLVED}
+        for item in context.items_by_kind[SemanticItemKind.FORMULA]
+    ):
+        return False
+    formula_node_ids = {
+        item.node_id
+        for item in (
+            *context.check_input.parsed_ast.projections,
+            *context.check_input.parsed_ast.aggregates,
+        )
+    }
+    return occurrence.node_id in formula_node_ids
+
+
 def _derived_formula_annotation_authorizes_literal(
     context: _SemanticContext,
     occurrence: _PredicateOccurrence,
 ) -> bool:
+    physical_formula_sources = {
+        item.source_id
+        for item in context.items_by_kind[SemanticItemKind.FORMULA]
+    }
     formula_sources = {
         source_id
         for source_id, bindings in context.bindings_by_source.items()
         if any(type(binding) is DerivedExpressionBinding for binding in bindings)
+        or (
+            source_id in physical_formula_sources
+            and any(type(binding) is PhysicalColumnBinding for binding in bindings)
+        )
     }
     return any(
         formula_sources.intersection(annotation.source_ids)
@@ -517,43 +640,6 @@ def _derived_formula_annotation_authorizes_literal(
         )
         == occurrence.expression_path[: len(annotation.expression_path)]
         for annotation in context.check_input.semantic_ast.coverage.annotations
-    )
-
-
-def _limit_mismatch(context: _SemanticContext) -> CheckResult | None:
-    expected = tuple(
-        item
-        for item in context.query_spec.semantic_items
-        if (
-            is_binding_free_structural_limit(item)
-            and type(item.literal_or_reference) is int
-            and item.literal_or_reference > 0
-        )
-    )
-    if not expected:
-        return None
-    root_scopes = {
-        scope.scope_id
-        for scope in context.check_input.parsed_ast.scopes
-        if scope.parent_scope_id is None and scope.query_role.value == "root"
-    }
-    actual = tuple(
-        limit
-        for limit in context.check_input.parsed_ast.limits
-        if limit.scope_id in root_scopes
-    )
-    if (
-        len(expected) == 1
-        and len(actual) == 1
-        and type(expected[0].literal_or_reference) is int
-        and actual[0].count == expected[0].literal_or_reference
-    ):
-        return None
-    return _failure(
-        context,
-        CheckFailureCode.LIMIT_MISMATCH,
-        sources=tuple(item.source_id for item in expected),
-        nodes=tuple(item.node_id for item in actual),
     )
 
 

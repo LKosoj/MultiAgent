@@ -14,16 +14,18 @@ import pytest
 from custom_tools.text_to_sql.adaptive.models import (
     CheckFailureCode,
     CheckKind,
-    CheckStatus,
     ColumnRef,
     EvidenceCost,
     EvidenceSourceKind,
-    ExpectedResultShape,
+    PhysicalColumnBinding,
+    PredicateOperator,
+    PredicateRef,
     ResearchState,
     ResearchAction,
     ResearchActionKind,
     ResearchReentryStatus,
     ResearchStopReason,
+    SemanticItemKind,
     ResultExpectation,
     ResultExpectationKind,
     SolverActionKind,
@@ -49,13 +51,12 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
     SolverSqlProposalReplayInput,
 )
 from custom_tools.text_to_sql.adaptive.freshness import (
-    DocumentSourceAvailability,
-    DocumentSourceState,
     FreshnessContext,
 )
 from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     load_schema_research_agent_profile,
 )
+from custom_tools.text_to_sql.adaptive.schema_probes import SchemaEvidenceDocument
 from custom_tools.text_to_sql.adaptive.policy import (
     canonical_action_digest,
     reconcile_probe_cost,
@@ -87,14 +88,12 @@ from custom_tools.text_to_sql.adaptive.solver_protocol import (
 from custom_tools.text_to_sql.adaptive.solver_results import (
     append_solver_check_result,
 )
+from custom_tools.text_to_sql.adaptive.sql_ast import SqlAstError, SqlAstErrorCode
 from test_text_to_sql_solver_runner import (
     _check,
     _passed_through,
-    _replace_schema,
     _runtime,
 )
-from tests.test_text_to_sql_derived_expression_semantics import _derived_case
-from tests.text_to_sql_semantic_coverage_helpers import SCHEMA
 from test_text_to_sql_adaptive_solver_reentry_runtime import (
     _one_remaining_reentry_case,
     _seed_honest_v2_research_history,
@@ -132,6 +131,7 @@ from workflow.adaptive_solver_checkpoint import (
 from workflow.deadline import DeadlineBudget
 from workflow.text_to_sql_adaptive_solver import (
     _reservation_authority,
+    _solver_context,
     _state_after_known_finalizer,
     reconcile_known_finalizer,
     reconcile_pending_finalizer_unknown,
@@ -149,6 +149,50 @@ def _ready_state():
         CheckKind.SEMANTIC,
         CheckKind.EXPLAIN,
     )
+
+
+def test_solver_context_includes_trusted_document_content() -> None:
+    state, research, requirements, _ = _runtime()
+    document = SchemaEvidenceDocument(
+        document_id="document-formula",
+        namespace="main",
+        schema_namespace_version=research.schema_namespace_version,
+        source_version="sha256:document-formula",
+        title="Metric definition",
+        content="required metric = SUM(value) / COUNT(record_id)",
+        target=None,
+    )
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=16_000)
+        ),
+        document_snapshot=(document,),
+    )
+
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["trusted_documents"] == [
+        {
+            "content": document.content,
+            "document_id": document.document_id,
+        }
+    ]
+
+
+def test_solver_context_includes_row_preservation_requirements() -> None:
+    state, _, requirements, _ = _runtime()
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=16_000)
+        ),
+        document_snapshot=(),
+    )
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["coverage_requirements"]["row_preservation_requirements"] == [
+        item.model_dump(mode="json")
+        for item in requirements.row_preservation_requirements
+    ]
 
 
 def _reservation(store, state):
@@ -255,6 +299,7 @@ def _persisted_result_contradiction_checkpoint(
     result_review_verdict: str = "contradicted",
     deterministic_failure_code: CheckFailureCode | None = None,
     repair_kind: str | None = None,
+    predicate_authority: PredicateRef | None = None,
 ):
     _, research, _, _ = _runtime()
     evidence = next(
@@ -268,13 +313,60 @@ def _persisted_result_contradiction_checkpoint(
         kind=ResultExpectationKind.FILTER_MATCH_ABSENT,
         column=evidence.target,
     )
-    research = research.model_copy(
-        update={
-            "result_expectations": (expectation,)
-            if include_exact_expectation
-            else (),
-        }
-    )
+    if predicate_authority is not None:
+        selected = next(
+            binding
+            for binding in research.bindings
+            if binding.source_id == expectation.source_id
+        )
+        physical = PhysicalColumnBinding(
+            binding_id="physical-status",
+            source_id=selected.source_id,
+            tables=selected.tables,
+            columns=selected.columns,
+            predicates=(),
+            join_path=selected.join_path,
+            evidence_ids=selected.evidence_ids,
+            confidence=selected.confidence,
+            status=selected.status,
+            validator_rule=selected.validator_rule,
+            physical_column=predicate_authority.left,
+        )
+        query_spec = research.query_spec.model_copy(
+            update={
+                "semantic_items": tuple(
+                    item.model_copy(
+                        update={
+                            "kind": SemanticItemKind.DIMENSION,
+                            "operator": None,
+                            "literal_or_reference": None,
+                            "binding_ids": (physical.binding_id,),
+                        }
+                    )
+                    if item.source_id == expectation.source_id
+                    else item
+                    for item in research.query_spec.semantic_items
+                )
+            }
+        )
+        research = ResearchState.model_validate(
+            {
+                **research.model_dump(mode="python"),
+                "query_spec": query_spec,
+                "bindings": (physical,),
+                "result_expectations": (expectation,)
+                if include_exact_expectation
+                else (),
+            }
+        )
+    else:
+        research = research.model_copy(
+            update={
+                "result_expectations": (expectation,)
+                if include_exact_expectation
+                else (),
+            }
+        )
     runtime, store = _generation_runtime(tmp_path, research_state=research)
     runtime.verified_research_state = research
     requirements = validate_coverage_inputs(
@@ -374,6 +466,7 @@ def _persisted_result_contradiction_checkpoint(
             execution=_successful_terminal(state)["execution"],
             deterministic_failure_code=deterministic_failure_code,
             repair_kind=repair_kind,
+            predicate_authority=predicate_authority,
         )
     replay = store.load_transition_replay_input(
         research.run_id,
@@ -774,6 +867,59 @@ def test_semantic_binding_mismatch_persists_exact_selected_binding_for_research(
     assert request.repair_binding_id == selected[0].binding_id
 
 
+def test_result_review_predicate_authority_routes_exact_value_search_reentry(
+    tmp_path,
+) -> None:
+    _, research, _, _ = _runtime()
+    evidence = next(
+        item for item in research.evidence if item.evidence_id == "evidence-status-value"
+    )
+    predicate = PredicateRef(
+        left=evidence.target,
+        operator=PredicateOperator.EQ,
+        right="active",
+    )
+    (
+        runtime,
+        store,
+        checkpoint,
+        research,
+        requirements,
+        _,
+        _,
+        _,
+    ) = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="verify the exact status value",
+        predicate_authority=predicate,
+    )
+    from workflow.text_to_sql_adaptive_solver import (
+        _commit_result_contradiction_missing_evidence,
+    )
+
+    _commit_result_contradiction_missing_evidence(
+        runtime,
+        store,
+        checkpoint,
+        research,
+        requirements,
+        table_namespace="main",
+    )
+
+    committed = store.load(research.run_id, research.run_incarnation)
+    assert committed is not None
+    request = committed.state.missing_evidence_requests[-1]
+    assert request.required_evidence_kind is EvidenceSourceKind.VALUE_SEARCH
+    assert request.predicate_authority == predicate
+    replay = store.load_transition_replay_input(
+        research.run_id,
+        research.run_incarnation,
+        committed.cursor.next_action_revision - 1,
+    )
+    assert type(replay) is SolverMissingEvidenceReplayInput
+    assert replay.proposal.proposal.predicate_authority == predicate
+
+
 def test_result_contradiction_missing_evidence_ids_are_stable_on_resume(
     tmp_path,
 ) -> None:
@@ -869,16 +1015,18 @@ def test_result_contradiction_rejects_invalid_receipt_before_missing_evidence(
 
 
 @pytest.mark.parametrize(
-    ("result_review_reason", "result_review_verdict"),
+    ("result_review_reason", "result_review_verdict", "repair_kind"),
     (
-        (None, "contradicted"),
-        (
-            "The returned rows do not establish the requested entity-time computation.",
-            "contradicted",
-        ),
+        (None, "contradicted", None),
         (
             "The returned rows do not establish the requested entity-time computation.",
             "ambiguous",
+            None,
+        ),
+        (
+            "The selected binding contradicts the requested semantic attribute.",
+            "contradicted",
+            "semantic_binding_mismatch",
         ),
     ),
 )
@@ -887,6 +1035,7 @@ def test_resume_result_contradiction_commits_missing_evidence_before_reentry(
     tmp_path,
     result_review_reason,
     result_review_verdict,
+    repair_kind,
 ) -> None:
     import workflow.text_to_sql_adaptive_solver as coordinator
 
@@ -903,6 +1052,7 @@ def test_resume_result_contradiction_commits_missing_evidence_before_reentry(
         tmp_path,
         result_review_reason=result_review_reason,
         result_review_verdict=result_review_verdict,
+        repair_kind=repair_kind,
     )
     expected_request_id, expected_action_id = _result_contradiction_ids(
         receipt,
@@ -986,6 +1136,83 @@ def test_resume_result_contradiction_commits_missing_evidence_before_reentry(
         }
 
 
+def test_reentry_admission_replays_durable_snapshot_after_budget_projection(
+    tmp_path,
+) -> None:
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store, checkpoint, research, requirements, *_ = (
+        _persisted_result_contradiction_checkpoint(tmp_path)
+    )
+    checkpoint = coordinator._commit_result_contradiction_missing_evidence(
+        runtime,
+        store,
+        checkpoint,
+        research,
+        requirements,
+        table_namespace="main",
+    )
+    budget = research.budget_state.model_copy(
+        update={
+            "used_model_calls": research.budget_state.used_model_calls + 1,
+            "remaining_model_calls": research.budget_state.remaining_model_calls - 1,
+            "used_model_tokens": research.budget_state.used_model_tokens + 1,
+            "remaining_model_tokens": research.budget_state.remaining_model_tokens - 1,
+        }
+    )
+    projected = research.model_copy(update={"budget_state": budget})
+    calls = {"admission": 0}
+
+    async def reenter(
+        solver_state,
+        research_state,
+        request_id,
+        *,
+        commit_solver_admission,
+        id_factory,
+        **_kwargs,
+    ):
+        admitted = admit_targeted_reentry(
+            solver_state,
+            research_state,
+            request_id,
+            base_revision=solver_state.revision,
+            id_factory=id_factory,
+        )
+        committed = commit_solver_admission(admitted)
+        calls["admission"] += 1
+        finalized = finalize_targeted_reentry(
+            committed,
+            admitted.record.research_reentry_id,
+            ResearchReentryStatus.PROTOCOL_FAILURE,
+            base_revision=committed.revision,
+        )
+        return SimpleNamespace(
+            solver_state=finalized.state,
+            research_state=research_state,
+            record=finalized.record,
+        )
+
+    asyncio.run(
+        coordinator._run_reentry(
+            runtime,
+            store,
+            checkpoint,
+            projected,
+            requirements,
+            _context(
+                run_id=projected.run_id,
+                incarnation=projected.run_incarnation,
+                schema=projected.schema_namespace_version,
+            ),
+            reenter,
+            iter(("result-contradiction-reentry-1",)).__next__,
+        )
+    )
+
+    assert calls == {"admission": 1}
+
+
 def test_resume_deterministic_result_shape_revises_sql_without_reentry(
     monkeypatch,
     tmp_path,
@@ -1028,6 +1255,75 @@ def test_resume_deterministic_result_shape_revises_sql_without_reentry(
 
     async def forbidden_resume(*_args, **_kwargs):
         raise AssertionError("deterministic SQL shape repair must call solver directly")
+
+    def stop_after_direct_commit(*_args, **_kwargs):
+        raise DirectRepairObserved()
+
+    monkeypatch.setattr(coordinator, "_resume_open_generation", forbidden_resume)
+    monkeypatch.setattr(coordinator, "_run_pre_execution", stop_after_direct_commit)
+
+    with pytest.raises(DirectRepairObserved):
+        asyncio.run(
+            run_adaptive_sql_generation(
+                runtime,
+                propose=propose,
+                safety_policy=object(),
+                row_limit=10,
+                dry_run_only=False,
+                table_namespace="main",
+                reenter=forbidden_reenter,
+            )
+        )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert calls == {"propose": 1, "reenter": 0}
+    assert checkpoint is not None
+    assert checkpoint.state.missing_evidence_requests == ()
+    assert len(checkpoint.state.sql_candidates) == 2
+
+
+def test_resume_proven_result_review_contradiction_revises_sql_without_reentry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    (
+        runtime,
+        store,
+        _,
+        _,
+        _,
+        receipt,
+        _,
+        _,
+    ) = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="the SQL adds an undocumented intermediate aggregation",
+        result_review_verdict="contradicted",
+    )
+    calls = {"propose": 0, "reenter": 0}
+
+    class DirectRepairObserved(BaseException):
+        pass
+
+    async def propose(_state, _requirements, repair_receipt):
+        calls["propose"] += 1
+        assert repair_receipt == receipt
+        return SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql="SELECT MAX(o.amount) FROM orders o",
+            ),
+        )
+
+    async def forbidden_reenter(*_args, **_kwargs):
+        calls["reenter"] += 1
+        raise AssertionError("proven SQL contradiction must not research")
+
+    async def forbidden_resume(*_args, **_kwargs):
+        raise AssertionError("proven SQL contradiction must call solver directly")
 
     def stop_after_direct_commit(*_args, **_kwargs):
         raise DirectRepairObserved()
@@ -1957,6 +2253,7 @@ def test_restart_settles_exact_started_reentry_model_before_protocol_terminal(
     context = _research_context(
         request,
         _trusted_targets(request.source_id, research, requirements),
+        research,
     )
     profile = load_schema_research_agent_profile()
     limits = runtime.verified_research_policy.model_budget
@@ -3271,6 +3568,252 @@ def test_malformed_solver_proposal_is_protocol_failure(tmp_path) -> None:
     assert checkpoint.state.stop_reason is SolverStopReason.PROTOCOL_FAILURE
 
 
+def test_unparseable_sql_proposal_is_returned_for_bounded_repair(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store = _generation_runtime(tmp_path)
+    feedbacks = []
+
+    class RepairedCandidateCommitted(BaseException):
+        pass
+
+    async def propose(_state, _requirements, feedback=None):
+        feedbacks.append(feedback)
+        sql = (
+            "SELECT o.status FROM orders o WHERE o.status = 'active'"
+            if feedback is not None
+            else "SELECT 'Women's Soccer'"
+        )
+        return SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql=sql,
+            ),
+        )
+
+    def stop_after_repaired_commit(*_args, **_kwargs):
+        raise RepairedCandidateCommitted()
+
+    monkeypatch.setattr(coordinator, "_run_pre_execution", stop_after_repaired_commit)
+
+    with pytest.raises(RepairedCandidateCommitted):
+        asyncio.run(
+            run_adaptive_sql_generation(
+                runtime,
+                propose=propose,
+                safety_policy=object(),
+                row_limit=10,
+                dry_run_only=False,
+                table_namespace="main",
+            )
+        )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert feedbacks == [
+        None,
+        {
+            "failure_code": "SQL_PARSE_REJECTED",
+            "reason": "SQL parser rejected the prior candidate",
+            "rejected_sql": "SELECT 'Women's Soccer'",
+        },
+    ]
+    assert checkpoint is not None
+    assert len(checkpoint.state.sql_candidates) == 1
+    assert checkpoint.state.stop_reason is None
+
+
+def test_sql_parser_timeout_remains_tool_failure(monkeypatch, tmp_path) -> None:
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store = _generation_runtime(tmp_path)
+    proposal_calls = 0
+
+    async def propose(*_args):
+        nonlocal proposal_calls
+        proposal_calls += 1
+        return SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql="SELECT o.status FROM orders o",
+            ),
+        )
+
+    def parser_timeout(*_args, **_kwargs):
+        raise SqlAstError(
+            SqlAstErrorCode.PARSE_TIMEOUT,
+            "SQL parsing exceeded its wall-time budget",
+        )
+
+    monkeypatch.setattr(coordinator, "apply_solver_proposal", parser_timeout)
+
+    output = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+        )
+    )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert proposal_calls == 1
+    assert output == {
+        "sql": "",
+        "description": "Adaptive solver stopped: RESEARCH_TOOL_FAILURE",
+    }
+    assert checkpoint is not None
+    assert checkpoint.state.stop_reason is SolverStopReason.TOOL_FAILURE
+
+
+def test_parse_retry_preserves_deterministic_result_shape_receipt(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    (
+        runtime,
+        store,
+        _,
+        _,
+        _,
+        receipt,
+        _,
+        _,
+    ) = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="an auxiliary output is not requested",
+        deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+    )
+    feedbacks = []
+
+    class RepairedCandidateCommitted(BaseException):
+        pass
+
+    async def propose(_state, _requirements, feedback):
+        feedbacks.append(feedback)
+        if len(feedbacks) == 1:
+            assert feedback == receipt
+            sql = "SELECT 'unclosed"
+        else:
+            assert feedback.repair_receipt == receipt
+            assert feedback.sql_parse_feedback == {
+                "failure_code": "SQL_PARSE_REJECTED",
+                "reason": "SQL parser rejected the prior candidate",
+                "rejected_sql": "SELECT 'unclosed",
+            }
+            sql = "SELECT o.status FROM orders o"
+        return SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql=sql,
+            ),
+        )
+
+    async def forbidden_resume(*_args, **_kwargs):
+        raise AssertionError("deterministic SQL shape repair must call solver directly")
+
+    def stop_after_repaired_commit(*_args, **_kwargs):
+        raise RepairedCandidateCommitted()
+
+    monkeypatch.setattr(coordinator, "_resume_open_generation", forbidden_resume)
+    monkeypatch.setattr(coordinator, "_run_pre_execution", stop_after_repaired_commit)
+
+    with pytest.raises(RepairedCandidateCommitted):
+        asyncio.run(
+            run_adaptive_sql_generation(
+                runtime,
+                propose=propose,
+                safety_policy=object(),
+                row_limit=10,
+                dry_run_only=False,
+                table_namespace="main",
+            )
+        )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert len(feedbacks) == 2
+    assert checkpoint is not None
+    assert len(checkpoint.state.sql_candidates) == 2
+    assert checkpoint.state.stop_reason is None
+
+
+def test_parse_retry_rejects_missing_evidence_during_result_shape_repair(
+    tmp_path,
+) -> None:
+    (
+        runtime,
+        store,
+        _,
+        _,
+        _,
+        receipt,
+        _,
+        _,
+    ) = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="an auxiliary output is not requested",
+        deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+    )
+    proposal_calls = 0
+    reentry_calls = 0
+
+    async def propose(_state, _requirements, _feedback):
+        nonlocal proposal_calls
+        proposal_calls += 1
+        proposal = (
+            SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql="SELECT 'unclosed",
+            )
+            if proposal_calls == 1
+            else MissingEvidenceProposal(
+                proposal_kind="missing_evidence",
+                source_id=receipt.source_id,
+                question="Which additional evidence is needed?",
+                required_evidence_kind=EvidenceSourceKind.SCHEMA,
+                reason="Requesting evidence is invalid during direct SQL repair",
+            )
+        )
+        return SolverProposalV1(proposal_version=1, proposal=proposal)
+
+    async def forbidden_reenter(*_args, **_kwargs):
+        nonlocal reentry_calls
+        reentry_calls += 1
+        raise AssertionError("deterministic SQL shape repair must not research")
+
+    output = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            reenter=forbidden_reenter,
+        )
+    )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert proposal_calls == 2
+    assert reentry_calls == 0
+    assert output == {
+        "sql": "",
+        "description": "Adaptive solver stopped: RESEARCH_PROTOCOL_FAILURE",
+    }
+    assert checkpoint is not None
+    assert checkpoint.state.missing_evidence_requests == ()
+    assert checkpoint.state.stop_reason is SolverStopReason.PROTOCOL_FAILURE
+
+
 def test_solver_runtime_error_is_tool_failure(tmp_path) -> None:
     runtime, store = _generation_runtime(tmp_path)
 
@@ -3346,6 +3889,77 @@ def test_missing_evidence_without_reentry_seals_and_replays(tmp_path) -> None:
         )
     )
     assert replay == first
+
+
+def test_solver_normalizes_unique_one_character_source_id_typo() -> None:
+    from workflow import text_to_sql_adaptive_solver as coordinator
+
+    state, _, _, _ = _runtime()
+    proposal = SolverProposalV1(
+        proposal_version=1,
+        proposal=MissingEvidenceProposal(
+            proposal_kind="missing_evidence",
+            source_id="statuX",
+            question="Which status evidence is authoritative?",
+            required_evidence_kind=EvidenceSourceKind.SCHEMA,
+            reason="One targeted observation is required",
+        ),
+    )
+
+    normalized = coordinator._normalize_solver_proposal_source_id(state, proposal)
+
+    assert normalized.proposal.source_id == "status"
+
+
+@pytest.mark.parametrize("source_id", ("statXX", "statusX"))
+def test_solver_does_not_normalize_distant_source_id(source_id) -> None:
+    from workflow import text_to_sql_adaptive_solver as coordinator
+
+    state, _, _, _ = _runtime()
+    proposal = SolverProposalV1(
+        proposal_version=1,
+        proposal=MissingEvidenceProposal(
+            proposal_kind="missing_evidence",
+            source_id=source_id,
+            question="Which status evidence is authoritative?",
+            required_evidence_kind=EvidenceSourceKind.SCHEMA,
+            reason="One targeted observation is required",
+        ),
+    )
+
+    normalized = coordinator._normalize_solver_proposal_source_id(state, proposal)
+
+    assert normalized is proposal
+
+
+def test_solver_does_not_normalize_ambiguous_source_id() -> None:
+    from workflow import text_to_sql_adaptive_solver as coordinator
+
+    state, _, _, _ = _runtime()
+    semantic_item = state.query_spec.semantic_items[0]
+    query_spec = state.query_spec.model_copy(
+        update={
+            "semantic_items": (
+                semantic_item,
+                semantic_item.model_copy(update={"source_id": "statuY"}),
+            )
+        }
+    )
+    state = state.model_copy(update={"query_spec": query_spec})
+    proposal = SolverProposalV1(
+        proposal_version=1,
+        proposal=MissingEvidenceProposal(
+            proposal_kind="missing_evidence",
+            source_id="statuX",
+            question="Which status evidence is authoritative?",
+            required_evidence_kind=EvidenceSourceKind.SCHEMA,
+            reason="One targeted observation is required",
+        ),
+    )
+
+    normalized = coordinator._normalize_solver_proposal_source_id(state, proposal)
+
+    assert normalized is proposal
 
 
 @pytest.mark.parametrize(
@@ -3546,6 +4160,7 @@ def test_reentry_admission_and_finalization_are_separate_durable_revisions(
 
 def test_reentry_failure_recovers_admitted_record_and_replays_terminal(
     tmp_path,
+    caplog,
 ) -> None:
     runtime, store = _generation_runtime(tmp_path)
 
@@ -3610,6 +4225,7 @@ def test_reentry_failure_recovers_admitted_record_and_replays_terminal(
         ResearchReentryStatus.PROTOCOL_FAILURE
     )
     assert calls == {"proposal": 1, "reentry": 1}
+    assert "external research boundary failed" in caplog.text
 
     async def forbidden(*_args, **_kwargs):
         raise AssertionError("sealed re-entry failure must replay exactly")

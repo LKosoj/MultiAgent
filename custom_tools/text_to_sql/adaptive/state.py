@@ -7,7 +7,7 @@ from typing import Iterable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
-from ._semantic_matching import predicate_matches
+from ._semantic_value_certificate import evidence_observes_exact_value
 from .evidence import evidence_source_kind_for_action
 from .models import (
     BindingBase,
@@ -15,11 +15,13 @@ from .models import (
     BudgetState,
     DiscriminatorValueBinding,
     EvidenceRecord,
+    EvidenceSourceKind,
     Hypothesis,
     HypothesisStatus,
     JoinCandidate,
     JoinCandidateStatus,
-    PredicateRef,
+    PhysicalColumnBinding,
+    PredicateOperator,
     ResearchAction,
     ResearchState,
     ResultExpectation,
@@ -182,6 +184,7 @@ def apply_research_transition(
     merged_bindings, added_bindings, updated_bindings = _merge_bindings(
         current.bindings,
         incoming_bindings,
+        new_evidence,
     )
     incoming_joins = _validated_unique(
         join_candidates,
@@ -486,6 +489,7 @@ def _merge_hypotheses(
 def _merge_bindings(
     existing: tuple[BindingBase, ...],
     incoming: tuple[BindingBase, ...],
+    new_evidence: tuple[EvidenceRecord, ...] = (),
 ) -> tuple[tuple[BindingBase, ...], tuple[str, ...], tuple[str, ...]]:
     by_id = {item.binding_id: item for item in existing}
     replacements: dict[str, BindingBase] = {}
@@ -501,15 +505,65 @@ def _merge_bindings(
             replacements[item.binding_id] = item
             added.append(item.binding_id)
             continue
-        if type(previous) is not type(item):
+        if type(previous) is not type(item) and not _is_exact_value_reentry_upgrade(
+            previous,
+            item,
+            new_evidence,
+        ):
             raise ResearchTransitionConflictError("binding kind is immutable")
-        _validate_binding_update(previous, item)
+        if type(previous) is type(item):
+            _validate_binding_update(previous, item)
         replacements[item.binding_id] = item
         if item != previous:
             updated.append(item.binding_id)
     merged = tuple(replacements.get(item.binding_id, item) for item in existing)
     merged += tuple(replacements[item_id] for item_id in added)
     return merged, tuple(added), tuple(updated)
+
+
+def _is_exact_value_reentry_upgrade(
+    previous: BindingBase,
+    replacement: BindingBase,
+    new_evidence: tuple[EvidenceRecord, ...],
+) -> bool:
+    predicate = (
+        replacement.discriminator_predicate
+        if isinstance(replacement, DiscriminatorValueBinding)
+        else None
+    )
+    exact_value = (
+        None
+        if predicate is None or predicate.operator is PredicateOperator.IS_NULL
+        else predicate.right
+    )
+    return (
+        isinstance(previous, PhysicalColumnBinding)
+        and isinstance(replacement, DiscriminatorValueBinding)
+        and previous.source_id == replacement.source_id
+        and previous.tables == replacement.tables
+        and previous.columns == replacement.columns
+        and previous.join_path == replacement.join_path
+        and previous.confidence == replacement.confidence
+        and previous.status is BindingStatus.SUPPORTED
+        and replacement.status is BindingStatus.SUPPORTED
+        and replacement.validator_rule
+        == "semantic-certificate:v1:discriminator_value"
+        and replacement.discriminator_column == previous.physical_column
+        and replacement.predicates == (replacement.discriminator_predicate,)
+        and replacement.discriminator_predicate.left == previous.physical_column
+        and replacement.discriminator_predicate.operator
+        in {PredicateOperator.EQ, PredicateOperator.IS_NULL}
+        and replacement.evidence_ids[:-1] == previous.evidence_ids
+        and len(replacement.evidence_ids) == len(previous.evidence_ids) + 1
+        and len(new_evidence) == 1
+        and new_evidence[0].evidence_id == replacement.evidence_ids[-1]
+        and new_evidence[0].source_kind is EvidenceSourceKind.VALUE_SEARCH
+        and evidence_observes_exact_value(
+            new_evidence[0],
+            previous.physical_column,
+            exact_value,
+        )
+    )
 
 
 def _validate_new_predicate_bindings(
@@ -534,40 +588,37 @@ def _validate_new_predicate_bindings(
             and binding.predicates[0] == binding.discriminator_predicate
             and binding.discriminator_predicate.left == binding.discriminator_column
         )
-        exact_query_match = False
-        if item.exact_physical_predicate and item.operator is not None:
-            try:
-                required_predicate = PredicateRef(
-                    left=binding.discriminator_column,
-                    operator=item.operator,
-                    right=item.literal_or_reference,
-                )
-            except (TypeError, ValueError):
-                pass
-            else:
-                exact_query_match = len(binding.predicates) == 1 and predicate_matches(
-                    required_predicate,
-                    binding.discriminator_predicate,
-                )
-        filter_matches_query = (
-            item.kind is SemanticItemKind.FILTER
-            and len(binding.predicates) == 1
-            and item.operator is not None
-            and binding.discriminator_predicate.operator is item.operator
-            and (not item.exact_physical_predicate or exact_query_match)
-        )
-        time_has_physical_predicates = (
-            item.kind is SemanticItemKind.TIME
-            and item.operator is not None
-            and bool(binding.predicates)
-            and (not item.exact_physical_predicate or exact_query_match)
-        )
-        if not primary_matches_column or not (
-            filter_matches_query or time_has_physical_predicates
-        ):
+        if not primary_matches_column:
             raise ResearchTransitionProtocolError(
-                "new discriminator binding must match the required operator and column"
+                "new discriminator binding must use its declared discriminator column"
             )
+        if item.kind is SemanticItemKind.FILTER and item.operator is None:
+            if binding.predicates != (binding.discriminator_predicate,):
+                raise ResearchTransitionProtocolError(
+                    "FILTER discriminator refinement requires exactly one predicate"
+                )
+            physical = tuple(
+                candidate
+                for candidate in existing
+                if isinstance(candidate, PhysicalColumnBinding)
+                and candidate.source_id == binding.source_id
+                and candidate.status is BindingStatus.SUPPORTED
+                and candidate.physical_column == binding.discriminator_column
+                and candidate.tables == binding.tables
+                and candidate.join_path == binding.join_path
+            )
+            if len(physical) != 1:
+                raise ResearchTransitionProtocolError(
+                    "FILTER discriminator refinement requires one supported physical binding"
+                )
+            if binding.discriminator_predicate.operator not in {
+                PredicateOperator.EQ,
+                PredicateOperator.IN,
+                PredicateOperator.IS_NULL,
+            }:
+                raise ResearchTransitionProtocolError(
+                    "FILTER discriminator refinement requires a discrete operator"
+                )
 
 
 def _validate_binding_update(previous: BindingBase, replacement: BindingBase) -> None:

@@ -320,6 +320,7 @@ def _bytes_digest(raw: bytes) -> str:
 def _require_linked_semantic_journal(
     connection: sqlite3.Connection,
     previous: ResearchState,
+    successor: ResearchState,
     replay_input: ResearchSemanticReplayInput,
     admission: SemanticTurnAdmission,
 ) -> None:
@@ -333,6 +334,39 @@ def _require_linked_semantic_journal(
             """,
             (previous.run_id, previous.run_incarnation, previous.revision),
         ).fetchall()
+        current_by_phase = {row["phase"]: row for row in rows}
+        current_matches = len(rows) == 2 and all(
+            current_by_phase.get(phase) is not None
+            and current_by_phase[phase]["action_digest"] == expected_digest
+            for phase, expected_digest in (
+                ("planned", replay_input.planned_action_digest),
+                ("observed", replay_input.observed_action_digest),
+            )
+        )
+        terminal = None
+        if not current_matches:
+            terminal = connection.execute(
+                """
+                SELECT 1
+                FROM adaptive_checkpoint_events
+                WHERE run_id = ? AND run_incarnation = ?
+                  AND loop_kind = 'research'
+                  AND revision <= ? AND phase = 'terminal'
+                LIMIT 1
+                """,
+                (previous.run_id, previous.run_incarnation, previous.revision),
+            ).fetchone()
+        if terminal is not None:
+            rows = connection.execute(
+                """
+                SELECT phase, action_json, action_digest
+                FROM adaptive_checkpoint_events
+                WHERE run_id = ? AND run_incarnation = ?
+                  AND loop_kind = 'research' AND revision = ?
+                  AND phase IN ('planned', 'observed')
+                """,
+                (previous.run_id, previous.run_incarnation, successor.revision),
+            ).fetchall()
     except sqlite3.Error as exc:
         raise AdaptiveResearchStateStoreConflictError(
             "research semantic transition requires its durable journal"
@@ -608,6 +642,7 @@ class AdaptiveResearchStateStore:
             _require_linked_semantic_journal(
                 connection,
                 previous,
+                successor,
                 replay_input,
                 admission,
             )

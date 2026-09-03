@@ -2050,13 +2050,19 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             logger.error(
                 f"🚫 Agent '{step.agent_type}' unavailable due to circuit breaker"
             )
+            end_time = datetime.now()
             return StepResult(
                 step_id=step.id,
                 status=StepStatus.FAILED,
                 start_time=step_start_time,
-                end_time=datetime.now(),
+                end_time=end_time,
                 error=f"Agent {step.agent_type} circuit breaker is OPEN",
                 error_class="circuit_breaker_open",
+                # W0-0.3: заполняем и для этого короткого замыкания — иначе
+                # наблюдаемость дырявая именно там, где она нужнее всего.
+                resource_usage={
+                    "duration_seconds": (end_time - step_start_time).total_seconds()
+                },
             )
 
         # Проверяем зацикливание
@@ -2068,13 +2074,17 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 context.workflow_id, step.id
             )
             logger.error(f"🔄 Loop detected for step '{step.id}': {suggestion}")
+            end_time = datetime.now()
             return StepResult(
                 step_id=step.id,
                 status=StepStatus.FAILED,
                 start_time=step_start_time,
-                end_time=datetime.now(),
+                end_time=end_time,
                 error=f"Loop detected: {suggestion}",
                 error_class="loop_detected",
+                resource_usage={
+                    "duration_seconds": (end_time - step_start_time).total_seconds()
+                },
             )
 
         retry_context = {
@@ -2146,13 +2156,17 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             raise
         except Exception as e:
             logger.error(f"❌ Enhanced step execution failed: {e}")
+            end_time = datetime.now()
             return StepResult(
                 step_id=step.id,
                 status=StepStatus.FAILED,
                 start_time=step_start_time,
-                end_time=datetime.now(),
+                end_time=end_time,
                 error=str(e),
                 error_class="execution_error",
+                resource_usage={
+                    "duration_seconds": (end_time - step_start_time).total_seconds()
+                },
             )
 
     async def _execute_non_retryable_attempt(
@@ -2441,6 +2455,10 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 duration_seconds=duration,
                 attempt_number=attempt,
                 agent_name=step.agent_type,
+                # W0-0.3: duration дублируется здесь намеренно — generic-потребители
+                # (например workflow/intelligence/aggregator.py) читают метрики через
+                # resource_usage по path-маппингу, а не через top-level поля StepResult.
+                resource_usage={"duration_seconds": duration},
             )
 
             logger.info(f"✅ Step '{step.id}' completed in {duration:.1f}s")
@@ -2461,6 +2479,9 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 duration_seconds=duration,
                 attempt_number=attempt,
                 agent_name=step.agent_type,
+                # W0-0.3: см. комментарий в success-ветке выше — дублирование
+                # duration_seconds для generic path-маппинга через resource_usage.
+                resource_usage={"duration_seconds": duration},
             )
 
     def _apply_decision_modifications(

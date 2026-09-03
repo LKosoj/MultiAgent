@@ -5,17 +5,19 @@ import os
 import json
 import logging
 import tempfile
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, Any, Optional
+from .schema_memory import SemanticFact
 from .utils import (
     dsn_to_sanitized_name,
     get_runtime_context_dsn,
     get_schema_version,
     get_table_columns,
-    get_table_description,
     mask_dsn,
+    set_table_description,
 )
 from .schema_metadata import SchemaStatsHelper
 from .schema_namespace import (
@@ -33,6 +35,7 @@ class LoadedSchema:
     schema: Dict[str, Any]
     namespace: SchemaNamespace
     source: str
+    semantic_facts: tuple[SemanticFact, ...] = ()
 
 
 class SchemaLoader:
@@ -67,19 +70,31 @@ class SchemaLoader:
                 "Required live schema introspection is unavailable"
             ) from exc
 
+        editable_schema = self._load_sqlrag_schema(dsn)
+        merged_schema, semantic_facts = self._merge_editable_schema(
+            live_schema,
+            editable_schema,
+        )
+        editable_schema_digest = self._editable_schema_digest(editable_schema)
         namespace = SchemaNamespace(
             scope=scope,
             schema_fingerprint=live_fingerprint,
         )
         if scope.transient:
-            return LoadedSchema(live_schema, namespace, "live")
+            return LoadedSchema(merged_schema, namespace, "live", semantic_facts)
 
         snapshot = self.file_manager.load_scoped_snapshot(scope)
-        if self._snapshot_matches_live(snapshot, scope, live_fingerprint):
+        if self._snapshot_matches_live(
+            snapshot,
+            scope,
+            live_fingerprint,
+            editable_schema_digest,
+        ):
             return LoadedSchema(
                 snapshot["schema_info"],  # type: ignore[index]
                 namespace,
                 "validated_snapshot",
+                semantic_facts,
             )
 
         self.file_manager.save_scoped_snapshot(
@@ -89,16 +104,18 @@ class SchemaLoader:
                 "schema_scope": scope.to_mapping(),
                 "captured_at": datetime.now(timezone.utc).isoformat(),
                 "schema_fingerprint": live_fingerprint,
-                "schema_info": live_schema,
+                "editable_schema_digest": editable_schema_digest,
+                "schema_info": merged_schema,
             },
         )
-        return LoadedSchema(live_schema, namespace, "live")
+        return LoadedSchema(merged_schema, namespace, "live", semantic_facts)
 
     @staticmethod
     def _snapshot_matches_live(
         snapshot: Optional[Dict[str, Any]],
         scope: SchemaScope,
         live_fingerprint: str,
+        editable_schema_digest: str | None,
     ) -> bool:
         if not isinstance(snapshot, dict):
             return False
@@ -112,10 +129,110 @@ class SchemaLoader:
             return False
         if stored_fingerprint != live_fingerprint:
             return False
+        if snapshot.get("editable_schema_digest") != editable_schema_digest:
+            return False
         try:
             return canonical_schema_fingerprint(stored_schema) == live_fingerprint
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _editable_schema_digest(
+        schema_info: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    ) -> str | None:
+        if schema_info is None:
+            return None
+        payload = json.dumps(schema_info, ensure_ascii=False, sort_keys=True)
+        import hashlib
+
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _is_example_value(value: object) -> bool:
+        return value is None or (
+            isinstance(value, (str, int, bool))
+            or (isinstance(value, float) and math.isfinite(value))
+        )
+
+    def _merge_editable_schema(
+        self,
+        live_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        editable_schema: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+    ) -> tuple[Dict[str, Dict[str, Dict[str, Any]]], tuple[SemanticFact, ...]]:
+        """Apply file-owned descriptions/examples only to exact live objects."""
+        merged = json.loads(json.dumps(live_schema, ensure_ascii=False))
+        if editable_schema is None:
+            return merged, ()
+
+        facts: list[SemanticFact] = []
+        for table_fqn, editable_table in editable_schema.items():
+            live_table = merged.get(table_fqn)
+            if not isinstance(live_table, dict) or not isinstance(editable_table, dict):
+                continue
+            description = editable_table.get("description")
+            if isinstance(description, str) and description.strip():
+                value = description.strip()
+                set_table_description(live_table, value)
+                facts.append(
+                    SemanticFact(
+                        subject="table",
+                        table_fqn=table_fqn,
+                        fact_kind="description",
+                        value=value,
+                        source="file",
+                        status="approved",
+                    )
+                )
+            editable_columns = get_table_columns(editable_table)
+            live_columns = get_table_columns(live_table)
+            for column_name, editable_column in editable_columns.items():
+                live_column = live_columns.get(column_name)
+                if not isinstance(live_column, dict) or not isinstance(editable_column, dict):
+                    continue
+                column_description = editable_column.get("description")
+                if isinstance(column_description, str) and column_description.strip():
+                    value = column_description.strip()
+                    live_column["description"] = value
+                    facts.append(
+                        SemanticFact(
+                            subject="column",
+                            table_fqn=table_fqn,
+                            column=column_name,
+                            fact_kind="description",
+                            value=value,
+                            source="file",
+                            status="approved",
+                        )
+                    )
+                examples = editable_column.get("examples")
+                if not isinstance(examples, list):
+                    continue
+                example_values = [
+                    value for value in examples if self._is_example_value(value)
+                ]
+                if not example_values:
+                    continue
+                live_column["examples"] = example_values
+                facts.extend(
+                    SemanticFact(
+                        subject="column",
+                        table_fqn=table_fqn,
+                        column=column_name,
+                        fact_kind="example",
+                        value=value,
+                        source="file",
+                        status="approved",
+                    )
+                    for value in example_values
+                )
+        return merged, tuple(
+            sorted(
+                facts,
+                key=lambda fact: json.dumps(
+                    fact.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+                ),
+            )
+        )
     
     def get_database_schema(
         self,

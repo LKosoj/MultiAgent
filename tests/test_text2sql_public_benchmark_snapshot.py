@@ -211,6 +211,7 @@ def test_canonical_snapshot_allowlist_is_minimal_and_exact() -> None:
     assert "custom_tools/sql_tools.py" in paths
     assert "custom_tools/text_to_sql" in paths
     assert "html_utils.py" in paths
+    assert "llm_call_context.py" in paths
     assert "workflow_pipelines/text_to_sql_pipeline.yaml" in paths
     assert "config/pii/categories.yaml" in paths
     assert "test_agent.py" not in paths

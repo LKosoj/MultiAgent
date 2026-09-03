@@ -2184,7 +2184,10 @@ def test_search_value_exact_match_is_never_truncated(
             lambda: search_value(value=value, target=target, top_k=1, runtime=runtime, budget=budget)
         )
 
-        assert read_probe_payload(result)["rows"] == [expected_row]
+        payload = read_probe_payload(result)
+        assert payload["rows"] == [expected_row]
+        assert payload["requested_value"] == value
+        assert type(payload["requested_value"]) is type(value)
         assert result.truncated is False
     finally:
         ledger.close()

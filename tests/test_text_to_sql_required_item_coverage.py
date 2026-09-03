@@ -146,7 +146,7 @@ def test_coverage_annotates_only_authorized_ast_locations() -> None:
     assert predicate.source_ids == ("status",)
 
 
-def test_positive_integer_limit_needs_no_binding_but_sql_value_stays_exact() -> None:
+def test_positive_integer_limit_is_solver_guidance_not_semantic_authority() -> None:
     base = build_case(
         "SELECT 1 LIMIT 1",
         (
@@ -201,7 +201,7 @@ def test_positive_integer_limit_needs_no_binding_but_sql_value_stays_exact() -> 
         )
 
     assert check("SELECT 1 LIMIT 1").status is CheckStatus.PASSED
-    assert check("SELECT 1 LIMIT 5").failure_code is CheckFailureCode.LIMIT_MISMATCH
+    assert check("SELECT 1 LIMIT 5").status is CheckStatus.PASSED
 
 
 def test_overlay_authentication_does_not_rederive_coverage(

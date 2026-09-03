@@ -11,6 +11,7 @@ DatabaseHandler отвечает за:
 
 import atexit
 import gc
+import math
 import sqlite3
 import threading
 import warnings
@@ -18,9 +19,10 @@ import os
 import logging
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from numbers import Real
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 warnings.filterwarnings(
     "ignore",
@@ -30,6 +32,7 @@ warnings.filterwarnings(
 
 logger = logging.getLogger(__name__)
 MEMORY_DB_SCHEMA_VERSION = 1
+_GATEWAY_EMBEDDING_SELECTOR = "llmgateway/embedding"
 
 
 class VectorReadiness(str, Enum):
@@ -71,6 +74,52 @@ def _embedding_dimension(model) -> int | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+class _GatewayEmbeddingAdapter:
+    """Minimal ``encode`` adapter for the existing OpenAI-compatible gateway."""
+
+    def __init__(self, *, base_url: str, api_key: str) -> None:
+        if not base_url or not api_key:
+            raise ValueError("OPENAI_API_BASE_DB and OPENAI_API_KEY_DB are required")
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=30.0)
+        self.model_name = _GATEWAY_EMBEDDING_SELECTOR
+        self.embedding_dimension: int | None = None
+
+    def encode(self, text: str, *, convert_to_tensor: bool = False) -> list[float]:
+        del convert_to_tensor
+        response = self._client.embeddings.create(
+            model=_GATEWAY_EMBEDDING_SELECTOR,
+            input=text,
+            encoding_format="float",
+        )
+        data = getattr(response, "data", None)
+        model_name = getattr(response, "model", None)
+        if (
+            not isinstance(data, list)
+            or len(data) != 1
+            or not isinstance(model_name, str)
+            or not model_name.strip()
+        ):
+            raise ValueError("gateway embedding response is incomplete")
+        embedding = getattr(data[0], "embedding", None)
+        if (
+            not isinstance(embedding, list)
+            or not embedding
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, Real)
+                or not math.isfinite(value)
+                for value in embedding
+            )
+        ):
+            raise ValueError("gateway embedding response has no vector")
+        self.model_name = model_name.strip()
+        self.embedding_dimension = len(embedding)
+        return embedding
+
+    def get_embedding_dimension(self) -> int | None:
+        return self.embedding_dimension
 
 
 def _deduplicate_active_agent_memory(cursor: sqlite3.Cursor) -> None:
@@ -163,14 +212,12 @@ class DatabaseHandler:
         self,
         db_path: str = "memory/smolagents_memory.db",
         chroma_path: str = "memory/chromadb",
-        embedding_model: str = "intfloat/multilingual-e5-base",
     ):
         """Инициализация обработчика БД
 
         Args:
             db_path: Путь к файлу базы данных SQLite
             chroma_path: Путь к директории ChromaDB
-            embedding_model: Модель для создания эмбеддингов
         """
         self.db_path = db_path
         self.chroma_path = chroma_path
@@ -194,7 +241,7 @@ class DatabaseHandler:
             self.tactical_collection = None
             self.set_vector_readiness(VectorReadiness.DISABLED, "disabled_by_config")
         else:
-            self._init_chroma(embedding_model)
+            self._init_chroma()
 
     def set_vector_readiness(
         self,
@@ -325,25 +372,21 @@ class DatabaseHandler:
         finally:
             conn.close()
 
-    def _init_chroma(self, embedding_model: str):
-        """Инициализация ChromaDB и модели эмбеддингов"""
+    def _init_chroma(self):
+        """Инициализация ChromaDB и gateway-эмбеддера."""
         try:
-            # Создаем модель эмбеддингов
-            print(f"Загружаем модель эмбеддингов: {embedding_model}")
-            # Сначала пробуем загрузить из локального кэша
-            try:
-                self.embedding_model = SentenceTransformer(
-                    embedding_model, local_files_only=True
-                )
-                print("✅ Модель загружена из локального кэша")
-            except Exception:
-                # Если модели нет локально, загружаем из интернета
-                print("⚠️ Модель не найдена локально, загружаем из HuggingFace...")
-                self.embedding_model = SentenceTransformer(embedding_model)
-            # Сохраняем читаемое имя модели для UI
-            self.embedding_model_name = embedding_model
+            self.embedding_model = _GatewayEmbeddingAdapter(
+                base_url=(os.getenv("OPENAI_API_BASE_DB") or "").strip(),
+                api_key=(os.getenv("OPENAI_API_KEY_DB") or "").strip(),
+            )
+            self.embedding_model.encode("schema memory readiness")
+            self.embedding_model_name = self.embedding_model.model_name
             self.embedding_dimension = _embedding_dimension(self.embedding_model)
             self.embedding_metadata_mismatch = False
+            print(
+                "Embedding gateway initialized: "
+                f"model={self.embedding_model_name}, dimension={self.embedding_dimension}"
+            )
 
             # Создаем клиент ChromaDB с отключенной телеметрией
             from chromadb.config import Settings

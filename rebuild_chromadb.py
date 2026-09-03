@@ -3,19 +3,17 @@
 Скрипт для пересоздания векторной базы данных ChromaDB из SQLite
 
 Использование:
-    python rebuild_chromadb.py [--force] [--db-path PATH] [--chroma-path PATH] [--model MODEL]
+    python rebuild_chromadb.py [--force] [--db-path PATH] [--chroma-path PATH]
 
 Параметры:
     --force           Принудительно пересоздать ChromaDB (по умолчанию)
     --db-path         Путь к SQLite базе данных (по умолчанию: smolagents_memory.db)
     --chroma-path     Путь к директории ChromaDB (по умолчанию: smolagents_chroma_db)
-    --model           Модель эмбеддингов (по умолчанию: all-MiniLM-L6-v2)
     --help, -h        Показать справку
 
 Примеры:
     python rebuild_chromadb.py
     python rebuild_chromadb.py --db-path custom_memory.db
-    python rebuild_chromadb.py --model sentence-transformers/all-mpnet-base-v2
 """
 
 import argparse
@@ -50,12 +48,6 @@ def main():
     )
     
     parser.add_argument(
-        "--model",
-        default="all-MiniLM-L6-v2", 
-        help="Модель эмбеддингов (по умолчанию: all-MiniLM-L6-v2)"
-    )
-    
-    parser.add_argument(
         "--stats-only",
         action="store_true",
         help="Только показать статистику, не пересоздавать"
@@ -72,14 +64,13 @@ def main():
     print("🚀 Запуск пересоздания ChromaDB...")
     print(f"📁 SQLite база: {args.db_path}")
     print(f"📁 ChromaDB директория: {args.chroma_path}")
-    print(f"🤖 Модель эмбеддингов: {args.model}")
+    print("🤖 Embedding gateway: llmgateway/embedding")
     print()
     
     try:
         # Импортируем после проверок, чтобы избежать долгой загрузки при ошибках
         from memory.database import DatabaseHandler
-        from memory.manager import MemoryManager
-        from memory.rebuild import rebuild_chromadb_tool
+        from memory.rebuild import RebuildStatus, rebuild_chromadb_from_sqlite
         
         if args.stats_only:
             # Показываем только статистику без пересоздания
@@ -87,9 +78,7 @@ def main():
             db_handler = DatabaseHandler(
                 db_path=args.db_path,
                 chroma_path=args.chroma_path,
-                embedding_model=args.model
             )
-            manager = MemoryManager(database_handler=db_handler)
             
             # Статистика SQLite
             import sqlite3
@@ -105,8 +94,16 @@ def main():
             conn.close()
             
             # Статистика ChromaDB
-            tactical_chroma = manager.tactical_collection.count() if manager.tactical_collection else 0
-            strategic_chroma = manager.strategic_collection.count() if manager.strategic_collection else 0
+            tactical_chroma = (
+                db_handler.tactical_collection.count()
+                if db_handler.tactical_collection
+                else 0
+            )
+            strategic_chroma = (
+                db_handler.strategic_collection.count()
+                if db_handler.strategic_collection
+                else 0
+            )
             
             print(f"📋 Тактическая память:")
             print(f"   SQLite: {tactical_sqlite} записей")
@@ -119,25 +116,14 @@ def main():
             print(f"   Синхронизация: {'✅' if strategic_sqlite == strategic_chroma else '❌'}")
             
         else:
-            # Пересоздаем ChromaDB
-            if args.force:
-                # Используем force_rebuild параметр
-                db_handler = DatabaseHandler(
-                    db_path=args.db_path,
-                    chroma_path=args.chroma_path,
-                    embedding_model=args.model
-                )
-                manager = MemoryManager(database_handler=db_handler, force_rebuild=True)
-            else:
-                # Используем функцию rebuild_chromadb_tool
-                db_handler = DatabaseHandler(
-                    db_path=args.db_path,
-                    chroma_path=args.chroma_path,
-                    embedding_model=args.model
-                )
-                manager = MemoryManager(database_handler=db_handler, force_rebuild=False)
-                result = rebuild_chromadb_tool()
-                print(result)
+            db_handler = DatabaseHandler(
+                db_path=args.db_path,
+                chroma_path=args.chroma_path,
+            )
+            result = rebuild_chromadb_from_sqlite(db_handler=db_handler)
+            print(result)
+            if result.status is not RebuildStatus.COMPLETE:
+                sys.exit(1)
     
     except KeyboardInterrupt:
         print("\n🛑 Операция прервана пользователем")
@@ -149,4 +135,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()

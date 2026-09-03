@@ -2595,7 +2595,8 @@ def test_core_code_formatter_uses_runtime_dsn_for_quoted_keyword_identifiers(mon
 # === EPIC 1.9: sql_safety_check fail-fast при LLM-сбое ===
 
 
-def test_sql_safety_check_llm_failure_sets_failed_status(monkeypatch):
+def test_sql_safety_check_llm_failure_keeps_static_safe_result(monkeypatch):
+    """W0-0.5: runtime-сбой LLM-аудита fail-open — static-safe результат сохраняется."""
     def boom(**kwargs):
         raise RuntimeError("boom")
 
@@ -2603,11 +2604,17 @@ def test_sql_safety_check_llm_failure_sets_failed_status(monkeypatch):
 
     result = sql_tools.sql_safety_check("SELECT 1")
 
-    assert result["safety_status"] == "failed"
+    assert result["safety_status"] == "safe"
     assert result["llm_audit"] == "failed"
-    assert result["is_safe"] is False
-    issue_types = {issue.get("issue_type") for issue in result.get("issues", [])}
-    assert "LLM_AUDIT_FAILED" in issue_types
+    assert result["is_safe"] is True
+    advisory_issue_types = {issue.get("issue_type") for issue in result.get("advisory_issues", [])}
+    assert "LLM_AUDIT_FAILED" in advisory_issue_types
+    advisory_failed = [
+        issue for issue in result.get("advisory_issues", [])
+        if issue.get("issue_type") == "LLM_AUDIT_FAILED"
+    ]
+    assert advisory_failed[0]["blocking"] is False
+    assert result.get("issues", []) == []
 
 
 def test_sql_safety_check_llm_success_marks_audit_ok(monkeypatch):
@@ -2623,24 +2630,40 @@ def test_sql_safety_check_llm_success_marks_audit_ok(monkeypatch):
     assert result["is_safe"] is True
 
 
-def test_sql_explain_cascades_llm_audit_failure(monkeypatch):
-    monkeypatch.setenv("TEXT_TO_SQL_DRY_RUN_ONLY", "1")
+def test_sql_explain_survives_llm_audit_failure(monkeypatch):
+    """W0-0.5: EXPLAIN переживает сбой LLM-аудита — DB-доступ не блокируется,
+
+    так как fail-open сохраняет is_safe=True при static-safe SQL. Проверяем,
+    что get_plugin().connect() действительно достигается (запрос НЕ отклонён
+    как UNSAFE), подставляя plugin с маркерным исключением в connect().
+    """
+    monkeypatch.delenv("TEXT_TO_SQL_DRY_RUN_ONLY", raising=False)
     dsn = "sqlite:///tmp/app.db"
 
     def boom(**kwargs):
         raise RuntimeError("audit down")
 
     monkeypatch.setattr("custom_tools.text_to_sql.core.call_openai_api", boom)
+
+    class _ConnectReachedPlugin(_AdmittedPluginDouble):
+        def connect(self, dsn):
+            raise RuntimeError("connect reached: audit failure did not block EXPLAIN")
+
+        def close(self, conn):
+            pass
+
     monkeypatch.setattr(
         "custom_tools.text_to_sql.core.get_plugin",
-        lambda dsn: (_ for _ in ()).throw(AssertionError("DB must not be opened on audit failure")),
+        lambda dsn: _ConnectReachedPlugin(),
     )
 
     result = sql_explain("SELECT 1", dsn=dsn)
 
     assert result["plan"] is None
     issue_types = {issue.get("issue_type") for issue in result.get("issues", [])}
-    assert "LLM_AUDIT_FAILED" in issue_types
+    assert "UNSAFE" not in issue_types
+    descriptions = " ".join(str(i.get("description", "")) for i in result.get("issues", []))
+    assert "connect reached" in descriptions
 
 
 def test_redact_text_masks_pii_only_when_masking_is_enabled(monkeypatch):

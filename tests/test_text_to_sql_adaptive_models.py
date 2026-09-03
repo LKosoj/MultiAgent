@@ -869,10 +869,9 @@ def test_missing_evidence_and_solver_state_link_to_known_contract_items() -> Non
             "schema:fedcba9876543210",
             "schema_namespace_version",
         ),
-        ("revision", 3, "revision"),
     ),
 )
-def test_solver_state_rejects_foreign_or_future_query(
+def test_solver_state_rejects_foreign_query(
     field: str,
     value: object,
     message: str,
@@ -883,11 +882,13 @@ def test_solver_state_rejects_foreign_or_future_query(
         SolverState(**values)
 
 
-def test_solver_state_candidate_cannot_be_in_the_future() -> None:
+def test_solver_state_candidate_revision_is_independent_from_solver_revision() -> None:
     values = solver_state().model_dump()
     values["sql_candidates"][0]["revision"] = 3
-    with pytest.raises(ValidationError, match="revision"):
-        SolverState(**values)
+
+    state = SolverState(**values)
+
+    assert state.sql_candidates[0].revision == 3
 
 
 def test_solver_state_rejects_duplicate_ast_candidates() -> None:

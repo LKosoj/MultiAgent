@@ -625,7 +625,7 @@ def test_policy_config_closes_every_budget_dimension() -> None:
     assert config.per_action.sample_rows == 50
     assert config.model_budget is not None
     assert config.model_budget.model_calls == 256
-    assert config.model_budget.input_tokens_per_call == 16_384
+    assert config.model_budget.input_tokens_per_call == 32_768
     assert config.model_budget.output_tokens_per_call == 32_000
     assert config.model_budget.total_tokens == 1_048_576
     with pytest.raises(ValidationError):

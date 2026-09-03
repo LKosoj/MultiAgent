@@ -119,9 +119,6 @@ def derive_coverage_footprint(
         joins_by_id[join.join_id] = join
     joins = tuple(joins_by_id[key] for key in sorted(joins_by_id))
 
-    binding_tables = {
-        canonical_json_bytes(table) for binding in bindings for table in binding.tables
-    }
     used_join_ids: set[str] = set()
     for binding in bindings:
         if not binding.join_path:
@@ -134,16 +131,6 @@ def derive_coverage_footprint(
         if len(covered_join_positions(matching)) != len(binding.join_path):
             raise FootprintError("eligible joins do not cover a selected join path")
         used_join_ids.update(join.join_id for join, _ in matching)
-    for join in joins:
-        if join.join_id in used_join_ids:
-            continue
-        if any(
-            canonical_json_bytes(table) not in binding_tables
-            for edge in join.path
-            for table in (edge.left.table, edge.right.table)
-        ):
-            raise FootprintError("eligible join leaves selected binding tables")
-
     return CoverageFootprint(
         eligible_validated_joins=joins,
         eligible_evidence_ids=tuple(

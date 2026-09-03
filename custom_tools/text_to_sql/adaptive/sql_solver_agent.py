@@ -152,8 +152,31 @@ class SqlSolverProposalAdapter:
                 "SQL-solver model response must be bytes or str"
             )
 
-        from .solver_protocol import parse_solver_proposal
+        from .solver_protocol import MAX_SOLVER_PROPOSAL_BYTES, parse_solver_proposal
 
+        response_size = (
+            len(response) if type(response) is bytes else len(response.encode("utf-8"))
+        )
+        if response_size <= MAX_SOLVER_PROPOSAL_BYTES and not (
+            type(response) is bytes and response.startswith(b"\xef\xbb\xbf")
+            or type(response) is str and response.startswith("\ufeff")
+        ):
+            try:
+                top_level = json.loads(
+                    response,
+                    object_pairs_hook=lambda pairs: pairs,
+                )
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            else:
+                if (
+                    type(top_level) is list
+                    and len(top_level) == 1
+                    and type(top_level[0]) is tuple
+                    and top_level[0][0] == "answer"
+                    and type(top_level[0][1]) is str
+                ):
+                    response = top_level[0][1]
         return parse_solver_proposal(response)
 
 

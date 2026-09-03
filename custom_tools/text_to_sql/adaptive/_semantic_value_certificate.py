@@ -162,13 +162,21 @@ def evidence_observes_exact_value(
     ):
         return False
     expected = value.value if type(value) is LiteralValue else value
-    return any(
+    returned_value_matches = any(
         isinstance(row, list)
         and len(row) == 1
         and type(row[0]) is type(expected)
         and row[0] == expected
         for row in payload["rows"]
     )
+    if observation.provenance.probe_kind is ResearchActionKind.SEARCH_VALUE:
+        return returned_value_matches or (
+            bool(payload["rows"])
+            and "requested_value" in payload
+            and type(payload["requested_value"]) is type(expected)
+            and payload["requested_value"] == expected
+        )
+    return returned_value_matches
 
 
 __all__ = [

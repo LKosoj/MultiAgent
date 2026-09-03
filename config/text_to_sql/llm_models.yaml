@@ -25,7 +25,6 @@ profiles:
       max_tokens: 20000
     nlu:
       intent_max_tokens: 800
-      nlp_max_tokens: 2000
       query_understanding_max_tokens: 16000
 
   # muni_ru: копия default — зарезервирован для тюнинга под муниципальный
@@ -41,5 +40,4 @@ profiles:
       max_tokens: 20000
     nlu:
       intent_max_tokens: 800
-      nlp_max_tokens: 2000
       query_understanding_max_tokens: 16000

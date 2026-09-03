@@ -296,6 +296,98 @@ def test_shared_schema_memory_allows_checkpoint_in_other_session(tmp_path: Path)
     assert receipt["verification_status"] == "logically_isolated_shared_memory"
 
 
+def test_shared_schema_memory_allows_semantic_and_probe_facts(tmp_path: Path) -> None:
+    root = _prepared_shared_schema_memory(tmp_path, "db-semantic-facts")
+    database = root / "smolagents_memory.db"
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute(
+            "CREATE TABLE agent_memory (session_id TEXT, agent_name TEXT, step INTEGER, data TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO agent_memory (session_id, agent_name, step, data) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                ("schema-session", "Schema-RAG-Agent", 1, '{"cache_kind":"schema_table"}'),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    2,
+                    '{"cache_kind":"schema_semantic_fact"}',
+                ),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    3,
+                    '{"cache_kind":"schema_probe_fact"}',
+                ),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    4,
+                    '{"cache_kind":"successful_sql_example"}',
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    receipt = verify_shared_schema_memory(root)
+
+    assert receipt["sqlite_records"] == 4
+
+
+def test_schema_memory_copy_preserves_semantic_and_probe_facts(tmp_path: Path) -> None:
+    from custom_tools.text_to_sql.eval.release_inputs import filter_schema_memory_copy
+
+    root = _prepared_shared_schema_memory(tmp_path, "db-semantic-fact-copy")
+    database = root / "smolagents_memory.db"
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute(
+            "CREATE TABLE agent_memory (session_id TEXT, agent_name TEXT, step INTEGER, data TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO agent_memory (session_id, agent_name, step, data) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                ("schema-session", "Schema-RAG-Agent", 1, '{"cache_kind":"schema_table"}'),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    2,
+                    '{"cache_kind":"schema_semantic_fact"}',
+                ),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    3,
+                    '{"cache_kind":"schema_probe_fact"}',
+                ),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    4,
+                    '{"cache_kind":"successful_sql_example"}',
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    filter_schema_memory_copy(root.parent)
+
+    with sqlite3.connect(database) as copied:
+        assert copied.execute("SELECT data FROM agent_memory ORDER BY step").fetchall() == [
+            ('{"cache_kind":"schema_table"}',),
+            ('{"cache_kind":"schema_semantic_fact"}',),
+            ('{"cache_kind":"schema_probe_fact"}',),
+            ('{"cache_kind":"successful_sql_example"}',),
+        ]
+
+
 def test_shared_schema_memory_allows_untyped_workflow_checkpoint_in_other_session(
     tmp_path: Path,
 ) -> None:

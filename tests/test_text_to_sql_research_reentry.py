@@ -14,9 +14,12 @@ from workflow.deadline import DeadlineBudget
 import custom_tools.text_to_sql.adaptive.research_reentry as reentry_module
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
+    EvidenceValidityScope,
     Hypothesis,
     HypothesisStatus,
     PredicateOperator,
+    QueryProbeRef,
+    ResearchActionKind,
     ResearchReentryStatus,
     ResearchStopReason,
     ResearchState,
@@ -41,17 +44,26 @@ from custom_tools.text_to_sql.adaptive.research_reentry import (
 )
 from custom_tools.text_to_sql.adaptive._policy_common import BudgetExhaustedError
 from custom_tools.text_to_sql.adaptive.semantic_coverage import validate_coverage_inputs
-from custom_tools.text_to_sql.adaptive.solver_loop import apply_solver_proposal
+from custom_tools.text_to_sql.adaptive.solver_loop import (
+    admit_targeted_reentry,
+    apply_solver_proposal,
+)
 from custom_tools.text_to_sql.adaptive.solver_protocol import (
     MissingEvidenceProposal,
     SolverProposalV1,
+    SqlCandidateProposal,
 )
 from custom_tools.text_to_sql.adaptive.models import EvidenceSourceKind
+from custom_tools.text_to_sql.adaptive.freshness import (
+    DocumentSourceAvailability,
+    DocumentSourceState,
+)
 from custom_tools.text_to_sql.adaptive.tool_registry import InspectColumnArguments
 from text_to_sql_semantic_checks_helpers import POSTGRES_DSN, ItemSpec, build_case
 from text_to_sql_semantic_coverage_helpers import (
     _action as research_action,
     _context,
+    _document_evidence,
     _schema_evidence,
 )
 
@@ -72,7 +84,12 @@ def _case():
     )
 
 
-def _stopped(case, *, semantic_repair: bool = False) -> SolverState:
+def _stopped(
+    case,
+    *,
+    source_id: str = "status",
+    semantic_repair: bool = False,
+) -> SolverState:
     state = SolverState(
         run_id=case.state.run_id,
         run_incarnation=case.state.run_incarnation,
@@ -93,7 +110,7 @@ def _stopped(case, *, semantic_repair: bool = False) -> SolverState:
             proposal_version=1,
             proposal=MissingEvidenceProposal(
                 proposal_kind="missing_evidence",
-                source_id="status",
+                source_id=source_id,
                 question="Which evidence should be refreshed?",
                 required_evidence_kind=EvidenceSourceKind.SCHEMA,
                 reason="The solver needs one targeted probe.",
@@ -129,6 +146,36 @@ def _decision() -> ResearchDecisionV1:
             ),
         }
     )
+
+
+def test_targeted_reentry_context_lists_completed_actions_for_trusted_targets() -> None:
+    case = _case()
+    stopped = _stopped(case, semantic_repair=True)
+    request = stopped.missing_evidence_requests[-1]
+    trusted_targets = reentry_module._trusted_targets(
+        request.source_id,
+        case.state,
+        case.requirements,
+    )
+
+    context = json.loads(
+        reentry_module._research_context(
+            request,
+            trusted_targets,
+            case.state,
+        )
+    )
+
+    assert context["completed_actions"] == [
+        {
+            "kind": "inspect_table",
+            "parameters": [["revision", 0]],
+            "target": case.state.action_history[0].target.model_dump(
+                mode="json",
+                by_alias=True,
+            ),
+        }
+    ]
 
 
 def _fresh(case) -> ResearchState:
@@ -428,6 +475,15 @@ async def test_semantic_binding_repair_continues_existing_research_until_rebound
     case = _case()
     stopped = _stopped(case, semantic_repair=True)
     bridge, final = _semantic_repair_states(case)
+    replacement = final.bindings[1].model_copy(
+        update={"evidence_ids": case.state.bindings[0].evidence_ids}
+    )
+    final = final.model_copy(
+        update={
+            "evidence": bridge.evidence,
+            "bindings": (final.bindings[0], replacement),
+        }
+    )
     target = case.requirements.allowed_columns[0]
     continued = []
 
@@ -475,6 +531,451 @@ async def test_semantic_binding_repair_continues_existing_research_until_rebound
     assert outcome.record.status is ResearchReentryStatus.COMPLETED
     assert outcome.research_state == final
     assert outcome.solver_state.stop_reason is None
+
+
+@pytest.mark.asyncio
+async def test_semantic_binding_repair_uses_continuation_document_freshness() -> None:
+    from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
+
+    case = _case()
+    stopped = _stopped(case, semantic_repair=True)
+    bridge, final = _semantic_repair_states(case)
+    document_evidence = _document_evidence(
+        "replacement-document-evidence",
+        content="The replacement value is documented.",
+    )
+    replacement = final.bindings[1].model_copy(
+        update={
+            "evidence_ids": (
+                *final.bindings[1].evidence_ids,
+                document_evidence.evidence_id,
+            )
+        }
+    )
+    final = final.model_copy(
+        update={
+            "evidence": (*final.evidence, document_evidence),
+            "bindings": (final.bindings[0], replacement),
+        }
+    )
+    continuation_freshness = _context(
+        documents=(
+            DocumentSourceState(
+                document_id="coverage-document",
+                availability=DocumentSourceAvailability.AVAILABLE,
+                source_version="v1",
+            ),
+        )
+    )
+
+    async def continue_research(_state, _request):
+        return ResearchLoopOutcome(
+            final_state=final,
+            stop_reason=ResearchStopReason.COMPLETE,
+            affected_source_ids=(),
+            citation_evidence_ids=tuple(
+                evidence.evidence_id for evidence in final.evidence
+            ),
+            ambiguity=None,
+            freshness_context=continuation_freshness,
+        )
+
+    outcome = await run_targeted_research_reentry(
+        stopped,
+        case.state,
+        "request-1",
+        requirements=case.requirements,
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=lambda **_kwargs: _decision(),
+        resolve_decision=lambda *_args, **_kwargs: SimpleNamespace(
+            tool_claim=SimpleNamespace(target=case.requirements.allowed_columns[0]),
+            admission=object(),
+            invocation=object(),
+        ),
+        execute_probe=lambda *_args, **_kwargs: SimpleNamespace(
+            status=ProbeStatus.SUCCESS
+        ),
+        commit_research_turn=lambda *_args, **_kwargs: SimpleNamespace(state=bridge),
+        continue_research=continue_research,
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
+    assert outcome.freshness_context == continuation_freshness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_after_binding", (False, True))
+@pytest.mark.parametrize("continuation_steps", (1, 4))
+async def test_unbound_formula_missing_evidence_continues_existing_research(
+    resume_after_binding: bool,
+    continuation_steps: int,
+) -> None:
+    from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
+
+    case = build_case(
+        "SELECT o.amount FROM orders o",
+        (
+            ItemSpec(
+                source_id="formula",
+                kind=SemanticItemKind.METRIC,
+                table="orders",
+                column="amount",
+            ),
+        ),
+    )
+    binding = case.state.bindings[0]
+    item = case.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "status": SemanticItemStatus.UNRESOLVED,
+            "binding_ids": (),
+        }
+    )
+    initial = case.state.model_copy(
+        update={
+            "query_spec": case.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (),
+        }
+    )
+    requirements = validate_coverage_inputs(
+        initial,
+        _context(),
+        initial.run_id,
+        initial.run_incarnation,
+    )
+    formula_case = SimpleNamespace(
+        state=initial,
+        query_spec=initial.query_spec,
+        requirements=requirements,
+    )
+    resolved_item = item.model_copy(
+        update={
+            "status": SemanticItemStatus.RESOLVED,
+            "binding_ids": (binding.binding_id,),
+        }
+    )
+    final_revision = initial.revision + continuation_steps
+    evidence = _schema_evidence(
+        "formula-probe-evidence",
+        QueryProbeRef(probe_id="formula-probe", namespace="main"),
+        kind=ResearchActionKind.EXECUTE_PROBE,
+        revision=final_revision,
+    ).model_copy(
+        update={
+            "source_kind": EvidenceSourceKind.PROBE,
+            "validity_scope": EvidenceValidityScope.RUN_ONLY,
+        }
+    )
+    resolved_binding = binding.model_copy(
+        update={"evidence_ids": (evidence.evidence_id,)}
+    )
+    final = initial.model_copy(
+        update={
+            "revision": final_revision,
+            "query_spec": initial.query_spec.model_copy(
+                update={
+                    "revision": final_revision,
+                    "semantic_items": (resolved_item,),
+                }
+            ),
+            "bindings": (resolved_binding,),
+            "evidence": (*initial.evidence, evidence),
+            "action_history": (
+                *initial.action_history,
+                *(
+                    research_action((("revision", revision),), index=revision)
+                    for revision in range(initial.revision, final_revision)
+                ),
+            ),
+        }
+    )
+    continued = []
+
+    async def continue_research(state, request):
+        continued.append((state, request))
+        return ResearchLoopOutcome(
+            final_state=final,
+            stop_reason=ResearchStopReason.COMPLETE,
+            affected_source_ids=(),
+            citation_evidence_ids=tuple(
+                evidence.evidence_id for evidence in final.evidence
+            ),
+            ambiguity=None,
+        )
+
+    stopped = _stopped(formula_case, source_id="formula")
+    if resume_after_binding:
+        admitted = admit_targeted_reentry(
+            stopped,
+            initial,
+            "request-1",
+            base_revision=stopped.revision,
+            id_factory=iter(("reentry-1",)).__next__,
+        )
+        solver_state = admitted.state
+        research_state = final
+        current_requirements = validate_coverage_inputs(
+            final,
+            _context(),
+            final.run_id,
+            final.run_incarnation,
+        )
+    else:
+        solver_state = stopped
+        research_state = initial
+        current_requirements = requirements
+
+    outcome = await run_targeted_research_reentry(
+        solver_state,
+        research_state,
+        "request-1",
+        requirements=current_requirements,
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=lambda **_kwargs: _decision(),
+        resolve_decision=lambda *_args, **_kwargs: None,
+        execute_probe=lambda *_args, **_kwargs: None,
+        commit_research_turn=lambda *_args, **_kwargs: None,
+        continue_research=continue_research,
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+        resume_admitted=resume_after_binding,
+    )
+
+    assert len(continued) == 1
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
+    assert outcome.research_state == final
+    assert outcome.solver_state.stop_reason is None
+    proposal = apply_solver_proposal(
+        outcome.solver_state,
+        SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(
+                proposal_kind="sql_candidate",
+                sql="SELECT o.amount FROM orders o",
+            ),
+        ),
+        base_revision=outcome.solver_state.revision,
+        dsn=POSTGRES_DSN,
+        table_namespace="main",
+        requirements=validate_coverage_inputs(
+            final,
+            _context(),
+            final.run_id,
+            final.run_incarnation,
+        ),
+        id_factory=iter(("candidate-1", "solver-action-2")).__next__,
+    )
+    assert proposal.state.sql_candidates[-1].sql == "SELECT o.amount FROM orders o"
+
+
+@pytest.mark.asyncio
+async def test_bound_formula_missing_schema_continues_existing_research() -> None:
+    from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
+
+    case = build_case(
+        "SELECT SUM(o.amount) FROM orders o",
+        (
+            ItemSpec(
+                source_id="formula",
+                kind=SemanticItemKind.FORMULA,
+                table="orders",
+                column="amount",
+            ),
+        ),
+    )
+    evidence = _schema_evidence(
+        "formula-relationship-evidence",
+        case.requirements.allowed_columns[0],
+        revision=case.state.revision + 1,
+    )
+    binding = case.state.bindings[0].model_copy(
+        update={
+            "evidence_ids": (
+                *case.state.bindings[0].evidence_ids,
+                evidence.evidence_id,
+            )
+        }
+    )
+    final = case.state.model_copy(
+        update={
+            "revision": case.state.revision + 1,
+            "query_spec": case.state.query_spec.model_copy(
+                update={"revision": case.state.query_spec.revision + 1}
+            ),
+            "bindings": (binding,),
+            "evidence": (*case.state.evidence, evidence),
+            "action_history": (
+                *case.state.action_history,
+                research_action(
+                    (("revision", case.state.revision),),
+                    index=case.state.revision,
+                ),
+            ),
+        }
+    )
+    continued = []
+
+    async def continue_research(state, request):
+        continued.append((state, request))
+        return ResearchLoopOutcome(
+            final_state=final,
+            stop_reason=ResearchStopReason.COMPLETE,
+            affected_source_ids=(),
+            citation_evidence_ids=tuple(
+                evidence.evidence_id for evidence in final.evidence
+            ),
+            ambiguity=None,
+        )
+
+    outcome = await run_targeted_research_reentry(
+        _stopped(case, source_id="formula"),
+        case.state,
+        "request-1",
+        requirements=case.requirements,
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=lambda **_kwargs: pytest.fail(
+            "a formula schema gap needs research continuation, not one probe"
+        ),
+        resolve_decision=lambda *_args, **_kwargs: None,
+        execute_probe=lambda *_args, **_kwargs: None,
+        commit_research_turn=lambda *_args, **_kwargs: None,
+        continue_research=continue_research,
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+
+    assert len(continued) == 1
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
+    assert outcome.research_state == final
+
+
+def test_unbound_formula_continuation_preserves_and_may_extend_other_sources() -> None:
+    case = build_case(
+        "SELECT o.amount, o.status FROM orders o",
+        (
+            ItemSpec(
+                source_id="formula",
+                kind=SemanticItemKind.METRIC,
+                table="orders",
+                column="amount",
+            ),
+            ItemSpec(
+                source_id="status",
+                kind=SemanticItemKind.METRIC,
+                table="orders",
+                column="status",
+            ),
+        ),
+    )
+    formula_binding, other_binding = case.state.bindings
+    unresolved_formula = case.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "status": SemanticItemStatus.UNRESOLVED,
+            "binding_ids": (),
+        }
+    )
+    baseline = case.state.model_copy(
+        update={
+            "query_spec": case.query_spec.model_copy(
+                update={
+                    "semantic_items": (
+                        unresolved_formula,
+                        case.query_spec.semantic_items[1],
+                    )
+                }
+            ),
+            "bindings": (other_binding,),
+        }
+    )
+    resolved_formula = unresolved_formula.model_copy(
+        update={
+            "status": SemanticItemStatus.RESOLVED,
+            "binding_ids": (formula_binding.binding_id,),
+        }
+    )
+    supplemental = other_binding.model_copy(
+        update={
+            "binding_id": "supplemental-status-binding",
+            "status": BindingStatus.CANDIDATE,
+        }
+    )
+    result = baseline.model_copy(
+        update={
+            "revision": baseline.revision + 1,
+            "query_spec": baseline.query_spec.model_copy(
+                update={
+                    "revision": baseline.query_spec.revision + 1,
+                    "semantic_items": (
+                        resolved_formula,
+                        baseline.query_spec.semantic_items[1],
+                    ),
+                }
+            ),
+            "bindings": (other_binding, formula_binding, supplemental),
+        }
+    )
+
+    reentry_module._validate_unbound_formula_result(
+        baseline,
+        result,
+        "formula",
+    )
+
+
+def test_semantic_binding_repair_preserves_and_may_extend_other_sources() -> None:
+    case = build_case(
+        "SELECT o.amount, o.status FROM orders o",
+        (
+            ItemSpec(
+                source_id="amount",
+                kind=SemanticItemKind.METRIC,
+                table="orders",
+                column="amount",
+            ),
+            ItemSpec(
+                source_id="status",
+                kind=SemanticItemKind.FILTER,
+                table="orders",
+                column="status",
+                operator=PredicateOperator.EQ,
+                literal="active",
+            ),
+        ),
+    )
+    failed, other = case.state.bindings
+    stale = failed.model_copy(update={"status": BindingStatus.STALE})
+    replacement = failed.model_copy(update={"binding_id": "replacement-amount"})
+    supplemental = other.model_copy(update={"binding_id": "supplemental-status"})
+    result = case.state.model_copy(
+        update={
+            "revision": case.state.revision + 1,
+            "bindings": (stale, other, replacement, supplemental),
+        }
+    )
+
+    reentry_module._validate_semantic_repair_result(
+        case.state,
+        result,
+        "amount",
+        failed.binding_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -575,6 +1076,69 @@ async def test_resolved_target_outside_trusted_scope_never_executes() -> None:
     assert calls["probe"] == 0
     assert outcome.record.status is ResearchReentryStatus.PROTOCOL_FAILURE
     assert outcome.solver_state.stop_reason is SolverStopReason.MISSING_EVIDENCE
+
+
+@pytest.mark.asyncio
+async def test_resolved_query_probe_executes_for_probe_evidence_request() -> None:
+    case = _case()
+    stopped = _stopped(case)
+    request = stopped.missing_evidence_requests[0].model_copy(
+        update={"required_evidence_kind": EvidenceSourceKind.PROBE}
+    )
+    stopped = stopped.model_copy(update={"missing_evidence_requests": (request,)})
+    probe_target = QueryProbeRef(probe_id="probe-1", namespace="main")
+    evidence = _schema_evidence(
+        "fresh-evidence",
+        probe_target,
+        kind=ResearchActionKind.EXECUTE_PROBE,
+        revision=2,
+    ).model_copy(
+        update={
+            "source_kind": EvidenceSourceKind.PROBE,
+            "validity_scope": EvidenceValidityScope.RUN_ONLY,
+        }
+    )
+    fresh = ResearchState.model_validate(
+        {
+            **case.state.model_dump(mode="python"),
+            "revision": 2,
+            "evidence": (*case.state.evidence, evidence),
+            "action_history": (
+                *case.state.action_history,
+                research_action((("revision", 1),), index=1),
+            ),
+        }
+    )
+    calls = {"probe": 0}
+
+    def probe(*args, **kwargs):
+        calls["probe"] += 1
+        return SimpleNamespace(status=ProbeStatus.SUCCESS)
+
+    outcome = await run_targeted_research_reentry(
+        stopped,
+        case.state,
+        "request-1",
+        requirements=case.requirements,
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=lambda **_kwargs: _decision(),
+        resolve_decision=lambda *_args, **_kwargs: SimpleNamespace(
+            tool_claim=SimpleNamespace(target=probe_target),
+            admission=object(),
+            invocation=object(),
+        ),
+        execute_probe=probe,
+        commit_research_turn=lambda *_args, **_kwargs: SimpleNamespace(state=fresh),
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+
+    assert calls["probe"] == 1
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
 
 
 @pytest.mark.asyncio

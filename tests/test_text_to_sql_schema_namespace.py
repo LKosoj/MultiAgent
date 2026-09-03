@@ -196,6 +196,67 @@ def test_scoped_loader_live_validates_before_reusing_or_replacing_snapshot(
     assert json.loads(snapshot_path.read_text(encoding="utf-8"))["schema_info"] == live
 
 
+def test_scoped_loader_applies_editable_dsn_schema_only_to_live_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A DSN-bound schema file augments, but cannot replace, live structure."""
+    loader = SchemaLoader(tmp_path)
+    scope = _scope()
+    dsn = "sqlite:///editable.db"
+    live = _schema()
+    editable_schema = {
+        "enable": True,
+        "schema_info": {
+            "public.orders": {
+                "description": "Customer invoice ledger",
+                "columns": {
+                    "amount": {
+                        "description": "Net invoice amount",
+                        "examples": [12, 18, float("nan"), float("inf"), -float("inf")],
+                    },
+                    "not_a_live_column": {"description": "must be ignored"},
+                },
+            },
+            "not_a_live_table": {
+                "description": "must be ignored",
+                "columns": {"id": {"type": "INTEGER"}},
+            },
+        },
+    }
+    loader.file_manager.ensure_sqlrag_directory()
+    loader.file_manager.get_schema_file_path(dsn).write_text(
+        json.dumps(editable_schema), encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        loader,
+        "_introspect_via_plugin",
+        lambda _dsn, *, autosave=True: live,
+    )
+
+    loaded = loader.load_scoped_schema({}, dsn, scope)
+
+    assert loaded.schema["public.orders"]["description"] == "Customer invoice ledger"
+    assert loaded.schema["public.orders"]["columns"]["amount"]["description"] == (
+        "Net invoice amount"
+    )
+    assert loaded.schema["public.orders"]["columns"]["amount"]["examples"] == [12, 18]
+    assert "not_a_live_column" not in loaded.schema["public.orders"]["columns"]
+    assert "not_a_live_table" not in loaded.schema
+    assert {fact.source for fact in loaded.semantic_facts} == {"file"}
+
+    editable_schema["schema_info"]["public.orders"]["description"] = (
+        "Corrected invoice ledger"
+    )
+    loader.file_manager.get_schema_file_path(dsn).write_text(
+        json.dumps(editable_schema), encoding="utf-8"
+    )
+
+    reloaded = loader.load_scoped_schema({}, dsn, scope)
+
+    assert reloaded.schema["public.orders"]["description"] == "Corrected invoice ledger"
+
+
 def test_transient_scope_is_live_only_and_freshness_failure_never_uses_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

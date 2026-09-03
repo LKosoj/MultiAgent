@@ -258,21 +258,6 @@ def test_derived_ordering_expression_reaches_authority_checks() -> None:
     )
 
 
-def test_derived_ordering_keeps_unconfirmed_columns_unauthorized() -> None:
-    check_input, state = _derived_case(
-        "SELECT gross_value FROM measure_record ORDER BY AVG(secret) DESC",
-        expression="average gross value",
-        physical_operand_names=("gross_value",),
-        semantic_kind=SemanticItemKind.ORDERING,
-        literal_or_reference="desc",
-    )
-
-    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
-
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
-
-
 def _root_formula_annotations(check_input: SemanticCheckInput):
     root_scopes = {
         scope.scope_id
@@ -354,6 +339,230 @@ def test_derived_expression_binding_can_authorize_filter_or_time() -> None:
         )
 
         assert result.status is CheckStatus.PASSED
+
+
+def test_derived_formula_authorizes_literals_in_where_predicates() -> None:
+    check_input, state = _derived_case(
+        "SELECT COUNT(*) FROM measure_record "
+        "WHERE gross_value > 80 AND gross_value < 500",
+        expression="normal gross range",
+        physical_operand_names=("gross_value",),
+        expected_result_shape=ExpectedResultShape.SCALAR,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    ("predicate", "expected_status", "expected_formula_annotations"),
+    (
+        (
+            "(left_code = 'left-token' AND right_code = 'right-token') OR "
+            "(left_code = 'right-token' AND right_code = 'left-token')",
+            CheckStatus.PASSED,
+            4,
+        ),
+        (
+            "((left_code = 'left-token' AND right_code = 'right-token') OR "
+            "(left_code = 'right-token' AND right_code = 'left-token')) "
+            "AND other_code = 'unrelated'",
+            CheckStatus.FAILED,
+            4,
+        ),
+    ),
+)
+def test_physical_formula_inputs_authorize_only_their_where_atoms(
+    predicate: str,
+    expected_status: CheckStatus,
+    expected_formula_annotations: int,
+) -> None:
+    table = _column("measure_record", "left_code").table
+    left = _column("measure_record", "left_code")
+    right = _column("measure_record", "right_code")
+    other = _column("measure_record", "other_code")
+    columns = (left, right, other)
+    evidence = tuple(
+        _schema_evidence(f"evidence-{column.column}", column) for column in columns
+    )
+    bindings = (
+        *(
+            PhysicalColumnBinding(
+                binding_id=f"binding-{column.column}",
+                source_id="pair-formula",
+                tables=(table,),
+                columns=(column,),
+                predicates=(),
+                join_path=(),
+                evidence_ids=(f"evidence-{column.column}",),
+                confidence=1.0,
+                status=BindingStatus.SUPPORTED,
+                validator_rule="physical-column",
+                physical_column=column,
+            )
+            for column in (left, right)
+        ),
+        PhysicalColumnBinding(
+            binding_id="binding-other_code",
+            source_id="other-output",
+            tables=(table,),
+            columns=(other,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=("evidence-other_code",),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="physical-column",
+            physical_column=other,
+        ),
+    )
+    state = _state(
+        item_specs=(
+            (
+                "pair-formula",
+                True,
+                SemanticItemStatus.RESOLVED,
+                ("binding-left_code", "binding-right_code"),
+            ),
+            (
+                "other-output",
+                True,
+                SemanticItemStatus.RESOLVED,
+                ("binding-other_code",),
+            ),
+        ),
+        bindings=bindings,
+        evidence=evidence,
+    )
+    formula = SemanticItem(
+        source_id="pair-formula",
+        kind=SemanticItemKind.FORMULA,
+        source_text="match the pair in either direction",
+        normalized_meaning="match the pair in either direction",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=("binding-left_code", "binding-right_code"),
+    )
+    other_item = SemanticItem(
+        source_id="other-output",
+        kind=SemanticItemKind.DIMENSION,
+        source_text="other code",
+        normalized_meaning="other code",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=("binding-other_code",),
+    )
+    query_spec = state.query_spec.model_copy(
+        update={
+            "semantic_items": (formula, other_item),
+            "expected_result_shape": ExpectedResultShape.ROWS,
+        }
+    )
+    state = state.model_copy(update={"query_spec": query_spec})
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    sql = f"SELECT other_code FROM measure_record WHERE {predicate}"
+    parsed_ast = parse_sql_candidate(sql, SQLITE_DSN, "physical-formula")
+    candidate = SqlCandidate(
+        candidate_id="physical-formula",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        query_spec,
+        requirements,
+        "main",
+    )
+
+    result = evaluate_semantic_authority_checks(
+        SemanticCheckInput(
+            semantic_ast=semantic_ast,
+            query_spec=query_spec,
+            requirements=requirements,
+        ),
+        state,
+        SQLITE_DSN,
+    )
+
+    assert result.status is expected_status
+    assert result.failure_code is (
+        None
+        if expected_status is CheckStatus.PASSED
+        else CheckFailureCode.UNAUTHORIZED_LITERAL
+    )
+    formula_annotations = tuple(
+        annotation
+        for annotation in semantic_ast.coverage.annotations
+        if annotation.source_ids == ("pair-formula",)
+        and annotation.expression_path
+    )
+    assert len(formula_annotations) == expected_formula_annotations
+
+
+def test_derived_metric_authorizes_literal_inside_its_expression() -> None:
+    check_input, state = _derived_case(
+        "SELECT AVG(elapsed_seconds) FROM measure_record "
+        "WHERE category_code = 1",
+        expression="average elapsed seconds for the documented category",
+        physical_operand_names=("category_code", "elapsed_seconds"),
+        expected_result_shape=ExpectedResultShape.SCALAR,
+        semantic_kind=SemanticItemKind.METRIC,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_derived_filter_authorizes_literal_inside_its_predicate() -> None:
+    check_input, state = _derived_case(
+        "SELECT AVG(elapsed_seconds) FROM measure_record "
+        "WHERE category_code NOT LIKE '+%'",
+        expression="average elapsed seconds for documented category rows",
+        physical_operand_names=("category_code", "elapsed_seconds"),
+        expected_result_shape=ExpectedResultShape.SCALAR,
+        semantic_kind=SemanticItemKind.FILTER,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_derived_formula_authorizes_literals_across_separate_input_predicates() -> None:
+    check_input, state = _derived_case(
+        "SELECT COUNT(CASE WHEN gross_value > 80 THEN expense_value END) "
+        "FROM measure_record WHERE expense_value < 500",
+        expression="conditional expense count",
+        expected_result_shape=ExpectedResultShape.SCALAR,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_derived_ordering_does_not_authorize_where_literal() -> None:
+    check_input, state = _derived_case(
+        "SELECT gross_value FROM measure_record "
+        "WHERE gross_value > 80 ORDER BY gross_value",
+        expression="gross value order",
+        physical_operand_names=("gross_value",),
+        semantic_kind=SemanticItemKind.ORDERING,
+        literal_or_reference="asc",
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
 
 
 def test_unknown_limit_uses_positive_outer_candidate_limit_without_binding() -> None:

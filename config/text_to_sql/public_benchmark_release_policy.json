@@ -20,7 +20,7 @@
         "call_surface": "python __main__:evaluation/evaluation_ex.py",
         "source_closure_sha256": "94263640236a98589e70c880448eed4b0896ba67399b2a5d5ad480583fe18eb5",
         "data_closure_sha256": "7a4bf610626d0b928ba8a588ab91bb3882325cb5a200d56b5078622839fc630f",
-        "runtime_identity_sha256": "177cb0d60c525cab9b09bddd678f250231f5ac8d5b24911568e1631218467dbd"
+        "runtime_identity_sha256": "9faf7178364a9f77133cac25c30a80afd715e3848a1710396c0f0f988fe38258"
       }
     },
     "spider": {
@@ -44,7 +44,7 @@
         "call_surface": "python API:evaluate_spider2sql",
         "source_closure_sha256": "f74b3f25e84a09609801749029d8baa86317c02dd51fbf30dc53934d5847397d",
         "data_closure_sha256": "fa65342bd5584813c9fbccff61dc603d0233947dca72dd1f63e56b0eb84d1274",
-        "runtime_identity_sha256": "177cb0d60c525cab9b09bddd678f250231f5ac8d5b24911568e1631218467dbd"
+        "runtime_identity_sha256": "9faf7178364a9f77133cac25c30a80afd715e3848a1710396c0f0f988fe38258"
       }
     }
   },
