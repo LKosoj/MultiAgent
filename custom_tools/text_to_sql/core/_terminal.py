@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from time import monotonic_ns
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -43,6 +44,51 @@ _PRE_EXECUTION_GATE_REQUIRED_RUNTIME_KEY = "_text_to_sql_pre_execution_gate_requ
 _PRE_EXECUTION_GATE_RUNTIME_KEY = "_text_to_sql_pre_execution_gate"
 _RESULT_VALIDATION_ABSENT = object()
 _RESULT_REVIEW_ABSENT = object()
+_VERIFIED_EXECUTION_CAPABILITY_MARKER = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _VerifiedExecutionCapability:
+    marker: object
+    run_id: str
+    sql_query: str
+    row_limit: int
+    dry_run_only: bool
+    execution: Dict[str, Any]
+
+
+def _verified_execution_from_result_review(
+    receipt: object,
+    *,
+    run_id: str,
+    sql_query: str,
+    row_limit: int,
+    dry_run_only: bool,
+) -> _VerifiedExecutionCapability:
+    """Bind a durable actionable review receipt to one internal finalizer call."""
+
+    from ..adaptive.result_review import ResultReviewReceipt
+
+    if (
+        type(receipt) is not ResultReviewReceipt
+        or receipt.run_id != run_id
+        or receipt.repair_kind != "semantic_binding_mismatch"
+        or type(sql_query) is not str
+        or not sql_query.strip()
+        or type(row_limit) is not int
+        or row_limit <= 0
+        or type(dry_run_only) is not bool
+        or type(receipt.execution) is not dict
+    ):
+        raise TypeError("verified execution receipt is invalid")
+    return _VerifiedExecutionCapability(
+        _VERIFIED_EXECUTION_CAPABILITY_MARKER,
+        run_id,
+        sql_query,
+        row_limit,
+        dry_run_only,
+        dict(receipt.execution),
+    )
 
 
 def _pre_execution_gate_allowed(
@@ -370,6 +416,7 @@ def finalize_text_to_sql_run(
     *,
     safety_policy: Optional["TextToSqlSafetyPolicy"] = None,
     namespace_version_key: str | None = None,
+    verified_execution: _VerifiedExecutionCapability | None = None,
 ) -> Dict[str, Any]:
     """Finalize one approved generated query through deterministic runtime gates."""
 
@@ -394,62 +441,72 @@ def finalize_text_to_sql_run(
         if not isinstance(safety_policy, TextToSqlSafetyPolicy):
             raise TypeError("safety_policy must be a TextToSqlSafetyPolicy or null")
 
-    gate_allowed = _pre_execution_gate_allowed(
-        run_id=run_id,
-        sql_query=sql_query,
-        safety_policy=safety_policy,
-    )
-    if gate_allowed is False:
-        return _terminal_mapping(
-            run_id=run_id,
-            status=TextToSqlTerminalStatus.ABSTAINED,
-            reason_code="DETERMINISTIC_CHECK_REJECTED",
-            sql=sql_query,
-            generated=True,
-            approved=False,
-            executed=False,
-            dry_run=False,
-            audited=False,
-            data=[],
-            columns=[],
-            rows_affected=0,
-            error=None,
-            execution={},
-            audit={},
-            persistence=_not_attempted(),
-        )
-
     from custom_tools.text_to_sql import core
     from ..utils import is_dry_run_only
 
     effective_dry_run_only = is_dry_run_only(payload_flag=dry_run_only)
-
-    execution_started_ns = monotonic_ns()
-    try:
-        executor_kwargs = {
-            "row_limit": row_limit,
-            "dsn": dsn,
-            "dry_run_only": effective_dry_run_only,
-        }
-        if safety_policy is not None:
-            executor_kwargs["safety_policy"] = safety_policy
-        raw_execution = core.secure_db_executor(sql_query, **executor_kwargs)
-    except WorkflowDeadlineExceeded:
-        raise
-    except Exception as exc:
-        elapsed_ms = max(0, monotonic_ns() - execution_started_ns) // 1_000_000
-        raw_execution = {
-            "success": False,
-            "data": [],
-            "columns": [],
-            "rows_affected": 0,
-            "execution_time_ms": elapsed_ms,
-            "error_message": bound_text_to_sql_error(exc) or "database execution failed",
-            "dry_run_only": effective_dry_run_only,
-            "skipped_execution": True,
-            "sql_query": sql_query,
-            "applied_row_limit": row_limit,
-        }
+    if verified_execution is None:
+        gate_allowed = _pre_execution_gate_allowed(
+            run_id=run_id,
+            sql_query=sql_query,
+            safety_policy=safety_policy,
+        )
+        if gate_allowed is False:
+            return _terminal_mapping(
+                run_id=run_id,
+                status=TextToSqlTerminalStatus.ABSTAINED,
+                reason_code="DETERMINISTIC_CHECK_REJECTED",
+                sql=sql_query,
+                generated=True,
+                approved=False,
+                executed=False,
+                dry_run=False,
+                audited=False,
+                data=[],
+                columns=[],
+                rows_affected=0,
+                error=None,
+                execution={},
+                audit={},
+                persistence=_not_attempted(),
+            )
+        execution_started_ns = monotonic_ns()
+        try:
+            executor_kwargs = {
+                "row_limit": row_limit,
+                "dsn": dsn,
+                "dry_run_only": effective_dry_run_only,
+            }
+            if safety_policy is not None:
+                executor_kwargs["safety_policy"] = safety_policy
+            raw_execution = core.secure_db_executor(sql_query, **executor_kwargs)
+        except WorkflowDeadlineExceeded:
+            raise
+        except Exception as exc:
+            elapsed_ms = max(0, monotonic_ns() - execution_started_ns) // 1_000_000
+            raw_execution = {
+                "success": False,
+                "data": [],
+                "columns": [],
+                "rows_affected": 0,
+                "execution_time_ms": elapsed_ms,
+                "error_message": bound_text_to_sql_error(exc) or "database execution failed",
+                "dry_run_only": effective_dry_run_only,
+                "skipped_execution": True,
+                "sql_query": sql_query,
+                "applied_row_limit": row_limit,
+            }
+    else:
+        if (
+            type(verified_execution) is not _VerifiedExecutionCapability
+            or verified_execution.marker is not _VERIFIED_EXECUTION_CAPABILITY_MARKER
+            or verified_execution.run_id != run_id
+            or verified_execution.sql_query != sql_query
+            or verified_execution.row_limit != row_limit
+            or verified_execution.dry_run_only is not dry_run_only
+        ):
+            raise TypeError("verified_execution capability is invalid")
+        raw_execution = verified_execution.execution
 
     execution, normalization_error = _normalize_execution_evidence(raw_execution)
     contract_error = normalization_error or text_to_sql_executor_contract_error(
@@ -568,7 +625,7 @@ def finalize_text_to_sql_run(
         )
 
     result_review: Dict[str, Any] = {}
-    if executed:
+    if executed and verified_execution is None:
         from tool_runtime_context import get_tool_runtime_value
         from ..adaptive.result_validation import (
             RESULT_VALIDATION_RUNTIME_KEY,

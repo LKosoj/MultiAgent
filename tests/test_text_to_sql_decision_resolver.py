@@ -1200,7 +1200,7 @@ def test_loaded_schema_rejects_missing_physical_column() -> None:
         )
 
 
-def test_loaded_schema_does_not_certify_discriminator_literal() -> None:
+def test_loaded_schema_certifies_valid_discriminator_literal() -> None:
     loaded, namespace = _schema(
         {
             "public.orders": {
@@ -1242,37 +1242,37 @@ def test_loaded_schema_does_not_certify_discriminator_literal() -> None:
         loaded=loaded,
         namespace=namespace,
     )
-    with pytest.raises(UnresolvableModelDecisionError):
-        resolve_research_decision(
-            discriminator_state,
-            _semantic_commit(
-                (
-                    {
-                        "proposal_type": "binding_assessment",
-                        "subject": {
-                            "reference_kind": "existing",
-                            "binding_id": discriminator_state.bindings[0].binding_id,
-                        },
-                        "certificate": "consistent",
-                        "citation_evidence_ids": ("evidence-1",),
+    resolved = resolve_research_decision(
+        discriminator_state,
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": discriminator_state.bindings[0].binding_id,
                     },
-                )
-            ),
-            loaded_schema=loaded,
-            freshness_context=_freshness(discriminator_state),
-            registry=_registry(namespace),
-        )
+                    "certificate": "consistent",
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded_schema=loaded,
+        freshness_context=_freshness(discriminator_state),
+        registry=_registry(namespace),
+    )
+    assert resolved.admission.bindings[0].status is BindingStatus.SUPPORTED
 
 
 @pytest.mark.parametrize(
     ("requested_value", "rows", "accepted"),
     (
         (31, [["31"]], True),
-        ("31", [["31"]], False),
-        (31, [], False),
+        ("31", [["31"]], True),
+        (31, [], True),
     ),
 )
-def test_search_value_assessment_uses_exact_requested_scalar(
+def test_search_value_result_does_not_gate_valid_discriminator_literal(
     requested_value: str | int,
     rows: list[list[str]],
     accepted: bool,

@@ -98,8 +98,21 @@ def _write_case_manifest(
         }
         if actual_database_digests != database_digests:
             raise SandboxError("canonical database input differs from release lock")
+        locked_rows = expected_locked_manifest.get("cases")
+        if not isinstance(locked_rows, list):
+            raise SandboxError("canonical release sidecar identities are invalid")
+        locked_sidecars = {
+            row["case_key"]: row["schema_description_sidecar"]
+            for row in locked_rows
+            if isinstance(row, Mapping)
+            and isinstance(row.get("case_key"), str)
+            and "schema_description_sidecar" in row
+        }
+        if set(locked_sidecars) != set(actual_database_digests):
+            raise SandboxError("canonical release sidecar identities are invalid")
     else:
         database_digests = actual_database_digests
+        locked_sidecars = None
     payload = {
         "schema_version": 1,
         "record_kind": "text2sql_case_manifest",
@@ -125,6 +138,13 @@ def _write_case_manifest(
                     case.prompt().encode("utf-8")
                 ).hexdigest(),
                 "database_sha256": database_digests[case.case_key],
+                "schema_description_sidecar": (
+                    locked_sidecars[case.case_key]
+                    if locked_sidecars is not None
+                    else release_support.release_inputs.schema_description_sidecar_identity(
+                        case
+                    )
+                ),
             }
             for case in ordered_cases
         ],

@@ -248,6 +248,21 @@ class BwrapBenchmarkExecution:
                 manifest_profile="bwrap_v2",
                 source_snapshot=self.snapshot,
             )
+        case_manifest = json.loads(
+            (self.output_dir / "case_manifest.json").read_text(encoding="utf-8")
+        )
+        rows = case_manifest.get("cases") if isinstance(case_manifest, Mapping) else None
+        if not isinstance(rows, list):
+            raise SandboxError("case manifest has invalid schema description sidecars")
+        self.schema_description_sidecars = {
+            str(row["case_key"]): row.get("schema_description_sidecar")
+            for row in rows
+            if isinstance(row, Mapping) and isinstance(row.get("case_key"), str)
+        }
+        if set(self.schema_description_sidecars) != {
+            case.case_key for case in self.selected_cases
+        }:
+            raise SandboxError("case manifest has invalid schema description sidecars")
 
     def _prepare_history(self) -> None:
         self.writer = facade.ObservationWriter(self.observations_path)
@@ -458,6 +473,9 @@ class BwrapBenchmarkExecution:
                 bundle_id=self.bundle_id,
                 configuration_digest=self.configuration_digest,
                 expected_database_digest=self.database_digests[case.case_key],
+                expected_schema_description_sidecar=self.schema_description_sidecars[
+                    case.case_key
+                ],
                 persist_receipt=self._persist_receipt,
                 run_scope=self.run_scope,
             )

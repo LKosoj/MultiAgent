@@ -37,6 +37,7 @@ from custom_tools.text_to_sql.adaptive.replay import (
     SolverExecutionReplayStep,
     SolverReentryAdmittedReplayAction,
     SolverReentryFinalizedReplayAction,
+    SolverSemanticRepairFallbackReplayAction,
     SolverReplaySnapshot,
     SolverReplayTerminal,
     SolverStopReplayAction,
@@ -556,6 +557,7 @@ def _solver_transition_action(action: SolverReplayAction):
         "solver_check": SolverCheckReplayAction,
         "research_reentry_admitted": SolverReentryAdmittedReplayAction,
         "research_reentry_finalized": SolverReentryFinalizedReplayAction,
+        "semantic_repair_fallback": SolverSemanticRepairFallbackReplayAction,
         "solver_stop": SolverStopReplayAction,
     }.get(kind)
     if model is None:

@@ -698,6 +698,41 @@ def test_scheduler_passes_caps_and_spawns_with_run_id_and_persisted_spec(
     assert snapshot.state == "running"
 
 
+def test_scheduler_refreshes_claim_lease_and_deadline_after_slow_expiry(
+    config: SupervisorConfig,
+) -> None:
+    clock = FakeClock()
+
+    class SlowExpiryStore(FakeStore):
+        def expire_queued_and_stale_leases(
+            self,
+            now_ms: int,
+            reaper_supervisor_id: str,
+            reaper_lease_expires_at_ms: int,
+        ) -> FakeExpiryResult:
+            result = super().expire_queued_and_stale_leases(
+                now_ms,
+                reaper_supervisor_id,
+                reaper_lease_expires_at_ms,
+            )
+            clock.advance(config.lease_seconds + 1)
+            return result
+
+    store = SlowExpiryStore()
+    store.claims.append(_claim(deadline_at_ms=31_500))
+    supervisor = _supervisor(store, config, clock=clock)
+
+    assert supervisor._schedule_once() == 0
+
+    assert store.claim_calls[0]["lease_expires_at_ms"] == (
+        clock.value_ms + config.lease_seconds * 1_000
+    )
+    assert store.finish_calls[0]["terminal_outcome"] == {
+        "status": "timed_out",
+        "reason": "QUEUE_DEADLINE_EXCEEDED",
+    }
+
+
 def test_pid_registration_rejection_reaps_process_without_handle(
     config: SupervisorConfig,
 ) -> None:

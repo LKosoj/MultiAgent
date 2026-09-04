@@ -50,6 +50,7 @@ class ReleaseCase(Protocol):
     database_path: Path
     question: str
     external_knowledge: str
+    schema_description_path: Path | None
 
     def prompt(self) -> str: ...
 
@@ -318,6 +319,44 @@ def _cached_sha256_file(
     return digest
 
 
+def schema_description_sidecar_identity(
+    case: ReleaseCase,
+    *,
+    digest_cache: FileDigestCache | None = None,
+) -> dict[str, object] | None:
+    """Return the closed, per-database curated-description input set."""
+
+    raw_root = getattr(case, "schema_description_path", None)
+    if raw_root is None:
+        return None
+    database_parent = resolve_safe_regular_file(
+        case.database_path, label="database"
+    ).parent.resolve()
+    root = Path(raw_root)
+    if root != database_parent / "database_description":
+        raise SandboxError("schema description sidecar is outside its database")
+    if root.is_symlink() or not root.is_dir():
+        raise SandboxError("schema description sidecar is missing or unsafe")
+
+    records: list[dict[str, str]] = []
+    for path in sorted(root.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".csv":
+            raise SandboxError("schema description sidecar has an invalid entry")
+        records.append(
+            {
+                "path": path.name,
+                "sha256": _cached_sha256_file(path, digest_cache),
+            }
+        )
+    if not records:
+        raise SandboxError("schema description sidecar is empty")
+    return {
+        "path": "database_description",
+        "files": records,
+        "digest": json_digest(records),
+    }
+
+
 def file_identity(
     path: Path,
     *,
@@ -498,6 +537,10 @@ def stable_case_manifest(
                 case.database_path,
                 cache,
                 digest_file=digest_file,
+            ),
+            "schema_description_sidecar": schema_description_sidecar_identity(
+                case,
+                digest_cache=cache,
             ),
         }
         for case in sorted(cases, key=lambda item: (item.ordinal, item.case_key))

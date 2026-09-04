@@ -81,10 +81,10 @@ class _SettledThreadOperation:
     error: BaseException | None = None
 
 
-async def _settle_thread_operation(function, /, *args) -> _SettledThreadOperation:
+async def _settle_thread_operation(function, /, *args, **kwargs) -> _SettledThreadOperation:
     """Let one durable thread operation finish even when its waiter is cancelled."""
 
-    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     cancellation = None
     while not task.done():
         try:
@@ -1433,6 +1433,39 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         prepared = preparation.value
         if prepared.terminal is not None:
             return prepared.terminal.to_mapping()
+        if prepared.verified_execution is not None:
+            from custom_tools.text_to_sql.core._terminal import (
+                finalize_text_to_sql_run,
+            )
+            from .text_to_sql_adaptive_solver import (
+                finalize_unreplaced_semantic_repair,
+            )
+
+            finalized = await _settle_thread_operation(
+                finalize_text_to_sql_run,
+                request["sql_query"],
+                runtime.query,
+                runtime.dsn,
+                request["row_limit"],
+                request["dry_run_only"],
+                context.session_id,
+                runtime.run_id,
+                verified_execution=prepared.verified_execution,
+            )
+            if finalized.error is not None:
+                raise finalized.error
+            checkpoint_result = await _settle_thread_operation(
+                finalize_unreplaced_semantic_repair,
+                runtime,
+                finalized.value,
+            )
+            if checkpoint_result.error is not None:
+                raise checkpoint_result.error
+            mapping = apply_finalizer_checkpoint(runtime, checkpoint_result.value)
+            control = finalized.cancellation or checkpoint_result.cancellation
+            if control is not None:
+                raise control
+            return mapping
         reservation = prepared.reservation
         if reservation is None:
             raise RuntimeError("adaptive finalizer reservation is missing")

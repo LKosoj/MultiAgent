@@ -20,10 +20,50 @@ from custom_tools.text_to_sql.adaptive.query_understanding import (
     QueryUnderstandingSemanticError,
     understand_query,
 )
+from custom_tools.text_to_sql.prompts import (
+    build_adaptive_query_completeness_prompt,
+    build_adaptive_query_understanding_prompt,
+)
 
 
 RUN_ID = "run-1"
 INCARNATION = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+
+def test_numbered_component_output_rule_requires_trusted_schema_documentation() -> None:
+    expected_rule = (
+        "Отдельно пронумерованные поля считаются запрошенными outputs только когда "
+        "доверенное описание схемы прямо называет их компонентами"
+    )
+    initial = build_adaptive_query_understanding_prompt("List contact details.")
+    completeness = build_adaptive_query_completeness_prompt(
+        "List contact details.",
+        {"expected_result_shape": "rows", "semantic_items": []},
+        schema_context="contacts.email_one: usable; contacts.email_three: unavailable",
+    )
+
+    assert expected_rule in initial
+    assert expected_rule in completeness
+    assert "недоступный или не участвующий компонент не добавляй" in initial
+    assert "недоступный или не участвующий компонент не добавляй" in completeness
+
+
+def test_command_verbs_are_not_requested_output_fields() -> None:
+    expected_rule = "Не превращай глагол-команду в выходное поле"
+    initial = build_adaptive_query_understanding_prompt(
+        "List the district and state the percentage change."
+    )
+    completeness = build_adaptive_query_completeness_prompt(
+        "Report the percentage and give the district name.",
+        {"expected_result_shape": "rows", "semantic_items": []},
+    )
+
+    assert expected_rule in initial
+    assert expected_rule in completeness
+    assert "state name, which state или state of the entity" in initial
+    assert "requested_output является сам объект" in completeness
+    assert "это два outputs X и Y" in initial
+    assert "не считай артикль достаточным признаком" in completeness
 
 
 def _item(
@@ -417,6 +457,70 @@ def test_adaptive_query_prompts_preserve_explicit_attribute_counts_as_metrics() 
         build_adaptive_query_completeness_prompt(question, initial),
     ):
         assert exception in prompt
+
+
+def test_adaptive_query_prompts_distinguish_configured_cadence_from_event_rate() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "How often is maintenance scheduled for machine 7?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "maintenance count",
+            normalized_meaning="count of maintenance events",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Вопрос how often/как часто может запрашивать настроенное расписание или "
+        "интервал сущности либо частоту, вычисляемую по наблюдаемым событиям. "
+        "В первом случае без периода наблюдения и группировки сохраняй атрибут "
+        "периодичности как DIMENSION и не превращай названное действие в FILTER. "
+        "Во втором случае, когда частоту нужно получить из событий за период или "
+        "по группам, сохраняй её как METRIC. Явные how many times/сколько раз, "
+        "число событий или иной числовой подсчёт также являются METRIC."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_derived_outputs_as_formulas() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Provide the asset ID and its service tenure."
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "service tenure",
+            normalized_meaning="service start date",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Запрашиваемое производное значение, которое по смыслу надо вычислить "
+        "из одного или нескольких исходных атрибутов, сохраняй как "
+        "requested_output FORMULA, а не как DIMENSION исходного атрибута. "
+        "Физический атрибут-источник является входом вычисления и не заменяет "
+        "требуемый производный результат."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
 
 
 def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions() -> None:

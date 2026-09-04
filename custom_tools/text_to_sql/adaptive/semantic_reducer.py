@@ -1061,16 +1061,7 @@ def _discriminator_certificate(
             cited,
             schema_columns,
         )
-        and (
-            _positive_predicate_certificate(predicate, cited)
-            if predicate.operator
-            in {
-                PredicateOperator.EQ,
-                PredicateOperator.IN,
-                PredicateOperator.IS_NULL,
-            }
-            else predicate_has_valid_literal(predicate)
-        )
+        and predicate_has_valid_literal(predicate)
         for predicate in item.predicates
     )
 

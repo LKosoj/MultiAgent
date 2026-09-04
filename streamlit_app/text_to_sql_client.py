@@ -230,12 +230,14 @@ class TextToSqlApiClient:
         transport: Optional[Transport] = None,
         poll_interval_seconds: float = 0.25,
         max_poll_attempts: int = 120,
+        request_timeout_seconds: float = 30,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self._auth_headers = auth_headers
         self._transport = transport or self._urllib_transport
         self.poll_interval_seconds = poll_interval_seconds
         self.max_poll_attempts = max_poll_attempts
+        self.request_timeout_seconds = request_timeout_seconds
 
     def _request(
         self,
@@ -281,7 +283,9 @@ class TextToSqlApiClient:
             method=method,
         )
         try:
-            with request.urlopen(api_request, timeout=30) as response:
+            with request.urlopen(
+                api_request, timeout=self.request_timeout_seconds
+            ) as response:
                 decoded = json.loads(response.read().decode("utf-8"))
         except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise TextToSqlApiError(f"API request failed: {exc}") from exc

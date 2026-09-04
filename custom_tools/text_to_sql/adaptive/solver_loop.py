@@ -297,6 +297,63 @@ def stop_solver(
     )
 
 
+def accept_unreplaced_semantic_repair(
+    state: SolverState,
+    *,
+    missing_evidence_request_id: str,
+    candidate_id: str,
+    execution_id: str,
+    normalized_ast_digest: str,
+    base_revision: int,
+) -> SolverState:
+    """Accept an executed candidate after its one semantic repair produced no replacement."""
+
+    state = _revalidate_exact(state, SolverState, SolverValidationError, "state")
+    _validate_solver_revision(state, base_revision)
+    if state.stop_reason is not SolverStopReason.MISSING_EVIDENCE:
+        raise SolverConflictError("semantic repair fallback requires MISSING_EVIDENCE")
+    if not state.research_reentries or (
+        state.research_reentries[-1].status is not ResearchReentryStatus.PROTOCOL_FAILURE
+        or state.research_reentries[-1].missing_evidence_request_id
+        != missing_evidence_request_id
+    ):
+        raise SolverConflictError("semantic repair fallback has no failed re-entry")
+    request = next(
+        (
+            item
+            for item in state.missing_evidence_requests
+            if item.missing_evidence_request_id == missing_evidence_request_id
+        ),
+        None,
+    )
+    if request is None or request.repair_kind != "semantic_binding_mismatch":
+        raise SolverConflictError("semantic repair fallback request is invalid")
+    candidate = next(
+        (item for item in state.sql_candidates if item.candidate_id == candidate_id),
+        None,
+    )
+    execution = next(
+        (item for item in state.execution_results if item.execution_id == execution_id),
+        None,
+    )
+    if (
+        candidate is None
+        or execution is None
+        or not execution.success
+        or execution.candidate_id != candidate_id
+        or candidate.normalized_ast_digest != normalized_ast_digest
+    ):
+        raise SolverConflictError("semantic repair fallback execution is invalid")
+    return SolverState.model_validate(
+        {
+            **state.model_dump(mode="python"),
+            "revision": state.revision + 1,
+            "selected_candidate_id": candidate_id,
+            "stop_reason": SolverStopReason.SOLVED,
+        }
+    )
+
+
 def admit_targeted_reentry(
     state: SolverState,
     research_state: ResearchState,

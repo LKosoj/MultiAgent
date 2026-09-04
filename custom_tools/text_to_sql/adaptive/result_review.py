@@ -423,13 +423,6 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
             "instruction": (
                 "Before using binding status or execution success as support, independently compare the requested attribute owner "
                 "with the selected table and column descriptions, and inspect the supplied schema for an attribute whose described owner and meaning match more directly. "
-                "Inspect join type and direction before returning consistent. When all row conditions "
-                "are on A and B only supplies a requested output, an INNER JOIN or reversed LEFT JOIN "
-                "can discard qualifying A rows: return contradicted targeting B's supplied binding with "
-                "repair_kind semantic_binding_mismatch. A required requested output, including a METRIC, "
-                "requires returning B's column, not a matching B row. NULL in a matched B row does not "
-                "prove that absence of a B row is preserved. This does not apply when B participates in "
-                "row qualification or the question explicitly requires a matching or nonempty B value. "
                 "Before returning consistent for each requested DIMENSION label, compare the selected "
                 "label against label columns on relations already used by the candidate AST. When trusted "
                 "descriptions show the selected label is partial or nullable and another label is full for "
@@ -443,9 +436,6 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "semantically matching full or official label exists on a relation already used by the "
                 "candidate AST; preserve those rows and return contradicted targeting the supplied binding "
                 "with repair_kind semantic_binding_mismatch. "
-                "Apply the no-row-discard rule only within the existing qualifying join scope and exclude "
-                "external current, canonical, persistent, or master labels unless the question explicitly "
-                "requests them or trusted schema or documents prove equivalence at the qualifying row scope. "
                 "Within the existing qualifying join scope, a label explicitly described as full or official "
                 "for the row supplying a required condition or formula is the row-local output. Do not name "
                 "an alternative as a replacement unless its trusted description explicitly establishes a full "
@@ -463,6 +453,9 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "expected_result_shape is only an answer-format hint; singular grammar does not "
                 "require a tie-break, LIMIT or one-row result. Preserve all matches unless "
                 "the question or trusted context explicitly requires another result grain or aggregation. "
+                "An entity or relationship role name alone does not authorize an exact discriminator predicate. "
+                "Do not contradict its omission unless the question, a trusted document, or an already selected binding explicitly requires "
+                "that exact column, operator, and value. "
                 "Use only this trusted context. Inspect the question, SQL, AST, "
                 "bindings, evidence, documents, columns and data. Never generate, "
                 "rewrite or execute SQL. Return only JSON object with exactly these keys: status, reason, "
@@ -658,6 +651,14 @@ def _parse_response(value: object) -> _ModelReviewResponse:
     if type(value) is not str:
         raise TypeError("result review response is not text")
     parsed = json.loads(value)
+    if (
+        type(parsed) is dict
+        and parsed.get("status") == "consistent"
+        and "reason" in parsed
+        and parsed["reason"] is None
+    ):
+        parsed = {**parsed, "reason": "result is consistent"}
+        return _ModelReviewResponse.model_validate(parsed)
     if type(parsed) is dict and "short_reason" in parsed and "reason" not in parsed:
         normalized = dict(parsed)
         normalized["reason"] = normalized.pop("short_reason")

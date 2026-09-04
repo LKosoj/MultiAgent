@@ -8,6 +8,8 @@ one append-only observation per completed case and can resume from that file.
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -15,10 +17,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 from typing import Any, Callable, Iterable, Mapping, Sequence
 import uuid
 
@@ -47,6 +51,7 @@ from custom_tools.text_to_sql.eval.sandbox import (  # noqa: E402
     validate_execution_mode,
 )
 from custom_tools.text_to_sql.eval import public_benchmark_release as release_support  # noqa: E402
+from custom_tools.text_to_sql.utils import dsn_to_sanitized_name  # noqa: E402
 from scripts import text2sql_benchmark_reporting as benchmark_reporting  # noqa: E402
 
 
@@ -281,6 +286,7 @@ class BenchmarkCase:
     question: str
     external_knowledge: str
     difficulty: str | None
+    schema_description_path: Path | None = None
 
     def prompt(self) -> str:
         return benchmark_prompt(self.question, self.external_knowledge)
@@ -332,6 +338,7 @@ def load_bird_cases(dataset_root: Path) -> list[BenchmarkCase]:
             label="database",
         )
         _require_database(database_path, database_id)
+        schema_description_path = database_path.parent / "database_description"
         cases.append(
             BenchmarkCase(
                 ordinal=ordinal,
@@ -342,6 +349,9 @@ def load_bird_cases(dataset_root: Path) -> list[BenchmarkCase]:
                 question=str(row["question"]),
                 external_knowledge=str(row.get("evidence") or ""),
                 difficulty=str(row.get("difficulty") or "") or None,
+                schema_description_path=(
+                    schema_description_path if schema_description_path.exists() else None
+                ),
             )
         )
     return cases
@@ -377,6 +387,7 @@ def load_spider_cases(
             label="database",
         )
         _require_database(database_path, database_id)
+        schema_description_path = database_path.parent / "database_description"
         document_name = str(row.get("external_knowledge") or "").strip()
         external_knowledge = ""
         if document_name:
@@ -398,6 +409,9 @@ def load_spider_cases(
                 question=str(row["question"]),
                 external_knowledge=external_knowledge,
                 difficulty=None,
+                schema_description_path=(
+                    schema_description_path if schema_description_path.exists() else None
+                ),
             )
         )
     return cases
@@ -407,6 +421,219 @@ def _require_database(path: Path, database_id: str) -> None:
     path = resolve_safe_regular_file(path, label="database")
     if path.stat().st_size < 1024:
         raise ValueError(f"SQLite database is missing or invalid: {database_id}: {path}")
+
+
+def schema_description_sidecar_identity(
+    case: BenchmarkCase,
+) -> dict[str, object] | None:
+    """Expose the pinned curated-description closure for one database."""
+
+    return release_support.release_inputs.schema_description_sidecar_identity(case)
+
+
+def _read_pinned_schema_description_sidecar(
+    case: BenchmarkCase,
+    expected_identity: Mapping[str, object] | None,
+) -> list[tuple[str, bytes]]:
+    """Read the manifest-bound sidecar closure once for materialization."""
+
+    if expected_identity is None:
+        if schema_description_sidecar_identity(case) is not None:
+            raise SandboxError("schema description sidecar changed after case manifest")
+        return []
+    root = case.schema_description_path
+    if root is None:
+        raise SandboxError("schema description sidecar is unavailable")
+    database_parent = resolve_safe_regular_file(
+        case.database_path, label="database"
+    ).parent.resolve()
+    if root != database_parent / "database_description":
+        raise SandboxError("schema description sidecar is outside its database")
+    if root.is_symlink() or not root.is_dir():
+        raise SandboxError("schema description sidecar is missing or unsafe")
+    records = expected_identity.get("files")
+    if not isinstance(records, list) or not records:
+        raise SandboxError("schema description sidecar identity is invalid")
+    expected_records: list[dict[str, str]] = []
+    for record in records:
+        if (
+            not isinstance(record, Mapping)
+            or not isinstance(record.get("path"), str)
+            or not isinstance(record.get("sha256"), str)
+        ):
+            raise SandboxError("schema description sidecar identity is invalid")
+        name = record["path"]
+        if Path(name).name != name or Path(name).suffix.lower() != ".csv":
+            raise SandboxError("schema description sidecar identity is invalid")
+        expected_records.append({"path": name, "sha256": record["sha256"]})
+    expected_records.sort(key=lambda record: record["path"])
+    if (
+        records != expected_records
+        or expected_identity.get("digest")
+        != release_support.release_inputs.json_digest(expected_records)
+    ):
+        raise SandboxError("schema description sidecar identity is invalid")
+
+    current_paths = sorted(root.iterdir(), key=lambda path: path.name)
+    if [path.name for path in current_paths] != [record["path"] for record in expected_records]:
+        raise SandboxError("schema description sidecar changed after case manifest")
+    pinned: list[tuple[str, bytes]] = []
+    for record, path in zip(expected_records, current_paths, strict=True):
+        if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".csv":
+            raise SandboxError("schema description sidecar changed after case manifest")
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            raise SandboxError("schema description sidecar CSV is unreadable") from exc
+        if hashlib.sha256(content).hexdigest() != record["sha256"]:
+            raise SandboxError("schema description sidecar changed after case manifest")
+        pinned.append((path.stem, content))
+    return pinned
+
+
+def _decode_schema_description_csv(content: bytes) -> str:
+    try:
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return content.decode("cp1252")
+
+
+def _live_sqlite_table_columns(
+    database_path: Path,
+) -> dict[str, tuple[str, dict[str, str]]]:
+    """Return exact SQLite names keyed by case-folded sidecar names."""
+
+    try:
+        connection = sqlite3.connect(
+            f"{database_path.resolve().as_uri()}?mode=ro",
+            uri=True,
+        )
+        try:
+            rows = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            tables: dict[str, tuple[str, dict[str, str]]] = {}
+            for (table_name,) in rows:
+                if not isinstance(table_name, str):
+                    continue
+                quoted_name = '"' + table_name.replace('"', '""') + '"'
+                columns = connection.execute(
+                    f"PRAGMA table_info({quoted_name})"
+                ).fetchall()
+                table_columns = {
+                    str(column[1]).casefold(): str(column[1]) for column in columns
+                }
+                tables[table_name.casefold()] = (table_name, table_columns)
+            return tables
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        raise SandboxError("live SQLite schema is unavailable") from exc
+
+
+def materialize_schema_description_sidecar(
+    case: BenchmarkCase,
+    *,
+    case_root: Path,
+    dsn: str,
+    expected_identity: Mapping[str, object] | None,
+) -> None:
+    """Write curated CSV descriptions into the existing editable schema format."""
+
+    pinned_sidecars = _read_pinned_schema_description_sidecar(case, expected_identity)
+    if not pinned_sidecars:
+        return
+    live_tables = _live_sqlite_table_columns(case.database_path)
+    schema_info: dict[str, dict[str, object]] = {}
+    for sidecar_table, content in pinned_sidecars:
+        live_table_info = live_tables.get(sidecar_table.casefold())
+        if live_table_info is None:
+            raise SandboxError("schema description sidecar references unknown live table")
+        live_table, live_columns = live_table_info
+        try:
+            reader = csv.DictReader(
+                io.StringIO(_decode_schema_description_csv(content), newline="")
+            )
+            if reader.fieldnames is None or not {
+                "original_column_name",
+                "column_description",
+            } <= set(reader.fieldnames):
+                raise SandboxError("schema description sidecar CSV is invalid")
+            columns: dict[str, dict[str, str]] = {}
+            for row in reader:
+                column_name = str(row.get("original_column_name") or "").strip()
+                description_parts: list[str] = []
+                for field_name in (
+                    "column_name",
+                    "column_description",
+                    "value_description",
+                ):
+                    part = str(row.get(field_name) or "").strip()
+                    if part and part not in description_parts:
+                        description_parts.append(part)
+                description = "\n".join(description_parts)
+                live_column = live_columns.get(column_name.casefold())
+                if not column_name or not description or live_column is None:
+                    continue
+                previous = columns.get(live_column)
+                if previous is not None and previous["description"] != description:
+                    raise SandboxError("schema description sidecar has conflicting columns")
+                columns[live_column] = {"description": description}
+        except (UnicodeDecodeError, csv.Error) as exc:
+            raise SandboxError("schema description sidecar CSV is unreadable") from exc
+        if columns:
+            schema_info[f"main.{live_table}"] = {"columns": columns}
+
+    destination_dir = case_root / "sqlrag"
+    destination = destination_dir / f"{dsn_to_sanitized_name(dsn)}.json"
+    if destination.exists():
+        try:
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SandboxError("existing editable schema is unreadable") from exc
+        if not isinstance(payload, dict):
+            raise SandboxError("existing editable schema is invalid")
+    else:
+        payload = {"enable": True, "source": "curated_schema_description_sidecar"}
+    existing_schema_info = payload.get("schema_info")
+    if existing_schema_info is None:
+        existing_schema_info = {}
+        payload["schema_info"] = existing_schema_info
+    if not isinstance(existing_schema_info, dict):
+        raise SandboxError("existing editable schema is invalid")
+    for table_name, sidecar_table in schema_info.items():
+        editable_table = existing_schema_info.get(table_name)
+        if not isinstance(editable_table, dict):
+            editable_table = {}
+            existing_schema_info[table_name] = editable_table
+        editable_columns = editable_table.get("columns")
+        if not isinstance(editable_columns, dict):
+            editable_columns = {}
+            editable_table["columns"] = editable_columns
+        for column_name, sidecar_column in sidecar_table["columns"].items():
+            editable_column = editable_columns.get(column_name)
+            if not isinstance(editable_column, dict):
+                editable_column = {}
+                editable_columns[column_name] = editable_column
+            editable_column["description"] = sidecar_column["description"]
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=str(destination_dir),
+        text=True,
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _select_cases(
@@ -700,6 +927,7 @@ def _client(base_url: str, token: str) -> TextToSqlApiClient:
         auth_headers=lambda: {"Authorization": f"Bearer {token}"},
         poll_interval_seconds=1.0,
         max_poll_attempts=1200,
+        request_timeout_seconds=600,
     )
 
 

@@ -374,3 +374,39 @@ def test_default_transport_preserves_absolute_result_url(monkeypatch) -> None:
         "url": "https://api.example/v1/runs/run-1/result",
         "timeout": 30,
     }
+
+
+def test_default_transport_uses_configured_request_timeout(monkeypatch) -> None:
+    from streamlit_app import text_to_sql_client as client_module
+
+    captured = {}
+
+    class _Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b"{}"
+
+    def fake_urlopen(api_request, timeout):
+        captured["timeout"] = timeout
+        return _Response()
+
+    monkeypatch.setattr(client_module.request, "urlopen", fake_urlopen)
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+        request_timeout_seconds=600,
+    )
+
+    client._urllib_transport(
+        "GET",
+        "/v1/runs/run-1",
+        json_body=None,
+        headers={"Authorization": "Bearer token"},
+    )
+
+    assert captured["timeout"] == 600

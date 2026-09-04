@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -1134,6 +1135,361 @@ def test_resume_result_contradiction_commits_missing_evidence_before_reentry(
             "question": result_review_reason,
             "reason": result_review_reason,
         }
+
+
+def test_unreplaced_semantic_repair_protocol_failure_keeps_checked_candidate(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    (
+        runtime,
+        store,
+        _,
+        research,
+        _,
+        _,
+        _,
+        _,
+    ) = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="selected attribute has an unconfirmed alternative",
+        result_review_verdict="contradicted",
+        repair_kind="semantic_binding_mismatch",
+    )
+    calls = {"propose": 0, "reenter": 0}
+
+    async def forbidden_propose(*_args):
+        calls["propose"] += 1
+        raise AssertionError("semantic repair must try its targeted re-entry first")
+
+    async def reenter(
+        solver_state,
+        research_state,
+        request_id,
+        *,
+        commit_solver_admission,
+        id_factory,
+        **_kwargs,
+    ):
+        calls["reenter"] += 1
+        admitted = admit_targeted_reentry(
+            solver_state,
+            research_state,
+            request_id,
+            base_revision=solver_state.revision,
+            id_factory=id_factory,
+        )
+        committed = commit_solver_admission(admitted)
+        finalized = finalize_targeted_reentry(
+            committed,
+            admitted.record.research_reentry_id,
+            ResearchReentryStatus.PROTOCOL_FAILURE,
+            base_revision=committed.revision,
+        )
+        return SimpleNamespace(
+            solver_state=finalized.state,
+            research_state=research_state,
+            record=finalized.record,
+        )
+
+    output = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=forbidden_propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            reenter=reenter,
+            id_factory=iter(("semantic-repair-reentry-1",)).__next__,
+        )
+    )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert calls == {"propose": 0, "reenter": 1}
+    assert output["sql"].endswith("ORDER BY o.status")
+    assert checkpoint is not None and checkpoint.terminal is None
+    assert checkpoint.state.research_reentries[-1].status is (
+        ResearchReentryStatus.PROTOCOL_FAILURE
+    )
+    from workflow.text_to_sql_adaptive_solver import prepare_finalizer_execution
+
+    prepared = prepare_finalizer_execution(
+        runtime,
+        {
+            "operation": "finalize_text_to_sql_run",
+            "sql_query": output["sql"],
+            "row_limit": 10,
+            "dry_run_only": False,
+        },
+    )
+    assert prepared.reservation is None
+    assert prepared.terminal is None
+    assert prepared.verified_execution is not None
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert checkpoint is not None
+    assert checkpoint.state.stop_reason is SolverStopReason.SOLVED
+    from custom_tools.text_to_sql import core
+    from custom_tools.text_to_sql.core import _terminal
+    from workflow.text_to_sql_adaptive_solver import finalize_unreplaced_semantic_repair
+
+    def forbidden_executor(*_args, **_kwargs):
+        raise AssertionError("semantic repair fallback must not execute SQL twice")
+
+    side_effects = {"audit": 0, "persistence": 0}
+
+    def audit_logger(_entry):
+        side_effects["audit"] += 1
+        return {"status": "logged", "log_id": "audit-2"}
+
+    def save_successful_sql(**_kwargs):
+        side_effects["persistence"] += 1
+        return {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}
+
+    monkeypatch.setattr(core, "secure_db_executor", forbidden_executor)
+    monkeypatch.setattr(core, "audit_logger", audit_logger)
+    monkeypatch.setattr(core, "save_successful_sql", save_successful_sql)
+    with pytest.raises(TypeError, match="verified_execution capability is invalid"):
+        _terminal.finalize_text_to_sql_run(
+            output["sql"],
+            runtime.query,
+            runtime.dsn,
+            10,
+            False,
+            "coverage-session",
+            runtime.run_id,
+            verified_execution={},
+        )
+    terminal = _terminal.finalize_text_to_sql_run(
+        output["sql"],
+        runtime.query,
+        runtime.dsn,
+        10,
+        False,
+        "coverage-session",
+        runtime.run_id,
+        verified_execution=prepared.verified_execution,
+    )
+    invalid_terminal = {
+        **terminal,
+        "execution": {**terminal["execution"], "execution_time_ms": 999},
+    }
+    with pytest.raises(ValueError, match="terminal execution is invalid"):
+        finalize_unreplaced_semantic_repair(runtime, invalid_terminal)
+
+    original_record_terminal = store.record_terminal
+
+    def interrupted_record_terminal(*_args, **_kwargs):
+        raise RuntimeError("interrupted after semantic repair fallback action")
+
+    monkeypatch.setattr(store, "record_terminal", interrupted_record_terminal)
+    with pytest.raises(RuntimeError, match="interrupted after semantic repair fallback"):
+        finalize_unreplaced_semantic_repair(runtime, terminal)
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert checkpoint is not None and checkpoint.terminal is None
+    assert checkpoint.state.stop_reason is SolverStopReason.SOLVED
+
+    monkeypatch.setattr(store, "record_terminal", original_record_terminal)
+    recovered = prepare_finalizer_execution(
+        runtime,
+        {
+            "operation": "finalize_text_to_sql_run",
+            "sql_query": output["sql"],
+            "row_limit": 10,
+            "dry_run_only": False,
+        },
+    )
+    assert recovered.terminal is not None
+    assert recovered.terminal.reason_code == "EXECUTION_UNKNOWN"
+    assert terminal["status"] == "succeeded"
+    assert side_effects == {"audit": 1, "persistence": 1}
+
+    from custom_tools.text_to_sql.adaptive.replay_engine import (
+        _replay_solver_transition,
+        _verify_solver_terminal,
+    )
+    from custom_tools.text_to_sql.adaptive.replay_contract import (
+        CanonicalReplayBlob,
+        SolverExecutionReconciliation,
+        SolverExecutionReplayAction,
+        SolverExecutionReplayStep,
+        SolverReplayTerminal,
+        SolverTransitionReplayStep,
+        durable_action_digest,
+        sha256_digest,
+    )
+    from workflow.text_to_sql_adaptive_replay import _solver_transition_action
+
+    chain = store.load_replay_chain(runtime.run_id, runtime.run_incarnation)
+    assert chain is not None
+    action = _solver_transition_action(chain.actions[-1])
+    replayed = _replay_solver_transition(
+        SimpleNamespace(action=action, replay_input=None),
+        chain.snapshots[-2].state,
+        {},
+    )
+    finalized_checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert finalized_checkpoint is not None
+    assert canonical_digest(replayed) == canonical_digest(finalized_checkpoint.state)
+
+    execution_action = next(
+        item for item in chain.actions if item.action_kind == "execution"
+    )
+    execution_reconciliation = next(
+        item
+        for item in chain.reconciliations
+        if item.action_revision == execution_action.action_revision
+    )
+
+    def blob(value):
+        content = canonical_json_bytes(value)
+        return CanonicalReplayBlob(
+            digest=sha256_digest(content),
+            byte_count=len(content),
+            content_base64=base64.b64encode(content).decode("ascii"),
+        )
+
+    prior_execution = SolverExecutionReplayStep(
+        action_revision=execution_action.action_revision,
+        base_state_revision=execution_action.base_state_revision,
+        base_state_digest=execution_action.base_state_digest,
+        action=SolverExecutionReplayAction(
+            candidate_id=execution_action.candidate_id,
+            execution_id=execution_action.execution_id,
+            normalized_ast_digest=execution_action.normalized_ast_digest,
+            request={
+                "operation": "finalize_text_to_sql_run",
+                "sql_query": output["sql"],
+                "row_limit": 10,
+                "dry_run_only": False,
+            },
+        ),
+        action_digest=durable_action_digest(
+            SolverExecutionReplayAction(
+                candidate_id=execution_action.candidate_id,
+                execution_id=execution_action.execution_id,
+                normalized_ast_digest=execution_action.normalized_ast_digest,
+                request={
+                    "operation": "finalize_text_to_sql_run",
+                    "sql_query": output["sql"],
+                    "row_limit": 10,
+                    "dry_run_only": False,
+                },
+            )
+        ),
+        reconciliation=SolverExecutionReconciliation(
+            outcome=execution_reconciliation.outcome,
+            result_state_revision=execution_reconciliation.result_state_revision,
+            result_state_digest=execution_reconciliation.result_state_digest,
+            result=blob(execution_reconciliation.result),
+            created_at_ns=execution_reconciliation.created_at_ns,
+        ),
+        created_at_ns=execution_action.created_at_ns,
+    )
+    fallback_step = SolverTransitionReplayStep(
+        action_revision=chain.actions[-1].action_revision,
+        base_state_revision=chain.actions[-1].base_state_revision,
+        base_state_digest=chain.actions[-1].base_state_digest,
+        result_state_revision=chain.actions[-1].result_state_revision,
+        result_state_digest=chain.actions[-1].result_state_digest,
+        action=action,
+        action_digest=durable_action_digest(action),
+        replay_input=None,
+        created_at_ns=chain.actions[-1].created_at_ns,
+    )
+    _verify_solver_terminal(
+        SimpleNamespace(
+            solver_steps=(prior_execution, fallback_step),
+            solver_terminal=SolverReplayTerminal(
+                state_revision=finalized_checkpoint.state.revision,
+                state_digest=canonical_digest(finalized_checkpoint.state),
+                next_action_revision=finalized_checkpoint.cursor.next_action_revision,
+                terminal=blob(recovered.terminal.to_mapping()),
+                created_at_ns=0,
+            ),
+        ),
+        finalized_checkpoint.state,
+    )
+
+
+def test_resume_unreplaced_semantic_repair_protocol_failure_reuses_candidate(
+    tmp_path,
+) -> None:
+    runtime, store, _, research, _, _, _, _ = _persisted_result_contradiction_checkpoint(
+        tmp_path,
+        result_review_reason="selected attribute has an unconfirmed alternative",
+        result_review_verdict="contradicted",
+        repair_kind="semantic_binding_mismatch",
+    )
+
+    async def first_reentry(
+        solver_state,
+        research_state,
+        request_id,
+        *,
+        commit_solver_admission,
+        id_factory,
+        **_kwargs,
+    ):
+        admitted = admit_targeted_reentry(
+            solver_state,
+            research_state,
+            request_id,
+            base_revision=solver_state.revision,
+            id_factory=id_factory,
+        )
+        committed = commit_solver_admission(admitted)
+        finalized = finalize_targeted_reentry(
+            committed,
+            admitted.record.research_reentry_id,
+            ResearchReentryStatus.PROTOCOL_FAILURE,
+            base_revision=committed.revision,
+        )
+        return SimpleNamespace(
+            solver_state=finalized.state,
+            research_state=research_state,
+            record=finalized.record,
+        )
+
+    async def unexpected_propose(*_args, **_kwargs):
+        raise AssertionError("unexpected proposal")
+
+    first = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=unexpected_propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            reenter=first_reentry,
+            id_factory=iter(("semantic-repair-reentry-1",)).__next__,
+        )
+    )
+    calls = {"propose": 0, "reenter": 0}
+
+    async def forbidden(*_args, **_kwargs):
+        calls["reenter"] += 1
+        raise AssertionError("completed semantic repair must not re-enter again")
+
+    async def forbidden_propose(*_args, **_kwargs):
+        calls["propose"] += 1
+        raise AssertionError("completed semantic repair must not propose again")
+
+    resumed = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=forbidden_propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            reenter=forbidden,
+        )
+    )
+
+    assert resumed == first
+    assert calls == {"propose": 0, "reenter": 0}
 
 
 def test_reentry_admission_replays_durable_snapshot_after_budget_projection(

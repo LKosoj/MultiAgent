@@ -310,13 +310,6 @@ class SolverStopReplayAction(StrictModel):
     reason: SolverStopReason
 
 
-SolverReplayAction: TypeAlias = (
-    SolverAction
-    | SolverCheckReplayAction
-    | SolverReentryAdmittedReplayAction
-    | SolverReentryFinalizedReplayAction
-    | SolverStopReplayAction
-)
 SolverTransitionReplayInput: TypeAlias = (
     SolverSqlProposalReplayInput
     | SolverMissingEvidenceReplayInput
@@ -353,13 +346,6 @@ class FinalizerExecutionRequest(StrictModel):
     dry_run_only: bool
 
 
-class SolverExecutionReplayAction(StrictModel):
-    candidate_id: Id
-    execution_id: Id
-    normalized_ast_digest: Digest
-    request: FinalizerExecutionRequest
-
-
 class CanonicalReplayBlob(StrictModel):
     digest: Digest
     byte_count: NonNegativeInt
@@ -381,6 +367,31 @@ class CanonicalReplayBlob(StrictModel):
 
     def content(self) -> bytes:
         return base64.b64decode(self.content_base64, validate=True)
+
+
+class SolverSemanticRepairFallbackReplayAction(StrictModel):
+    kind: Literal["semantic_repair_fallback"] = "semantic_repair_fallback"
+    missing_evidence_request_id: Id
+    candidate_id: Id
+    execution_id: Id
+    normalized_ast_digest: Digest
+
+
+class SolverExecutionReplayAction(StrictModel):
+    candidate_id: Id
+    execution_id: Id
+    normalized_ast_digest: Digest
+    request: FinalizerExecutionRequest
+
+
+SolverReplayAction: TypeAlias = (
+    SolverAction
+    | SolverCheckReplayAction
+    | SolverReentryAdmittedReplayAction
+    | SolverReentryFinalizedReplayAction
+    | SolverStopReplayAction
+    | SolverSemanticRepairFallbackReplayAction
+)
 
 
 class SolverExecutionReconciliation(StrictModel):
@@ -997,6 +1008,7 @@ __all__ = [
     "SolverReplaySnapshot",
     "SolverReplayStep",
     "SolverReplayTerminal",
+    "SolverSemanticRepairFallbackReplayAction",
     "SolverStopReplayAction",
     "SolverTransitionReplayStep",
     "dedupe_artifact_references",

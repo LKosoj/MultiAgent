@@ -149,6 +149,7 @@ def _run_case_in_sandbox(
     bundle_id: str,
     configuration_digest: str,
     expected_database_digest: str,
+    expected_schema_description_sidecar: Mapping[str, object] | None = None,
     persist_receipt: Callable[[Mapping[str, object]], None],
     run_scope: str,
 ) -> tuple[dict[str, Any], dict[str, object]]:
@@ -193,6 +194,12 @@ def _run_case_in_sandbox(
             state_root=state_root,
             case_root=case_root,
             dsn=case_dsn,
+        )
+        runner.materialize_schema_description_sidecar(
+            case,
+            case_root=case_root,
+            dsn=case_dsn,
+            expected_identity=expected_schema_description_sidecar,
         )
 
     def start_case() -> dict[str, Any]:

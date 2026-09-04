@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import BaseModel
 from text_to_sql_semantic_checks_helpers import POSTGRES_DSN, ItemSpec, build_case
 from text_to_sql_semantic_coverage_helpers import SCHEMA, _context
 
@@ -47,6 +48,7 @@ from custom_tools.text_to_sql.core._db_exec import (
     QueryPurpose,
 )
 from custom_tools.text_to_sql.schema_loader import LoadedSchema
+from custom_tools.text_to_sql.schema_memory import SemanticFact
 from custom_tools.text_to_sql.schema_namespace import (
     SchemaNamespace,
     SchemaScope,
@@ -990,6 +992,92 @@ def test_execution_id_cannot_collide_with_missing_evidence_request():
 
 class _SneakyStr(str):
     pass
+
+
+def _file_description_fact() -> SemanticFact:
+    return SemanticFact(
+        subject="column",
+        table_fqn="orders",
+        column="status",
+        fact_kind="description",
+        value="order state",
+        source="file",
+        status="approved",
+    )
+
+
+def test_runner_accepts_exact_loaded_schema_semantic_facts():
+    state, research_state, requirements, loaded_schema = _runtime()
+    enriched = LoadedSchema(
+        loaded_schema.schema,
+        loaded_schema.namespace,
+        loaded_schema.source,
+        (_file_description_fact(),),
+    )
+
+    result = _runner_call(state, research_state, requirements, enriched)
+
+    assert result.check_results[0].check_kind is CheckKind.SAFETY
+
+
+class _SemanticFactSubclass(SemanticFact):
+    pass
+
+
+class _SemanticFactImpostor(BaseModel):
+    subject: str
+    table_fqn: str
+    column: str | None = None
+    fact_kind: str
+    value: str | int | float | bool | None
+    source: str
+    status: str
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "semantic_fact_subclass",
+        "semantic_fact_impostor",
+        "semantic_fact_hidden",
+        "semantic_fact_scalar",
+    ),
+)
+def test_runner_rejects_nonexact_loaded_schema_semantic_facts_before_parsing(
+    monkeypatch,
+    target,
+):
+    state, research_state, requirements, loaded_schema = _runtime()
+    fact = _file_description_fact()
+    if target == "semantic_fact_subclass":
+        fact = _SemanticFactSubclass.model_validate(fact.model_dump(mode="python"))
+    elif target == "semantic_fact_impostor":
+        fact = _SemanticFactImpostor.model_validate(fact.model_dump(mode="python"))
+    elif target == "semantic_fact_hidden":
+        object.__setattr__(fact, "hidden", "forged")
+    else:
+        object.__setattr__(fact, "value", _SneakyStr("order state"))
+    enriched = LoadedSchema(
+        loaded_schema.schema,
+        loaded_schema.namespace,
+        loaded_schema.source,
+        (fact,),
+    )
+    parsings = []
+    from custom_tools.text_to_sql.adaptive import solver_runner
+
+    real_parser = solver_runner.parse_sql_candidate
+
+    def tracked_parser(*args, **kwargs):
+        parsings.append(True)
+        return real_parser(*args, **kwargs)
+
+    monkeypatch.setattr(solver_runner, "parse_sql_candidate", tracked_parser)
+
+    with pytest.raises(SolverRunnerValidationError):
+        _runner_call(state, research_state, requirements, enriched)
+
+    assert parsings == []
 
 
 @pytest.mark.parametrize(

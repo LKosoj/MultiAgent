@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import copy
 from pathlib import Path
 import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from types import SimpleNamespace
 from typing import Mapping
 
@@ -56,6 +54,8 @@ from scripts.text2sql_public_benchmark import (
 )
 from streamlit_app.text_to_sql_client import TextToSqlResult
 from custom_tools.text_to_sql.eval.sandbox import prepare_case_overlays
+from custom_tools.text_to_sql.schema_loader import SchemaLoader
+from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
 from custom_tools.text_to_sql.adaptive.model_budget import (
     ModelBudgetLimits,
     ModelTokenUsage,
@@ -89,6 +89,20 @@ def _sqlite_file(path: Path) -> None:
     path.write_bytes(b"SQLite format 3\x00" + b"\x00" * 2048)
 
 
+def test_benchmark_client_allows_long_running_status_requests(monkeypatch) -> None:
+    captured = {}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(benchmark_runner, "TextToSqlApiClient", _Client)
+
+    benchmark_runner._client("http://127.0.0.1:8000", "token")
+
+    assert captured["request_timeout_seconds"] == 600
+
+
 def test_load_bird_cases_does_not_put_gold_sql_in_prompt(tmp_path: Path) -> None:
     root = tmp_path / "bird"
     root.mkdir()
@@ -108,17 +122,386 @@ def test_load_bird_cases_does_not_put_gold_sql_in_prompt(tmp_path: Path) -> None
         encoding="utf-8",
     )
     _sqlite_file(root / "dev_databases" / "school" / "school.sqlite")
+    descriptions = root / "dev_databases" / "school" / "database_description"
+    descriptions.mkdir()
+    (descriptions / "students.csv").write_text(
+        "original_column_name,column_description\nstudent_id,student identifier\n",
+        encoding="utf-8",
+    )
 
     cases = load_bird_cases(root)
 
     assert len(cases) == 1
     assert cases[0].case_key == "bird:0"
     assert cases[0].case_id == "7"
+    assert cases[0].schema_description_path == descriptions
     assert "SELECT COUNT(*)" not in cases[0].prompt()
     assert cases[0].prompt() == benchmark_prompt(
         "Count the students.",
         "Students are enrolled people.",
     )
+
+
+def test_schema_description_sidecar_is_bound_and_materialized_before_sandbox(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "contacts" / "contacts.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE contacts (email_one TEXT, email_two TEXT, email_three TEXT)"
+        )
+    descriptions = database.parent / "database_description"
+    descriptions.mkdir()
+    csv_path = descriptions / "contacts.csv"
+    csv_path.write_text(
+        "original_column_name,column_name,column_description,data_format,value_description\n"
+        "email_one,first email,first usable email slot,text,\n"
+        "email_two,second email,second usable email slot,text,\n"
+        "email_three,,,text,unavailable and does not participate\n",
+        encoding="utf-8",
+    )
+    case = benchmark_runner.BenchmarkCase(
+        ordinal=0,
+        case_key="synthetic:0",
+        case_id="0",
+        database_id="contacts",
+        database_path=database,
+        question="List email slots.",
+        external_knowledge="",
+        difficulty=None,
+        schema_description_path=descriptions,
+    )
+    identity = benchmark_runner.schema_description_sidecar_identity(case)
+    assert identity is not None
+    assert identity["path"] == "database_description"
+    assert identity["files"] == [
+        {"path": "contacts.csv", "sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()}
+    ]
+    _write_case_manifest(
+        tmp_path / "case_manifest.json",
+        cases=[case],
+        benchmark="synthetic",
+        repeat_ordinal=1,
+        bundle_id="bundle-1",
+        seed=17,
+        run_scope="diagnostic_subset",
+    )
+    manifest_row = json.loads((tmp_path / "case_manifest.json").read_text())[
+        "cases"
+    ][0]
+    assert manifest_row["schema_description_sidecar"] == identity
+
+    case_root = tmp_path / "case"
+    (case_root / "sqlrag").mkdir(parents=True)
+    dsn = "sqlite:////benchmark-input/contacts.sqlite"
+    benchmark_runner.materialize_schema_description_sidecar(
+        case,
+        case_root=case_root,
+        dsn=dsn,
+        expected_identity=identity,
+    )
+
+    editable = json.loads(
+        (case_root / "sqlrag" / f"{dsn_to_sanitized_name(dsn)}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    columns = editable["schema_info"]["main.contacts"]["columns"]
+    assert (
+        columns["email_one"]["description"]
+        == "first email\nfirst usable email slot"
+    )
+    assert (
+        columns["email_two"]["description"]
+        == "second email\nsecond usable email slot"
+    )
+    assert (
+        columns["email_three"]["description"]
+        == "unavailable and does not participate"
+    )
+    merged, _facts = SchemaLoader(case_root)._merge_editable_schema(
+        {
+            "main.contacts": {
+                "columns": {
+                    "email_one": {"description": "statistical description"},
+                    "email_two": {},
+                    "email_three": {},
+                }
+            }
+        },
+        editable["schema_info"],
+    )
+    assert (
+        merged["main.contacts"]["columns"]["email_one"]["description"]
+        == "first email\nfirst usable email slot"
+    )
+
+    csv_path.write_text(csv_path.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    with pytest.raises(benchmark_runner.SandboxError, match="sidecar changed"):
+        benchmark_runner.materialize_schema_description_sidecar(
+            case,
+            case_root=case_root,
+            dsn=dsn,
+            expected_identity=identity,
+        )
+
+
+def test_schema_description_sidecar_uses_live_names_and_preserves_editable_schema(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "contacts" / "contacts.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            'CREATE TABLE Contacts (Email TEXT, Keep TEXT, "__table_name__" TEXT)'
+        )
+    descriptions = database.parent / "database_description"
+    descriptions.mkdir()
+    (descriptions / "contacts.csv").write_bytes(
+        "\ufefforiginal_column_name,column_description\n"
+        "email,preferred contact address\n"
+        "__table_name__,ordinary live column\n"
+        "stale_column,no longer present\n".encode("utf-8")
+    )
+    (descriptions / "unused.csv").write_bytes(
+        "original_column_name,column_description\n"
+        "ignored,Gr\xfc\xdfe\n".encode("cp1252")
+    )
+    case = benchmark_runner.BenchmarkCase(
+        ordinal=0,
+        case_key="synthetic:0",
+        case_id="0",
+        database_id="contacts",
+        database_path=database,
+        question="List contact addresses.",
+        external_knowledge="",
+        difficulty=None,
+        schema_description_path=descriptions,
+    )
+    identity = benchmark_runner.schema_description_sidecar_identity(case)
+    assert identity is not None
+    case_root = tmp_path / "case"
+    editable_dir = case_root / "sqlrag"
+    editable_dir.mkdir(parents=True)
+    dsn = "sqlite:////benchmark-input/contacts.sqlite"
+    editable_path = editable_dir / f"{dsn_to_sanitized_name(dsn)}.json"
+    editable_path.write_text(
+        json.dumps(
+            {
+                "enable": True,
+                "source": "existing",
+                "schema_info": {
+                    "main.Contacts": {
+                        "columns": {"Keep": {"description": "retain this"}}
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(benchmark_runner.SandboxError, match="unknown live table"):
+        benchmark_runner.materialize_schema_description_sidecar(
+            case,
+            case_root=case_root,
+            dsn=dsn,
+            expected_identity=identity,
+        )
+
+    (descriptions / "unused.csv").unlink()
+    identity = benchmark_runner.schema_description_sidecar_identity(case)
+    benchmark_runner.materialize_schema_description_sidecar(
+        case,
+        case_root=case_root,
+        dsn=dsn,
+        expected_identity=identity,
+    )
+
+    editable = json.loads(editable_path.read_text(encoding="utf-8"))
+    assert editable["source"] == "existing"
+    columns = editable["schema_info"]["main.Contacts"]["columns"]
+    assert columns["Email"]["description"] == "preferred contact address"
+    assert columns["Keep"]["description"] == "retain this"
+    assert columns["__table_name__"]["description"] == "ordinary live column"
+    assert "stale_column" not in columns
+
+
+def test_canonical_case_manifest_keeps_locked_sidecar_identity_after_input_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "contacts" / "contacts.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE contacts (email TEXT)")
+    descriptions = database.parent / "database_description"
+    descriptions.mkdir()
+    csv_path = descriptions / "contacts.csv"
+    csv_path.write_text(
+        "original_column_name,column_description\nemail,old description\n",
+        encoding="utf-8",
+    )
+    case = benchmark_runner.BenchmarkCase(
+        ordinal=0,
+        case_key="bird:0",
+        case_id="0",
+        database_id="contacts",
+        database_path=database,
+        question="List contacts.",
+        external_knowledge="",
+        difficulty=None,
+        schema_description_path=descriptions,
+    )
+    locked_manifest = benchmark_runner._stable_case_manifest("bird", [case])
+    locked_identity = locked_manifest["cases"][0]["schema_description_sidecar"]
+    assert isinstance(locked_identity, dict)
+    original_stable_manifest = public_benchmark_artifacts._stable_case_manifest
+
+    def verify_then_change_sidecar(*args: object, **kwargs: object) -> dict[str, object]:
+        result = original_stable_manifest(*args, **kwargs)
+        csv_path.write_text(
+            "original_column_name,column_description\nemail,new description\n",
+            encoding="utf-8",
+        )
+        return result
+
+    monkeypatch.setattr(
+        public_benchmark_artifacts,
+        "_stable_case_manifest",
+        verify_then_change_sidecar,
+    )
+    manifest_path = tmp_path / "case_manifest.json"
+    _write_case_manifest(
+        manifest_path,
+        cases=[case],
+        benchmark="bird",
+        repeat_ordinal=1,
+        bundle_id="bundle-1",
+        seed=17,
+        run_scope="full_release",
+        expected_locked_manifest=locked_manifest,
+        expected_database_digests={
+            case.case_key: hashlib.sha256(database.read_bytes()).hexdigest()
+        },
+    )
+
+    written_identity = json.loads(manifest_path.read_text(encoding="utf-8"))["cases"][0][
+        "schema_description_sidecar"
+    ]
+    assert written_identity == locked_identity
+
+
+def test_bwrap_execution_materializes_manifest_sidecar_before_process_start(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "contacts" / "contacts.sqlite"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE contacts (email TEXT)")
+    descriptions = database.parent / "database_description"
+    descriptions.mkdir()
+    (descriptions / "contacts.csv").write_text(
+        "original_column_name,column_description\nemail,preferred address\n",
+        encoding="utf-8",
+    )
+    case = benchmark_runner.BenchmarkCase(
+        ordinal=0,
+        case_key="bird:0",
+        case_id="0",
+        database_id="contacts",
+        database_path=database,
+        question="List contacts.",
+        external_knowledge="",
+        difficulty=None,
+        schema_description_path=descriptions,
+    )
+    locked_manifest = benchmark_runner._stable_case_manifest("bird", [case])
+    locked_identity = locked_manifest["cases"][0]["schema_description_sidecar"]
+    assert isinstance(locked_identity, dict)
+    source = tmp_path / "source"
+    (source / "backend").mkdir(parents=True)
+    (source / "backend" / "app.py").write_text("APP = 1\n", encoding="utf-8")
+    snapshot = benchmark_runner.create_source_snapshot(
+        source,
+        tmp_path / "snapshot",
+        allowed_paths=(Path("backend"),),
+    )
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    state_root = tmp_path / "state"
+    args = SimpleNamespace(
+        dataset="bird",
+        repeat_ordinal=1,
+        seed=17,
+        sandbox_venv_root=tmp_path / "venv",
+        sandbox_secret_dir=tmp_path / "secrets",
+        sandbox_env=[],
+        case_timeout=1.0,
+        max_rows=1,
+    )
+    execution = BwrapBenchmarkExecution(args, "token")
+    execution.output_dir = output_dir
+    execution.selected_cases = [case]
+    execution.cases = [case]
+    execution.partial_resume = False
+    execution.locked_case_manifest = locked_manifest
+    execution.locked_database_digests = {
+        case.case_key: hashlib.sha256(database.read_bytes()).hexdigest()
+    }
+    execution.bundle_id = "bundle-1"
+    execution.run_scope = "full_release"
+    execution.execution_mode = "canonical_release"
+    execution.snapshot = snapshot
+    execution.state_root = state_root
+    execution.configuration_digest = "sha256:" + "a" * 64
+    execution.configuration_sources = []
+    execution.source_snapshot_manifest_digest = "sha256:" + "b" * 64
+    execution.leg_progress = None
+    monkeypatch.setattr(bwrap_execution.facade, "_write_manifest", lambda **_kwargs: None)
+    execution._write_input_artifacts()
+
+    assert execution.schema_description_sidecars == {case.case_key: locked_identity}
+    seen_identities: list[object] = []
+    original_materialize = benchmark_runner.materialize_schema_description_sidecar
+
+    def capture_materialize(*args: object, **kwargs: object) -> None:
+        seen_identities.append(kwargs["expected_identity"])
+        original_materialize(*args, **kwargs)
+
+    monkeypatch.setattr(
+        benchmark_runner,
+        "materialize_schema_description_sidecar",
+        capture_materialize,
+    )
+    events: list[str] = []
+
+    class FakeRunner:
+        def run(self, spec, _start_case, *, expected_snapshot, before_start):
+            prepare_case_overlays(spec)
+            before_start()
+            destination = spec.case_root / "sqlrag" / (
+                f"{dsn_to_sanitized_name('sqlite:////benchmark-input/contacts.sqlite')}.json"
+            )
+            payload = json.loads(destination.read_text(encoding="utf-8"))
+            assert (
+                payload["schema_info"]["main.contacts"]["columns"]["email"][
+                    "description"
+                ]
+                == "preferred address"
+            )
+            events.extend(("materialized", "process"))
+            return {"run_id": "run-1", "outcome": {"status": "succeeded", "reason_code": "OK"}}
+
+    monkeypatch.setattr(benchmark_runner, "SandboxCaseRunner", FakeRunner)
+    execution._persist_receipt = lambda _receipt: None
+    execution._commit_observation = lambda *_args: None
+
+    execution._run_one_case(case, 1)
+
+    assert seen_identities == [locked_identity]
+    assert events == ["materialized", "process"]
 
 
 def test_load_spider_cases_filters_non_local_and_loads_documents(

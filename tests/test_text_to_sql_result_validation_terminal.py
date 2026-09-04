@@ -1030,6 +1030,83 @@ def test_result_review_preserves_document_defined_row_role() -> None:
     assert receipt.verdict == "consistent"
 
 
+@pytest.mark.parametrize(
+    ("documents", "expected_verdict"),
+    (
+        ((), "consistent"),
+        (("A registered member is exactly a row whose status equals active.",), "contradicted"),
+    ),
+)
+def test_result_review_does_not_invent_discriminator_from_role_name(
+    documents: tuple[str, ...],
+    expected_verdict: str,
+) -> None:
+    state, requirements, candidate, _ = _case()
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"original_text": "List registered members."}
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"].lower()
+        assert payload["question"] == "List registered members."
+        required_clauses = (
+            "entity or relationship role name alone does not authorize",
+            "exact discriminator predicate",
+            "question, a trusted document, or an already selected binding explicitly requires",
+        )
+        if not all(clause in instruction for clause in required_clauses):
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the role name implies an additional discriminator filter",
+                    "source_id": "source-1",
+                }
+            )
+        if payload["documents"]:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the trusted document explicitly requires the exact status predicate",
+                    "source_id": "source-1",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "no exact discriminator predicate is explicitly required",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parse_sql_candidate(SQL, POSTGRES_DSN, candidate.candidate_id),
+        documents=documents,
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=SQL,
+        execution=_executor_result([["open"]]),
+    )
+
+    assert receipt.verdict == expected_verdict
+
+
 def test_result_review_does_not_let_shape_hint_override_documented_row_scope() -> None:
     state, _, candidate, _ = _case()
     state = state.model_copy(
@@ -2089,7 +2166,7 @@ def test_result_review_rejects_partial_in_scope_label() -> None:
     assert receipt.repair_binding_id == requirements.selected_bindings[0].binding_id
 
 
-def test_result_review_rejects_inner_join_that_discards_output_only_relation_rows() -> None:
+def test_result_review_does_not_impose_output_only_join_type() -> None:
     join_path = (inner_join("organizations", "id", "ratings", "organization_id"),)
     state = build_state(
         (
@@ -2193,10 +2270,10 @@ def test_result_review_rejects_inner_join_that_discards_output_only_relation_row
         execution={**_executor_result([[4.5]]), "columns": ["score"], "sql_query": sql},
     )
 
-    assert receipt.verdict == "contradicted"
-    assert receipt.source_id == "rating"
-    assert receipt.repair_kind == "semantic_binding_mismatch"
-    assert receipt.repair_binding_id == requirements.selected_bindings[1].binding_id
+    assert receipt.verdict == "consistent"
+    assert receipt.source_id is None
+    assert receipt.repair_kind is None
+    assert receipt.repair_binding_id is None
 
 
 def test_result_review_clears_binding_without_semantic_repair() -> None:
@@ -3488,6 +3565,46 @@ def test_typed_terminal_fails_closed_when_result_review_is_missing(monkeypatch) 
 
     assert result["reason_code"] == "RESULT_REVIEW_FAILED"
     assert calls == ["executor", "audit"]
+
+
+def test_consistent_result_review_accepts_null_reason(monkeypatch) -> None:
+    state, requirements, candidate, validator = _case()
+    calls = _terminal_side_effects(monkeypatch, [["paid"]], persistence_allowed=True)
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=FreshnessContext(
+            evaluated_at=state.evidence[0].observed_at,
+            run_id=state.run_id,
+            run_incarnation=state.run_incarnation,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        candidate=candidate,
+        parsed_ast=parse_sql_candidate(SQL, POSTGRES_DSN, candidate.candidate_id),
+        documents=(),
+        model=lambda _prompt: json.dumps(
+            {
+                "status": "consistent",
+                "reason": None,
+                "source_id": None,
+                "repair_kind": None,
+                "repair_binding_id": None,
+                "predicate_authority": None,
+            }
+        ),
+    )
+    token = set_tool_runtime_context(
+        {RESULT_VALIDATION_RUNTIME_KEY: validator, RESULT_REVIEW_RUNTIME_KEY: review}
+    )
+    try:
+        result = _finalize(state.run_id)
+    finally:
+        reset_tool_runtime_context(token)
+
+    assert result["status"] == "succeeded"
+    assert result["result_review"]["verdict"] == "consistent"
+    assert result["result_review"]["reason"] == "result is consistent"
+    assert calls == ["executor", "audit", "persistence"]
 
 
 @pytest.mark.parametrize(

@@ -12,6 +12,7 @@ from pydantic import TypeAdapter, ValidationError
 
 from custom_tools.text_to_sql import core
 from custom_tools.text_to_sql.schema_loader import LoadedSchema
+from custom_tools.text_to_sql.schema_memory import SemanticFact
 from custom_tools.text_to_sql.schema_namespace import (
     SchemaNamespace,
     SchemaScope,
@@ -826,10 +827,14 @@ def _exact_dataclass_value(
             if type(model_dict) is not dict or set(model_dict) != set(declared):
                 return False
             return all(
-                _exact_dataclass_value(
-                    getattr(value, name),
-                    active,
-                    allowed_dataclasses,
+                (
+                    _exact_semantic_facts(getattr(value, name))
+                    if type(value) is LoadedSchema and name == "semantic_facts"
+                    else _exact_dataclass_value(
+                        getattr(value, name),
+                        active,
+                        allowed_dataclasses,
+                    )
                 )
                 for name in declared
             )
@@ -844,6 +849,24 @@ def _exact_dataclass_value(
         )
     finally:
         active.remove(identity)
+
+
+def _exact_semantic_facts(value: object) -> bool:
+    if type(value) is not tuple:
+        return False
+    for fact in value:
+        try:
+            checked = revalidate_exact_model(
+                fact,
+                SemanticFact,
+                ValueError,
+                "semantic fact",
+            )
+        except ValueError:
+            return False
+        if not exact_value(fact, checked):
+            return False
+    return True
 
 
 def _malformed_check(candidate_id: str, kind: CheckKind) -> CheckResult:

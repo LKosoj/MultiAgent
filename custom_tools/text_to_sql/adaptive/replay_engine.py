@@ -14,6 +14,7 @@ from .replay_contract import (
     SolverExecutionReplayStep,
     SolverReentryAdmittedReplayAction,
     SolverReentryFinalizedReplayAction,
+    SolverSemanticRepairFallbackReplayAction,
     SolverStopReplayAction,
     SolverTransitionReplayStep,
     _result_contradiction_receipt,
@@ -253,6 +254,19 @@ def _replay_solver_transition(step, state, research_states):
             action.reason,
             base_revision=state.revision,
         )
+    if type(action) is SolverSemanticRepairFallbackReplayAction:
+        if replay_input is not None:
+            raise ReplayContractError("semantic repair fallback cannot carry replay input")
+        from .solver_loop import accept_unreplaced_semantic_repair
+
+        return accept_unreplaced_semantic_repair(
+            state,
+            missing_evidence_request_id=action.missing_evidence_request_id,
+            candidate_id=action.candidate_id,
+            execution_id=action.execution_id,
+            normalized_ast_digest=action.normalized_ast_digest,
+            base_revision=state.revision,
+        )
     raise ReplayContractError("unsupported solver transition action")
 
 
@@ -343,6 +357,67 @@ def _verify_solver_terminal(payload, state) -> None:
                     state.run_id, candidate.sql
                 ).to_mapping()
             )
+    elif payload.solver_steps and type(payload.solver_steps[-1]) is SolverTransitionReplayStep and type(
+        payload.solver_steps[-1].action
+    ) is SolverSemanticRepairFallbackReplayAction:
+        action = payload.solver_steps[-1].action
+        from .result_review import ResultReviewReceipt
+        from workflow._text_to_sql_solver_execution_reducer import (
+            execution_unknown_terminal_result,
+        )
+        from workflow.text_to_sql_contract import TextToSqlTerminalResult
+
+        terminal_bytes = terminal.terminal.content()
+        try:
+            fallback_terminal = TextToSqlTerminalResult.from_mapping(
+                json.loads(terminal_bytes)
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ReplayContractError("semantic repair fallback terminal is invalid") from exc
+        if fallback_terminal.reason_code == "EXECUTION_UNKNOWN":
+            candidate = next(
+                (
+                    item
+                    for item in state.sql_candidates
+                    if item.candidate_id == action.candidate_id
+                ),
+                None,
+            )
+            if candidate is None:
+                raise ReplayContractError("semantic repair fallback has no candidate")
+            expected = canonical_json_bytes(
+                execution_unknown_terminal_result(state.run_id, candidate.sql).to_mapping()
+            )
+        else:
+            receipts = [
+                _result_contradiction_receipt(step)
+                for step in payload.solver_steps[:-1]
+                if type(step) is SolverExecutionReplayStep
+                and step.action.candidate_id == action.candidate_id
+                and step.action.execution_id == action.execution_id
+                and step.action.normalized_ast_digest == action.normalized_ast_digest
+            ]
+            receipts = [receipt for receipt in receipts if receipt is not None]
+            candidate = next(
+                (
+                    item
+                    for item in state.sql_candidates
+                    if item.candidate_id == action.candidate_id
+                ),
+                None,
+            )
+            if (
+                candidate is None
+                or fallback_terminal.run_id != state.run_id
+                or fallback_terminal.sql != candidate.sql
+                or len(receipts) != 1
+                or type(receipts[0]) is not ResultReviewReceipt
+                or fallback_terminal.execution != receipts[0].execution
+            ):
+                raise ReplayContractError(
+                    "semantic repair fallback terminal does not match execution"
+                )
+            expected = canonical_json_bytes(fallback_terminal.to_mapping())
     else:
         from .terminal import solver_stop_terminal_result
 

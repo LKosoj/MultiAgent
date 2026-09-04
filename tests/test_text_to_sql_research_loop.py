@@ -3223,6 +3223,89 @@ def test_discriminator_feedback_rejects_nonfinite_float_literals(value) -> None:
     assert "missing_probe" not in feedback[0]
 
 
+def test_schema_known_discriminator_column_probes_typed_literal() -> None:
+    """A loaded column still needs exact evidence only for its predicate value."""
+
+    loaded_schema, namespace = _fixture_schema(
+        {"public.catalog": {"columns": {"code": {"type": "TEXT"}}}}
+    )
+    base = _policy_state(namespace, with_evidence=True)
+    table = TableRef(namespace="main", schema="public", table="catalog")
+    code = ColumnRef(table=table, column="code")
+    binding = DiscriminatorValueBinding(
+        binding_id="catalog-code-filter",
+        source_id="source-1",
+        tables=(table,),
+        columns=(code,),
+        predicates=(
+            {
+                "left": code,
+                "operator": PredicateOperator.EQ,
+                "right": 7,
+            },
+        ),
+        join_path=(),
+        evidence_ids=(base.evidence[0].evidence_id,),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=code,
+        discriminator_predicate={
+            "left": code,
+            "operator": PredicateOperator.EQ,
+            "right": 7,
+        },
+    )
+    state = base.model_copy(update={"bindings": (binding,)})
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": binding.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "search_value",
+                    "arguments": {
+                        "table": "public.catalog",
+                        "column": "code",
+                        "value": 7,
+                        "top_k": 1,
+                    },
+                },
+            },
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state,
+        decision,
+        _freshness(state),
+        requested_action=None,
+        loaded_schema=loaded_schema,
+    )
+
+    assert feedback[0]["missing_probe"] == {
+        "tool_name": "search_value",
+        "arguments": {
+            "table": "public.catalog",
+            "column": "code",
+            "value": 7,
+            "top_k": 1,
+        },
+    }
+
+
 def test_missing_column_probe_is_not_recommended_after_failed_inspection() -> None:
     """A prior inspect action is enough even when it produced no evidence."""
 
@@ -4053,6 +4136,141 @@ def test_unique_one_character_source_id_typo_is_normalized() -> None:
     normalized = _research_loop_module._normalize_model_source_ids(state, decision)
 
     assert normalized.proposals[0].source_id == "source-1"
+
+
+def test_unknown_binding_assessment_is_canonicalized_only_when_unambiguous() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    base = _policy_state(namespace, with_evidence=True)
+    table = base.evidence[0].target
+    assert isinstance(table, TableRef)
+    column = ColumnRef(table=table, column="status")
+
+    def state_with_candidates(candidate_ids: tuple[str, ...]) -> ResearchState:
+        bindings = tuple(
+            PhysicalColumnBinding(
+                binding_id=binding_id,
+                source_id="source-1",
+                tables=(table,),
+                columns=(column,),
+                predicates=(),
+                join_path=(),
+                evidence_ids=(base.evidence[0].evidence_id,),
+                confidence=0.0,
+                status=BindingStatus.CANDIDATE,
+                validator_rule=None,
+                physical_column=column,
+            )
+            for binding_id in candidate_ids
+        )
+        item = base.query_spec.semantic_items[0].model_copy(
+            update={
+                "status": SemanticItemStatus.PARTIALLY_RESOLVED,
+                "binding_ids": candidate_ids,
+            }
+        )
+        return base.model_copy(
+            update={
+                "bindings": bindings,
+                "query_spec": base.query_spec.model_copy(
+                    update={"semantic_items": (item,)}
+                ),
+            }
+        )
+
+    def decision(*binding_ids: str) -> ResearchDecisionV1:
+        return ResearchDecisionV1.model_validate(
+            {
+                "decision_version": 1,
+                "proposals": tuple(
+                    {
+                        "proposal_type": "binding_assessment",
+                        "subject": {
+                            "reference_kind": "existing",
+                            "binding_id": binding_id,
+                        },
+                        "certificate": "consistent",
+                        "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                    }
+                    for binding_id in binding_ids
+                ),
+                "next": {"next_kind": "semantic_commit"},
+            }
+        )
+
+    unique = state_with_candidates(("binding-candidate",))
+    normalized = _research_loop_module._normalize_model_source_ids(
+        unique, decision("binding-candidatf")
+    )
+    assert normalized.proposals[0].subject.binding_id == "binding-candidate"
+
+    no_candidates = state_with_candidates(())
+    unknown = decision("binding-candidatf")
+    assert _research_loop_module._normalize_model_source_ids(
+        no_candidates, unknown
+    ) is unknown
+
+    ambiguous = state_with_candidates(("binding-candidate", "binding-other"))
+    assert _research_loop_module._normalize_model_source_ids(
+        ambiguous, unknown
+    ) is unknown
+
+    multiple_unknown = decision("binding-unknown", "binding-other")
+    assert _research_loop_module._normalize_model_source_ids(
+        unique, multiple_unknown
+    ) is multiple_unknown
+
+    valid = decision("binding-candidate")
+    assert _research_loop_module._normalize_model_source_ids(unique, valid) is valid
+
+    mixed = decision("binding-candidate", "binding-candidatf")
+    assert _research_loop_module._normalize_model_source_ids(unique, mixed) is mixed
+
+    mixed_reference_kinds = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:other-binding",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "physical_column",
+                        "physical_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                },
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": "binding-candidatf",
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                },
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "proposed",
+                        "proposal_key": "proposal:other-binding",
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (base.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+    assert (
+        _research_loop_module._normalize_model_source_ids(
+            unique, mixed_reference_kinds
+        )
+        is mixed_reference_kinds
+    )
 
 
 def test_source_id_typo_is_not_normalized_without_one_unique_match() -> None:

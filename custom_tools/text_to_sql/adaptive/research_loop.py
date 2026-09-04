@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 import inspect
@@ -36,6 +36,7 @@ from workflow.deadline import (
 )
 
 from ..schema_loader import LoadedSchema
+from ..utils import get_table_columns
 from .decision_resolver import (
     DecisionExecutionError,
     DecisionResolverError,
@@ -65,6 +66,7 @@ from .models import (
     ResearchState,
     ResearchStopReason,
     SemanticItemKind,
+    SemanticItemStatus,
     TableRef,
 )
 from .policy import (
@@ -1173,6 +1175,7 @@ class _ResearchLoopCoordinator:
                     decision,
                     self._freshness_context,
                     self._preflight_requested_action(state, decision),
+                    loaded_schema=self._loaded_schema,
                 ),
             )
         except UnresolvableModelDecisionError as error:
@@ -1191,6 +1194,7 @@ class _ResearchLoopCoordinator:
                         else ()
                     ),
                     exact_column=error.exact_column,
+                    loaded_schema=self._loaded_schema,
                 ),
             )
         except DuplicateResearchActionError as error:
@@ -1872,8 +1876,59 @@ def _normalize_model_source_ids(
                 changed = True
         proposals.append(proposal)
     if not changed:
+        return _canonicalize_unknown_binding_assessment_reference(state, decision)
+    return _canonicalize_unknown_binding_assessment_reference(
+        state, decision.model_copy(update={"proposals": tuple(proposals)})
+    )
+
+
+def _canonicalize_unknown_binding_assessment_reference(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+) -> ResearchDecisionV1:
+    durable_binding_ids = {binding.binding_id for binding in state.bindings}
+    binding_assessments = tuple(
+        proposal
+        for proposal in decision.proposals
+        if isinstance(proposal, BindingAssessment)
+    )
+    if len(binding_assessments) != 1:
         return decision
-    return decision.model_copy(update={"proposals": tuple(proposals)})
+    unknown = binding_assessments[0]
+    if (
+        not isinstance(unknown.subject, ExistingBindingRef)
+        or unknown.subject.binding_id in durable_binding_ids
+    ):
+        return decision
+    candidate_binding_ids = tuple(
+        binding.binding_id
+        for binding in state.bindings
+        if binding.status is BindingStatus.CANDIDATE
+        and sum(
+            item.status is SemanticItemStatus.PARTIALLY_RESOLVED
+            and binding.binding_id in item.binding_ids
+            for item in state.query_spec.semantic_items
+        )
+        == 1
+    )
+    if len(candidate_binding_ids) != 1:
+        return decision
+    return decision.model_copy(
+        update={
+            "proposals": tuple(
+                proposal.model_copy(
+                    update={
+                        "subject": ExistingBindingRef(
+                            binding_id=candidate_binding_ids[0]
+                        )
+                    }
+                )
+                if proposal is unknown
+                else proposal
+                for proposal in decision.proposals
+            )
+        }
+    )
 
 
 def _rejected_preflight_assessment_context(
@@ -1884,6 +1939,7 @@ def _rejected_preflight_assessment_context(
     *,
     duplicate_existing_binding_ids_by_proposal_key: tuple[tuple[str, str], ...] = (),
     exact_column: ColumnRef | None = None,
+    loaded_schema: LoadedSchema | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Describe rejected proposals and one deterministic missing probe."""
 
@@ -2072,14 +2128,20 @@ def _rejected_preflight_assessment_context(
                     item["existing_evidence_id"] = evidence_ids[0]
                 else:
                     missing_probe = _missing_binding_column_probe(
-                        binding, fresh_evidence, state.action_history
+                        binding,
+                        fresh_evidence,
+                        state.action_history,
+                        loaded_schema=loaded_schema,
                     )
                     if missing_probe is not None:
                         column, probe = missing_probe
                         candidates.append((column, item, probe))
             else:
                 missing_probe = _missing_binding_column_probe(
-                    binding, fresh_evidence, state.action_history
+                    binding,
+                    fresh_evidence,
+                    state.action_history,
+                    loaded_schema=loaded_schema,
                 )
                 if missing_probe is not None:
                     column, probe = missing_probe
@@ -2188,6 +2250,8 @@ def _missing_binding_column_probe(
     binding: object,
     evidence: tuple[EvidenceRecord, ...],
     action_history: tuple[ResearchAction, ...],
+    *,
+    loaded_schema: LoadedSchema | None = None,
 ) -> tuple[ColumnRef, dict[str, object]] | None:
     """Return one exact inspection only when it is provably the missing fact."""
 
@@ -2199,6 +2263,11 @@ def _missing_binding_column_probe(
         columns = binding.input_columns
     else:
         return None
+    def column_is_known(column: ColumnRef) -> bool:
+        return any(
+            evidence_observes_exact_column(record, column) for record in evidence
+        ) or _loaded_schema_observes_exact_column(loaded_schema, column)
+
     try:
         missing = next(
             (
@@ -2212,10 +2281,7 @@ def _missing_binding_column_probe(
                         item.column,
                     ),
                 )
-                if not any(
-                    evidence_observes_exact_column(record, column)
-                    for record in evidence
-                )
+                if not column_is_known(column)
                 and not any(
                     action.kind is ResearchActionKind.INSPECT_COLUMN
                     and action.target == column
@@ -2246,10 +2312,7 @@ def _missing_binding_column_probe(
     try:
         for predicate in binding.predicates:
             column = predicate.left
-            if not any(
-                evidence_observes_exact_column(record, column)
-                for record in evidence
-            ):
+            if not column_is_known(column):
                 return None
             if predicate.operator is PredicateOperator.EQ:
                 values = (predicate.right,)
@@ -2302,6 +2365,24 @@ def _missing_binding_column_probe(
     except ExactValueCertificateError:
         return None
     return None
+
+
+def _loaded_schema_observes_exact_column(
+    loaded_schema: LoadedSchema | None,
+    column: ColumnRef,
+) -> bool:
+    """Return whether the captured schema proves this exact physical column."""
+
+    if not isinstance(loaded_schema, LoadedSchema):
+        return False
+    table_body = loaded_schema.schema.get(_logical_table_name(column.table))
+    if not isinstance(table_body, Mapping):
+        return False
+    try:
+        columns = get_table_columns(table_body)
+    except (TypeError, ValueError):
+        return False
+    return column.column in columns
 
 
 def _missing_join_relationship_probe(

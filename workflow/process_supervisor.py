@@ -688,12 +688,13 @@ class WorkflowProcessSupervisor:
             for _ in range(self._config.global_limit):
                 if not self._running:
                     break
+                claim_now_ms = self._now_ms()
                 claim_value = self._store.claim_next_queued(
                     self._supervisor_id,
                     self._config.global_limit,
                     self._config.per_tenant_limit,
                     self._config.per_owner_limit,
-                    now_ms + self._config.lease_seconds * 1_000,
+                    claim_now_ms + self._config.lease_seconds * 1_000,
                 )
                 if claim_value is None:
                     break
@@ -732,7 +733,7 @@ class WorkflowProcessSupervisor:
                         expected_attempt_generation=claim.attempt_generation,
                     )
                     continue
-                if claim.deadline_at_ms <= now_ms:
+                if claim.deadline_at_ms <= claim_now_ms:
                     self._terminalize(
                         claim.run_id,
                         _terminal_outcome(

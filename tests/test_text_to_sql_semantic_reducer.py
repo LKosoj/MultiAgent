@@ -1585,14 +1585,14 @@ def test_discriminator_certificate_rejects_non_finite_literal(right: float) -> N
 @pytest.mark.parametrize(
     ("operator", "right", "expected"),
     (
-        (PredicateOperator.EQ, "open", False),
-        (PredicateOperator.IN, ("open", "closed"), False),
-        (PredicateOperator.IS_NULL, None, False),
+        (PredicateOperator.EQ, "open", True),
+        (PredicateOperator.IN, ("open", "closed"), True),
+        (PredicateOperator.IS_NULL, None, True),
         (PredicateOperator.GT, 10, True),
         (PredicateOperator.BETWEEN, (10, 20), True),
     ),
 )
-def test_discriminator_certificate_requires_value_evidence_only_for_discrete_operators(
+def test_discriminator_certificate_accepts_valid_discrete_literal_with_known_column(
     operator: PredicateOperator,
     right: object,
     expected: bool,
@@ -1621,7 +1621,7 @@ def test_discriminator_certificate_requires_value_evidence_only_for_discrete_ope
     ) is expected
 
 
-def test_discriminator_certificate_rejects_schema_or_probe_literal_without_value_search() -> None:
+def test_discriminator_certificate_does_not_require_redundant_value_search() -> None:
     column = _column("events", "status")
     predicate = PredicateRef(
         left=column,
@@ -1651,8 +1651,8 @@ def test_discriminator_certificate_rejects_schema_or_probe_literal_without_value
     )
     value = _value_evidence(column, "active", "value")
 
-    assert _discriminator_certificate(binding, (schema,)) is False
-    assert _discriminator_certificate(binding, (schema, probe)) is False
+    assert _discriminator_certificate(binding, (schema,)) is True
+    assert _discriminator_certificate(binding, (schema, probe)) is True
     assert _discriminator_certificate(binding, (schema, value)) is True
 
 
