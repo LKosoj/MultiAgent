@@ -63,6 +63,10 @@ instructions: |-
   denominator; use an independent aggregate or subquery when necessary.
   When the denominator is all base entities, compute it from the base table
   without joins that can discard them.
+  Treat the entity population explicitly named by the question or trusted
+  formula as the denominator population; do not replace it with rows of the
+  table that stores a qualifying attribute. When that attribute exists only
+  in a related table, preserve the relationship back to the named base entity.
   For a ratio or percentage over entities, when a one-to-many join can repeat
   one entity, deduplicate the same entity identity in both numerator and
   denominator. Do not apply this rule to a requested count of joined rows.

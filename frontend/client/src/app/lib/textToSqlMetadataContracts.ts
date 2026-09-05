@@ -120,6 +120,13 @@ function parseGlossaryEntry(value: unknown): TextToSqlGlossaryEntry {
   };
 }
 
+export function parseTextToSqlGlossaryEntries(payload: unknown): TextToSqlGlossaryEntry[] {
+  if (!Array.isArray(payload)) {
+    throw new Error("Invalid Text-to-SQL glossary entries shape");
+  }
+  return payload.map(parseGlossaryEntry);
+}
+
 function parseSemanticFact(value: unknown): TextToSqlSemanticFact {
   if (
     !isRecord(value)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { parseTextToSqlMetadataView } from "../textToSqlMetadataContracts";
+import { parseTextToSqlGlossaryEntries, parseTextToSqlMetadataView } from "../textToSqlMetadataContracts";
 
 // Mirrors the text_to_sql.metadata.load response shape from
 // docs/plans/2026-09-05-text2sql-metadata-editor.md §1.2. The backend for
@@ -221,5 +221,21 @@ describe("parseTextToSqlMetadataView", () => {
     const payload = validPayload();
     mutate(payload);
     expect(() => parseTextToSqlMetadataView(payload)).toThrow();
+  });
+});
+
+describe("parseTextToSqlGlossaryEntries", () => {
+  it("parses the entries returned by save_glossary", () => {
+    const entries = parseTextToSqlGlossaryEntries([
+      { term: "выручка", synonyms: ["revenue"], table: "public.orders", column: "amount", kind: "measure", note: null },
+    ]);
+    expect(entries).toEqual([
+      { term: "выручка", synonyms: ["revenue"], table: "public.orders", column: "amount", kind: "measure", note: null },
+    ]);
+  });
+
+  it("rejects a non-array payload and malformed entries", () => {
+    expect(() => parseTextToSqlGlossaryEntries({})).toThrow("glossary entries shape");
+    expect(() => parseTextToSqlGlossaryEntries([{ term: "x" }])).toThrow("glossary entry shape");
   });
 });

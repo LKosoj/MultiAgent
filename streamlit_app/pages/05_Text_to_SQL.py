@@ -464,6 +464,11 @@ def show_metadata_editor(client: TextToSqlApiClient, *, is_admin: bool) -> None:
         )
 
     st.markdown("### Описания таблиц и колонок")
+    if metadata.editable_file_enabled is False:
+        st.warning(
+            "Файл описаний для этого подключения отключён (enable: false): "
+            "сохранённые описания не попадут в пайплайн, пока файл не будет включён."
+        )
     original_description_rows = _build_description_rows(metadata.tables)
     edited_description_rows = st.data_editor(
         original_description_rows,

@@ -30,6 +30,23 @@ from .schema_namespace import (
 logger = logging.getLogger(__name__)
 
 
+def compute_editable_schema_digest(
+    schema_info: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
+) -> str | None:
+    """Sha256 digest of the raw ``schema_info`` payload (or None if absent).
+
+    Pure extraction of ``SchemaLoader._editable_schema_digest`` so callers
+    outside ``SchemaLoader`` (e.g. the metadata editor) can compute/compare
+    the same digest without needing a loader instance.
+    """
+    if schema_info is None:
+        return None
+    payload = json.dumps(schema_info, ensure_ascii=False, sort_keys=True)
+    import hashlib
+
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True)
 class LoadedSchema:
     schema: Dict[str, Any]
@@ -146,12 +163,7 @@ class SchemaLoader:
     def _editable_schema_digest(
         schema_info: Optional[Dict[str, Dict[str, Dict[str, Any]]]],
     ) -> str | None:
-        if schema_info is None:
-            return None
-        payload = json.dumps(schema_info, ensure_ascii=False, sort_keys=True)
-        import hashlib
-
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return compute_editable_schema_digest(schema_info)
 
     @staticmethod
     def _is_example_value(value: object) -> bool:
@@ -280,18 +292,25 @@ class SchemaLoader:
         # Интроспекция через плагин ТОЛЬКО если файла нет
         return self._introspect_via_plugin(effective_dsn, autosave=autosave)
     
-    def _load_sqlrag_schema(self, dsn: str) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:
-        """Загружает схему из sqlrag/<sanitized>.json.
+    def introspect_live_schema(self, dsn: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+        """Живая интроспекция без побочной записи ``sqlrag/<name>.json``.
 
-        Два разных случая с разными политиками обработки:
+        Публичная точка для потребителей вне модуля (редактор метаданных),
+        которым нужна только текущая схема БД для валидации ввода.
+        """
+        return self._introspect_via_plugin(dsn, autosave=False)
 
-        - Невалидный верхний уровень JSON (не dict): warning + return None —
-          структурно битый файл пропускается, управление передаётся fallback
-          (introspection). Это не ошибка конфигурации пользователя.
+    def load_raw_sqlrag_document(self, dsn: str) -> Optional[Dict[str, Any]]:
+        """Читает sqlrag/<sanitized>.json целиком, без гейта ``enable``.
 
-        - Отсутствие ключа `enable`: fail-fast (ValueError) — пользователь
-          явно создал файл схемы, но забыл указать обязательный ключ; тихий
-          fallback на introspection здесь недопустим.
+        Возвращает весь верхний уровень документа (``enable``/``schema_info``/
+        ``version``/``source``/...) как есть. ``None`` — файла нет, либо его
+        не удалось прочитать/распарсить, либо верхний уровень JSON не dict
+        (структурно битый файл пропускается молча, ровно как раньше делал
+        ``_load_sqlrag_schema``). ``ValueError``, если ключ ``enable``
+        отсутствует — тот же fail-fast контракт, что был у
+        ``_load_sqlrag_schema`` (пользователь явно создал файл схемы, но
+        забыл указать обязательный ключ; тихий fallback здесь недопустим).
         """
         name = dsn_to_sanitized_name(dsn)
         sqlrag_dir = self.repo_root / "sqlrag"
@@ -325,7 +344,17 @@ class SchemaLoader:
             raise ValueError(
                 f"schema_loader: 'enable' key is required in {json_path}"
             )
+        return obj
+
+    def _load_sqlrag_schema(self, dsn: str) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:
+        """Загружает схему из sqlrag/<sanitized>.json (только при enable=true)."""
+        obj = self.load_raw_sqlrag_document(dsn)
+        if obj is None:
+            return None
+
         if not obj.get("enable"):
+            name = dsn_to_sanitized_name(dsn)
+            json_path = self.repo_root / "sqlrag" / f"{name}.json"
             logger.info(
                 "sqlrag schema file %s has enable=false; skipping file and falling back to introspection",
                 json_path,
@@ -588,6 +617,40 @@ class SchemaFileManager:
             if tmp_path.exists():
                 tmp_path.unlink()
     
+    def save_schema_document_atomic(self, dsn: str, document: Dict[str, Any]) -> None:
+        """Атомарно записывает весь документ sqlrag/<sanitized>.json.
+
+        tmp+fsync+os.replace+dir-fsync — тот же паттерн, что
+        ``save_scoped_snapshot``, но в ``get_schema_file_path(dsn)``. Это
+        единственный путь записи для редактора метаданных (в отличие от
+        не атомарного ``save_schema_to_file``, который не переиспользуем
+        для пользовательских правок).
+        """
+        self.ensure_sqlrag_directory()
+        path = self.get_schema_file_path(dsn)
+        payload = json.dumps(document, ensure_ascii=False, indent=2)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(self.sqlrag_dir),
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+                tmp_file.write(payload)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, path)
+            dir_fd = os.open(self.sqlrag_dir, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
+
     def schema_file_exists(self, dsn: str) -> bool:
         """Проверяет существование файла схемы."""
         return self.get_schema_file_path(dsn).exists()

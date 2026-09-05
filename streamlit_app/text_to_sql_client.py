@@ -164,6 +164,8 @@ class SemanticFactSummary:
 class MetadataView:
     connection_ref: str
     schema_digest: Optional[str]
+    # None = файла sqlrag/<dsn>.json ещё нет; False = файл выключен (enable: false)
+    editable_file_enabled: Optional[bool]
     tables: list[TableMetadata]
     glossary_digest: str
     glossary_entries: list[GlossaryEntrySummary]
@@ -683,9 +685,13 @@ class TextToSqlApiClient:
         schema_digest = data.get("schema_digest")
         if schema_digest is not None and not isinstance(schema_digest, str):
             raise TextToSqlApiError("metadata schema_digest must be a string or null")
+        editable_file_enabled = data.get("editable_file_enabled")
+        if editable_file_enabled is not None and not isinstance(editable_file_enabled, bool):
+            raise TextToSqlApiError("metadata editable_file_enabled must be a boolean or null")
         return MetadataView(
             connection_ref=connection_ref,
             schema_digest=schema_digest,
+            editable_file_enabled=editable_file_enabled,
             tables=[
                 _table_metadata(table_fqn, table_payload)
                 for table_fqn, table_payload in tables_raw.items()

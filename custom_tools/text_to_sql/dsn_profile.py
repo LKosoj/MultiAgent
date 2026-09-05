@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -594,6 +595,23 @@ def _parse_nlu_hints(value: Any, path: Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def glossary_entry_to_mapping(entry: GlossaryEntry) -> dict[str, Any]:
+    """Единственное представление ``GlossaryEntry`` как plain dict.
+
+    Используется и при записи yaml, и при подсчёте digest глоссария в
+    редакторе метаданных — иначе новое поле, добавленное в одном месте,
+    разошлось бы с digest в другом.
+    """
+    return {
+        "term": entry.term,
+        "synonyms": list(entry.synonyms),
+        "table": entry.table,
+        "column": entry.column,
+        "kind": entry.kind,
+        "note": entry.note,
+    }
+
+
 def profile_to_mapping(profile: DsnProfile) -> dict[str, Any]:
     """Сериализовать ``DsnProfile`` в plain dict для записи в yaml."""
     return {
@@ -601,17 +619,7 @@ def profile_to_mapping(profile: DsnProfile) -> dict[str, Any]:
         "dsn_fingerprint": profile.dsn_fingerprint,
         "schema_namespace_version": profile.schema_namespace_version,
         "captured_at": profile.captured_at,
-        "glossary": [
-            {
-                "term": entry.term,
-                "synonyms": list(entry.synonyms),
-                "table": entry.table,
-                "column": entry.column,
-                "kind": entry.kind,
-                "note": entry.note,
-            }
-            for entry in profile.glossary
-        ],
+        "glossary": [glossary_entry_to_mapping(entry) for entry in profile.glossary],
         "aliases": {key: list(values) for key, values in profile.aliases.items()},
         "type_hints": {key: list(values) for key, values in profile.type_hints.items()},
         "metric_hints": {
@@ -657,6 +665,43 @@ def dump_profile_yaml(profile: DsnProfile) -> str:
     )
 
 
+def save_dsn_profile_atomic(profile: DsnProfile, dsn: str) -> None:
+    """Атомарно записывает ``profile`` в ``dsn_profile_path(dsn)``.
+
+    tmp+fsync+os.replace+dir-fsync (тот же паттерн, что
+    ``SchemaFileManager.save_scoped_snapshot``), используя уже существующую
+    сериализацию ``dump_profile_yaml`` — не дублирует её. После записи
+    сбрасывает кэш модуля (``reset_cache()``), чтобы последующий
+    ``load_dsn_profile`` гарантированно перечитал файл, не полагаясь на
+    разрешение ``mtime`` файловой системы.
+    """
+    path = dsn_profile_path(dsn)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = dump_profile_yaml(profile)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(payload)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+        dir_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    reset_cache()
+
+
 __all__ = [
     "GlossaryEntry",
     "PreferIdOverNameRule",
@@ -668,5 +713,7 @@ __all__ = [
     "load_dsn_profile_or_empty",
     "reset_cache",
     "profile_to_mapping",
+    "glossary_entry_to_mapping",
     "dump_profile_yaml",
+    "save_dsn_profile_atomic",
 ]

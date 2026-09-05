@@ -390,6 +390,182 @@ def test_replace_dsn_glossary_facts_replaces_set_and_keeps_file_facts(
     assert manager.find_approved_semantic_facts(("invoice",), namespace) == [file_fact]
 
 
+# ---------------------------------------------------------------------------
+# Metadata editor — typed_probe fact status override (2026-09-05 design)
+# ---------------------------------------------------------------------------
+
+
+def _install_fake_memory_tools(monkeypatch, saved: list[dict]) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+
+
+def test_rejected_typed_probe_fact_disappears_from_find_approved_semantic_facts(
+    monkeypatch, tmp_path
+) -> None:
+    """A typed_probe fact explicitly rejected via the override mechanism must
+    stop being returned by find_approved_semantic_facts (§0/§2.4 of the
+    metadata editor design: typed_probe facts have no replace-snapshot, so
+    this override is their only revocation path)."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+    from custom_tools.text_to_sql.schema_memory_sqlite import _semantic_fact_key
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+    _install_fake_memory_tools(monkeypatch, saved)
+    manager = SchemaMemoryManager(tmp_path)
+
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="example",
+        value="199.99",
+        source="typed_probe",
+        status="approved",
+    )
+    manager.save_approved_semantic_facts(namespace, (fact,))
+    assert manager.find_approved_semantic_facts(("199.99",), namespace) == [fact]
+
+    fact_key = _semantic_fact_key(fact)
+    manager.set_semantic_fact_status_override(namespace, fact_key, "rejected")
+
+    assert manager.find_approved_semantic_facts(("199.99",), namespace) == []
+
+
+def test_status_override_is_idempotent_and_reversible(monkeypatch, tmp_path) -> None:
+    """Repeating the same override is a no-op (no duplicate records), and a
+    later override on the same fact_key replaces the effective status."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+    from custom_tools.text_to_sql.schema_memory_sqlite import _semantic_fact_key
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+    _install_fake_memory_tools(monkeypatch, saved)
+    manager = SchemaMemoryManager(tmp_path)
+
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="example",
+        value="42",
+        source="typed_probe",
+        status="approved",
+    )
+    manager.save_approved_semantic_facts(namespace, (fact,))
+    fact_key = _semantic_fact_key(fact)
+
+    manager.set_semantic_fact_status_override(namespace, fact_key, "rejected")
+    manager.set_semantic_fact_status_override(namespace, fact_key, "rejected")
+    override_records = [
+        record
+        for record in saved
+        if record["cache_kind"] == "schema_semantic_fact_status_override"
+    ]
+    assert len(override_records) == 1
+
+    assert manager.find_approved_semantic_facts(("42",), namespace) == []
+
+    manager.set_semantic_fact_status_override(namespace, fact_key, "approved")
+    assert manager.find_approved_semantic_facts(("42",), namespace) == [fact]
+
+
+def test_list_semantic_facts_returns_typed_probe_facts_without_term_filter(
+    monkeypatch, tmp_path
+) -> None:
+    """list_semantic_facts returns every current typed_probe fact (no term
+    filter, unlike find_approved_semantic_facts) paired with its effective
+    status after overrides."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+    from custom_tools.text_to_sql.schema_memory_sqlite import _semantic_fact_key
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+    _install_fake_memory_tools(monkeypatch, saved)
+    manager = SchemaMemoryManager(tmp_path)
+
+    kept_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="example",
+        value="1",
+        source="typed_probe",
+        status="approved",
+    )
+    rejected_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="example",
+        value="2",
+        source="typed_probe",
+        status="approved",
+    )
+    file_fact = SemanticFact(
+        subject="table",
+        table_fqn="public.orders",
+        fact_kind="description",
+        value="Orders table",
+        source="file",
+        status="approved",
+    )
+    manager.save_approved_semantic_facts(namespace, (kept_fact, rejected_fact))
+    manager.replace_file_semantic_facts(namespace, (file_fact,))
+    manager.set_semantic_fact_status_override(
+        namespace, _semantic_fact_key(rejected_fact), "rejected"
+    )
+
+    results = manager.list_semantic_facts(namespace)
+
+    assert set(results) == {(kept_fact, "approved"), (rejected_fact, "rejected")}
+    # source filter excludes file facts by default (only typed_probe).
+    assert file_fact not in [fact for fact, _status in results]
+
+
 def test_replace_file_semantic_facts_replaces_set_and_keeps_glossary_facts(
     monkeypatch, tmp_path
 ) -> None:

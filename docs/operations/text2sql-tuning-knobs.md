@@ -36,6 +36,7 @@ text-to-sql — **без изменения логики**. Документ ф�
 6. [LLM safety audit](#6-llm-safety-audit-советующий-аудит-sql-перед-выполнением)
 7. [DSN-профиль](#7-dsn-профиль-w1-12)
 8. [Глоссарий DSN](#8-глоссарий-dsn-w2-22)
+8а. [Редактор метаданных (UI)](#8а-редактор-метаданных-ui)
 9. [Память успешных SQL](#9-память-успешных-sql-w2-23)
 10. [RRF в каталоге схемы](#10-rrf-в-каталоге-схемы-w3-31)
 11. [Подсказка код↔метка](#11-подсказка-кодметка-w3-32)
@@ -656,6 +657,66 @@ scoped-снапшота схемы, поэтому строки «Синоним
 следующее чтение (`find_approved_semantic_facts`) увидит неполный или
 пустой набор глоссария до следующего успешного вызова
 `replace_dsn_glossary_facts` — это не откатывается автоматически.
+
+---
+
+## 8а. Редактор метаданных (UI)
+
+`custom_tools/text_to_sql/metadata_editor.py` — оркестрация backend-действий
+для UI-редактора описаний таблиц/колонок, глоссария и статуса семантических
+фактов. Это не «ручка настройки пайплайна» в смысле остального документа
+(нет env-переменных/констант с диапазоном), а справочник по четырём
+AG-UI service actions (`backend/fastapi_app/agui/service.py::handle_service_action`,
+раздел `"text_to_sql.metadata.*"`) и связанным инвариантам — оператору
+полезно знать, что дёргает файлы `sqlrag/`, прежде чем чинить кэш руками.
+
+| Действие | Права | Что делает |
+|---|---|---|
+| `text_to_sql.metadata.load` | любой пользователь с доступом к `connection_ref` | Отдаёт живую схему (обязательна доступная БД — валидация только через `SchemaLoader.load_scoped_schema`, «legacy»-путь `get_database_schema` не используется), описания/примеры из `sqlrag/<dsn>.json`, секцию `glossary` из `sqlrag/<dsn>.profile.yaml` и факты `source="typed_probe"` со статусом approved/rejected. |
+| `text_to_sql.metadata.save_descriptions` | только роль `admin` | Частичное (read-modify-write) обновление описаний таблиц/колонок и примеров в `sqlrag/<dsn>.json`; `null` = не трогать поле, `""` = явно очистить. Пишет атомарно (tmp + fsync + `os.replace`, тот же приём, что `SchemaFileManager.save_scoped_snapshot`). |
+| `text_to_sql.metadata.save_glossary` | только роль `admin` | Полная замена списка `glossary` в `sqlrag/<dsn>.profile.yaml` (не патч по одной записи). Если файла профиля ещё нет — создаёт его с identity-полями (`dsn_fingerprint`, `schema_namespace_version`, `captured_at`), остальные секции (`aliases`/`metric_hints`/`nlu_hints`/…) не трогает. |
+| `text_to_sql.metadata.set_fact_status` | только роль `admin` | Единственный способ «отклонить» (`rejected`) конкретный `typed_probe`-факт — см. ниже, почему это отдельный механизм. |
+
+**Почему запись — только `admin`.** Метаданные общие для всех пользователей
+DSN (как и `apply_dsn_glossary`/`replace_file_semantic_facts`, которые тоже
+применяются глобально к namespace, а не к одному пользователю). Три
+write-действия сознательно добавлены только в `_ALL_SERVICE_ACTIONS` (не в
+`_USER_ACTIONS`), поэтому автоматически попадают в `_ADMIN_ONLY_ACTIONS`
+(`_ALL_SERVICE_ACTIONS - _USER_ACTIONS - ...`) — плюс defense-in-depth: явная
+проверка `principal.has_role("admin")` внутри самого обработчика.
+
+**Самообслуживаемая инвалидация — ничего руками сбрасывать не нужно** (см.
+§0 плана `docs/plans/2026-09-05-text2sql-metadata-editor.md`):
+- правка `sqlrag/<dsn>.json` меняет `editable_schema_digest` → следующий
+  `load_scoped_schema` сам считает файл устаревшим и перестраивает снапшот;
+- правка `sqlrag/<dsn>.profile.yaml` меняет `mtime_ns`/`size` → кэш
+  `load_dsn_profile()` (ключ `(path, mtime_ns, size)`) и `env_fingerprint`
+  schema-linking кэша (`SchemaCacheManager.prepare_cache_info`) сами считают
+  предыдущее значение устаревшим;
+- факты `source in {"file", "dsn_glossary"}` пересохраняются заново на
+  каждый прогон исследования (replace-семантика) — старые версии сами
+  перестают быть видны `find_approved_semantic_facts`.
+
+**Единственное исключение — статус `typed_probe`-фактов.** У них нет
+replace-набора (факт сохраняется один раз при типизированном исследовании и
+не пересоздаётся), поэтому `set_fact_status` пишет отдельную запись-оверрайд
+(`cache_kind="schema_semantic_fact_status_override"`,
+`custom_tools/text_to_sql/schema_memory_sqlite.py::set_semantic_fact_status_override`)
+поверх исходного факта, а не мутирует сам факт — это единственное место в
+редакторе метаданных, где инвалидация не самообслуживается и требует
+отдельного кода.
+
+Оптимистическая блокировка (защита от «два администратора одновременно
+правят одно и то же»): `save_descriptions`/`save_glossary` принимают
+`expected_schema_digest`/`expected_glossary_digest` из последнего `load` и
+сравнивают с текущим digest файла на момент записи; при расхождении —
+`SchemaMetadataConflictError` (подкласс `ValueError`), UI должен предложить
+перезагрузить метаданные. `set_fact_status` — идемпотентный тумблер без
+токена версии (approved/rejected), конкурентная запись не создаёт
+конфликта — см. открытый вопрос в §7 плана.
+
+Контракт payload/ответов каждого действия — `docs/text_to_sql_contracts.md`,
+раздел «4. Контракт действий редактирования метаданных».
 
 ---
 

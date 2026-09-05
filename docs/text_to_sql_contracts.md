@@ -94,3 +94,130 @@
    - `tests/test_text_to_sql_contracts_documented.py` — каждый `contract_name`
      из `custom_tools/text_to_sql/adaptive/models.py` упомянут в этом
      документе (и наоборот — в документе нет несуществующих имён).
+
+## 4. Контракт действий редактирования метаданных (`text_to_sql.metadata.*`)
+
+Четыре стандартных AG-UI service actions
+(`backend/fastapi_app/agui/service.py::handle_service_action`, тот же
+транспорт, что у `text_to_sql.schema.load`). Ошибки — обычные исключения
+(`ValueError`/`PermissionError`/подклассы), их заворачивает существующий слой
+AG-UI в конверт `{ok: false, error: str(exc)}`.
+
+Реализация — `custom_tools/text_to_sql/metadata_editor.py`. Права доступа и
+самообслуживаемая инвалидация кэшей описаны в
+`docs/operations/text2sql-tuning-knobs.md`, раздел «8а. Редактор метаданных
+(UI)».
+
+### 4.1 `text_to_sql.metadata.load`
+
+Payload: `{ "connection_ref": "conn-..." }` (обязательно; «сырой» dsn не
+поддерживается).
+
+Ответ:
+```jsonc
+{
+  "connection_ref": "conn-...",
+  "dsn_dialect": "postgresql",
+  "schema_digest": "sha256hex" | null,
+  "editable_file_enabled": true | false | null,
+  "tables": {
+    "<table_fqn>": {
+      "description": "...",
+      "description_source": "file" | "none",
+      "columns": {
+        "<column_name>": {
+          "type": "text",
+          "description": "...",
+          "description_source": "file" | "none",
+          "examples": ["..."],
+          "examples_source": "file" | "none"
+        }
+      }
+    }
+  },
+  "glossary": {
+    "digest": "sha256hex",
+    "profile_exists": true | false,
+    "dsn_fingerprint": "postgresql://host:5432/db" | null,
+    "schema_namespace_version": "sha256hex" | null,
+    "entries": [
+      { "term": "...", "synonyms": ["..."], "table": "...", "column": "..." | null,
+        "kind": "dimension" | "measure" | "filter_value" | "entity" | null,
+        "note": "..." | null }
+    ]
+  },
+  "facts": [
+    { "fact_key": "text2sql-semantic-fact-v1-...", "subject": "table" | "column",
+      "table_fqn": "...", "column": "..." | null,
+      "fact_kind": "description" | "example" | "glossary_term",
+      "value": "...", "status": "approved" | "rejected" }
+  ]  // только source == "typed_probe"
+}
+```
+
+Права: любой принципал с доступом к `connection_ref` (та же проверка, что и
+`text_to_sql.schema.load`).
+
+### 4.2 `text_to_sql.metadata.save_descriptions`
+
+Payload:
+```jsonc
+{
+  "connection_ref": "conn-...",
+  "expected_schema_digest": "sha256hex" | null,
+  "tables": [
+    {
+      "table_fqn": "public.orders",
+      "description": "..." | null,     // null/отсутствует = не менять, "" = очистить
+      "columns": [
+        { "column": "status", "description": "..." | null, "examples": ["..."] | null }
+      ]
+    }
+  ]
+}
+```
+
+Ответ: `{ "saved": true, "schema_digest": "sha256hex" }`.
+
+Права: только роль `admin`. Частичное обновление (read-modify-write):
+меняются только присланные поля, остальное содержимое файла — без изменений.
+Лимиты: ≤ 500 таблиц и ≤ 200 колонок за вызов, описание таблицы ≤ 2000
+символов, описание колонки ≤ 1000 символов, ≤ 20 примеров на колонку.
+Несовпадение `expected_schema_digest` с текущим digest файла →
+`SchemaMetadataConflictError` (подкласс `ValueError`).
+
+### 4.3 `text_to_sql.metadata.save_glossary`
+
+Payload:
+```jsonc
+{
+  "connection_ref": "conn-...",
+  "expected_glossary_digest": "sha256hex",   // для отсутствующего профиля — sha256([])
+  "entries": [
+    { "term": "выручка", "synonyms": ["revenue", "оборот"], "table": "public.orders",
+      "column": "amount" | null, "kind": "measure" | null, "note": "..." | null }
+  ]
+}
+```
+
+Ответ: `{ "saved": true, "glossary_digest": "sha256hex", "entries": [...] }` —
+`entries` возвращаются в том виде, в каком сохранены (обрезанные пробелы,
+дедуплицированные синонимы), чтобы UI показывал сохранённое состояние без
+повторной загрузки.
+
+Права: только роль `admin`. Семантика — **полная замена** списка `glossary`
+целиком (не патч по одной записи). Лимиты: ≤ 500 записей, `term`/`synonyms`
+≤ 200 символов, `note` ≤ 2000 символов. Несовпадение
+`expected_glossary_digest` → `SchemaMetadataConflictError`.
+
+### 4.4 `text_to_sql.metadata.set_fact_status`
+
+Payload: `{ "connection_ref": "conn-...", "fact_key": "text2sql-semantic-fact-v1-...", "status": "approved" | "rejected" }`.
+
+Ответ: `{ "saved": true, "fact_key": "...", "status": "rejected" }`.
+
+Права: только роль `admin`. Действует только на факты `source ==
+"typed_probe"` (описания/примеры из файла и термины глоссария уже
+редактируются через 4.2/4.3). Неизвестный `fact_key` или факт не
+`typed_probe` → `ValueError`. Без токена оптимистической блокировки — это
+идемпотентный тумблер.

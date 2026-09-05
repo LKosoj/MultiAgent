@@ -527,6 +527,131 @@ def test_result_review_rejects_ratio_multiplied_by_one_to_many_join() -> None:
     assert receipt.source_id == "source-1"
 
 
+def test_result_review_rejects_related_rows_as_named_entity_population() -> None:
+    account_event_join = inner_join("accounts", "id", "status_events", "account_id")
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="account-population",
+                kind=SemanticItemKind.DIMENSION,
+                table="accounts",
+                column="id",
+            ),
+            ItemSpec(
+                source_id="active-status",
+                kind=SemanticItemKind.FILTER,
+                table="status_events",
+                column="status",
+                operator=PredicateOperator.EQ,
+                literal="active",
+                join_path=(account_event_join,),
+            ),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": (
+                        "What percentage of all accounts have an active status event?"
+                    )
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    sql = (
+        "SELECT CAST(SUM(CASE WHEN e.status = 'active' THEN 1 ELSE 0 END) AS REAL) "
+        "/ COUNT(*) FROM status_events e"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-related-row-ratio")
+    candidate = SqlCandidate(
+        candidate_id="terminal-related-row-ratio",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = " ".join(payload["instruction"].split())
+        has_rule = all(
+            clause in instruction
+            for clause in (
+                "entity population explicitly named by the question",
+                "table that stores a qualifying attribute",
+                "relationship back to the named base entity",
+            )
+        )
+        has_population_binding = any(
+            binding["source_id"] == "account-population"
+            and binding["physical_column"]["table"]["table"] == "accounts"
+            for binding in payload["bindings"]
+        )
+        has_related_filter = any(
+            binding["source_id"] == "active-status" and binding["join_path"]
+            for binding in payload["bindings"]
+        )
+        sql_uses_only_related_rows = (
+            "status_events" in payload["sql"] and "accounts" not in payload["sql"]
+        )
+        if not (
+            has_rule
+            and has_population_binding
+            and has_related_filter
+            and sql_uses_only_related_rows
+        ):
+            return json.dumps(
+                {"status": "consistent", "reason": "the percentage executed"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "the SQL counts status-event rows instead of all accounts",
+                "source_id": "account-population",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(),
+        schema={
+            "accounts": "one row per account",
+            "status_events": "status events related to accounts",
+        },
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[0.5]]),
+            "columns": ["percentage"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id == "account-population"
+
+
 def test_result_review_does_not_require_both_alternative_endpoints_for_one_output() -> None:
     join_path = (inner_join("items", "id", "relations", "left_id"),)
     state = build_state(

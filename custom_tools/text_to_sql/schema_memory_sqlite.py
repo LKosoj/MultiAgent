@@ -26,6 +26,7 @@ import logging
 import sqlite3
 import threading
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence
@@ -76,7 +77,7 @@ class SemanticFact(BaseModel):
     fact_kind: Literal["description", "example", "glossary_term"]
     value: str | int | float | bool | None
     source: Literal["file", "typed_probe", "dsn_glossary"]
-    status: Literal["approved", "candidate"]
+    status: Literal["approved", "candidate", "rejected"]
     kind: Literal["dimension", "measure", "filter_value", "entity"] | None = None
     note: str | None = None
 
@@ -169,6 +170,25 @@ def _semantic_file_snapshot_key(source_digest: str, *, source: str = "file") -> 
     return f"text2sql-semantic-{source}-snapshot-v1-" + source_digest.removeprefix(
         "sha256:"
     )
+
+
+def _semantic_fact_status_override_key(fact_key: str) -> str:
+    """Cache key for a status-override record targeting ``fact_key``."""
+    return f"text2sql-semantic-fact-status-v1-{fact_key}"
+
+
+@dataclass(frozen=True)
+class _FactCandidate:
+    """One semantic fact record that survived source-snapshot replacement.
+
+    Shared result type between ``_scan_semantic_fact_candidates`` and its two
+    callers (``find_approved_semantic_facts``, ``list_semantic_facts``).
+    """
+
+    fact: SemanticFact
+    key: str
+    step: int
+    source_digest: str
 
 
 def _probe_fact_key(fact: dict[str, Any]) -> str:
@@ -1711,23 +1731,21 @@ class SchemaMemoryManager:
                 _approved_semantic_facts_from_probe_fact(fact),
             )
 
-    def find_approved_semantic_facts(
-        self,
-        terms: Sequence[str],
+    @staticmethod
+    def _scan_semantic_fact_candidates(
         namespace: SchemaNamespace,
-    ) -> List[SemanticFact]:
-        """Read matching approved facts from one exact schema namespace."""
+    ) -> List["_FactCandidate"]:
+        """Read+filter every currently-live approved fact record of a namespace.
+
+        Shared "record -> surviving approved fact" plumbing between
+        ``find_approved_semantic_facts`` (which additionally scores by
+        search terms) and ``list_semantic_facts`` (which returns every fact
+        of given sources with no term filter). Neither the search-term score
+        nor status-override application belongs here — both are applied by
+        the two callers on top of this shared candidate set.
+        """
         if not isinstance(namespace, SchemaNamespace):
             raise TypeError("namespace must be SchemaNamespace")
-        normalized_terms = tuple(
-            dict.fromkeys(
-                term.casefold()
-                for term in terms
-                if isinstance(term, str) and term.strip()
-            )
-        )
-        if not normalized_terms:
-            return []
         from memory.tools import get_memory, memory_requester_context
 
         with memory_requester_context("Schema-RAG-Agent"):
@@ -1751,7 +1769,7 @@ class SchemaMemoryManager:
         latest_snapshot: dict[str, tuple[int, str] | None] = {
             source: None for source in snapshot_marker_fields
         }
-        candidates: list[tuple[int, str, int, str, SemanticFact]] = []
+        candidates: list[tuple[int, str, str, SemanticFact]] = []
         for sequence, record in enumerate(records):
             data = record.get("data") if isinstance(record, dict) else None
             if (
@@ -1789,14 +1807,10 @@ class SchemaMemoryManager:
             key = data.get("cache_key")
             if not isinstance(key, str) or key != _semantic_fact_key(fact):
                 continue
-            rendered = json.dumps(
-                _semantic_fact_dump(fact), ensure_ascii=False, sort_keys=True
-            ).casefold()
             candidates.append(
                 (
-                    sum(term in rendered for term in normalized_terms),
-                    key,
                     sequence_or_step,
+                    key,
                     data.get("source_digest") if isinstance(data.get("source_digest"), str) else key,
                     fact,
                 )
@@ -1804,7 +1818,7 @@ class SchemaMemoryManager:
         latest_fact_source: dict[str, dict[tuple[str, str, str | None, str], tuple[int, str]]] = {
             source: {} for source in snapshot_marker_fields
         }
-        for _score, _key, step, source_digest, fact in candidates:
+        for step, _key, source_digest, fact in candidates:
             if fact.source not in latest_fact_source:
                 continue
             identity = (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
@@ -1822,12 +1836,169 @@ class SchemaMemoryManager:
             return source_digest == latest_fact_source[fact.source][identity][1]
 
         return [
-            fact
-            for _score, _key, _step, source_digest, fact in sorted(
-                candidates, key=lambda item: (-item[0], item[1])
-            )
-            if _score and _survives_replacement(fact, source_digest)
+            _FactCandidate(fact=fact, key=key, step=step, source_digest=source_digest)
+            for step, key, source_digest, fact in candidates
+            if _survives_replacement(fact, source_digest)
         ]
+
+    @staticmethod
+    def _latest_semantic_fact_status_overrides(
+        namespace: SchemaNamespace,
+    ) -> dict[str, str]:
+        """Latest override status per overridden ``fact_key`` in one namespace.
+
+        Overrides are append-only records under
+        ``cache_kind="schema_semantic_fact_status_override"`` (written by
+        ``set_semantic_fact_status_override``); the most recent one (by
+        ``sequence_or_step``) wins for a given ``fact_key``.
+        """
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        from memory.tools import get_memory, memory_requester_context
+
+        with memory_requester_context("Schema-RAG-Agent"):
+            records = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_semantic_fact_status_override",
+                requesting_agent="Schema-RAG-Agent",
+            )
+        latest: dict[str, tuple[int, str]] = {}
+        for sequence, record in enumerate(records):
+            data = record.get("data") if isinstance(record, dict) else None
+            if (
+                not isinstance(data, dict)
+                or data.get("schema_version") != namespace.version_key
+            ):
+                continue
+            overridden_fact_key = data.get("overridden_fact_key")
+            status = data.get("status")
+            if not isinstance(overridden_fact_key, str) or status not in (
+                "approved",
+                "rejected",
+            ):
+                continue
+            step = record.get("step") if isinstance(record, dict) else None
+            sequence_or_step = step if isinstance(step, int) else sequence
+            previous = latest.get(overridden_fact_key)
+            if previous is None or sequence_or_step > previous[0]:
+                latest[overridden_fact_key] = (sequence_or_step, status)
+        return {key: status for key, (_step, status) in latest.items()}
+
+    def find_approved_semantic_facts(
+        self,
+        terms: Sequence[str],
+        namespace: SchemaNamespace,
+    ) -> List[SemanticFact]:
+        """Read matching, non-rejected approved facts from one schema namespace."""
+        normalized_terms = tuple(
+            dict.fromkeys(
+                term.casefold()
+                for term in terms
+                if isinstance(term, str) and term.strip()
+            )
+        )
+        if not normalized_terms:
+            return []
+        candidates = self._scan_semantic_fact_candidates(namespace)
+        overrides = self._latest_semantic_fact_status_overrides(namespace)
+        scored: list[tuple[int, str, SemanticFact]] = []
+        for candidate in candidates:
+            if overrides.get(candidate.key) == "rejected":
+                continue
+            rendered = json.dumps(
+                _semantic_fact_dump(candidate.fact), ensure_ascii=False, sort_keys=True
+            ).casefold()
+            score = sum(term in rendered for term in normalized_terms)
+            if score:
+                scored.append((score, candidate.key, candidate.fact))
+        return [
+            fact
+            for _score, _key, fact in sorted(scored, key=lambda item: (-item[0], item[1]))
+        ]
+
+    def list_semantic_facts(
+        self,
+        namespace: SchemaNamespace,
+        *,
+        sources: frozenset[str] = frozenset({"typed_probe"}),
+    ) -> list[tuple[SemanticFact, Literal["approved", "rejected"]]]:
+        """All current facts of ``sources`` in one namespace, with effective status.
+
+        Unlike ``find_approved_semantic_facts`` there is no search-term
+        filter — every surviving fact of the requested sources is returned,
+        paired with its effective status after applying any
+        ``set_semantic_fact_status_override`` record.
+        """
+        candidates = self._scan_semantic_fact_candidates(namespace)
+        overrides = self._latest_semantic_fact_status_overrides(namespace)
+        result: list[tuple[SemanticFact, Literal["approved", "rejected"]]] = []
+        for candidate in candidates:
+            if candidate.fact.source not in sources:
+                continue
+            effective_status = overrides.get(candidate.key, "approved")
+            if effective_status not in ("approved", "rejected"):
+                effective_status = "approved"
+            result.append((candidate.fact, effective_status))
+        return result
+
+    def set_semantic_fact_status_override(
+        self,
+        namespace: SchemaNamespace,
+        fact_key: str,
+        status: Literal["approved", "rejected"],
+    ) -> None:
+        """Record an explicit approved/rejected override for ``fact_key``.
+
+        Writes a small, standalone override record (not a ``SemanticFact``)
+        rather than mutating the original fact record — the override targets
+        the original fact's identity (``fact_key``, computed the same way
+        ``save_approved_semantic_facts`` computed it) so the original
+        append-only audit record is never touched, and a repeated call with
+        the same status is a no-op (manual existence check before insert,
+        mirroring ``save_approved_semantic_facts``'s own dedup idiom —
+        ``save_memory``'s built-in dedup only covers
+        ``SEMANTIC_CACHE_KINDS``, which this cache_kind is not part of).
+        """
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        if not isinstance(fact_key, str) or not fact_key.strip():
+            raise ValueError("fact_key must be a non-empty string")
+        if status not in ("approved", "rejected"):
+            raise ValueError("status must be 'approved' or 'rejected'")
+        from memory.tools import get_memory, memory_requester_context, save_memory
+
+        override_key = _semantic_fact_status_override_key(fact_key)
+        with memory_requester_context("Schema-RAG-Agent"):
+            existing = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_semantic_fact_status_override",
+                cache_key=override_key,
+                requesting_agent="Schema-RAG-Agent",
+            )
+        if any(
+            isinstance(record, dict)
+            and isinstance(record.get("data"), dict)
+            and record["data"].get("overridden_fact_key") == fact_key
+            and record["data"].get("status") == status
+            for record in existing
+        ):
+            return
+        saved_step = save_memory(
+            session_id=namespace.version_key,
+            agent_name="Schema-RAG-Agent",
+            data={
+                "cache_kind": "schema_semantic_fact_status_override",
+                "cache_key": override_key,
+                "cache_source": "metadata_editor",
+                "schema_version": namespace.version_key,
+                "overridden_fact_key": fact_key,
+                "status": status,
+            },
+        )
+        if type(saved_step) is not int or saved_step < 0:
+            raise SchemaIndexingError("semantic fact status override was not persisted")
 
     def save_approved_semantic_facts(
         self,

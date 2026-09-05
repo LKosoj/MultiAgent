@@ -207,6 +207,10 @@ _ALL_SERVICE_ACTIONS = frozenset(
         "text_to_sql.history.append",
         "text_to_sql.history.clear",
         "text_to_sql.history.list",
+        "text_to_sql.metadata.load",
+        "text_to_sql.metadata.save_descriptions",
+        "text_to_sql.metadata.save_glossary",
+        "text_to_sql.metadata.set_fact_status",
         "text_to_sql.schema.load",
         "tools.active_runs",
         "tools.cleanup",
@@ -255,6 +259,7 @@ _USER_ACTIONS = frozenset(
         "text_to_sql.history.append",
         "text_to_sql.history.clear",
         "text_to_sql.history.list",
+        "text_to_sql.metadata.load",
         "text_to_sql.schema.load",
         "utils.base64.decode",
         "utils.base64.encode",
@@ -4478,6 +4483,87 @@ def handle_service_action(
         finally:
             plugin.close(conn)
         return {"schema": _serialize(schema), "source": "db", "warnings": warnings}
+    if action in (
+        "text_to_sql.metadata.load",
+        "text_to_sql.metadata.save_descriptions",
+        "text_to_sql.metadata.save_glossary",
+        "text_to_sql.metadata.set_fact_status",
+    ):
+        connection_ref = payload.get("connection_ref")
+        if not isinstance(connection_ref, str) or not connection_ref:
+            raise ValueError("connection_ref is required")
+        record, dsn = _resolve_text_to_sql_connection_with_record(
+            connection_ref, principal
+        )
+        if action != "text_to_sql.metadata.load" and not principal.has_role("admin"):
+            # Defense-in-depth: the action is already admin-only via
+            # _ALL_SERVICE_ACTIONS/_ADMIN_ONLY_ACTIONS classification, checked
+            # by _require_service_action_role before dispatch; this mirrors
+            # db.connections.register/delete's own explicit re-check.
+            raise PermissionError(f"{action} requires role admin")
+        scope_mapping = _trusted_text_to_sql_schema_scope(
+            record, principal, run_id="metadata-editor", dsn=dsn
+        )
+        from custom_tools.text_to_sql import metadata_editor
+        from custom_tools.text_to_sql.dsn_profile import glossary_entry_to_mapping
+
+        if action == "text_to_sql.metadata.load":
+            view = metadata_editor.load_metadata_view(
+                project_root=_project_root(),
+                connection_ref=connection_ref,
+                dsn=dsn,
+                scope_mapping=scope_mapping,
+            )
+            return metadata_editor.metadata_view_to_mapping(view)
+        if action == "text_to_sql.metadata.save_descriptions":
+            table_edits = metadata_editor.parse_table_description_edits(
+                payload.get("tables")
+            )
+            expected_schema_digest = payload.get("expected_schema_digest")
+            if expected_schema_digest is not None and not isinstance(
+                expected_schema_digest, str
+            ):
+                raise ValueError("expected_schema_digest must be a string or null")
+            new_schema_digest = metadata_editor.save_table_descriptions(
+                project_root=_project_root(),
+                dsn=dsn,
+                expected_schema_digest=expected_schema_digest,
+                table_edits=table_edits,
+            )
+            return {"saved": True, "schema_digest": new_schema_digest}
+        if action == "text_to_sql.metadata.save_glossary":
+            entries = metadata_editor.parse_glossary_entries(payload.get("entries"))
+            expected_glossary_digest = payload.get("expected_glossary_digest")
+            if not isinstance(expected_glossary_digest, str):
+                raise ValueError("expected_glossary_digest is required")
+            saved_glossary = metadata_editor.save_glossary(
+                project_root=_project_root(),
+                dsn=dsn,
+                expected_glossary_digest=expected_glossary_digest,
+                entries=entries,
+            )
+            return {
+                "saved": True,
+                "glossary_digest": saved_glossary.digest,
+                "entries": [
+                    glossary_entry_to_mapping(entry) for entry in saved_glossary.entries
+                ],
+            }
+        # action == "text_to_sql.metadata.set_fact_status"
+        fact_key = payload.get("fact_key")
+        if not isinstance(fact_key, str) or not fact_key:
+            raise ValueError("fact_key is required")
+        status = payload.get("status")
+        if status not in ("approved", "rejected"):
+            raise ValueError("status must be 'approved' or 'rejected'")
+        metadata_editor.set_fact_status(
+            project_root=_project_root(),
+            dsn=dsn,
+            scope_mapping=scope_mapping,
+            fact_key=fact_key,
+            status=status,
+        )
+        return {"saved": True, "fact_key": fact_key, "status": status}
     if action == "db.test_configs.list":
         configs = _load_db_test_configs()
         return {

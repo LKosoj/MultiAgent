@@ -499,6 +499,8 @@ def test_prompt_keeps_ratio_denominator_in_its_own_row_scope() -> None:
     assert "must not reduce the denominator" in normalized_instructions
     assert "all base entities" in normalized_instructions
     assert "base table without joins that can discard them" in normalized_instructions
+    assert "entity population explicitly named by the question" in normalized_instructions
+    assert "table that stores a qualifying attribute" in normalized_instructions
     assert "multiple scalar values for one answer" in normalized_instructions
     assert "columns of one row rather than UNION rows" in normalized_instructions
     assert "unless separate rows are explicitly requested" in normalized_instructions

@@ -2318,6 +2318,255 @@ def test_text_to_sql_schema_load_rejects_non_boolean_fallback_flag(monkeypatch):
         )
 
 
+# ---------------------------------------------------------------------------
+# text_to_sql.metadata.* (2026-09-05 metadata editor design)
+# ---------------------------------------------------------------------------
+
+
+class _MetadataEditorLivePlugin:
+    """Fixed live schema, matching the LivePlugin stub used by schema.load tests."""
+
+    def __init__(self, schema: dict) -> None:
+        self._schema = schema
+
+    def connect(self, _dsn):
+        return object()
+
+    def parse_schema_from_dsn(self, _dsn):
+        return None
+
+    def introspect_schema(self, _conn, _schema_arg):
+        return json.loads(json.dumps(self._schema))
+
+    def normalize_schema_names(self, _dsn, schema):
+        return schema
+
+    def close(self, _conn):
+        return None
+
+
+_METADATA_EDITOR_SCHEMA = {
+    "public.orders": {"columns": {"amount": {"type": "DECIMAL"}}},
+}
+
+
+def _install_fake_memory_tools_for_metadata_editor(monkeypatch) -> list[dict]:
+    """``SchemaMemoryManager`` (used by ``metadata_editor.py`` for typed_probe
+    facts) does ``from memory.tools import ...`` lazily on every call, so it
+    needs a real ``memory.tools`` submodule stub -- ``_load_service_with_stubs``
+    only fakes ``memory``/``memory.streamlit_api`` (mirrors the in-memory fake
+    used by tests/test_text_to_sql_metadata_editor.py)."""
+    saved: list[dict] = []
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        types.SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: contextlib.nullcontext(),
+        ),
+    )
+    return saved
+
+
+def _setup_metadata_editor_test(monkeypatch, tmp_path):
+    """Isolate SchemaLoader/SchemaMemoryManager (via ``_project_root``) *and*
+    dsn_profile.py (via its own ``get_repo_root``, since that module resolves
+    ``sqlrag/<dsn>.profile.yaml`` independently of ``_project_root`` — see
+    metadata_editor.py's module docstring / final report discrepancy note)."""
+    # Pre-import metadata_editor (and its transitive custom_tools.text_to_sql.*
+    # dependency chain, incl. successful_sql_memory -> memory.index_consistency)
+    # *before* _load_service_with_stubs replaces sys.modules["memory"] with a
+    # bare stub — otherwise the lazy import inside the service handler would
+    # try to execute that chain against the fake "memory" package and fail
+    # with ModuleNotFoundError: No module named 'memory.index_consistency'.
+    from custom_tools.text_to_sql import dsn_profile as dsn_profile_module
+    from custom_tools.text_to_sql import metadata_editor  # noqa: F401
+    from backend.fastapi_app.agui.auth import Principal
+
+    wf_manager = _WorkflowManagerStub()
+    service = _load_service_with_stubs(monkeypatch, wf_manager)
+    _install_fake_memory_tools_for_metadata_editor(monkeypatch)
+    monkeypatch.setattr(service, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(dsn_profile_module, "get_repo_root", lambda: tmp_path)
+    dsn_profile_module.reset_cache()
+    # _load_service_with_stubs() replaces sys.modules["db_plugins"] with a bare
+    # stub module, so the plugin must be attached to *that* module object
+    # (matching the established pattern used elsewhere in this file).
+    db_plugins = sys.modules["db_plugins"]
+    monkeypatch.setattr(
+        db_plugins,
+        "get_plugin",
+        lambda _dsn: _MetadataEditorLivePlugin(_METADATA_EDITOR_SCHEMA),
+        raising=False,
+    )
+
+    admin = Principal(subject="admin", tenant_id="ops", roles=frozenset({"admin", "user"}))
+    alice = Principal(subject="alice", tenant_id="tenant-1", roles=frozenset({"user"}))
+    dsn = "postgresql://svc:metadata-secret@db.example:5432/app"
+    connection = service.handle_service_action(
+        "db.connections.register",
+        {
+            "display_name": "Production",
+            "dsn": dsn,
+            "owner_subject": "alice",
+            "tenant_id": "tenant-1",
+        },
+        principal=admin,
+    )["connection"]
+    return service, admin, alice, connection["connection_ref"], dsn
+
+
+def test_metadata_load_is_readable_by_a_plain_user(monkeypatch, tmp_path):
+    service, _admin, alice, connection_ref, _dsn = _setup_metadata_editor_test(
+        monkeypatch, tmp_path
+    )
+
+    view = service.handle_service_action(
+        "text_to_sql.metadata.load",
+        {"connection_ref": connection_ref},
+        principal=alice,
+    )
+
+    assert view["connection_ref"] == connection_ref
+    assert view["dsn_dialect"] == "postgresql"
+    assert view["schema_digest"] is None
+    assert "public.orders" in view["tables"]
+    assert view["glossary"]["profile_exists"] is False
+    assert view["facts"] == []
+
+
+def test_metadata_write_actions_require_admin_role(monkeypatch, tmp_path):
+    service, _admin, alice, connection_ref, _dsn = _setup_metadata_editor_test(monkeypatch, tmp_path)
+
+    write_calls = [
+        (
+            "text_to_sql.metadata.save_descriptions",
+            {
+                "connection_ref": connection_ref,
+                "expected_schema_digest": None,
+                "tables": [],
+            },
+        ),
+        (
+            "text_to_sql.metadata.save_glossary",
+            {
+                "connection_ref": connection_ref,
+                "expected_glossary_digest": "sha256hex",
+                "entries": [],
+            },
+        ),
+        (
+            "text_to_sql.metadata.set_fact_status",
+            {
+                "connection_ref": connection_ref,
+                "fact_key": "text2sql-semantic-fact-v1-does-not-exist",
+                "status": "rejected",
+            },
+        ),
+    ]
+    for action, payload in write_calls:
+        with pytest.raises(PermissionError, match="requires role"):
+            service.handle_service_action(action, payload, principal=alice)
+
+
+def test_metadata_editor_end_to_end_through_connection_ref(monkeypatch, tmp_path):
+    """Full round trip: connection_ref -> dsn -> tmp_path/sqlrag files, then a
+    fresh load (no service restart) observes the saved values (§0 self-healing
+    invalidation / plan §6 point 1 manual smoke test, exercised here as an
+    automated regression)."""
+    service, admin, _alice, connection_ref, dsn = _setup_metadata_editor_test(monkeypatch, tmp_path)
+
+    initial = service.handle_service_action(
+        "text_to_sql.metadata.load",
+        {"connection_ref": connection_ref},
+        principal=admin,
+    )
+    assert initial["schema_digest"] is None
+    assert initial["glossary"]["profile_exists"] is False
+
+    save_result = service.handle_service_action(
+        "text_to_sql.metadata.save_descriptions",
+        {
+            "connection_ref": connection_ref,
+            "expected_schema_digest": initial["schema_digest"],
+            "tables": [
+                {
+                    "table_fqn": "public.orders",
+                    "description": "Заказы",
+                    "columns": [
+                        {"column": "amount", "description": "Сумма", "examples": ["1", "2"]}
+                    ],
+                }
+            ],
+        },
+        principal=admin,
+    )
+    assert save_result["saved"] is True
+    assert isinstance(save_result["schema_digest"], str) and save_result["schema_digest"]
+    from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
+
+    schema_file = tmp_path / "sqlrag" / f"{dsn_to_sanitized_name(dsn)}.json"
+    assert schema_file.exists()
+    assert json.loads(schema_file.read_text(encoding="utf-8"))["schema_info"][
+        "public.orders"
+    ]["description"] == "Заказы"
+
+    glossary_result = service.handle_service_action(
+        "text_to_sql.metadata.save_glossary",
+        {
+            "connection_ref": connection_ref,
+            "expected_glossary_digest": initial["glossary"]["digest"],
+            "entries": [
+                {
+                    "term": "выручка",
+                    "synonyms": ["revenue"],
+                    "table": "public.orders",
+                    "column": "amount",
+                    "kind": "measure",
+                    "note": None,
+                }
+            ],
+        },
+        principal=admin,
+    )
+    assert glossary_result["saved"] is True
+    assert glossary_result["glossary_digest"]
+    assert [entry["term"] for entry in glossary_result["entries"]] == ["выручка"]
+
+    reloaded = service.handle_service_action(
+        "text_to_sql.metadata.load",
+        {"connection_ref": connection_ref},
+        principal=admin,
+    )
+    assert reloaded["schema_digest"] == save_result["schema_digest"]
+    orders = reloaded["tables"]["public.orders"]
+    assert orders["description"] == "Заказы"
+    assert orders["description_source"] == "file"
+    assert orders["columns"]["amount"]["description"] == "Сумма"
+    assert orders["columns"]["amount"]["examples"] == ["1", "2"]
+    assert reloaded["glossary"]["profile_exists"] is True
+    assert reloaded["glossary"]["digest"] == glossary_result["glossary_digest"]
+    assert [entry["term"] for entry in reloaded["glossary"]["entries"]] == ["выручка"]
+
+    # Stale expected_schema_digest -> version conflict, not a generic 500.
+    with pytest.raises(ValueError, match="version conflict"):
+        service.handle_service_action(
+            "text_to_sql.metadata.save_descriptions",
+            {
+                "connection_ref": connection_ref,
+                "expected_schema_digest": initial["schema_digest"],
+                "tables": [],
+            },
+            principal=admin,
+        )
+
+
 def test_workflow_result_artifacts_and_logs_are_redacted(monkeypatch):
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)

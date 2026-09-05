@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { isRecord } from "../../lib/textToSqlContracts";
 import {
+  parseTextToSqlGlossaryEntries,
   type TextToSqlColumnMetadata,
   type TextToSqlGlossaryEntry,
   type TextToSqlMetadataView,
@@ -36,6 +37,9 @@ type TableEdit = {
 type TableEditMap = Record<string, TableEdit>;
 
 type GlossaryDraftEntry = {
+  // Stable per-row key: rows can be removed from the middle of the list, so
+  // the array index would make React reuse the wrong DOM inputs.
+  id: number;
   term: string;
   synonymsText: string;
   table: string;
@@ -52,8 +56,15 @@ function formatExamples(examples: unknown[]): string {
   return examples.map((item) => String(item)).join(", ");
 }
 
+let nextGlossaryRowId = 1;
+
+function newGlossaryRowId(): number {
+  return nextGlossaryRowId++;
+}
+
 function toDraftEntry(entry: TextToSqlGlossaryEntry): GlossaryDraftEntry {
   return {
+    id: newGlossaryRowId(),
     term: entry.term,
     synonymsText: entry.synonyms.join(", "),
     table: entry.table,
@@ -223,7 +234,10 @@ export function TextToSqlMetadataTab({
   };
 
   const addGlossaryRow = () => {
-    setGlossaryDraft((prev) => [...prev, { term: "", synonymsText: "", table: "", column: "", kind: "", note: "" }]);
+    setGlossaryDraft((prev) => [
+      ...prev,
+      { id: newGlossaryRowId(), term: "", synonymsText: "", table: "", column: "", kind: "", note: "" },
+    ]);
   };
 
   const removeGlossaryRow = (index: number) => {
@@ -247,10 +261,16 @@ export function TextToSqlMetadataTab({
       const digest = isRecord(response) && typeof response.glossary_digest === "string"
         ? response.glossary_digest
         : metadataView.glossary.digest;
+      // The server trims and deduplicates synonyms; show what was actually
+      // stored rather than the raw draft.
+      const savedEntries = isRecord(response) && Array.isArray(response.entries)
+        ? parseTextToSqlGlossaryEntries(response.entries)
+        : entries;
       setMetadataView({
         ...metadataView,
-        glossary: { digest, profile_exists: true, entries },
+        glossary: { digest, profile_exists: true, entries: savedEntries },
       });
+      setGlossaryDraft(savedEntries.map(toDraftEntry));
     } catch (err) {
       handleSaveError(err);
     }
@@ -334,6 +354,12 @@ export function TextToSqlMetadataTab({
             <div className="section-header">
               <div className="card-title">Описания таблиц и колонок</div>
             </div>
+            {metadataView.editable_file_enabled === false ? (
+              <p className="card-hint">
+                Файл описаний для этого подключения отключён (enable: false): сохранённые
+                описания не попадут в пайплайн, пока файл не будет включён.
+              </p>
+            ) : null}
             <div className="stack">
               {Object.entries(metadataView.tables).map(([tableFqn, table]) => {
                 const tableEdit = tableEdits[tableFqn];
@@ -412,7 +438,7 @@ export function TextToSqlMetadataTab({
             </div>
             <div className="stack">
               {glossaryDraft.map((row, index) => (
-                <div key={index} className="graph-input">
+                <div key={row.id} className="graph-input">
                   <div className="form-grid">
                     <label className="field">
                       <span className="label">Термин</span>

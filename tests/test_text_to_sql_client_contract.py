@@ -486,6 +486,7 @@ def test_load_metadata_uses_service_action_and_parses_tables_and_glossary() -> N
     }
     assert metadata.schema_digest == "digest-1"
     assert metadata.glossary_digest == "glossary-digest-1"
+    assert metadata.editable_file_enabled is True
     assert len(metadata.tables) == 1
     table = metadata.tables[0]
     assert table.table_fqn == "public.orders"
@@ -493,6 +494,66 @@ def test_load_metadata_uses_service_action_and_parses_tables_and_glossary() -> N
     assert table.columns[0].examples == ["new", "paid"]
     assert metadata.glossary_entries[0].term == "выручка"
     assert metadata.facts[0].fact_key == "text2sql-semantic-fact-v1-abc"
+
+
+@pytest.mark.parametrize("raw_flag, expected", [(False, False), (None, None)])
+def test_load_metadata_parses_editable_file_enabled_flag(raw_flag, expected) -> None:
+    def transport(method, path, *, json_body, headers):
+        return {
+            "action": "text_to_sql.metadata.load",
+            "ok": True,
+            "data": {
+                "connection_ref": "connection-7",
+                "dsn_dialect": "postgresql",
+                "schema_digest": "digest-1",
+                "editable_file_enabled": raw_flag,
+                "tables": {},
+                "glossary": {
+                    "digest": "glossary-digest-1",
+                    "profile_exists": False,
+                    "dsn_fingerprint": None,
+                    "schema_namespace_version": None,
+                    "entries": [],
+                },
+                "facts": [],
+            },
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test", transport=transport, auth_headers=lambda: {"Authorization": "Bearer token"}
+    )
+
+    assert client.load_metadata("connection-7").editable_file_enabled is expected
+
+
+def test_load_metadata_rejects_non_boolean_editable_file_enabled() -> None:
+    def transport(method, path, *, json_body, headers):
+        return {
+            "action": "text_to_sql.metadata.load",
+            "ok": True,
+            "data": {
+                "connection_ref": "connection-7",
+                "dsn_dialect": "postgresql",
+                "schema_digest": "digest-1",
+                "editable_file_enabled": "yes",
+                "tables": {},
+                "glossary": {
+                    "digest": "glossary-digest-1",
+                    "profile_exists": False,
+                    "dsn_fingerprint": None,
+                    "schema_namespace_version": None,
+                    "entries": [],
+                },
+                "facts": [],
+            },
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test", transport=transport, auth_headers=lambda: {"Authorization": "Bearer token"}
+    )
+
+    with pytest.raises(TextToSqlApiError, match="editable_file_enabled"):
+        client.load_metadata("connection-7")
 
 
 def test_save_metadata_descriptions_sends_expected_digest() -> None:
