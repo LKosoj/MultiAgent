@@ -84,12 +84,14 @@ class SchemaLinkingCore:
     def find_main_table(self, db_schema, semantic_tables=None):
         return self._heuristic.find_main_table(db_schema, semantic_tables)
 
-    def best_column_for(self, name, table, table_schema):
-        return self._heuristic.best_column_for(name, table, table_schema)
+    def best_column_for(self, name, table, table_schema, dsn: Optional[str] = None):
+        return self._heuristic.best_column_for(name, table, table_schema, dsn=dsn)
 
-    def link_filters(self, filters_in, linked_dimensions, main_table, db_schema):
+    def link_filters(
+        self, filters_in, linked_dimensions, main_table, db_schema, dsn: Optional[str] = None
+    ):
         return self._heuristic.link_filters(
-            filters_in, linked_dimensions, main_table, db_schema
+            filters_in, linked_dimensions, main_table, db_schema, dsn=dsn
         )
 
     # ------------------------------------------------------------------
@@ -217,6 +219,7 @@ class SchemaLinkingCore:
                 llm_result = self.llm_linking(
                     entities,
                     db_schema,
+                    dsn=dsn,
                     namespace=namespace,
                 )
             if llm_result:

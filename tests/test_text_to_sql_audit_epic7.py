@@ -545,6 +545,47 @@ def test_save_successful_sql_card_number_in_user_query_masked(monkeypatch, tmp_p
     assert "[CARD]" in content
 
 
+def test_save_successful_sql_masks_pii_before_semantic_memory(monkeypatch, tmp_path):
+    """БЛОКЕР 2.3: user_query/sql маскируются перед передачей в
+    save_successful_sql_example — иначе сырые email/DSN дословно попадают в
+    semantic-память успешных примеров и подмешиваются в solver_context
+    последующих запусков (тот же класс утечки, что и для legacy sqlrag/*.md).
+    """
+    import custom_tools.text_to_sql.successful_sql_memory as ssm
+    from memory.index_consistency import SemanticIndexStatus
+
+    fake_core = tmp_path / "repo" / "custom_tools" / "text_to_sql" / "core.py"
+    fake_core.parent.mkdir(parents=True)
+    fake_core.write_text("", encoding="utf-8")
+    monkeypatch.setattr(core_module, "__file__", str(fake_core))
+
+    captured = {}
+
+    def fake_save_successful_sql_example(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(status=SemanticIndexStatus.INDEXED, error_code=None)
+
+    monkeypatch.setattr(ssm, "save_successful_sql_example", fake_save_successful_sql_example)
+
+    result = save_successful_sql(
+        sql_query="SELECT * FROM users -- dsn=postgresql://admin:secret@host:5432/db",
+        user_query="напиши на test@example.com отчёт",
+        dsn="sqlite:///tmp/test_semantic_mask.db",
+        namespace_version_key="a" * 64,
+        dialect="sqlite",
+        run_id="run-1",
+        approved=True,
+        executed=True,
+        execution_success=True,
+        audited=True,
+    )
+
+    assert result["status"] == "saved"
+    assert captured, "save_successful_sql_example не был вызван"
+    assert "test@example.com" not in captured["user_query"]
+    assert "secret" not in captured["sql"]
+
+
 def test_sanitize_audit_obj_masks_card_number_in_result_data():
     """_sanitize_audit_obj применяет card_number-правило к строкам внутри result_data (#23+#5)."""
     from custom_tools.text_to_sql.core._audit import _sanitize_audit_obj

@@ -9,8 +9,8 @@
 #
 # Этот yaml — единый список порогов. Значения профиля `default` сохраняют
 # исторические дефолты (чтобы существующие тесты и пользовательские
-# конфигурации не сломались). Профиль `muni_ru` зарезервирован для
-# тюнинга под муниципальный РФ-датасет (пока — снимок default'а).
+# конфигурации не сломались). Доменный тюнинг порогов под конкретную
+# БД задаётся в DSN-профиле.
 #
 # Контракт:
 #   * Корень: `profiles.<name>`. Профиль `default` обязателен.
@@ -38,12 +38,6 @@ version: 1
 
 profiles:
   default:
-    rag_examples_min_score: 0.7
-    strategic_memory_min_score: 0.75
-    tactical_memory_min_score: 0.5
-    schema_linking_min_score: 0.2
-
-  muni_ru:
     rag_examples_min_score: 0.7
     strategic_memory_min_score: 0.75
     tactical_memory_min_score: 0.5

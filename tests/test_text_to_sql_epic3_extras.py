@@ -121,7 +121,7 @@ def test_schema_loader_invalid_json_warns_and_get_database_schema_falls_back(
 
     fallback_schema = {"fallback": {"columns": {"id": {"type": "int"}}}}
     loader = SchemaLoader(repo_root=repo_root)
-    monkeypatch.setattr(loader, "_introspect_via_plugin", lambda _dsn: fallback_schema)
+    monkeypatch.setattr(loader, "_introspect_via_plugin", lambda _dsn, **_kwargs: fallback_schema)
 
     with caplog.at_level(logging.WARNING, logger="custom_tools.text_to_sql.schema_loader"):
         result = loader.get_database_schema({}, dsn=dsn)

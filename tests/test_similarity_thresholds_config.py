@@ -51,13 +51,30 @@ def test_loads_default_profile_from_repo_yaml():
     assert profile.schema_linking_min_score == pytest.approx(0.2)
 
 
-def test_profile_switch_via_env(monkeypatch):
+def test_profile_switch_via_env(tmp_path, monkeypatch):
     """Активный профиль управляется env TEXT_TO_SQL_SIMILARITY_PROFILE."""
-    monkeypatch.setenv("TEXT_TO_SQL_SIMILARITY_PROFILE", "muni_ru")
+    yaml_path = _write_yaml(
+        tmp_path,
+        """
+profiles:
+  default:
+    rag_examples_min_score: 0.7
+    strategic_memory_min_score: 0.75
+    tactical_memory_min_score: 0.5
+    schema_linking_min_score: 0.2
+  alt:
+    rag_examples_min_score: 0.6
+    strategic_memory_min_score: 0.65
+    tactical_memory_min_score: 0.4
+    schema_linking_min_score: 0.3
+""",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_SIMILARITY_THRESHOLDS_PATH", str(yaml_path))
+    monkeypatch.setenv("TEXT_TO_SQL_SIMILARITY_PROFILE", "alt")
     stc.reset_cache()
-    assert stc.resolve_active_profile() == "muni_ru"
+    assert stc.resolve_active_profile() == "alt"
     profile = stc.load_similarity_thresholds()
-    assert profile.name == "muni_ru"
+    assert profile.name == "alt"
 
 
 def test_missing_file_raises(tmp_path, monkeypatch):
@@ -84,7 +101,7 @@ def test_profiles_must_contain_default(tmp_path, monkeypatch):
         tmp_path,
         """
 profiles:
-  muni_ru:
+  alt:
     rag_examples_min_score: 0.7
     strategic_memory_min_score: 0.75
     tactical_memory_min_score: 0.5

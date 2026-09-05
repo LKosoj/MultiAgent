@@ -15,7 +15,7 @@ import os
 import yaml
 from typing import TYPE_CHECKING, Any, Dict, List
 
-from .nlu_config import NLUMorphemesRegistry, load_nlu_morphemes
+from .nlu_config import NLUMorphemesRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +46,15 @@ def _nlu_max_tokens(key: str) -> int:
     return int(load_llm_models_config().get("nlu", key))
 
 
+def _nlu_model(step: str):
+    """Модель для NLU LLM-вызова ``step`` из реестра ``llm_models.yaml::step_models`` (W1-1.1)."""
+    from agent_command import model_mapping
+
+    from .llm_models_config import step_model_name
+
+    return model_mapping[step_model_name(step)]
+
+
 _TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}|\d+[.,]?\d*|[\w\-]+", re.IGNORECASE | re.UNICODE)
 _DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _NUM_TOKEN_PATTERN = re.compile(r"\d+[.,]?\d*")
@@ -66,13 +75,20 @@ class NLUProcessor:
             "Set TEXT_TO_SQL_NLU_ALLOW_FALLBACKS=1 to use heuristic NLU fallback."
         )
 
-    def _require_fallback_cfg(self, operation: str):
+    def _require_fallback_cfg(self, operation: str, *, dsn: str | None = None):
         """Загружает yaml и явно валидирует feature-flag `enabled`.
 
         Если конфиг помечен ``enabled: false`` — поднимаем RuntimeError,
         не запуская closed-world эвристику.
+
+        ``dsn`` (W1-1.2b): если передан и для него есть непустой
+        DSN-профиль в части ``nlu_hints``, он приоритетнее named
+        nlu_morphemes-профиля — см.
+        ``dsn_profile_overrides.resolve_nlu_morphemes``.
         """
-        cfg = load_nlu_morphemes(registry=self._morphemes_registry)
+        from .dsn_profile_overrides import resolve_nlu_morphemes
+
+        cfg = resolve_nlu_morphemes(dsn=dsn, registry=self._morphemes_registry)
         if not cfg.enabled:
             raise RuntimeError(
                 f"Heuristic NLU fallback for {operation} is disabled by "
@@ -138,6 +154,7 @@ class NLUProcessor:
             prompt=prompt,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
+            model=_nlu_model("nlu_query_understanding"),
             response_format={"type": "json_object"},
         )
         decoded = parse_llm_json_response(response)
@@ -156,6 +173,7 @@ class NLUProcessor:
             ),
             system_prompt=system_prompt,
             max_tokens=max_tokens,
+            model=_nlu_model("nlu_completeness"),
             response_format={"type": "json_object"},
         )
         corrected = parse_llm_json_response(completeness_response)
@@ -166,11 +184,19 @@ class NLUProcessor:
             response=corrected,
         )
 
-    def extract_intent(self, text: str, session_id: str | None = None) -> Dict[str, Any]:
+    def extract_intent(
+        self, text: str, session_id: str | None = None, *, dsn: str | None = None
+    ) -> Dict[str, Any]:
         """Извлечение намерения и сущностей из текста.
 
         ``session_id`` пробрасывается в logger.extra; не используется для
         фабрикации значений — per AGENTS.md.
+
+        ``dsn`` (W1-1.2b): если передан и для него есть непустой
+        DSN-профиль в части ``nlu_hints``, он приоритетнее named
+        nlu_morphemes-профиля в fallback-эвристике (см.
+        ``dsn_profile_overrides.resolve_nlu_morphemes``). Используется
+        только heuristic fallback-путём; LLM-путь ``dsn`` не использует.
         """
         logger.info("Extracting intent and entities", extra={"session_id": session_id})
 
@@ -184,7 +210,9 @@ class NLUProcessor:
         if not text or not text.strip():
             logger.warning("extract_intent: пустой или пробельный ввод, пропускаем NLU")
             try:
-                cfg = load_nlu_morphemes(registry=self._morphemes_registry)
+                from .dsn_profile_overrides import resolve_nlu_morphemes
+
+                cfg = resolve_nlu_morphemes(dsn=dsn, registry=self._morphemes_registry)
                 default_intent = cfg.default_intent
             except (FileNotFoundError, ValueError, OSError, yaml.YAMLError):
                 logger.warning("extract_intent: конфиг NLU недоступен, используем нейтральный intent")
@@ -201,6 +229,7 @@ class NLUProcessor:
                     prompt=prompt,
                     system_prompt="Ты находишь intent и сущности для Text-to-SQL. Верни только JSON.",
                     max_tokens=_nlu_max_tokens("intent_max_tokens"),
+                    model=_nlu_model("nlu_intent"),
                     response_format={"type": "json_object"}
                 )
                 from .utils import parse_llm_json_response
@@ -216,7 +245,7 @@ class NLUProcessor:
             raise self._nlu_unavailable_error("intent extraction")
 
         # Opt-in fallback эвристика
-        return self._fallback_extract_intent(text)
+        return self._fallback_extract_intent(text, dsn=dsn)
 
     def _fallback_tokenize(self, text: str) -> Dict[str, List[str]]:
         """Fallback токенизация без LLM. Список adpositions грузится из yaml."""
@@ -237,13 +266,17 @@ class NLUProcessor:
 
         return {"tokens": tokens, "pos_tags": pos_tags}
 
-    def _fallback_extract_intent(self, text: str) -> Dict[str, Any]:
+    def _fallback_extract_intent(
+        self, text: str, *, dsn: str | None = None
+    ) -> Dict[str, Any]:
         """Fallback извлечение интента без LLM.
 
         Все морфемы, регэксп-паттерны и интент-правила берутся из
-        ``config/text_to_sql/nlu_morphemes.yaml`` (см. ``nlu_config.py``).
+        ``config/text_to_sql/nlu_morphemes.yaml`` (см. ``nlu_config.py``),
+        либо (W1-1.2b) из непустого DSN-профиля для ``dsn``, если он
+        приоритетнее — см. ``dsn_profile_overrides.resolve_nlu_morphemes``.
         """
-        cfg = self._require_fallback_cfg("intent extraction")
+        cfg = self._require_fallback_cfg("intent extraction", dsn=dsn)
         lower = text.lower()
 
         metrics: List[str] = [

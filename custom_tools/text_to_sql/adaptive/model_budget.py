@@ -17,6 +17,9 @@ from .serialization import _register_internal_decode_models, canonical_digest
 
 _SHA256_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 SQLITE_SIGNED_INTEGER_MAX = 2**63 - 1
+# Conservative estimate for sizing an LLM prompt from its byte length without
+# tokenizing it; both model-input-size guards below use the same constant.
+APPROXIMATE_BYTES_PER_TOKEN = 4
 ModelIdentity = Annotated[str, Field(min_length=1, max_length=512)]
 ClaimGeneration = Annotated[
     int,

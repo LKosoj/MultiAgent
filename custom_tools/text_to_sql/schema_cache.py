@@ -189,6 +189,18 @@ _T2S_PROFILE_ENV_VARS: tuple = (
     "TEXT_TO_SQL_SIGNIFICANCE_PROFILE",
     "TEXT_TO_SQL_SIMILARITY_PROFILE",
     "TEXT_TO_SQL_SCHEMA_SOURCE_PATH",
+    # Пути к yaml-конфигам: смена файла (а не только профиля внутри него)
+    # меняет алиасы/джойны/промпты, поэтому тоже инвалидирует кэш.
+    "TEXT_TO_SQL_COLUMN_ALIASES_PATH",
+    "TEXT_TO_SQL_JOINS_PATH",
+    "TEXT_TO_SQL_LLM_MODELS_PATH",
+    "TEXT_TO_SQL_MAIN_TABLE_SCORING_PATH",
+    "TEXT_TO_SQL_NLU_MORPHEMES_PATH",
+    "TEXT_TO_SQL_PROMPTS_PATH",
+    "TEXT_TO_SQL_SCHEMA_LINKING_EXAMPLES_PATH",
+    "TEXT_TO_SQL_SIGNIFICANCE_PATH",
+    "TEXT_TO_SQL_SIMILARITY_THRESHOLDS_PATH",
+    "TEXT_TO_SQL_TYPE_CATEGORIES_PATH",
 )
 
 
@@ -239,9 +251,22 @@ def _compute_env_fingerprint(
 
     Возвращает hex-строку длиной 64 (полный sha256).
     """
-    raw_dsn = (
-        dsn if (isinstance(dsn, str) and dsn.strip()) else os.getenv("DB_DSN", "")
-    ) if include_dsn else ""
+    explicit_dsn = dsn if (isinstance(dsn, str) and dsn.strip()) else None
+    # W1-1.2 blocker 1: DB_DSN-env fallback только в нескоупленном режиме
+    # (include_dsn=True). В scoped/namespace-режиме (include_dsn=False)
+    # namespace уже несёт identity изоляции; резолвить DSN-профиль по
+    # глобальной DB_DSN здесь нельзя — иначе профиль ЧУЖОГО DSN (или смена
+    # DB_DSN несвязанного процесса) мог бы влиять на fingerprint кэша
+    # текущего tenant'а. Если effective_dsn клиента не передан явно —
+    # результат "absent" (см. _dsn_profile_file_marker), а не подстановка
+    # DB_DSN.
+    if explicit_dsn is not None:
+        resolved_dsn = explicit_dsn
+    elif include_dsn:
+        resolved_dsn = os.getenv("DB_DSN", "")
+    else:
+        resolved_dsn = ""
+    raw_dsn = resolved_dsn if include_dsn else ""
     fingerprint_input: Dict[str, str] = {
         "DB_DSN_IDENTITY": _dsn_host_port_db(raw_dsn),
     }
@@ -251,8 +276,36 @@ def _compute_env_fingerprint(
         # переменной и пустая строка дают РАЗНЫЙ fingerprint (контракт env).
         if value is not None:
             fingerprint_input[var] = value
+
+    # W1-1.2: DSN-профиль (sqlrag/<dsn>.profile.yaml) — операторская правка
+    # алиасов/metric_hints для конкретной базы не должна давать stale
+    # schema-linking результат из кэша. Используем resolved_dsn (не raw_dsn),
+    # т.к. выбор файла профиля зависит от фактического DSN независимо от
+    # include_dsn (который управляет только тем, попадают ли credentials-less
+    # host:port:db в cache_key при scoped-запуске).
+    fingerprint_input["DSN_PROFILE_FILE"] = _dsn_profile_file_marker(resolved_dsn)
+
     serialized = json.dumps(fingerprint_input, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _dsn_profile_file_marker(dsn: str) -> str:
+    """Маркер файла ``sqlrag/<dsn>.profile.yaml`` для env-fingerprint.
+
+    Отсутствие DSN или файла → ``"absent"``; иначе ``mtime_ns:size`` — дешёвый
+    stat без чтения содержимого файла.
+    """
+    if not dsn:
+        return "absent"
+    # Lazy import: dsn_profile.py не должен быть top-level зависимостью
+    # schema_cache.py (избегаем цикла импортов между модулями пакета).
+    from .dsn_profile import dsn_profile_path
+
+    path = dsn_profile_path(dsn)
+    if not path.is_file():
+        return "absent"
+    stat = path.stat()
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
 def _compute_schema_fingerprint(schema_dict: Dict[str, Dict[str, Any]]) -> str:
@@ -334,7 +387,13 @@ class SchemaCacheManager:
 
         if namespace is not None:
             session_id_cache = namespace.version_key
-            effective_dsn = None
+            # W1-1.2 blocker 1: раньше тут был жёсткий None — DSN-профиль
+            # (sqlrag/<dsn>.profile.yaml) в env-fingerprint выбирался по
+            # глобальной DB_DSN вместо DSN текущего клиента (cross-tenant
+            # риск: чужой профиль мог бы менять/не менять fingerprint tenant'а).
+            # Теперь используем реальный dsn, если caller его передал
+            # (schema_linker.py прокидывает effective_dsn).
+            effective_dsn = dsn if (isinstance(dsn, str) and dsn.strip()) else None
         elif isinstance(session_id, str) and session_id.strip():
             session_id_cache = session_id.strip()
             effective_dsn = (

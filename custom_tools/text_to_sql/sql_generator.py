@@ -71,6 +71,13 @@ class SQLGenerator:
 
         return int(load_llm_models_config().get("sql_generation", "max_tokens"))
 
+    def _sql_generation_model(self):
+        """Модель для LLM-вызовов sql_generator из ``llm_models.yaml::step_models`` (W1-1.1)."""
+        from agent_command import model_mapping
+        from .llm_models_config import step_model_name
+
+        return model_mapping[step_model_name("sql_generation")]
+
     def _apply_safety_validation(
         self,
         sql_query: str,
@@ -530,6 +537,7 @@ class SQLGenerator:
                 prompt=prompt,
                 system_prompt=system_prompt,
                 max_tokens=self._sql_generation_max_tokens(),
+                model=self._sql_generation_model(),
                 response_format={"type": "json_object"}
             )
 

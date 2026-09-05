@@ -308,7 +308,7 @@ def test_nlu_intent_extraction_threads_session_id(monkeypatch):
         def process_text(self, text, session_id=None):
             return {"tokens": [], "pos_tags": []}
 
-        def extract_intent(self, text, session_id=None):
+        def extract_intent(self, text, session_id=None, dsn=None):
             received["text"] = text
             received["session_id"] = session_id
             return {"intent": "query", "entities": {}}

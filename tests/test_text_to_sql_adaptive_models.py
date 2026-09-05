@@ -216,6 +216,7 @@ def test_closed_enums_have_only_the_normative_values() -> None:
         "distinct_values",
         "execute_probe",
         "read_document",
+        "semantic_commit",
     }
     assert {member.value for member in CheckKind} == {
         "safety",
@@ -255,6 +256,7 @@ def test_closed_enums_have_only_the_normative_values() -> None:
         "EAV_CATALOG_PREDICATE_MISSING",
         "EAV_VALUE_PREDICATE_MISSING",
         "EAV_JOIN_MISMATCH",
+        "FORMULA_SEMANTICS_MISMATCH",
         "SAFETY_REJECTED",
         "SCHEMA_REJECTED",
         "EXPLAIN_REJECTED",
@@ -565,6 +567,8 @@ def test_all_binding_variants_are_discriminated_and_supported_needs_evidence_and
         expression=ExpressionRef(
             expression_id="expression-1", expression="status - previous_status"
         ),
+        document=DocumentRef(document_id="document-1", namespace="main"),
+        rule_excerpt="Status delta is documented here.",
         input_columns=(column("status"), column("previous_status")),
     )
     document = DocumentRuleBinding(
@@ -623,6 +627,8 @@ def test_derived_expression_binding_requires_nonempty_distinct_ordered_inputs(
             expression=ExpressionRef(
                 expression_id="expression-1", expression="gross - cost"
             ),
+            document=DocumentRef(document_id="document-1", namespace="main"),
+            rule_excerpt="Gross minus cost is documented here.",
             input_columns=inputs,
         )
 
@@ -653,6 +659,8 @@ def test_derived_expression_binding_accepts_nonempty_distinct_ordered_inputs(
         expression=ExpressionRef(
             expression_id="expression-1", expression=expression
         ),
+        document=DocumentRef(document_id="document-1", namespace="main"),
+        rule_excerpt="Expression is documented here.",
         input_columns=inputs,
     )
 

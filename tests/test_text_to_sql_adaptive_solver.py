@@ -15,6 +15,8 @@ import pytest
 from custom_tools.text_to_sql.adaptive.models import (
     CheckFailureCode,
     CheckKind,
+    CheckResult,
+    CheckStatus,
     ColumnRef,
     EvidenceCost,
     EvidenceSourceKind,
@@ -29,6 +31,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     SemanticItemKind,
     ResultExpectation,
     ResultExpectationKind,
+    SimilarSuccessfulSqlExample,
     SolverActionKind,
     SolverState,
     SolverStopReason,
@@ -59,13 +62,35 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
 )
 from custom_tools.text_to_sql.adaptive.schema_probes import SchemaEvidenceDocument
 from custom_tools.text_to_sql.adaptive.policy import (
+    MAX_ACTIONS,
+    MAX_DB_PROBES,
+    MAX_DB_PROBE_MS,
+    MAX_INLINE_BYTES,
+    MAX_MODEL_INPUT_TOKENS_PER_CALL,
+    MAX_MODEL_OUTPUT_TOKENS_PER_CALL,
+    MAX_MODEL_TOTAL_TOKENS,
+    MAX_RETURNED_ROWS,
+    MAX_SAMPLE_ROWS,
+    MAX_WALL_CLOCK_SECONDS,
+    AdaptivePolicyConfig,
+    OperationCountBudget,
+    PerActionBudget,
+    ResourceBudget,
+    ResultVolumeBudget,
+    WallClockBudget,
     canonical_action_digest,
     reconcile_probe_cost,
     reserve_model_call_budget,
     reserve_probe_budget,
 )
+from custom_tools.text_to_sql.adaptive.model_budget import (
+    APPROXIMATE_BYTES_PER_TOKEN,
+    ModelBudgetLimits,
+    ModelTokenUsage,
+)
 from custom_tools.text_to_sql.adaptive.serialization import canonical_digest
 from custom_tools.text_to_sql.adaptive.serialization import canonical_json_bytes
+from custom_tools.text_to_sql.adaptive.serialization import deserialize_contract
 from custom_tools.text_to_sql.adaptive.serialization import serialize_contract
 from custom_tools.text_to_sql.adaptive.semantic_coverage import validate_coverage_inputs
 from custom_tools.text_to_sql.adaptive.replay_inputs import serialize_replay_input
@@ -117,7 +142,11 @@ from workflow._text_to_sql_solver_terminal_evidence import (
     decode_verified_solver_terminal_evidence,
     encode_verified_solver_terminal_evidence,
 )
-from workflow._text_to_sql_solver_reentry import build_production_reentry_boundary
+from workflow._text_to_sql_solver_reentry import (
+    build_production_reentry_boundary,
+    settle_incomplete_solver_model_call,
+)
+from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
 from workflow.adaptive_research_state_store import AdaptiveResearchStateStore
 from workflow.adaptive_state_store import (
     AdaptiveCheckpointKey,
@@ -131,11 +160,22 @@ from workflow.adaptive_solver_checkpoint import (
 )
 from workflow.deadline import DeadlineBudget
 from workflow.text_to_sql_adaptive_solver import (
+    DIAG_CHAR_CAP,
+    DOC_CONTENT_CHAR_CAP,
+    HISTORY_KEEP,
+    _drop_similar_examples,
+    _initial_solver_state,
+    _limit_document_count,
     _reservation_authority,
     _solver_context,
+    _solver_context_sized,
     _state_after_known_finalizer,
+    _truncate_check_diagnostics,
+    _truncate_document_content,
+    _truncate_solver_history,
     reconcile_known_finalizer,
     reconcile_pending_finalizer_unknown,
+    run_production_adaptive_sql_generation,
     run_adaptive_sql_generation,
 )
 from workflow.text_to_sql_contract import TextToSqlTerminalResult
@@ -196,6 +236,630 @@ def test_solver_context_includes_row_preservation_requirements() -> None:
     ]
 
 
+def _add_sql_candidate(state, requirements, *, sql, candidate_id, action_id):
+    ids = iter((candidate_id, action_id))
+    return apply_solver_proposal(
+        state,
+        SolverProposalV1(
+            proposal_version=1,
+            proposal=SqlCandidateProposal(proposal_kind="sql_candidate", sql=sql),
+        ),
+        base_revision=state.revision,
+        dsn=POSTGRES_DSN,
+        table_namespace="main",
+        requirements=requirements,
+        id_factory=lambda: next(ids),
+    ).state
+
+
+def _document_content_truncation_runtime(state, requirements, *, fill_char="x"):
+    """A runtime whose one oversized document forces ``truncate_document_content``."""
+
+    document = SimpleNamespace(document_id="document-huge", content=fill_char * 50_000)
+    documents = (document,)
+    generous_runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=10_000_000)
+        ),
+        document_snapshot=documents,
+    )
+    baseline = json.loads(_solver_context(generous_runtime, state, requirements))
+    assert baseline["context_truncation"]["applied_steps"] == []
+    original_bytes = baseline["context_truncation"]["original_bytes"]
+
+    truncated_documents = _truncate_document_content(baseline["trusted_documents"])
+    assert truncated_documents != baseline["trusted_documents"]
+    fitted_core = {
+        "coverage_requirements": baseline["coverage_requirements"],
+        "solver_state": baseline["solver_state"],
+        "trusted_documents": truncated_documents,
+    }
+    _, fitted_size = _solver_context_sized(
+        fitted_core, ["truncate_document_content"], original_bytes
+    )
+    input_tokens = -(-fitted_size // APPROXIMATE_BYTES_PER_TOKEN)
+
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=input_tokens)
+        ),
+        document_snapshot=documents,
+    )
+    return runtime, truncated_documents
+
+
+def test_solver_context_under_limit_is_not_truncated() -> None:
+    state, _, requirements, _ = _runtime()
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=16_000)
+        ),
+        document_snapshot=(),
+    )
+
+    payload_str = _solver_context(runtime, state, requirements)
+    payload = json.loads(payload_str)
+
+    assert payload["context_truncation"]["applied_steps"] == []
+    # `final_bytes` must truthfully report the size of what is actually
+    # returned (marker included); `original_bytes` measures the core content
+    # before the marker was added, so it is always a bit smaller.
+    assert payload["context_truncation"]["final_bytes"] == len(
+        payload_str.encode("utf-8")
+    )
+    assert (
+        payload["context_truncation"]["final_bytes"]
+        >= payload["context_truncation"]["original_bytes"]
+    )
+    assert payload["coverage_requirements"] == requirements.model_dump(mode="json")
+    assert payload["solver_state"] == state.model_dump(mode="json")
+    assert payload["trusted_documents"] == []
+
+
+def _similar_examples_state(state):
+    return state.model_copy(
+        update={
+            "similar_successful_sql_examples": (
+                SimilarSuccessfulSqlExample(
+                    user_query="show total revenue by month " * 50,
+                    sql="SELECT 1",
+                ),
+            )
+        }
+    )
+
+
+def _similar_examples_drop_runtime(state, requirements, *, document=None):
+    """A runtime whose retrieved examples force ``drop_similar_successful_sql_examples``."""
+
+    documents = (document,) if document is not None else ()
+    generous_runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=10_000_000)
+        ),
+        document_snapshot=documents,
+    )
+    baseline = json.loads(_solver_context(generous_runtime, state, requirements))
+    assert baseline["context_truncation"]["applied_steps"] == []
+    original_bytes = baseline["context_truncation"]["original_bytes"]
+
+    dropped_state = _drop_similar_examples(baseline["solver_state"])
+    assert dropped_state != baseline["solver_state"]
+    fitted_core = {
+        "coverage_requirements": baseline["coverage_requirements"],
+        "solver_state": dropped_state,
+        "trusted_documents": baseline["trusted_documents"],
+    }
+    _, fitted_size = _solver_context_sized(
+        fitted_core, ["drop_similar_successful_sql_examples"], original_bytes
+    )
+    input_tokens = -(-fitted_size // APPROXIMATE_BYTES_PER_TOKEN)
+
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=input_tokens)
+        ),
+        document_snapshot=documents,
+    )
+    return runtime
+
+
+def test_solver_context_drops_similar_examples_before_documents() -> None:
+    state, _, requirements, _ = _runtime()
+    state = _similar_examples_state(state)
+    document = SimpleNamespace(document_id="document-small", content="keep me")
+    runtime = _similar_examples_drop_runtime(state, requirements, document=document)
+
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["context_truncation"]["applied_steps"] == [
+        "drop_similar_successful_sql_examples"
+    ]
+    assert payload["solver_state"]["similar_successful_sql_examples"] == []
+    assert payload["trusted_documents"] == [
+        {"content": document.content, "document_id": document.document_id}
+    ]
+
+
+def test_solver_context_similar_examples_drop_is_deterministic() -> None:
+    state, _, requirements, _ = _runtime()
+    state = _similar_examples_state(state)
+    runtime = _similar_examples_drop_runtime(state, requirements)
+
+    first = _solver_context(runtime, state, requirements)
+    second = _solver_context(runtime, state, requirements)
+
+    assert first == second
+    assert json.loads(first)["context_truncation"]["applied_steps"] == [
+        "drop_similar_successful_sql_examples"
+    ]
+
+
+def test_solver_context_truncates_documents_first() -> None:
+    state, _, requirements, _ = _runtime()
+    runtime, truncated_documents = _document_content_truncation_runtime(state, requirements)
+
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["context_truncation"]["applied_steps"] == ["truncate_document_content"]
+    assert payload["trusted_documents"] == truncated_documents
+    assert len(truncated_documents[0]["content"]) > DOC_CONTENT_CHAR_CAP
+    assert truncated_documents[0]["content"].startswith("x" * DOC_CONTENT_CHAR_CAP)
+    assert payload["solver_state"] == state.model_dump(mode="json")
+    assert payload["coverage_requirements"] == requirements.model_dump(mode="json")
+
+
+def test_solver_context_limits_document_count_deterministically() -> None:
+    state, _, requirements, _ = _runtime()
+    documents = (
+        SimpleNamespace(document_id="document-0", content="a" * 10),
+        SimpleNamespace(document_id="document-1", content="b" * 3_000),
+        SimpleNamespace(document_id="document-2", content="c" * 10),
+    )
+    core = {
+        "coverage_requirements": requirements.model_dump(mode="json"),
+        "solver_state": state.model_dump(mode="json"),
+        "trusted_documents": [
+            {"content": document.content, "document_id": document.document_id}
+            for document in documents
+        ],
+    }
+    original_bytes = len(canonical_json_bytes(core))
+    # document-1 is far too large to fit alongside document-0; document-2 is
+    # tried afterwards regardless and does fit, mirroring
+    # ``SchemaLimiter.build_schema_summary``'s incremental fit.
+    kept_documents = [core["trusted_documents"][0], core["trusted_documents"][2]]
+    _, target_size = _solver_context_sized(
+        {**core, "trusted_documents": kept_documents},
+        ["limit_document_count"],
+        original_bytes,
+    )
+    input_tokens = -(-target_size // APPROXIMATE_BYTES_PER_TOKEN)
+
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=input_tokens)
+        ),
+        document_snapshot=documents,
+    )
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["context_truncation"]["applied_steps"] == ["limit_document_count"]
+    assert payload["trusted_documents"] == kept_documents
+
+
+def test_solver_context_truncates_solver_history_keeping_latest_candidate() -> None:
+    state, _, requirements, _ = _runtime()
+    state = _add_sql_candidate(
+        state,
+        requirements,
+        sql="SELECT o.status FROM orders o WHERE o.status = 'inactive'",
+        candidate_id="candidate-2",
+        action_id="action-2",
+    )
+    state = _add_sql_candidate(
+        state,
+        requirements,
+        sql="SELECT o.status FROM orders o WHERE o.status = 'suspended'",
+        candidate_id="candidate-3",
+        action_id="action-3",
+    )
+    for candidate in state.sql_candidates:
+        state = append_solver_check_result(
+            state,
+            _check(candidate.candidate_id, CheckKind.SAFETY),
+            base_revision=state.revision,
+        ).state
+        state = append_solver_check_result(
+            state,
+            _check(candidate.candidate_id, CheckKind.SCHEMA),
+            base_revision=state.revision,
+        ).state
+    last_candidate = state.sql_candidates[-1]
+    repair_receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=last_candidate.revision,
+        candidate_id=last_candidate.candidate_id,
+        normalized_ast_digest=last_candidate.normalized_ast_digest,
+        requirements_digest=requirements.requirements_digest,
+        source_id=None,
+        evidence_id=None,
+        verdict="consistent",
+        reason="row preservation confirmed",
+        execution={},
+        deterministic_failure_code=None,
+    )
+    sql_parse_feedback = {
+        "failure_code": "SQL_PARSE_REJECTED",
+        "reason": "SQL parser rejected the prior candidate",
+        "rejected_sql": "SELECT 'unclosed",
+    }
+
+    core = {
+        "coverage_requirements": requirements.model_dump(mode="json"),
+        "solver_state": state.model_dump(mode="json"),
+        "trusted_documents": [],
+        "deterministic_sql_repair_receipt": repair_receipt.model_dump(mode="json"),
+        "sql_parse_feedback": dict(sql_parse_feedback),
+    }
+    original_bytes = len(canonical_json_bytes(core))
+    truncated_state = _truncate_solver_history(core["solver_state"])
+    assert truncated_state != core["solver_state"]
+    _, fitted_size = _solver_context_sized(
+        {**core, "solver_state": truncated_state},
+        ["truncate_solver_history"],
+        original_bytes,
+    )
+    input_tokens = -(-fitted_size // APPROXIMATE_BYTES_PER_TOKEN)
+
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=input_tokens)
+        ),
+        document_snapshot=(),
+    )
+    payload = json.loads(
+        _solver_context(runtime, state, requirements, repair_receipt, sql_parse_feedback)
+    )
+
+    assert payload["context_truncation"]["applied_steps"] == ["truncate_solver_history"]
+    assert payload["coverage_requirements"] == requirements.model_dump(mode="json")
+    assert payload["deterministic_sql_repair_receipt"] == repair_receipt.model_dump(
+        mode="json"
+    )
+    assert payload["sql_parse_feedback"] == dict(sql_parse_feedback)
+    assert payload["solver_state"]["sql_candidates"] == [
+        candidate.model_dump(mode="json")
+        for candidate in state.sql_candidates[-HISTORY_KEEP:]
+    ]
+    expected_last_checks = [
+        check.model_dump(mode="json")
+        for check in state.check_results
+        if check.candidate_id == last_candidate.candidate_id
+    ]
+    actual_last_checks = [
+        check
+        for check in payload["solver_state"]["check_results"]
+        if check["candidate_id"] == last_candidate.candidate_id
+    ]
+    assert actual_last_checks == expected_last_checks
+    dropped_candidate_id = state.sql_candidates[0].candidate_id
+    assert dropped_candidate_id not in {
+        candidate["candidate_id"] for candidate in payload["solver_state"]["sql_candidates"]
+    }
+    assert dropped_candidate_id not in {
+        check["candidate_id"] for check in payload["solver_state"]["check_results"]
+    }
+
+
+def test_solver_context_truncates_check_diagnostics_for_earlier_candidates() -> None:
+    """Step 4 (``truncate_check_diagnostics``) caps free text on non-latest checks."""
+
+    state, _, requirements, _ = _runtime()
+    first_candidate_id = state.sql_candidates[-1].candidate_id
+    state = append_solver_check_result(
+        state,
+        CheckResult(
+            check_id=f"safety:{first_candidate_id}:failed",
+            candidate_id=first_candidate_id,
+            check_kind=CheckKind.SAFETY,
+            status=CheckStatus.FAILED,
+            failure_code=CheckFailureCode.SAFETY_REJECTED,
+            affected_source_ids=(),
+            affected_ast_node_ids=(),
+            observed_error="E" * 2_000,
+            required_change="R" * 2_000,
+        ),
+        base_revision=state.revision,
+    ).state
+    state = _add_sql_candidate(
+        state,
+        requirements,
+        sql="SELECT o.status FROM orders o WHERE o.status = 'inactive'",
+        candidate_id="candidate-2",
+        action_id="action-2",
+    )
+    last_candidate_id = state.sql_candidates[-1].candidate_id
+    last_check = _check(last_candidate_id, CheckKind.SAFETY)
+    state = append_solver_check_result(
+        state, last_check, base_revision=state.revision
+    ).state
+
+    core = {
+        "coverage_requirements": requirements.model_dump(mode="json"),
+        "solver_state": state.model_dump(mode="json"),
+        "trusted_documents": [],
+    }
+    original_bytes = len(canonical_json_bytes(core))
+    assert _truncate_solver_history(core["solver_state"]) == core["solver_state"]
+
+    diagnosed_state = _truncate_check_diagnostics(core["solver_state"])
+    assert diagnosed_state != core["solver_state"]
+    _, fitted_size = _solver_context_sized(
+        {**core, "solver_state": diagnosed_state},
+        ["truncate_check_diagnostics"],
+        original_bytes,
+    )
+    input_tokens = -(-fitted_size // APPROXIMATE_BYTES_PER_TOKEN)
+
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=input_tokens)
+        ),
+        document_snapshot=(),
+    )
+    payload = json.loads(_solver_context(runtime, state, requirements))
+
+    assert payload["context_truncation"]["applied_steps"] == ["truncate_check_diagnostics"]
+    assert payload["solver_state"]["sql_candidates"] == [
+        candidate.model_dump(mode="json") for candidate in state.sql_candidates
+    ]
+    capped_check = next(
+        check
+        for check in payload["solver_state"]["check_results"]
+        if check["candidate_id"] == first_candidate_id
+    )
+    assert capped_check["observed_error"].startswith("E" * DIAG_CHAR_CAP)
+    assert capped_check["required_change"].startswith("R" * DIAG_CHAR_CAP)
+    assert len(capped_check["observed_error"]) < 2_000
+    assert len(capped_check["required_change"]) < 2_000
+    surviving_last_check = next(
+        check
+        for check in payload["solver_state"]["check_results"]
+        if check["candidate_id"] == last_candidate_id
+    )
+    assert surviving_last_check == last_check.model_dump(mode="json")
+
+
+def test_solver_context_is_deterministic_across_calls() -> None:
+    state, _, requirements, _ = _runtime()
+    runtime, _ = _document_content_truncation_runtime(state, requirements, fill_char="y")
+
+    first = _solver_context(runtime, state, requirements)
+    second = _solver_context(runtime, state, requirements)
+
+    assert first == second
+    assert json.loads(first)["context_truncation"]["applied_steps"] == [
+        "truncate_document_content"
+    ]
+
+
+def test_solver_context_raises_after_all_steps_when_core_exceeds_limit() -> None:
+    state, _, requirements, _ = _runtime()
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=1)
+        ),
+        document_snapshot=(),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="adaptive solver context exceeds configured model input after truncation",
+    ):
+        _solver_context(runtime, state, requirements)
+
+
+def test_initial_solver_state_disabled_yields_no_examples(monkeypatch) -> None:
+    import custom_tools.text_to_sql.successful_sql_memory as memory_module
+
+    _, research, _, _ = _runtime()
+    calls: list[str] = []
+    monkeypatch.setattr(memory_module, "successful_sql_memory_enabled", lambda: False)
+    monkeypatch.setattr(
+        memory_module,
+        "retrieve_successful_sql_examples",
+        lambda **_kwargs: calls.append("called"),
+    )
+
+    state = _initial_solver_state(research)
+
+    assert state.similar_successful_sql_examples == ()
+    assert calls == []
+
+
+def test_initial_solver_state_enabled_includes_retrieved_examples(monkeypatch) -> None:
+    import custom_tools.text_to_sql.successful_sql_memory as memory_module
+
+    _, research, _, _ = _runtime()
+    context_entries = [
+        {"user_query": "show active orders", "sql": "SELECT 1", "dialect": "sqlite"},
+        {"user_query": "show inactive orders", "sql": "SELECT 2", "dialect": "sqlite"},
+    ]
+    seen_kwargs: dict[str, str] = {}
+
+    def fake_retrieve(*, namespace_version_key, user_query):
+        seen_kwargs["namespace_version_key"] = namespace_version_key
+        seen_kwargs["user_query"] = user_query
+        return memory_module.SuccessfulSqlRetrieval(
+            status="READY",
+            examples=(),
+            context_json=json.dumps(context_entries),
+        )
+
+    monkeypatch.setattr(memory_module, "successful_sql_memory_enabled", lambda: True)
+    monkeypatch.setattr(memory_module, "retrieve_successful_sql_examples", fake_retrieve)
+
+    state = _initial_solver_state(research)
+
+    assert [
+        {"user_query": example.user_query, "sql": example.sql}
+        for example in state.similar_successful_sql_examples
+    ] == [
+        {"user_query": entry["user_query"], "sql": entry["sql"]}
+        for entry in context_entries
+    ]
+    assert seen_kwargs == {
+        "namespace_version_key": research.schema_namespace_version.split(":", 1)[-1],
+        "user_query": research.query_spec.original_text,
+    }
+
+
+def test_initial_solver_state_ignores_non_ready_retrieval(monkeypatch) -> None:
+    import custom_tools.text_to_sql.successful_sql_memory as memory_module
+
+    _, research, _, _ = _runtime()
+    monkeypatch.setattr(memory_module, "successful_sql_memory_enabled", lambda: True)
+    monkeypatch.setattr(
+        memory_module,
+        "retrieve_successful_sql_examples",
+        lambda **_kwargs: memory_module.SuccessfulSqlRetrieval(
+            status="EMPTY", examples=(), context_json="[]"
+        ),
+    )
+
+    state = _initial_solver_state(research)
+
+    assert state.similar_successful_sql_examples == ()
+
+
+def test_initial_solver_state_is_deterministic_given_same_retrieval(monkeypatch) -> None:
+    import custom_tools.text_to_sql.successful_sql_memory as memory_module
+
+    _, research, _, _ = _runtime()
+    context_entries = [{"user_query": "show active orders", "sql": "SELECT 1"}]
+    monkeypatch.setattr(memory_module, "successful_sql_memory_enabled", lambda: True)
+    monkeypatch.setattr(
+        memory_module,
+        "retrieve_successful_sql_examples",
+        lambda **_kwargs: memory_module.SuccessfulSqlRetrieval(
+            status="READY",
+            examples=(),
+            context_json=json.dumps(context_entries),
+        ),
+    )
+
+    first = _initial_solver_state(research)
+    second = _initial_solver_state(research)
+
+    assert first == second
+    assert first.similar_successful_sql_examples == (
+        SimilarSuccessfulSqlExample(user_query="show active orders", sql="SELECT 1"),
+    )
+
+
+def test_solver_state_missing_similar_examples_field_deserializes_to_empty() -> None:
+    state, _, requirements, _ = _runtime()
+    legacy = json.loads(serialize_contract(state))
+    legacy.pop("similar_successful_sql_examples")
+
+    decoded = deserialize_contract(canonical_json_bytes(legacy))
+
+    assert isinstance(decoded, SolverState)
+    assert decoded.similar_successful_sql_examples == ()
+    assert decoded == state
+
+
+def test_similar_examples_are_fixed_at_first_incarnation_not_recomputed_on_resume(
+    monkeypatch, tmp_path
+) -> None:
+    """Durable-resume guarantee: ``_initial_solver_state`` retrieval only ever
+    runs once, when ``run_adaptive_sql_generation`` finds no existing
+    checkpoint (text_to_sql_adaptive_solver.py:399-402). A resumed/replayed
+    run must reuse the persisted examples verbatim, even if the underlying
+    memory store would now answer differently.
+    """
+
+    import custom_tools.text_to_sql.successful_sql_memory as memory_module
+
+    runtime, store = _generation_runtime(tmp_path)
+    retrieval_calls: list[str] = []
+
+    def fake_retrieve(*, namespace_version_key, user_query):
+        retrieval_calls.append(user_query)
+        return memory_module.SuccessfulSqlRetrieval(
+            status="READY",
+            examples=(),
+            context_json=json.dumps(
+                [{"user_query": "show active orders", "sql": "SELECT 1"}]
+            )
+            if len(retrieval_calls) == 1
+            else json.dumps(
+                [{"user_query": "a completely different hit", "sql": "SELECT 2"}]
+            ),
+        )
+
+    monkeypatch.setattr(memory_module, "successful_sql_memory_enabled", lambda: True)
+    monkeypatch.setattr(memory_module, "retrieve_successful_sql_examples", fake_retrieve)
+
+    async def propose(_state, _requirements):
+        return SolverProposalV1(
+            proposal_version=1,
+            proposal=MissingEvidenceProposal(
+                proposal_kind="missing_evidence",
+                source_id="status",
+                question="Which status evidence is authoritative?",
+                required_evidence_kind=EvidenceSourceKind.SCHEMA,
+                reason="One targeted observation is required",
+            ),
+        )
+
+    ids = iter(("request-1", "action-1"))
+    first = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=propose,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            id_factory=ids.__next__,
+        )
+    )
+    assert first["sql"] == ""
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert checkpoint is not None and checkpoint.terminal is not None
+    assert checkpoint.state.similar_successful_sql_examples == (
+        SimilarSuccessfulSqlExample(user_query="show active orders", sql="SELECT 1"),
+    )
+    assert len(retrieval_calls) == 1
+
+    async def forbidden(*_args):
+        raise AssertionError("terminal checkpoint must not call the model")
+
+    replay = asyncio.run(
+        run_adaptive_sql_generation(
+            runtime,
+            propose=forbidden,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+        )
+    )
+
+    assert replay == first
+    # The retrieval mock would answer differently on a second call; the
+    # persisted examples must still reflect the first-incarnation snapshot.
+    assert len(retrieval_calls) == 1
+    resumed_checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert resumed_checkpoint is not None
+    assert resumed_checkpoint.state.similar_successful_sql_examples == (
+        SimilarSuccessfulSqlExample(user_query="show active orders", sql="SELECT 1"),
+    )
+
+
 def _reservation(store, state):
     candidate = state.sql_candidates[-1]
     return store.reserve_execution(
@@ -247,6 +911,7 @@ def _successful_terminal(state):
             "path": "/tmp/query.md",
         },
         "ambiguity": None,
+        "provenance": {},
         "result_review": {
             "record_kind": "text2sql_result_review",
             "run_id": state.run_id,
@@ -2156,6 +2821,7 @@ def test_deterministic_rejection_seals_without_execution_result(tmp_path) -> Non
                 "persistence": {"status": "not_attempted"},
                 "ambiguity": None,
                 "result_review": {},
+                "provenance": {},
             }
 
     checkpoint = reconcile_known_finalizer(
@@ -4598,3 +5264,764 @@ def test_reentry_failure_recovers_admitted_record_and_replays_terminal(
         )
     )
     assert replay == first
+
+
+def _solver_model_budget_policy(model_calls: int) -> AdaptivePolicyConfig:
+    """Build a minimal v2 policy config with a chosen model-call budget.
+
+    Mirrors ``tests/test_adaptive_model_budget.py::_config`` so the solver's
+    own model calls can be reserved against a real ``AdaptiveBudgetLedger``.
+    """
+
+    limits = ModelBudgetLimits(
+        model_calls=model_calls,
+        input_tokens_per_call=MAX_MODEL_INPUT_TOKENS_PER_CALL,
+        output_tokens_per_call=MAX_MODEL_OUTPUT_TOKENS_PER_CALL,
+        total_tokens=MAX_MODEL_TOTAL_TOKENS,
+    )
+    return AdaptivePolicyConfig(
+        policy_version=2,
+        wall_clock=WallClockBudget(wall_clock_seconds=MAX_WALL_CLOCK_SECONDS),
+        resource_limits=ResourceBudget(
+            model_tokens=limits.total_tokens,
+            db_probe_ms=MAX_DB_PROBE_MS,
+        ),
+        operation_counts=OperationCountBudget(
+            actions=MAX_ACTIONS,
+            model_decisions=limits.model_calls,
+            db_probes=MAX_DB_PROBES,
+        ),
+        result_volume=ResultVolumeBudget(
+            returned_rows=MAX_RETURNED_ROWS,
+            inline_bytes=MAX_INLINE_BYTES,
+        ),
+        per_action=PerActionBudget(sample_rows=MAX_SAMPLE_ROWS),
+        model_budget=limits,
+    )
+
+
+def _production_solver_runtime(tmp_path, *, model_calls: int):
+    runtime, store = _generation_runtime(tmp_path)
+    runtime.budget_ledger = AdaptiveBudgetLedger(
+        tmp_path / "solver-model-budget.sqlite"
+    )
+    runtime.verified_research_policy = _solver_model_budget_policy(model_calls)
+    return runtime, store
+
+
+def _solver_sql_response(sql: str) -> str:
+    return json.dumps(
+        {
+            "proposal_version": 1,
+            "proposal": {"proposal_kind": "sql_candidate", "sql": sql},
+        }
+    )
+
+
+class _SequencedSolverModel:
+    """Async model stub returning one canned response per call, by index."""
+
+    def __init__(self, responses) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def __call__(self, _prompt: str) -> str:
+        response = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        return response
+
+
+async def _forbidden_solver_reentry(*_args, **_kwargs):
+    raise AssertionError("this solver run must not need research re-entry")
+
+
+def _passing_pre_execution_gates(state, candidate_id, *, commit_transition, **_kwargs):
+    for kind in (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+        CheckKind.EXPLAIN,
+    ):
+        transition = append_solver_check_result(
+            state,
+            _check(candidate_id, kind),
+            base_revision=state.revision,
+        )
+        state = commit_transition(transition)
+    return state
+
+
+def test_production_solver_generation_records_and_retries_model_ledger_attempts(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6: the solver's own model calls go through the durable budget."""
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    _, research, _, _ = _runtime()
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+    model = _SequencedSolverModel(
+        [
+            # Malformed SQL: rejected by the AST parser, so the solver retries
+            # within the same SolverState revision instead of committing it.
+            _solver_sql_response("SELECT 'Women's Soccer'"),
+            _solver_sql_response(
+                "SELECT o.status FROM orders o WHERE o.status = 'active'"
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    assert model.calls == 2
+
+    records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    first_call_id = f"solver-generate-{research.revision}-0"
+    second_call_id = f"solver-generate-{research.revision}-1"
+    assert set(records) == {first_call_id, second_call_id}
+    assert records[first_call_id].reconciliation is not None
+    assert records[second_call_id].reconciliation is not None
+
+
+class _SimulatedProcessKill(BaseException):
+    """Marks "the process died right here" for a test.
+
+    Deliberately a ``BaseException``, not an ``Exception``: a real process
+    kill never runs any of this module's ``except Exception`` handlers (e.g.
+    ``_commit_next_solver_proposal``'s), so the simulated crash must not be
+    catchable by them either -- otherwise the test would exercise a sealed
+    ``TOOL_FAILURE``/``BUDGET_EXHAUSTED`` terminal instead of a genuine
+    durable-restart replay.
+    """
+
+
+def test_production_solver_generation_resumes_after_started_without_result_crash(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6 remark C: a crash between STARTED and RESULT for the solver's
+    own model call must not durably block every future resume.
+
+    The shared model-budget ledger allows only one outstanding (unreconciled)
+    reservation per run/incarnation at a time (``_model_budget_chain`` in
+    ``_policy_model_budget.py``: "only one model reservation may be
+    outstanding"). Before this fix, a process killed after durably recording
+    STARTED for "solver-generate-{revision}-0" but before RESULT left that
+    record outstanding forever: ``_next_solver_model_attempt`` still counted
+    it and minted a *new* call_id for the retry, and reserving that new
+    call_id hit ``BudgetConflictError`` (mapped to
+    ``SolverStopReason.BUDGET_EXHAUSTED``) on every subsequent resume.
+    ``settle_incomplete_solver_model_call`` (invoked from
+    ``_resume_open_generation``) now force-closes that stale STARTED record
+    on resume, so the retry proceeds.
+    """
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    _, research, _, _ = _runtime()
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+
+    real_execute = coordinator.execute_model_call_with_budget_async
+
+    async def _crash_after_started(
+        run_id,
+        run_incarnation,
+        call_id,
+        request_digest,
+        model_identity,
+        maximum_input_tokens,
+        maximum_output_tokens,
+        _execute,
+        *,
+        config,
+        ledger,
+        **_kwargs,
+    ):
+        # Durably record RESERVED + STARTED exactly as the real machinery
+        # would, then die -- emulating a process kill between the STARTED
+        # write and the RESULT write, without ever invoking the model
+        # provider (``_execute``/``_call`` is never awaited).
+        reservation = reserve_model_call_budget(
+            run_id,
+            run_incarnation,
+            call_id,
+            request_digest,
+            model_identity,
+            maximum_input_tokens,
+            maximum_output_tokens,
+            config=config,
+            ledger=ledger,
+        )
+        owner = "crashed-owner"
+        claim = ledger.claim_model_execution(reservation, owner, now_ns=1)
+        assert claim.acquired is True
+        ledger.record_model_started(
+            _model_started(reservation, "crashed-invocation", claim.generation, 2),
+            owner_token=owner,
+        )
+        raise _SimulatedProcessKill(
+            "simulated process kill: STARTED recorded, RESULT never written"
+        )
+
+    monkeypatch.setattr(
+        coordinator, "execute_model_call_with_budget_async", _crash_after_started
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    crashing_model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    with pytest.raises(_SimulatedProcessKill):
+        asyncio.run(
+            run_production_adaptive_sql_generation(
+                runtime,
+                safety_policy=object(),
+                row_limit=10,
+                dry_run_only=False,
+                table_namespace="main",
+                model=crashing_model,
+                reenter=_forbidden_solver_reentry,
+            )
+        )
+    assert crashing_model.calls == 0
+
+    first_call_id = f"solver-generate-{research.revision}-0"
+    crashed_records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    assert set(crashed_records) == {first_call_id}
+    assert crashed_records[first_call_id].started is not None
+    assert crashed_records[first_call_id].result is None
+    assert crashed_records[first_call_id].reconciliation is None
+
+    # "Restart the process": the real budget-call machinery comes back, and a
+    # fresh model stub stands in for the new incarnation's provider.
+    monkeypatch.setattr(
+        coordinator, "execute_model_call_with_budget_async", real_execute
+    )
+    resumed_model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=resumed_model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    # The provider ran exactly once for the whole resumed run: the stale
+    # STARTED record was settled (not replayed through the provider again),
+    # and only the fresh retry actually invoked it.
+    assert resumed_model.calls == 1
+
+    second_call_id = f"solver-generate-{research.revision}-1"
+    resumed_records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    assert set(resumed_records) == {first_call_id, second_call_id}
+    # The crashed call is settled with unknown (maximum-charged) usage, not a
+    # real model response.
+    assert resumed_records[first_call_id].reconciliation is not None
+    assert (
+        resumed_records[first_call_id].reconciliation.actual_usage.input_tokens
+        is None
+    )
+    assert resumed_records[second_call_id].reconciliation is not None
+
+    # A redundant settle attempt (e.g. a second supervisor restart racing the
+    # first) must not create extra reservations: nothing is outstanding
+    # anymore, so this is a no-op.
+    asyncio.run(settle_incomplete_solver_model_call(runtime))
+    final_records = runtime.budget_ledger.load_model_records(
+        runtime.run_id, runtime.run_incarnation
+    )
+    assert len(final_records) == 2
+
+
+def test_production_solver_generation_resumes_after_reserved_without_started_crash(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6 remark D: a crash between RESERVED and STARTED must not durably
+    block every future resume either.
+
+    ``record_model_reservation``, ``claim_model_execution`` and
+    ``record_model_started`` (``workflow/adaptive_budget_ledger.py``) are
+    three separate durable sqlite transactions. A process killed right after
+    the first one leaves a "solver-generate-{revision}-0" ledger record with
+    ``started is None, reconciliation is None`` -- a *different* crash window
+    from the STARTED-without-RESULT one covered above. Before this fix,
+    ``settle_incomplete_solver_model_call`` bailed out whenever
+    ``outstanding[0].started is None``, so this window was left completely
+    unhandled and resume hit ``BudgetConflictError``
+    (``SolverStopReason.BUDGET_EXHAUSTED``) forever, same as the other window.
+    """
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    _, research, _, _ = _runtime()
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+
+    real_execute = coordinator.execute_model_call_with_budget_async
+
+    async def _crash_after_reserved(
+        run_id,
+        run_incarnation,
+        call_id,
+        request_digest,
+        model_identity,
+        maximum_input_tokens,
+        maximum_output_tokens,
+        _execute,
+        *,
+        config,
+        ledger,
+        **_kwargs,
+    ):
+        # Durably record RESERVED only -- no claim, no STARTED -- then die,
+        # emulating a process kill right after the reservation's own sqlite
+        # transaction commits.
+        reserve_model_call_budget(
+            run_id,
+            run_incarnation,
+            call_id,
+            request_digest,
+            model_identity,
+            maximum_input_tokens,
+            maximum_output_tokens,
+            config=config,
+            ledger=ledger,
+        )
+        raise _SimulatedProcessKill(
+            "simulated process kill: RESERVED recorded, STARTED never written"
+        )
+
+    monkeypatch.setattr(
+        coordinator, "execute_model_call_with_budget_async", _crash_after_reserved
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    crashing_model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    with pytest.raises(_SimulatedProcessKill):
+        asyncio.run(
+            run_production_adaptive_sql_generation(
+                runtime,
+                safety_policy=object(),
+                row_limit=10,
+                dry_run_only=False,
+                table_namespace="main",
+                model=crashing_model,
+                reenter=_forbidden_solver_reentry,
+            )
+        )
+    assert crashing_model.calls == 0
+
+    first_call_id = f"solver-generate-{research.revision}-0"
+    crashed_records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    assert set(crashed_records) == {first_call_id}
+    assert crashed_records[first_call_id].started is None
+    assert crashed_records[first_call_id].result is None
+    assert crashed_records[first_call_id].reconciliation is None
+
+    # "Restart the process": the real budget-call machinery comes back, and a
+    # fresh model stub stands in for the new incarnation's provider.
+    monkeypatch.setattr(
+        coordinator, "execute_model_call_with_budget_async", real_execute
+    )
+    resumed_model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=resumed_model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    # The provider ran exactly once for the whole resumed run: the stale
+    # RESERVED-only record was settled (a fresh STARTED minted for it and
+    # immediately reconciled with unknown usage), not replayed through the
+    # provider again.
+    assert resumed_model.calls == 1
+
+    second_call_id = f"solver-generate-{research.revision}-1"
+    resumed_records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    assert set(resumed_records) == {first_call_id, second_call_id}
+    assert resumed_records[first_call_id].started is not None
+    assert resumed_records[first_call_id].reconciliation is not None
+    assert (
+        resumed_records[first_call_id].reconciliation.actual_usage.input_tokens
+        is None
+    )
+    assert resumed_records[second_call_id].reconciliation is not None
+
+    # A redundant settle attempt must not create extra reservations: nothing
+    # is outstanding anymore, so this is a no-op.
+    asyncio.run(settle_incomplete_solver_model_call(runtime))
+    final_records = runtime.budget_ledger.load_model_records(
+        runtime.run_id, runtime.run_incarnation
+    )
+    assert len(final_records) == 2
+
+
+def test_production_solver_generation_stops_on_budget_exhausted(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6: an exhausted shared model budget stops the solver, not TOOL_FAILURE."""
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=1)
+    model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT 'Women's Soccer'")]
+    )
+
+    def forbidden_gates(*_args, **_kwargs):
+        raise AssertionError(
+            "a budget-exhausted solver must stop before pre-execution gates"
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        forbidden_gates,
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert checkpoint is not None
+    assert checkpoint.state.stop_reason is SolverStopReason.BUDGET_EXHAUSTED
+    assert output == {
+        "sql": "",
+        "description": "Adaptive solver stopped: RESEARCH_BUDGET_EXHAUSTED",
+    }
+    # The first (malformed-SQL) attempt still consumed the sole model call and
+    # is durably reconciled; only the retry was blocked by the budget.
+    records = runtime.budget_ledger.load_model_records(
+        runtime.run_id, runtime.run_incarnation
+    )
+    assert len(records) == 1
+    assert records[0].reservation.call_id.startswith("solver-generate-")
+    assert records[0].reconciliation is not None
+
+
+def test_production_solver_generation_stops_on_context_overflow_tool_failure(
+    monkeypatch, tmp_path
+) -> None:
+    """Bonus (review 2.1): an untruncatable ``_solver_context`` core raises
+    ``ValueError`` inside ``propose()`` *before* any model call or budget
+    reservation is attempted (see the call order at text_to_sql_adaptive_solver.py:249-316:
+    ``_solver_context`` runs first, ``execute_model_call_with_budget_async``
+    only after). ``_commit_next_solver_proposal`` maps that generic exception
+    to ``SolverStopReason.TOOL_FAILURE`` via ``_proposal_failure_reason``,
+    mirroring ``test_solver_runtime_error_is_tool_failure`` but through the
+    real production model/budget wiring instead of a synthetic ``propose``.
+    """
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+    tiny_limits = runtime.verified_research_policy.model_budget.model_copy(
+        update={"input_tokens_per_call": 1}
+    )
+    runtime.verified_research_policy = runtime.verified_research_policy.model_copy(
+        update={"model_budget": tiny_limits}
+    )
+    model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    def forbidden_gates(*_args, **_kwargs):
+        raise AssertionError(
+            "a context-overflow solver must stop before pre-execution gates"
+        )
+
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        forbidden_gates,
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
+    assert checkpoint is not None
+    assert checkpoint.state.stop_reason is SolverStopReason.TOOL_FAILURE
+    assert output == {
+        "sql": "",
+        "description": "Adaptive solver stopped: RESEARCH_TOOL_FAILURE",
+    }
+    # The oversized-context failure happens before the model is ever called
+    # and before any ledger reservation is made.
+    assert model.calls == 0
+    assert (
+        runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+        == ()
+    )
+
+
+def test_production_solver_generation_retries_past_reconciled_replay(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6 remark A: a durable ledger replay that reconciles the exact
+    call_id without invoking the provider (e.g. a crash between the ledger
+    write and capturing `proposed` in a prior incarnation) leaves `proposed`
+    as None. propose() must retry with the next durable attempt instead of
+    raising RuntimeError -> TOOL_FAILURE, mirroring research_loop's own outer
+    attempt loop for the identical replay outcome.
+
+    That "already reconciled" branch lives inside
+    ``_claim_model_execution_step`` (_policy_model_budget.py:~490-497): when
+    it fires, ``execute_model_call_with_budget_async`` returns the durable
+    ``ModelCallReconciliation`` straight away, without ever invoking the
+    ``execute`` callback (``_call`` below, which is the only thing that sets
+    `proposed`). A fresh test run has no prior-incarnation ledger record to
+    honestly replay, so this monkeypatches
+    ``execute_model_call_with_budget_async`` itself to reproduce exactly that
+    observable outcome for the first call, then delegates to the real
+    implementation for the retry.
+    """
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    _, research, _, _ = _runtime()
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+
+    real_execute = coordinator.execute_model_call_with_budget_async
+    observed_call_ids: list[str] = []
+
+    async def _fake_execute(run_id, run_incarnation, call_id, *args, **kwargs):
+        observed_call_ids.append(call_id)
+        if len(observed_call_ids) == 1:
+            # Mimic the reconciled-replay outcome: return without invoking
+            # `execute`, leaving `proposed` as None so propose() must retry.
+            return None
+        return await real_execute(run_id, run_incarnation, call_id, *args, **kwargs)
+
+    monkeypatch.setattr(
+        coordinator, "execute_model_call_with_budget_async", _fake_execute
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    assert model.calls == 1
+
+    first_call_id = f"solver-generate-{research.revision}-0"
+    retried_call_id = f"solver-generate-{research.revision}-1"
+    assert observed_call_ids == [first_call_id, retried_call_id]
+
+    records = {
+        record.reservation.call_id: record
+        for record in runtime.budget_ledger.load_model_records(
+            runtime.run_id, runtime.run_incarnation
+        )
+    }
+    assert set(records) == {retried_call_id}
+    assert records[retried_call_id].reconciliation is not None
+
+
+class _SequencedSolverModelWithUsage:
+    """Async model stub returning one canned ``SqlSolverModelResponse`` per call."""
+
+    def __init__(self, responses) -> None:
+        self._responses = list(responses)
+        self.calls = 0
+
+    async def __call__(self, _prompt: str):
+        response = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        return response
+
+
+def test_production_solver_generation_charges_real_reported_usage(
+    monkeypatch, tmp_path
+) -> None:
+    """W0-0.6b: the solver ledger charges the model's real reported usage."""
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+    from custom_tools.text_to_sql.adaptive.sql_solver_agent import (
+        SqlSolverModelResponse,
+    )
+
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+    model = _SequencedSolverModelWithUsage(
+        [
+            SqlSolverModelResponse(
+                raw_response=_solver_sql_response(
+                    "SELECT o.status FROM orders o WHERE o.status = 'active'"
+                ),
+                usage=ModelTokenUsage(input_tokens=100, output_tokens=50),
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    records = runtime.budget_ledger.load_model_records(
+        runtime.run_id, runtime.run_incarnation
+    )
+    assert len(records) == 1
+    reconciliation = records[0].reconciliation
+    assert reconciliation is not None
+    assert reconciliation.usage_was_conservative is False
+    assert reconciliation.charged_total_tokens == 150
+
+
+def test_production_solver_generation_charges_conservative_usage_without_reported_tokens(
+    monkeypatch, tmp_path
+) -> None:
+    """Regression guard: a bare-text model response still charges the reservation maxima."""
+
+    import workflow.text_to_sql_adaptive_solver as coordinator
+
+    runtime, store = _production_solver_runtime(tmp_path, model_calls=5)
+    model = _SequencedSolverModel(
+        [_solver_sql_response("SELECT o.status FROM orders o WHERE o.status = 'active'")]
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "run_solver_candidate_pre_execution_gates",
+        _passing_pre_execution_gates,
+    )
+
+    output = asyncio.run(
+        run_production_adaptive_sql_generation(
+            runtime,
+            safety_policy=object(),
+            row_limit=10,
+            dry_run_only=False,
+            table_namespace="main",
+            model=model,
+            reenter=_forbidden_solver_reentry,
+        )
+    )
+
+    assert output["sql"].startswith("SELECT o.status")
+    records = runtime.budget_ledger.load_model_records(
+        runtime.run_id, runtime.run_incarnation
+    )
+    assert len(records) == 1
+    reconciliation = records[0].reconciliation
+    assert reconciliation is not None
+    assert reconciliation.usage_was_conservative is True
+    assert reconciliation.charged_total_tokens == 64768

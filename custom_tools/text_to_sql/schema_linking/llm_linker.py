@@ -116,8 +116,13 @@ class LLMLinker:
                         dsn=dsn,
                     )
                 else:
+                    # W1-1.2-review Блокер 1 (уточнено финальным ревью): на namespace-ветке
+                    # find_semantic_relevant_tables ищет по namespace.version_key и dsn НЕ
+                    # читает — DSN-профиль на этот поиск не влияет ни до, ни после правки.
+                    # dsn передаём только для симметрии с legacy-веткой выше.
                     relevant_tables = self.memory_manager.find_semantic_relevant_tables(
                         entity_names,
+                        dsn=dsn,
                         namespace=namespace,
                     )
                 memory_status = getattr(
@@ -233,7 +238,14 @@ class LLMLinker:
                     k: _redact_linking_value(v)
                     for k, v in entities_for_prompt["filters"].items()
                 }
-            prompt = build_schema_linking_prompt(entities_for_prompt, schema_str, dsn=dsn)
+            prompt = build_schema_linking_prompt(
+                entities_for_prompt,
+                schema_str,
+                dsn=dsn,
+                schema_fingerprint=(
+                    namespace.schema_fingerprint if namespace is not None else None
+                ),
+            )
 
             logger.info(f"Schema linking prompt length: {len(prompt)}")
             logger.debug(
@@ -251,11 +263,15 @@ class LLMLinker:
             prompts_profile = load_prompts_config()
             system_prompt = prompts_profile.get_text("schema_linking", "system_prompt")
 
+            from agent_command import model_mapping
+            from ..llm_models_config import step_model_name
+
             schema_budget["model_calls"] = 1
             resp = call_openai_api(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 max_tokens=max_tokens,
+                model=model_mapping[step_model_name("schema_linking")],
                 response_format={"type": "json_object"},
             )
 

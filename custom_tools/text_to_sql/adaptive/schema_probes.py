@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
-from collections.abc import Callable, Mapping
+from collections import OrderedDict, defaultdict, deque
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from fractions import Fraction
 import re
+import threading
 import time
 import uuid
+from types import MappingProxyType
 from typing import Any, Protocol
 
 from pydantic import field_validator
@@ -59,6 +62,12 @@ MAX_SCHEMA_PROBE_TOP_K = 50
 MAX_SCHEMA_PROBE_DEPTH = 4
 MAX_CONTAINMENT_SAMPLE_SIZE = 1_000
 MAX_AMBIGUITY_PATHS_PER_TABLE = 2
+RRF_K = 60
+# Only the top-3 lexical matches act as FK-adjacency anchors: this keeps the
+# structural tie-break focused on plausible target tables (it mirrors the
+# legacy max()-based top-3 that originally seeded the F05 ambiguity check)
+# instead of letting every distant, low-scoring table pull in FK evidence.
+FK_ANCHOR_CANDIDATE_COUNT = 3
 
 
 class ScopedSchemaLoader(Protocol):
@@ -282,6 +291,9 @@ def search_schema_catalog(
     def observe(schema: dict[str, object], _: DatabaseCapabilities) -> _Observation:
         query = target.table.strip().casefold()
         candidates: list[tuple[int, str, list[str], list[str]]] = []
+        name_scores: dict[str, int] = {}
+        description_scores: dict[str, int] = {}
+        column_scores: dict[str, int] = {}
         for table_name in sorted(schema, key=str.casefold):
             table_body = schema[table_name]
             if not isinstance(table_body, Mapping):
@@ -293,6 +305,7 @@ def search_schema_catalog(
             table_score = _text_match_score(query, table_name)
             if table_score:
                 matched_fields.append("table")
+                name_scores[table_name] = table_score
             description = table_body.get("description", "")
             description_score = (
                 _text_match_score(query, description)
@@ -301,6 +314,7 @@ def search_schema_catalog(
             )
             if description_score:
                 matched_fields.append("table_description")
+                description_scores[table_name] = description_score
             matched_columns: list[str] = []
             column_score = 0
             for column_name, metadata in get_table_columns(table_body).items():
@@ -315,6 +329,8 @@ def search_schema_catalog(
                 if score:
                     matched_columns.append(column_name)
                     column_score = max(column_score, score)
+            if column_score:
+                column_scores[table_name] = column_score
             score = max(table_score, description_score, column_score)
             if score:
                 candidates.append(
@@ -325,20 +341,34 @@ def search_schema_catalog(
                         matched_fields,
                     )
                 )
-        candidates.sort(key=lambda item: (-item[0], item[1].casefold(), item[1]))
-        selected = candidates[:top_k]
-        top_score_count = (
-            sum(1 for item in candidates if item[0] == candidates[0][0])
-            if candidates
-            else 0
+        # Recall-first ranking (W3-3.1): fuse the three independent lexical
+        # signals (table name / description / column) via Reciprocal Rank
+        # Fusion instead of collapsing them with max(), so a table that
+        # matches several signals can rise above one that only matches a
+        # single, higher-scoring signal. The structural FK-adjacency signal
+        # is deliberately excluded from that sum (see
+        # ``_rank_catalog_candidates``): it only breaks ties among
+        # candidates whose lexical RRF is exactly equal, so it can never
+        # displace a candidate with a strictly stronger lexical match. Only
+        # tables that already have a lexical match (score > 0) can appear in
+        # results, which keeps total_matches/truncated and the pinned F05
+        # ambiguity ordering identical to the legacy behaviour when every
+        # table matches the same single signal.
+        ranked_candidates, is_ambiguous = _rank_catalog_candidates(
+            candidates,
+            name_scores,
+            description_scores,
+            column_scores,
+            _cached_relationship_edges(schema, runtime),
         )
         status = (
             "missing"
-            if not candidates
+            if not ranked_candidates
             else "ambiguous"
-            if top_score_count > 1
+            if is_ambiguous
             else "matched"
         )
+        selected = ranked_candidates[:top_k]
         results = [
             {
                 "match_fields": fields,
@@ -1152,6 +1182,112 @@ def _relationship_edges(schema: Mapping[str, object]) -> list[dict[str, object]]
     )
 
 
+# Bounded memo for `_relationship_edges`, which is O(tables^2 * columns) and
+# would otherwise be recomputed on every `search_schema_catalog` call within
+# a research loop even though the schema has not changed. Keyed by
+# `SchemaNamespace.version_key`, a hash of the schema's own canonical
+# fingerprint plus scope, so distinct schema content never collides and a
+# stale entry can never be read back for a schema that has since changed.
+# Bounded to the most recently seen schemas so a long-lived process serving
+# many databases cannot grow this without limit.
+#
+# Guarded by `_RELATIONSHIP_EDGES_CACHE_LOCK`: this cache is read and written
+# from multiple `asyncio.to_thread` worker threads concurrently (the agui
+# runner), and an unguarded plain dict raised
+# `RuntimeError: dictionary changed size during iteration` when one thread's
+# eviction (`next(iter(...))`/`pop`) raced another thread's read/write.
+# `OrderedDict` + `move_to_end`/`popitem(last=False)` gives cheap LRU
+# eviction once every mutation happens under the lock (mirrors the
+# containment TTL cache in `join_containment.py`).
+#
+# Entries are stored as `tuple[Mapping[str, object], ...]` (each edge a
+# `MappingProxyType`), not `list[dict]`: a plain list/dict is a shared
+# mutable object handed out to every caller, so one caller's in-place
+# mutation (e.g. `.append`/`edge["x"] = ...`) would silently corrupt the
+# cache for every other reader of the same `version_key`. Neither of the
+# three functions that consume edges (`_fk_anchor_link_counts`,
+# `_rank_catalog_candidates`, `code_label_cascade._fk_lookup_candidates`)
+# takes this lock, so a plain (non-reentrant) `Lock` is sufficient.
+_RELATIONSHIP_EDGES_CACHE_MAXSIZE = 8
+_RELATIONSHIP_EDGES_CACHE: "OrderedDict[str, tuple[Mapping[str, object], ...]]" = OrderedDict()
+_RELATIONSHIP_EDGES_CACHE_LOCK = threading.Lock()
+_RELATIONSHIP_EDGES_CACHE_MISS = object()
+
+
+def _relationship_edges_cache_get(version_key: str) -> object:
+    with _RELATIONSHIP_EDGES_CACHE_LOCK:
+        edges = _RELATIONSHIP_EDGES_CACHE.get(version_key, _RELATIONSHIP_EDGES_CACHE_MISS)
+        if edges is not _RELATIONSHIP_EDGES_CACHE_MISS:
+            _RELATIONSHIP_EDGES_CACHE.move_to_end(version_key)
+        return edges
+
+
+def _relationship_edges_cache_put(
+    version_key: str, edges: tuple[Mapping[str, object], ...]
+) -> None:
+    with _RELATIONSHIP_EDGES_CACHE_LOCK:
+        _RELATIONSHIP_EDGES_CACHE[version_key] = edges
+        _RELATIONSHIP_EDGES_CACHE.move_to_end(version_key)
+        while len(_RELATIONSHIP_EDGES_CACHE) > _RELATIONSHIP_EDGES_CACHE_MAXSIZE:
+            _RELATIONSHIP_EDGES_CACHE.popitem(last=False)
+
+
+def _relationship_edges_from_cache(
+    schema: Mapping[str, object],
+    version_key: str,
+) -> tuple[Mapping[str, object], ...]:
+    cached = _relationship_edges_cache_get(version_key)
+    if cached is not _RELATIONSHIP_EDGES_CACHE_MISS:
+        return cached
+    # Computed outside the lock: `_relationship_edges` is O(tables^2) and
+    # must never hold `_RELATIONSHIP_EDGES_CACHE_LOCK` while running, or
+    # concurrent lookups for *other* version_keys would serialize behind it.
+    # Two threads racing the same miss may both compute once; the second
+    # `_relationship_edges_cache_put` just overwrites with an equal value.
+    # Frozen once here (not inside `_relationship_edges_cache_put`) so the
+    # cache-miss return value is exactly what gets cached: no mutable list
+    # ever escapes to a caller, on either the hit or the miss path.
+    edges = tuple(_freeze_relationship_edge(edge) for edge in _relationship_edges(schema))
+    _relationship_edges_cache_put(version_key, edges)
+    return edges
+
+
+def _freeze_relationship_edge(edge: Mapping[str, object]) -> Mapping[str, object]:
+    """Deep-freeze one edge: ``column_pairs`` is a nested list of dicts, so a
+    top-level ``MappingProxyType`` alone would still let a consumer mutate
+    the shared cache through ``edge["column_pairs"].append(...)``."""
+    frozen = dict(edge)
+    pairs = frozen.get("column_pairs")
+    if isinstance(pairs, list):
+        frozen["column_pairs"] = tuple(
+            MappingProxyType(dict(pair)) if isinstance(pair, Mapping) else pair
+            for pair in pairs
+        )
+    return MappingProxyType(frozen)
+
+
+def _cached_relationship_edges(
+    schema: Mapping[str, object],
+    runtime: SchemaProbeRuntime,
+) -> tuple[Mapping[str, object], ...]:
+    return _relationship_edges_from_cache(schema, runtime.namespace.version_key)
+
+
+def relationship_edges_cached(
+    schema: Mapping[str, object],
+    version_key: str,
+) -> tuple[Mapping[str, object], ...]:
+    """Public wrapper over the same bounded relationship-edges cache used by
+    schema probes (`_cached_relationship_edges`), so callers outside this
+    module (e.g. the code<->label cascade hint) share one cache instead of
+    each paying for their own recomputation of `_relationship_edges` per
+    research iteration.
+    """
+    if not isinstance(version_key, str) or not version_key:
+        raise TypeError("version_key must be a non-empty str")
+    return _relationship_edges_from_cache(schema, version_key)
+
+
 def _declared_relationship(
     source_table: str,
     constraint: Mapping[str, object],
@@ -1356,6 +1492,125 @@ def _text_match_score(query: str, value: str) -> int:
     return 1 if terms and all(term in normalized for term in terms) else 0
 
 
+def _dense_rank(scored_names: list[tuple[int, str]]) -> dict[str, int]:
+    """Rank ``(score, name)`` pairs with ties sharing one rank (1 = best).
+
+    Equal scores must resolve to the exact same rank so that Reciprocal
+    Rank Fusion preserves an exact tie between tables that only match a
+    single, identical-scoring signal (see the pinned F05 ambiguity test).
+    """
+    ordered = sorted(
+        scored_names, key=lambda item: (-item[0], item[1].casefold(), item[1])
+    )
+    ranks: dict[str, int] = {}
+    rank = 0
+    previous_score: int | None = None
+    for score, name in ordered:
+        if score != previous_score:
+            rank += 1
+            previous_score = score
+        ranks[name] = rank
+    return ranks
+
+
+def _fk_anchor_link_counts(
+    top_tables: list[str],
+    relationship_edges: Sequence[Mapping[str, object]],
+    lexical_candidate_names: set[str],
+) -> dict[str, int]:
+    """Count, per table, how many FK edges connect it to ``top_tables``.
+
+    Only tables that are already lexical candidates are eligible: a table
+    with zero text-match score never becomes a result purely through FK
+    adjacency. The raw count (not a rank) is returned because it is only
+    ever used as a tie-break value, never summed into the lexical RRF — see
+    ``_rank_catalog_candidates``.
+    """
+    top_set = set(top_tables)
+    link_counts: dict[str, int] = {}
+    for edge in relationship_edges:
+        from_table = str(edge["from_table"])
+        to_table = str(edge["to_table"])
+        for anchor, neighbor in ((from_table, to_table), (to_table, from_table)):
+            if (
+                anchor in top_set
+                and neighbor != anchor
+                and neighbor in lexical_candidate_names
+            ):
+                link_counts[neighbor] = link_counts.get(neighbor, 0) + 1
+    return link_counts
+
+
+def _reciprocal_rank_fusion(*rank_maps: dict[str, int]) -> dict[str, Fraction]:
+    """Fuse independent rank maps with RRF: score(t) = sum 1 / (RRF_K + rank)."""
+    fused: dict[str, Fraction] = {}
+    for ranks in rank_maps:
+        for name, rank in ranks.items():
+            fused[name] = fused.get(name, Fraction(0)) + Fraction(1, RRF_K + rank)
+    return fused
+
+
+def _rank_catalog_candidates(
+    candidates: list[tuple[int, str, list[str], list[str]]],
+    name_scores: dict[str, int],
+    description_scores: dict[str, int],
+    column_scores: dict[str, int],
+    edges: Sequence[Mapping[str, object]],
+) -> tuple[list[tuple[int, str, list[str], list[str]]], bool]:
+    """Rank schema-catalog candidates; report whether the top rank ties.
+
+    Only the three lexical signals (table name / description / column) are
+    fused into ``lexical_rrf`` via Reciprocal Rank Fusion. The FK-adjacency
+    signal is kept out of that sum on purpose: it is applied afterwards as a
+    pure tie-break, active only among candidates whose ``lexical_rrf`` is
+    *exactly* equal (``Fraction`` equality). This guarantees a structurally
+    adjacent table can never outrank a table with a strictly stronger
+    lexical match — it can only decide between candidates that are
+    otherwise indistinguishable on lexical grounds.
+
+    The result is "ambiguous" (second element ``True``) when two or more
+    top-ranked candidates still share both an equal ``lexical_rrf`` and an
+    equal FK tie-break value: a difference in either one is enough to
+    resolve the tie deterministically.
+    """
+    if not candidates:
+        return [], False
+
+    legacy_order = sorted(
+        candidates, key=lambda item: (-item[0], item[1].casefold(), item[1])
+    )
+    lexical_candidate_names = {item[1] for item in candidates}
+    top_lexical_names = [
+        item[1] for item in legacy_order[:FK_ANCHOR_CANDIDATE_COUNT]
+    ]
+    fk_link_counts = _fk_anchor_link_counts(
+        top_lexical_names, edges, lexical_candidate_names
+    )
+    lexical_rrf = _reciprocal_rank_fusion(
+        *(
+            _dense_rank([(score, name) for name, score in scores.items()])
+            for scores in (name_scores, description_scores, column_scores)
+        )
+    )
+    ranked_candidates = sorted(
+        candidates,
+        key=lambda item: (
+            -lexical_rrf[item[1]],
+            -fk_link_counts.get(item[1], 0),
+            item[1].casefold(),
+            item[1],
+        ),
+    )
+    top_name = ranked_candidates[0][1]
+    top_tiebreak = (lexical_rrf[top_name], fk_link_counts.get(top_name, 0))
+    tie_count = sum(
+        1
+        for item in ranked_candidates
+        if (lexical_rrf[item[1]], fk_link_counts.get(item[1], 0)) == top_tiebreak
+    )
+    return ranked_candidates, tie_count > 1
+
+
 def _other_table(edge: Mapping[str, object], table: str) -> str:
     left = str(edge["from_table"])
     return str(edge["to_table"]) if left == table else left
@@ -1409,5 +1664,6 @@ __all__ = [
     "inspect_relationships",
     "inspect_table",
     "read_schema_evidence",
+    "relationship_edges_cached",
     "search_schema_catalog",
 ]

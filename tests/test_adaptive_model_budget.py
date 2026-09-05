@@ -518,6 +518,62 @@ def test_call_id_replay_rejects_changed_policy_before_provider(tmp_path) -> None
         ledger.close()
 
 
+def test_call_id_replay_with_changed_model_identity_names_the_policy_change(
+    tmp_path, caplog
+) -> None:
+    """W5: when the exact same logical call (run/incarnation/request) is
+    re-reserved with a *different* model_identity — e.g. an operator switched
+    a step's model class in llm_models.yaml between a crash and the resume
+    that re-enters this call_id — the raised BudgetConflictError must name
+    the old/new model identity instead of the generic "already has a
+    reservation" message, and a WARNING must be logged, so the operator can
+    tell "config changed" apart from "budget exhausted"."""
+
+    ledger = AdaptiveBudgetLedger(tmp_path / "changed-model-identity.sqlite")
+
+    def execute(_reservation):
+        return ModelTokenUsage(input_tokens=10, output_tokens=5)
+
+    try:
+        execute_model_call_with_budget(
+            RUN_ID,
+            INCARNATION,
+            "model-swap-call",
+            _request_digest("swap"),
+            MODEL_IDENTITY,
+            200,
+            100,
+            execute,
+            config=_config(),
+            ledger=ledger,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "first-owner",
+        )
+        with caplog.at_level("WARNING"):
+            with pytest.raises(
+                BudgetConflictError, match="model .* changed between incarnations"
+            ) as exc_info:
+                reserve_model_call_budget(
+                    RUN_ID,
+                    INCARNATION,
+                    "model-swap-call",
+                    _request_digest("swap"),
+                    "provider/model-v2",
+                    200,
+                    100,
+                    config=_config(),
+                    ledger=ledger,
+                )
+        assert "provider/model-v1" in str(exc_info.value)
+        assert "provider/model-v2" in str(exc_info.value)
+        assert any(
+            "changed between incarnations" in record.message
+            for record in caplog.records
+        )
+    finally:
+        ledger.close()
+
+
 def test_invalid_request_digest_stops_before_reservation_and_provider(tmp_path) -> None:
     ledger = AdaptiveBudgetLedger(tmp_path / "before-reserve.sqlite")
     invoked = False

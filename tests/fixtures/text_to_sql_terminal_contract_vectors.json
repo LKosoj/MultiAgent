@@ -33,7 +33,8 @@
       "path": "/tmp/query.md"
     },
     "result_review": {},
-    "ambiguity": null
+    "ambiguity": null,
+    "provenance": {}
   },
   "cases": [
     {

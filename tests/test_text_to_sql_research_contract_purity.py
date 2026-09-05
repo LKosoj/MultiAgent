@@ -127,7 +127,7 @@ def test_decision_identity_json_and_schema_are_unchanged() -> None:
         "sha256:35c448c0dbe3d7e6861094b4fd747cc50bcb2c9d9f7065637ff5fb47e07e6251"
     )
     assert canonical_digest(ResearchDecisionV1.model_json_schema()) == (
-        "sha256:ea5933b9c607822630e382e46db8cd9f1c9662f633a5a638763cd96ec7861472"
+        "sha256:7dd5e4dc0d831ec9183651818522c104d2afdf0aa19497e8c63e945e0b207e95"
     )
     assert canonical_digest(ToolIntent.model_json_schema()) == (
         "sha256:f92074173045d807a909d21ca66a4db0500bb1750a52cbb1692781084eb31374"

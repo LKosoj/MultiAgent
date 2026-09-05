@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import inspect
 import json
 from pathlib import Path
@@ -12,7 +13,9 @@ from pydantic import ValidationError
 
 from workflow.deadline import DeadlineBudget, execute_step_attempt
 
+from .model_budget import ModelTokenUsage
 from .models import NonEmptyText, StrictModel
+from .serialization import ContractDecodeError
 
 if TYPE_CHECKING:
     from .solver_protocol import SolverProposalV1
@@ -42,10 +45,20 @@ class SqlSolverAgentProfile(StrictModel):
     instructions: NonEmptyText
 
 
+@dataclass(frozen=True, slots=True)
+class SqlSolverModelResponse:
+    """Transient raw model response with provider-reported usage."""
+
+    raw_response: str | bytes
+    usage: ModelTokenUsage
+
+
 class SqlSolverProposalModel(Protocol):
     """Minimal async provider boundary: one prompt and one raw response."""
 
-    async def __call__(self, prompt: str, /) -> str | bytes: ...
+    async def __call__(
+        self, prompt: str, /
+    ) -> str | bytes | SqlSolverModelResponse: ...
 
 
 def load_sql_solver_agent_profile(
@@ -124,6 +137,22 @@ class SqlSolverProposalAdapter:
     ) -> SolverProposalV1:
         """Return one parsed proposal without retrying, executing, or persisting it."""
 
+        proposal, _usage = await self.propose_with_usage(
+            task=task,
+            solver_context=solver_context,
+            deadline=deadline,
+        )
+        return proposal
+
+    async def propose_with_usage(
+        self,
+        *,
+        task: str,
+        solver_context: str,
+        deadline: DeadlineBudget,
+    ) -> tuple[SolverProposalV1, ModelTokenUsage]:
+        """Return one parsed proposal and its transient model usage."""
+
         await asyncio.sleep(0)
         if not isinstance(deadline, DeadlineBudget):
             raise TypeError("deadline must be a DeadlineBudget")
@@ -135,10 +164,10 @@ class SqlSolverProposalAdapter:
             solver_context=solver_context,
         )
 
-        async def call_model(_: object) -> str | bytes:
+        async def call_model(_: object) -> str | bytes | SqlSolverModelResponse:
             return await self._model(prompt)
 
-        response = await execute_step_attempt(
+        raw = await execute_step_attempt(
             "sql_solver_agent",
             call_model,
             None,
@@ -147,6 +176,16 @@ class SqlSolverProposalAdapter:
         )
         await asyncio.sleep(0)
         deadline.require_remaining("SQL-solver response parsing")
+        if type(raw) is SqlSolverModelResponse:
+            response = raw.raw_response
+            usage = raw.usage
+            if type(usage) is not ModelTokenUsage:
+                raise SqlSolverModelResponseError(
+                    "SQL-solver model usage must be ModelTokenUsage"
+                )
+        else:
+            response = raw
+            usage = ModelTokenUsage(input_tokens=None, output_tokens=None)
         if type(response) not in (bytes, str):
             raise SqlSolverModelResponseError(
                 "SQL-solver model response must be bytes or str"
@@ -177,7 +216,12 @@ class SqlSolverProposalAdapter:
                     and type(top_level[0][1]) is str
                 ):
                     response = top_level[0][1]
-        return parse_solver_proposal(response)
+        try:
+            proposal = parse_solver_proposal(response)
+        except ContractDecodeError as error:
+            error.model_usage = usage
+            raise
+        return proposal, usage
 
 
 def _is_async_callable(model: object) -> bool:

@@ -401,6 +401,7 @@ def _terminal_contract_payload(status="succeeded", run_id="run-terminal"):
         } if succeeded else {"status": "not_attempted"},
         "result_review": {},
         "ambiguity": None,
+        "provenance": {},
     }
 
 
@@ -2376,6 +2377,7 @@ def test_workflow_result_artifacts_and_logs_are_redacted(monkeypatch):
 
 
 def test_agui_redaction_sanitizes_gzip_base64_report(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     wf_manager = _WorkflowManagerStub()
     service = _load_service_with_stubs(monkeypatch, wf_manager)
     raw_dsn = "postgresql://alice:secret@example.com/app?api_key=abc"
@@ -2508,6 +2510,8 @@ def test_text_to_sql_workflow_result_reports_failure_and_dry_run_execution(monke
                     "audit": {"status": "logged", "log_id": "audit-1"},
                     "persistence": {"status": "not_attempted"},
                     "ambiguity": None,
+                    "result_review": {},
+                    "provenance": {},
                 },
             "result": {"message": "partial"},
             "artifacts": {
@@ -3047,6 +3051,7 @@ def test_workflow_streamlit_redaction_masks_camel_case_secret_keys():
 
 
 def test_workflow_thread_telemetry_failure_redacts_pii(monkeypatch, tmp_path):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = streamlit_api.WorkflowManager(use_enhanced=False, pipelines_dir=str(tmp_path))
     run_id = "wf-telemetry-pii"
@@ -3134,6 +3139,7 @@ def test_workflow_thread_telemetry_failure_redacts_pii(monkeypatch, tmp_path):
 
 
 def test_workflow_thread_telemetry_success_output_redacts_pii(monkeypatch, tmp_path):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = streamlit_api.WorkflowManager(use_enhanced=False, pipelines_dir=str(tmp_path))
     run_id = "wf-telemetry-success-pii"
@@ -3226,6 +3232,7 @@ def test_workflow_thread_telemetry_success_output_redacts_pii(monkeypatch, tmp_p
 
 
 def test_workflow_thread_telemetry_warning_logs_redact_pii(monkeypatch, tmp_path):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = streamlit_api.WorkflowManager(use_enhanced=False, pipelines_dir=str(tmp_path))
     run_id = "wf-telemetry-warning-pii"
@@ -3291,6 +3298,7 @@ def test_workflow_thread_telemetry_warning_logs_redact_pii(monkeypatch, tmp_path
 
 
 def test_workflow_process_log_capture_redacts_pii(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     run_id = "wf-log-capture-pii"
     log_path = Path(__file__).resolve().parents[1] / "logs" / f"{run_id}_logs.jsonl"
@@ -3327,6 +3335,7 @@ def test_workflow_process_log_capture_redacts_pii(monkeypatch):
 
 
 def test_workflow_status_parameters_redact_pii(monkeypatch, tmp_path):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = streamlit_api.WorkflowManager(
         use_enhanced=False,
@@ -3484,7 +3493,10 @@ async def test_workflow_checkpoint_persists_camel_case_secret_refs(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_workflow_checkpoint_persists_pii_refs_and_restores_raw_context(tmp_path):
+async def test_workflow_checkpoint_persists_pii_refs_and_restores_raw_context(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     workflow_pkg = _install_light_workflow_package()
     store = workflow_pkg.state_manager.SQLiteWorkflowStore(str(tmp_path / "workflow_state.db"))
     raw_note = "contact person@example.com +7 (495) 123-45-67"
@@ -3520,7 +3532,8 @@ async def test_workflow_checkpoint_persists_pii_refs_and_restores_raw_context(tm
 
 
 @pytest.mark.asyncio
-async def test_workflow_checkpoint_migrates_legacy_raw_secrets(tmp_path):
+async def test_workflow_checkpoint_migrates_legacy_raw_secrets(tmp_path, monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     workflow_pkg = _install_light_workflow_package()
     store = workflow_pkg.state_manager.SQLiteWorkflowStore(str(tmp_path / "workflow_state.db"))
     raw_dsn = "postgresql://alice:secret@example.com/app"
@@ -3816,6 +3829,7 @@ def test_enhanced_text_to_sql_never_falls_back_to_old_pipeline(monkeypatch):
 
 
 def test_workflow_manager_reads_process_mode_artifacts_from_event_store(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = object.__new__(streamlit_api.WorkflowManager)
     manager.active_runs = {}
@@ -3943,7 +3957,8 @@ def test_workflow_manager_stored_status_uses_exact_identity_and_strict_terminal(
     )
 
 
-def test_workflow_manager_redacts_active_status_and_artifacts():
+def test_workflow_manager_redacts_active_status_and_artifacts(monkeypatch):
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     streamlit_api = _load_light_workflow_streamlit_api()
     manager = object.__new__(streamlit_api.WorkflowManager)
     raw_dsn = (
@@ -7301,6 +7316,8 @@ def test_workflow_manager_text_to_sql_serializes_typed_terminal_outcome(
         "audit": {"status": "logged", "log_id": "audit-1"},
         "persistence": {"status": "not_attempted"},
         "ambiguity": None,
+        "result_review": {},
+        "provenance": {},
     })
 
     class WorkflowDef:

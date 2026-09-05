@@ -137,11 +137,11 @@ def test_reference_start_fingerprint_is_canonical_and_reference_sensitive():
 def test_raw_dsn_start_fingerprint_uses_canonical_typed_contract():
     assert canonical_text_to_sql_start_fingerprint(
         {"query": "count orders", "dsn": _DSN}
-    ) == "a8aef22f2bab01c153f8444e1f71903d5c4f536aaf00e8d4c12bca446a6d1be6"
+    ) == "d0587d9b2f3d43e028a6b0bccf4a61b986c0b3867626b3a569af04d9bb124bd2"
     assert canonical_text_to_sql_start_fingerprint(
         {
             "query": "count orders",
             "dsn": _DSN,
             "admin_raw_dsn_compat": True,
         }
-    ) == "a8aef22f2bab01c153f8444e1f71903d5c4f536aaf00e8d4c12bca446a6d1be6"
+    ) == "d0587d9b2f3d43e028a6b0bccf4a61b986c0b3867626b3a569af04d9bb124bd2"

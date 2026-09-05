@@ -1439,6 +1439,7 @@ def test_post_repeat_stop_finalization_is_idempotent_and_records_remaining_legs(
     assert "- `post_repeat_candidate.json`" not in report
     assert "- `post_repeat_repair_decision.json`" not in report
 
+    (leg_dir / "early_stop_report.md").chmod(0o600)
     (leg_dir / "early_stop_report.md").write_text("tampered\n", encoding="utf-8")
     with pytest.raises(DiagnosticArtifactError, match="changed"):
         release.finalize_post_repeat_stop(
@@ -1608,6 +1609,7 @@ def test_continue_finalization_rejects_writable_candidate_without_resealing(
         + "\n",
         encoding="utf-8",
     )
+    candidate_path.chmod(0o644)
     decision_path = leg_dir / decision_name
     decision_path.write_text(
         json.dumps(
@@ -1865,8 +1867,8 @@ def test_evaluated_leg_handshake_requires_complete_sealed_inventory(
         release._validate_leg_artifacts(leg_dir, tampered)
 
     unsealed = {"artifacts": dict(artifacts_by_name)}
-    evaluated_path.write_text("runner_stdout.log\n", encoding="utf-8")
     evaluated_path.chmod(0o600)
+    evaluated_path.write_text("runner_stdout.log\n", encoding="utf-8")
     with pytest.raises(release.SandboxError, match="not sealed"):
         release._validate_leg_artifacts(leg_dir, unsealed)
 

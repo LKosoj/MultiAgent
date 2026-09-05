@@ -41,7 +41,6 @@ def _setup_env(monkeypatch):
     monkeypatch.setenv("DB_DSN", "sqlite:///tmp/test.db")
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "0")
     monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "1")
-    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PROFILE", "muni_ru")
     from custom_tools.text_to_sql import column_aliases_config
     column_aliases_config.reset_cache()
 

@@ -40,7 +40,8 @@ _DEFAULT_PROFILE = "default"
 # Поля, которые могут жить либо на верхнем уровне yaml (flat layout,
 # backward-compat с pre-W3 конфигом), либо внутри ``profiles.<name>``
 # (W3-T1: профиль-ориентированный layout, default = пустой/нейтральный,
-# доменные RU морфемы — в ``profiles.muni_ru``).
+# доменные RU морфемы — в отдельном именованном профиле, который заводит
+# сам проект).
 _PROFILE_OVERRIDABLE_KEYS = (
     "enabled",
     "intents",
@@ -71,7 +72,7 @@ class NLUMorphemesRegistry:
     def get_or_load(self, path: Path) -> "NLUMorphemes":
         abs_key = str(path.resolve(strict=False))
         # W3-T1: cache key учитывает активный профиль — переключение
-        # ``TEXT_TO_SQL_NLU_PROFILE`` между muni_ru и default в рамках
+        # ``TEXT_TO_SQL_NLU_PROFILE`` между именованными профилями в рамках
         # одного процесса (например, в тестах) должно давать разные
         # объекты, без явного ``reset_cache``.
         profile = resolve_active_profile()
@@ -335,8 +336,8 @@ def resolve_active_profile() -> str:
         в profile-aware layout отдаёт пустой/нейтральный набор морфем
         (``enabled: false``, intents/dimensions/intent_rules: []) —
         non-RU инсталляции не получают RU интентов в fallback'е.
-      * ``TEXT_TO_SQL_NLU_PROFILE=muni_ru`` восстанавливает legacy
-        набор морфем под муниципальный РФ-датасет.
+      * Доменный набор морфем задаётся отдельным именованным профилем
+        (``TEXT_TO_SQL_NLU_PROFILE=<name>``), который заводит сам проект.
     """
     return _shared_resolve_active_profile_name(
         None, env_var=_ENV_PROFILE_VAR, default=_DEFAULT_PROFILE

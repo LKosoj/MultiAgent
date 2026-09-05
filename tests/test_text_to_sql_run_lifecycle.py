@@ -286,6 +286,8 @@ def _terminal_payload(
                 "status": "error",
                 "error": "result reconciliation failed",
             },
+            "result_review": {},
+            "provenance": {},
         }
     else:
         terminal = _terminal_contract(run_id=run_id, status=status)
@@ -360,6 +362,8 @@ def _terminal_contract(
             if succeeded
             else {"status": "not_attempted"}
         ),
+        "result_review": {},
+        "provenance": {},
     }
 
 

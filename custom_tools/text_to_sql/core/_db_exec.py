@@ -1680,6 +1680,16 @@ def _secure_db_executor(
                     )
     execution_result["timeout_enforcement_mode"] = timeout_mode.value
     execution_result["cancellation_enforcement_mode"] = cancellation_mode.value
+    # W4-4.1: surface the safety check's LLM-advisory verdict (and any advisory
+    # findings) on the executor result so the terminal finalizer can quote it
+    # in the run's provenance footer. `safety` was computed above, before the
+    # DSN connection was even opened, and is untouched since.
+    llm_audit = safety.get("llm_audit")
+    if isinstance(llm_audit, str):
+        execution_result["llm_audit"] = llm_audit
+    advisory_issues = safety.get("advisory_issues")
+    if isinstance(advisory_issues, list):
+        execution_result["advisory_issues"] = advisory_issues
     return execution_result
 
 

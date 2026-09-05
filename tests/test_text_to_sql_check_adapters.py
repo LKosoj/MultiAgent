@@ -397,29 +397,43 @@ def test_safety_adapter_maps_confirmed_blocking_failure():
     assert result.repair == CheckRepair(kind=RepairKind.REVISE_SQL)
 
 
-def test_safety_adapter_maps_structured_timeout_only_to_inconclusive():
+@pytest.mark.parametrize(
+    ("audit", "issue_type"),
+    (
+        ("failed", "LLM_AUDIT_FAILED"),
+        ("timeout", "LLM_AUDIT_TIMEOUT"),
+    ),
+)
+def test_safety_adapter_maps_llm_audit_degradation_to_passed_with_advisory(
+    audit: str,
+    issue_type: str,
+):
+    # W0-0.5: сбой самого LLM-аудита fail-open — static-safe результат
+    # остаётся PASSED, деградация видна только через advisory_issues.
     native = _safety_result(
-        is_safe=False,
-        safety_status="failed",
-        llm_audit="timeout",
-        llm_audit_error="deadline",
-        issues=[
+        is_safe=True,
+        safety_status="safe",
+        llm_audit=audit,
+        llm_audit_error="unavailable",
+        advisory_issues=[
             {
-                "issue_type": "LLM_AUDIT_TIMEOUT",
-                "description": "deadline",
+                "issue_type": issue_type,
+                "description": "unavailable",
+                "blocking": False,
             }
         ],
     )
 
     result = adapt_safety_check_result(_candidate(), native)
 
-    assert result.status is CheckStatus.INCONCLUSIVE
-    assert result.failure_code is CheckFailureCode.CHECK_TIMEOUT
-    assert result.observed_error == "LLM_AUDIT_TIMEOUT"
+    assert result.status is CheckStatus.PASSED
+    assert result.check_id == "safety:candidate-1:passed"
 
 
-def test_safety_adapter_maps_canonical_llm_failure_to_rejected():
-    native = _safety_result(
+def test_safety_adapter_rejects_unsafe_result_carrying_llm_audit_issue_type():
+    # Старая форма (llm audit failure сигнализировался блокирующим issue)
+    # больше не легитимна: продюсер её не производит.
+    old_form = _safety_result(
         is_safe=False,
         safety_status="failed",
         llm_audit="failed",
@@ -431,12 +445,20 @@ def test_safety_adapter_maps_canonical_llm_failure_to_rejected():
             }
         ],
     )
+    valid_tuple_with_llm_issue = _safety_result(
+        is_safe=False,
+        safety_status="unsafe",
+        llm_audit="skipped_static_unsafe",
+        issues=[
+            {"issue_type": "FORBIDDEN_COMMAND", "description": "blocked"},
+            {"issue_type": "LLM_AUDIT_FAILED", "description": "unavailable"},
+        ],
+    )
 
-    result = adapt_safety_check_result(_candidate(), native)
-
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.SAFETY_REJECTED
-    assert result.observed_error == "LLM_AUDIT_FAILED"
+    for native in (old_form, valid_tuple_with_llm_issue):
+        result = adapt_safety_check_result(_candidate(), native)
+        assert result.status is CheckStatus.INCONCLUSIVE
+        assert result.failure_code is CheckFailureCode.CHECK_MALFORMED
 
 
 @pytest.mark.parametrize(
@@ -451,11 +473,17 @@ def test_safety_adapter_rejects_contradictory_llm_audit_issue_pair(
     issue_type: str,
 ):
     native = _safety_result(
-        is_safe=False,
-        safety_status="failed",
+        is_safe=True,
+        safety_status="safe",
         llm_audit=audit,
         llm_audit_error="runtime failure",
-        issues=[{"issue_type": issue_type, "description": "runtime failure"}],
+        advisory_issues=[
+            {
+                "issue_type": issue_type,
+                "description": "runtime failure",
+                "blocking": False,
+            }
+        ],
     )
 
     result = adapt_safety_check_result(_candidate(), native)
@@ -464,23 +492,20 @@ def test_safety_adapter_rejects_contradictory_llm_audit_issue_pair(
     assert result.failure_code is CheckFailureCode.CHECK_MALFORMED
 
 
-def test_safety_adapter_does_not_hide_blocking_issue_behind_timeout():
+def test_safety_adapter_does_not_hide_llm_audit_failure_without_advisory_evidence():
+    # audit сообщает о сбое, но advisory_issues не содержит соответствующего
+    # LLM_AUDIT_FAILED/TIMEOUT — деградация была бы скрыта от оператора.
     native = _safety_result(
-        is_safe=False,
-        safety_status="failed",
-        llm_audit="timeout",
+        is_safe=True,
+        safety_status="safe",
+        llm_audit="failed",
         llm_audit_error="deadline",
-        issues=[
-            {"issue_type": "LLM_AUDIT_TIMEOUT", "description": "deadline"},
-            {"issue_type": "FORBIDDEN_COMMAND", "description": "blocked"},
-        ],
     )
 
     result = adapt_safety_check_result(_candidate(), native)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.SAFETY_REJECTED
-    assert result.observed_error == "FORBIDDEN_COMMAND,LLM_AUDIT_TIMEOUT"
+    assert result.status is CheckStatus.INCONCLUSIVE
+    assert result.failure_code is CheckFailureCode.CHECK_MALFORMED
 
 
 @pytest.mark.parametrize("value", (0, 1, "false"))

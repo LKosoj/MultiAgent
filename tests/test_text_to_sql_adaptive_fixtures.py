@@ -300,13 +300,13 @@ def test_wave4_fixture_semantics_and_evidence_requirements_are_explicit() -> Non
             },
         },
         "F10_SAFE_EMPTY_RESULT": {
-            "items with negative quantity": {
+            "item-b with a zero quantity": {
                 "description": (
-                    "Stock items whose quantity is below zero; a valid binding remains "
-                    "supported even when no row matches."
+                    "Two individually observed values whose conjunction has no matching "
+                    "row; a valid typed filter can still return an empty result."
                 ),
-                "expected_binding_kind": "physical_column",
-                "evidence_requirements": ("schema_column", "empty_result"),
+                "expected_binding_kind": "discriminator_value",
+                "evidence_requirements": ("schema_column", "exact_values", "empty_result"),
             },
         },
     }
@@ -348,7 +348,7 @@ def test_unsupported_and_empty_result_are_distinct_contracts() -> None:
     assert unsupported.semantic_expectations[0].expected_binding_kind is None
     assert unsupported.schema_documents == ()
     assert empty.expected_category == "supported"
-    assert empty.semantic_expectations[0].expected_binding_kind == "physical_column"
+    assert empty.semantic_expectations[0].expected_binding_kind == "discriminator_value"
     assert "empty_result" in empty.semantic_expectations[0].evidence_requirements
 
 

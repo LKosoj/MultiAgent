@@ -221,7 +221,6 @@ def resolve_active_profile_name(explicit: str | None = None) -> str:
         explicit,
         env_var=_ENV_PROFILE_VAR,
         default=_DEFAULT_PROFILE,
-        umbrella_map={"muni_ru": _DEFAULT_PROFILE},
     )
 
 

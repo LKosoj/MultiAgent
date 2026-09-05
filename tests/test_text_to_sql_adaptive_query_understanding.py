@@ -1955,6 +1955,7 @@ def test_adaptive_query_prompts_keep_available_attribute_as_nullable_dimension()
 def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    import agent_command
     import custom_tools.text_to_sql.nlu as nlu_module
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -1999,6 +2000,7 @@ def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
                 "без привязки к схеме. Верни только JSON."
             ),
             "max_tokens": 321,
+            "model": agent_command.model_mapping["model_code"],
             "response_format": {"type": "json_object"},
         },
         {
@@ -2008,6 +2010,7 @@ def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
                 "без привязки к схеме. Верни только JSON."
             ),
             "max_tokens": 321,
+            "model": agent_command.model_mapping["model_code"],
             "response_format": {"type": "json_object"},
         },
     ]

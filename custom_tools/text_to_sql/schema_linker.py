@@ -178,6 +178,7 @@ class SchemaLinker:
             cache_info = self.cache_manager.prepare_cache_info(
                 entities,
                 db_schema,
+                dsn=effective_dsn,
                 namespace=namespace,
             )
         elif session_id is None:
@@ -229,6 +230,7 @@ class SchemaLinker:
             else:
                 cached_result["schema_info"] = self.context_builder.build_relevant_schema_context(
                     *context_args,
+                    dsn=effective_dsn,
                     namespace=namespace,
                 )
                 cached_result["namespace_version_key"] = namespace.version_key
@@ -251,6 +253,7 @@ class SchemaLinker:
             result = self.linking_core.perform_linking(
                 entities,
                 db_schema,
+                dsn=effective_dsn,
                 namespace=namespace,
             )
 
@@ -270,6 +273,7 @@ class SchemaLinker:
         else:
             result["schema_info"] = self.context_builder.build_relevant_schema_context(
                 *context_args,
+                dsn=effective_dsn,
                 namespace=namespace,
             )
             result["namespace_version_key"] = namespace.version_key
@@ -582,6 +586,7 @@ class SchemaLinker:
             return self.cache_manager.prepare_cache_info(
                 entities,
                 db_schema,
+                dsn=dsn,
                 namespace=namespace,
             )
         return self.cache_manager.prepare_cache_info(

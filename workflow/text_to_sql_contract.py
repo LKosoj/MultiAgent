@@ -462,6 +462,16 @@ _TEXT_TO_SQL_EXECUTION_OPTIONAL_FIELDS = frozenset({
     "policy_version",
     "capability_error",
     "pre_execution_error_code",
+    # `llm_audit`/`advisory_issues` are deliberately part of the executor's
+    # own contract, not a separate reviewer-only channel: the owner of a run
+    # is meant to see the verdict of the advisory audit that ran over their
+    # own SQL. The UI never renders these raw — the provenance footer
+    # (workflow/text_to_sql_provenance.py) only surfaces the closed set of
+    # ``provenance.safety_llm_audit`` statuses; ``advisory_issues`` details
+    # are not rendered anywhere, so exposing the fields here does not leak
+    # free-form audit internals.
+    "llm_audit",
+    "advisory_issues",
     *_TEXT_TO_SQL_ENFORCEMENT_MODE_FIELDS,
 })
 _TEXT_TO_SQL_EXECUTOR_BOUNDARY_REQUIRED_FIELDS = frozenset({
@@ -475,6 +485,10 @@ _TEXT_TO_SQL_EXECUTOR_BOUNDARY_OPTIONAL_FIELDS = frozenset({
     "policy_version",
     "capability_error",
     "pre_execution_error_code",
+    # See _TEXT_TO_SQL_EXECUTION_OPTIONAL_FIELDS above: same fields, same
+    # rationale — advisory audit results cross the executor boundary as-is.
+    "llm_audit",
+    "advisory_issues",
     *_TEXT_TO_SQL_ENFORCEMENT_MODE_FIELDS,
 })
 _TEXT_TO_SQL_ISSUE_FIELDS = frozenset({"issue_type", "description"})
@@ -485,6 +499,29 @@ _TEXT_TO_SQL_EXPLAIN_FIELDS = frozenset({
     "issues",
 })
 _TEXT_TO_SQL_CAPABILITY_ERROR_FIELDS = frozenset({"capability", "reason_code"})
+_TEXT_TO_SQL_ADVISORY_ISSUE_FIELDS = frozenset({"issue_type", "description", "blocking"})
+_TEXT_TO_SQL_LLM_AUDIT_VALUES = frozenset({
+    "ok",
+    "failed",
+    "timeout",
+    "skipped_static_unsafe",
+    "skipped_static_only",
+})
+# W4-4.1: closed shape of the terminal `provenance` evidence field — a
+# best-effort trace (tables/columns/row accounting/safety+review status) of
+# a SUCCEEDED, executed run, surfaced to operators alongside the answer.
+_TEXT_TO_SQL_PROVENANCE_FIELDS = frozenset({
+    "run_id",
+    "tables",
+    "columns",
+    "row_count",
+    "row_limit",
+    "possibly_truncated",
+    "safety_llm_audit",
+    "result_review_verdict",
+    "parse_error",
+    "has_derived_tables",
+})
 
 
 def _validate_text_to_sql_enforcement_modes(
@@ -537,6 +574,87 @@ def _validate_text_to_sql_capability_error(value: Any, *, field_name: str) -> No
     for key in _TEXT_TO_SQL_CAPABILITY_ERROR_FIELDS:
         if not isinstance(value[key], str) or not value[key].strip():
             raise TypeError(f"{field_name}.{key} must be a non-empty string")
+
+
+def _validate_text_to_sql_llm_audit(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, str) or value not in _TEXT_TO_SQL_LLM_AUDIT_VALUES:
+        allowed = ", ".join(sorted(_TEXT_TO_SQL_LLM_AUDIT_VALUES))
+        raise ValueError(f"{field_name} must be one of: {allowed}")
+
+
+def _validate_text_to_sql_advisory_issues(value: Any, *, field_name: str) -> None:
+    if not isinstance(value, list):
+        raise TypeError(f"{field_name} must be a list")
+    for index, issue in enumerate(value):
+        item_name = f"{field_name}[{index}]"
+        if not isinstance(issue, dict) or set(issue) != _TEXT_TO_SQL_ADVISORY_ISSUE_FIELDS:
+            raise ValueError(
+                f"{item_name} must contain exactly issue_type, description, and blocking"
+            )
+        for key in ("issue_type", "description"):
+            if not isinstance(issue[key], str) or not issue[key].strip():
+                raise TypeError(f"{item_name}.{key} must be a non-empty string")
+        if type(issue["blocking"]) is not bool:
+            raise TypeError(f"{item_name}.blocking must be a boolean")
+
+
+def _validate_text_to_sql_provenance(
+    value: Any,
+    *,
+    run_id: str,
+    executed: bool,
+    field_name: str,
+) -> None:
+    if not isinstance(value, dict) or set(value) != _TEXT_TO_SQL_PROVENANCE_FIELDS:
+        raise ValueError(
+            f"{field_name} must contain exactly "
+            + ", ".join(sorted(_TEXT_TO_SQL_PROVENANCE_FIELDS))
+        )
+    if not executed:
+        raise ValueError(f"{field_name} requires top-level executed=true")
+    if value["run_id"] != run_id:
+        raise ValueError(f"{field_name}.run_id must match top-level run_id")
+    for key in ("tables", "columns"):
+        items = value[key]
+        if not isinstance(items, list) or not all(
+            isinstance(item, str) and item for item in items
+        ):
+            raise TypeError(f"{field_name}.{key} must be a list of non-empty strings")
+        if items != sorted(items) or len(items) != len(set(items)):
+            raise ValueError(f"{field_name}.{key} must be sorted and deduplicated")
+    row_count = value["row_count"]
+    if type(row_count) is not int or row_count < 0:
+        raise TypeError(f"{field_name}.row_count must be a non-negative integer")
+    row_limit = value["row_limit"]
+    if type(row_limit) is not int or row_limit <= 0:
+        raise TypeError(f"{field_name}.row_limit must be a positive integer")
+    if type(value["possibly_truncated"]) is not bool:
+        raise TypeError(f"{field_name}.possibly_truncated must be a boolean")
+    if value["possibly_truncated"] != (row_count >= row_limit):
+        raise ValueError(
+            f"{field_name}.possibly_truncated must reflect row_count >= row_limit"
+        )
+    safety_llm_audit = value["safety_llm_audit"]
+    if safety_llm_audit is not None:
+        _validate_text_to_sql_llm_audit(
+            safety_llm_audit,
+            field_name=f"{field_name}.safety_llm_audit",
+        )
+    result_review_verdict = value["result_review_verdict"]
+    if result_review_verdict is not None and not isinstance(result_review_verdict, str):
+        raise TypeError(f"{field_name}.result_review_verdict must be a string or null")
+    if type(value["parse_error"]) is not bool:
+        raise TypeError(f"{field_name}.parse_error must be a boolean")
+    if value["parse_error"] and (value["tables"] or value["columns"]):
+        raise ValueError(
+            f"{field_name} cannot contain tables or columns when parse_error=true"
+        )
+    if type(value["has_derived_tables"]) is not bool:
+        raise TypeError(f"{field_name}.has_derived_tables must be a boolean")
+    if value["parse_error"] and value["has_derived_tables"]:
+        raise ValueError(
+            f"{field_name}.has_derived_tables must be false when parse_error=true"
+        )
 
 
 def _validate_text_to_sql_pre_execution_error_code(
@@ -789,6 +907,22 @@ def text_to_sql_executor_contract_error(
                 )
             except (TypeError, ValueError) as exc:
                 return bound_text_to_sql_error(exc)
+        if "llm_audit" in result:
+            try:
+                _validate_text_to_sql_llm_audit(
+                    result["llm_audit"],
+                    field_name="executor field 'llm_audit'",
+                )
+            except (TypeError, ValueError) as exc:
+                return bound_text_to_sql_error(exc)
+        if "advisory_issues" in result:
+            try:
+                _validate_text_to_sql_advisory_issues(
+                    result["advisory_issues"],
+                    field_name="executor advisory_issues",
+                )
+            except (TypeError, ValueError) as exc:
+                return bound_text_to_sql_error(exc)
         return None
     except BaseException as exc:
         detail = bound_text_to_sql_error(exc)
@@ -796,6 +930,28 @@ def text_to_sql_executor_contract_error(
             "executor contract validation failed"
             + (f": {detail}" if detail else "")
         )
+
+
+# W4-4.1 added the required `provenance` field to an already-shipped
+# contract. Snapshots written before that change (on disk / in SQLite) do
+# not have the key at all, and `from_mapping` would otherwise reject them
+# outright at every read site that decodes a *stored* terminal, i.e.:
+#   - workflow/adaptive_solver_checkpoint.py:_terminal_result_from_bytes
+#     (solver checkpoint resume — a raised ValueError there risks the
+#     run being "not recognized" and re-executed)
+#   - backend/fastapi_app/agui/store.py:_text_to_sql_history_entry_from_row
+#     (user-facing run history — a raised ValueError surfaces as a 500)
+#   - workflow/result_delivery.py:_terminal_outcome_mapping /
+#     _validated_terminal_outcome (delivery of a previously produced
+#     terminal — a raised ValueError there discards the real terminal and
+#     substitutes a synthetic failure)
+# `from_mapping` fills in the default below when the key is absent so those
+# legacy snapshots keep round-tripping. This is deliberately narrow: only
+# fields added after initial release belong here, and every other field in
+# `_FIELDS` must still be present or `from_mapping` raises, unchanged.
+_LEGACY_OPTIONAL_TERMINAL_FIELDS: Mapping[str, Any] = {
+    "provenance": {},
+}
 
 
 @dataclass(frozen=True)
@@ -820,6 +976,7 @@ class TextToSqlTerminalResult:
     persistence: Mapping[str, Any]
     ambiguity: AmbiguityReport | None = None
     result_review: Mapping[str, Any] = field(default_factory=dict)
+    provenance: Mapping[str, Any] = field(default_factory=dict)
 
     _FIELDS = frozenset({
         "run_id",
@@ -840,6 +997,7 @@ class TextToSqlTerminalResult:
         "persistence",
         "ambiguity",
         "result_review",
+        "provenance",
     })
 
     def __post_init__(self) -> None:
@@ -872,7 +1030,7 @@ class TextToSqlTerminalResult:
             raise TypeError("error must be a string or null")
         if self.ambiguity is not None and type(self.ambiguity) is not AmbiguityReport:
             raise TypeError("ambiguity must be an AmbiguityReport or null")
-        for field_name in ("execution", "audit", "persistence", "result_review"):
+        for field_name in ("execution", "audit", "persistence", "result_review", "provenance"):
             if not isinstance(getattr(self, field_name), Mapping):
                 raise TypeError(f"{field_name} must be an object")
         evidence = _isolated_json_value(
@@ -883,13 +1041,30 @@ class TextToSqlTerminalResult:
                 "audit": self.audit,
                 "persistence": self.persistence,
                 "result_review": self.result_review,
+                "provenance": self.provenance,
             },
             field_name="terminal evidence",
         )
-        for field_name in ("data", "columns", "execution", "audit", "persistence", "result_review"):
+        for field_name in (
+            "data",
+            "columns",
+            "execution",
+            "audit",
+            "persistence",
+            "result_review",
+            "provenance",
+        ):
             object.__setattr__(self, field_name, evidence[field_name])
         self.assert_invariants()
-        for field_name in ("data", "columns", "execution", "audit", "persistence", "result_review"):
+        for field_name in (
+            "data",
+            "columns",
+            "execution",
+            "audit",
+            "persistence",
+            "result_review",
+            "provenance",
+        ):
             object.__setattr__(
                 self,
                 field_name,
@@ -908,7 +1083,21 @@ class TextToSqlTerminalResult:
         missing = cls._FIELDS - keys
         unknown = keys - cls._FIELDS
         if missing:
-            raise ValueError(f"Text-to-SQL terminal result missing fields: {sorted(missing)}")
+            # See _LEGACY_OPTIONAL_TERMINAL_FIELDS: a field-not-present key is
+            # tolerated only if every missing key is a known legacy-optional
+            # field (i.e. added after initial release). Any other missing
+            # field is still a hard contract violation.
+            if not missing <= _LEGACY_OPTIONAL_TERMINAL_FIELDS.keys():
+                raise ValueError(
+                    f"Text-to-SQL terminal result missing fields: {sorted(missing)}"
+                )
+            value = {
+                **value,
+                **{
+                    field_name: _LEGACY_OPTIONAL_TERMINAL_FIELDS[field_name]
+                    for field_name in missing
+                },
+            }
         if unknown:
             raise ValueError(f"Text-to-SQL terminal result has unknown fields: {sorted(unknown)}")
 
@@ -959,6 +1148,11 @@ class TextToSqlTerminalResult:
                 if isinstance(value["result_review"], dict)
                 else value["result_review"]
             ),
+            provenance=(
+                dict(value["provenance"])
+                if isinstance(value["provenance"], dict)
+                else value["provenance"]
+            ),
         )
 
     def assert_invariants(self) -> None:
@@ -968,6 +1162,7 @@ class TextToSqlTerminalResult:
         audit = _thaw_json_value(self.audit)
         persistence = _thaw_json_value(self.persistence)
         result_review = _thaw_json_value(self.result_review)
+        provenance = _thaw_json_value(self.provenance)
         reason: Optional[TextToSqlTerminalReasonCode] = None
 
         if (self.reason_code == TextToSqlTerminalReasonCode.RESEARCH_AMBIGUOUS.value) != (
@@ -1217,6 +1412,16 @@ class TextToSqlTerminalResult:
                         execution["explain_result"],
                         execution=execution,
                     )
+                if "llm_audit" in execution:
+                    _validate_text_to_sql_llm_audit(
+                        execution["llm_audit"],
+                        field_name="execution.llm_audit",
+                    )
+                if "advisory_issues" in execution:
+                    _validate_text_to_sql_advisory_issues(
+                        execution["advisory_issues"],
+                        field_name="execution.advisory_issues",
+                    )
         elif self.executed or self.dry_run:
             raise ValueError(
                 "executed or dry_run terminal state requires execution evidence"
@@ -1235,6 +1440,14 @@ class TextToSqlTerminalResult:
         elif self.status is TextToSqlTerminalStatus.SUCCEEDED and self.executed:
             # Non-Typed callers remain supported; Typed runtime installs its reviewer.
             pass
+
+        if provenance:
+            _validate_text_to_sql_provenance(
+                provenance,
+                run_id=self.run_id,
+                executed=self.executed,
+                field_name="provenance",
+            )
 
         if audit:
             audit_status = audit.get("status")
@@ -1514,6 +1727,7 @@ class TextToSqlTerminalResult:
                 None if self.ambiguity is None else self.ambiguity.model_dump(mode="json")
             ),
             "result_review": _thaw_json_value(self.result_review),
+            "provenance": _thaw_json_value(self.provenance),
         }, field_name="terminal_result")
 
 

@@ -56,6 +56,139 @@ tokenizer:
     )
 
 
+def _write_full_ru_config(path: Path) -> None:
+    """Полный набор RU-морфем/regex (эвристика fallback) для regression-тестов.
+
+    Не привязан к какому-либо именованному профилю production yaml — это
+    самодостаточная тестовая фикстура (flat legacy layout, без ``profiles``),
+    поэтому активный профиль (env ``TEXT_TO_SQL_NLU_PROFILE``) не влияет на
+    её применение.
+    """
+    path.write_text(
+        r"""
+version: 1
+language: ru
+enabled: true
+
+intents:
+  - canonical: revenue
+    morphemes: ["выруч", "revenue", "amount", "сумм", "доход", "прибыл"]
+  - canonical: count
+    morphemes: ["количеств", "count", "число", "сколько", "штук", "единиц"]
+  - canonical: average
+    morphemes: ["средн", "average", "avg"]
+
+dimensions:
+  - canonical: date
+    morphemes: ["дат", "date", "период", "время", "месяц", "год", "день"]
+  - canonical: region
+    morphemes: ["регион", "region", "страна", "город", "облас", "край"]
+  - canonical: product
+    morphemes: ["продук", "product", "товар", "категор"]
+  - canonical: customer
+    morphemes: ["клиент", "customer", "покупател", "заказчик"]
+
+relative_date:
+  triggers: ["последни", "за послед", "last"]
+  periods:
+    - canonical: month
+      morphemes: ["месяц", "month"]
+    - canonical: week
+      morphemes: ["неделя", "week", "недели", "неделю", "недель"]
+    - canonical: year
+      morphemes: ["год", "year"]
+    - canonical: day
+      morphemes: ["день", "дней", "дня", "day"]
+  days_pattern: '(\d+)\s*(?:месяц|недел|год|дн|день|дней|дня|week|month|year|day)'
+
+patterns:
+  date_iso:
+    - '(20\d{2}-\d{2}-\d{2})'
+  region:
+    - 'регион(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+    - 'в\s+([a-zA-Zа-яА-Я]+(?:ской|ском|кой|ком)?\s*(?:област|регион|край))'
+    - 'город(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+  amount_greater:
+    - '(?:больше|более|>)\s*(\d+(?:\.\d+)?)'
+  amount_less:
+    - '(?:меньше|менее|<)\s*(\d+(?:\.\d+)?)'
+  amount_between:
+    - 'между\s*(\d+(?:\.\d+)?)\s*и\s*(\d+(?:\.\d+)?)'
+  top_n:
+    - '(?:топ|top)\s*(\d+)'
+    - 'первы[еих]\s*(\d+)'
+    - 'лучши[еих]\s*(\d+)'
+    - '(?:показать|вывести)\s*(\d+)'
+
+regions:
+  normalize: {}
+
+order:
+  triggers: ["по убыван", "по возраст", "desc", "asc"]
+  desc_triggers: ["по убыван", "desc"]
+
+intent_rules:
+  - canonical: aggregate
+    morphemes: ["агрегир", "сумм", "итог", "всего"]
+  - canonical: aggregate_over_time
+    morphemes: ["по времени", "по месяц", "по дат", "динамик"]
+  - canonical: compare
+    morphemes: ["сравни", "compare", "против", "vs"]
+
+default_intent: query
+top_n_intent: top_n
+
+tokenizer:
+  adpositions: ["по", "за", "между", "в", "для", "от", "до"]
+""",
+        encoding="utf-8",
+    )
+
+
+def _write_ru_named_profile_config(path: Path, profile_name: str) -> None:
+    """Тот же RU-набор, что и ``_write_full_ru_config``, но под ``profiles.<name>``.
+
+    Нужен для тестов механизма выбора именованного профиля (env/umbrella),
+    а не для проверки содержимого морфем как такового.
+    """
+    path.write_text(
+        f"""
+version: 1
+language: ru
+
+profiles:
+  {profile_name}:
+    enabled: true
+    intents:
+      - canonical: revenue
+        morphemes: ["выруч", "revenue", "amount", "сумм", "доход", "прибыл"]
+    dimensions:
+      - canonical: region
+        morphemes: ["регион", "region", "страна", "город", "облас", "край"]
+    relative_date:
+      triggers: []
+      periods: []
+      days_pattern: '(\\d+)\\s*(?:day)'
+    patterns:
+      date_iso: []
+      region: []
+      amount_greater: []
+      amount_less: []
+      amount_between: []
+      top_n: []
+    order:
+      triggers: []
+      desc_triggers: []
+    intent_rules: []
+    default_intent: query
+    top_n_intent: top_n
+    tokenizer:
+      adpositions: []
+""",
+        encoding="utf-8",
+    )
+
+
 def test_nlu_loads_morphemes_from_yaml(tmp_path, monkeypatch):
     """Подмена пути к yaml через env должна полностью переопределять словарь."""
     cfg_path = tmp_path / "nlu_morphemes.yaml"
@@ -110,15 +243,17 @@ def test_nlu_no_russian_morphemes_in_python_code():
     )
 
 
-def test_muni_ru_profile_preserves_legacy_revenue_extraction(monkeypatch):
-    """Регресс: профиль muni_ru хранит ту же морфему 'выруч', что и старый код.
+def test_full_ru_config_preserves_legacy_revenue_extraction(tmp_path, monkeypatch):
+    """Регресс: тестовый RU-набор хранит ту же морфему 'выруч', что и старый код.
 
-    W3-T1: RU-морфемы переехали в ``profiles.muni_ru``; default-профиль
-    стал нейтральным. Поэтому regression-кейс активирует muni_ru явно
-    через env ``TEXT_TO_SQL_NLU_PROFILE``.
+    W3-T1: RU-морфемы больше не живут в production yaml (только ``default``,
+    нейтральный). Regression-кейс поэтому подставляет собственный
+    самодостаточный RU-конфиг через ``TEXT_TO_SQL_NLU_MORPHEMES_PATH``.
     """
-    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    _write_full_ru_config(cfg_path)
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(cfg_path))
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_PROFILE", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
     monkeypatch.setattr(nlu, "call_openai_api", None)
 
@@ -129,10 +264,12 @@ def test_muni_ru_profile_preserves_legacy_revenue_extraction(monkeypatch):
     assert "region" in result["entities"]["dimensions"]
 
 
-def test_umbrella_text2sql_profile_selects_muni_ru_nlu(monkeypatch):
-    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
+def test_umbrella_text2sql_profile_selects_named_ru_profile(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    _write_ru_named_profile_config(cfg_path, "ru_regional")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(cfg_path))
     monkeypatch.delenv("TEXT_TO_SQL_NLU_PROFILE", raising=False)
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "ru_regional")
     monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
     monkeypatch.setattr(nlu, "call_openai_api", None)
 
@@ -144,7 +281,7 @@ def test_umbrella_text2sql_profile_selects_muni_ru_nlu(monkeypatch):
 
 def test_specific_nlu_profile_env_wins_over_umbrella(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "ignored_profile")
     monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "default")
     monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
     monkeypatch.setattr(nlu, "call_openai_api", None)
@@ -154,11 +291,13 @@ def test_specific_nlu_profile_env_wins_over_umbrella(monkeypatch):
         processor.extract_intent("покажи выручку по регионам")
 
 
-def test_muni_ru_profile_preserves_top_n_and_order(monkeypatch):
-    """Регресс: regex-паттерны top_n / order переехали в profiles.muni_ru
-    без потери поведения (W3-T1)."""
-    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+def test_full_ru_config_preserves_top_n_and_order(tmp_path, monkeypatch):
+    """Регресс: regex-паттерны top_n / order не теряют поведение (W3-T1),
+    даже когда production yaml больше не содержит доменного профиля."""
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    _write_full_ru_config(cfg_path)
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(cfg_path))
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_PROFILE", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
     monkeypatch.setattr(nlu, "call_openai_api", None)
 
@@ -171,8 +310,8 @@ def test_muni_ru_profile_preserves_top_n_and_order(monkeypatch):
 
 
 def test_default_profile_blocks_ru_fallback(monkeypatch):
-    """W3-T1: без активации muni_ru дефолтный profile-aware yaml держит
-    fallback закрытым — non-RU инсталляция не получает RU интентов."""
+    """W3-T1: без активации доменного профиля дефолтный profile-aware yaml
+    держит fallback закрытым — non-RU инсталляция не получает RU интентов."""
     import pytest
 
     monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
@@ -190,45 +329,47 @@ def test_default_profile_blocks_ru_fallback(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def _muni_ru_fallback_processor(monkeypatch):
-    """Процессор с профилем muni_ru, fallback включён, без LLM."""
-    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+def _ru_fallback_processor(tmp_path, monkeypatch):
+    """Процессор с самодостаточным тестовым RU-конфигом, fallback включён, без LLM."""
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    _write_full_ru_config(cfg_path)
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(cfg_path))
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_PROFILE", raising=False)
     monkeypatch.setenv("TEXT_TO_SQL_NLU_ALLOW_FALLBACKS", "1")
     monkeypatch.setattr(nlu, "call_openai_api", None)
     return NLUProcessor()
 
 
-def test_relative_date_month_with_count(_muni_ru_fallback_processor):
+def test_relative_date_month_with_count(_ru_fallback_processor):
     """T10-nlu #25: 'за последние 3 месяца' → period=month, count=3 (не 1)."""
-    result = _muni_ru_fallback_processor.extract_intent("за последние 3 месяца")
+    result = _ru_fallback_processor.extract_intent("за последние 3 месяца")
     rd = result["entities"]["filters"].get("relative_date")
     assert rd is not None, "relative_date filter должен быть установлен"
     assert rd["period"] == "month"
     assert rd["count"] == 3
 
 
-def test_relative_date_week_with_count(_muni_ru_fallback_processor):
+def test_relative_date_week_with_count(_ru_fallback_processor):
     """T10-nlu #25: 'за последние 2 недели' → period=week, count=2."""
-    result = _muni_ru_fallback_processor.extract_intent("за последние 2 недели")
+    result = _ru_fallback_processor.extract_intent("за последние 2 недели")
     rd = result["entities"]["filters"].get("relative_date")
     assert rd is not None, "relative_date filter должен быть установлен"
     assert rd["period"] == "week"
     assert rd["count"] == 2
 
 
-def test_relative_date_day_with_count(_muni_ru_fallback_processor):
+def test_relative_date_day_with_count(_ru_fallback_processor):
     """T10-nlu #25 регресс: 'за последние 7 дней' → period=day, count=7."""
-    result = _muni_ru_fallback_processor.extract_intent("за последние 7 дней")
+    result = _ru_fallback_processor.extract_intent("за последние 7 дней")
     rd = result["entities"]["filters"].get("relative_date")
     assert rd is not None, "relative_date filter должен быть установлен"
     assert rd["period"] == "day"
     assert rd["count"] == 7
 
 
-def test_relative_date_year_no_count(_muni_ru_fallback_processor):
+def test_relative_date_year_no_count(_ru_fallback_processor):
     """T10-nlu: 'за последний год' без числа → period=year, count=1."""
-    result = _muni_ru_fallback_processor.extract_intent("за последний год")
+    result = _ru_fallback_processor.extract_intent("за последний год")
     rd = result["entities"]["filters"].get("relative_date")
     assert rd is not None, "relative_date filter должен быть установлен"
     assert rd["period"] == "year"
@@ -305,7 +446,7 @@ def test_process_text_is_local_and_deterministic(monkeypatch):
     assert calls == []
 
 
-def test_relative_date_not_set_without_period_unit(_muni_ru_fallback_processor):
+def test_relative_date_not_set_without_period_unit(_ru_fallback_processor):
     """T10-nlu регресс: запрос с триггером 'последн*' без явной единицы периода
     НЕ должен устанавливать relative_date.
 
@@ -317,7 +458,7 @@ def test_relative_date_not_set_without_period_unit(_muni_ru_fallback_processor):
         "последние 10 записей",
         "последний отчёт",
     ]:
-        result = _muni_ru_fallback_processor.extract_intent(query)
+        result = _ru_fallback_processor.extract_intent(query)
         rd = result["entities"]["filters"].get("relative_date")
         assert rd is None, (
             f"relative_date не должен устанавливаться без явной единицы периода: {query!r}, "

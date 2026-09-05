@@ -30,6 +30,7 @@ def intent_extraction(
     session_id: Optional[str] = None,
     *,
     nlu_processor,
+    dsn: Optional[str] = None,
 ) -> Dict[str, object]:
     """LLM-интенто- и сущностное извлечение.
 
@@ -37,8 +38,11 @@ def intent_extraction(
         text: Входной текст для извлечения интентов и сущностей
         session_id: ID сессии для контекста (опционально). Пробрасывается в
             ``NLUProcessor.extract_intent`` для логирования и аудита.
+        dsn: явный DSN целевой БД (опционально). Пробрасывается в
+            ``NLUProcessor.extract_intent`` для приоритетного DSN-профиля
+            в heuristic fallback-пути (W1-1.2b).
 
     Returns:
         Словарь с извлеченными интентами и сущностями
     """
-    return nlu_processor.extract_intent(text, session_id=session_id)
+    return nlu_processor.extract_intent(text, session_id=session_id, dsn=dsn)

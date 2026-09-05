@@ -2,7 +2,6 @@ from custom_tools.text_to_sql.prompts import (
     build_column_description_prompt_with_context,
     build_schema_linking_prompt,
 )
-from custom_tools.text_to_sql import prompts_config
 from custom_tools.text_to_sql.sql_generator import SQLGenerator
 
 
@@ -20,7 +19,7 @@ def test_schema_linking_prompt_has_stable_json_examples():
 def test_sql_generation_prompt_escapes_context_and_user_text(monkeypatch):
     captured = {}
 
-    def fake_call_openai_api(*, prompt, system_prompt, max_tokens, response_format):
+    def fake_call_openai_api(*, prompt, system_prompt, max_tokens, response_format, model=None):
         captured["prompt"] = prompt
         captured["system_prompt"] = system_prompt
         return '{"sql_query":"SELECT 1"}'
@@ -50,16 +49,3 @@ def test_column_description_prompt_escapes_identifier_like_values():
     assert 'public.bad\\"\\nname' in prompt
     assert "context with" in prompt
 
-
-def test_text2sql_muni_ru_umbrella_uses_default_prompt_profile(monkeypatch):
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
-    monkeypatch.delenv("TEXT_TO_SQL_PROMPTS_PROFILE", raising=False)
-    prompts_config.reset_cache()
-
-    try:
-        rules_text, system_prompt = SQLGenerator()._load_sql_generation_prompts()
-    finally:
-        prompts_config.reset_cache()
-
-    assert "только SELECT" in rules_text
-    assert "SQL-генератор" in system_prompt

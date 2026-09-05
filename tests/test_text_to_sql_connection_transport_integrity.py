@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import subprocess
 import sys
 import textwrap
@@ -10,6 +11,33 @@ from fastapi import HTTPException
 
 from backend.fastapi_app.agui.auth import Principal
 from streamlit_app.text_to_sql_client import TextToSqlApiClient, TextToSqlRunRequest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_gateway_state_database(monkeypatch, tmp_path):
+    """Tests below do ``import backend.fastapi_app.main`` inside the test body.
+
+    At module load time ``main.py`` calls
+    ``workflow.state_files.default_state_database_path(APP_ROOT, ...)``, which
+    enforces that the real repo's ``data/`` directory is owned by the current
+    user (a legitimate production safety check we must not weaken). In this
+    checkout that directory is root-owned, so a fresh import of ``main``
+    always raises ``PermissionError`` regardless of which test triggers it.
+
+    Point the resolver at a ``tmp_path``-owned database instead, and drop any
+    cached ``backend.fastapi_app.main`` module so each test gets a fresh
+    import that uses the patched resolver. This mirrors the existing pattern
+    in tests/test_ag_ui_gateway.py::_load_gateway_with_runner_stub.
+    """
+    state_files = importlib.import_module("workflow.state_files")
+    monkeypatch.setattr(
+        state_files,
+        "default_state_database_path",
+        lambda *_args, **_kwargs: tmp_path / "agui_events.db",
+    )
+    monkeypatch.delitem(sys.modules, "backend.fastapi_app.main", raising=False)
+    yield
+    monkeypatch.delitem(sys.modules, "backend.fastapi_app.main", raising=False)
 
 
 def test_connection_registration_does_not_import_memory_rag_api() -> None:

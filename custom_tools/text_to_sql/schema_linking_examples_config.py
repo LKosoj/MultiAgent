@@ -42,7 +42,7 @@ _DEFAULT_PROFILE = "default"
 
 
 class SchemaLinkingProfile:
-    """Доменные подсказки для одного профиля (например, muni_ru)."""
+    """Доменные подсказки для одного профиля."""
 
     __slots__ = (
         "name",
@@ -210,6 +210,38 @@ def resolve_active_profile_name(explicit: str | None = None) -> str:
     )
 
 
+def render_schema_linking_domain_examples(
+    priority_id_columns: List[str],
+    low_priority_name_columns: List[str],
+    prefer_id_over_name_rules: List[tuple[str, str]],
+) -> str:
+    """Отрендерить блок текста с доменными подсказками для промпта.
+
+    Общий рендерер для двух источников доменных подсказок: именованного
+    профиля этого модуля (``compose_schema_linking_domain_examples``) и
+    per-DSN профиля (``prompts.py::_compose_domain_examples_from_metric_hints``).
+    Решение «рендерить или нет» остаётся за вызывающей стороной (у каждого
+    источника свой критерий пустоты).
+    """
+    lines: List[str] = ["ДОМЕННЫЕ ПРИМЕРЫ ИЗ ТЕКУЩЕЙ СХЕМЫ:"]
+    if priority_id_columns:
+        lines.append(
+            "- Приоритетные ID-колонки (предпочитай их при джойнах): "
+            + ", ".join(priority_id_columns)
+        )
+    if low_priority_name_columns:
+        lines.append(
+            "- Низкоприоритетные текстовые колонки (использовать только если нет ID): "
+            + ", ".join(low_priority_name_columns)
+        )
+    for id_column, ignore_column in prefer_id_over_name_rules:
+        lines.append(
+            f"- Если есть {id_column} — используй его, "
+            f"игнорируй {ignore_column}."
+        )
+    return "\n".join(lines) + "\n\n"
+
+
 def compose_schema_linking_domain_examples(profile_name: str | None = None) -> str:
     """Сформировать блок текста с доменными подсказками для промпта.
 
@@ -223,23 +255,14 @@ def compose_schema_linking_domain_examples(profile_name: str | None = None) -> s
     if profile.is_empty():
         return ""
 
-    lines: List[str] = ["ДОМЕННЫЕ ПРИМЕРЫ ИЗ ТЕКУЩЕЙ СХЕМЫ:"]
-    if profile.priority_id_columns:
-        lines.append(
-            "- Приоритетные ID-колонки (предпочитай их при джойнах): "
-            + ", ".join(profile.priority_id_columns)
-        )
-    if profile.low_priority_name_columns:
-        lines.append(
-            "- Низкоприоритетные текстовые колонки (использовать только если нет ID): "
-            + ", ".join(profile.low_priority_name_columns)
-        )
-    for rule in profile.prefer_id_over_name_rules:
-        lines.append(
-            f"- Если есть {rule['id_column']} — используй его, "
-            f"игнорируй {rule['ignore_column']}."
-        )
-    return "\n".join(lines) + "\n\n"
+    return render_schema_linking_domain_examples(
+        profile.priority_id_columns,
+        profile.low_priority_name_columns,
+        [
+            (rule["id_column"], rule["ignore_column"])
+            for rule in profile.prefer_id_over_name_rules
+        ],
+    )
 
 
 def reset_cache() -> None:

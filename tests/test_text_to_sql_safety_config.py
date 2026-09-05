@@ -83,17 +83,6 @@ def test_umbrella_text2sql_profile_selects_safety_profile(monkeypatch):
     assert profile.profile_name == "extended"
 
 
-def test_umbrella_text2sql_muni_ru_uses_default_safety_profile(monkeypatch):
-    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
-    monkeypatch.delenv("TEXT_TO_SQL_SAFETY_PROFILE", raising=False)
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
-    safety_config.reset_cache()
-
-    profile = load_safety_profile()
-
-    assert profile.profile_name == "default"
-
-
 def test_specific_safety_profile_env_wins_over_umbrella(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_SAFETY_CONFIG_PATH", raising=False)
     monkeypatch.setenv("TEXT2SQL_PROFILE", "extended")

@@ -263,8 +263,13 @@ class HeuristicLinker:
                     dsn=dsn,
                 )
             else:
+                # W1-1.2-review Блокер 1 (уточнено финальным ревью): на namespace-ветке
+                # find_semantic_relevant_tables ищет по namespace.version_key и dsn НЕ
+                # читает — DSN-профиль на этот поиск не влияет ни до, ни после правки.
+                # dsn передаём только для симметрии с legacy-веткой выше.
                 semantic_tables = self.memory_manager.find_semantic_relevant_tables(
                     self.collect_entity_terms(entities),
+                    dsn=dsn,
                     namespace=namespace,
                 )
         except (EmbeddingUnavailableError, EmbeddingFailedError) as e:
@@ -287,6 +292,7 @@ class HeuristicLinker:
                     db_schema.get(main_table, {}),
                     entity_type="metric",
                     diagnostics=diagnostics,
+                    dsn=dsn,
                 )
                 if col:
                     linked_metrics.append({"name": m, "table": main_table, "column": col})
@@ -304,7 +310,7 @@ class HeuristicLinker:
                 # Это устраняет order-dependent поведение (баг #11).
                 candidates: List[Tuple[str, str, int]] = []
                 for t, table_schema in db_schema.items():
-                    ranked = self._score_columns_for_name(d, table_schema)
+                    ranked = self._score_columns_for_name(d, table_schema, dsn=dsn)
                     if not ranked:
                         continue
                     table_cols = get_table_columns(table_schema)
@@ -360,6 +366,7 @@ class HeuristicLinker:
             main_table,
             db_schema,
             diagnostics,
+            dsn=dsn,
         )
 
         return linked_metrics, linked_dimensions, linked_filters, unlinked
@@ -466,13 +473,14 @@ class HeuristicLinker:
         name: str,
         table: str,
         table_schema: Dict[str, Dict[str, Any]],
+        dsn: Optional[str] = None,
     ) -> Optional[Tuple[str, int]]:
         """Как ``best_column_for``, но возвращает (имя, score).
 
         Введено в W1-T5 (баг 4), чтобы ``link_filters`` мог сравнивать
         качество кандидатов из разных таблиц, а не брать первый попавшийся.
         """
-        candidates = self._score_columns_for_name(name, table_schema)
+        candidates = self._score_columns_for_name(name, table_schema, dsn=dsn)
         if not candidates:
             return None
         candidates.sort(key=lambda x: (-x[1], x[0]))
@@ -484,6 +492,7 @@ class HeuristicLinker:
         name: str,
         table: str,
         table_schema: Dict[str, Dict[str, Any]],
+        dsn: Optional[str] = None,
     ) -> Optional[str]:
         """Находит наилучшую колонку для сущности.
 
@@ -493,15 +502,17 @@ class HeuristicLinker:
           3. Совпадение query_term с именем FK references таблицы (+5).
           4. Type-match (+3 при primary signal / weight_solo иначе).
           5. Опциональный yaml-override через
-             ``config/text_to_sql/column_aliases.yaml``.
+             ``config/text_to_sql/column_aliases.yaml``, либо (W1-1.2b)
+             DSN-профиль (``dsn_profile_overrides.resolve_column_aliases_profile``),
+             если он непуст для этой БД — DSN-профиль приоритетнее.
         """
-        from ..column_aliases_config import get_active_profile
+        from .. import dsn_profile_overrides
 
-        result = self._best_column_with_score(name, table, table_schema)
+        result = self._best_column_with_score(name, table, table_schema, dsn=dsn)
         if result is None:
             return None
         best_column, best_score = result
-        profile = get_active_profile()
+        profile = dsn_profile_overrides.resolve_column_aliases_profile(dsn=dsn)
         logger.debug(
             "Best column for '%s' in %s: %s (score: %d, profile: %s)",
             name,
@@ -520,8 +531,9 @@ class HeuristicLinker:
         *,
         entity_type: str,
         diagnostics: Optional[Dict[str, Any]],
+        dsn: Optional[str] = None,
     ) -> Optional[str]:
-        candidates = self._score_columns_for_name(name, table_schema)
+        candidates = self._score_columns_for_name(name, table_schema, dsn=dsn)
         top_candidates = self._top_candidates(
             [(table, column, score) for column, score in candidates]
         )
@@ -572,16 +584,21 @@ class HeuristicLinker:
         self,
         name: str,
         table_schema: Dict[str, Dict[str, Any]],
+        dsn: Optional[str] = None,
     ) -> List[Tuple[str, int]]:
         """Полный scoring всех колонок таблицы для заданного query-имени.
 
         Возвращает список ``(col_name, score)`` для всех колонок со
         ``score > 0`` (без сортировки). Используется ``best_column_for``
         и ``_best_column_with_score``.
+
+        ``dsn`` (W1-1.2b): если передан и для него есть непустой
+        DSN-профиль в части aliases/type_hints, он приоритетнее
+        named column_aliases-профиля (см. ``dsn_profile_overrides``).
         """
         import re
         from ..utils import get_table_columns
-        from ..column_aliases_config import get_active_profile
+        from .. import dsn_profile_overrides
         from ..nlu_config import canonicalize_token_via_morphemes
         from ..type_categories_config import load_type_categories_config
 
@@ -589,7 +606,7 @@ class HeuristicLinker:
             return []
 
         name_lower = name.lower()
-        profile = get_active_profile()
+        profile = dsn_profile_overrides.resolve_column_aliases_profile(dsn=dsn)
         alias_terms = profile.expand(name_lower)
 
         type_hints = profile.type_hints
@@ -691,11 +708,14 @@ class HeuristicLinker:
         linked_dimensions: List[Dict[str, Any]],
         main_table: Optional[str],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
+        dsn: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Связывает фильтры с колонками схемы.
 
         4.15: сравнение ``filter_name`` с ``dim["name"]`` идёт через
-        column_aliases.yaml (активный профиль).
+        column_aliases.yaml (активный профиль), либо (W1-1.2b) через
+        DSN-профиль, если он для этого ``dsn`` непуст — см.
+        ``dsn_profile_overrides.resolve_column_aliases_profile``.
         """
         return self._link_filters_with_diagnostics(
             filters_in,
@@ -703,6 +723,7 @@ class HeuristicLinker:
             main_table,
             db_schema,
             diagnostics=None,
+            dsn=dsn,
         )
 
     def _link_filters_with_diagnostics(
@@ -712,11 +733,12 @@ class HeuristicLinker:
         main_table: Optional[str],
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         diagnostics: Optional[Dict[str, Any]],
+        dsn: Optional[str] = None,
     ) -> Dict[str, Any]:
-        from ..column_aliases_config import get_active_profile
+        from .. import dsn_profile_overrides
 
         linked_filters: Dict[str, Any] = {}
-        profile = get_active_profile()
+        profile = dsn_profile_overrides.resolve_column_aliases_profile(dsn=dsn)
 
         for filter_name, filter_value in filters_in.items():
             found_in_dimensions = False
@@ -744,7 +766,7 @@ class HeuristicLinker:
                 candidates.extend(
                     (table_name, column, score)
                     for column, score in self._score_columns_for_name(
-                        filter_name, table_schema
+                        filter_name, table_schema, dsn=dsn
                     )
                 )
 

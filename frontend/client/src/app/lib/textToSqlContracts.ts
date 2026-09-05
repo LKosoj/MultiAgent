@@ -1,4 +1,8 @@
-import { isTextToSqlConnectionReference, type TextToSqlTerminalOutcome } from "./textToSqlClient";
+import {
+  isTextToSqlConnectionReference,
+  normalizeTextToSqlTerminalOutcome,
+  type TextToSqlTerminalOutcome,
+} from "./textToSqlClient";
 
 export type TextToSqlHistorySummary = {
   run_id: string;
@@ -78,6 +82,7 @@ export const TEXT_TO_SQL_REASON_CODES = [
   "RESULT_AGGREGATION_FAILED",
   "RESULT_PERSISTENCE_FAILED",
   "RESULT_RECONCILIATION_FAILED",
+  "RESULT_REVIEW_FAILED",
   "OUTPUT_RETRY_CHAIN_FAILED",
 ] as const;
 
@@ -95,7 +100,8 @@ export function isKnownTextToSqlReasonCode(
 export const terminalFields = [
   "run_id", "status", "reason_code", "sql", "generated", "approved",
   "executed", "dry_run", "audited", "data", "columns", "rows_affected",
-  "error", "execution", "audit", "persistence",
+  "error", "execution", "audit", "persistence", "ambiguity", "result_review",
+  "provenance",
 ] as const;
 
 const maxTerminalErrorLength = 4096;
@@ -257,6 +263,9 @@ export function isTextToSqlTerminalOutcome(value: unknown): value is TextToSqlTe
     && isRecord(value.execution)
     && isRecord(value.audit)
     && isRecord(value.persistence)
+    && (value.ambiguity === null || isRecord(value.ambiguity))
+    && isRecord(value.result_review)
+    && isRecord(value.provenance)
     && isJsonValue(value.data)
     && isJsonValue(value.execution)
     && isJsonValue(value.audit)
@@ -268,7 +277,7 @@ export function textToSqlHistoryTerminalState(payload: unknown) {
   const record = payload && typeof payload === "object"
     ? payload as Record<string, unknown>
     : null;
-  const terminal = record?.terminal_outcome;
+  const terminal = normalizeTextToSqlTerminalOutcome(record?.terminal_outcome);
   const outcome = isTextToSqlTerminalOutcome(terminal) ? terminal : null;
   const summary = outcome === null && isTextToSqlHistorySummary(payload)
     ? payload
@@ -291,23 +300,22 @@ export function textToSqlHistoryTerminalState(payload: unknown) {
 
 export function textToSqlHistoryRowCount(payload: unknown): number | null {
   const record = isRecord(payload) ? payload : null;
-  const terminal = record?.terminal_outcome;
+  const terminal = normalizeTextToSqlTerminalOutcome(record?.terminal_outcome);
   if (isTextToSqlTerminalOutcome(terminal)) return terminal.data.length;
   return isTextToSqlHistorySummary(payload) ? payload.row_count : null;
 }
 
 function storedHistorySummary(value: unknown): TextToSqlHistorySummary | null {
-  if (!isRecord(value) || !isTextToSqlTerminalOutcome(value.terminal_snapshot)) {
-    return null;
-  }
+  if (!isRecord(value)) return null;
+  const terminal = normalizeTextToSqlTerminalOutcome(value.terminal_snapshot);
+  if (!isTextToSqlTerminalOutcome(terminal)) return null;
   if (
     typeof value.run_id !== "string"
-    || value.terminal_snapshot.run_id !== value.run_id
+    || terminal.run_id !== value.run_id
     || !isNonNegativeInteger(value.created_at_ms)
     || typeof value.dialect !== "string"
     || typeof value.profile_name !== "string"
   ) return null;
-  const terminal = value.terminal_snapshot;
   const execution: Record<string, unknown> = {};
   for (const field of historyExecutionFieldNames) {
     const fieldValue = terminal.execution[field];
@@ -368,7 +376,7 @@ export function textToSqlRunTerminalStatus(payload: unknown): string | null {
   }
   if (!isRecord(payload)) return null;
 
-  const terminal = payload.terminal_outcome;
+  const terminal = normalizeTextToSqlTerminalOutcome(payload.terminal_outcome);
   if (isTextToSqlTerminalOutcome(terminal)) return terminal.status;
 
   const status = payload.status ?? payload.state;

@@ -7,7 +7,7 @@
 # truth конкретного домена.
 #
 # Дефолтный профиль ПУСТ. Это значит:
-#   * без явного profile = "muni_ru" (или другого) поиск опирается
+#   * без явного доменного профиля поиск опирается
 #     ТОЛЬКО на exact-match, FK references и description (которое
 #     обогащается schema_enricher через LLM).
 #   * никаких молчаливых эвристик «revenue → amount».
@@ -53,92 +53,3 @@ profiles:
       temporal: []
       identifier: []
 
-  # ---------------------------------------------------------------
-  # Регрессионный safety-net для пользовательского муниципального
-  # датасета (РФ). Сохраняет ровно тот же набор синонимов, что был
-  # захардкожен в schema_linking_core.py до T4.2 — чтобы существующие
-  # запросы вида "revenue по region" продолжали находить amount/region_id.
-  #
-  # Активируется через env TEXT_TO_SQL_COLUMN_ALIASES_PROFILE=muni_ru.
-  # ---------------------------------------------------------------
-  muni_ru:
-    aliases:
-      revenue:
-        - revenue
-        - amount
-        - sale_amount
-        - total
-        - sum
-        - price
-        - cost
-      date:
-        - date
-        - order_date
-        - created_at
-        - dt
-        - timestamp
-        - time
-        - day
-      region:
-        - region
-        - region_name
-        - regionid
-        - region_id
-        - country
-        - city
-        - location
-      product:
-        - product
-        - product_name
-        - item
-        - good
-        - commodity
-      customer:
-        - customer
-        - client
-        - user
-        - buyer
-        - purchaser
-      year:
-        - year
-        - yr
-        - fiscal_year
-        - calendar_year
-      month:
-        - month
-        - mon
-        - period
-      quarter:
-        - quarter
-        - qtr
-        - q
-      category:
-        - category
-        - cat
-        - type
-        - class
-        - classification
-      id:
-        - id
-        - identifier
-        - key
-        - code
-    # Legacy type-hint наборы, ранее захардкоженные в
-    # schema_linking_core.py (B1-блокер). Это query-токены, для
-    # которых совпадение по типу колонки даёт +3 бонус.
-    type_hints:
-      numeric:
-        - amount
-        - sum
-        - total
-        - revenue
-        - price
-        - cost
-      temporal:
-        - date
-        - time
-        - timestamp
-      identifier:
-        - id
-        - key
-        - code

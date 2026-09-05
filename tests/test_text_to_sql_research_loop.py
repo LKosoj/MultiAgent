@@ -9629,3 +9629,48 @@ async def test_semantic_transition_preserves_model_budget_for_terminal_replay_ex
         state_store.close()
         checkpoint_store.close()
         ledger.close()
+
+
+def test_state_with_reconciled_model_budget_accepts_solver_generate_records(
+    tmp_path,
+) -> None:
+    """W0-0.6: the adaptive solver's own model calls share this ledger.
+
+    ``workflow/text_to_sql_adaptive_solver.py`` records its proposal model
+    calls under ``solver-generate-<SolverState.revision>-<attempt>``, a
+    revision counter independent of ``ResearchState.revision``. Those records
+    must not trip the research-turn attempt-contiguity check here, and the
+    shared model budget must still account for them.
+    """
+
+    _, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    ledger = AdaptiveBudgetLedger(tmp_path / "mixed-model-budget.sqlite")
+
+    async def usage(_reservation) -> ModelTokenUsage:
+        return ModelTokenUsage(input_tokens=None, output_tokens=None)
+
+    _seed_prior_model_budget(state, ledger, _policy())
+    asyncio.run(
+        execute_model_call_with_budget_async(
+            state.run_id,
+            state.run_incarnation,
+            "solver-generate-0-0",
+            canonical_digest({"seed": "solver-revision-0"}),
+            "sql_solver_agent:test/model",
+            10,
+            10,
+            usage,
+            config=_policy(),
+            ledger=ledger,
+            claim_now_ns=lambda: 0,
+            owner_token_factory=lambda: "seed-solver-owner",
+        )
+    )
+
+    projected = _state_with_reconciled_model_budget(state, ledger, _policy())
+
+    assert projected.budget_state.used_model_calls == 2
+    assert projected.budget_state.remaining_model_calls == (
+        _policy().model_budget.model_calls - 2
+    )

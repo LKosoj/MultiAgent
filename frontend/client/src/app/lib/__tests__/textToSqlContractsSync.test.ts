@@ -7,6 +7,7 @@ import {
   TEXT_TO_SQL_TERMINAL_OUTCOME_STATUSES,
   terminalFields,
 } from "../textToSqlContracts";
+import { TEXT_TO_SQL_LEGACY_TERMINAL_FIELD_DEFAULTS } from "../textToSqlClient";
 
 // Source of truth generated from workflow/text_to_sql_contract.py
 // (TextToSqlTerminalStatus / TextToSqlTerminalReasonCode / required terminal
@@ -20,6 +21,7 @@ const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as {
   reason_codes: string[];
   required_fields: string[];
   terminal_statuses: string[];
+  legacy_optional_fields: string[];
 };
 
 describe("Text-to-SQL contract constants stay in sync with the Python schema", () => {
@@ -36,5 +38,10 @@ describe("Text-to-SQL contract constants stay in sync with the Python schema", (
   it("mirrors the required terminal outcome fields", () => {
     expect([...terminalFields].sort())
       .toEqual([...schema.required_fields].sort());
+  });
+
+  it("mirrors the legacy-optional terminal outcome fields (_LEGACY_OPTIONAL_TERMINAL_FIELDS)", () => {
+    expect(Object.keys(TEXT_TO_SQL_LEGACY_TERMINAL_FIELD_DEFAULTS).sort())
+      .toEqual([...schema.legacy_optional_fields].sort());
   });
 });

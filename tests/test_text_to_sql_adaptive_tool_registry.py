@@ -745,7 +745,7 @@ def test_controller_resumes_registry_result_without_reexecution_and_rejects_tamp
             {
                 "run_id": RUN_ID,
                 "run_incarnation": INCARNATION,
-                "loop_kind": AdaptiveLoopKind.RESEARCH.value,
+                "loop_kind": AdaptiveLoopKind.SOLVER.value,
                 "tool_call_id": "call-1",
             }
         ).split(":", 1)[1]
@@ -816,7 +816,7 @@ def test_controller_resumes_registry_result_without_reexecution_and_rejects_tamp
         state_store=state_store,
         run_id=RUN_ID,
         run_incarnation=INCARNATION,
-        loop_kind=AdaptiveLoopKind.RESEARCH,
+        loop_kind=AdaptiveLoopKind.SOLVER,
         before_observed=crash_before_observed,
     )
     try:
@@ -830,7 +830,7 @@ def test_controller_resumes_registry_result_without_reexecution_and_rejects_tamp
             state_store=state_store,
             run_id=RUN_ID,
             run_incarnation=INCARNATION,
-            loop_kind=AdaptiveLoopKind.RESEARCH,
+            loop_kind=AdaptiveLoopKind.SOLVER,
         )
         result = resumed.run()
 

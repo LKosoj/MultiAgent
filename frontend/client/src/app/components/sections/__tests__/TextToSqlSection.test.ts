@@ -144,6 +144,9 @@ function terminalOutcome(status: string) {
       filename: "query.md",
       path: "/tmp/query.md",
     } : { status: "not_attempted" },
+    ambiguity: null,
+    result_review: {},
+    provenance: {},
   };
 }
 
@@ -580,6 +583,24 @@ describe("textToSqlHistoryTerminalState", () => {
       executed: false,
       dryRun: true,
       error: undefined,
+    });
+  });
+
+  it("accepts a legacy terminal outcome that predates the provenance field", () => {
+    // W4-4.1 added the required `provenance` field to an already-shipped
+    // contract; a terminal outcome stored/produced before that change lacks
+    // the key entirely (see workflow/text_to_sql_contract.py
+    // _LEGACY_OPTIONAL_TERMINAL_FIELDS). It must still resolve normally
+    // instead of falling back to "invalid_terminal".
+    const legacyOutcome = terminalOutcome("succeeded") as Record<string, unknown>;
+    delete legacyOutcome.provenance;
+
+    expect(textToSqlHistoryTerminalState({
+      terminal_outcome: legacyOutcome,
+    })).toMatchObject({
+      status: "succeeded",
+      success: true,
+      executed: true,
     });
   });
 

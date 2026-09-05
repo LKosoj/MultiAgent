@@ -73,10 +73,12 @@ class SemanticFact(BaseModel):
     subject: Literal["table", "column"]
     table_fqn: str
     column: str | None = None
-    fact_kind: Literal["description", "example"]
+    fact_kind: Literal["description", "example", "glossary_term"]
     value: str | int | float | bool | None
-    source: Literal["file", "typed_probe"]
+    source: Literal["file", "typed_probe", "dsn_glossary"]
     status: Literal["approved", "candidate"]
+    kind: Literal["dimension", "measure", "filter_value", "entity"] | None = None
+    note: str | None = None
 
     @field_validator("table_fqn")
     @classmethod
@@ -109,14 +111,37 @@ class SemanticFact(BaseModel):
             not isinstance(self.value, str) or not self.value.strip()
         ):
             raise ValueError("description facts require a non-empty text value")
+        if self.fact_kind != "glossary_term" and (
+            self.kind is not None or self.note is not None
+        ):
+            raise ValueError("kind/note are only valid for glossary_term facts")
         return self
+
+
+# W2-2.2: ``kind``/``note`` were added later, exclusively for
+# ``dsn_glossary`` facts. Every ``file``/``typed_probe`` fact ever persisted
+# always has both at their ``None`` default, so including them (even as
+# ``null``) in a fact's canonical dump would change the JSON shape of every
+# already-stored fact and break its ``cache_key``/identity match. Facts that
+# never populate them keep the exact pre-existing dump; only glossary facts
+# that set them see the new keys.
+_OPTIONAL_GLOSSARY_FACT_FIELDS = ("kind", "note")
+
+
+def _semantic_fact_dump(fact: SemanticFact) -> dict[str, Any]:
+    """Canonical dump of one fact used for hashing/identity/storage."""
+
+    exclude = {
+        name for name in _OPTIONAL_GLOSSARY_FACT_FIELDS if getattr(fact, name) is None
+    }
+    return fact.model_dump(mode="json", exclude=exclude)
 
 
 def _semantic_fact_key(fact: SemanticFact) -> str:
     from .adaptive.serialization import canonical_digest
 
     return "text2sql-semantic-fact-v1-" + canonical_digest(
-        fact.model_dump(mode="json")
+        _semantic_fact_dump(fact)
     ).removeprefix("sha256:")
 
 
@@ -125,14 +150,23 @@ def _semantic_fact_source_digest(facts: Sequence[SemanticFact]) -> str:
 
     return canonical_digest(
         sorted(
-            (fact.model_dump(mode="json") for fact in facts),
+            (_semantic_fact_dump(fact) for fact in facts),
             key=lambda fact: json.dumps(fact, ensure_ascii=False, sort_keys=True),
         )
     )
 
 
-def _semantic_file_snapshot_key(source_digest: str) -> str:
-    return "text2sql-semantic-file-snapshot-v1-" + source_digest.removeprefix(
+def _semantic_file_snapshot_key(source_digest: str, *, source: str = "file") -> str:
+    """Return the snapshot marker key for one fact-set source.
+
+    ``source="file"`` (the default) reproduces the original, pre-existing
+    key byte-for-byte so already-persisted file snapshots keep matching.
+    ``source="dsn_glossary"`` gives the DSN glossary its own, non-colliding
+    snapshot namespace (EPIC W2-2.2).
+    """
+    if source not in ("file", "dsn_glossary"):
+        raise ValueError("source must be 'file' or 'dsn_glossary'")
+    return f"text2sql-semantic-{source}-snapshot-v1-" + source_digest.removeprefix(
         "sha256:"
     )
 
@@ -1703,7 +1737,20 @@ class SchemaMemoryManager:
                 cache_kind="schema_semantic_fact",
                 requesting_agent="Schema-RAG-Agent",
             )
-        latest_file_snapshot: tuple[int, str] | None = None
+        # W2-2.2: ``file`` and ``dsn_glossary`` are both "replaceable"
+        # fact-set sources — each write replaces the whole set, and a
+        # snapshot marker record (``is_file_snapshot`` /
+        # ``is_dsn_glossary_snapshot``) tells us which source_digest is
+        # current so stale facts from an older replace call drop out.
+        # ``typed_probe`` facts have no such marker and are never filtered
+        # by digest below.
+        snapshot_marker_fields = {
+            "file": "is_file_snapshot",
+            "dsn_glossary": "is_dsn_glossary_snapshot",
+        }
+        latest_snapshot: dict[str, tuple[int, str] | None] = {
+            source: None for source in snapshot_marker_fields
+        }
         candidates: list[tuple[int, str, int, str, SemanticFact]] = []
         for sequence, record in enumerate(records):
             data = record.get("data") if isinstance(record, dict) else None
@@ -1714,18 +1761,24 @@ class SchemaMemoryManager:
                 continue
             step = record.get("step") if isinstance(record, dict) else None
             sequence_or_step = step if isinstance(step, int) else sequence
-            if data.get("is_file_snapshot") is True:
+            matched_snapshot_marker = False
+            for source, marker_field in snapshot_marker_fields.items():
+                if data.get(marker_field) is not True:
+                    continue
+                matched_snapshot_marker = True
                 source_digest = data.get("source_digest")
                 if (
                     isinstance(source_digest, str)
                     and data.get("cache_key")
-                    == _semantic_file_snapshot_key(source_digest)
+                    == _semantic_file_snapshot_key(source_digest, source=source)
                     and (
-                        latest_file_snapshot is None
-                        or sequence_or_step > latest_file_snapshot[0]
+                        latest_snapshot[source] is None
+                        or sequence_or_step > latest_snapshot[source][0]
                     )
                 ):
-                    latest_file_snapshot = (sequence_or_step, source_digest)
+                    latest_snapshot[source] = (sequence_or_step, source_digest)
+                break
+            if matched_snapshot_marker:
                 continue
             try:
                 fact = SemanticFact.model_validate(data.get("fact"))
@@ -1737,7 +1790,7 @@ class SchemaMemoryManager:
             if not isinstance(key, str) or key != _semantic_fact_key(fact):
                 continue
             rendered = json.dumps(
-                fact.model_dump(mode="json"), ensure_ascii=False, sort_keys=True
+                _semantic_fact_dump(fact), ensure_ascii=False, sort_keys=True
             ).casefold()
             candidates.append(
                 (
@@ -1748,29 +1801,32 @@ class SchemaMemoryManager:
                     fact,
                 )
             )
-        latest_file_source: dict[tuple[str, str, str | None, str], tuple[int, str]] = {}
+        latest_fact_source: dict[str, dict[tuple[str, str, str | None, str], tuple[int, str]]] = {
+            source: {} for source in snapshot_marker_fields
+        }
         for _score, _key, step, source_digest, fact in candidates:
-            if fact.source != "file":
+            if fact.source not in latest_fact_source:
                 continue
             identity = (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
-            previous = latest_file_source.get(identity)
+            previous = latest_fact_source[fact.source].get(identity)
             if previous is None or step > previous[0]:
-                latest_file_source[identity] = (step, source_digest)
+                latest_fact_source[fact.source][identity] = (step, source_digest)
+
+        def _survives_replacement(fact: SemanticFact, source_digest: str) -> bool:
+            if fact.source not in snapshot_marker_fields:
+                return True
+            snapshot = latest_snapshot[fact.source]
+            if snapshot is not None:
+                return source_digest == snapshot[1]
+            identity = (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
+            return source_digest == latest_fact_source[fact.source][identity][1]
+
         return [
             fact
             for _score, _key, _step, source_digest, fact in sorted(
                 candidates, key=lambda item: (-item[0], item[1])
             )
-            if _score
-            if fact.source != "file"
-            or (
-                source_digest == latest_file_snapshot[1]
-                if latest_file_snapshot is not None
-                else source_digest
-                == latest_file_source[
-                    (fact.subject, fact.table_fqn, fact.column, fact.fact_kind)
-                ][1]
-            )
+            if _score and _survives_replacement(fact, source_digest)
         ]
 
     def save_approved_semantic_facts(
@@ -1807,7 +1863,7 @@ class SchemaMemoryManager:
             if any(
                 isinstance(record, dict)
                 and isinstance(record.get("data"), dict)
-                and record["data"].get("fact") == fact.model_dump(mode="json")
+                and record["data"].get("fact") == _semantic_fact_dump(fact)
                 for record in existing
             ):
                 continue
@@ -1820,7 +1876,97 @@ class SchemaMemoryManager:
                     "cache_source": "typed_semantic_fact",
                     "schema_version": namespace.version_key,
                     "source_digest": None,
-                    "fact": fact.model_dump(mode="json"),
+                    "fact": _semantic_fact_dump(fact),
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError("approved semantic fact was not persisted")
+
+    def _replace_semantic_fact_source(
+        self,
+        namespace: SchemaNamespace,
+        facts: tuple[SemanticFact, ...],
+        *,
+        source: str,
+        marker_field: str,
+    ) -> None:
+        """Shared "replace the whole fact-set" plumbing for one source.
+
+        Used by both ``replace_file_semantic_facts`` (``source="file"``) and
+        ``replace_dsn_glossary_facts`` (``source="dsn_glossary"``, EPIC
+        W2-2.2). Writes a snapshot marker record carrying the current
+        ``source_digest`` so ``find_approved_semantic_facts`` can drop facts
+        left over from an earlier replace call, then persists each fact once.
+        """
+        from memory.tools import get_memory, memory_requester_context, save_memory
+
+        source_digest = _semantic_fact_source_digest(facts)
+        snapshot_key = _semantic_file_snapshot_key(source_digest, source=source)
+        with memory_requester_context("Schema-RAG-Agent"):
+            existing = get_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                cache_kind="schema_semantic_fact",
+                cache_key=snapshot_key,
+                requesting_agent="Schema-RAG-Agent",
+            )
+        if not any(
+            isinstance(record, dict)
+            and isinstance(record.get("data"), dict)
+            and record["data"].get(marker_field) is True
+            and record["data"].get("source_digest") == source_digest
+            for record in existing
+        ):
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_semantic_fact",
+                    "cache_key": snapshot_key,
+                    "cache_source": "typed_semantic_fact",
+                    "schema_version": namespace.version_key,
+                    marker_field: True,
+                    "source_digest": source_digest,
+                },
+            )
+            if type(saved_step) is not int or saved_step < 0:
+                raise SchemaIndexingError(
+                    f"semantic {source} snapshot was not persisted"
+                )
+
+        for fact in facts:
+            fact_key = _semantic_fact_key(fact)
+            with memory_requester_context("Schema-RAG-Agent"):
+                existing = get_memory(
+                    session_id=namespace.version_key,
+                    agent_name="Schema-RAG-Agent",
+                    cache_kind="schema_semantic_fact",
+                    cache_key=fact_key,
+                    requesting_agent="Schema-RAG-Agent",
+                )
+            if any(
+                isinstance(record, dict)
+                and isinstance(record.get("data"), dict)
+                and record["data"].get("fact") == _semantic_fact_dump(fact)
+                # A fact carried over unchanged from an earlier replace call
+                # still needs a fresh row stamped with *this* source_digest,
+                # or it would keep the stale digest forever and get dropped
+                # by find_approved_semantic_facts' snapshot filter the
+                # moment any other fact in the set changes.
+                and record["data"].get("source_digest") == source_digest
+                for record in existing
+            ):
+                continue
+            saved_step = save_memory(
+                session_id=namespace.version_key,
+                agent_name="Schema-RAG-Agent",
+                data={
+                    "cache_kind": "schema_semantic_fact",
+                    "cache_key": fact_key,
+                    "cache_source": "typed_semantic_fact",
+                    "schema_version": namespace.version_key,
+                    "source_digest": source_digest,
+                    "fact": _semantic_fact_dump(fact),
                 },
             )
             if type(saved_step) is not int or saved_step < 0:
@@ -1840,71 +1986,39 @@ class SchemaMemoryManager:
                 raise TypeError("file snapshots must contain file SemanticFact values")
             if fact.status != "approved":
                 raise ValueError("only approved semantic facts may be persisted")
-        from memory.tools import get_memory, memory_requester_context, save_memory
+        self._replace_semantic_fact_source(
+            namespace, facts, source="file", marker_field="is_file_snapshot"
+        )
 
-        file_source_digest = _semantic_fact_source_digest(facts)
-        snapshot_key = _semantic_file_snapshot_key(file_source_digest)
-        with memory_requester_context("Schema-RAG-Agent"):
-            existing = get_memory(
-                session_id=namespace.version_key,
-                agent_name="Schema-RAG-Agent",
-                cache_kind="schema_semantic_fact",
-                cache_key=snapshot_key,
-                requesting_agent="Schema-RAG-Agent",
-            )
-        if not any(
-            isinstance(record, dict)
-            and isinstance(record.get("data"), dict)
-            and record["data"].get("is_file_snapshot") is True
-            and record["data"].get("source_digest") == file_source_digest
-            for record in existing
-        ):
-            saved_step = save_memory(
-                session_id=namespace.version_key,
-                agent_name="Schema-RAG-Agent",
-                data={
-                    "cache_kind": "schema_semantic_fact",
-                    "cache_key": snapshot_key,
-                    "cache_source": "typed_semantic_fact",
-                    "schema_version": namespace.version_key,
-                    "is_file_snapshot": True,
-                    "source_digest": file_source_digest,
-                },
-            )
-            if type(saved_step) is not int or saved_step < 0:
-                raise SchemaIndexingError("semantic file snapshot was not persisted")
+    def replace_dsn_glossary_facts(
+        self,
+        namespace: SchemaNamespace,
+        facts: Sequence[SemanticFact],
+    ) -> None:
+        """Replace the current DSN-glossary fact snapshot, including an empty one.
 
+        EPIC W2-2.2: a term removed from the DSN glossary profile must
+        disappear from ``find_approved_semantic_facts`` on the next call —
+        mirrors ``replace_file_semantic_facts`` but keeps its own snapshot
+        namespace/marker so it never interacts with file- or
+        typed_probe-owned facts.
+        """
+        if not isinstance(namespace, SchemaNamespace):
+            raise TypeError("namespace must be SchemaNamespace")
+        facts = tuple(facts)
         for fact in facts:
-            fact_key = _semantic_fact_key(fact)
-            with memory_requester_context("Schema-RAG-Agent"):
-                existing = get_memory(
-                    session_id=namespace.version_key,
-                    agent_name="Schema-RAG-Agent",
-                    cache_kind="schema_semantic_fact",
-                    cache_key=fact_key,
-                    requesting_agent="Schema-RAG-Agent",
+            if not isinstance(fact, SemanticFact) or fact.source != "dsn_glossary":
+                raise TypeError(
+                    "dsn glossary snapshots must contain dsn_glossary SemanticFact values"
                 )
-            if any(
-                isinstance(record, dict)
-                and isinstance(record.get("data"), dict)
-                and record["data"].get("fact") == fact.model_dump(mode="json")
-                for record in existing
-            ):
-                continue
-            saved_step = save_memory(
-                session_id=namespace.version_key,
-                agent_name="Schema-RAG-Agent",
-                data={
-                    "cache_kind": "schema_semantic_fact",
-                    "cache_key": fact_key,
-                    "cache_source": "typed_semantic_fact",
-                    "schema_version": namespace.version_key,
-                    "source_digest": file_source_digest,
-                    "fact": fact.model_dump(mode="json"),
-                },
-            )
-            if type(saved_step) is not int or saved_step < 0:
-                raise SchemaIndexingError("approved semantic fact was not persisted")
+            if fact.status != "approved":
+                raise ValueError("only approved semantic facts may be persisted")
+        self._replace_semantic_fact_source(
+            namespace,
+            facts,
+            source="dsn_glossary",
+            marker_field="is_dsn_glossary_snapshot",
+        )
 
     def set_schema_ready_marker(
         self,

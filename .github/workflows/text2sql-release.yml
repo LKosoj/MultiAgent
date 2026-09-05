@@ -104,6 +104,9 @@ jobs:
             --require-hashes \
             --requirement requirements.lock
 
+      - name: Contract schema fixture is current
+        run: python3 scripts/text_to_sql_contract_schema.py --check
+
       - name: Run backend contract suite without warnings
         run: pytest -q -W error
 

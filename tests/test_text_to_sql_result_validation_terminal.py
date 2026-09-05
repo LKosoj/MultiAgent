@@ -2408,10 +2408,9 @@ def test_result_review_prompt_keeps_qualifying_row_output_without_canonical_requ
             "Exclude external current, canonical, persistent, or master labels unless the "
             "question explicitly requests them or trusted schema or documents prove equivalence "
             "at the qualifying row scope" not in instruction
-            or "Apply the no-row-discard rule only within the existing qualifying join scope and "
-            "exclude external current, canonical, persistent, or master labels unless the question "
-            "explicitly requests them or trusted schema or documents prove equivalence at the "
-            "qualifying row scope" not in instruction
+            or "Do not repair a NULL or partial selected output by filtering out qualifying rows "
+            "when a semantically matching full or official label exists on a relation already used "
+            "by the candidate AST" not in instruction
             or "The alternative must be a semantically matching full requested label, not merely "
             "any full label in a joined relation" not in instruction
             or payload.get("schema") != schema

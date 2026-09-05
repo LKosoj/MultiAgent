@@ -319,16 +319,20 @@ class JoinBuilder:
 
         Приоритет:
           * явный ctor-параметр ``inflector`` (включая ``[]``);
-          * иначе — yaml ``nlu_morphemes.table_name_inflections``.
-            Если в yaml ``enabled: false`` — возвращаем пустой список.
+          * иначе — yaml ``nlu_morphemes.table_name_inflections``, либо
+            (W1-1.2b) DSN-профиль ``self.dsn``, если для него есть
+            непустой ``nlu_hints`` — см.
+            ``dsn_profile_overrides.resolve_nlu_morphemes``.
+            Если в итоговом конфиге ``enabled: false`` — возвращаем
+            пустой список.
         """
         if self._inflector_override is not None:
             return self._inflector_override
         # Импорт ленивый: JoinBuilder используется и в сценариях, где
         # yaml-пути могут переопределяться поздно (тесты с monkeypatch).
-        from .nlu_config import load_nlu_morphemes
+        from .dsn_profile_overrides import resolve_nlu_morphemes
 
-        cfg = load_nlu_morphemes()
+        cfg = resolve_nlu_morphemes(dsn=self.dsn)
         if not cfg.table_name_inflections_enabled:
             return []
         return list(cfg.table_name_pluralizers)

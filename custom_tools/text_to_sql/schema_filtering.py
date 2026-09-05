@@ -3,7 +3,7 @@ Schema Filtering - фильтрация и оптимизация схемы д�
 """
 import os
 import logging
-from typing import Dict, Iterable, List, Any, Optional, Set
+from typing import Dict, Iterable, List, Any, Optional, Set, TYPE_CHECKING
 from .utils import (
     coerce_strict_bool,
     get_table_columns,
@@ -12,6 +12,9 @@ from .utils import (
 )
 from .schema_metadata import ColumnMetadataHelper
 from .schema_namespace import SchemaNamespace
+
+if TYPE_CHECKING:
+    from .significance_config import SignificanceProfile
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +71,9 @@ def _expand_entity_tokens(
     return list(dict.fromkeys(tokens))
 
 
-def _try_load_morphemes_index() -> Optional[Dict[str, List[str]]]:
+def _try_load_morphemes_index(
+    dsn: Optional[str] = None,
+) -> Optional[Dict[str, List[str]]]:
     """Пытается собрать индекс {canonical: [morphemes]} из yaml.
 
     По умолчанию (``TEXT_TO_SQL_MORPHEMES_REQUIRED=1``) недоступность yaml —
@@ -78,13 +83,17 @@ def _try_load_morphemes_index() -> Optional[Dict[str, List[str]]]:
     ``TEXT_TO_SQL_MORPHEMES_REQUIRED=0`` — тогда выводится warning DEGRADED
     и возвращается ``None``.
 
+    ``dsn`` (W1-1.2b): если передан и для него есть непустой DSN-профиль
+    в части ``nlu_hints``, он приоритетнее named nlu_morphemes-профиля —
+    см. ``dsn_profile_overrides.resolve_nlu_morphemes``.
+
     Программерские баги (TypeError, AttributeError и т.п.) всегда пробрасываются
     наружу.
     """
     try:
-        from .nlu_config import load_nlu_morphemes  # local import to break cycle
+        from .dsn_profile_overrides import resolve_nlu_morphemes  # local import to break cycle
 
-        cfg = load_nlu_morphemes()
+        cfg = resolve_nlu_morphemes(dsn=dsn)
     except (FileNotFoundError, ValueError, ImportError) as exc:
         required = coerce_strict_bool(
             os.getenv("TEXT_TO_SQL_MORPHEMES_REQUIRED", "1"),
@@ -121,31 +130,47 @@ class SchemaColumnFilter:
     """Фильтр колонок схемы по релевантности."""
     
     def filter_relevant_columns(
-        self, 
+        self,
         table_name: str,
-        full_table_schema: Dict[str, Dict[str, Any]], 
-        linked_metrics: List[Dict[str, Any]], 
-        linked_dimensions: List[Dict[str, Any]], 
-        linked_filters: Dict[str, Any], 
-        joins: List[Dict[str, Any]]
+        full_table_schema: Dict[str, Dict[str, Any]],
+        linked_metrics: List[Dict[str, Any]],
+        linked_dimensions: List[Dict[str, Any]],
+        linked_filters: Dict[str, Any],
+        joins: List[Dict[str, Any]],
+        dsn: Optional[str] = None,
+        significance_profile: Optional["SignificanceProfile"] = None,
     ) -> Dict[str, Dict[str, Any]]:
-        """Фильтрует колонки таблицы, оставляя только семантически и функционально значимые."""
-        
+        """Фильтрует колонки таблицы, оставляя только семантически и функционально значимые.
+
+        ``dsn`` (W1-1.2b) пробрасывается в
+        ``ColumnMetadataHelper.is_semantic_significant_column`` — DSN-профиль
+        приоритетнее named significance-профиля, если он для этой БД непуст.
+
+        ``significance_profile`` (W1-1.2-review, замечание 2): если вызывающая
+        сторона уже зарезолвила профиль значимости (см.
+        ``SchemaContextBuilder.build_relevant_schema_context``, который
+        резолвит его ОДИН РАЗ перед циклом по таблицам, а не на каждый вызов
+        этого метода) — передаём готовый объект дальше в
+        ``is_semantic_significant_column`` и ``dsn`` для него игнорируется.
+        """
+
         # Получаем колонки таблицы в новом формате
         table_columns = get_table_columns(full_table_schema)
-        
+
         # 1. Извлекаем прямо связанные колонки (ОБЯЗАТЕЛЬНЫЕ)
         directly_linked = ColumnMetadataHelper.extract_directly_linked_columns(
             table_name, linked_metrics, linked_dimensions, linked_filters, joins
         )
-        
+
         # 2. Извлекаем ключевые колонки (PK/FK)
         key_columns = ColumnMetadataHelper.get_key_columns(full_table_schema)
-        
+
         # 3. Находим семантически значимые колонки
         semantic_columns = set()
         for col_name, col_info in table_columns.items():
-            if ColumnMetadataHelper.is_semantic_significant_column(col_name, col_info):
+            if ColumnMetadataHelper.is_semantic_significant_column(
+                col_name, col_info, dsn=dsn, significance_profile=significance_profile
+            ):
                 semantic_columns.add(col_name)
         
         # Объединяем все категории
@@ -265,8 +290,13 @@ class SchemaContextBuilder:
                         dsn=dsn,
                     )
                 else:
+                    # W1-1.2-review Блокер 1 (уточнено финальным ревью): на namespace-ветке
+                    # find_semantic_relevant_tables ищет по namespace.version_key и dsn НЕ
+                    # читает — DSN-профиль на этот поиск не влияет ни до, ни после правки.
+                    # dsn передаём только для симметрии с legacy-веткой выше.
                     memory_relevant_tables = self.memory_manager.find_semantic_relevant_tables(
                         entity_keywords,
+                        dsn=dsn,
                         namespace=namespace,
                     )
                 relevant_tables.update(memory_relevant_tables)
@@ -282,13 +312,24 @@ class SchemaContextBuilder:
         filtered_schema = {}
         total_original_columns = 0
         total_filtered_columns = 0
-        
+
+        # W1-1.2-review замечание 2: раньше профиль значимости резолвился
+        # заново (dsn_profile_overrides.resolve_significance_profile ->
+        # dsn_profile.load_dsn_profile -> path.stat()) на КАЖДУЮ колонку
+        # каждой таблицы. Резолвим один раз здесь и передаём готовый объект
+        # в filter_relevant_columns для всех таблиц этого вызова.
+        from .dsn_profile_overrides import resolve_significance_profile
+
+        significance_profile = resolve_significance_profile(dsn=dsn)
+
         for table_name in relevant_tables:
             if table_name in full_schema:
                 # Применяем фильтрацию колонок
                 filtered_table = self.column_filter.filter_relevant_columns(
                     table_name, full_schema[table_name],
-                    linked_metrics, linked_dimensions, linked_filters, joins
+                    linked_metrics, linked_dimensions, linked_filters, joins,
+                    dsn=dsn,
+                    significance_profile=significance_profile,
                 )
                 # Skip-маркер от column_filter — таблица не имеет ни одной
                 # релевантной колонки, добавлять её в context нельзя.
@@ -333,6 +374,7 @@ class SchemaRelevanceFilter:
         db_schema: Dict[str, Dict[str, Dict[str, Any]]],
         *,
         morphemes_index: Optional[Dict[str, List[str]]] = None,
+        dsn: Optional[str] = None,
     ) -> Set[str]:
         """Находит релевантные таблицы по именам сущностей.
 
@@ -340,9 +382,14 @@ class SchemaRelevanceFilter:
         см. ``_try_load_morphemes_index``) entity расширяется морфемами:
         substring проверяется по каждой словоформе, а не только по самой
         entity (3.12). Без yaml поведение идентично прежнему substring.
+        ``dsn`` (W1-1.2b) игнорируется, если ``morphemes_index`` передан явно.
         """
         relevant_tables = set()
-        index = morphemes_index if morphemes_index is not None else _try_load_morphemes_index()
+        index = (
+            morphemes_index
+            if morphemes_index is not None
+            else _try_load_morphemes_index(dsn=dsn)
+        )
 
         for entity in entities:
             entity_lower = entity.lower()
@@ -396,14 +443,20 @@ class SchemaRelevanceFilter:
         entities: List[str],
         *,
         morphemes_index: Optional[Dict[str, List[str]]] = None,
+        dsn: Optional[str] = None,
     ) -> float:
         """Вычисляет релевантность таблицы для списка сущностей.
 
         Substring-матчинг расширён морфемами из yaml (см. 3.12). При
         отключённом yaml поведение остаётся прежним substring-only.
+        ``dsn`` (W1-1.2b) игнорируется, если ``morphemes_index`` передан явно.
         """
         score = 0.0
-        index = morphemes_index if morphemes_index is not None else _try_load_morphemes_index()
+        index = (
+            morphemes_index
+            if morphemes_index is not None
+            else _try_load_morphemes_index(dsn=dsn)
+        )
 
         # Проверяем соответствие имени таблицы
         table_name_lower = table_name.lower()

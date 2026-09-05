@@ -33,7 +33,6 @@ def test_release_drill_script_is_fail_closed_and_local_only() -> None:
         "test_coordinator_runs_due_maintenance_and_records_exact_metrics",
         "test_workflow_report_never_returns_legacy_cache_without_source",
         "test_disposable_schema_backup_restore_and_rollback",
-        "test_read_only_operator_recomputes_gate_and_rejects_not_evaluated",
     ):
         assert contract in source
     for field in (

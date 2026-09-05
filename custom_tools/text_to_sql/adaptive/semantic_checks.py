@@ -15,6 +15,7 @@ from ._semantic_coverage_footprint import (
     model_payload,
     normalized_state_digest,
 )
+from ._sql_ast_models import PredicateLocation
 from .checks import SemanticCheckInput, require_authenticated_semantic_input
 from .models import (
     BindingStatus,
@@ -37,18 +38,22 @@ from .models import (
     SemanticItemKind,
     SemanticItemStatus,
     TableRef,
+    VerticalAttributeBinding,
     is_binding_free_semantic_item,
 )
 from .semantic_coverage import CoverageRequirements
 from .semantic_plan import (
+    AstColumnOccurrence,
     _relation_tables,
     _resolve_column_ref,
+    collect_ast_columns,
     predicate_from_expression,
 )
 
 
 _AUTHORITY_FAILURE_ORDER = (
     CheckFailureCode.UNAUTHORIZED_TABLE,
+    CheckFailureCode.UNAUTHORIZED_COLUMN,
     CheckFailureCode.UNAUTHORIZED_JOIN,
     CheckFailureCode.UNAUTHORIZED_LITERAL,
 )
@@ -75,10 +80,12 @@ class _SemanticContext:
     bindings_by_source: dict[str, tuple[object, ...]]
     items_by_kind: dict[SemanticItemKind, tuple[SemanticItem, ...]]
     tables: tuple[tuple[str, TableRef], ...]
+    columns: tuple[AstColumnOccurrence, ...]
     relation_tables: dict[str, TableRef]
     joins: tuple[object, ...]
     root_scope_ids: frozenset[str]
     authority_predicates: tuple[_PredicateOccurrence, ...]
+    expression_relation_node_ids: frozenset[str]
 
 
 class _SemanticInputError(ValueError):
@@ -99,6 +106,7 @@ def evaluate_semantic_authority_checks(
         context = _validated_context(check_input, research_state, dsn)
         checks = {
             CheckFailureCode.UNAUTHORIZED_TABLE: _unauthorized_table,
+            CheckFailureCode.UNAUTHORIZED_COLUMN: _unauthorized_column,
             CheckFailureCode.UNAUTHORIZED_JOIN: _unauthorized_join,
             CheckFailureCode.UNAUTHORIZED_LITERAL: _unauthorized_authority_literal,
         }
@@ -222,6 +230,12 @@ def _validated_context(
             },
         )
     )
+    columns = collect_ast_columns(
+        active_ast,
+        relation_tables,
+        allowed_columns=authority_columns,
+        dialect=ast.parsed_ast.dialect,
+    )
     return _SemanticContext(
         check_input=check_input,
         query_spec=query_spec,
@@ -236,6 +250,7 @@ def _validated_context(
             (fact.node_id, relation_tables[fact.relation_id])
             for fact in active_ast.table_scans
         ),
+        columns=columns.occurrences,
         relation_tables=relation_tables,
         joins=tuple(active_ast.joins),
         root_scope_ids=frozenset(
@@ -244,6 +259,9 @@ def _validated_context(
             if scope.parent_scope_id is None and scope.query_role.value == "root"
         ),
         authority_predicates=authority_predicates,
+        expression_relation_node_ids=frozenset(
+            fact.node_id for fact in active_ast.expression_relations
+        ),
     )
 
 
@@ -311,9 +329,28 @@ def _unauthorized_table(context: _SemanticContext) -> CheckResult | None:
     return _failure(context, CheckFailureCode.UNAUTHORIZED_TABLE, nodes=nodes) if nodes else None
 
 
+def _unauthorized_column(context: _SemanticContext) -> CheckResult | None:
+    # Scoped to columns smuggled through a derived (expression) relation, e.g.
+    # ``UNNEST(ARRAY[o.secret]) AS u(value)`` re-exposing ``o.secret`` as
+    # ``u.value``. Plain physical-column references elsewhere in the AST
+    # (aggregates, projections, ...) are intentionally not blanket-checked
+    # here: schema validation owns unselected-but-existing column references,
+    # and requested-output/discriminator/vertical checks already cover their
+    # own authority-sensitive column usages precisely.
+    allowed = set(context.requirements.allowed_columns)
+    for path in context.requirements.allowed_join_paths:
+        for edge in path:
+            allowed.update((edge.left, edge.right))
+    nodes = tuple(
+        item.node_id
+        for item in context.columns
+        if item.node_id in context.expression_relation_node_ids
+        and item.column not in allowed
+    )
+    return _failure(context, CheckFailureCode.UNAUTHORIZED_COLUMN, nodes=nodes) if nodes else None
+
+
 def _unauthorized_join(context: _SemanticContext) -> CheckResult | None:
-    if not context.requirements.row_preservation_requirements:
-        return None
     source_ids: list[str] = []
     node_ids: list[str] = []
     for requirement in context.requirements.row_preservation_requirements:
@@ -322,6 +359,22 @@ def _unauthorized_join(context: _SemanticContext) -> CheckResult | None:
             continue
         source_ids.extend(requirement.related_source_ids)
         node_ids.extend(mismatches)
+    for binding in context.requirements.selected_bindings:
+        # Only vertical/EAV bindings get their join_path validated as a gate
+        # here: swapped entity/catalog columns can silently attribute a value
+        # to the wrong entity, which is a genuine authorization concern. For
+        # every other binding kind, a "wrong" INNER join_path is intentionally
+        # not treated as a pre-execution gate (see
+        # test_reversed_and_different_inner_join_edges_are_not_pre_execution_gates
+        # and test_cross_join_with_authorized_endpoints_is_not_blocked_by_join_path);
+        # LEFT-preserving joins are already covered above via
+        # row_preservation_requirements.
+        if type(binding) is not VerticalAttributeBinding or not binding.join_path:
+            continue
+        mismatches = _join_path_edge_mismatches(binding.join_path, context)
+        if mismatches:
+            source_ids.append(binding.source_id)
+            node_ids.extend(mismatches)
     return (
         _failure(
             context,
@@ -372,13 +425,75 @@ def _row_preservation_join_mismatches(requirement, context: _SemanticContext):
     return None
 
 
+def _join_path_edge_mismatches(join_path, context: _SemanticContext):
+    """Node IDs of joins whose ON-condition does not encode a required edge.
+
+    Unlike ``_row_preservation_join_mismatches`` (LEFT-join-only), this
+    inspects every binding's ``join_path`` regardless of join type, catching
+    e.g. a vertical/EAV join whose ON-condition swaps physical columns
+    between two otherwise-correctly-joined tables.
+    """
+    node_ids: list[str] = []
+    used_node_ids: set[str] = set()
+    for edge in join_path:
+        candidates = [
+            join
+            for join in context.joins
+            if join.scope_id in context.root_scope_ids
+            and join.node_id not in used_node_ids
+            and _join_connects_edge_tables(join, edge, context)
+        ]
+        if len(candidates) != 1:
+            # Accepted limitation (mirrors _row_preservation_join_mismatches):
+            # when several joins connect the same table pair (e.g. two EAV
+            # attribute pivots over one entity table) the edge cannot be
+            # attributed to a single join by topology alone, so it is not
+            # gated here rather than risk a false rejection.
+            continue
+        join = candidates[0]
+        used_node_ids.add(join.node_id)
+        if not _join_condition_has_edge(join, edge, context):
+            node_ids.append(join.node_id)
+            node_ids.extend(
+                predicate.node_id
+                for predicate in context.check_input.parsed_ast.predicates
+                if predicate.location is PredicateLocation.JOIN_ON
+                and predicate.owner_node_id == join.node_id
+            )
+    return tuple(node_ids)
+
+
+def _join_connects_edge_tables(join, edge, context: _SemanticContext) -> bool:
+    # ``left_relation_ids`` accumulates every relation already in scope, not
+    # just the join's immediate left operand (chained joins keep growing this
+    # set). Matching purely by table membership in the combined set is
+    # therefore ambiguous for edges whose tables happen to be a subset of a
+    # later join's cumulative left side. Anchor the match on the table this
+    # join actually introduces (``relation_id``) and require the edge's other
+    # table to already be in scope.
+    own_table = context.relation_tables.get(join.relation_id)
+    left_tables = {
+        context.relation_tables.get(relation_id) for relation_id in join.left_relation_ids
+    }
+    if own_table == edge.left.table:
+        return edge.right.table in left_tables
+    if own_table == edge.right.table:
+        return edge.left.table in left_tables
+    return False
+
+
 def _join_condition_has_edge(join, edge, context: _SemanticContext) -> bool:
     if join.condition is None:
         return False
-    expected = PredicateRef(
+    expected_forward = PredicateRef(
         left=edge.left,
         operator=edge.operator,
         right=edge.right,
+    )
+    expected_reversed = PredicateRef(
+        left=edge.right,
+        operator=edge.operator,
+        right=edge.left,
     )
     pending = [join.condition]
     while pending:
@@ -393,7 +508,10 @@ def _join_condition_has_edge(join, edge, context: _SemanticContext) -> bool:
             )
         except (TypeError, ValueError):
             actual = None
-        if actual is not None and predicate_matches(expected, actual):
+        if actual is not None and (
+            predicate_matches(expected_forward, actual)
+            or predicate_matches(expected_reversed, actual)
+        ):
             return True
         pending.extend(child for _, _, child in getattr(expression, "children", ()))
     return False

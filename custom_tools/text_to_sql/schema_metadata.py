@@ -8,9 +8,10 @@ critical_description_keywords) вынесены в config/text_to_sql/significan
 """
 import logging
 from collections.abc import Mapping
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, TYPE_CHECKING
 
-from .significance_config import load_significance_config
+if TYPE_CHECKING:
+    from .significance_config import SignificanceProfile
 
 logger = logging.getLogger(__name__)
 
@@ -250,18 +251,51 @@ class ColumnMetadataHelper:
     """Утилиты для работы с метаданными колонок."""
     
     @staticmethod
-    def is_semantic_significant_column(col_name: str, col_info: Dict[str, Any]) -> bool:
+    def is_semantic_significant_column(
+        col_name: str,
+        col_info: Dict[str, Any],
+        *,
+        dsn: Optional[str] = None,
+        significance_profile: Optional["SignificanceProfile"] = None,
+    ) -> bool:
         """Определяет, является ли колонка семантически значимой.
 
         Списки значимости берутся из yaml-конфига (см. significance_config).
         Если конфиг отсутствует — поднимется ``FileNotFoundError``, без
         молчаливых дефолтов.
+
+        ``dsn`` (W1-1.2b): если передан и для него есть непустой
+        DSN-профиль в части ``metric_hints.significant_columns``, он
+        приоритетнее named significance-профиля — см.
+        ``dsn_profile_overrides.resolve_significance_profile``.
+        ``medium_priority_patterns`` ТОЖЕ входит в DSN-профиль (см.
+        ``resolve_significance_profile``: паттерны компилируются из
+        ``dsn_profile.SignificantColumnHints.medium_priority_patterns``) —
+        замещается вместе с остальными полями секции ``significant_columns``,
+        когда она непуста в DSN-профиле.
+
+        ``significance_profile`` (W1-1.2-review, замечание 2): если передан,
+        используется НАПРЯМУЮ вместо резолва по ``dsn`` — вызывающий код,
+        которому нужно проверить много колонок подряд (см.
+        ``SchemaColumnFilter.filter_relevant_columns`` в цикле
+        ``build_relevant_schema_context`` по всем таблицам), резолвит профиль
+        ОДИН РАЗ и передаёт готовый объект сюда, вместо повторного похода в
+        ``resolve_significance_profile`` → ``load_dsn_profile`` (``stat()``
+        на каждый вызов) на каждую колонку. При ``significance_profile is not
+        None`` параметр ``dsn`` игнорируется. Без ``significance_profile``
+        поведение не меняется (обратная совместимость): резолв по ``dsn`` на
+        каждый вызов, как раньше.
         """
         if not col_name:
             return False
 
         col_name_lower = col_name.lower()
-        config = load_significance_config()
+        if significance_profile is not None:
+            config = significance_profile
+        else:
+            from .dsn_profile_overrides import resolve_significance_profile
+
+            config = resolve_significance_profile(dsn=dsn)
 
         # Проверяем высокоприоритетные точные совпадения
         for pattern in config.high_priority_exact:

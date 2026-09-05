@@ -307,13 +307,13 @@ def test_profile_extra_partitions_cache(tmp_path, monkeypatch):
 
 def test_resolve_active_profile_name_uses_umbrella_fallback(monkeypatch):
     monkeypatch.delenv("TEXT_TO_SQL_TEST_PROFILE", raising=False)
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "umbrella_value")
 
     assert (
         resolve_active_profile_name(
             None, env_var="TEXT_TO_SQL_TEST_PROFILE", default="default"
         )
-        == "muni_ru"
+        == "umbrella_value"
     )
 
 

@@ -262,6 +262,10 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
             calls.append(("save_semantic_facts", namespace, facts))
             return True
 
+        def replace_dsn_glossary_facts(self, namespace, facts):
+            calls.append(("save_glossary_facts", namespace, facts))
+            return True
+
         def find_semantic_relevant_tables(self, terms, namespace=None):
             calls.append(("find", tuple(terms), namespace))
             return ["public.revenue"]
@@ -337,9 +341,9 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         "load_schema_research_agent_profile",
         lambda: SimpleNamespace(model="test-model"),
     )
-    monkeypatch.setattr(typed_research, "_research_model", lambda *_args: object())
+    monkeypatch.setattr(typed_research, "_research_model", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(
-        typed_research, "_research_stop_review_model", lambda *_args: object()
+        typed_research, "_research_stop_review_model", lambda *_args, **_kwargs: object()
     )
     monkeypatch.setattr(typed_research, "run_production_schema_research", run_research)
     monkeypatch.setattr(
@@ -376,6 +380,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         ),
         ("ensure", loaded.namespace, loaded.schema),
         ("save_semantic_facts", loaded.namespace, ()),
+        ("save_glossary_facts", loaded.namespace, ()),
         ("find", ("monthly revenue", "revenue"), loaded.namespace),
         ("find_facts", ("monthly revenue", "revenue"), loaded.namespace),
         ("find_semantic_facts", ("monthly revenue", "revenue"), loaded.namespace),
@@ -582,3 +587,173 @@ def test_non_promotable_probe_does_not_replace_file_semantic_facts(
     assert manager.find_approved_semantic_facts(("invoice",), namespace) == [
         file_fact
     ]
+
+
+def test_typed_research_merges_dsn_glossary_after_snapshot_and_persists_facts(
+    monkeypatch,
+) -> None:
+    """A non-empty DSN glossary reaches memory and prompts, but never sqlrag/.
+
+    The "Синонимы: ..." note must be visible to schema indexing and to the
+    research agent (captured ``loaded_schema``) while the saved scoped
+    snapshot keeps the pre-merge descriptions, so the note never
+    re-accumulates across loads.
+    """
+    import workflow.text_to_sql_typed_research as typed_research
+    from custom_tools.text_to_sql.dsn_profile import GlossaryEntry
+
+    loaded = _loaded_schema()
+    calls: list[tuple[str, object]] = []
+    captured: dict[str, object] = {}
+    final_state = SimpleNamespace(
+        schema_namespace_version="sha256:" + loaded.namespace.version_key
+    )
+    entry = GlossaryEntry(
+        term="выручка",
+        synonyms=("доход",),
+        table="public.revenue",
+        column="amount",
+        kind="measure",
+        note=None,
+    )
+    profile_requests: list[tuple[str, str | None]] = []
+
+    def fake_load_dsn_profile(dsn, *, live_schema_fingerprint=None):
+        profile_requests.append((dsn, live_schema_fingerprint))
+        return _profile_with_glossary(entry)
+
+    class MemoryManager:
+        def restore_descriptions_from_memory(self, namespace, schema):
+            return True
+
+        def ensure_schema_indexed_in_memory(self, namespace, schema):
+            calls.append(("ensure", namespace, schema))
+
+        def replace_file_semantic_facts(self, namespace, facts):
+            return True
+
+        def replace_dsn_glossary_facts(self, namespace, facts):
+            calls.append(("save_glossary_facts", namespace, facts))
+            return True
+
+        def find_semantic_relevant_tables(self, terms, namespace=None):
+            return []
+
+        def find_verified_probe_facts(self, terms, namespace):
+            return []
+
+        def find_approved_semantic_facts(self, terms, namespace):
+            return []
+
+        def save_verified_probe_facts(self, namespace, state):
+            pass
+
+    class Loader:
+        def __init__(self, _repo_root):
+            self.file_manager = SimpleNamespace(
+                load_scoped_snapshot=lambda _scope: {
+                    "snapshot_version": 1,
+                    "schema_scope": loaded.namespace.scope.to_mapping(),
+                    "schema_fingerprint": loaded.namespace.schema_fingerprint,
+                    "schema_info": {},
+                },
+                save_scoped_snapshot=lambda scope, snapshot: calls.append(
+                    ("save_snapshot", scope, snapshot)
+                ),
+            )
+
+        def load_scoped_schema(self, *_args):
+            return loaded
+
+    class Enricher:
+        def enrich_descriptions_with_llm(self, schema, *, dsn=None):
+            schema["public.revenue"]["columns"]["amount"]["description"] = "Amount"
+
+    async def run_research(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            final_state=final_state,
+            stop_reason=SimpleNamespace(value="complete"),
+            ambiguity=None,
+        )
+
+    monkeypatch.setattr(typed_research, "load_dsn_profile", fake_load_dsn_profile)
+    monkeypatch.setattr(typed_research, "SchemaLoader", Loader)
+    monkeypatch.setattr(typed_research, "SchemaEnricher", Enricher, raising=False)
+    monkeypatch.setattr(
+        typed_research, "SchemaMemoryManager", lambda _root: MemoryManager()
+    )
+    monkeypatch.setattr(
+        typed_research.NLUProcessor,
+        "_understand_query",
+        lambda _self, *_args, **_kwargs: _query_spec(),
+    )
+    monkeypatch.setattr(
+        typed_research,
+        "load_adaptive_policy_config",
+        lambda: SimpleNamespace(
+            model_budget=SimpleNamespace(output_tokens_per_call=1)
+        ),
+    )
+    monkeypatch.setattr(
+        typed_research,
+        "load_schema_research_agent_profile",
+        lambda: SimpleNamespace(model="test-model"),
+    )
+    monkeypatch.setattr(typed_research, "_research_model", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        typed_research, "_research_stop_review_model", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(typed_research, "run_production_schema_research", run_research)
+    monkeypatch.setattr(
+        typed_research,
+        "live_terminal_document_freshness_context",
+        lambda *_args: object(),
+    )
+    monkeypatch.setattr(
+        typed_research,
+        "research_stop_terminal_result",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        typed_research,
+        "evaluate_research_generation_authority",
+        lambda *_args: SimpleNamespace(allowed=True),
+    )
+
+    runtime = _runtime(loaded)
+    result = asyncio.run(typed_research.run_typed_schema_research(runtime))
+
+    assert result["ready_for_sql"] is True
+    assert profile_requests == [
+        (runtime.dsn, loaded.namespace.schema_fingerprint)
+    ]
+    by_name = {name: rest for name, *rest in calls}
+    snapshot_schema = by_name["save_snapshot"][1]["schema_info"]
+    assert "Синонимы" not in snapshot_schema["public.revenue"]["columns"]["amount"][
+        "description"
+    ]
+    indexed_schema = by_name["ensure"][1]
+    assert (
+        indexed_schema["public.revenue"]["columns"]["amount"]["description"]
+        == "Amount Синонимы: выручка, доход"
+    )
+    assert (
+        captured["loaded_schema"].schema["public.revenue"]["columns"]["amount"][
+            "description"
+        ]
+        == "Amount Синонимы: выручка, доход"
+    )
+    glossary_facts = by_name["save_glossary_facts"][1]
+    assert glossary_facts
+    assert {fact.source for fact in glossary_facts} == {"dsn_glossary"}
+    assert {fact.fact_kind for fact in glossary_facts} == {"glossary_term"}
+    assert {fact.table_fqn for fact in glossary_facts} == {"public.revenue"}
+
+
+def _profile_with_glossary(entry):
+    from dataclasses import replace
+
+    from custom_tools.text_to_sql.dsn_profile import DsnProfile
+
+    return replace(DsnProfile.empty(), glossary=(entry,))

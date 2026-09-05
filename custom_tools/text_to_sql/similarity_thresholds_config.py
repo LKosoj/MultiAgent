@@ -4,8 +4,8 @@ Loader для ``config/text_to_sql/similarity_thresholds.yaml`` (W9-A7).
 Единый source of truth для similarity-порогов text-to-sql / memory.
 До W9-A7 пороги жили env-defaults в разных модулях (RAG_VECTOR_THRESHOLD,
 RAG_RERANK_THRESHOLD, SCHEMA_TABLE_MIN_SCORE и т.д.). YAML с профилями
-позволяет унифицировать их и переключать поведение под датасет
-(muni_ru) без редактирования кода.
+позволяет унифицировать их и переключать поведение под конкретный
+датасет без редактирования кода.
 
 Контракт (verbatim из AGENTS.md):
   * Конфиг обязателен — отсутствие файла → ``FileNotFoundError``
@@ -217,7 +217,7 @@ def load_similarity_thresholds() -> SimilarityThresholdsProfile:
     active_name = resolve_active_profile()
     profile = config.get_profile(active_name)
     # L47: предупреждение при использовании профиля-копии default.
-    # Если muni_ru (или другой non-default профиль) совпадает с default по
+    # Если активный non-default профиль совпадает с default по
     # всем полям — скорее всего он не настроен; предупреждаем, чтобы
     # разработчик не считал его рабочим тюнингом.
     if active_name != _DEFAULT_PROFILE:

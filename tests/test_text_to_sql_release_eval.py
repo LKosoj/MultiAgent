@@ -288,6 +288,8 @@ def _cancelled_terminal(run_id: str) -> dict:
         "execution": {},
         "audit": {},
         "persistence": {"status": "not_attempted"},
+        "result_review": {},
+        "provenance": {},
     }
 
 

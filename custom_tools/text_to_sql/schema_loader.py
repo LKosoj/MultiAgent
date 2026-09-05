@@ -70,18 +70,24 @@ class SchemaLoader:
                 "Required live schema introspection is unavailable"
             ) from exc
 
+        namespace = SchemaNamespace(
+            scope=scope,
+            schema_fingerprint=live_fingerprint,
+        )
+        if scope.transient:
+            # A transient scope is request-local and live-only: it must not
+            # read (or write) any persisted artifact, including the editable
+            # sqlrag/<dsn>.json overlay consulted below for non-transient
+            # scopes (contract pinned by
+            # test_raw_text_to_sql_schema_load_is_request_local_and_live_only).
+            return LoadedSchema(live_schema, namespace, "live", ())
+
         editable_schema = self._load_sqlrag_schema(dsn)
         merged_schema, semantic_facts = self._merge_editable_schema(
             live_schema,
             editable_schema,
         )
         editable_schema_digest = self._editable_schema_digest(editable_schema)
-        namespace = SchemaNamespace(
-            scope=scope,
-            schema_fingerprint=live_fingerprint,
-        )
-        if scope.transient:
-            return LoadedSchema(merged_schema, namespace, "live", semantic_facts)
 
         snapshot = self.file_manager.load_scoped_snapshot(scope)
         if self._snapshot_matches_live(
@@ -238,8 +244,17 @@ class SchemaLoader:
         self,
         schema_info: Dict[str, Any],
         dsn: Optional[str] = None,
+        *,
+        autosave: bool = True,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Получает схему БД из различных источников."""
+        """Получает схему БД из различных источников.
+
+        ``autosave=False`` (W1-1.2 blocker 2) отключает автосохранение
+        ``sqlrag/<sanitized>.json`` при интроспекции через плагин — нужен
+        служебному скрипту ``text2sql_dsn_profile_scaffold.py``, которому
+        нужна только схема для заполнения ``.profile.yaml``, а не побочный
+        JSON-снапшот.
+        """
         effective_dsn = (
             dsn if (isinstance(dsn, str) and dsn.strip())
             else get_runtime_context_dsn()
@@ -263,7 +278,7 @@ class SchemaLoader:
             return sqlrag_schema
         
         # Интроспекция через плагин ТОЛЬКО если файла нет
-        return self._introspect_via_plugin(effective_dsn)
+        return self._introspect_via_plugin(effective_dsn, autosave=autosave)
     
     def _load_sqlrag_schema(self, dsn: str) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:
         """Загружает схему из sqlrag/<sanitized>.json.

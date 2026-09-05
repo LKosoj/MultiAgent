@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 import json
+import logging
 from pathlib import Path
 import re
 import subprocess
@@ -25,6 +26,8 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
 from custom_tools.text_to_sql.adaptive.production_research import (
     _bounded_research_context,
     _bounded_hierarchical_table_hints,
+    assemble_production_research,
+    stable_schema_research_model_identity,
 )
 from custom_tools.text_to_sql.adaptive._policy_common import BudgetAdmissionError
 from custom_tools.text_to_sql.adaptive.semantic_coverage import CoverageInputErrorCode
@@ -43,6 +46,8 @@ from custom_tools.text_to_sql.adaptive.models import (
     PredicateOperator,
     PhysicalColumnBinding,
     QuerySpec,
+    ResearchAction,
+    ResearchActionKind,
     ResearchState,
     SemanticItem,
     SemanticItemKind,
@@ -56,6 +61,7 @@ from custom_tools.text_to_sql.adaptive.policy import (
     ResourceBudget,
     ResultVolumeBudget,
     WallClockBudget,
+    canonical_action_digest,
     initial_budget_state,
 )
 from custom_tools.text_to_sql.adaptive.model_budget import (
@@ -63,11 +69,25 @@ from custom_tools.text_to_sql.adaptive.model_budget import (
     ModelTokenUsage,
 )
 from custom_tools.text_to_sql.adaptive.schema_probes import SchemaEvidenceDocument
+from custom_tools.text_to_sql.adaptive.evidence import probe_result_to_evidence
+from custom_tools.text_to_sql.adaptive.probes import ProbeStatus, build_probe_result
 from custom_tools.text_to_sql.adaptive.serialization import (
     ContractDecodeError,
     ContractValidationError,
+    canonical_json_bytes,
 )
 from custom_tools.text_to_sql.schema_memory import SemanticFact
+from custom_tools.text_to_sql.schema_loader import LoadedSchema
+from custom_tools.text_to_sql.schema_namespace import (
+    SCHEMA_NAMESPACE_SERIALIZATION_VERSION,
+    SchemaNamespace,
+    SchemaScope,
+    canonical_schema_fingerprint,
+)
+from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
+from workflow.adaptive_research_state_store import AdaptiveResearchStateStore
+from workflow.adaptive_state_store import AdaptiveStateStore
+from workflow.deadline import DeadlineBudget
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -362,6 +382,591 @@ def test_approved_semantic_facts_are_context_only_and_bounded() -> None:
     assert context["approved_semantic_fact_hints"] == [fact.model_dump(mode="json")]
     assert context["state"]["evidence"] == []
     assert context["state"]["bindings"] == []
+
+
+def _search_value_zero_rows_evidence(
+    state: ResearchState,
+    column: ColumnRef,
+    requested_value: str,
+) -> EvidenceRecord:
+    """One real SEARCH_VALUE evidence record with zero observed rows.
+
+    Built through the production probe-result -> evidence conversion (never
+    a hand-rolled observation string) so the canonical provenance envelope
+    W3-3.2's cascade trigger reads is trustworthy.
+    """
+    digest = canonical_action_digest(
+        kind=ResearchActionKind.SEARCH_VALUE,
+        hypothesis_id=None,
+        target=column,
+        parameters=(("top_k", 5), ("value", requested_value)),
+        expected_revision=0,
+    )
+    action = ResearchAction(
+        action_id="cascade-trigger-action",
+        kind=ResearchActionKind.SEARCH_VALUE,
+        hypothesis_id=None,
+        target=column,
+        parameters=(("top_k", 5), ("value", requested_value)),
+        action_digest=digest,
+        expected_revision=0,
+    )
+    payload = {
+        "columns": [column.column],
+        "rows": [],
+        "requested_value": requested_value,
+    }
+    raw = canonical_json_bytes(payload)
+    result = build_probe_result(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        revision=0,
+        schema_namespace_version=state.schema_namespace_version,
+        invocation_id="cascade-trigger-evidence",
+        action_digest=digest,
+        probe_kind=ResearchActionKind.SEARCH_VALUE,
+        status=ProbeStatus.SUCCESS,
+        target=column,
+        started_at=datetime(2026, 9, 1, tzinfo=UTC),
+        completed_at=datetime(2026, 9, 1, tzinfo=UTC),
+        summary="search value returned no rows",
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=0,
+            bytes=len(raw),
+        ),
+        row_count=0,
+        payload=payload,
+    )
+    evidence = probe_result_to_evidence(result, action)
+    assert evidence is not None
+    return evidence
+
+
+def _cascade_trigger_schema() -> dict[str, Any]:
+    return {
+        "orders": {
+            "columns": {
+                "region_code": {
+                    "type": "VARCHAR",
+                    "constraint_type": "FK",
+                    "references": "regions.id",
+                },
+            },
+        },
+        "regions": {
+            "columns": {
+                "id": {"type": "INT", "is_primary_key": True},
+                "name": {"type": "VARCHAR"},
+            },
+        },
+    }
+
+
+def _cascade_trigger_state(policy: AdaptivePolicyConfig) -> ResearchState:
+    """A minimal state whose only evidence is an empty label-shaped
+    SEARCH_VALUE probe on ``orders.region_code`` (W3-3.2 trigger)."""
+    state = _minimal_research_state(policy)
+    table = TableRef(namespace="main", schema=None, table="orders")
+    column = ColumnRef(table=table, column="region_code")
+    evidence = _search_value_zero_rows_evidence(state, column, "Moscow")
+    return ResearchState(
+        **{
+            **state.model_dump(mode="python", round_trip=True),
+            "evidence": (evidence,),
+        }
+    )
+
+
+def test_code_label_cascade_shadow_mode_logs_columns_without_shaping_context(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Default mode: log candidate columns, never touch model input, never
+    log the searched value itself (it is user data)."""
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "shadow")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_tools.text_to_sql.adaptive.production_research",
+    ):
+        context = json.loads(
+            _bounded_research_context(
+                SimpleNamespace(schema=schema),
+                state,
+                policy,
+                profile=load_schema_research_agent_profile(),
+                task=state.query_spec.original_text,
+                validation_feedback=(),
+            )
+        )
+
+    assert "code_label_cascade_hints" not in context
+    shadow_records = [
+        record for record in caplog.records if "code_label_cascade shadow" in record.message
+    ]
+    assert len(shadow_records) == 1
+    assert "regions" in shadow_records[0].message
+    assert "name" in shadow_records[0].message
+    assert "fk_lookup" in shadow_records[0].message
+    assert "Moscow" not in shadow_records[0].message
+
+
+def test_code_label_cascade_on_mode_adds_bounded_context_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "on")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema=schema),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+        )
+    )
+
+    assert context["code_label_cascade_hints"] == [
+        {"table": "regions", "column": "name", "reason": "fk_lookup"}
+    ]
+
+
+def test_code_label_cascade_off_mode_disables_hint_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "off")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_tools.text_to_sql.adaptive.production_research",
+    ):
+        context = json.loads(
+            _bounded_research_context(
+                SimpleNamespace(schema=schema),
+                state,
+                policy,
+                profile=load_schema_research_agent_profile(),
+                task=state.query_spec.original_text,
+                validation_feedback=(),
+            )
+        )
+
+    assert "code_label_cascade_hints" not in context
+    assert not [
+        record for record in caplog.records if "code_label_cascade" in record.message
+    ]
+
+
+def test_code_label_cascade_unknown_env_value_fails_closed_to_shadow(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "not-a-real-mode")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_tools.text_to_sql.adaptive.production_research",
+    ):
+        context = json.loads(
+            _bounded_research_context(
+                SimpleNamespace(schema=schema),
+                state,
+                policy,
+                profile=load_schema_research_agent_profile(),
+                task=state.query_spec.original_text,
+                validation_feedback=(),
+            )
+        )
+
+    assert "code_label_cascade_hints" not in context
+    assert [
+        record for record in caplog.records if "code_label_cascade shadow" in record.message
+    ]
+
+
+def test_code_label_cascade_hint_dropped_when_it_does_not_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fit-or-pop: a cascade hint that would overflow the inline-bytes
+    budget is dropped instead of raising, mirroring
+    ``verified_probe_fact_hints``/``approved_semantic_fact_hints``."""
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "off")
+    baseline_policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(baseline_policy)
+    schema = _cascade_trigger_schema()
+    baseline = _bounded_research_context(
+        SimpleNamespace(schema=schema),
+        state,
+        baseline_policy,
+        profile=load_schema_research_agent_profile(),
+        task=state.query_spec.original_text,
+        validation_feedback=(),
+    )
+    tight_policy = AdaptivePolicyConfig.model_validate(
+        {
+            **baseline_policy.model_dump(mode="python", round_trip=True),
+            "result_volume": {
+                "returned_rows": baseline_policy.result_volume.returned_rows,
+                "inline_bytes": len(baseline.encode("utf-8")),
+            },
+        }
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "on")
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema=schema),
+            state,
+            tight_policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+        )
+    )
+
+    assert "code_label_cascade_hints" not in context
+
+
+def test_code_label_cascade_on_mode_filters_candidates_outside_research_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cascade hint pointing at a table the narrowed ``semantic_table_hints``
+    schema excludes is useless to the model (it cannot query a table it
+    cannot see), so "on" mode must drop it rather than include it."""
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "on")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema=schema),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+            semantic_table_hints=("orders",),
+        )
+    )
+
+    assert context.get("code_label_cascade_hints", []) == []
+
+
+def test_code_label_cascade_shadow_mode_logs_outside_research_schema_count(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Shadow mode is diagnostic-only, so it logs against the full schema,
+    but must also surface how many logged candidates would be dropped by
+    the "on"-mode research_schema filter."""
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "shadow")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="custom_tools.text_to_sql.adaptive.production_research",
+    ):
+        context = json.loads(
+            _bounded_research_context(
+                SimpleNamespace(schema=schema),
+                state,
+                policy,
+                profile=load_schema_research_agent_profile(),
+                task=state.query_spec.original_text,
+                validation_feedback=(),
+                semantic_table_hints=("orders",),
+            )
+        )
+
+    assert "code_label_cascade_hints" not in context
+    shadow_records = [
+        record for record in caplog.records if "code_label_cascade shadow" in record.message
+    ]
+    assert len(shadow_records) == 1
+    assert "regions" in shadow_records[0].message
+    assert "outside_research_schema=1" in shadow_records[0].message
+
+
+def test_bounded_research_context_reuses_relationship_edges_cache_across_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `loaded_schema` carries a real namespace (as production's
+    `LoadedSchema` does), `_bounded_research_context` must route the
+    cascade hint's relationship-edge lookup through schema_probes's shared
+    cache keyed by `namespace.version_key`, instead of recomputing edges
+    on every call within a research loop."""
+    from custom_tools.text_to_sql.adaptive import schema_probes as schema_probes_module
+
+    monkeypatch.setenv("TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT", "shadow")
+    policy = _minimal_research_context_policy()
+    state = _cascade_trigger_state(policy)
+    schema = _cascade_trigger_schema()
+    scope = SchemaScope(
+        serialization_version=SCHEMA_NAMESPACE_SERIALIZATION_VERSION,
+        tenant_id="cascade-cache-tenant",
+        access_scope_id="cascade-cache-scope",
+        connection_view_id="cascade-cache-view",
+        transient=True,
+    )
+    namespace = SchemaNamespace(
+        scope=scope, schema_fingerprint=canonical_schema_fingerprint(schema)
+    )
+    loaded_schema = LoadedSchema(schema, namespace, "live", ())
+
+    calls = {"count": 0}
+    original_relationship_edges = schema_probes_module._relationship_edges
+
+    def counting_relationship_edges(schema: Any) -> Any:
+        calls["count"] += 1
+        return original_relationship_edges(schema)
+
+    monkeypatch.setattr(
+        schema_probes_module, "_relationship_edges", counting_relationship_edges
+    )
+
+    for _ in range(2):
+        _bounded_research_context(
+            loaded_schema,
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task=state.query_spec.original_text,
+            validation_feedback=(),
+        )
+
+    assert calls["count"] == 1
+
+
+def test_relationship_edges_cached_returns_immutable_tuple() -> None:
+    """W3: the cache must hand out an immutable ``tuple`` of read-only
+    ``Mapping`` edges, not a shared mutable ``list[dict]`` — otherwise one
+    caller's in-place mutation (``.append``/item assignment) would silently
+    corrupt the cache for every other reader of the same ``version_key``."""
+    from custom_tools.text_to_sql.adaptive import schema_probes as schema_probes_module
+
+    schema = {
+        "orders": {
+            "columns": {
+                "region_code": {
+                    "type": "VARCHAR",
+                    "constraint_type": "FK",
+                    "references": "regions.id",
+                },
+            },
+        },
+        "regions": {
+            "columns": {
+                "id": {"type": "INT", "is_primary_key": True},
+                "name": {"type": "VARCHAR"},
+            },
+        },
+    }
+
+    edges = schema_probes_module.relationship_edges_cached(
+        schema, "immutable-tuple-test"
+    )
+
+    assert isinstance(edges, tuple)
+    assert edges
+    with pytest.raises(AttributeError):
+        edges.append({"from_table": "x", "to_table": "y"})  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        edges[0]["from_table"] = "mutated"
+    # Deep freeze: the nested FK column pairs must be read-only too, or a
+    # consumer could still corrupt the shared cache via ``column_pairs``.
+    pairs = edges[0]["column_pairs"]
+    assert isinstance(pairs, tuple)
+    with pytest.raises(TypeError):
+        pairs[0]["to_column"] = "mutated"
+
+
+def test_relationship_edges_cache_is_thread_safe_under_concurrent_eviction() -> None:
+    """32 threads hammering more distinct version_keys than the cache's
+    bound (8) must force concurrent eviction without ever raising (the
+    pre-fix plain dict + unlocked ``pop(next(iter(...)))`` eviction could
+    raise ``RuntimeError: dictionary changed size during iteration`` here),
+    and every thread must still get back edges identical to a direct,
+    uncached computation for its own schema."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from custom_tools.text_to_sql.adaptive import schema_probes as schema_probes_module
+
+    def schema_for(i: int) -> dict[str, Any]:
+        return {
+            f"orders_{i}": {
+                "columns": {
+                    "region_code": {
+                        "type": "VARCHAR",
+                        "constraint_type": "FK",
+                        "references": f"regions_{i}.id",
+                    },
+                },
+            },
+            f"regions_{i}": {
+                "columns": {
+                    "id": {"type": "INT", "is_primary_key": True},
+                    "name": {"type": "VARCHAR"},
+                },
+            },
+        }
+
+    version_keys = [f"thread-safety-cache-test-{i}" for i in range(16)]
+
+    def worker(i: int) -> bool:
+        index = i % len(version_keys)
+        schema = schema_for(index)
+        edges = schema_probes_module.relationship_edges_cached(
+            schema, version_keys[index]
+        )
+        expected = schema_probes_module._relationship_edges(schema)
+        # `relationship_edges_cached` returns a deep-frozen tuple of
+        # read-only mappings (nested `column_pairs` tuples), not list[dict]:
+        # compare structurally via JSON so container types don't matter.
+        return json.dumps(edges, sort_keys=True, default=dict) == json.dumps(
+            expected, sort_keys=True, default=dict
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        results = list(pool.map(worker, range(400)))
+
+    assert all(results)
+
+
+def _assemble_with_table_hint_gap(
+    schema: dict[str, Any],
+    semantic_table_hints: tuple[str, ...],
+    approved_semantic_fact_hints: tuple[SemanticFact, ...],
+    tmp_path: Path,
+):
+    """Build one real `assemble_production_research` assembly for the
+    filter-trap regression tests below (W2-2.2). Everything except
+    `research_context` stays unused/undriven — no real DB/model/state
+    machinery is exercised, only the trusted narrowing computed inside
+    `assemble_production_research` itself."""
+    scope = SchemaScope(
+        serialization_version=SCHEMA_NAMESPACE_SERIALIZATION_VERSION,
+        tenant_id="gap-tenant",
+        access_scope_id="gap-scope",
+        connection_view_id="gap-view",
+        transient=True,
+    )
+    namespace = SchemaNamespace(scope=scope, schema_fingerprint=canonical_schema_fingerprint(schema))
+    loaded_schema = LoadedSchema(schema, namespace, "live", ())
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    profile = load_schema_research_agent_profile()
+    db_path = tmp_path / "gap-state.sqlite"
+    return assemble_production_research(
+        initial_state=state,
+        query=state.query_spec.original_text,
+        loaded_schema=loaded_schema,
+        semantic_table_hints=semantic_table_hints,
+        approved_semantic_fact_hints=approved_semantic_fact_hints,
+        dsn="dummy-dsn",
+        scope=scope,
+        table_namespace="main",
+        model=lambda *args, **kwargs: None,
+        model_identity=stable_schema_research_model_identity(profile.model),
+        profile=profile,
+        state_store=AdaptiveResearchStateStore(db_path),
+        checkpoint_store=AdaptiveStateStore(db_path),
+        budget_ledger=AdaptiveBudgetLedger(db_path),
+        policy=policy,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+    )
+
+
+def test_approved_semantic_fact_hint_survives_missing_table_hint_gap(tmp_path: Path) -> None:
+    """A fact about `orders` must not be dropped when the separate
+    table-search only surfaced `customers` and there is no FK between them
+    (the filter trap: two indexes match the same user term against
+    different text, see production_research.py's assemble_production_research)."""
+    schema = {
+        "customers": {"columns": {"id": {}}},
+        "orders": {"columns": {"id": {}}},
+    }
+    fact = SemanticFact(
+        subject="table",
+        table_fqn="orders",
+        fact_kind="description",
+        value="Customer orders",
+        source="typed_probe",
+        status="approved",
+    )
+
+    assembly = _assemble_with_table_hint_gap(
+        schema, ("customers",), (fact,), tmp_path
+    )
+    context = json.loads(assembly.research_context(assembly.initial_state, ()))
+
+    assert "orders" in context["schema"]
+    assert context["approved_semantic_fact_hints"] == [fact.model_dump(mode="json")]
+
+
+def test_empty_table_hints_keep_full_schema_even_with_facts(tmp_path: Path) -> None:
+    """Empty `semantic_table_hints` must still mean "use the full schema" —
+    the union-with-fact-tables fix must not turn that into "narrow to just
+    the fact tables" (regression guard for step 4 of W2-2.2)."""
+    schema = {
+        "customers": {"columns": {"id": {}}},
+        "orders": {"columns": {"id": {}}},
+    }
+    fact = SemanticFact(
+        subject="table",
+        table_fqn="orders",
+        fact_kind="description",
+        value="Customer orders",
+        source="typed_probe",
+        status="approved",
+    )
+
+    assembly = _assemble_with_table_hint_gap(schema, (), (fact,), tmp_path)
+    context = json.loads(assembly.research_context(assembly.initial_state, ()))
+
+    assert "semantic_table_hints" not in context
+    assert set(context["schema"]) == {"customers", "orders"}
+    assert context["approved_semantic_fact_hints"] == [fact.model_dump(mode="json")]
+
+
+def test_unrelated_fact_still_filtered(tmp_path: Path) -> None:
+    """A fact about a table absent from the captured schema entirely is
+    still rejected up front — the W2-2.2 fix only rescues facts about
+    tables the schema actually has; it must not weaken this existing
+    admission check."""
+    schema = {"orders": {"columns": {"id": {}}}}
+    fact = SemanticFact(
+        subject="table",
+        table_fqn="ghost_table",
+        fact_kind="description",
+        value="Not part of this schema",
+        source="typed_probe",
+        status="approved",
+    )
+
+    with pytest.raises(TypeError, match="approved_semantic_fact_hints"):
+        _assemble_with_table_hint_gap(schema, (), (fact,), tmp_path)
 
 
 def test_semantic_table_hints_limit_inline_schema_details() -> None:

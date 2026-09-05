@@ -65,6 +65,7 @@ def _successful_payload(**overrides):
         },
         "result_review": {},
         "ambiguity": None,
+        "provenance": {},
     }
     payload.update(overrides)
     execution = payload.get("execution")
@@ -76,6 +77,23 @@ def _successful_payload(**overrides):
         execution.setdefault("sql_query", payload["sql"])
         execution.setdefault("applied_row_limit", 10)
     return payload
+
+
+def _valid_provenance(**overrides):
+    provenance = {
+        "run_id": "run-1",
+        "tables": ["orders"],
+        "columns": ["orders.id"],
+        "row_count": 1,
+        "row_limit": 10,
+        "possibly_truncated": False,
+        "safety_llm_audit": None,
+        "result_review_verdict": None,
+        "parse_error": False,
+        "has_derived_tables": False,
+    }
+    provenance.update(overrides)
+    return provenance
 
 
 def _executor_result(**overrides):
@@ -350,6 +368,50 @@ def test_terminal_model_rejects_missing_and_unknown_fields():
     unknown = _successful_payload(unexpected="value")
     with pytest.raises(ValueError, match="unknown"):
         TextToSqlTerminalResult.from_mapping(unknown)
+
+
+def test_terminal_model_defaults_legacy_missing_provenance_to_empty_mapping():
+    # W4-4.1 added the required `provenance` field to an already-shipped
+    # contract; snapshots stored before that change lack the key entirely.
+    # `from_mapping` must still accept them (see _LEGACY_OPTIONAL_TERMINAL_FIELDS).
+    payload = _successful_payload()
+    payload.pop("provenance")
+
+    outcome = TextToSqlTerminalResult.from_mapping(payload)
+
+    assert outcome.provenance == {}
+    assert outcome.to_mapping()["provenance"] == {}
+
+
+def test_terminal_model_rejects_non_bool_has_derived_tables():
+    payload = _successful_payload(
+        provenance=_valid_provenance(has_derived_tables="yes")
+    )
+
+    with pytest.raises(TypeError, match="has_derived_tables"):
+        TextToSqlTerminalResult.from_mapping(payload)
+
+
+def test_terminal_model_rejects_has_derived_tables_true_with_parse_error():
+    payload = _successful_payload(
+        provenance=_valid_provenance(
+            tables=[],
+            columns=[],
+            parse_error=True,
+            has_derived_tables=True,
+        )
+    )
+
+    with pytest.raises(ValueError, match="has_derived_tables"):
+        TextToSqlTerminalResult.from_mapping(payload)
+
+
+def test_terminal_model_still_rejects_missing_non_legacy_fields():
+    payload = _successful_payload()
+    payload.pop("sql")
+
+    with pytest.raises(ValueError, match="missing fields"):
+        TextToSqlTerminalResult.from_mapping(payload)
 
 
 def test_abstained_requires_reason_and_cannot_claim_runtime_gates():
@@ -757,6 +819,7 @@ def test_schema_linking_reasons_are_closed_abstained_outcomes(reason_code):
             },
         ),
         ("persistence", {"status": "banana"}),
+        ("provenance", {"extra": True}),
     ],
 )
 def test_terminal_audit_and_persistence_schemas_are_closed(field, value):
@@ -2339,3 +2402,342 @@ def test_text_to_sql_identity_is_exact_name_only(name, category, expected):
 def test_terminal_payload_is_json_serializable():
     outcome = TextToSqlTerminalResult.from_mapping(_successful_payload())
     assert json.loads(json.dumps(outcome.to_mapping()))["status"] == "succeeded"
+
+
+def test_build_text_to_sql_provenance_happy_path():
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    sql_query = (
+        "SELECT o.id, c.name AS customer_name FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id"
+    )
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query=sql_query,
+        dsn="sqlite:///unused.db",
+        execution={"llm_audit": "ok"},
+        execution_summary={"row_count": 2, "row_limit": 10},
+        result_review={"verdict": "consistent"},
+    )
+
+    assert provenance == {
+        "run_id": "run-1",
+        "tables": ["customers", "orders"],
+        "columns": [
+            "customers.id",
+            "customers.name",
+            "orders.customer_id",
+            "orders.id",
+        ],
+        "row_count": 2,
+        "row_limit": 10,
+        "possibly_truncated": False,
+        "safety_llm_audit": "ok",
+        "result_review_verdict": "consistent",
+        "has_derived_tables": False,
+        "parse_error": False,
+    }
+
+
+def test_build_text_to_sql_provenance_excludes_cte_name_from_tables():
+    # `find_all(exp.Table)` alone can't tell a CTE reference (`FROM cte`)
+    # apart from a real table by name; without filtering, the CTE's own
+    # name leaks into `tables` alongside the physical table its body reads.
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="WITH cte AS (SELECT id FROM orders) SELECT cte.id FROM cte",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["orders"]
+    assert provenance["has_derived_tables"] is True
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_detects_subquery_source_as_derived():
+    # A subquery used directly as a FROM source (no CTE) hides its physical
+    # table behind an alias the same way a CTE does.
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT * FROM (SELECT id FROM orders) t",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["orders"]
+    assert provenance["has_derived_tables"] is True
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_detects_lateral_source_as_derived():
+    # `LATERAL (...)` is a row source like a plain FROM/JOIN subquery, but
+    # sqlglot nests it as Subquery -> Lateral -> Join, so the subquery's
+    # immediate parent is `exp.Lateral`, not `exp.From`/`exp.Join` directly.
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query=(
+            "SELECT t.id, x.val FROM t, LATERAL "
+            "(SELECT val FROM u WHERE u.id = t.id) AS x"
+        ),
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["t", "u"]
+    assert provenance["has_derived_tables"] is True
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_scalar_subquery_in_where_is_not_derived():
+    # A subquery used as a predicate (not a row source) must not flip
+    # has_derived_tables: its immediate sqlglot parent is the predicate node
+    # (`In`), never From/Join/Lateral.
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT t.id FROM t WHERE t.id IN (SELECT id FROM u)",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["t", "u"]
+    assert provenance["has_derived_tables"] is False
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_union_is_a_pinned_known_limitation():
+    # Documented limitation: a bare UNION parses as exp.Union, not
+    # exp.Select, so per-branch column qualifiers are never resolved against
+    # either branch's tables and has_derived_tables only reflects subqueries
+    # nested inside a branch (there are none here). This test pins that
+    # behavior rather than attempting to fix it.
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT a.id FROM a UNION SELECT b.id FROM b",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["a", "b"]
+    assert provenance["columns"] == ["a.id", "b.id"]
+    assert provenance["has_derived_tables"] is False
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_simple_query_has_no_derived_tables():
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT id FROM orders",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 1, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["tables"] == ["orders"]
+    assert provenance["has_derived_tables"] is False
+    assert provenance["parse_error"] is False
+
+
+def test_build_text_to_sql_provenance_row_count_at_limit_is_possibly_truncated():
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT 1",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 10, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["possibly_truncated"] is True
+
+
+def test_build_text_to_sql_provenance_marks_parse_error_without_crashing():
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="not valid sql (((",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 0, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["parse_error"] is True
+    assert provenance["tables"] == []
+    assert provenance["columns"] == []
+    assert provenance["has_derived_tables"] is False
+
+
+def test_build_text_to_sql_provenance_defaults_missing_llm_audit_and_verdict_to_none():
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    provenance = terminal._build_text_to_sql_provenance(
+        run_id="run-1",
+        sql_query="SELECT 1",
+        dsn="sqlite:///unused.db",
+        execution={},
+        execution_summary={"row_count": 0, "row_limit": 10},
+        result_review={},
+    )
+
+    assert provenance["safety_llm_audit"] is None
+    assert provenance["result_review_verdict"] is None
+
+
+def test_finalizer_populates_provenance_for_executed_success(monkeypatch):
+    core = importlib.import_module("custom_tools.text_to_sql.core")
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+    sql_query = (
+        "SELECT o.id, c.name AS customer_name FROM orders o "
+        "JOIN customers c ON o.customer_id = c.id"
+    )
+
+    monkeypatch.setattr(
+        core,
+        "secure_db_executor",
+        lambda *args, **kwargs: _executor_result(
+            sql_query=sql_query,
+            data=[[1, "a"]],
+            columns=["id", "customer_name"],
+            rows_affected=1,
+            llm_audit="ok",
+        ),
+    )
+    monkeypatch.setattr(
+        core,
+        "audit_logger",
+        lambda entry: {"status": "logged", "log_id": "audit-1"},
+    )
+    monkeypatch.setattr(
+        core,
+        "save_successful_sql",
+        lambda *args, **kwargs: {
+            "status": "saved",
+            "filename": "query.md",
+            "path": "/tmp/query.md",
+        },
+    )
+
+    result = terminal.finalize_text_to_sql_run(
+        sql_query,
+        "one",
+        "sqlite:///unused.db",
+        10,
+        False,
+        "session-1",
+        "run-1",
+    )
+
+    assert result["status"] == "succeeded"
+    provenance = result["provenance"]
+    assert provenance["run_id"] == "run-1"
+    assert provenance["tables"] == ["customers", "orders"]
+    assert provenance["row_count"] == 1
+    assert provenance["row_limit"] == 10
+    assert provenance["possibly_truncated"] is False
+    assert provenance["safety_llm_audit"] == "ok"
+    assert provenance["result_review_verdict"] is None
+    assert provenance["parse_error"] is False
+
+
+def test_finalizer_provenance_empty_when_not_executed(monkeypatch):
+    core = importlib.import_module("custom_tools.text_to_sql.core")
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    monkeypatch.setattr(
+        core,
+        "secure_db_executor",
+        lambda sql_query, row_limit=None, dsn=None, *, dry_run_only=None: {
+            "success": True,
+            "data": [],
+            "columns": [],
+            "rows_affected": 0,
+            "execution_time_ms": 1,
+            "error_message": None,
+            "dry_run_only": True,
+            "skipped_execution": True,
+            "sql_query": sql_query,
+            "applied_row_limit": row_limit,
+        },
+    )
+    monkeypatch.setattr(
+        core,
+        "audit_logger",
+        lambda entry: {"status": "logged", "log_id": "audit-1"},
+    )
+    monkeypatch.setattr(
+        core,
+        "save_successful_sql",
+        lambda *args, **kwargs: pytest.fail("dry-run must not persist SQL"),
+    )
+
+    result = terminal.finalize_text_to_sql_run(
+        "SELECT 1",
+        "one",
+        "sqlite:///unused.db",
+        10,
+        True,
+        "session-1",
+        "run-1",
+    )
+
+    assert result["executed"] is False
+    assert result["provenance"] == {}
+
+
+def test_finalizer_provenance_empty_for_abstained_before_execution(monkeypatch):
+    core = importlib.import_module("custom_tools.text_to_sql.core")
+    terminal = importlib.import_module("custom_tools.text_to_sql.core._terminal")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("must abstain before any execution/audit/persistence")
+
+    monkeypatch.setattr(
+        terminal,
+        "_pre_execution_gate_allowed",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(core, "secure_db_executor", forbidden)
+    monkeypatch.setattr(core, "audit_logger", forbidden)
+    monkeypatch.setattr(core, "save_successful_sql", forbidden)
+
+    result = terminal.finalize_text_to_sql_run(
+        "SELECT 1",
+        "one",
+        "sqlite:///unused.db",
+        10,
+        False,
+        "session-1",
+        "run-1",
+    )
+
+    assert result["status"] == "abstained"
+    assert result["reason_code"] == "DETERMINISTIC_CHECK_REJECTED"
+    assert result["executed"] is False
+    assert result["provenance"] == {}

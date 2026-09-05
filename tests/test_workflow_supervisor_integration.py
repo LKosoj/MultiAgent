@@ -753,6 +753,9 @@ def test_normal_worker_exit_adopts_pending_child_result_before_fallback(
                 "filename": "query.md",
                 "path": "/tmp/query.md",
             },
+            "ambiguity": None,
+            "result_review": {},
+            "provenance": {},
         }
     ).to_mapping()
     payload = streamlit_api._build_workflow_result_event_payload(

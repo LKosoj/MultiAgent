@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 
 _DETERMINISTIC_DRILL_NAMES = frozenset(
     {
-        "adaptive_rollback_operator",
         "memory_reconciliation_and_rebuild",
         "outbox_crash_and_restart",
         "retention_and_report_fallback",
@@ -1078,7 +1077,7 @@ def test_release_evidence_writer_rejects_each_missing_deterministic_drill(
     (
         ("duplicate", "drill step is duplicated"),
         ("unknown", "drill report has missing or failed steps"),
-        ("adaptive_failed", "drill report has missing or failed steps"),
+        ("schema_failed", "drill report has missing or failed steps"),
     ),
 )
 def test_release_evidence_writer_rejects_invalid_deterministic_drill_step(
@@ -1090,15 +1089,15 @@ def test_release_evidence_writer_rejects_invalid_deterministic_drill_step(
     report_path = context["artifacts"] / "deterministic-drills.json"
     report = json.loads(report_path.read_text(encoding="utf-8"))
     drills = report["drills"]
-    adaptive = next(
-        drill for drill in drills if drill["name"] == "adaptive_rollback_operator"
+    schema_drill = next(
+        drill for drill in drills if drill["name"] == "schema_backup_restore_rollback"
     )
     if mutation == "duplicate":
         drills[-1] = dict(drills[0])
     elif mutation == "unknown":
-        adaptive["name"] = "unknown_drill"
+        schema_drill["name"] = "unknown_drill"
     else:
-        adaptive["status"] = "failed"
+        schema_drill["status"] = "failed"
     report_path.write_text(json.dumps(report), encoding="utf-8")
 
     completed = _run_evidence_writer(context)

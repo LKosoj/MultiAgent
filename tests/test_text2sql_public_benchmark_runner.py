@@ -935,6 +935,7 @@ def test_manifest_records_verifiable_pipeline_provenance(
         "model_configuration",
         "configuration_sources",
         "successful_sql_memory_enabled",
+        "clarifying_questions_enabled",
         "principal",
         "sources",
     }
@@ -1084,6 +1085,20 @@ def test_cli_default_case_timeout_is_14400_seconds() -> None:
     args = benchmark_runner.build_parser().parse_args([])
 
     assert args.case_timeout == 14_400.0
+
+
+def test_cli_default_llm_models_profile_is_none() -> None:
+    args = benchmark_runner.build_parser().parse_args([])
+
+    assert args.llm_models_profile is None
+
+
+def test_cli_llm_models_profile_flag_is_parsed() -> None:
+    args = benchmark_runner.build_parser().parse_args(
+        ["--llm-models-profile", "experiment"]
+    )
+
+    assert args.llm_models_profile == "experiment"
 
 
 def test_manifest_records_frozen_runtime_memory_setting(
@@ -2248,6 +2263,9 @@ def test_runtime_evidence_model_calls_tokens_cost_receipts_ledger_unreadable_cor
         # Two trailing integers are stripped, even when the step name
         # itself is hyphenated.
         ("research-model-2-3", "research-model"),
+        # The adaptive solver's own model-call ids follow the same
+        # "<step>-<revision>-<attempt>" shape.
+        ("solver-generate-0-0", "solver-generate"),
         # A number embedded earlier in the id does not count as the
         # trailing suffix when the id does not itself end in two integers.
         ("research-2-model", "research-2-model"),
@@ -2298,6 +2316,9 @@ def test_canonical_environment_is_closed_typed_and_forces_empty_memory() -> None
         "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
         "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
         "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0",
+        "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
+        "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
+        "TEXT_TO_SQL_LLM_MODELS_PROFILE": "default",
     }
     policy_path = (
         Path(__file__).resolve().parents[1]
@@ -2318,6 +2339,41 @@ def test_canonical_environment_is_closed_typed_and_forces_empty_memory() -> None
         )
     with pytest.raises(ValueError, match="http"):
         _canonical_runtime_environment({"model_api_base": "file:///tmp/model"})
+
+
+def test_canonical_environment_pins_an_explicit_llm_models_profile() -> None:
+    """An operator-chosen profile (e.g. the W5 ``experiment`` profile) must be
+    written verbatim into the release environment, instead of the loader's
+    ``"default"`` fallback, so the benchmark actually exercises that profile
+    rather than silently reverting to the ambient/ unset env var."""
+
+    environment = _canonical_runtime_environment(
+        {"model_api_base": "http://127.0.0.1:9999/v1"},
+        llm_models_profile="experiment",
+    )
+
+    assert environment["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == "experiment"
+
+    # An empty string is treated exactly like not passing a profile at all
+    # (the loader's own "default" fallback), not as an invalid value.
+    empty_environment = _canonical_runtime_environment(
+        {"model_api_base": "http://127.0.0.1:9999/v1"},
+        llm_models_profile="",
+    )
+    assert empty_environment["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == "default"
+
+
+def test_canonical_environment_rejects_an_unknown_llm_models_profile() -> None:
+    """An operator typo (or a profile that was since renamed/removed) must
+    fail fast here, during release-lock validation, instead of silently
+    pinning a name into the environment that ``llm_models_config`` will only
+    reject once something deep inside the benchmark run tries to load it."""
+
+    with pytest.raises(ValueError, match="unknown llm models profile"):
+        _canonical_runtime_environment(
+            {"model_api_base": "http://127.0.0.1:9999/v1"},
+            llm_models_profile="does-not-exist",
+        )
 
 
 
@@ -2519,6 +2575,40 @@ def test_release_lock_inventories_every_used_input_and_detects_tamper(
         _validate_release_input_lock(args, lock, policy=policy)
 
 
+def test_release_lock_threads_llm_models_profile_from_args_into_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``--llm-models-profile`` (``args.llm_models_profile``) must actually
+    reach ``canonical_runtime_environment`` -- both when the lock is created
+    and when it is later validated -- not just be declared and ignored by
+    ``build_parser()``."""
+
+    args = _release_fixture_args(tmp_path)
+    args.llm_models_profile = "experiment"
+    policy = _release_fixture_policy(args)
+    monkeypatch.setattr(
+        benchmark_runner,
+        "_verified_git_provenance",
+        lambda _path, *, origin, revision: {
+            "origin": origin,
+            "revision": revision,
+            "worktree": "verified",
+        },
+    )
+
+    lock = _create_release_input_lock(args, policy=policy)
+
+    assert lock["canonical_environment"]["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == (
+        "experiment"
+    )
+    _validate_release_input_lock(args, lock, policy=policy)
+
+    args.llm_models_profile = "default"
+    with pytest.raises(benchmark_runner.SandboxError, match="environment identity"):
+        _validate_release_input_lock(args, lock, policy=policy)
+
+
 def test_release_lock_rejects_an_evaluator_outside_or_changed_under_dataset_root(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -2624,6 +2714,7 @@ def _write_valid_completed_leg(
             "model_configuration": {"reported_by_runtime": False},
             "configuration_sources": [],
             "successful_sql_memory_enabled": "0",
+            "clarifying_questions_enabled": "0",
             "principal": {"subject": "benchmark", "tenant_id": None, "roles": ["admin"]},
             "sources": [],
             "source_snapshot_digest": identity["source_snapshot_digest"],
@@ -4239,6 +4330,61 @@ def test_case_reuses_latest_scoped_schema_snapshot_after_empty_history(
     assert copied["schema_info"]["items"]["id"]["description"] == (
         "latest description"
     )
+
+
+def test_seed_case_schema_snapshot_never_seeds_dsn_profile_file(
+    tmp_path: Path,
+) -> None:
+    """W1-1.2: DSN-профили (``sqlrag/<dsn>.profile.yaml``) содержат доменную
+    разметку конкретной инсталляции и не должны попадать в публичный
+    benchmark-сэндбокс ни при каких условиях — даже если случайно лежат
+    рядом с легитимным schema-снепшотом в state_root.
+    """
+    from custom_tools.text_to_sql.schema_namespace import SchemaScope
+
+    state_root = tmp_path / "state"
+    case_root = state_root / "bird-r1-current"
+    (case_root / "sqlrag").mkdir(parents=True)
+    dsn = "sqlite:////benchmark-input/example.sqlite"
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "text2sql-benchmark",
+            "access_scope_id": "owner:text2sql-benchmark",
+            "connection_view_id": (
+                "dsn:" + hashlib.sha256(dsn.encode("utf-8")).hexdigest()[:16]
+            ),
+            "transient": False,
+        }
+    )
+    filename = f"schema-v1-{scope.scope_key}.json"
+    prior_sqlrag = state_root / "bird-r1-previous" / "sqlrag"
+    prior_sqlrag.mkdir(parents=True)
+    (prior_sqlrag / filename).write_text(
+        json.dumps(
+            {
+                "snapshot_version": 1,
+                "schema_scope": scope.to_mapping(),
+                "captured_at": "2026-08-29T00:00:00+00:00",
+                "schema_fingerprint": "a" * 64,
+                "schema_info": {"items": {"id": {"description": "d"}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Симулируем случайно оставшийся рядом с легитимным снепшотом DSN-профиль.
+    (prior_sqlrag / "sqlite_benchmark_input_example_sqlite.profile.yaml").write_text(
+        "version: 1\n", encoding="utf-8"
+    )
+
+    bwrap_execution.facade.seed_case_schema_snapshot(
+        state_root=state_root,
+        case_root=case_root,
+        dsn=dsn,
+    )
+
+    assert (case_root / "sqlrag" / filename).is_file()
+    assert list((case_root / "sqlrag").glob("*.profile.yaml")) == []
 
 
 def test_release_legs_keep_new_state_roots_but_share_seeded_schema_memory(

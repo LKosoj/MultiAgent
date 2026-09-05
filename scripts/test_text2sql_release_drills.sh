@@ -253,8 +253,7 @@ python3 -m pytest -q -W error --junitxml="$junit_path" \
   tests/test_operational_retention.py::test_retention_lease_has_one_winner_and_persists_completion \
   tests/test_operational_retention.py::test_coordinator_runs_due_maintenance_and_records_exact_metrics \
   tests/test_t14_service_client_cutover.py::test_workflow_report_never_returns_legacy_cache_without_source \
-  tests/test_text_to_sql_state_migrations.py::test_disposable_schema_backup_restore_and_rollback \
-  tests/test_text_to_sql_adaptive_rollback_operator.py::test_read_only_operator_recomputes_gate_and_rejects_not_evaluated
+  tests/test_text_to_sql_state_migrations.py::test_disposable_schema_backup_restore_and_rollback
 pytest_status=$?
 set -e
 
@@ -296,9 +295,6 @@ groups = {
     },
     "schema_backup_restore_rollback": {
         "test_disposable_schema_backup_restore_and_rollback",
-    },
-    "adaptive_rollback_operator": {
-        "test_read_only_operator_recomputes_gate_and_rejects_not_evaluated",
     },
 }
 cases = {}

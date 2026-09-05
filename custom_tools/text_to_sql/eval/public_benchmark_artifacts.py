@@ -497,6 +497,10 @@ def _write_manifest(
             "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED",
             os.getenv("TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED", "1"),
         ),
+        "clarifying_questions_enabled": runtime_environment.get(
+            "TEXT_TO_SQL_CLARIFYING_QUESTIONS",
+            os.getenv("TEXT_TO_SQL_CLARIFYING_QUESTIONS", "1"),
+        ),
         "principal": {
             "subject": principal.get("subject"),
             "tenant_id": principal.get("tenant_id"),

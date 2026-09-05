@@ -322,6 +322,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 "persistence": {"status": "not_attempted"},
                 "result_review": {},
                 "ambiguity": None,
+                "provenance": {},
             }
         )
 
@@ -453,6 +454,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 "persistence": {"status": "not_attempted"},
                 "result_review": {},
                 "ambiguity": None,
+                "provenance": {},
             }
         )
 
@@ -482,6 +484,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 "persistence": {"status": "not_attempted"},
                 "result_review": {},
                 "ambiguity": None,
+                "provenance": {},
             }
         )
 
@@ -638,6 +641,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         outputs = dict(raw_outputs) if isinstance(raw_outputs, dict) else {}
         outputs.pop("early_stop_semantic_evidence", None)
         outputs.pop("early_stop_stagnation_evidence", None)
+        outputs.pop("clarification_needed", None)
         canonical["outputs"] = outputs
 
         runtime = self._exact_typed_runtime(context)
@@ -647,6 +651,10 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         from .text_to_sql_early_stop_evidence import (
             build_text_to_sql_early_stop_evidence,
             build_text_to_sql_stagnation_evidence,
+        )
+        from .text_to_sql_clarifying_question import (
+            build_text_to_sql_clarifying_question,
+            clarifying_questions_enabled,
         )
 
         evidence = build_text_to_sql_early_stop_evidence(
@@ -664,6 +672,15 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         )
         if stagnation_evidence is not None:
             outputs["early_stop_stagnation_evidence"] = stagnation_evidence
+        if clarifying_questions_enabled():
+            clarification = build_text_to_sql_clarifying_question(
+                research_outcome=runtime.verified_research_outcome,
+                solver_state=runtime.verified_solver_state,
+                terminal_status=outcome.status.value,
+                terminal_reason_code=outcome.reason_code,
+            )
+            if clarification is not None:
+                outputs["clarification_needed"] = clarification
         return canonical
 
     def _coerce_bool(self, value: Any, default: bool = False) -> bool:
@@ -1450,6 +1467,9 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 request["dry_run_only"],
                 context.session_id,
                 runtime.run_id,
+                namespace_version_key=self._namespace_version_key_from_state(
+                    runtime.verified_research_state
+                ),
                 verified_execution=prepared.verified_execution,
             )
             if finalized.error is not None:
@@ -1469,8 +1489,25 @@ class EnhancedWorkflowEngine(WorkflowEngine):
         reservation = prepared.reservation
         if reservation is None:
             raise RuntimeError("adaptive finalizer reservation is missing")
+        # W2-2.3: this is the ordinary (non-fallback) success path — it runs the
+        # finalizer tool through the generic tool-call machinery below, keyed off
+        # ``step.tool_params`` rather than ``request`` above. ``request``'s key
+        # set is pinned by ``_validate_finalizer_request`` and by the checkpoint
+        # store's persisted ``request_digest`` (durable resume), so it must not
+        # gain new keys. The namespace key is threaded in on a shallow step copy
+        # instead, mirroring how the fallback branch above passes it as a keyword
+        # argument outside ``request``.
+        import copy
+
+        finalizer_step = copy.copy(step)
+        finalizer_step.tool_params = dict(step.tool_params)
+        finalizer_step.tool_params["namespace_version_key"] = (
+            self._namespace_version_key_from_state(runtime.verified_research_state)
+        )
         try:
-            result = await self._execute_on_db_audit_tool_once(step, context, task)
+            result = await self._execute_on_db_audit_tool_once(
+                finalizer_step, context, task
+            )
         except (asyncio.CancelledError, WorkflowDeadlineExceeded) as control:
             checkpoint, later_cancellation = await self._settle_adaptive_finalizer(
                 runtime,
@@ -1516,6 +1553,20 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     task,
                 )
         return apply_finalizer_checkpoint(runtime, reconciliation.value)
+
+    @staticmethod
+    def _namespace_version_key_from_state(state: object) -> str:
+        """Extract the opaque ``successful_sql`` memory key from research state.
+
+        ``ResearchState.schema_namespace_version`` is a ``Digest``-typed string
+        of the form ``"<algorithm>:<hex>"`` (e.g. ``"sha256:<64 hex chars>"``,
+        see ``TextToSqlTypedRuntime`` construction and
+        ``SchemaNamespace.version_key`` in
+        ``custom_tools/text_to_sql/schema_namespace.py``). Only the digest
+        portion after the single colon matches the ``successful_sql_memory``
+        namespace-key format (``^[0-9a-f]{64}$``), so it is split off here.
+        """
+        return state.schema_namespace_version.split(":", 1)[-1]
 
     @staticmethod
     def _open_result_contradiction_checkpoint(runtime):

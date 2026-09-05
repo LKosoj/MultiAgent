@@ -19,6 +19,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     SolverActionKind,
     SolverState,
     SolverStopReason,
+    is_binding_free_semantic_item,
 )
 from custom_tools.text_to_sql.adaptive.ambiguity import AmbiguityReport
 from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
@@ -106,7 +107,11 @@ def _research_outcome(
         bindings=(),
         join_candidates=(),
         unresolved_items=tuple(
-            item.source_id for item in query_spec.semantic_items if item.required
+            sorted(
+                item.source_id
+                for item in query_spec.semantic_items
+                if item.required and not is_binding_free_semantic_item(item, ())
+            )
         ),
         action_history=(),
         budget_state=_budget_state(),

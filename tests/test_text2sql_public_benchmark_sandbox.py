@@ -1119,7 +1119,15 @@ def test_case_runner_final_verification_happens_after_receipt_before_spawn(
     )
 
     def tamper_after_receipt() -> None:
-        (snapshot.root / "backend" / "app.py").write_text("APP = 2\n", encoding="utf-8")
+        # The snapshot seals files to 0o444, so unlock/reseal around the
+        # tamper write — otherwise even the owning user can't write the
+        # "changed" content, and leaving it unlocked would let the
+        # permission check fire first and mask the content-mismatch
+        # rejection this test is actually about.
+        app_py = snapshot.root / "backend" / "app.py"
+        app_py.chmod(0o644)
+        app_py.write_text("APP = 2\n", encoding="utf-8")
+        app_py.chmod(0o444)
 
     with pytest.raises(SandboxError, match="frozen manifest"):
         runner.run(

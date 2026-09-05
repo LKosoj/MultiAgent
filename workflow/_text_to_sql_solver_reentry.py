@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
+import logging
 import time
 
 from custom_tools.text_to_sql.adaptive.data_probes import DataProbeRuntime
@@ -24,6 +25,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchState,
     SemanticItemKind,
 )
+from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
 from custom_tools.text_to_sql.adaptive.probes import (
     ProbeResult,
     ProbeStatus,
@@ -66,6 +68,7 @@ from custom_tools.text_to_sql.adaptive.tool_registry import (
     AdaptiveResearchToolContext,
     AdaptiveResearchToolRegistry,
 )
+from custom_tools.text_to_sql.llm_models_config import step_model_name
 from workflow.deadline import execute_step_attempt
 
 from .adaptive_budget_ledger import EXECUTION_CLAIM_LEASE_NS
@@ -449,7 +452,10 @@ async def _continue_production_research(
         # route so ResearchStopReview (a flat model without $defs) does not get
         # forced through the ResearchDecisionV1-shaped response_format.
         stop_review_model=_research_stop_review_model(
-            profile.model, limits.output_tokens_per_call, state.run_id
+            step_model_name("research_stop_review"),
+            limits.output_tokens_per_call,
+            state.run_id,
+            input_tokens=limits.input_tokens_per_call,
         ),
     )
     result = await run_research_loop(**assembly.loop_arguments())
@@ -597,13 +603,71 @@ def _semantic_repair_bindings(
     return updated
 
 
+logger = logging.getLogger(__name__)
+
+
+# Mirrors the two targeted-research call_id prefixes minted by
+# research_loop._model_call_id / _research_stop_review_call_id
+# (custom_tools/text_to_sql/adaptive/research_loop.py); that module's own
+# `_MODEL_CALL_ID` regex is private, so this is a literal copy rather than an
+# import. Ledger records outside these prefixes (e.g. the adaptive solver's
+# own "solver-generate-*" model calls) are not targeted-research reservations
+# and must not be mistaken for the one this function settles.
+_TARGETED_RESEARCH_MODEL_CALL_PREFIXES = ("research-model-", "research-stop-review-")
+
+
+async def _unknown_usage_replay(_reservation: object) -> ModelTokenUsage:
+    """Shared ``execute`` callback for both settle functions below.
+
+    ``record_model_reservation``, ``claim_model_execution`` and
+    ``record_model_started`` (``workflow/adaptive_budget_ledger.py``) are
+    three separate durable sqlite transactions, so a killed process can leave
+    a *durably reserved* model call in either of two states: RESERVED with no
+    STARTED at all, or STARTED with no RESULT. Both settle functions replay
+    the exact stored reservation through ``execute_model_call_with_budget_async``
+    with a ``claim_now_ns`` pushed past ``EXECUTION_CLAIM_LEASE_NS`` so the
+    stale claim is reclaimed immediately instead of waiting out the real 4h
+    lease, and this callback is what that replay executes:
+
+    - STARTED-without-RESULT: ``_claim_model_execution_step``
+      (``_policy_model_budget.py``) finds the existing ``started`` record and
+      settles it internally via ``_settle_model_result`` *before* returning
+      control to ``execute_model_call_with_budget_async`` -- this callback is
+      never awaited in that case.
+    - RESERVED-without-STARTED: there is no existing ``started`` record for
+      ``_claim_model_execution_step`` to settle internally, so it mints a
+      brand-new one under the resumed incarnation's claim and returns
+      ``_ModelExecutionReady``; ``execute_model_call_with_budget_async`` then
+      awaits this callback to obtain a usage to settle *that* record with.
+
+    Either way the model provider must not actually run for a call this is
+    only replaying to unblock the ledger, so this always reports "unknown"
+    usage rather than a real response. ``model_charge``
+    (``custom_tools/text_to_sql/adaptive/model_budget.py``) treats
+    ``ModelTokenUsage(None, None)`` as consuming the reservation's maxima --
+    the same conservative charge ``_settle_model_failure`` already uses for a
+    real execution failure.
+    """
+
+    return ModelTokenUsage(input_tokens=None, output_tokens=None)
+
+
 async def settle_incomplete_reentry_model_call(
     runtime: object,
     solver_state: object,
     research_state: ResearchState,
     requirements: object,
 ) -> ResearchState:
-    """Conservatively close only the exact STARTED targeted model call."""
+    """Conservatively close only the exact outstanding targeted model call.
+
+    ``record_model_reservation``, ``claim_model_execution`` and
+    ``record_model_started`` (``workflow/adaptive_budget_ledger.py``) are three
+    separate durable sqlite transactions, so a process kill can leave an
+    outstanding reservation in either of two crash windows: RESERVED with no
+    STARTED at all, or STARTED with no RESULT. Both are handled the same way
+    below -- see the ``_unknown_usage_replay`` callback's docstring for why
+    one execute() call safely covers both.
+    """
 
     ledger = getattr(runtime, "budget_ledger", None)
     policy = getattr(runtime, "verified_research_policy", None)
@@ -620,10 +684,15 @@ async def settle_incomplete_reentry_model_call(
         research_state.run_id,
         research_state.run_incarnation,
     )
-    outstanding = tuple(record for record in records if record.reconciliation is None)
+    outstanding = tuple(
+        record
+        for record in records
+        if record.reconciliation is None
+        and record.reservation.call_id.startswith(_TARGETED_RESEARCH_MODEL_CALL_PREFIXES)
+    )
     if not outstanding:
         return _state_with_reconciled_model_budget(research_state, ledger, policy)
-    if len(outstanding) != 1 or outstanding[0].started is None:
+    if len(outstanding) != 1:
         return research_state
 
     record = outstanding[0]
@@ -668,21 +737,121 @@ async def settle_incomplete_reentry_model_call(
         reservation.maximum_output_tokens,
     )
     if actual != expected:
+        if (
+            actual[0] == expected[0]
+            and actual[1] == expected[1]
+            and actual[2] != expected[2]
+        ):
+            # Same call_id and same request content, but the schema-research
+            # step's model identity on record differs from what the current
+            # schema_research agent profile / llm_models.yaml resolves to now.
+            # This is the "model policy changed between incarnations" case
+            # (see reserve_model_call_budget in _policy_model_budget.py): the
+            # outstanding STARTED reservation was made under the old model, so
+            # it can never be conservatively settled under the new one.
+            # Falling through to `return research_state` unchanged is still
+            # correct (this function must stay conservative), but that used
+            # to be silent — log it so an operator resuming a run after
+            # editing model config gets a diagnosable trail instead of an
+            # unexplained stall.
+            logger.warning(
+                "model policy changed between incarnations: reentry model "
+                "call_id=%s cannot be settled: model_identity on record %s "
+                "!= currently resolved %s; resume is impossible for this "
+                "outstanding call, start a new run",
+                actual[0],
+                actual[2],
+                expected[2],
+            )
+        else:
+            logger.warning(
+                "outstanding reentry model call_id=%s does not match the "
+                "expected replay (call_id/request/model/limits); leaving it "
+                "unsettled",
+                actual[0],
+            )
         return research_state
-
-    async def forbid_provider(_reservation):
-        raise RuntimeError("STARTED replay must not invoke the model provider")
 
     await execute_model_call_with_budget_async(
         research_state.run_id,
         research_state.run_incarnation,
         *expected,
-        forbid_provider,
+        _unknown_usage_replay,
         config=policy,
         ledger=ledger,
         claim_now_ns=lambda: time.time_ns() + EXECUTION_CLAIM_LEASE_NS + 1,
     )
     return _state_with_reconciled_model_budget(research_state, ledger, policy)
+
+
+# The adaptive solver's own model calls (workflow/text_to_sql_adaptive_solver.py
+# `propose()`) mint call_ids as f"solver-generate-{revision}-{attempt}". That
+# format is private to this module's caller, so this is a literal copy of the
+# prefix, not an import -- same reasoning as
+# _TARGETED_RESEARCH_MODEL_CALL_PREFIXES above.
+_SOLVER_GENERATE_MODEL_CALL_PREFIX = "solver-generate-"
+
+
+async def settle_incomplete_solver_model_call(runtime: object) -> None:
+    """Force-close a stale outstanding ``solver-generate-*`` call.
+
+    Symmetric to ``settle_incomplete_reentry_model_call`` above, but for the
+    solver's own model calls instead of the research sub-loop's. A process can
+    be killed in either of two durable-write windows for one
+    "solver-generate-{revision}-{attempt}" ledger record: RESERVED with no
+    STARTED at all, or STARTED with no RESULT (``record_model_reservation``,
+    ``claim_model_execution`` and ``record_model_started`` in
+    ``workflow/adaptive_budget_ledger.py`` are three separate sqlite
+    transactions). Either way, that record is the *sole* outstanding
+    reservation the shared per-run model-budget ledger will ever allow at a
+    time (``_model_budget_chain`` in ``_policy_model_budget.py`` enforces
+    "only one model reservation may be outstanding"). Every later reservation
+    attempt -- including the very next solver-generate-* attempt on resume --
+    is then durably blocked by ``BudgetConflictError`` until this exact record
+    is settled; ``_next_solver_model_attempt``'s plain count of ledger records
+    for this revision never advances past it on its own.
+
+    A plain retry that reused this same call_id would still have to wait out
+    the real ``EXECUTION_CLAIM_LEASE_NS`` (4h) lease inside
+    ``claim_model_execution`` (``_adaptive_budget_ledger_common.py``) before a
+    new owner is allowed to reclaim it. Passing a ``claim_now_ns`` pushed past
+    the lease -- exactly as ``settle_incomplete_reentry_model_call`` does for
+    the research prefixes -- makes the reclaim immediate: the outstanding
+    record is settled with unknown (maximum-charged) usage instead of a real
+    model response (see ``_unknown_usage_replay``'s docstring for why one
+    callback safely covers both crash windows).
+    """
+
+    ledger = getattr(runtime, "budget_ledger", None)
+    policy = getattr(runtime, "verified_research_policy", None)
+    if ledger is None or policy is None:
+        return
+    records = ledger.load_model_records(runtime.run_id, runtime.run_incarnation)
+    outstanding = tuple(
+        record
+        for record in records
+        if record.reconciliation is None
+        and record.reservation.call_id.startswith(
+            _SOLVER_GENERATE_MODEL_CALL_PREFIX
+        )
+    )
+    if len(outstanding) != 1:
+        return
+
+    reservation = outstanding[0].reservation
+    await execute_model_call_with_budget_async(
+        reservation.run_id,
+        reservation.run_incarnation,
+        reservation.call_id,
+        reservation.request_digest,
+        reservation.model_identity,
+        reservation.maximum_input_tokens,
+        reservation.maximum_output_tokens,
+        _unknown_usage_replay,
+        config=policy,
+        ledger=ledger,
+        claim_now_ns=lambda: time.time_ns() + EXECUTION_CLAIM_LEASE_NS + 1,
+    )
 
 
 def _registry(runtime, table_namespace, budget_factory):
@@ -712,4 +881,5 @@ def _registry(runtime, table_namespace, budget_factory):
 __all__ = (
     "build_production_reentry_boundary",
     "settle_incomplete_reentry_model_call",
+    "settle_incomplete_solver_model_call",
 )

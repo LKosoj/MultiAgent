@@ -205,9 +205,12 @@ def _terminal_payload(execution, **overrides):
         "columns": [],
         "rows_affected": 0,
         "error": "execution failed",
+        "ambiguity": None,
         "execution": execution,
         "audit": {"status": "logged", "log_id": "audit-1"},
         "persistence": {"status": "not_attempted"},
+        "result_review": {},
+        "provenance": {},
     }
     payload.update(overrides)
     return payload

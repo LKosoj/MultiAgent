@@ -348,7 +348,6 @@ def _resolve_profile_name(profile: str | None) -> str:
         profile,
         env_var=_ENV_PROFILE,
         default=_DEFAULT_PROFILE,
-        umbrella_map={"muni_ru": _DEFAULT_PROFILE},
     )
 
 

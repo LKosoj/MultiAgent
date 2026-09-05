@@ -790,6 +790,12 @@ def _resolve_table(
     return matches[0], table_body
 
 
+# Public alias so other modules (e.g. the code<->label cascade hint in
+# `code_label_cascade.py`) can resolve a `TableRef` to its schema dict key
+# without duplicating this matching logic themselves.
+resolve_schema_table_key = _resolve_table
+
+
 def _resolve_column(
     target: ColumnRef,
     schema: Mapping[str, object],

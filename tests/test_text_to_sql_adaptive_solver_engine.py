@@ -194,6 +194,133 @@ def test_finalizer_is_reserved_once_and_terminal_replay_does_not_call_it(
     assert store.load(state.run_id, state.run_incarnation).terminal is not None
 
 
+def test_finalizer_ordinary_success_path_threads_namespace_version_key(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """W2-2.3 gap fix: the *ordinary* (non-fallback) success path — reservation
+    followed by ``_execute_on_db_audit_tool_once`` — must also thread the run's
+    schema namespace version key into the ``finalize_text_to_sql_run`` tool
+    call. Previously only the semantic-repair fallback branch
+    (``prepared.verified_execution``) passed it, so ``successful_sql`` memory
+    was never populated on normal runs.
+    """
+    import tool_manager
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime, state, _store = _finalizer_runtime(tmp_path)
+    step = _finalizer_step(state)
+    original_tool_params = dict(step.tool_params)
+    step.tool_params.update(
+        {
+            "user_query": runtime.query,
+            "dsn": runtime.dsn,
+            "run_id": runtime.run_id,
+        }
+    )
+    captured: dict = {}
+
+    def fake_finalize_text_to_sql_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return _successful_terminal(state)
+
+    class DirectToolManager:
+        @staticmethod
+        def run_tool(*, tool_function, session_id, **kwargs):
+            kwargs.pop("tool_name")
+            kwargs.pop("task_description")
+            kwargs.pop("workflow_run_id")
+            return tool_function(session_id=session_id, **kwargs)
+
+    engine.factory = SimpleNamespace(
+        _create_tool=lambda _name: core.finalize_text_to_sql_run
+    )
+    engine.resource_manager = SimpleNamespace(record_api_call=lambda _run_id: None)
+    monkeypatch.setattr(tool_manager, "get_tool_manager", lambda: DirectToolManager())
+    monkeypatch.setattr(core, "finalize_text_to_sql_run", fake_finalize_text_to_sql_run)
+
+    result = asyncio.run(
+        engine._execute_reserved_text_to_sql_finalizer(
+            step, _context(runtime), "finalize"
+        )
+    )
+
+    expected_key = runtime.verified_research_state.schema_namespace_version.split(
+        ":", 1
+    )[-1]
+    assert expected_key == runtime.loaded_schema.namespace.version_key
+    assert captured["namespace_version_key"] == expected_key
+    assert result["status"] == "succeeded"
+    # The reservation/CAS ``request`` dict (built by ``_adaptive_finalizer_request``)
+    # keeps its pinned 4-key shape after the call — namespace_version_key must
+    # not leak into ``step.tool_params`` on the original step object, since a
+    # replay/retry re-reads it from there and an extra key would change the
+    # persisted ``request_digest`` used for durable resume.
+    assert dict(step.tool_params) == {
+        **original_tool_params,
+        "user_query": runtime.query,
+        "dsn": runtime.dsn,
+        "run_id": runtime.run_id,
+    }
+
+
+def test_finalizer_ordinary_success_path_still_threads_key_when_memory_disabled(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """Even in the canonical public-benchmark environment (memory writes
+    disabled), the engine must still thread a valid namespace key through —
+    ``successful_sql_memory``/``_audit.save_successful_sql`` own the
+    ``TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED`` gate and no-op the write
+    themselves. The engine has no business re-checking that flag; duplicating
+    the gate at this layer would just create a second place to get it wrong.
+    """
+    import tool_manager
+
+    monkeypatch.setenv("TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED", "0")
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime, state, _store = _finalizer_runtime(tmp_path)
+    step = _finalizer_step(state)
+    step.tool_params.update(
+        {
+            "user_query": runtime.query,
+            "dsn": runtime.dsn,
+            "run_id": runtime.run_id,
+        }
+    )
+    captured: dict = {}
+
+    def fake_finalize_text_to_sql_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return _successful_terminal(state)
+
+    class DirectToolManager:
+        @staticmethod
+        def run_tool(*, tool_function, session_id, **kwargs):
+            kwargs.pop("tool_name")
+            kwargs.pop("task_description")
+            kwargs.pop("workflow_run_id")
+            return tool_function(session_id=session_id, **kwargs)
+
+    engine.factory = SimpleNamespace(
+        _create_tool=lambda _name: core.finalize_text_to_sql_run
+    )
+    engine.resource_manager = SimpleNamespace(record_api_call=lambda _run_id: None)
+    monkeypatch.setattr(tool_manager, "get_tool_manager", lambda: DirectToolManager())
+    monkeypatch.setattr(core, "finalize_text_to_sql_run", fake_finalize_text_to_sql_run)
+
+    asyncio.run(
+        engine._execute_reserved_text_to_sql_finalizer(
+            step, _context(runtime), "finalize"
+        )
+    )
+
+    expected_key = runtime.verified_research_state.schema_namespace_version.split(
+        ":", 1
+    )[-1]
+    assert captured["namespace_version_key"] == expected_key
+
+
 @pytest.mark.parametrize("mismatch", ("sql_query", "candidate_id"))
 def test_reserved_finalizer_rejects_unverified_candidate_before_db_audit(
     monkeypatch,
@@ -377,13 +504,15 @@ def test_verified_semantic_repair_execution_is_durable_and_never_reexecutes(
         raise AssertionError("verified fallback must not use the db_audit tool")
 
     side_effects = {"audit": 0, "persistence": 0}
+    persistence_calls = []
 
     def audit_logger(_entry):
         side_effects["audit"] += 1
         return {"status": "logged", "log_id": "audit"}
 
-    def save_successful_sql(**_kwargs):
+    def save_successful_sql(**kwargs):
         side_effects["persistence"] += 1
+        persistence_calls.append(kwargs)
         return {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}
 
     monkeypatch.setattr(core, "secure_db_executor", forbidden_executor)
@@ -434,6 +563,13 @@ def test_verified_semantic_repair_execution_is_durable_and_never_reexecutes(
     assert result["status"] == "succeeded"
     assert replay == result
     assert side_effects == {"audit": 1, "persistence": 1}
+    # W2-2.3: the finalizer must thread the run's own schema namespace
+    # version (hex-only, "sha256:" prefix stripped) through to the
+    # successful-SQL memory write, not merely call it.
+    assert len(persistence_calls) == 1
+    assert persistence_calls[0]["namespace_version_key"] == (
+        research.schema_namespace_version.split(":", 1)[-1]
+    )
 
 
 def test_semantic_repair_fallback_cancellation_settles_before_terminal(
@@ -505,8 +641,11 @@ def test_semantic_repair_fallback_cancellation_settles_before_terminal(
         side_effects["audit"] += 1
         return {"status": "logged", "log_id": "audit"}
 
-    def save_successful_sql(**_kwargs):
+    persistence_calls = []
+
+    def save_successful_sql(**kwargs):
         side_effects["persistence"] += 1
+        persistence_calls.append(kwargs)
         return {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}
 
     def forbidden_executor(*_args, **_kwargs):
@@ -542,6 +681,12 @@ def test_semantic_repair_fallback_cancellation_settles_before_terminal(
     )
     assert replay["status"] == "succeeded"
     assert side_effects == {"audit": 1, "persistence": 1}
+    # W2-2.3: same namespace-version-key propagation as the non-cancellation
+    # variant above, exercised through the cancel-during-audit path instead.
+    assert len(persistence_calls) == 1
+    assert persistence_calls[0]["namespace_version_key"] == (
+        research.schema_namespace_version.split(":", 1)[-1]
+    )
 
 
 @pytest.mark.parametrize(

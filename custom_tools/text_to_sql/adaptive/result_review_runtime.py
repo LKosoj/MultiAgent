@@ -10,6 +10,7 @@ from custom_tools.text_to_sql.schema_loader import LoadedSchema
 from custom_tools.text_to_sql.schema_metadata import get_foreign_key_constraints
 from custom_tools.text_to_sql.validators import SchemaLimiter
 
+from .model_budget import APPROXIMATE_BYTES_PER_TOKEN
 from .result_review import (
     RESULT_REVIEW_RUNTIME_KEY,
     _ModelReviewResponse,
@@ -73,6 +74,8 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
     try:
         from agent_command import create_text_to_sql_model
         from utils import call_openai_api
+
+        from ..llm_models_config import step_model_name
         from workflow._text_to_sql_document_authority import (
             solver_document_freshness_reference,
         )
@@ -173,13 +176,13 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
         }
 
         def review(prompt: str) -> str:
-            if len(prompt.encode("utf-8")) > input_tokens * 4:
+            if len(prompt.encode("utf-8")) > input_tokens * APPROXIMATE_BYTES_PER_TOKEN:
                 raise ValueError("result review context exceeds configured model input")
             timeout_seconds = deadline.require_remaining(
                 "text_to_sql_result_review_call"
             )
             provider = create_text_to_sql_model(
-                "model_hard",
+                step_model_name("result_review"),
                 max_tokens=output_tokens,
                 temperature=0.3,
                 timeout_seconds=timeout_seconds,
@@ -193,7 +196,38 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
                     model=provider,
                     max_tokens=output_tokens,
                     temperature=0.3,
-                    max_retries=0,
+                    # W5: allow exactly one retry so a transient empty model
+                    # response does not immediately fail the review (this
+                    # step is not on the durable model-budget ledger, so
+                    # call_openai_api's own built-in retry-on-empty-response
+                    # is the only place to add it, unlike the schema-research/
+                    # SQL-solver wrappers, which share
+                    # custom_tools/text_to_sql/adaptive/_empty_response_retry.py
+                    # ::retry_once_on_empty_response because *they* run inside
+                    # an outstanding ledger reservation). A persistently empty
+                    # response after the retry still ends the same way it
+                    # did before this change: call_openai_api logs and
+                    # returns "" rather than raising (see its final
+                    # `return ""`), which downstream JSON parsing of review()
+                    # already treats as a malformed/failed review.
+                    #
+                    # Side effect accepted knowingly: call_openai_api's own
+                    # loop has two independent retry triggers: an empty
+                    # response is retried directly (utils.py, the
+                    # `if not response_text` branch) without any keyword
+                    # check, and a raised provider exception is retried
+                    # whenever its message contains one of a fixed set of
+                    # keywords (utils.py, ~lines 911-932),
+                    # including "400"/"bad request" alongside genuinely
+                    # transient ones ("timeout", "connection", "5xx", ...).
+                    # Raising max_retries from 0 to 1 therefore also grants
+                    # one retry to a persistent 4xx client error here (e.g. a
+                    # malformed request body), which cannot succeed on retry
+                    # -- it just wastes one extra provider call before
+                    # falling through to the same "" result. Narrowing that
+                    # keyword list to exclude 4xx would require editing
+                    # utils.py itself, which is out of scope for this change.
+                    max_retries=1,
                     response_format=response_format,
                 )
             deadline.require_remaining("text_to_sql_result_review_response")

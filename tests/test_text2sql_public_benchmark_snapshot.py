@@ -166,8 +166,16 @@ def test_snapshot_rejects_tampered_symlink(tmp_path: Path) -> None:
         tmp_path / "snapshot",
         allowed_paths=(Path("backend"),),
     )
-    link = snapshot.root / "backend" / "linked.py"
+    backend_dir = snapshot.root / "backend"
+    link = backend_dir / "linked.py"
+    # `create_source_snapshot` seals every directory to 0o555 (no write bit),
+    # so the owning user (not just other users) cannot add entries either.
+    # Temporarily unlock the directory to plant the tamper, then reseal it so
+    # the assertion below exercises the symlink rejection itself rather than
+    # an incidental "backend dir mode changed" permission mismatch.
+    backend_dir.chmod(0o755)
     link.symlink_to("../outside.py")
+    backend_dir.chmod(0o555)
     spec = BwrapSandboxSpec(
         snapshot_root=snapshot.root,
         venv_root=tmp_path / "venv",
@@ -192,13 +200,27 @@ def test_snapshot_verification_rejects_changed_content(tmp_path: Path) -> None:
         tmp_path / "snapshot",
         allowed_paths=(Path("backend"),),
     )
-    (snapshot.root / "backend" / "app.py").write_text("APP = 2\n", encoding="utf-8")
+    # `create_source_snapshot` seals files to 0o444 and directories to 0o555,
+    # so the tamper below must unlock/reseal around each write — otherwise the
+    # owning user can't even write the "changed" content, and if the mode
+    # were left unlocked the permission check would fire first and mask the
+    # content-mismatch rejection this test is actually about.
+    app_py = snapshot.root / "backend" / "app.py"
+    app_py.chmod(0o644)
+    app_py.write_text("APP = 2\n", encoding="utf-8")
+    app_py.chmod(0o444)
 
     with pytest.raises(SandboxError, match="frozen manifest"):
         verify_source_snapshot(snapshot)
 
-    (snapshot.root / "backend" / "app.py").write_text("APP = 1\n", encoding="utf-8")
-    (snapshot.root / "unexpected-empty-directory").mkdir()
+    app_py.chmod(0o644)
+    app_py.write_text("APP = 1\n", encoding="utf-8")
+    app_py.chmod(0o444)
+    snapshot.root.chmod(0o755)
+    unexpected_directory = snapshot.root / "unexpected-empty-directory"
+    unexpected_directory.mkdir()
+    unexpected_directory.chmod(0o555)
+    snapshot.root.chmod(0o555)
     with pytest.raises(SandboxError, match="frozen manifest"):
         verify_source_snapshot(snapshot)
 

@@ -135,14 +135,96 @@ def _raw_pyodbc_dsn() -> str:
     return f"mssql+pyodbc:///?odbc_connect={odbc_connect}&driver=ODBC+Driver+17"
 
 
-def test_nlu_fails_fast_without_llm_unless_fallback_opted_in(monkeypatch):
+def test_nlu_fails_fast_without_llm_unless_fallback_opted_in(tmp_path, monkeypatch):
     from custom_tools.text_to_sql import nlu, nlu_config
 
-    # W3-T1: default NLU-профиль теперь нейтральный (RU-морфемы переехали
-    # в profiles.muni_ru). Контракт ALLOW_FALLBACKS=1 проверяем на
-    # активном muni_ru-профиле — для пользовательского РФ-датасета это
-    # рабочий конфиг.
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    # W3-T1: default NLU-профиль нейтральный (RU-морфемы в этом yaml больше
+    # не хранятся — доменные подсказки задаются в DSN-профиле). Контракт
+    # ALLOW_FALLBACKS=1 проверяем на самодостаточной тестовой фикстуре с
+    # полным RU-набором морфем (flat legacy layout — без profiles, поэтому
+    # активный именованный профиль тут ни при чём, это регрессионный
+    # safety-net самой heuristic-эвристики).
+    custom_yaml = tmp_path / "nlu_morphemes.yaml"
+    custom_yaml.write_text(
+        r"""
+version: 1
+language: ru
+enabled: true
+
+intents:
+  - canonical: revenue
+    morphemes: ["выруч", "revenue", "amount", "сумм", "доход", "прибыл"]
+  - canonical: count
+    morphemes: ["количеств", "count", "число", "сколько", "штук", "единиц"]
+  - canonical: average
+    morphemes: ["средн", "average", "avg"]
+
+dimensions:
+  - canonical: date
+    morphemes: ["дат", "date", "период", "время", "месяц", "год", "день"]
+  - canonical: region
+    morphemes: ["регион", "region", "страна", "город", "облас", "край"]
+  - canonical: product
+    morphemes: ["продук", "product", "товар", "категор"]
+  - canonical: customer
+    morphemes: ["клиент", "customer", "покупател", "заказчик"]
+
+relative_date:
+  triggers: ["последни", "за послед", "last"]
+  periods:
+    - canonical: month
+      morphemes: ["месяц", "month"]
+    - canonical: week
+      morphemes: ["неделя", "week", "недели", "неделю", "недель"]
+    - canonical: year
+      morphemes: ["год", "year"]
+    - canonical: day
+      morphemes: ["день", "дней", "дня", "day"]
+  days_pattern: '(\d+)\s*(?:месяц|недел|год|дн|день|дней|дня|week|month|year|day)'
+
+patterns:
+  date_iso:
+    - '(20\d{2}-\d{2}-\d{2})'
+  region:
+    - 'регион(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+    - 'в\s+([a-zA-Zа-яА-Я]+(?:ской|ском|кой|ком)?\s*(?:област|регион|край))'
+    - 'город(?:е|а)?\s+([a-zA-Zа-яА-Я\-]+)'
+  amount_greater:
+    - '(?:больше|более|>)\s*(\d+(?:\.\d+)?)'
+  amount_less:
+    - '(?:меньше|менее|<)\s*(\d+(?:\.\d+)?)'
+  amount_between:
+    - 'между\s*(\d+(?:\.\d+)?)\s*и\s*(\d+(?:\.\d+)?)'
+  top_n:
+    - '(?:топ|top)\s*(\d+)'
+    - 'первы[еих]\s*(\d+)'
+    - 'лучши[еих]\s*(\d+)'
+    - '(?:показать|вывести)\s*(\d+)'
+
+regions:
+  normalize: {}
+
+order:
+  triggers: ["по убыван", "по возраст", "desc", "asc"]
+  desc_triggers: ["по убыван", "desc"]
+
+intent_rules:
+  - canonical: aggregate
+    morphemes: ["агрегир", "сумм", "итог", "всего"]
+  - canonical: aggregate_over_time
+    morphemes: ["по времени", "по месяц", "по дат", "динамик"]
+  - canonical: compare
+    morphemes: ["сравни", "compare", "против", "vs"]
+
+default_intent: query
+top_n_intent: top_n
+
+tokenizer:
+  adpositions: ["по", "за", "между", "в", "для", "от", "до"]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", str(custom_yaml))
     nlu_config.reset_cache()
 
     processor = NLUProcessor()
@@ -173,17 +255,43 @@ def test_nlu_invalid_llm_response_does_not_fallback_without_opt_in(monkeypatch):
         processor.extract_intent("сколько заказов")
 
 
-def test_schema_linking_wrapper_input_is_explicitly_normalized(monkeypatch):
-    monkeypatch.setenv("DB_DSN", "sqlite:///tmp/test.db")
+def test_schema_linking_wrapper_input_is_explicitly_normalized(tmp_path, monkeypatch):
+    dsn = "sqlite:///tmp/test.db"
+    monkeypatch.setenv("DB_DSN", dsn)
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "0")
     monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "1")
-    # После T4.2 «revenue → amount» не является дефолтной эвристикой:
-    # для этого нужен явный профиль доменных алиасов (или LLM-обогащённое
-    # description колонки). Включаем muni_ru — это регрессионный safety-net
-    # для пользовательского датасета.
-    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PROFILE", "muni_ru")
+    # После T4.2 «revenue → amount» не является дефолтной эвристикой: для
+    # этого нужен явный профиль доменных алиасов (или LLM-обогащённое
+    # description колонки). Домен больше не хранится в этом yaml (он
+    # переехал в DSN-профиль), поэтому пишем самодостаточную тестовую
+    # фикстуру — регрессионный safety-net для алиас-логики best_column_for.
+    custom_yaml = tmp_path / "column_aliases.yaml"
+    custom_yaml.write_text(
+        """
+version: 2
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+profiles:
+  default:
+    aliases: {}
+  alt:
+    aliases:
+      revenue: [revenue, amount, total]
+      region: [region, region_name, region_id]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PATH", str(custom_yaml))
+    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PROFILE", "alt")
     from custom_tools.text_to_sql import column_aliases_config
     column_aliases_config.reset_cache()
+    # Schema-linking RAG-кэш не учитывает TEXT_TO_SQL_COLUMN_ALIASES_PATH
+    # в своём ключе (только имя профиля) — чистим кэш для этого DSN, чтобы
+    # тест не зависел от результатов чужих прогонов с тем же DSN/профилем.
+    from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
+    purge_schema_linking_rag_cache(session_id=dsn_to_sanitized_name(dsn))
 
     wrapper = {
         "intent": "aggregation",
@@ -774,8 +882,9 @@ def test_schema_linking_core_passes_explicit_dsn_to_llm_prompt(monkeypatch):
     captured = {}
     dsn = "postgresql://runtime_user:runtime_pass@db.example.com/runtime_db"
 
-    def build_prompt(entities, schema_str, profile=None, dsn=None):
+    def build_prompt(entities, schema_str, profile=None, dsn=None, schema_fingerprint=None):
         captured["prompt_dsn"] = dsn
+        captured["prompt_schema_fingerprint"] = schema_fingerprint
         return "prompt"
 
     def llm_caller(**kwargs):
@@ -809,6 +918,10 @@ def test_schema_linking_core_passes_explicit_dsn_to_llm_prompt(monkeypatch):
     )
 
     assert captured["prompt_dsn"] == dsn
+    # Без namespace (не передан в perform_linking) schema_fingerprint
+    # обязан быть None — llm_linking выводит его из namespace.schema_fingerprint,
+    # а не из dsn.
+    assert captured["prompt_schema_fingerprint"] is None
     assert memory.dsn == dsn
     assert result["linked_entities"]["metrics"][0]["table"] == "orders"
 

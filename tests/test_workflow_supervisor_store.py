@@ -104,6 +104,9 @@ def _terminal_payload(
                 "status": "error",
                 "error": "worker failed",
             },
+            "ambiguity": None,
+            "result_review": {},
+            "provenance": {},
         }
     ).to_mapping()
     return {
@@ -1085,6 +1088,9 @@ def test_every_terminal_store_path_clears_private_spec(
                         "status": "error",
                         "error": "worker failed",
                     },
+                    "ambiguity": None,
+                    "result_review": {},
+                    "provenance": {},
                 }
             ).to_mapping()
             payload = {

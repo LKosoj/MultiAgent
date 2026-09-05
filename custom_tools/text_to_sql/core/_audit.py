@@ -383,10 +383,18 @@ def save_successful_sql(
             from ..successful_sql_memory import save_successful_sql_example
             from memory.index_consistency import SemanticIndexStatus
 
+            # БЛОКЕР 2.3: маскируем PII/DSN до передачи в semantic-память —
+            # иначе сырой NL-запрос и SQL дословно попадают в solver_context
+            # последующих запусков. dedup id (canonical_example_id) считается
+            # внутри save_successful_sql_example из переданных значений, поэтому
+            # маскировать нужно именно здесь, а не только ниже для legacy .md.
+            masked_user_query = _sanitize_audit_text(user_query) if user_query else user_query
+            masked_sql_query = _sanitize_audit_text((sql_query or "").strip())
+
             receipt = save_successful_sql_example(
                 namespace_version_key=namespace_version_key,
-                user_query=user_query,
-                sql=sql_query,
+                user_query=masked_user_query,
+                sql=masked_sql_query,
                 dialect=dialect or get_current_dialect_name(effective_dsn, strict=True),
                 run_id=run_id,
                 approved=approved,

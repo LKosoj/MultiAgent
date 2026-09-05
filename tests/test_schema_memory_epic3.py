@@ -257,6 +257,333 @@ def test_empty_file_snapshot_supersedes_previous_file_facts(
 
 
 # ---------------------------------------------------------------------------
+# W2-2.2 — DSN glossary terms as SemanticFact
+# ---------------------------------------------------------------------------
+
+
+def test_dsn_glossary_synonym_found_by_user_term(monkeypatch, tmp_path) -> None:
+    """A DSN-glossary term reaches find_approved_semantic_facts by user wording."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    manager = SchemaMemoryManager(tmp_path)
+    fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="glossary_term",
+        value="выручка",
+        source="dsn_glossary",
+        status="approved",
+        kind="measure",
+    )
+
+    manager.replace_dsn_glossary_facts(namespace, (fact,))
+
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [fact]
+
+
+def test_replace_dsn_glossary_facts_replaces_set_and_keeps_file_facts(
+    monkeypatch, tmp_path
+) -> None:
+    """Removing a glossary term drops it; file facts are untouched."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    manager = SchemaMemoryManager(tmp_path)
+
+    file_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="description",
+        value="Net invoice amount",
+        source="file",
+        status="approved",
+    )
+    manager.replace_file_semantic_facts(namespace, (file_fact,))
+
+    revenue_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="glossary_term",
+        value="выручка",
+        source="dsn_glossary",
+        status="approved",
+        kind="measure",
+    )
+    income_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="glossary_term",
+        value="доход",
+        source="dsn_glossary",
+        status="approved",
+        kind="measure",
+    )
+    manager.replace_dsn_glossary_facts(namespace, (revenue_fact, income_fact))
+
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [revenue_fact]
+    assert manager.find_approved_semantic_facts(("доход",), namespace) == [income_fact]
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [file_fact]
+
+    # Re-replacing with a smaller set must drop the removed term...
+    manager.replace_dsn_glossary_facts(namespace, (revenue_fact,))
+
+    assert manager.find_approved_semantic_facts(("доход",), namespace) == []
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [revenue_fact]
+    # ...and must not touch the unrelated file-owned fact.
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [file_fact]
+
+
+def test_replace_file_semantic_facts_replaces_set_and_keeps_glossary_facts(
+    monkeypatch, tmp_path
+) -> None:
+    """Mirror of the glossary test: re-saving the file snapshot must drop
+    removed file facts and must never touch DSN-glossary-owned facts
+    (W2-2.2 review remark: both snapshot sources share one storage helper,
+    so a regression in either direction is a silent cross-source wipe)."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+
+    schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(schema))
+    saved: list[dict] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record["schema_version"] == kwargs["session_id"]
+                and record["cache_kind"] == kwargs["cache_kind"]
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    manager = SchemaMemoryManager(tmp_path)
+
+    glossary_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="glossary_term",
+        value="выручка",
+        source="dsn_glossary",
+        status="approved",
+        kind="measure",
+    )
+    manager.replace_dsn_glossary_facts(namespace, (glossary_fact,))
+
+    description_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="description",
+        value="Net invoice amount",
+        source="file",
+        status="approved",
+    )
+    example_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.orders",
+        column="amount",
+        fact_kind="example",
+        value="19.99",
+        source="file",
+        status="approved",
+    )
+    manager.replace_file_semantic_facts(namespace, (description_fact, example_fact))
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [description_fact]
+    assert manager.find_approved_semantic_facts(("19.99",), namespace) == [example_fact]
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [glossary_fact]
+
+    # Re-saving a smaller file snapshot must drop the removed file fact...
+    manager.replace_file_semantic_facts(namespace, (description_fact,))
+
+    assert manager.find_approved_semantic_facts(("19.99",), namespace) == []
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == [description_fact]
+    # ...and must not touch the glossary-owned fact.
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [glossary_fact]
+
+    # An empty file snapshot clears file facts only.
+    manager.replace_file_semantic_facts(namespace, ())
+
+    assert manager.find_approved_semantic_facts(("invoice",), namespace) == []
+    assert manager.find_approved_semantic_facts(("выручка",), namespace) == [glossary_fact]
+
+
+def test_semantic_fact_key_unchanged_for_legacy_facts() -> None:
+    """W2-2.2 added optional kind/note fields; pre-existing dumps (and thus
+    cache_key) for facts that never set them must stay byte-for-byte the
+    same, or every already-persisted file/typed_probe fact would silently
+    stop matching its own stored cache_key (see production_research trap
+    write-up). Digests below were computed on HEAD before this change."""
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
+    from custom_tools.text_to_sql.schema_memory_sqlite import _semantic_fact_key
+
+    typed_probe_fact = SemanticFact(
+        subject="column",
+        table_fqn="orders",
+        column="status",
+        fact_kind="example",
+        value="paid",
+        source="typed_probe",
+        status="approved",
+    )
+    assert _semantic_fact_key(typed_probe_fact) == (
+        "text2sql-semantic-fact-v1-"
+        "0cfb582802cbe91a245c33f70cecf346f20de56f583ca6219f24a2aa7d3d0c87"
+    )
+
+    file_fact = SemanticFact(
+        subject="table",
+        table_fqn="orders",
+        fact_kind="description",
+        value="Orders table",
+        source="file",
+        status="approved",
+    )
+    assert _semantic_fact_key(file_fact) == (
+        "text2sql-semantic-fact-v1-"
+        "e4eb1f777c7f5b511802e462369510a731919cc7ac4aca45b047963bc67d87d2"
+    )
+
+
+def test_glossary_synonym_reaches_table_search(monkeypatch, tmp_path) -> None:
+    """A synonym merged into the schema description reaches lexical table search."""
+    from dataclasses import dataclass
+
+    from custom_tools.text_to_sql.dsn_glossary import (
+        merge_glossary_synonyms_into_schema,
+    )
+
+    @dataclass(frozen=True)
+    class _GlossaryEntry:
+        term: str
+        synonyms: tuple
+        table: str
+        column: str | None
+        kind: str | None
+        note: str | None
+
+    schema = {
+        "public.orders": {
+            "description": "",
+            "columns": {"amount": {"type": "DECIMAL"}},
+        }
+    }
+    entries = [_GlossaryEntry("выручка", (), "public.orders", None, "measure", None)]
+    merged = merge_glossary_synonyms_into_schema(schema, entries)
+    assert "выручка" in merged["public.orders"]["description"]
+
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:orders",
+            "transient": False,
+        }
+    )
+    namespace = SchemaNamespace(scope, canonical_schema_fingerprint(merged))
+    saved: list[dict] = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=lambda **kwargs: [
+                {"data": record}
+                for record in saved
+                if record.get("schema_version") == kwargs.get("session_id")
+                and record.get("cache_kind") == kwargs.get("cache_kind")
+            ],
+            save_memory=lambda **kwargs: saved.append(kwargs["data"]) or 1,
+            memory_requester_context=lambda _agent: nullcontext(),
+        ),
+    )
+    manager = SchemaMemoryManager(tmp_path)
+    manager.index_schema_in_memory(
+        namespace.version_key,
+        "glossary-schema.json",
+        merged,
+        "hash123",
+        schema_version=namespace.version_key,
+    )
+
+    found = SchemaMemoryManager._sqlite_lexical_schema_tables(["выручка"], namespace)
+
+    assert found == ["public.orders"]
+
+
+# ---------------------------------------------------------------------------
 # T3.4 — legacy/new формат схемы через helper'ы
 # ---------------------------------------------------------------------------
 

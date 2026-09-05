@@ -31,27 +31,3 @@ profiles:
     # Правила «если в таблицах есть колонка X — используй её, игнорируй Y».
     # Каждая запись: {id_column: <имя>, ignore_column: <имя>}.
     prefer_id_over_name_rules: []
-
-  # ---------------------------------------------------------------
-  # Профиль муниципального/демографического датасета пользователя (РФ).
-  # Содержит конкретные имена из существующих схем (territory_id, oktmo,
-  # municipal_district_name и т.п.) — те, что раньше были захардкожены
-  # в build_schema_linking_prompt.
-  # ---------------------------------------------------------------
-  muni_ru:
-    priority_id_columns:
-      - district_id
-      - area_id
-      - zone_id
-      - territory_id
-      - region_id
-      - okato
-      - oktmo
-
-    low_priority_name_columns:
-      - municipal_district_name
-      - region_name
-
-    prefer_id_over_name_rules:
-      - id_column: territory_id
-        ignore_column: municipal_district_name

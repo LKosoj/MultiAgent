@@ -51,7 +51,10 @@
   "canonical_environment": {
     "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
     "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
-    "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0"
+    "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0",
+    "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
+    "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
+    "TEXT_TO_SQL_LLM_MODELS_PROFILE": "default"
   },
   "model_routes": {
     "model_code": {

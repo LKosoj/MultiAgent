@@ -1,4 +1,7 @@
 {
+  "legacy_optional_fields": [
+    "provenance"
+  ],
   "reason_codes": [
     "AUDIT_CONTRACT_INVALID",
     "AUDIT_FAILED",
@@ -26,6 +29,7 @@
     "RESULT_AGGREGATION_FAILED",
     "RESULT_PERSISTENCE_FAILED",
     "RESULT_RECONCILIATION_FAILED",
+    "RESULT_REVIEW_FAILED",
     "SCHEMA_CLARIFICATION_REQUIRED",
     "SCHEMA_CONTEXT_BUDGET_EXCEEDED",
     "SCHEMA_GROUNDING_FAILED",
@@ -37,6 +41,7 @@
     "VERIFIER_REJECTED"
   ],
   "required_fields": [
+    "ambiguity",
     "approved",
     "audit",
     "audited",
@@ -48,7 +53,9 @@
     "execution",
     "generated",
     "persistence",
+    "provenance",
     "reason_code",
+    "result_review",
     "rows_affected",
     "run_id",
     "sql",

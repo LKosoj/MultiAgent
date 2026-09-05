@@ -50,10 +50,75 @@ export type TextToSqlTerminalOutcome = {
   execution: Record<string, unknown>;
   audit: Record<string, unknown>;
   persistence: Record<string, unknown>;
+  ambiguity: Record<string, unknown> | null;
+  result_review: Record<string, unknown>;
+  provenance: Record<string, unknown>;
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+// W4-4.1 added the required `provenance` field to an already-shipped
+// contract (see workflow/text_to_sql_contract.py _LEGACY_OPTIONAL_TERMINAL_FIELDS
+// for the full rationale and the stored-data read sites this protects).
+// Older backends / stored history can still send a terminal outcome without
+// the key; fill in the same legacy default here so
+// isTextToSqlTerminalOutcome's strict "every terminalFields key present"
+// check (textToSqlContracts.ts) doesn't reject an otherwise-valid payload.
+// Keep this default in sync with the Python-side one.
+export const TEXT_TO_SQL_LEGACY_TERMINAL_FIELD_DEFAULTS: Record<string, unknown> = {
+  provenance: {},
+};
+
+export function normalizeTextToSqlTerminalOutcome(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const missingFields = Object.keys(TEXT_TO_SQL_LEGACY_TERMINAL_FIELD_DEFAULTS).filter(
+    (field) => !Object.prototype.hasOwnProperty.call(value, field),
+  );
+  if (missingFields.length === 0) return value;
+  const normalized: Record<string, unknown> = { ...value };
+  for (const field of missingFields) {
+    normalized[field] = TEXT_TO_SQL_LEGACY_TERMINAL_FIELD_DEFAULTS[field];
+  }
+  return normalized;
+}
+
+// W4-4.1 follow-up (second review round): `getStatus`/`getResult` are the
+// only places a terminal outcome enters the app from the backend, so this is
+// the one spot that must normalize it — every reader downstream (textToSqlRunState.ts's
+// isConfirmedTextToSqlResult/isConfirmedTextToSqlResultForRun/textToSqlStatusForRun,
+// the useTextToSqlRun hook, etc.) then sees an already-normalized payload and
+// needs no normalization logic of its own. Handles both response shapes seen
+// in the wild: a flat payload (`{ ..., terminal_outcome }`, from workflows.result
+// and some workflows.status replies) and one with the outcome nested under a
+// `status` object (`{ status: { ..., terminal_outcome } }`, the other
+// workflows.status shape). Never mutates the input.
+function normalizeTextToSqlBackendPayload(value: unknown): unknown {
+  if (!isRecord(value)) return value;
+  const patch: Record<string, unknown> = {};
+  let changed = false;
+
+  if (Object.prototype.hasOwnProperty.call(value, "terminal_outcome")) {
+    const normalized = normalizeTextToSqlTerminalOutcome(value.terminal_outcome);
+    if (normalized !== value.terminal_outcome) {
+      patch.terminal_outcome = normalized;
+      changed = true;
+    }
+  }
+
+  if (
+    isRecord(value.status)
+    && Object.prototype.hasOwnProperty.call(value.status, "terminal_outcome")
+  ) {
+    const normalizedOutcome = normalizeTextToSqlTerminalOutcome(value.status.terminal_outcome);
+    if (normalizedOutcome !== value.status.terminal_outcome) {
+      patch.status = { ...value.status, terminal_outcome: normalizedOutcome };
+      changed = true;
+    }
+  }
+
+  return changed ? { ...value, ...patch } : value;
 }
 
 const connectionRefPattern = /^conn-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -151,10 +216,12 @@ export function createTextToSqlClient(
       return runServiceAction("text_to_sql.schema.load", payload);
     },
     getStatus(runId: string): Promise<unknown> {
-      return runServiceAction("workflows.status", { run_id: runId });
+      return runServiceAction("workflows.status", { run_id: runId })
+        .then(normalizeTextToSqlBackendPayload);
     },
     getResult(runId: string): Promise<unknown> {
-      return runServiceAction("workflows.result", { run_id: runId });
+      return runServiceAction("workflows.result", { run_id: runId })
+        .then(normalizeTextToSqlBackendPayload);
     },
     getArtifacts(runId: string): Promise<unknown> {
       return runServiceAction("workflows.artifacts", { run_id: runId });

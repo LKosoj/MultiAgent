@@ -222,6 +222,8 @@ def _derived_binding() -> DerivedExpressionBinding:
             expression_id="net-expression",
             expression="gross - discount",
         ),
+        document=DocumentRef(document_id="rules", namespace="main"),
+        rule_excerpt="Net is gross minus discount.",
         input_columns=inputs,
     )
 

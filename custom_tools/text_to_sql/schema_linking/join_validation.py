@@ -383,7 +383,7 @@ class JoinValidator:
         — единый источник истины для всех call-sites.
         """
         if self.join_builder is None:
-            self.join_builder = JoinBuilder(db_schema)
+            self.join_builder = JoinBuilder(db_schema, dsn=get_runtime_context_dsn())
 
         requested_tables: set = compute_required_tables(
             linked_metrics, linked_dimensions, linked_filters

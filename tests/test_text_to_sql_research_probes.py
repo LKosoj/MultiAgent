@@ -1100,6 +1100,443 @@ def test_schema_catalog_probe_reports_f05_ambiguity_instead_of_first_match(
         ledger.close()
 
 
+def test_schema_catalog_rrf_single_signal_preserves_legacy_order(
+    tmp_path: Path,
+) -> None:
+    # Query "ord" hits three tables through the name signal only (no
+    # description/column matches, no foreign keys). "ordinance" and
+    # "orders" both prefix-match (score 3, tied); "border" only
+    # substring-matches (score 2). With a single signal in play, RRF must
+    # reproduce the legacy max()-based order and ambiguity exactly.
+    schema = {
+        "ordinance": {"columns": {"id": {"type": "INTEGER"}}},
+        "orders": {"columns": {"id": {"type": "INTEGER"}}},
+        "border": {"columns": {"id": {"type": "INTEGER"}}},
+    }
+    runtime = _mock_schema_runtime(schema)
+    target = _table("ord")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-single-signal",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "ambiguous"
+        assert payload["total_matches"] == 3
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "orders",
+            "ordinance",
+            "border",
+        ]
+        assert [item["score"] for item in payload["results"]] == [3, 3, 2]
+    finally:
+        ledger.close()
+
+
+def test_schema_catalog_rrf_promotes_multi_signal_table(tmp_path: Path) -> None:
+    # "region_summary" has the higher single-signal score (name prefix, 3)
+    # while "sales_region_ledger" only substring-matches the name (2) but
+    # also substring-matches the description (2). Under the legacy
+    # max()-based score, region_summary(3) would outrank
+    # sales_region_ledger(2). RRF sums one fraction per matching signal, so
+    # the two-signal table overtakes the single-signal one.
+    schema = {
+        "region_summary": {"columns": {"id": {"type": "INTEGER"}}},
+        "sales_region_ledger": {
+            "columns": {"id": {"type": "INTEGER"}},
+            "description": "sales region notes",
+        },
+    }
+    runtime = _mock_schema_runtime(schema)
+    target = _table("region")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-multi-signal",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "matched"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "sales_region_ledger",
+            "region_summary",
+        ]
+    finally:
+        ledger.close()
+
+
+def test_schema_catalog_rrf_fk_neighbor_signal(tmp_path: Path) -> None:
+    # "customer_account" and "customer_ledger" both prefix-match "customer"
+    # (score 3): their lexical RRF is exactly tied, since name is the only
+    # matching signal for both. "old_customer_archive" only substring-
+    # matches (score 2), so its lexical RRF is strictly lower than the tied
+    # pair's -- per the W3-3.1 tie-break design the FK signal can never
+    # promote it past either of them (a weaker lexical match may not
+    # displace a stronger one). FK adjacency is instead a pure tie-break:
+    # among candidates whose lexical RRF is *exactly* equal, "customer_ledger"
+    # wins over "customer_account" because it declares no FK of its own but
+    # is the target of "old_customer_archive"'s FK, giving it a non-zero
+    # tie-break count while "customer_account" has none. The tie being
+    # resolved by a strict count difference is what makes the result
+    # "matched" rather than "ambiguous".
+    schema_with_fk = {
+        "customer_account": {"columns": {"id": {"type": "INTEGER"}}},
+        "customer_ledger": {"columns": {"id": {"type": "INTEGER"}}},
+        "old_customer_archive": {
+            "columns": {
+                "id": {"type": "INTEGER"},
+                "ledger_id": {"type": "INTEGER"},
+            },
+            "foreign_keys": {
+                "complete": True,
+                "constraints": [
+                    {
+                        "constraint_id": "archive_ledger_fk",
+                        "to_table": "customer_ledger",
+                        "column_pairs": [
+                            {"from_column": "ledger_id", "to_column": "id"}
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+    runtime = _mock_schema_runtime(schema_with_fk)
+    target = _table("customer")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-fk-neighbor-with-fk",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "matched"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "customer_ledger",
+            "customer_account",
+            "old_customer_archive",
+        ]
+    finally:
+        ledger.close()
+
+    # Without any FK at all, "customer_account" and "customer_ledger" have
+    # no signal left to break their exact lexical-RRF tie, so the probe
+    # must report "ambiguous" instead of picking either one.
+    schema_without_fk = {
+        "customer_account": {"columns": {"id": {"type": "INTEGER"}}},
+        "customer_ledger": {"columns": {"id": {"type": "INTEGER"}}},
+    }
+    runtime = _mock_schema_runtime(schema_without_fk)
+    target = _table("customer")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-fk-neighbor-without-fk",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "ambiguous"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "customer_account",
+            "customer_ledger",
+        ]
+    finally:
+        ledger.close()
+
+
+def test_schema_catalog_fk_tiebreak_never_displaces_lexical_leader(
+    tmp_path: Path,
+) -> None:
+    # Regression for the W3-3.1 code-review blocker: the FK signal used to
+    # be summed into the same Reciprocal Rank Fusion as the lexical
+    # signals, so a table with a weak lexical match (score 2) but an FK
+    # link to a top lexical candidate could outrank -- and, at top_k=1,
+    # completely displace -- the single strongest lexical match (score 3).
+    # "alpha_master" prefix-matches "alpha" (score 3, the sole lexical
+    # leader). "gamma_alpha_hub" and "delta_alpha_node" only substring-match
+    # (score 2). "weak_alpha_ref" also only substring-matches (score 2) but
+    # declares a foreign key to "gamma_alpha_hub". Under the fixed
+    # tie-break design, "alpha_master" must remain first regardless of any
+    # FK adjacency among the weaker matches.
+    schema = {
+        "alpha_master": {"columns": {"id": {"type": "INTEGER"}}},
+        "gamma_alpha_hub": {"columns": {"id": {"type": "INTEGER"}}},
+        "delta_alpha_node": {"columns": {"id": {"type": "INTEGER"}}},
+        "weak_alpha_ref": {
+            "columns": {
+                "id": {"type": "INTEGER"},
+                "hub_id": {"type": "INTEGER"},
+            },
+            "foreign_keys": {
+                "complete": True,
+                "constraints": [
+                    {
+                        "constraint_id": "weak_ref_hub_fk",
+                        "to_table": "gamma_alpha_hub",
+                        "column_pairs": [
+                            {"from_column": "hub_id", "to_column": "id"}
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+    runtime = _mock_schema_runtime(schema)
+    target = _table("alpha")
+
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="fk-tiebreak-top-k-10",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "matched"
+        assert payload["results"][0]["table"]["table"] == "alpha_master"
+        scores = [item["score"] for item in payload["results"]]
+        assert scores == sorted(scores, reverse=True)
+    finally:
+        ledger.close()
+
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 1),),
+        suffix="fk-tiebreak-top-k-1",
+    )
+    try:
+        result = search_schema_catalog(target, 1, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+
+        assert payload["status"] == "matched"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "alpha_master"
+        ]
+    finally:
+        ledger.close()
+
+
+def test_schema_catalog_lexical_rrf_order_is_non_increasing() -> None:
+    # The per-item "score" field is the legacy max()-based signal and is
+    # allowed to be non-monotonic across results (see
+    # test_schema_catalog_rrf_promotes_multi_signal_table: a two-signal
+    # table can legitimately overtake a single, higher-scoring one). What
+    # must always hold is that the fused *lexical* RRF value that actually
+    # drives the ranking -- computed the same way search_schema_catalog
+    # computes it, before any FK tie-break is applied -- is non-increasing
+    # across the ranked output.
+    candidates = [
+        (3, "single_signal_leader", [], ["table"]),
+        (2, "multi_signal_table", [], ["table", "table_description"]),
+        (2, "single_signal_tail", [], ["table"]),
+    ]
+    name_scores = {
+        "single_signal_leader": 3,
+        "multi_signal_table": 2,
+        "single_signal_tail": 2,
+    }
+    description_scores = {"multi_signal_table": 2}
+    column_scores: dict[str, int] = {}
+
+    ranked, is_ambiguous = schema_probe_module._rank_catalog_candidates(
+        candidates, name_scores, description_scores, column_scores, []
+    )
+
+    assert is_ambiguous is False
+    assert [name for _, name, _, _ in ranked] == [
+        "multi_signal_table",
+        "single_signal_leader",
+        "single_signal_tail",
+    ]
+
+    lexical_rrf = schema_probe_module._reciprocal_rank_fusion(
+        *(
+            schema_probe_module._dense_rank(
+                [(score, name) for name, score in scores.items()]
+            )
+            for scores in (name_scores, description_scores, column_scores)
+        )
+    )
+    rrf_sequence = [lexical_rrf[name] for _, name, _, _ in ranked]
+    assert rrf_sequence == sorted(rrf_sequence, reverse=True)
+
+
+def test_schema_catalog_rrf_is_deterministic(tmp_path: Path) -> None:
+    schema = {
+        "region_summary": {"columns": {"id": {"type": "INTEGER"}}},
+        "sales_region_ledger": {
+            "columns": {"id": {"type": "INTEGER"}},
+            "description": "sales region notes",
+        },
+        "unrelated_widget": {"columns": {"id": {"type": "INTEGER"}}},
+    }
+    runtime = _mock_schema_runtime(schema)
+    target = _table("region")
+    payloads = []
+    for index in range(2):
+        budget, ledger = _schema_budget_runtime(
+            tmp_path,
+            runtime.namespace,
+            ResearchActionKind.INSPECT_CATALOG,
+            target,
+            parameters=(("top_k", 10),),
+            suffix=f"rrf-deterministic-{index}",
+        )
+        try:
+            result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+            payloads.append(read_probe_payload(result))
+        finally:
+            ledger.close()
+
+    assert payloads[0] == payloads[1]
+
+
+def test_schema_catalog_rrf_ambiguity_uses_exact_fraction_ties(
+    tmp_path: Path,
+) -> None:
+    # Case A: both tables match through the exact same single signal
+    # (column name only) with the same score, like the pinned F05 fixture.
+    # Their RRF fractions are exactly equal, so the probe must still report
+    # "ambiguous".
+    tied_schema = {
+        "member_state_a": {"columns": {"state_value": {"type": "TEXT"}}},
+        "member_state_b": {"columns": {"state_value": {"type": "TEXT"}}},
+    }
+    runtime = _mock_schema_runtime(tied_schema)
+    target = _table("state_value")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-ambiguous-tie",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+        assert payload["status"] == "ambiguous"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "member_state_a",
+            "member_state_b",
+        ]
+    finally:
+        ledger.close()
+
+    # Case B: both tables share the same legacy max()-bucket (name prefix,
+    # score 3) but "vendor_ledger" also has a weak column-description match.
+    # The legacy int-bucket comparison would call this "ambiguous" too, but
+    # the extra signal gives vendor_ledger a strictly larger RRF fraction,
+    # so the probe must resolve it to "matched" instead.
+    distinct_schema = {
+        "vendor_summary": {"columns": {"id": {"type": "INTEGER"}}},
+        "vendor_ledger": {
+            "columns": {
+                "id": {
+                    "type": "INTEGER",
+                    "description": "preferred vendor reference",
+                }
+            }
+        },
+    }
+    runtime = _mock_schema_runtime(distinct_schema)
+    target = _table("vendor")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-ambiguous-distinct",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+        assert payload["status"] == "matched"
+        assert [item["table"]["table"] for item in payload["results"]] == [
+            "vendor_ledger",
+            "vendor_summary",
+        ]
+    finally:
+        ledger.close()
+
+
+def test_schema_catalog_top_k_and_truncated_semantics_preserved(
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "widget_alpha": {"columns": {"id": {"type": "INTEGER"}}},
+        "widget_beta": {"columns": {"id": {"type": "INTEGER"}}},
+        "widget_gamma": {"columns": {"id": {"type": "INTEGER"}}},
+        "widget_delta": {"columns": {"id": {"type": "INTEGER"}}},
+        "widget_epsilon": {"columns": {"id": {"type": "INTEGER"}}},
+        "unrelated_gadget": {"columns": {"id": {"type": "INTEGER"}}},
+    }
+    runtime = _mock_schema_runtime(schema)
+    target = _table("widget")
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 2),),
+        suffix="rrf-top-k-small",
+    )
+    try:
+        result = search_schema_catalog(target, 2, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+        assert len(payload["results"]) == 2
+        assert payload["total_matches"] == 5
+        assert result.truncated is True
+    finally:
+        ledger.close()
+
+    budget, ledger = _schema_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.INSPECT_CATALOG,
+        target,
+        parameters=(("top_k", 10),),
+        suffix="rrf-top-k-large",
+    )
+    try:
+        result = search_schema_catalog(target, 10, runtime=runtime, budget=budget)
+        payload = read_probe_payload(result)
+        assert len(payload["results"]) == 5
+        assert payload["total_matches"] == 5
+        assert result.truncated is False
+    finally:
+        ledger.close()
+
+
 def test_schema_table_probe_reports_ambiguous_and_missing_targets(
     tmp_path: Path,
 ) -> None:

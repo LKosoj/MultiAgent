@@ -2,9 +2,17 @@
 Загрузчик yaml-конфига LLM-параметров для text-to-sql pipeline.
 
 Конфиг — единственный source of truth для параметров LLM-вызовов
-(``max_tokens``, и в перспективе ``model``, ``temperature``, ...). В .py
+(``max_tokens``, ``model``, и в перспективе ``temperature``, ...). В .py
 файлах ни одного магического числа быть не должно (см. AGENTS.md и
 EPIC 4 / 4.17).
+
+Секция ``step_models`` (W1-1.1) — реестр «шаг пайплайна → класс модели»:
+имя класса — это alias из ``agent_command.py::_MODEL_CONFIGS``
+(``model_code``, ``model_hard``, ...). ``step_model_name()`` возвращает
+это имя как строку; резолвинг в реальный объект модели (и валидация,
+что alias существует) происходит на стороне вызывающего кода через
+``agent_command.model_mapping`` / ``agent_command.create_text_to_sql_model``
+— этот модуль ``agent_command`` не импортирует (тяжёлый граф зависимостей).
 
 Контракт:
   * Путь по умолчанию: ``config/text_to_sql/llm_models.yaml``.
@@ -123,7 +131,7 @@ class LLMModelsConfig:
         # реально читаются runtime-кодом text-to-sql пайплайна. Список снят
         # с config/text_to_sql/llm_models.yaml — единого source of truth.
         # При добавлении новой секции в yaml необходимо обновить этот набор.
-        REQUIRED_SECTIONS = {"schema_linking", "sql_generation", "nlu"}
+        REQUIRED_SECTIONS = {"schema_linking", "sql_generation", "nlu", "step_models"}
         default_profile = profiles[_DEFAULT_PROFILE]
         missing = REQUIRED_SECTIONS - set(default_profile.sections.keys())
         if missing:
@@ -175,6 +183,11 @@ def load_llm_models_config() -> LLMModelsProfile:
     ``_load_config_object()``. Кэшируется по абсолютному пути yaml-файла.
     """
     return get_active_profile()
+
+
+def step_model_name(step: str, *, explicit_profile: str | None = None) -> str:
+    """Имя класса модели (alias из agent_command._MODEL_CONFIGS) для шага пайплайна."""
+    return get_active_profile(explicit_profile).get("step_models", step)
 
 
 def _load_config_object() -> LLMModelsConfig:

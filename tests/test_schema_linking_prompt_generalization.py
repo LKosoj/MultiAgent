@@ -3,8 +3,10 @@
 Проверяют:
   * дефолтный профиль не добавляет доменных подсказок в промпт
     (универсальный шаблон, никаких oktmo/territory_id/...);
-  * профиль ``muni_ru`` восстанавливает легаси-поведение для
-    пользовательского муниципального датасета;
+  * произвольный именованный профиль восстанавливает легаси-поведение для
+    пользовательского муниципального датасета (доменные подсказки теперь
+    задаются в DSN-профиле, а не в этом yaml, — здесь только проверяется
+    сам механизм подстановки);
   * подмена пути конфига через env подменяет источник профилей;
   * отсутствие конфига приводит к ``FileNotFoundError`` (fail-fast);
   * в ``custom_tools/text_to_sql/prompts.py`` не осталось доменных
@@ -85,25 +87,62 @@ def test_schema_linking_join_examples_are_valid_single_brace_json():
     assert '"join_type": "LEFT"}}' not in prompt
 
 
-def test_schema_linking_prompt_muni_profile_includes_legacy_terms():
-    """Профиль ``muni_ru`` → промпт содержит исторические доменные имена."""
+def _write_legacy_municipal_yaml(tmp_path: Path) -> Path:
+    """Тестовая фикстура с легаси-доменными терминами (раньше — старый именованный профиль).
+
+    Не связана с production yaml (там теперь только пустой ``default``):
+    доменные подсказки под конкретную БД теперь живут в DSN-профиле, а этот
+    тест проверяет только сам механизм подстановки именованного профиля.
+    """
+    custom_yaml = tmp_path / "schema_linking_examples.yaml"
+    custom_yaml.write_text(
+        """
+version: 1
+profiles:
+  default:
+    priority_id_columns: []
+    low_priority_name_columns: []
+    prefer_id_over_name_rules: []
+  legacy_demo:
+    priority_id_columns:
+      - territory_id
+      - oktmo
+    low_priority_name_columns:
+      - municipal_district_name
+    prefer_id_over_name_rules:
+      - id_column: territory_id
+        ignore_column: municipal_district_name
+""",
+        encoding="utf-8",
+    )
+    return custom_yaml
+
+
+def test_schema_linking_prompt_named_profile_includes_legacy_terms(tmp_path, monkeypatch):
+    """Именованный профиль → промпт содержит исторические доменные имена."""
+    custom_yaml = _write_legacy_municipal_yaml(tmp_path)
+    monkeypatch.setenv(_ENV_PATH_VAR, str(custom_yaml))
+    schema_linking_examples_config.reset_cache()
+
     entities, schema_str = _sample_inputs()
-    prompt = build_schema_linking_prompt(entities, schema_str, profile="muni_ru")
+    prompt = build_schema_linking_prompt(entities, schema_str, profile="legacy_demo")
 
     assert "ДОМЕННЫЕ ПРИМЕРЫ" in prompt
     # Регрессионная проверка для пользовательского датасета.
     for token in ("oktmo", "territory_id", "municipal_district_name"):
         assert token in prompt, (
-            f"Профиль muni_ru должен содержать легаси-токен '{token}'"
+            f"Профиль 'legacy_demo' должен содержать легаси-токен '{token}'"
         )
 
 
-def test_schema_linking_prompt_profile_via_env(monkeypatch):
+def test_schema_linking_prompt_profile_via_env(tmp_path, monkeypatch):
     """Env ``TEXT_TO_SQL_SCHEMA_LINKING_PROFILE`` переключает профиль."""
-    entities, schema_str = _sample_inputs()
-    monkeypatch.setenv(_ENV_PROFILE_VAR, "muni_ru")
+    custom_yaml = _write_legacy_municipal_yaml(tmp_path)
+    monkeypatch.setenv(_ENV_PATH_VAR, str(custom_yaml))
+    monkeypatch.setenv(_ENV_PROFILE_VAR, "legacy_demo")
     schema_linking_examples_config.reset_cache()
 
+    entities, schema_str = _sample_inputs()
     prompt = build_schema_linking_prompt(entities, schema_str)
     assert "territory_id" in prompt
     assert "oktmo" in prompt

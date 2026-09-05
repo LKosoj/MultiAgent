@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +27,7 @@ from ._semantic_value_certificate import (
     ExactValueCertificateError,
     evidence_observes_exact_column,
 )
+from .code_label_cascade import cascade_hint_mode, code_label_cascade_hints
 from .data_probes import DataProbeRuntime
 from .freshness import (
     DocumentSourceAvailability,
@@ -81,6 +83,8 @@ from .serialization import (
 )
 from .state import _result_expectation_key
 from .tool_registry import AdaptiveResearchToolContext, AdaptiveResearchToolRegistry
+
+logger = logging.getLogger(__name__)
 
 
 _MAX_SCHEMA_RESEARCH_PROMPT_BYTES = 65_536
@@ -246,11 +250,29 @@ def assemble_production_research(
     if not isinstance(profile, SchemaResearchAgentProfile):
         raise TypeError("profile must be SchemaResearchAgentProfile")
     model_identity = _require_stable_model_identity(model_identity, profile.model)
-    semantic_table_hints = _bounded_hierarchical_table_hints(
-        loaded_schema.schema,
-        semantic_table_hints,
-        maximum_tables=SchemaLimiter().max_tables,
-    )
+    # W2-2.2: an approved fact's table must survive schema narrowing even
+    # when the separate table-search that produced ``semantic_table_hints``
+    # missed it (two different indexes match the same user terms against
+    # different text — see `_bounded_research_context`'s
+    # ``approved_semantic_fact_hints`` filter). Only extend when the caller
+    # already asked to narrow: empty hints must keep meaning "use the full
+    # schema", never "narrow to just the fact tables".
+    if semantic_table_hints:
+        fact_only_tables = sorted(
+            {fact.table_fqn for fact in approved_semantic_fact_hints}
+            - set(semantic_table_hints)
+        )
+        semantic_table_hints = _bounded_hierarchical_table_hints(
+            loaded_schema.schema,
+            semantic_table_hints + tuple(fact_only_tables),
+            maximum_tables=SchemaLimiter().max_tables,
+        )
+    else:
+        semantic_table_hints = _bounded_hierarchical_table_hints(
+            loaded_schema.schema,
+            semantic_table_hints,
+            maximum_tables=SchemaLimiter().max_tables,
+        )
 
     loader = _CapturedSchemaOnlyLoader()
     schema_runtime = SchemaProbeRuntime(
@@ -777,6 +799,17 @@ def _bounded_research_context(
             ),
         ):
             if fact.table_fqn not in research_schema:
+                # Defence-in-depth only: `assemble_production_research`
+                # already folds every approved fact's table into the
+                # narrowed hint set (W2-2.2), so this should not trigger in
+                # production. It stays as a guard against a caller invoking
+                # `_bounded_research_context` directly with a stale/foreign
+                # `research_schema` — but it must never drop a fact silently.
+                logger.warning(
+                    "approved_semantic_fact_hints: dropping fact for table"
+                    " %r not present in the narrowed research schema",
+                    fact.table_fqn,
+                )
                 continue
             included_facts.append(fact.model_dump(mode="json"))
             if _encode_context(
@@ -790,6 +823,72 @@ def _bounded_research_context(
                 break
         if not included_facts:
             context.pop("approved_semantic_fact_hints")
+    cascade_mode = cascade_hint_mode()
+    if cascade_mode != "off":
+        # `loaded_schema.namespace` is only present on the real production
+        # `LoadedSchema` (unit tests here often pass a bare stand-in with
+        # just `.schema`); fall back to an uncached lookup rather than
+        # requiring the attribute.
+        cascade_namespace = getattr(loaded_schema, "namespace", None)
+        cascade_version_key = getattr(cascade_namespace, "version_key", None)
+        cascade_candidates = code_label_cascade_hints(
+            state, loaded_schema.schema, version_key=cascade_version_key
+        )
+        if cascade_candidates:
+            if cascade_mode == "shadow":
+                # Diagnostic only: shadow mode never shapes model input, so
+                # log against the full candidate set (not narrowed to
+                # research_schema) and separately count how many candidates
+                # would be dropped by the "on"-mode filter below, to make
+                # that filter's impact visible before it is relied upon.
+                outside_research_schema = sum(
+                    1
+                    for candidate in cascade_candidates
+                    if candidate.table not in research_schema
+                )
+                logger.info(
+                    "code_label_cascade shadow: %s (outside_research_schema=%d)",
+                    [
+                        {
+                            "table": candidate.table,
+                            "column": candidate.column,
+                            "reason": candidate.reason,
+                        }
+                        for candidate in cascade_candidates
+                    ],
+                    outside_research_schema,
+                )
+            else:
+                # A hint pointing at a table outside the narrowed
+                # research_schema is not something the model can act on (it
+                # cannot query a table it cannot see), so drop those
+                # candidates before spending any inline-byte budget on them.
+                in_scope_candidates = [
+                    candidate
+                    for candidate in cascade_candidates
+                    if candidate.table in research_schema
+                ]
+                included_cascade_hints: list[dict[str, object]] = []
+                context["code_label_cascade_hints"] = included_cascade_hints
+                for candidate in in_scope_candidates:
+                    included_cascade_hints.append(
+                        {
+                            "table": candidate.table,
+                            "column": candidate.column,
+                            "reason": candidate.reason,
+                        }
+                    )
+                    if _encode_context(
+                        research_schema,
+                        context,
+                        policy,
+                        maximum_bytes,
+                        fits_prompt,
+                    ) is None:
+                        included_cascade_hints.pop()
+                        break
+                if not included_cascade_hints:
+                    context.pop("code_label_cascade_hints")
     _refresh_omitted_counts(state_payload, state_view, context)
     encoded = _encode_context(
         research_schema,

@@ -1,7 +1,8 @@
-"""Verifies llm_call_context (run_id/step_name) is set at the three provider call sites:
+"""Verifies llm_call_context (run_id/step_name) is set at the four provider call sites:
 
 - workflow/text_to_sql_typed_research.py::_typed_schema_model (schema-research decision + stop-review)
-- workflow/text_to_sql_adaptive_solver.py::_production_json_model
+- workflow/text_to_sql_adaptive_solver.py::_production_json_model (schema-research re-entry)
+- workflow/text_to_sql_adaptive_solver.py::_production_solver_model (SQL-solver proposals)
 - custom_tools/text_to_sql/adaptive/result_review_runtime.py::build_result_review_runtime
 
 Each test monkeypatches the provider boundary and reads back llm_call_context.get_llm_call_context()
@@ -90,6 +91,77 @@ def test_adaptive_solver_production_json_model_sets_llm_call_context(monkeypatch
     asyncio.run(model("solver prompt"))
 
     assert captured == {"run_id": "run-solver", "step_name": "SQL-solver"}
+
+
+def test_adaptive_solver_production_solver_model_sets_llm_call_context_and_usage(
+    monkeypatch,
+):
+    import agent_command
+    from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
+    from custom_tools.text_to_sql.adaptive.sql_solver_agent import (
+        SqlSolverModelResponse,
+    )
+    from workflow.text_to_sql_adaptive_solver import _production_solver_model
+
+    captured: dict[str, object] = {}
+
+    class Provider:
+        def __call__(self, messages, **kwargs):
+            captured.update(get_llm_call_context())
+            return ChatMessage(
+                role=MessageRole.ASSISTANT,
+                content='{"ok": true}',
+                token_usage=SimpleNamespace(input_tokens=10, output_tokens=4),
+            )
+
+    monkeypatch.setattr(
+        agent_command, "create_text_to_sql_model", lambda *a, **k: Provider()
+    )
+
+    runtime = SimpleNamespace(
+        run_id="run-solver",
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(output_tokens_per_call=512)
+        ),
+    )
+    model = _production_solver_model(runtime, "profile-model", "system prompt")
+    response = asyncio.run(model("solver prompt"))
+
+    assert isinstance(response, SqlSolverModelResponse)
+    assert response.raw_response == '{"ok": true}'
+    assert response.usage == ModelTokenUsage(input_tokens=10, output_tokens=4)
+    assert captured == {"run_id": "run-solver", "step_name": "SQL-solver"}
+
+
+def test_adaptive_solver_production_solver_model_reports_unknown_usage_without_tokens(
+    monkeypatch,
+):
+    import agent_command
+    from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
+    from custom_tools.text_to_sql.adaptive.sql_solver_agent import (
+        SqlSolverModelResponse,
+    )
+    from workflow.text_to_sql_adaptive_solver import _production_solver_model
+
+    class Provider:
+        def __call__(self, messages, **kwargs):
+            return ChatMessage(role=MessageRole.ASSISTANT, content='{"ok": true}')
+
+    monkeypatch.setattr(
+        agent_command, "create_text_to_sql_model", lambda *a, **k: Provider()
+    )
+
+    runtime = SimpleNamespace(
+        run_id="run-solver",
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(output_tokens_per_call=512)
+        ),
+    )
+    model = _production_solver_model(runtime, "profile-model", "system prompt")
+    response = asyncio.run(model("solver prompt"))
+
+    assert isinstance(response, SqlSolverModelResponse)
+    assert response.usage == ModelTokenUsage(input_tokens=None, output_tokens=None)
 
 
 def test_result_review_runtime_sets_llm_call_context(monkeypatch, tmp_path):

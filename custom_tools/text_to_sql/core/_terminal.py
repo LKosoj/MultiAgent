@@ -184,6 +184,141 @@ def _execution_summary(
     }
 
 
+def _sql_provenance_tables_and_columns(
+    sql_query: str,
+    dsn: str,
+) -> tuple[list[str], list[str], bool, bool]:
+    """Best-effort table/column trace of the final SQL for the provenance footer.
+
+    Purely descriptive (no schema lookup, no execution): parses the already
+    executed ``sql_query`` with sqlglot to name the tables/columns it touched.
+    Any parse failure is non-fatal — callers get empty lists with
+    ``parse_error=True`` instead of a crash (W4-4.1).
+
+    Also reports ``has_derived_tables``: whether the query reads through a
+    CTE (``WITH``) or a subquery used as a row source — a FROM/JOIN source,
+    or a ``LATERAL`` (whose immediate parent is ``exp.Lateral``, not
+    ``exp.From``/``exp.Join``, since sqlglot nests ``Lateral`` between the
+    subquery and the ``Join``). When true, ``tables`` only names the
+    physical tables those derived sources read, and column qualifiers like
+    ``cte.id`` are left unresolved to a table. A scalar/correlated subquery
+    used as a predicate (e.g. ``WHERE x IN (SELECT ...)``) is not a row
+    source and does not count: its immediate sqlglot parent is the
+    predicate node (``In``, ...), never ``From``/``Join``/``Lateral``.
+
+    Known limitation (not fixed here): a bare ``UNION``/``UNION ALL`` at the
+    statement's top level parses as ``exp.Union``, not ``exp.Select`` — the
+    per-branch aliases are never resolved, so ``columns`` reports column
+    qualifiers as written in the source SQL (e.g. ``a.id``, unresolved
+    against either branch's tables) and ``has_derived_tables`` only reflects
+    subqueries nested inside a branch, not the union shape itself.
+    """
+    try:
+        from sqlglot import exp
+
+        from ..dialects import get_sqlglot_dialect
+        from ..utils import parse_with_timeout
+        from ..validators._schema_scope import ScopeResolver
+
+        dialect = get_sqlglot_dialect(dsn, strict=bool(dsn and dsn.strip()))
+        read = None if dialect == "ansi" else dialect
+        statements = [
+            statement
+            for statement in (parse_with_timeout(sql_query, read=read) or [])
+            if statement is not None
+        ]
+        if len(statements) != 1:
+            return [], [], False, True
+        stmt = statements[0]
+        resolver = ScopeResolver()
+
+        # A `WITH cte AS (...)` name is referenced later as `FROM cte`, which
+        # sqlglot parses as an ordinary exp.Table — indistinguishable from a
+        # real table by name alone. Left unfiltered, the CTE name itself
+        # leaks into `tables` alongside (or instead of) the physical tables
+        # its body actually reads. Excluding known CTE names here is a
+        # narrow, name-based fix; a proper fix would resolve tables via
+        # sqlglot's `Scope` the way validators/schema_aware.py:255-320
+        # already does for validation — reusing that here is a separate task.
+        with_node = stmt.args.get("with")
+        cte_names = {
+            resolver.clean_identifier(cte.alias)
+            for cte in (with_node.expressions if with_node is not None else [])
+            if getattr(cte, "alias", None)
+        }
+
+        # A subquery used as a FROM/JOIN/LATERAL source (a "derived table")
+        # is the other shape that hides physical tables behind an alias —
+        # same reasoning as the CTE case above. `LATERAL (...)` parses with
+        # the subquery's immediate parent being `exp.Lateral` (itself nested
+        # inside the `exp.Join`), not `exp.From`/`exp.Join` directly, so it
+        # needs its own check here. Subqueries elsewhere (e.g. an
+        # `IN (SELECT ...)` predicate) aren't table sources and don't count:
+        # their immediate parent is the predicate node, not From/Join/Lateral.
+        has_derived_tables = with_node is not None or any(
+            isinstance(subquery.parent, (exp.From, exp.Join, exp.Lateral))
+            for subquery in stmt.find_all(exp.Subquery)
+        )
+
+        tables = sorted({
+            name
+            for table_expr in stmt.find_all(exp.Table)
+            if (name := resolver.get_real_table_name(table_expr)) and name not in cte_names
+        })
+        alias_mapping = resolver.build_alias_mapping(stmt, {})
+        columns: set[str] = set()
+        for column_expr in stmt.find_all(exp.Column):
+            column_name = resolver.clean_identifier(column_expr.name)
+            if not column_name:
+                continue
+            table_ref = getattr(column_expr, "table", None)
+            if table_ref:
+                resolved_table = alias_mapping.get(
+                    str(table_ref),
+                    resolver.clean_identifier(table_ref),
+                )
+                columns.add(f"{resolved_table}.{column_name}")
+            else:
+                columns.add(column_name)
+        return tables, sorted(columns), has_derived_tables, False
+    except WorkflowDeadlineExceeded:
+        raise
+    except Exception:
+        return [], [], False, True
+
+
+def _build_text_to_sql_provenance(
+    *,
+    run_id: str,
+    sql_query: str,
+    dsn: str,
+    execution: Dict[str, Any],
+    execution_summary: Dict[str, Any],
+    result_review: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Assemble the honest, human-readable trace for one executed answer."""
+
+    tables, sql_columns, has_derived_tables, parse_error = _sql_provenance_tables_and_columns(
+        sql_query, dsn
+    )
+    row_count = execution_summary["row_count"]
+    row_limit = execution_summary["row_limit"]
+    llm_audit = execution.get("llm_audit")
+    verdict = result_review.get("verdict") if result_review else None
+    return {
+        "run_id": run_id,
+        "tables": tables,
+        "columns": sql_columns,
+        "row_count": row_count,
+        "row_limit": row_limit,
+        "possibly_truncated": row_count >= row_limit,
+        "safety_llm_audit": llm_audit if isinstance(llm_audit, str) else None,
+        "result_review_verdict": verdict if isinstance(verdict, str) else None,
+        "has_derived_tables": has_derived_tables,
+        "parse_error": parse_error,
+    }
+
+
 def _terminal_mapping(
     *,
     run_id: str,
@@ -203,6 +338,7 @@ def _terminal_mapping(
     audit: Dict[str, Any],
     persistence: Dict[str, Any],
     result_review: Dict[str, Any] | None = None,
+    provenance: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     outcome = TextToSqlTerminalResult(
         run_id=run_id,
@@ -222,6 +358,7 @@ def _terminal_mapping(
         audit=audit,
         persistence=persistence,
         result_review=result_review or {},
+        provenance=provenance or {},
     )
     outcome.assert_invariants()
     return outcome.to_mapping()
@@ -799,6 +936,17 @@ def finalize_text_to_sql_run(
             persistence=persistence,
         )
 
+    provenance: Dict[str, Any] = {}
+    if executed:
+        provenance = _build_text_to_sql_provenance(
+            run_id=run_id,
+            sql_query=sql_query,
+            dsn=dsn,
+            execution=execution,
+            execution_summary=execution_summary,
+            result_review=result_review,
+        )
+
     return _terminal_mapping(
         run_id=run_id,
         status=TextToSqlTerminalStatus.SUCCEEDED,
@@ -817,4 +965,5 @@ def finalize_text_to_sql_run(
         audit=audit,
         persistence=persistence,
         result_review=result_review,
+        provenance=provenance,
     )

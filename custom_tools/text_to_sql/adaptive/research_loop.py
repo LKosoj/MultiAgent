@@ -1789,8 +1789,16 @@ def _state_with_reconciled_model_budget(
     attempts_by_revision: dict[int, list[int]] = {}
     last_revision = -1
     for record in records:
-        matched = _MODEL_CALL_ID.match(record.reservation.call_id)
+        call_id = record.reservation.call_id
+        matched = _MODEL_CALL_ID.match(call_id)
         if matched is None:
+            if _SOLVER_MODEL_CALL_ID.match(call_id) is not None:
+                # Solver proposal calls do not belong to this ResearchState's
+                # revision numbering; skip them for the attempt-contiguity
+                # check below. completed_model_budget_chain() below still
+                # walks every record, solver included, since they all share
+                # one cost chain against the same policy budget.
+                continue
             raise ValueError("model ledger call ID is not a research-loop attempt")
         revision = int(matched["revision"])
         attempt = int(matched["attempt"])
@@ -2837,6 +2845,11 @@ def _research_stop_review_call_id(state: ResearchState, attempt: int) -> str:
 _MODEL_CALL_ID = re.compile(
     r"^research-(?:model|stop-review)-(?P<revision>\d+)-(?P<attempt>\d+)$"
 )
+
+# Adaptive solver proposal calls (workflow/text_to_sql_adaptive_solver.py) share
+# this same model-budget ledger but are keyed by SolverState.revision, a
+# counter independent of the ResearchState revision tracked in this module.
+_SOLVER_MODEL_CALL_ID = re.compile(r"^solver-generate-\d+-\d+$")
 
 
 def _is_async_model(model: object) -> bool:

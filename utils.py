@@ -934,6 +934,14 @@ def call_openai_api(prompt: str, system_prompt: str = None, max_tokens: int = 10
                 logger.error(f"Все попытки исчерпаны. Последняя ошибка: {e}")
     
     logger.error(f"Ошибка вызова OpenAI API после {max_retries + 1} попыток: {last_exception}")
+    # W5: call_openai_api's public contract on failure is to return "" rather
+    # than raise, but that means the caller receives a value that is
+    # indistinguishable from "the model legitimately said nothing" unless it
+    # already checks for emptiness itself. Log a WARNING pointing this out
+    # (in addition to the logger.error above, which explains *why* the calls
+    # failed) so this silent-empty-string contract is visible to anyone
+    # grepping logs for a caller that misbehaved on an empty answer.
+    logger.warning("call_openai_api возвращает пустую строку вызывающему коду после исчерпания всех попыток")
     return ""
 
 def call_openai_api_streaming(

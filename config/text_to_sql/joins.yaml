@@ -7,8 +7,8 @@
 #   2. containment-ratio валидатор джойнов |A∩B|/|A| по данным.
 #
 # Фича опт-ин: профиль `default` консервативен (greedy + containment off,
-# поведение пайплайна не меняется), профиль `muni_ru` агрессивнее (граф +
-# containment validate) — паттерн Phase 4.
+# поведение пайплайна не меняется). Более агрессивные настройки (граф +
+# containment validate) задаются доменными подсказками в DSN-профиле.
 #
 # Контракт:
 #   * Корень: `profiles.<name>`. Профиль `default` обязателен.
@@ -45,13 +45,6 @@ profiles:
   default:
     path_algo: greedy
     containment: "off"
-    min_containment: 0.1
-    max_terminals: 8
-    containment_sample: 1000
-
-  muni_ru:
-    path_algo: graph
-    containment: validate
     min_containment: 0.1
     max_terminals: 8
     containment_sample: 1000

@@ -217,10 +217,14 @@ class SchemaEnricher:
                     raise RuntimeError(
                         "call_openai_api is unavailable; cannot enrich schema descriptions"
                     )
+                from agent_command import model_mapping
+                from .llm_models_config import step_model_name
+
                 resp = call_openai_api(
                     prompt=prompt,
                     system_prompt="Ты эксперт по базам данных. Анализируй контекст и генерируй точные описания колонок. Верни только JSON.",
                     max_tokens=16000,
+                    model=model_mapping[step_model_name("schema_enricher")],
                     response_format={"type": "json_object"}
                 )
 

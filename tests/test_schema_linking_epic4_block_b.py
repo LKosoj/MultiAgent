@@ -46,25 +46,64 @@ def _reset_caches(monkeypatch):
     monkeypatch.delenv(_LLM_MODELS_PATH_VAR, raising=False)
     monkeypatch.delenv(_LLM_MODELS_PROFILE_VAR, raising=False)
     monkeypatch.delenv(_NLU_PROFILE_VAR, raising=False)
+    monkeypatch.delenv("TEXT_TO_SQL_NLU_MORPHEMES_PATH", raising=False)
     column_aliases_config.reset_cache()
     main_table_scoring_config.reset_cache()
     llm_models_config.reset_cache()
     nlu_config.reset_cache()
 
 
+_NLU_MORPHEMES_PATH_VAR = "TEXT_TO_SQL_NLU_MORPHEMES_PATH"
+
+# Самодостаточный тестовый RU-набор морфем (не зависит от production yaml,
+# где остался только нейтральный профиль ``default``). Нужен интентам
+# revenue/count/average и dimension "region" для тестов лемматизации ниже.
+_RU_NLU_MORPHEMES_YAML = r"""
+version: 1
+language: ru
+enabled: true
+intents:
+  - canonical: revenue
+    morphemes: ["выруч", "revenue", "amount", "сумм", "доход", "прибыл"]
+dimensions:
+  - canonical: region
+    morphemes: ["регион", "region", "страна", "город", "облас", "край"]
+relative_date:
+  triggers: []
+  periods: []
+  days_pattern: '(\d+)\s*(?:day)'
+patterns:
+  date_iso: []
+  region: []
+  amount_greater: []
+  amount_less: []
+  amount_between: []
+  top_n: []
+order:
+  triggers: []
+  desc_triggers: []
+intent_rules: []
+default_intent: query
+top_n_intent: top_n
+tokenizer:
+  adpositions: []
+"""
+
+
 @pytest.fixture
-def _muni_ru_nlu(monkeypatch):
-    """W3-T1: активирует profiles.muni_ru в nlu_morphemes.yaml.
+def _ru_nlu(tmp_path, monkeypatch):
+    """Подсовывает самодостаточный тестовый RU-набор морфем через путь-override.
 
     Тесты RU-лемматизации (4.13 — детект FK по metadata vs суффикс,
     4.14 — морфема ``выруч`` → canonical ``revenue``) опираются на
-    канонические RU-морфемы. В default-профиле NLU они отсутствуют
-    (W3-T1: профиль default нейтральный), поэтому нужно явно
-    переключиться на ``muni_ru``. Cache nlu_config учитывает имя
-    профиля в cache key (см. NLUMorphemesRegistry.get_or_load),
-    но autouse fixture всё равно сбрасывает кэш до и после теста.
+    канонические RU-морфемы. В default-профиле production yaml их нет
+    (W3-T1: профиль default нейтральный), поэтому подставляем отдельный
+    yaml с нужными морфемами вместо активации несуществующего именованного
+    профиля.
     """
-    monkeypatch.setenv(_NLU_PROFILE_VAR, "muni_ru")
+    cfg_path = tmp_path / "nlu_morphemes.yaml"
+    cfg_path.write_text(_RU_NLU_MORPHEMES_YAML, encoding="utf-8")
+    monkeypatch.setenv(_NLU_MORPHEMES_PATH_VAR, str(cfg_path))
     nlu_config.reset_cache()
     yield
 
@@ -112,7 +151,9 @@ def test_llm_models_config_loader(tmp_path, monkeypatch):
         "      max_tokens: 8000\n"
         "    nlu:\n"
         "      intent_max_tokens: 700\n"
-        "      custom_probe_max_tokens: 1500\n",
+        "      custom_probe_max_tokens: 1500\n"
+        "    step_models:\n"
+        "      schema_linking: model_code\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))
@@ -143,7 +184,7 @@ def test_llm_models_yaml_has_no_dead_nlp_max_tokens_key():
     не даёт ему незаметно вернуться. Грузит реальный yaml через дефолтный
     путь (без env-override) — используем autouse ``_reset_caches``.
     """
-    for profile_name in ("default", "muni_ru"):
+    for profile_name in ("default", "experiment"):
         profile = llm_models_config.get_active_profile(profile_name)
         assert not profile.has("nlu", "nlp_max_tokens"), (
             f"profile '{profile_name}': dead key 'nlp_max_tokens' must not "
@@ -152,12 +193,12 @@ def test_llm_models_yaml_has_no_dead_nlp_max_tokens_key():
 
 
 def test_linking_cache_hash_tracks_llm_model_profile_and_path(monkeypatch):
-    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PROFILE", "experiment")
     monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PATH", "/tmp/models.yaml")
 
     collected = schema_cache._collect_linking_cache_env()
 
-    assert collected["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == "muni_ru"
+    assert collected["TEXT_TO_SQL_LLM_MODELS_PROFILE"] == "experiment"
     assert collected["TEXT_TO_SQL_LLM_MODELS_PATH"] == "/tmp/models.yaml"
     assert "schema-budget" in schema_cache.SCHEMA_LINKING_LOGIC_VERSION
 
@@ -194,13 +235,13 @@ def test_heuristic_linking_no_dead_fallback():
 # ---------------------------------------------------------------------- #
 
 
-def test_fk_detection_via_metadata_not_suffix(_muni_ru_nlu):
+def test_fk_detection_via_metadata_not_suffix(_ru_nlu):
     """Heuristic-выбор измерения избегает FK-колонок по метаданным,
     даже если у них нет суффикса «_id».
 
-    W3-T1: требует RU-лемматизацию (``регион`` → matches ``region``),
-    которая теперь живёт в профиле ``muni_ru`` — см. fixture
-    ``_muni_ru_nlu``.
+    W3-T1: требует RU-лемматизацию (``регион`` → matches ``region``);
+    production-профиль default нейтрален, поэтому тест подставляет свой
+    RU-набор морфем — см. fixture ``_ru_nlu``.
     """
     core = _make_core(relevant_tables=["orders"])
 
@@ -245,16 +286,16 @@ def test_fk_detection_via_metadata_not_suffix(_muni_ru_nlu):
 # ---------------------------------------------------------------------- #
 
 
-def test_token_matching_with_morpheme_lemmatization(_muni_ru_nlu):
+def test_token_matching_with_morpheme_lemmatization(_ru_nlu):
     """Query-токен «выручка» матчит description «revenue» через канон.
 
-    nlu_morphemes.yaml в профиле ``muni_ru`` содержит intent
+    Тестовый RU-набор морфем (fixture ``_ru_nlu``) содержит intent
     canonical=revenue с морфемами [«выруч», «revenue», «amount», «сумм», ...].
     После 4.14 query «выручка» и description-токен «revenue» должны
     нормализоваться в один canonical.
 
     W3-T1: default-профиль NLU теперь нейтральный (без RU-морфем),
-    поэтому тест активирует ``muni_ru`` через fixture ``_muni_ru_nlu``.
+    поэтому тест подставляет свой RU-набор через fixture ``_ru_nlu``.
     """
     core = _make_core()
     table_schema = {
@@ -272,10 +313,38 @@ def test_token_matching_with_morpheme_lemmatization(_muni_ru_nlu):
 # ---------------------------------------------------------------------- #
 
 
-def test_link_filters_via_column_aliases(monkeypatch):
-    """В профиле muni_ru фильтр ``revenue`` должен матчить измерение
+def test_link_filters_via_column_aliases(tmp_path, monkeypatch):
+    """В доменном профиле фильтр ``revenue`` должен матчить измерение
     ``amount`` через алиасы (раньше использовался strict lowercase match)."""
-    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "muni_ru")
+    cfg_path = tmp_path / "column_aliases.yaml"
+    cfg_path.write_text(
+        """
+version: 2
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+profiles:
+  default:
+    aliases: {}
+    type_hints:
+      numeric: []
+      temporal: []
+      identifier: []
+  alt:
+    aliases:
+      revenue:
+        - revenue
+        - amount
+    type_hints:
+      numeric: []
+      temporal: []
+      identifier: []
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(_ALIAS_PATH_VAR, str(cfg_path))
+    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "alt")
     column_aliases_config.reset_cache()
 
     core = _make_core()
@@ -454,7 +523,9 @@ def test_max_tokens_from_llm_models_config(monkeypatch, tmp_path):
         "    sql_generation:\n"
         "      max_tokens: 9999\n"
         "    nlu:\n"
-        "      intent_max_tokens: 700\n",
+        "      intent_max_tokens: 700\n"
+        "    step_models:\n"
+        "      schema_linking: model_code\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))
@@ -498,7 +569,9 @@ def test_mandatory_schema_over_profile_hard_cap_skips_llm(monkeypatch, tmp_path)
         "    sql_generation:\n"
         "      max_tokens: 9999\n"
         "    nlu:\n"
-        "      intent_max_tokens: 700\n",
+        "      intent_max_tokens: 700\n"
+        "    step_models:\n"
+        "      schema_linking: model_code\n",
         encoding="utf-8",
     )
     monkeypatch.setenv(_LLM_MODELS_PATH_VAR, str(cfg_path))

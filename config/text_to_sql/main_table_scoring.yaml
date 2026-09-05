@@ -48,16 +48,3 @@ profiles:
     # main table не угадывается.
     min_score_for_pick: 1
 
-  # ---------------------------------------------------------------
-  # Муниципальный РФ-датасет: пока веса совпадают с default.
-  # Профиль присутствует для совместимости с общей convention
-  # text-to-sql (profiles.default + profiles.muni_ru) и для будущих
-  # доменных override'ов без миграции схемы yaml.
-  # ---------------------------------------------------------------
-  muni_ru:
-    semantic_match_weight: 100
-    pk_weight: 10
-    fk_weight: 5
-    numeric_weight: 3
-    columns_count_weight: 2
-    min_score_for_pick: 1

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 import inspect
-import sqlite3
+import logging
 import time
 from typing import Awaitable, Protocol
 import uuid
@@ -45,6 +45,8 @@ from ._policy_config import (
     _require_model_budget_v2,
     initial_model_budget_state,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class _ModelExecutionClaim(Protocol):
@@ -185,6 +187,43 @@ def reserve_model_call_budget(
             and stored.maximum_output_tokens == maximum_output_tokens
         ):
             return stored
+        if (
+            len(matching) == 1
+            and stored.run_id == run_id
+            and stored.run_incarnation == run_incarnation
+            and stored.request_digest == request_digest
+            and (
+                stored.model_identity != model_identity
+                or stored.policy_digest != policy_digest
+            )
+        ):
+            # Same logical call (identical run/incarnation/request) already has
+            # a durable reservation, but the step's model (or the wider policy
+            # it is pinned to) changed since that reservation was written —
+            # e.g. an operator edited llm_models.yaml/adaptive.yaml between a
+            # crash and the resume that re-entered this exact call_id. Ledger
+            # reservations are immutable (W1 budget contract), so this call_id
+            # can never be admitted again under the new model/policy: resuming
+            # this run is impossible and the ambiguous BUDGET_EXHAUSTED outcome
+            # this used to surface as (via BudgetAdmissionError) gave the
+            # operator no way to tell "budget ran out" apart from "config
+            # changed under a live run". Log loudly and say so explicitly.
+            logger.warning(
+                "model policy changed between incarnations: step call_id=%s "
+                "model_identity %s->%s, policy_digest %s->%s; resume is "
+                "impossible for this run, start a new run",
+                call_id,
+                stored.model_identity,
+                model_identity,
+                stored.policy_digest,
+                policy_digest,
+            )
+            raise BudgetConflictError(
+                "model call reservation's policy changed between "
+                f"incarnations: {call_id} {stored.model_identity}->"
+                f"{model_identity} (policy_digest {stored.policy_digest}->"
+                f"{policy_digest}); resume impossible, start a new run"
+            )
         raise BudgetConflictError("model call identity already has a reservation")
     if any(record.reservation.policy_digest != policy_digest for record in records):
         raise BudgetAdmissionError("model budget ledger policy does not match")
@@ -293,6 +332,13 @@ def _settle_model_result(
     owner_token: str,
     usage: ModelTokenUsage,
 ) -> ModelCallReconciliation:
+    # Lazy import: this module is pulled in by the replay decode path purely
+    # for its policy/budget type definitions, which must stay free of the
+    # sqlite3 runtime dependency (see test_text_to_sql_adaptive_replay_r2.py
+    # fresh-process purity checks). Only this retry path, reached solely by
+    # live ledger writes, needs sqlite3's error types.
+    import sqlite3
+
     result = _model_result(started, claim_generation, usage)
     for attempt in range(2):
         try:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import re
 from collections.abc import Mapping
 from pathlib import Path
@@ -28,11 +29,19 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     load_schema_research_agent_profile,
 )
 from custom_tools.text_to_sql.adaptive.terminal import research_stop_terminal_result
-from custom_tools.text_to_sql.llm_models_config import load_llm_models_config
+from custom_tools.text_to_sql.dsn_glossary import (
+    apply_dsn_glossary,
+    merge_glossary_synonyms_into_schema,
+)
+from custom_tools.text_to_sql.dsn_profile import load_dsn_profile
+from custom_tools.text_to_sql.llm_models_config import (
+    load_llm_models_config,
+    step_model_name,
+)
 from llm_call_context import llm_call_context
 from custom_tools.text_to_sql.nlu import NLUProcessor
 from custom_tools.text_to_sql.schema_enricher import SchemaEnricher
-from custom_tools.text_to_sql.schema_loader import SchemaLoader
+from custom_tools.text_to_sql.schema_loader import LoadedSchema, SchemaLoader
 from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
 from custom_tools.text_to_sql.schema_namespace import SchemaScope
 from custom_tools.text_to_sql.validators.schema_limiter import SchemaLimiter
@@ -41,6 +50,22 @@ from ._text_to_sql_document_authority import (
     live_terminal_document_freshness_context,
 )
 from .text_to_sql_typed_runtime import TextToSqlTypedRuntime
+
+logger = logging.getLogger(__name__)
+
+
+def _dsn_glossary_entries(dsn: str, schema_fingerprint: str):
+    """Return the DSN profile glossary, degrading to empty on a broken file.
+
+    A malformed or foreign ``*.profile.yaml`` must not abort research: the
+    glossary is an optional hint layer, so we log and continue without it.
+    ``TEXT_TO_SQL_DSN_PROFILE_STRICT=1`` still raises through ``RuntimeError``.
+    """
+    try:
+        return load_dsn_profile(dsn, live_schema_fingerprint=schema_fingerprint).glossary
+    except ValueError as error:
+        logger.warning("DSN profile ignored for typed research: %s", error)
+        return ()
 
 
 async def run_typed_schema_research(
@@ -84,6 +109,18 @@ async def run_typed_schema_research(
             raise RuntimeError("Scoped schema snapshot is missing after live load")
         snapshot["schema_info"] = loaded_schema.schema
         schema_loader.file_manager.save_scoped_snapshot(scope, snapshot)
+    # Glossary synonyms are merged after the snapshot is saved so the
+    # "Синонимы: ..." notes never persist into sqlrag/ and re-accumulate.
+    glossary = _dsn_glossary_entries(
+        runtime.dsn, loaded_schema.namespace.schema_fingerprint
+    )
+    if glossary:
+        loaded_schema = LoadedSchema(
+            merge_glossary_synonyms_into_schema(loaded_schema.schema, glossary),
+            loaded_schema.namespace,
+            loaded_schema.source,
+            loaded_schema.semantic_facts,
+        )
     runtime.capture_loaded_schema(loaded_schema)
 
     query_spec = await asyncio.to_thread(
@@ -114,6 +151,7 @@ async def run_typed_schema_research(
         loaded_schema.namespace,
         loaded_schema.semantic_facts,
     )
+    apply_dsn_glossary(memory_manager, loaded_schema, glossary)
     semantic_table_hints = tuple(
         memory_manager.find_semantic_relevant_tables(
             _query_spec_terms(query_spec),
@@ -137,11 +175,23 @@ async def run_typed_schema_research(
     profile = load_schema_research_agent_profile()
     if policy.model_budget is None:
         raise ValueError("Typed research requires a model budget")
+    # getattr, not direct attribute access: some test doubles stub
+    # ``model_budget`` with only ``output_tokens_per_call`` set. Falling
+    # back to ``None`` there just disables retry-usage clamping for this
+    # call (see ``_typed_schema_model``'s ``input_tokens`` docstring),
+    # rather than raising on a shape older callers already relied on.
+    research_input_tokens = getattr(policy.model_budget, "input_tokens_per_call", None)
     model = _research_model(
-        profile.model, policy.model_budget.output_tokens_per_call, runtime.run_id
+        profile.model,
+        policy.model_budget.output_tokens_per_call,
+        runtime.run_id,
+        input_tokens=research_input_tokens,
     )
     stop_review_model = _research_stop_review_model(
-        profile.model, policy.model_budget.output_tokens_per_call, runtime.run_id
+        step_model_name("research_stop_review"),
+        policy.model_budget.output_tokens_per_call,
+        runtime.run_id,
+        input_tokens=research_input_tokens,
     )
     try:
         outcome = await run_production_schema_research(
@@ -282,8 +332,31 @@ def _typed_schema_model(
     response_format: dict[str, object],
     run_id: str | None = None,
     step_name: str | None = None,
+    *,
+    input_tokens: int | None = None,
 ):
+    """Build the schema-research/stop-review model wrapper.
+
+    ``input_tokens`` is the *same* ``policy.model_budget.input_tokens_per_call``
+    the caller used to open the one outstanding ledger reservation this
+    wrapper's provider call runs inside (``research-model-*``/
+    ``research-stop-review-*`` in
+    ``custom_tools/text_to_sql/adaptive/research_loop.py``) -- passing
+    anything else would clamp a retry's summed usage to the wrong cap. It
+    defaults to ``None`` for callers that have no such value in scope,
+    which disables clamping for a retry and falls back to charging
+    only the successful attempt's own usage instead -- see the ``model``
+    closure below.
+    """
+
     from agent_command import create_text_to_sql_model
+    from custom_tools.text_to_sql.adaptive._empty_response_retry import (
+        _is_blank_text,
+        _is_empty,
+        _raw_response_text,
+        retry_once_on_empty_response,
+        sum_model_token_usage,
+    )
 
     provider = create_text_to_sql_model(
         profile_model,
@@ -302,23 +375,30 @@ def _typed_schema_model(
             ),
             ChatMessage(role=MessageRole.USER, content=prompt),
         ]
-        with llm_call_context(run_id=run_id, step_name=step_name):
-            response = await asyncio.to_thread(
-                provider,
-                messages,
-                max_tokens=output_tokens,
-                temperature=0.3,
-                response_format=response_format,
-            )
-        if type(response) in (bytes, str):
-            raw_response = response
-        elif isinstance(response, ChatMessage):
-            raw_response = response.content
-        else:
-            raw_response = None
-        if type(raw_response) not in (bytes, str):
-            raise ValueError("schema-research model response is empty")
-        if not raw_response.strip():
+
+        async def _invoke_provider():
+            with llm_call_context(run_id=run_id, step_name=step_name):
+                return await asyncio.to_thread(
+                    provider,
+                    messages,
+                    max_tokens=output_tokens,
+                    temperature=0.3,
+                    response_format=response_format,
+                )
+
+        # A retry (on an empty response) is a second *provider* call for
+        # this same logical model call, made from inside whichever ledger
+        # reservation the caller already holds open (research_loop.py's
+        # ``research-model-*``/``research-stop-review-*``) -- it must not
+        # open a second, nested reservation of its own. See
+        # custom_tools/text_to_sql/adaptive/_empty_response_retry.py.
+        response, attempts = await retry_once_on_empty_response(
+            _invoke_provider,
+            is_empty=lambda candidate: _is_blank_text(_raw_response_text(candidate)),
+            log_context=f"{step_name} (run_id={run_id})",
+        )
+        raw_response = _raw_response_text(response)
+        if _is_empty(raw_response):
             raise ValueError("schema-research model response is empty")
         response_size = (
             len(raw_response)
@@ -327,26 +407,64 @@ def _typed_schema_model(
         )
         if response_size > max(1_024, output_tokens * 8):
             raise ValueError("schema-research model response is too large")
+        if len(attempts) == 1:
+            # No retry happened: charge the provider's usage as-is so a
+            # genuine cap overshoot still surfaces at reconciliation.
+            usage = _provider_model_usage(attempts[0])
+        elif input_tokens is None:
+            # The caller did not supply this call's reservation cap (see the
+            # ``input_tokens`` docstring above), so summing both attempts'
+            # usage here could overshoot an unseen cap and make
+            # reconciliation fail unrecoverably (see
+            # custom_tools/text_to_sql/adaptive/_empty_response_retry.py).
+            # Charge only the successful attempt's own usage instead: that
+            # alone is exactly what a non-retried call would have charged,
+            # so it is guaranteed to fit under the cap. The wasted empty
+            # attempt's tokens are simply not charged at all.
+            logger.warning(
+                "%s: retried usage cap is unavailable to this wrapper; "
+                "charging only the successful attempt, not the sum across "
+                "both attempts",
+                step_name,
+            )
+            usage = _provider_model_usage(attempts[-1])
+        else:
+            usage = sum_model_token_usage(
+                tuple(_provider_model_usage(attempt) for attempt in attempts),
+                max_input_tokens=input_tokens,
+                max_output_tokens=output_tokens,
+            )
         return SchemaResearchModelResponse(
             raw_response=raw_response,
-            usage=_provider_model_usage(response),
+            usage=usage,
         )
 
     return model
 
 
-def _research_model(profile_model: str, output_tokens: int, run_id: str | None = None):
+def _research_model(
+    profile_model: str,
+    output_tokens: int,
+    run_id: str | None = None,
+    *,
+    input_tokens: int | None = None,
+):
     return _typed_schema_model(
         profile_model,
         output_tokens,
         _typed_response_format(ResearchDecisionV1, "ResearchDecisionV1"),
         run_id,
         "schema-research",
+        input_tokens=input_tokens,
     )
 
 
 def _research_stop_review_model(
-    profile_model: str, output_tokens: int, run_id: str | None = None
+    profile_model: str,
+    output_tokens: int,
+    run_id: str | None = None,
+    *,
+    input_tokens: int | None = None,
 ):
     return _typed_schema_model(
         profile_model,
@@ -354,6 +472,7 @@ def _research_stop_review_model(
         _typed_response_format(ResearchStopReview, "ResearchStopReview"),
         run_id,
         "schema-research-stop-review",
+        input_tokens=input_tokens,
     )
 
 

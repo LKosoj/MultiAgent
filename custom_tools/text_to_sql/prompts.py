@@ -4,7 +4,11 @@ LLM промпт-билдеры для различных этапов Text-to-S
 import json
 from typing import Dict, Any, List, Optional
 from .dialects import get_current_dialect_label
-from .schema_linking_examples_config import compose_schema_linking_domain_examples
+from .dsn_profile import MetricHints, load_dsn_profile_or_empty
+from .schema_linking_examples_config import (
+    compose_schema_linking_domain_examples,
+    render_schema_linking_domain_examples,
+)
 from .pii_categories_config import compose_pii_description
 from .utils import redact_text_to_sql_value
 
@@ -386,24 +390,88 @@ def build_nlp_prompt(text: str) -> str:
     )
 
 
+def _compose_domain_examples_from_metric_hints(metric_hints: MetricHints) -> str:
+    """Тот же текстовый формат, что ``compose_schema_linking_domain_examples``,
+    но из ``DsnProfile.metric_hints`` (per-DSN профиль) вместо именованного
+    профиля yaml. Источник данных разный (per-DSN yaml vs именованный
+    профиль), но рендер общий — см. ``render_schema_linking_domain_examples``.
+    """
+    return render_schema_linking_domain_examples(
+        list(metric_hints.priority_id_columns),
+        list(metric_hints.low_priority_name_columns),
+        [
+            (rule.id_column, rule.ignore_column)
+            for rule in metric_hints.prefer_id_over_name_rules
+        ],
+    )
+
+
+def _resolve_schema_linking_domain_examples(
+    profile: Optional[str],
+    dsn: Optional[str],
+    schema_fingerprint: Optional[str] = None,
+) -> str:
+    """DSN-профиль (per-database yaml) приоритетнее именованного профиля.
+
+    Если ``dsn`` задан и для него существует непустой ``metric_hints`` в
+    ``sqlrag/<dsn>.profile.yaml`` — используем его. Иначе поведение не
+    меняется: именованный профиль (``profile`` / env / ``default``).
+
+    ``schema_fingerprint`` (если известен вызывающей стороне, например
+    ``SchemaNamespace.schema_fingerprint``) пробрасывается в
+    ``load_dsn_profile`` как ``live_schema_fingerprint`` — иначе проверка
+    устаревания профиля (``schema_namespace_version``) никогда не срабатывает.
+
+    Битый/чужой DSN-профиль (``ValueError``: невалидный yaml, чужой
+    ``dsn_fingerprint`` и т.п.) не должен ронять весь schema-linking —
+    деградируем на именованный профиль с warning (см.
+    ``dsn_profile.load_dsn_profile_or_empty`` — общий хелпер, используемый
+    также ``dsn_profile_overrides._safe_load_dsn_profile``). ``RuntimeError``
+    (устаревший профиль при ``TEXT_TO_SQL_DSN_PROFILE_STRICT=1``)
+    пробрасывается дальше — это осознанный fail-fast режим оператора.
+    """
+    hints = load_dsn_profile_or_empty(
+        dsn,
+        live_schema_fingerprint=schema_fingerprint,
+        purpose="schema_linking_prompt",
+    ).metric_hints
+    # Намеренно не используем ``MetricHints.is_empty()`` целиком: он также
+    # учитывает ``significant_columns``, который этот промпт не рендерит
+    # (адресован другому будущему потребителю). Гейт — только по полям,
+    # которые реально попадают в текст ниже.
+    if hints.priority_id_columns or hints.low_priority_name_columns or hints.prefer_id_over_name_rules:
+        return _compose_domain_examples_from_metric_hints(hints)
+    return compose_schema_linking_domain_examples(profile)
+
+
 def build_schema_linking_prompt(
     entities: Dict[str, Any],
     schema_str: str,
     profile: Optional[str] = None,
     dsn: Optional[str] = None,
+    schema_fingerprint: Optional[str] = None,
 ) -> str:
     """Промпт для сопоставления сущностей со схемой БД.
 
-    Конкретные имена колонок конкретного датасета в шаблоне не зашиты —
-    они подгружаются из yaml-конфига
-    ``config/text_to_sql/prompts/schema_linking_examples.yaml`` через
-    выбранный профиль. По умолчанию используется пустой профиль
-    ``default`` (доменных строк в промпт не добавляется); другие профили
-    выбираются через аргумент ``profile`` или env
-    ``TEXT_TO_SQL_SCHEMA_LINKING_PROFILE``.
+    Конкретные имена колонок конкретного датасета в шаблоне не зашиты.
+    Источник доменных подсказок (в порядке приоритета):
+      1. DSN-профиль ``sqlrag/<dsn>.profile.yaml`` (см. ``dsn_profile.py``),
+         если для переданного ``dsn`` файл существует и его ``metric_hints``
+         непусты;
+      2. именованный профиль yaml-конфига
+         ``config/text_to_sql/prompts/schema_linking_examples.yaml``,
+         выбранный через аргумент ``profile`` или env
+         ``TEXT_TO_SQL_SCHEMA_LINKING_PROFILE`` (по умолчанию — пустой
+         ``default``, доменных строк в промпт не добавляется).
+
+    ``schema_fingerprint`` — текущий fingerprint живой схемы (например,
+    ``SchemaNamespace.schema_fingerprint``), используется для проверки
+    устаревания DSN-профиля (см. ``_resolve_schema_linking_domain_examples``).
     """
     dialect_label = get_current_dialect_label(dsn, strict=bool(dsn and str(dsn).strip()))
-    domain_examples_block = compose_schema_linking_domain_examples(profile)
+    domain_examples_block = _resolve_schema_linking_domain_examples(
+        profile, dsn, schema_fingerprint
+    )
     safe_entities = _redact_prompt_value(entities)
     safe_schema_str = _redact_prompt_value(schema_str)
     return (

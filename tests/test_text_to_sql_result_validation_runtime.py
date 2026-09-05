@@ -471,6 +471,7 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
         "source_id",
         "repair_kind",
         "repair_binding_id",
+        "predicate_authority",
     ]
     assert response_format["json_schema"]["schema"]["properties"]["source_id"] == {
         "anyOf": [
@@ -506,6 +507,68 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
     assert expired_receipt.evidence_id is None
     assert len(provider_calls) == 1
     assert len(review_calls) == 1
+
+
+def test_result_review_runtime_reads_model_from_step_models_registry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """W1-1.1: result_review model alias comes from ``llm_models.yaml::step_models``.
+
+    Regression companion to
+    ``test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_call``
+    (asserts the *default* alias stays ``model_hard``, unaffected by this change).
+    This test proves the alias is actually read from the registry: overriding
+    ``step_models.result_review`` to ``model_lite`` changes the alias passed to
+    ``create_text_to_sql_model``.
+    """
+    import agent_command
+    import utils
+    from custom_tools.text_to_sql import llm_models_config
+
+    cfg_path = tmp_path / "llm_models.yaml"
+    cfg_path.write_text(
+        "version: 1\n"
+        "profiles:\n"
+        "  default:\n"
+        "    schema_linking: {}\n"
+        "    sql_generation: {}\n"
+        "    nlu: {}\n"
+        "    step_models:\n"
+        "      result_review: model_lite\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PATH", str(cfg_path))
+    llm_models_config.reset_cache()
+    try:
+        runtime, _ = _runtime_with_persisted_candidate(tmp_path / "registry-override")
+        runtime.verified_research_policy = load_adaptive_policy_config()
+
+        provider_names: list[str] = []
+        monkeypatch.setattr(
+            agent_command,
+            "create_text_to_sql_model",
+            lambda name, **kwargs: (provider_names.append(name), object())[-1],
+        )
+        monkeypatch.setattr(
+            utils,
+            "call_openai_api",
+            lambda **_kwargs: '{"status":"consistent","reason":"matches"}',
+        )
+
+        capability = build_result_review_runtime(runtime, sql_query=VALID_SQL)
+        assert capability is not INVALID_RESULT_REVIEW_RUNTIME
+        evaluate_result_review_capability(
+            capability,
+            expected_run_id=runtime.run_id,
+            expected_sql=VALID_SQL,
+            execution=_successful_execution(),
+        )
+
+        assert provider_names == ["model_lite"]
+    finally:
+        monkeypatch.delenv("TEXT_TO_SQL_LLM_MODELS_PATH", raising=False)
+        llm_models_config.reset_cache()
 
 
 def test_enhanced_engine_installs_result_validation_metadata_fail_closed(tmp_path) -> None:

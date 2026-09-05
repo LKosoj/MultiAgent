@@ -4,13 +4,25 @@
 # Override path via env TEXT_TO_SQL_LLM_MODELS_PATH.
 # Override profile via env TEXT_TO_SQL_LLM_MODELS_PROFILE.
 #
-# Назначение секций (см. EPIC 4 / 4.17, W6-T3):
+# Назначение секций (см. EPIC 4 / 4.17, W6-T3; W1-1.1 для step_models):
 #   * schema_linking — параметры LLM-запросов внутри schema_linking pipeline
 #     (custom_tools/text_to_sql/schema_linking/strategies.py::llm_linking)
 #   * sql_generation — параметры LLM-запросов в SQL-генераторе
 #     (custom_tools/text_to_sql/sql_generator.py)
 #   * nlu — параметры LLM-запросов NLU (intent extraction, tokenization и
 #     adaptive query understanding), custom_tools/text_to_sql/nlu.py.
+#   * step_models — реестр «шаг пайплайна → класс модели» (W1-1.1).
+#     Значения — имена классов моделей (alias) из agent_command.py::_MODEL_CONFIGS
+#     (model_search/model_lite/model_code/model_hard/model_summary/model_big/
+#     model_vision/model_reranker/model_ultimate). Ключи schema_research и
+#     sql_solver — зеркала model из agent_profiles/schema_research_agent.yaml
+#     и agent_profiles/sql_solver_agent.yaml соответственно: источник истины
+#     для этих двух шагов — сам agent-профиль, а не этот реестр; синхронность
+#     проверяется контракт-тестом (tests/test_text_to_sql_step_models_registry.py).
+#     Остальные ключи (research_stop_review, result_review, safety_llm_audit,
+#     nlu_query_understanding, nlu_completeness, nlu_intent, schema_enricher,
+#     schema_linking, sql_generation) проводятся в код через
+#     custom_tools/text_to_sql/llm_models_config.py::step_model_name.
 #
 # Дефолтный профиль содержит безопасные общие значения; конкретные
 # домены/датасеты могут переопределять их в своих профилях.
@@ -26,13 +38,69 @@ profiles:
     nlu:
       intent_max_tokens: 800
       query_understanding_max_tokens: 16000
+    step_models:
+      schema_research: model_code
+      sql_solver: model_code
+      research_stop_review: model_code
+      result_review: model_hard
+      safety_llm_audit: model_code
+      nlu_query_understanding: model_code
+      nlu_completeness: model_code
+      nlu_intent: model_code
+      schema_enricher: model_code
+      schema_linking: model_code
+      sql_generation: model_code
 
-  # muni_ru: копия default — зарезервирован для тюнинга под муниципальный
-  # РФ-датасет. Добавлен для симметрии с остальными text-to-sql конфигами
-  # (similarity_thresholds, main_table_scoring и т.д.), все из которых
-  # содержат профиль muni_ru. Без этого профиля TEXT_TO_SQL_LLM_MODELS_PROFILE=muni_ru
-  # даёт KeyError при get_active_profile().
-  muni_ru:
+  # experiment (W5, training-free): та же схема секций, что и default
+  # — правится ТОЛЬКО step_models, схема_linking/sql_generation/nlu не
+  # трогаем, чтобы разница в поведении объяснялась исключительно классом
+  # модели по шагу. Активируется явно через env
+  # TEXT_TO_SQL_LLM_MODELS_PROFILE=experiment (по умолчанию бенчмарк и прод
+  # используют "default" — см. canonical_runtime_environment).
+  #
+  # Что меняется и почему (переводим на model_lite только шаги, у которых
+  # ОБА признака сразу: (a) ответ — untyped json_object, не строгий
+  # json_schema с контрактной валидацией, и (b) ошибка/деградация шага
+  # fail-open — пайплайн не останавливается, а просто теряет точность
+  # совета/классификации):
+  #   * research_stop_review — независимая проверка «хватит ли данных
+  #     research, чтобы остановиться» (json_object). Ledger-identity вызова
+  #     привязана к profile.model основного research (не к этому ключу),
+  #     так что смена модели здесь не путает бюджетный/replay-учёт
+  #     (см. docs/operations/text2sql-tuning-knobs.md, раздел 2).
+  #     Измерить: число итераций research + доля BUDGET_EXHAUSTED/
+  #     STAGNATED в исходах прогона на experiment vs default.
+  #   * result_review — пост-исполнительная сверка результата запроса
+  #     (строгий json_schema, но статус НЕ блокирует финализацию SQL:
+  #     провал сверки просто помечает кандидат как "contradicted"/
+  #     "malformed", соседний шаг пере-предлагает SQL). Единственное
+  #     исключение из правила «строгий json_schema — не трогаем»: сверка
+  #     дешевле генерации (короткий verdict, не SQL), поэтому кандидат на
+  #     облегчение всё равно.
+  #     Измерить: доля verdict="contradicted"/"malformed" (ложные срабатывания
+  #     сверки) в отчёте бенчмарка.
+  #   * safety_llm_audit — документирован как советующий (advisory),
+  #     не блокирующий: провал/таймаут аудита пишется как неблокирующий
+  #     LLM_AUDIT_TIMEOUT/LLM_AUDIT_FAILED в advisory_issues, статический
+  #     слой безопасности остаётся обязательным и не зависит от этого шага
+  #     (custom_tools/text_to_sql/core/_sql_generation_api.py).
+  #     Измерить: долю advisory_issues с issue_type LLM_AUDIT_* и полноту
+  #     находок (сверить с ручным разбором выборки SQL).
+  #
+  # Не трогаем (остаются как в default, наследуются копированием значения):
+  #   * schema_research/sql_solver — зеркала agent_profiles/*.yaml, источник
+  #     истины не этот yaml (контракт-тест test_text_to_sql_step_models_registry).
+  #   * nlu_intent — НЕ понижаем: fail-open здесь работает только при явном
+  #     TEXT_TO_SQL_NLU_ALLOW_FALLBACKS=1 (custom_tools/text_to_sql/nlu.py,
+  #     ``_fallback_extract_intent``); по умолчанию (0) ошибка/деградация
+  #     LLM на этом шаге поднимает RuntimeError, а не деградирует изящно, так
+  #     что этот шаг не удовлетворяет признаку (b) выше и остаётся на
+  #     default.
+  #   * nlu_query_understanding/nlu_completeness — не fail-open (см. выше).
+  #   * schema_enricher/schema_linking/sql_generation — это шаги генерации
+  #     контента (описания колонок / связывание сущностей / сам SQL), не
+  #     верификация/классификация, ошибка здесь не деградирует изящно.
+  experiment:
     schema_linking:
       max_tokens: 20000
       schema_prompt_hard_max_chars: 32000
@@ -41,3 +109,15 @@ profiles:
     nlu:
       intent_max_tokens: 800
       query_understanding_max_tokens: 16000
+    step_models:
+      schema_research: model_code
+      sql_solver: model_code
+      research_stop_review: model_lite
+      result_review: model_lite
+      safety_llm_audit: model_lite
+      nlu_query_understanding: model_code
+      nlu_completeness: model_code
+      nlu_intent: model_code
+      schema_enricher: model_code
+      schema_linking: model_code
+      sql_generation: model_code

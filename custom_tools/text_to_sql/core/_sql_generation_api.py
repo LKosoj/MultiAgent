@@ -109,6 +109,13 @@ _LLM_SAFETY_TIMEOUT_CACHE: "OrderedDict[str, float]" = OrderedDict()
 # и как fail-safe значение при некорректной конфигурации (см. ниже).
 _LLM_SAFETY_TIMEOUT_NEGATIVE_TTL_DEFAULT_S = 0.0
 
+# W0-0.5 review: эти имена зарезервированы под сентинелы деградации самого
+# LLM-аудита (см. except-ветки в sql_safety_check ниже). Свободный
+# issue_type от модели (промпт не ограничивает набор) не должен коллизировать
+# с ними, иначе адаптер checks.py::adapt_safety_check_result перепутает
+# успешный аудит со сбоем.
+_LLM_AUDIT_SENTINEL_ISSUE_TYPES = frozenset({"LLM_AUDIT_FAILED", "LLM_AUDIT_TIMEOUT"})
+
 
 def _get_llm_safety_timeout_negative_ttl_s() -> float:
     # Fail-safe: этот геттер вызывается из negative-TTL путей (cache_check вне
@@ -391,11 +398,15 @@ def _run_llm_safety_audit(sql_query: str, dsn: Optional[str] = None) -> Dict[str
     if call_openai_api is None:
         raise RuntimeError("call_openai_api is not available for LLM safety audit")
 
+    from agent_command import model_mapping
+    from ..llm_models_config import step_model_name
+
     prompt = build_sql_safety_prompt(sql_query, dsn=dsn)
     resp = call_openai_api(
         prompt=prompt,
         system_prompt="Ты SQL-аудитор. Ищи уязвимости и узкие места. Верни только JSON.",
         max_tokens=2000,
+        model=model_mapping[step_model_name("safety_llm_audit")],
         response_format={"type": "json_object"},
     )
     from ..utils import parse_llm_json_response
@@ -851,8 +862,15 @@ def sql_safety_check(
         if isinstance(llm_issues, list):
             for item in llm_issues:
                 if isinstance(item, dict) and item.get("issue_type") and item.get("description"):
+                    # W0-0.5 review: если свободный issue_type модели совпал бы
+                    # с зарезервированным сентинелом деградации аудита, адаптер
+                    # (checks.py::adapt_safety_check_result) принял бы успешный
+                    # аудит за сбой. Переименовываем находку, не теряя её.
+                    llm_issue_type = f"LLM_{item['issue_type']}"
+                    if llm_issue_type in _LLM_AUDIT_SENTINEL_ISSUE_TYPES:
+                        llm_issue_type = f"LLM_FINDING_{item['issue_type']}"
                     advisory_issues.append({
-                        "issue_type": f"LLM_{item['issue_type']}",
+                        "issue_type": llm_issue_type,
                         "description": item["description"],
                         "blocking": False,
                     })

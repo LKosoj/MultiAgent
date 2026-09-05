@@ -648,6 +648,7 @@ def _apply_text_to_sql_terminal_failure(
                     else {"status": "not_attempted"}
                 ),
                 "ambiguity": None,
+                "provenance": source.get("provenance", {}),
             }).to_mapping()
         status, _success = _terminal_legacy_fields(terminal_outcome)
         public_error = terminal_outcome.get("error")
@@ -915,6 +916,7 @@ def _build_text_to_sql_no_runtime_terminal(
             "persistence": {"status": "not_attempted"},
             "result_review": {},
             "ambiguity": None,
+            "provenance": {},
         }
     ).to_mapping()
 

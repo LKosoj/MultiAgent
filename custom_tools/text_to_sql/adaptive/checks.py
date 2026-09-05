@@ -194,7 +194,7 @@ def adapt_safety_check_result(
         if type(is_safe) is not bool:
             raise TypeError("is_safe must be a boolean")
         issue_types = _issue_types(result["issues"])
-        _issue_types(result["advisory_issues"], advisory=True)
+        advisory_issue_types = _issue_types(result["advisory_issues"], advisory=True)
         status = result["safety_status"]
         audit = result["llm_audit"]
         if type(status) is not str or type(audit) is not str:
@@ -217,15 +217,19 @@ def adapt_safety_check_result(
             or not result["policy_version"].strip()
         ):
             raise ValueError("static safety metadata is invalid")
-        llm_issue_types = set(issue_types).intersection(
+        # W0-0.5: продюсер (_sql_generation_api.py::sql_safety_check) устроен
+        # по принципу fail-open — сбой самого LLM-аудита живёт ТОЛЬКО как
+        # non-blocking LLM_AUDIT_FAILED/LLM_AUDIT_TIMEOUT в advisory_issues,
+        # а не как блокирующий issue.
+        advisory_llm_types = set(advisory_issue_types).intersection(
             {"LLM_AUDIT_FAILED", "LLM_AUDIT_TIMEOUT"}
         )
-        expected_llm_issue_types = {
+        expected_advisory_llm_types = {
             "failed": {"LLM_AUDIT_FAILED"},
             "timeout": {"LLM_AUDIT_TIMEOUT"},
         }.get(audit, set())
-        if llm_issue_types != expected_llm_issue_types:
-            raise ValueError("LLM audit state contradicts its issue type")
+        if advisory_llm_types != expected_advisory_llm_types:
+            raise ValueError("LLM audit state contradicts its advisory issue type")
         if is_safe:
             if (
                 issue_types
@@ -234,23 +238,20 @@ def adapt_safety_check_result(
                 not in {
                     "ok",
                     "skipped_static_only",
+                    "failed",
+                    "timeout",
                 }
             ):
                 raise ValueError("safe result carries a blocking failure")
             return _passed(candidate_id, CheckKind.SAFETY)
-        if not issue_types or (status, audit) not in {
-            ("unsafe", "skipped_static_unsafe"),
-            ("failed", "failed"),
-            ("failed", "timeout"),
-        }:
-            raise ValueError("unsafe result lacks one native failure state")
-        if _timeout_only(issue_types):
-            return _inconclusive(
-                candidate_id,
-                CheckKind.SAFETY,
-                CheckFailureCode.CHECK_TIMEOUT,
-                _summary(issue_types),
+        if (
+            not issue_types
+            or (status, audit) != ("unsafe", "skipped_static_unsafe")
+            or set(issue_types).intersection(
+                {"LLM_AUDIT_FAILED", "LLM_AUDIT_TIMEOUT"}
             )
+        ):
+            raise ValueError("unsafe result lacks the native static-reject state")
         return _failed(
             candidate_id,
             CheckKind.SAFETY,

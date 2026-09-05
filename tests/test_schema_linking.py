@@ -3,18 +3,45 @@ import json
 from custom_tools.sql_tools import schema_linking
 
 
-def test_schema_linking_generates_join_sqlite(monkeypatch):
+def test_schema_linking_generates_join_sqlite(tmp_path, monkeypatch):
     # Устанавливаем SQLite диалект
     monkeypatch.setenv("DB_DSN", "sqlite:///tmp/test.db")
     # Отключаем LLM для стабильности теста
     monkeypatch.setenv("SCHEMA_LINKING_USE_LLM", "0")
     monkeypatch.setenv("SCHEMA_LINKING_ALLOW_FALLBACKS", "1")
     # После T4.2 «revenue → amount», «region → region_id» — не дефолтная
-    # эвристика, а доменный профиль. Включаем muni_ru — регрессионный
-    # safety-net для пользовательского датасета.
-    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PROFILE", "muni_ru")
+    # эвристика, а доменный профиль. Пишем свой тестовый профиль (домен
+    # больше не хранится в этом yaml — он переехал в DSN-профиль) —
+    # регрессионный safety-net для алиас-логики best_column_for.
     from custom_tools.text_to_sql import column_aliases_config
+    custom_yaml = tmp_path / "column_aliases.yaml"
+    custom_yaml.write_text(
+        """
+version: 2
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+profiles:
+  default:
+    aliases: {}
+  alt:
+    aliases:
+      revenue: [revenue, amount, total]
+      region: [region, region_name, region_id]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PATH", str(custom_yaml))
+    monkeypatch.setenv("TEXT_TO_SQL_COLUMN_ALIASES_PROFILE", "alt")
     column_aliases_config.reset_cache()
+    # Schema-linking RAG-кэш (постоянная память) не учитывает содержимое
+    # TEXT_TO_SQL_COLUMN_ALIASES_PATH в своём ключе — только имя профиля.
+    # Чистим кэш для этого DSN, чтобы тест не зависел от результатов чужих
+    # прогонов с тем же DSN/профилем.
+    from custom_tools.sql_tools import purge_schema_linking_rag_cache
+    from custom_tools.text_to_sql.utils import dsn_to_sanitized_name
+    purge_schema_linking_rag_cache(session_id=dsn_to_sanitized_name("sqlite:///tmp/test.db"))
     entities = {
         "metrics": ["revenue"],
         "dimensions": ["region"],

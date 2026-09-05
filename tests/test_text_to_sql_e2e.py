@@ -83,6 +83,7 @@ def engine_with_stubs(monkeypatch):
                 "columns": ["total"],
                 "rows_affected": 1,
                 "error": None,
+                "ambiguity": None,
                 "execution": {
                     "success": True,
                     "sql_query": SQL,
@@ -100,6 +101,8 @@ def engine_with_stubs(monkeypatch):
                     "filename": "query.md",
                     "path": "/tmp/query.md",
                 },
+                "result_review": {},
+                "provenance": {},
             }
         raise AssertionError(f"unexpected tool step: {step.id}")
 

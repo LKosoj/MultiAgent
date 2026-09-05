@@ -1449,6 +1449,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--official-evaluator-image-identity", type=Path)
     parser.add_argument("--model-api-base")
     parser.add_argument("--model-backend-id")
+    parser.add_argument("--llm-models-profile", default=None)
     return parser
 
 

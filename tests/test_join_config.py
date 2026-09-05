@@ -3,7 +3,7 @@
 
 Покрывают:
   * загрузку default-профиля из репо-yaml (greedy/off/0.1/8/1000);
-  * агрессивный muni_ru (graph/validate);
+  * произвольный именованный профиль с агрессивными настройками (graph/validate);
   * парсинг `"off"` как строки, а не bool;
   * env-оверрайд каждого ключа (env > yaml), пустой env → yaml;
   * профиль-env + value-env (value побеждает);
@@ -44,6 +44,29 @@ def _write_yaml(tmp_path: Path, body: str) -> Path:
     return path
 
 
+def _write_aggressive_profile_yaml(tmp_path: Path) -> Path:
+    """yaml с default (greedy/off) + именованным профилем ``alt`` (graph/validate)."""
+    return _write_yaml(
+        tmp_path,
+        """
+profiles:
+  default:
+    path_algo: greedy
+    containment: "off"
+    min_containment: 0.1
+    max_terminals: 8
+    containment_sample: 1000
+
+  alt:
+    path_algo: graph
+    containment: validate
+    min_containment: 0.1
+    max_terminals: 8
+    containment_sample: 1000
+""",
+    )
+
+
 # --- загрузка из репо-yaml --------------------------------------------------
 
 
@@ -58,26 +81,30 @@ def test_loads_default_profile_from_repo_yaml():
     assert profile.containment_sample == 1000
 
 
-def test_muni_ru_is_aggressive(monkeypatch):
-    """Профиль muni_ru включает граф и containment validate."""
-    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "muni_ru")
+def test_named_profile_is_aggressive(tmp_path, monkeypatch):
+    """Именованный профиль может включать граф и containment validate."""
+    yaml_path = _write_aggressive_profile_yaml(tmp_path)
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PATH", str(yaml_path))
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "alt")
     jc.reset_cache()
-    assert jc.resolve_active_profile() == "muni_ru"
+    assert jc.resolve_active_profile() == "alt"
     profile = jc.load_join_config()
-    assert profile.name == "muni_ru"
+    assert profile.name == "alt"
     assert profile.path_algo == "graph"
     assert profile.containment == "validate"
 
 
-def test_umbrella_text2sql_profile_selects_muni_ru(monkeypatch):
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+def test_umbrella_text2sql_profile_selects_named_profile(tmp_path, monkeypatch):
+    yaml_path = _write_aggressive_profile_yaml(tmp_path)
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PATH", str(yaml_path))
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "alt")
     jc.reset_cache()
-    assert jc.resolve_active_profile() == "muni_ru"
+    assert jc.resolve_active_profile() == "alt"
     assert jc.load_join_config().path_algo == "graph"
 
 
 def test_specific_join_profile_env_wins_over_umbrella(monkeypatch):
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "ignored_profile")
     monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "default")
     jc.reset_cache()
     assert jc.resolve_active_profile() == "default"
@@ -135,12 +162,14 @@ def test_empty_env_falls_back_to_yaml(monkeypatch):
 # --- профиль-env + value-env (value побеждает) ------------------------------
 
 
-def test_value_env_wins_over_profile_env(monkeypatch):
-    """Профиль muni_ru даёт graph, но per-key env переопределяет на greedy."""
-    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "muni_ru")
+def test_value_env_wins_over_profile_env(tmp_path, monkeypatch):
+    """Именованный профиль даёт graph, но per-key env переопределяет на greedy."""
+    yaml_path = _write_aggressive_profile_yaml(tmp_path)
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PATH", str(yaml_path))
+    monkeypatch.setenv("TEXT_TO_SQL_JOINS_PROFILE", "alt")
     monkeypatch.setenv("TEXT_TO_SQL_JOIN_PATH_ALGO", "greedy")
     jc.reset_cache()
-    # профиль активный — muni_ru (graph), но value-env побеждает
+    # профиль активный — alt (graph), но value-env побеждает
     assert jc.load_join_config().path_algo == "graph"
     assert jc.resolve_path_algo() == "greedy"
 
@@ -171,7 +200,7 @@ def test_profiles_must_contain_default(tmp_path, monkeypatch):
         tmp_path,
         """
 profiles:
-  muni_ru:
+  alt:
     path_algo: graph
     containment: validate
     min_containment: 0.1

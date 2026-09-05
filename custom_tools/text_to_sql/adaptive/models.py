@@ -1051,6 +1051,17 @@ class SolverAction(StrictModel):
         return self
 
 
+class SimilarSuccessfulSqlExample(StrictModel):
+    """One cross-run successful-SQL memory hit, bound into the solver prompt.
+
+    Untrusted retrieval data (see successful_sql_memory.py): the solver agent
+    profile treats everything inside ``solver_context`` as untrusted input.
+    """
+
+    user_query: NonEmptyText
+    sql: NonEmptyText
+
+
 class SolverState(ContractModel):
     contract_name: Literal["solver_state"] = "solver_state"
     schema_namespace_version: Digest
@@ -1060,6 +1071,7 @@ class SolverState(ContractModel):
     execution_results: tuple[ExecutionResult, ...]
     missing_evidence_requests: tuple[MissingEvidenceRequest, ...]
     research_reentries: tuple[ResearchReentryRecord, ...] = ()
+    similar_successful_sql_examples: tuple[SimilarSuccessfulSqlExample, ...] = ()
     action_history: tuple[SolverAction, ...]
     selected_candidate_id: Id | None
     stop_reason: SolverStopReason | None
@@ -1092,6 +1104,23 @@ class SolverState(ContractModel):
             "research_reentry_id",
             "research_reentries",
         )
+        failed_check_candidate_ids = {
+            check.candidate_id
+            for check in self.check_results
+            if check.status is CheckStatus.FAILED
+        }
+        digest_seen: dict[str, str] = {}
+        for candidate in self.sql_candidates:
+            digest = candidate.normalized_ast_digest
+            prior_candidate_id = digest_seen.get(digest)
+            if (
+                prior_candidate_id is not None
+                and prior_candidate_id not in failed_check_candidate_ids
+            ):
+                raise ValueError(
+                    "SolverState normalized_ast_digest must be globally unique"
+                )
+            digest_seen[digest] = candidate.candidate_id
         if len(self.sql_candidates) > 8:
             raise ValueError("SolverState supports at most 8 SQL candidates")
         execution_candidate_ids = tuple(

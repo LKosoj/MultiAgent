@@ -12,9 +12,11 @@ from typing import Any
 import pytest
 import yaml
 
+from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
 from custom_tools.text_to_sql.adaptive.sql_solver_agent import (
     SQL_SOLVER_AGENT_PROFILE_PATH,
     SqlSolverAgentProfile,
+    SqlSolverModelResponse,
     SqlSolverModelResponseError,
     SqlSolverProposalAdapter,
     build_sql_solver_prompt,
@@ -129,6 +131,74 @@ def test_adapter_rejects_noncanonical_answer_wrapper(response: bytes | str) -> N
         )
 
     assert len(model.prompts) == 1
+
+
+def test_propose_with_usage_returns_reported_usage() -> None:
+    model = _AsyncRecordingModel(
+        SqlSolverModelResponse(
+            raw_response=_payload(), usage=ModelTokenUsage(input_tokens=5, output_tokens=3)
+        )
+    )
+
+    proposal, usage = asyncio.run(
+        _adapter(model).propose_with_usage(
+            task="Count orders.",
+            solver_context="Known table: orders.",
+            deadline=_deadline(),
+        )
+    )
+
+    assert proposal.proposal.sql == "SELECT 1"
+    assert usage == ModelTokenUsage(input_tokens=5, output_tokens=3)
+
+
+def test_propose_with_usage_defaults_to_unknown_usage_for_bare_text() -> None:
+    model = _AsyncRecordingModel(_payload())
+
+    proposal, usage = asyncio.run(
+        _adapter(model).propose_with_usage(
+            task="Count orders.",
+            solver_context="Known table: orders.",
+            deadline=_deadline(),
+        )
+    )
+
+    assert proposal.proposal.sql == "SELECT 1"
+    assert usage == ModelTokenUsage(input_tokens=None, output_tokens=None)
+
+
+def test_propose_with_usage_attaches_usage_to_decode_error() -> None:
+    model = _AsyncRecordingModel(
+        SqlSolverModelResponse(
+            raw_response="not json", usage=ModelTokenUsage(input_tokens=7, output_tokens=2)
+        )
+    )
+
+    with pytest.raises(ContractDecodeError) as excinfo:
+        asyncio.run(
+            _adapter(model).propose_with_usage(
+                task="Count orders.",
+                solver_context="Known table: orders.",
+                deadline=_deadline(),
+            )
+        )
+
+    assert excinfo.value.model_usage == ModelTokenUsage(input_tokens=7, output_tokens=2)
+
+
+def test_propose_with_usage_rejects_non_model_token_usage() -> None:
+    model = _AsyncRecordingModel(
+        SqlSolverModelResponse(raw_response=_payload(), usage="not-usage")  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(SqlSolverModelResponseError):
+        asyncio.run(
+            _adapter(model).propose_with_usage(
+                task="Count orders.",
+                solver_context="Known table: orders.",
+                deadline=_deadline(),
+            )
+        )
 
 
 def test_prompt_wraps_untrusted_task_and_context_in_canonical_envelope() -> None:

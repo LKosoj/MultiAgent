@@ -203,18 +203,27 @@ def natural_language_processing(text: str, session_id: Optional[str] = None) -> 
     return _impl(text, session_id, nlu_processor=_get_core_singleton("nlu_processor"))
 
 
-def intent_extraction(text: str, session_id: Optional[str] = None) -> Dict[str, object]:
+def intent_extraction(
+    text: str, session_id: Optional[str] = None, dsn: Optional[str] = None
+) -> Dict[str, object]:
     """Извлекает intent и сущности из пользовательского запроса.
 
     Args:
         text: входной текст на естественном языке.
         session_id: необязательный идентификатор сессии для аудита.
+        dsn: DSN целевой БД для приоритетного DSN-профиля в heuristic
+            fallback-пути NLU (опционально).
 
     Returns:
         Словарь с полями `intent` и `entities`.
     """
     from ._nlu_api import intent_extraction as _impl
-    return _impl(text, session_id, nlu_processor=_get_core_singleton("nlu_processor"))
+    return _impl(
+        text,
+        session_id,
+        nlu_processor=_get_core_singleton("nlu_processor"),
+        dsn=dsn,
+    )
 
 
 def vector_db_search(query: str, top_k: int = 3) -> List[Dict[str, object]]:

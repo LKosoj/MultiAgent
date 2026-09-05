@@ -46,7 +46,7 @@ _MIN_CONFIG_VERSION = 2
 
 
 class ColumnAliasesProfile:
-    """Алиасы одного доменного профиля (например, muni_ru)."""
+    """Алиасы одного доменного профиля."""
 
     __slots__ = ("name", "aliases", "type_hints")
 

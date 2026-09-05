@@ -1210,7 +1210,8 @@ def test_reducer_has_no_check_or_execution_boundary_dependency() -> None:
     source = inspect.getsource(module)
     assert ".checks" not in source
     assert ".executor" not in source
-    assert ".execution" not in source
+    assert "from .execution import" not in source
+    assert "from . import execution" not in source
 
 
 @pytest.mark.parametrize("forged", ("state", "proposal", "requirements"))

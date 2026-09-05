@@ -27,7 +27,10 @@ from custom_tools.text_to_sql.adaptive.models import (
     SemanticItemKind,
     SolverState,
 )
-from custom_tools.text_to_sql.adaptive.model_budget import ModelTokenUsage
+from custom_tools.text_to_sql.adaptive.model_budget import (
+    ModelBudgetLedgerRecord,
+    ModelTokenUsage,
+)
 from custom_tools.text_to_sql.adaptive.evidence import probe_result_to_evidence
 from custom_tools.text_to_sql.adaptive.freshness import FreshnessContext
 from custom_tools.text_to_sql.adaptive.policy import (
@@ -67,7 +70,10 @@ from custom_tools.text_to_sql.adaptive.research_decision import (
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
     validate_coverage_inputs,
 )
-from custom_tools.text_to_sql.adaptive.solver_loop import apply_solver_proposal
+from custom_tools.text_to_sql.adaptive.solver_loop import (
+    admit_targeted_reentry,
+    apply_solver_proposal,
+)
 from custom_tools.text_to_sql.adaptive.solver_protocol import (
     MissingEvidenceProposal,
     SolverProposalV1,
@@ -85,6 +91,7 @@ from workflow.text_to_sql_typed_runtime import (
 from workflow._text_to_sql_document_authority import empty_schema_document_registry
 from workflow._text_to_sql_solver_reentry import (
     build_production_reentry_boundary,
+    settle_incomplete_reentry_model_call,
 )
 from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
 from workflow.adaptive_research_state_store import AdaptiveResearchStateStore
@@ -1292,6 +1299,451 @@ async def test_reentry_continuation_routes_stop_review_through_its_own_model(
     assert observed_response_format["type"] == "json_schema"
     assert observed_response_format["json_schema"]["name"] == "ResearchStopReview"
     assert observed_response_format != {"type": "json_object"}
+
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_reentry_continuation_stop_review_model_comes_from_step_models_registry(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """W1-1.1: the stop-review model alias on the re-entry continuation path is
+    read from ``llm_models.yaml::step_models.research_stop_review`` — not
+    hardcoded to ``profile.model``. Overriding the registry must change the
+    alias passed to ``create_text_to_sql_model`` for the stop-review model,
+    while ``stable_schema_research_model_identity`` (a separate ledger-identity
+    concern, built from ``profile.model`` directly) stays unaffected.
+    """
+    from custom_tools.text_to_sql import llm_models_config
+
+    cfg_path = tmp_path / "llm_models.yaml"
+    cfg_path.write_text(
+        "version: 1\n"
+        "profiles:\n"
+        "  default:\n"
+        "    schema_linking: {}\n"
+        "    sql_generation: {}\n"
+        "    nlu: {}\n"
+        "    step_models:\n"
+        "      research_stop_review: model_lite\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TEXT_TO_SQL_LLM_MODELS_PATH", str(cfg_path))
+    llm_models_config.reset_cache()
+    try:
+        runtime, solver, research, _requirements, _freshness = _one_remaining_reentry_case(
+            tmp_path
+        )
+        request = solver.missing_evidence_requests[-1]
+        profile = load_schema_research_agent_profile()
+
+        import agent_command
+        import workflow._text_to_sql_solver_reentry as production_reentry
+
+        class _NoOpMemoryManager:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def find_semantic_relevant_tables(self, *_args, **_kwargs):
+                return ()
+
+            def find_verified_probe_facts(self, *_args, **_kwargs):
+                return ()
+
+            def find_approved_semantic_facts(self, *_args, **_kwargs):
+                return ()
+
+        monkeypatch.setattr(production_reentry, "SchemaMemoryManager", _NoOpMemoryManager)
+
+        class _StoppedBeforeLoop(Exception):
+            """Raised once the loop assembly is reached, to avoid running it."""
+
+        captured_assembly: dict[str, object] = {}
+
+        def fake_assemble(**kwargs):
+            captured_assembly.update(kwargs)
+            raise _StoppedBeforeLoop
+
+        monkeypatch.setattr(
+            production_reentry, "assemble_production_research", fake_assemble
+        )
+
+        captured_names: list[str] = []
+
+        class _FakeProvider:
+            def __call__(self, messages, *, max_tokens, temperature, response_format):
+                return '{"decision":"stop_confirmed","hint":null}'
+
+        monkeypatch.setattr(
+            agent_command,
+            "create_text_to_sql_model",
+            lambda name, *_args, **_kwargs: (captured_names.append(name), _FakeProvider())[-1],
+        )
+
+        async def research_decision_model(_prompt: str) -> str:
+            raise AssertionError(
+                "this test only exercises the continuation's model wiring"
+            )
+
+        with pytest.raises(_StoppedBeforeLoop):
+            await production_reentry._continue_production_research(
+                runtime,
+                "main",
+                research_decision_model,
+                profile,
+                research,
+                request,
+            )
+
+        assert captured_names == ["model_lite"]
+        assert captured_assembly["model_identity"] == stable_schema_research_model_identity(
+            "model_code"
+        )
+
+        runtime.research_state_store.close()
+        runtime.budget_ledger.close()
+    finally:
+        monkeypatch.delenv("TEXT_TO_SQL_LLM_MODELS_PATH", raising=False)
+        llm_models_config.reset_cache()
+
+
+def test_settle_incomplete_reentry_model_call_ignores_stray_solver_generate_record(
+    tmp_path,
+) -> None:
+    """W0-0.6 remark B: the outstanding-record count settle_incomplete_reentry_model_call
+    uses (workflow/_text_to_sql_solver_reentry.py) must ignore ledger records
+    outside the targeted-research call_id prefixes. Since W0-0.6 the adaptive
+    solver's own "solver-generate-*" calls share this ledger; before the fix,
+    one such record alongside the genuinely outstanding targeted-research
+    reservation made `len(outstanding) != 1`, so the function silently
+    returned the research state unsettled.
+
+    A genuinely outstanding "solver-generate-*" record is not this function's
+    job either way: it is settled by the sibling
+    ``settle_incomplete_solver_model_call`` (same module), called separately
+    from ``_resume_open_generation``. This test only pins down that the
+    prefix filter here keeps ignoring that prefix, not that nothing else in
+    the codebase ever settles it.
+    """
+
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    admitted = admit_targeted_reentry(
+        solver,
+        research,
+        "request-1",
+        base_revision=solver.revision,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+    solver_state = admitted.state
+
+    request = solver_state.missing_evidence_requests[-1]
+    context = reentry_module._research_context(
+        request,
+        reentry_module._trusted_targets(request.source_id, research, requirements),
+        research,
+    )
+    profile = load_schema_research_agent_profile()
+    limits = runtime.verified_research_policy.model_budget
+    assert limits is not None
+
+    reservation = reserve_model_call_budget(
+        research.run_id,
+        research.run_incarnation,
+        _model_call_id(research, 0),
+        canonical_digest(
+            {
+                "research_context": context,
+                "state": research.model_dump(mode="json", by_alias=True),
+                "task": request.question,
+            }
+        ),
+        stable_schema_research_model_identity(profile.model),
+        limits.input_tokens_per_call,
+        limits.output_tokens_per_call,
+        config=runtime.verified_research_policy,
+        ledger=runtime.budget_ledger,
+    )
+    owner = "crashed-owner"
+    claim = runtime.budget_ledger.claim_model_execution(reservation, owner, now_ns=1)
+    assert claim.acquired is True
+    runtime.budget_ledger.record_model_started(
+        _model_started(reservation, "crashed-invocation", claim.generation, 2),
+        owner_token=owner,
+    )
+
+    # The real ledger allows only one outstanding (unreconciled) reservation
+    # at a time (workflow/adaptive_budget_ledger.py), so a genuine
+    # "solver-generate-0-0" reservation cannot coexist, unreconciled, with the
+    # research one above. It is injected only into the *first*
+    # load_model_records() read below -- the exact read
+    # settle_incomplete_reentry_model_call uses to compute `outstanding`
+    # (workflow/_text_to_sql_solver_reentry.py ~619-630) -- so the test pins
+    # down that the prefix filter, not incidental ledger state, is what makes
+    # settlement succeed.
+    scratch_ledger = AdaptiveBudgetLedger(tmp_path / "scratch-ledger.sqlite")
+    stray_reservation = reserve_model_call_budget(
+        research.run_id,
+        research.run_incarnation,
+        "solver-generate-0-0",
+        canonical_digest({"solver": "stray"}),
+        "sql_solver_agent:stray-model",
+        limits.input_tokens_per_call,
+        limits.output_tokens_per_call,
+        config=runtime.verified_research_policy,
+        ledger=scratch_ledger,
+    )
+    stray_record = ModelBudgetLedgerRecord(
+        reservation=stray_reservation,
+        started=None,
+        result=None,
+        reconciliation=None,
+    )
+    real_ledger = runtime.budget_ledger
+
+    class _LedgerWithStrayOnFirstRead:
+        def __init__(self) -> None:
+            self._reads = 0
+
+        def load_model_records(self, run_id: str, run_incarnation: str):
+            records = real_ledger.load_model_records(run_id, run_incarnation)
+            self._reads += 1
+            if self._reads == 1:
+                return (*records, stray_record)
+            return records
+
+        def __getattr__(self, name: str):
+            return getattr(real_ledger, name)
+
+    runtime.budget_ledger = _LedgerWithStrayOnFirstRead()
+
+    updated = asyncio.run(
+        settle_incomplete_reentry_model_call(
+            runtime, solver_state, research, requirements
+        )
+    )
+
+    settled_records = real_ledger.load_model_records(
+        research.run_id, research.run_incarnation
+    )
+    settled_by_call_id = {
+        record.reservation.call_id: record for record in settled_records
+    }
+    target_call_id = _model_call_id(research, 0)
+    assert target_call_id in settled_by_call_id
+    assert settled_by_call_id[target_call_id].reconciliation is not None
+    assert not any(
+        call_id.startswith("solver-generate-") for call_id in settled_by_call_id
+    )
+    assert (
+        updated.budget_state.used_model_calls
+        == research.budget_state.used_model_calls + 1
+    )
+
+    runtime.research_state_store.close()
+    real_ledger.close()
+    scratch_ledger.close()
+
+
+def test_settle_incomplete_reentry_model_call_logs_model_identity_change(
+    tmp_path, caplog
+) -> None:
+    """W5: if the outstanding STARTED reservation for the exact targeted-
+    research call (same call_id and request_digest) was made under a model
+    identity that no longer matches what the current schema_research profile
+    resolves to -- e.g. an operator switched the step's model between a crash
+    and this resume -- settle_incomplete_reentry_model_call must still stay
+    conservative (leave the call unsettled, return the research state
+    unchanged), but it must log a WARNING naming the old/new model identity
+    instead of settling (or failing) silently.
+    """
+
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    admitted = admit_targeted_reentry(
+        solver,
+        research,
+        "request-1",
+        base_revision=solver.revision,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+    solver_state = admitted.state
+
+    request = solver_state.missing_evidence_requests[-1]
+    context = reentry_module._research_context(
+        request,
+        reentry_module._trusted_targets(request.source_id, research, requirements),
+        research,
+    )
+    profile = load_schema_research_agent_profile()
+    limits = runtime.verified_research_policy.model_budget
+    assert limits is not None
+    expected_model_identity = stable_schema_research_model_identity(profile.model)
+    stale_model_identity = "schema_research_agent:stale-pre-config-change-model"
+    assert stale_model_identity != expected_model_identity
+
+    reservation = reserve_model_call_budget(
+        research.run_id,
+        research.run_incarnation,
+        _model_call_id(research, 0),
+        canonical_digest(
+            {
+                "research_context": context,
+                "state": research.model_dump(mode="json", by_alias=True),
+                "task": request.question,
+            }
+        ),
+        stale_model_identity,
+        limits.input_tokens_per_call,
+        limits.output_tokens_per_call,
+        config=runtime.verified_research_policy,
+        ledger=runtime.budget_ledger,
+    )
+    owner = "crashed-owner"
+    claim = runtime.budget_ledger.claim_model_execution(reservation, owner, now_ns=1)
+    assert claim.acquired is True
+    runtime.budget_ledger.record_model_started(
+        _model_started(reservation, "crashed-invocation", claim.generation, 2),
+        owner_token=owner,
+    )
+
+    with caplog.at_level("WARNING"):
+        updated = asyncio.run(
+            settle_incomplete_reentry_model_call(
+                runtime, solver_state, research, requirements
+            )
+        )
+
+    assert updated is research
+    unsettled_records = runtime.budget_ledger.load_model_records(
+        research.run_id, research.run_incarnation
+    )
+    target_call_id = _model_call_id(research, 0)
+    unsettled_by_call_id = {
+        record.reservation.call_id: record for record in unsettled_records
+    }
+    assert unsettled_by_call_id[target_call_id].reconciliation is None
+    assert any(
+        "changed between incarnations" in record.message
+        and stale_model_identity in record.message
+        and expected_model_identity in record.message
+        for record in caplog.records
+    )
+
+    runtime.research_state_store.close()
+    runtime.budget_ledger.close()
+
+
+def test_settle_incomplete_reentry_model_call_settles_reserved_without_started(
+    tmp_path,
+) -> None:
+    """W0-0.6 remark D: a crash between RESERVED and STARTED must not durably
+    block the targeted-research reentry either.
+
+    ``record_model_reservation``, ``claim_model_execution`` and
+    ``record_model_started`` (``workflow/adaptive_budget_ledger.py``) are
+    three separate durable sqlite transactions, so a process killed right
+    after the first one leaves the targeted-research call_id's ledger record
+    with ``started is None, reconciliation is None`` -- a different crash
+    window than the STARTED-without-RESULT one the other tests in this file
+    cover. Before this fix, ``settle_incomplete_reentry_model_call`` bailed
+    out on ``outstanding[0].started is None``, so resuming from this window
+    left the call unsettled forever and every later reservation attempt hit
+    ``BudgetConflictError``.
+    """
+
+    runtime, solver, research, requirements, _ = _one_remaining_reentry_case(tmp_path)
+    admitted = admit_targeted_reentry(
+        solver,
+        research,
+        "request-1",
+        base_revision=solver.revision,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+    solver_state = admitted.state
+
+    request = solver_state.missing_evidence_requests[-1]
+    context = reentry_module._research_context(
+        request,
+        reentry_module._trusted_targets(request.source_id, research, requirements),
+        research,
+    )
+    profile = load_schema_research_agent_profile()
+    limits = runtime.verified_research_policy.model_budget
+    assert limits is not None
+
+    target_call_id = _model_call_id(research, 0)
+    # Durably record RESERVED only -- no claim, no STARTED -- emulating a
+    # process kill right after the reservation's own sqlite transaction
+    # commits, before ``claim_model_execution``/``record_model_started`` ever
+    # ran.
+    reserve_model_call_budget(
+        research.run_id,
+        research.run_incarnation,
+        target_call_id,
+        canonical_digest(
+            {
+                "research_context": context,
+                "state": research.model_dump(mode="json", by_alias=True),
+                "task": request.question,
+            }
+        ),
+        stable_schema_research_model_identity(profile.model),
+        limits.input_tokens_per_call,
+        limits.output_tokens_per_call,
+        config=runtime.verified_research_policy,
+        ledger=runtime.budget_ledger,
+    )
+    crashed_records = runtime.budget_ledger.load_model_records(
+        research.run_id, research.run_incarnation
+    )
+    # ``_one_remaining_reentry_case`` already durably records one fully
+    # reconciled "research-model-*" call per prior revision, so the ledger is
+    # not empty before this test's own RESERVED-only record is added -- only
+    # the record count must not grow across the settle calls below.
+    crashed_by_call_id = {
+        record.reservation.call_id: record for record in crashed_records
+    }
+    assert crashed_by_call_id[target_call_id].started is None
+    assert crashed_by_call_id[target_call_id].result is None
+    assert crashed_by_call_id[target_call_id].reconciliation is None
+    total_before_settle = len(crashed_records)
+
+    updated = asyncio.run(
+        settle_incomplete_reentry_model_call(
+            runtime, solver_state, research, requirements
+        )
+    )
+
+    settled_records = runtime.budget_ledger.load_model_records(
+        research.run_id, research.run_incarnation
+    )
+    settled_by_call_id = {
+        record.reservation.call_id: record for record in settled_records
+    }
+    assert len(settled_records) == total_before_settle
+    assert settled_by_call_id[target_call_id].started is not None
+    assert settled_by_call_id[target_call_id].reconciliation is not None
+    # Settled with unknown (maximum-charged) usage, not a real model response.
+    assert (
+        settled_by_call_id[target_call_id].reconciliation.actual_usage.input_tokens
+        is None
+    )
+    assert (
+        updated.budget_state.used_model_calls
+        == research.budget_state.used_model_calls + 1
+    )
+
+    # A redundant settle attempt must not create extra reservations: nothing
+    # is outstanding anymore, so this is a no-op.
+    replayed = asyncio.run(
+        settle_incomplete_reentry_model_call(runtime, solver_state, updated, requirements)
+    )
+    final_records = runtime.budget_ledger.load_model_records(
+        research.run_id, research.run_incarnation
+    )
+    assert len(final_records) == total_before_settle
+    assert replayed.budget_state.used_model_calls == updated.budget_state.used_model_calls
 
     runtime.research_state_store.close()
     runtime.budget_ledger.close()

@@ -4,7 +4,7 @@
   * ``best_column_for`` опирается на column.description и FK-references,
     а не на захардкоженный словарь синонимов;
   * дефолтный (пустой) yaml-профиль не находит «revenue → amount»;
-  * профиль ``muni_ru`` сохраняет легаси-поведение пользователя;
+  * произвольный именованный профиль сохраняет легаси-поведение пользователя;
   * ``find_main_table`` использует semantic memory как primary signal;
   * fail-fast: без semantic memory и без структурного сигнала
     возвращается ``None``;
@@ -85,7 +85,7 @@ def test_best_column_uses_description_not_name():
 
 
 def test_best_column_no_synonyms_in_default_profile():
-    """Без активного muni_ru профиля «revenue» НЕ должен находить ``amount``.
+    """Без активного доменного профиля «revenue» НЕ должен находить ``amount``.
 
     Никакого захардкоженного словаря синонимов: дефолтный yaml профиль пуст,
     description у колонки тоже пуст — связи нет.
@@ -100,12 +100,32 @@ def test_best_column_no_synonyms_in_default_profile():
     assert core.best_column_for("revenue", "orders", table_schema) is None
 
 
-def test_best_column_muni_profile_preserves_legacy(monkeypatch):
-    """С активным профилем muni_ru «revenue» снова находит ``amount``.
+def test_best_column_named_profile_preserves_legacy(tmp_path, monkeypatch):
+    """С активным именованным профилем «revenue» снова находит ``amount``.
 
-    Это регрессионный safety-net для пользовательского датасета.
+    Самодостаточная тестовая фикстура (домен больше не хранится в этом
+    yaml — доменные подсказки переехали в DSN-профиль) — регрессионный
+    safety-net для алиас-логики best_column_for.
     """
-    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "muni_ru")
+    custom_yaml = tmp_path / "column_aliases.yaml"
+    custom_yaml.write_text(
+        """
+version: 2
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+profiles:
+  default:
+    aliases: {}
+  alt:
+    aliases:
+      revenue: [revenue, amount, total]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(_ALIAS_PATH_VAR, str(custom_yaml))
+    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "alt")
     column_aliases_config.reset_cache()
 
     core = _make_core()
@@ -461,16 +481,41 @@ def test_best_column_type_hint_default_profile_no_bonus():
     assert core.best_column_for("revenue", "orders", table_schema) is None
 
 
-def test_best_column_type_hint_muni_profile(monkeypatch):
-    """С активным muni_ru профилем type-hint список numeric содержит
+def test_best_column_type_hint_named_profile(tmp_path, monkeypatch):
+    """С активным именованным профилем type-hint список numeric содержит
     ``amount``, и колонка ``amount: DECIMAL`` получает type-bonus поверх
-    primary signal (exact-match)."""
-    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "muni_ru")
+    primary signal (exact-match).
+
+    Самодостаточная тестовая фикстура (домен больше не хранится в этом
+    yaml — доменные подсказки переехали в DSN-профиль).
+    """
+    custom_yaml = tmp_path / "column_aliases.yaml"
+    custom_yaml.write_text(
+        """
+version: 2
+policy:
+  type_hint_categories: ["numeric", "temporal", "identifier"]
+  required_profiles: ["default"]
+  default_profile_must_be_empty: true
+profiles:
+  default:
+    aliases: {}
+  alt:
+    aliases: {}
+    type_hints:
+      numeric: [amount, sum, total, revenue, price, cost]
+      temporal: [date, time, timestamp]
+      identifier: [id, key, code]
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(_ALIAS_PATH_VAR, str(custom_yaml))
+    monkeypatch.setenv(_ALIAS_PROFILE_VAR, "alt")
     column_aliases_config.reset_cache()
 
-    # numeric_hints для muni_ru: amount/sum/total/revenue/price/cost.
+    # numeric_hints для alt: amount/sum/total/revenue/price/cost.
     cfg = column_aliases_config.load_column_aliases_config()
-    type_hints = cfg.get_type_hints("muni_ru")
+    type_hints = cfg.get_type_hints("alt")
     assert "amount" in type_hints["numeric"]
     assert "date" in type_hints["temporal"]
     assert "id" in type_hints["identifier"]
@@ -481,7 +526,7 @@ def test_best_column_type_hint_muni_profile(monkeypatch):
 
     core = _make_core()
     # «amount» как query — exact-match даёт +10 primary signal,
-    # type-bonus в muni_ru даёт +3 numeric. Без muni_ru type-bonus = 0.
+    # type-bonus в alt даёт +3 numeric. Без alt type-bonus = 0.
     table_schema = {
         "columns": {
             "amount": {"type": "DECIMAL", "description": ""},

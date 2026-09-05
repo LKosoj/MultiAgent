@@ -265,6 +265,52 @@ def test_orchestrator_llm_finding_is_advisory_only_when_static_safe(monkeypatch)
     assert matching[0]["blocking"] is False
 
 
+def test_orchestrator_llm_finding_avoids_audit_sentinel_name_collision(monkeypatch) -> None:
+    """W0-0.5 review: если модель вернёт issue_type "AUDIT_FAILED"/"AUDIT_TIMEOUT",
+
+    итоговое advisory-имя не должно совпасть с зарезервированными сентинелами
+    LLM_AUDIT_FAILED/LLM_AUDIT_TIMEOUT — иначе адаптер
+    checks.py::adapt_safety_check_result перепутает успешный аудит (llm_audit=
+    "ok") со сбоем аудита. Прогоняем результат прямо через адаптер, чтобы
+    проверить стык продюсер<->адаптер, а не только имя строки.
+    """
+    from custom_tools.text_to_sql.core._sql_generation_api import (
+        _clear_llm_safety_cache,
+        sql_safety_check,
+    )
+    from custom_tools.text_to_sql import core as core_facade
+    from custom_tools.text_to_sql.adaptive.checks import adapt_safety_check_result
+    from custom_tools.text_to_sql.adaptive.models import CheckStatus, SqlCandidate
+    from custom_tools.text_to_sql.adaptive.sql_ast import parse_sql_candidate
+
+    _clear_llm_safety_cache()
+
+    def with_sentinel_collision(**kwargs):
+        return '{"issues": [{"issue_type": "AUDIT_FAILED", "description": "x"}]}'
+
+    monkeypatch.setattr(core_facade, "call_openai_api", with_sentinel_collision)
+
+    sql_validator = core_facade.sql_validator
+    sql = "SELECT * FROM orchestrator_sentinel_collision_test"
+    result = sql_safety_check(sql, sql_validator=sql_validator)
+
+    assert result["is_safe"] is True
+    assert result["llm_audit"] == "ok"
+    advisory_types = [i.get("issue_type") for i in result.get("advisory_issues", [])]
+    assert advisory_types == ["LLM_FINDING_AUDIT_FAILED"]
+
+    dsn = "postgresql://user:password@localhost:5432/example"
+    parsed_ast = parse_sql_candidate(sql, dsn, "sentinel-collision-candidate")
+    candidate = SqlCandidate(
+        candidate_id="sentinel-collision-candidate",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=1,
+    )
+    adapted = adapt_safety_check_result(candidate, result)
+    assert adapted.status is CheckStatus.PASSED
+
+
 def test_orchestrator_propagates_programming_bugs_from_advisor(monkeypatch) -> None:
     """Программные баги советника (не в узком except-списке) должны падать наружу,
 

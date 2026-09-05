@@ -446,6 +446,8 @@ def build_release_plan(policy: Mapping[str, object]) -> list[dict[str, object]]:
 
 def canonical_runtime_environment(
     settings: Mapping[str, object],
+    *,
+    llm_models_profile: str | None = None,
 ) -> dict[str, str]:
     allowed_settings = {"model_api_base"}
     unknown = sorted(set(settings) - allowed_settings)
@@ -457,11 +459,40 @@ def canonical_runtime_environment(
     parsed = urlsplit(model_api_base)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("canonical model API base must be an http(s) URL")
+    if llm_models_profile is None or (
+        isinstance(llm_models_profile, str) and not llm_models_profile.strip()
+    ):
+        # No profile pinned explicitly (an empty/blank string is treated the
+        # same as not passing one at all): write the loader's own default
+        # ("default") rather than leaving the operator's ambient
+        # TEXT_TO_SQL_LLM_MODELS_PROFILE in effect, so the release
+        # environment (and its digest) stays reproducible regardless of the
+        # shell that launches the benchmark.
+        resolved_llm_models_profile = "default"
+    elif isinstance(llm_models_profile, str):
+        # Fail fast on a typo'd/unknown profile name here, rather than
+        # silently pinning it into the release environment and only
+        # discovering it does not exist once something deep in the
+        # benchmark run tries to load it.
+        from custom_tools.text_to_sql.llm_models_config import get_active_profile
+
+        try:
+            get_active_profile(llm_models_profile)
+        except KeyError as error:
+            raise ValueError(
+                f"unknown llm models profile: {llm_models_profile}"
+            ) from error
+        resolved_llm_models_profile = llm_models_profile
+    else:
+        raise ValueError("llm_models_profile must be non-empty text or None")
     environment = {
         "OPENAI_API_BASE_DB": model_api_base,
         "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
         "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
         "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0",
+        "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
+        "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
+        "TEXT_TO_SQL_LLM_MODELS_PROFILE": resolved_llm_models_profile,
     }
     return environment
 
@@ -842,6 +873,7 @@ def _build_release_lock_and_binding(
 ) -> tuple[dict[str, object], FrozenReleaseInputs]:
     canonical_environment = canonical_runtime_environment(
         {"model_api_base": args.model_api_base},
+        llm_models_profile=getattr(args, "llm_models_profile", None),
     )
     model_backend_id = str(args.model_backend_id or "").strip()
     if not model_backend_id:
@@ -1050,6 +1082,7 @@ def validate_release_input_lock(
         raise SandboxError("release plan does not match canonical order")
     expected_environment = canonical_runtime_environment(
         {"model_api_base": args.model_api_base},
+        llm_models_profile=getattr(args, "llm_models_profile", None),
     )
     if lock.get("canonical_environment") != expected_environment or lock.get(
         "canonical_environment_digest"

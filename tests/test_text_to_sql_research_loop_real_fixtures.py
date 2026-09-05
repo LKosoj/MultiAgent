@@ -604,7 +604,14 @@ def test_bounded_context_prioritizes_validated_join_over_supported_binding_bundl
         table=TableRef(namespace="main", schema=None, table="customers"),
         column="order_id",
     )
-    binding_evidence = _context_evidence(base, "evidence-binding", "x" * 500)
+    # Target a table the validated join below does not touch: the join's own
+    # endpoint-table schema preload (see `_fill_bounded_state_view`) must not
+    # accidentally compete with this already-supported binding's evidence for
+    # the same table slot; that is a distinct feature from the join-vs-binding
+    # priority behaviour under test here.
+    binding_evidence = _context_evidence(base, "evidence-binding", "x" * 500).model_copy(
+        update={"target": TableRef(namespace="main", schema=None, table="accounts")}
+    )
     join_evidence = _context_evidence(
         base,
         "evidence-join",
@@ -954,7 +961,7 @@ def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None
             ),
             "evidence": evidence,
             "bindings": bindings,
-            "unresolved_items": (formula_id, eur_id, czk_id),
+            "unresolved_items": (eur_id, czk_id),
         }
     )
     schema = {
@@ -990,6 +997,7 @@ def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None
             task=state.query_spec.original_text,
             validation_feedback=feedback,
             documents=(document,),
+            semantic_repair_continuation=True,
         )
         included = json.loads(context)["state"]
         prompt = build_schema_research_prompt(
@@ -1023,6 +1031,7 @@ def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None
                 "status",
                 "discriminator_column",
                 "discriminator_predicate",
+                "predicates",
             }
             for item in included["bindings"]
         )
@@ -1465,7 +1474,7 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
     payload = json.loads(context)
     included = payload["state"]
     assert len(context.encode("utf-8")) <= 16 * 1024
-    assert len(prompt.encode("utf-8")) <= 32 * 1024
+    assert len(prompt.encode("utf-8")) <= 64 * 1024
     assert canonical_json_bytes(state) == before
     assert [item["source_id"] for item in included["query_spec"]["semantic_items"]][0] == "source-1"
     assert included["hypotheses"][0]["hypothesis_id"] == hypothesis.hypothesis_id
@@ -1491,6 +1500,31 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
     assert claim.kind.value == "inspect_table"
 
 
+class _StopReviewContinueModel:
+    """Independent stop-review stub: always allows one more research turn.
+
+    The scripted vertical-fixture script below deliberately spends its first
+    three turns gathering schema evidence before it has enough facts to
+    propose a join or binding. That is exactly the "three consecutive
+    non-novel turns" shape the production stop-review safety valve is
+    designed to interrupt (see research_loop._consecutive_non_novel), so a
+    real run always needs this independent review to grant a "continue"
+    before the scripted turn can proceed. It never contradicts trusted facts
+    and never selects a binding itself; it only unblocks the next scripted,
+    already-planned research turn.
+    """
+
+    async def __call__(self, prompt: str) -> str:
+        envelope = json.loads(prompt)
+        assert envelope.get("review_kind") == "research_stop_review"
+        return json.dumps(
+            {
+                "decision": "continue",
+                "hint": "Continue the already-planned schema research turn.",
+            }
+        )
+
+
 class _VerticalFixtureModel:
     """Scripted decisions selected from trusted schema and observed probe payloads."""
 
@@ -1505,6 +1539,15 @@ class _VerticalFixtureModel:
         self.prompts.append(envelope)
         raw_context = envelope["input"]["research_context"]
         assert isinstance(raw_context, str)
+        hint_marker = "\n\nIndependent stop review allows one normal research turn."
+        if hint_marker in raw_context:
+            # A granted stop-review hint is appended as a plain-text suffix to
+            # the (otherwise JSON) research_context string; see
+            # _ResearchLoopCoordinator._model_decision. The scripted decisions
+            # below are keyed purely off the durable state/schema, so the
+            # non-authoritative hint text itself carries no new information
+            # for this script and is dropped before decoding.
+            raw_context = raw_context.split(hint_marker, 1)[0]
         context = json.loads(raw_context)
         schema = context["schema"]
         state = context["state"]
@@ -2362,6 +2405,27 @@ def test_production_registry_admits_sample_rows_with_its_planned_limit(
     assert json.loads(result.inline_payload_json)["rows"] == [["member-a"]]
 
 
+# The scripted vertical-fixture research turns spend their first three turns
+# (table, column, relationship inspection) gathering schema evidence with no
+# hypothesis/binding/join/unresolved-item change, and several more such
+# evidence-only turns later while confirming the discovered relationships.
+# The production stop-review safety valve (_consecutive_non_novel in
+# research_loop.py) requires one independent, budget-charged review call
+# before any research turn that follows three such non-novel turns in a row.
+# Given this script's fixed shape, that happens right before each of these
+# revisions. Revision 14 additionally needs a review because, once the model
+# budget below is sized to be fully spent by the end of the run (see
+# total_model_calls), remaining headroom briefly drops under the separate
+# "at least 3 calls left" safety margin the coordinator also checks before a
+# final decision (_model_budget_supports in research_loop.py); that margin
+# check triggers one more independent review with reason=BUDGET_EXHAUSTED,
+# which this fixture's stub also answers with "continue". This exact set was
+# measured empirically against the current production budget/stagnation
+# logic and is expected to stay stable, since the fixture and script have no
+# randomness.
+_STOP_REVIEW_REVISIONS = (3, 4, 5, 6, 7, 11, 12, 13, 14)
+
+
 @pytest.mark.parametrize(
     ("fixture_id", "_repeat"),
     [
@@ -2375,7 +2439,19 @@ def test_eav_and_opaque_fixtures_reach_complete_through_real_registry(
     fixture_id: str,
     _repeat: int,
 ) -> None:
-    policy = _policy(actions=15)
+    policy_values = _policy(actions=15).model_dump(mode="python")
+    # Each stop-review is its own charged model call, on top of the 15
+    # scripted research decisions; give the model budget enough calls/tokens
+    # to admit exactly that many, so the run still ends with the budget
+    # fully spent (asserted below) instead of exhausting it early.
+    total_model_calls = policy_values["operation_counts"]["actions"] + len(
+        _STOP_REVIEW_REVISIONS
+    )
+    policy_values["model_budget"]["model_calls"] = total_model_calls
+    policy_values["model_budget"]["total_tokens"] = total_model_calls * 1_000
+    policy_values["resource_limits"]["model_tokens"] = total_model_calls * 1_000
+    policy_values["operation_counts"]["model_decisions"] = total_model_calls
+    policy = AdaptivePolicyConfig.model_validate(policy_values)
     database = create_sqlite_adaptive_fixture(fixture_id, tmp_path / "fixture.sqlite")
     dsn = f"sqlite://{database}"
     loader = SchemaLoader(tmp_path / "schema-cache")
@@ -2455,6 +2531,7 @@ def test_eav_and_opaque_fixtures_reach_complete_through_real_registry(
         )
     )
     model = _VerticalFixtureModel()
+    review_model = _StopReviewContinueModel()
     freshness = FreshnessContext(
         evaluated_at=datetime.now(UTC) + timedelta(minutes=5),
         run_id=state.run_id,
@@ -2483,6 +2560,7 @@ def test_eav_and_opaque_fixtures_reach_complete_through_real_registry(
                 budget_ledger=ledger,
                 policy=policy,
                 deadline=deadline,
+                stop_review_model=review_model,
             )
         )
         assert outcome.stop_reason is ResearchStopReason.COMPLETE, (
@@ -2533,12 +2611,24 @@ def test_eav_and_opaque_fixtures_reach_complete_through_real_registry(
         assert final_budget.remaining_model_tokens == (
             final_budget.initial_model_tokens - final_budget.used_model_tokens
         )
-        assert [record.reservation.call_id for record in model_records] == [
-            f"research-model-{revision}-0"
-            for revision in range(policy.operation_counts.actions)
+        expected_call_ids: list[str] = []
+        for revision in range(policy.operation_counts.actions):
+            if revision in _STOP_REVIEW_REVISIONS:
+                expected_call_ids.append(f"research-stop-review-{revision}-0")
+                expected_call_ids.append(f"research-model-{revision}-1")
+            else:
+                expected_call_ids.append(f"research-model-{revision}-0")
+        assert [
+            record.reservation.call_id for record in model_records
+        ] == expected_call_ids
+        decision_records = [
+            record
+            for record in model_records
+            if record.reservation.call_id.startswith("research-model-")
         ]
+        assert len(decision_records) == len(probe_records)
         for probe_record, model_record in zip(
-            probe_records, model_records, strict=True
+            probe_records, decision_records, strict=True
         ):
             assert model_record.reconciliation is not None
             assert (

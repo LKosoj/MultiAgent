@@ -8,6 +8,7 @@ import uuid
 
 import streamlit as st
 from streamlit_app._theme import inject_theme
+from workflow.text_to_sql_provenance import format_text_to_sql_provenance_footer
 from streamlit_app.text_to_sql_client import (
     TERMINAL_RUN_STATUSES,
     ConnectionSummary,
@@ -143,6 +144,23 @@ def _refresh_run(
     return status, result
 
 
+_MARKDOWN_SPECIAL_CHARS = "\\`*_[]#<>"
+
+
+def _escape_markdown(text: str) -> str:
+    """Escape Markdown control characters so ``st.markdown`` renders them literally.
+
+    Clarification options come from verified model state, not the user, but
+    ``st.markdown`` still interprets ``_``/``*``/`` ` ``/etc. as formatting
+    (e.g. ``orders.status_code`` would render with a spurious italic). No
+    ``unsafe_allow_html`` is used, so this only prevents mis-rendering, not
+    injection.
+    """
+    return "".join(
+        f"\\{char}" if char in _MARKDOWN_SPECIAL_CHARS else char for char in text
+    )
+
+
 def _render_result(result: TextToSqlResult) -> None:
     st.markdown("### Результат")
     st.write(f"Статус: `{result.status}`")
@@ -155,9 +173,28 @@ def _render_result(result: TextToSqlResult) -> None:
     if result.rows:
         st.dataframe(result.rows, use_container_width=True)
     explanation = result.final_output
+    if isinstance(explanation, Mapping):
+        outputs = explanation.get("outputs")
+        clarification = (
+            outputs.get("clarification_needed")
+            if isinstance(outputs, Mapping)
+            else None
+        )
+        if isinstance(clarification, Mapping) and clarification.get("question"):
+            st.warning(str(clarification["question"]))
+            options = clarification.get("options")
+            if isinstance(options, list) and options:
+                st.markdown(
+                    "\n".join(
+                        f"- {_escape_markdown(str(option))}" for option in options
+                    )
+                )
     if explanation:
         st.markdown("#### Объяснение")
         st.write(explanation)
+    footer = format_text_to_sql_provenance_footer(result.raw.get("provenance", {}))
+    if footer:
+        st.caption(_escape_markdown(footer))
     error_message = result.raw.get("error")
     if error_message:
         st.error(str(error_message))

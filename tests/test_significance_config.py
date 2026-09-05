@@ -9,8 +9,8 @@
     ``schema_metadata.py`` больше нет — они переехали в yaml;
   * дефолтный профиль НЕ содержит доменных терминов (oktmo, «значение
     показател» и т.п.);
-  * активация ``muni_ru`` через env возвращает доменные термины как
-    significant за счёт union с default;
+  * активация именованного профиля через env возвращает доменные термины
+    как significant за счёт union с default;
   * v1 yaml (без секции profiles) корректно мигрирует и логирует
     DEPRECATION warning.
 """
@@ -149,15 +149,48 @@ def test_significance_default_profile_excludes_oktmo(monkeypatch):
     assert ColumnMetadataHelper.is_semantic_significant_column("foobar", {}) is False
 
 
-def test_significance_muni_profile_includes_oktmo_via_merge(monkeypatch):
-    """Активация ``muni_ru`` через env возвращает oktmo и доменные термины.
+def test_significance_named_profile_includes_domain_terms_via_merge(tmp_path, monkeypatch):
+    """Активация именованного профиля возвращает доменные термины из него.
 
-    Регрес-сейф: union с default — default-признаки остаются значимыми.
+    Самодостаточная тестовая фикстура (домен больше не хранится в этом
+    yaml — доменные подсказки теперь задаются в DSN-профиле). Регрес-сейф:
+    union с default — default-признаки остаются значимыми.
     """
-    monkeypatch.setenv(_ENV_PROFILE_VAR, "muni_ru")
+    custom_yaml = tmp_path / "significance.yaml"
+    _write_yaml(
+        custom_yaml,
+        """
+version: 2
+profiles:
+  default:
+    high_priority_exact:
+      - id
+    high_priority_compound: []
+    medium_priority_patterns:
+      - pattern: '_id$'
+        description: идентификатор
+    critical_description_keywords:
+      - "первичный ключ"
+  muni_demo:
+    high_priority_exact:
+      - oktmo
+      - year
+      - value
+      - amount
+      - period
+    high_priority_compound: []
+    medium_priority_patterns: []
+    critical_description_keywords:
+      - "год отчет"
+      - "период отчет"
+      - "значение показател"
+""",
+    )
+    monkeypatch.setenv(_ENV_PATH_VAR, str(custom_yaml))
+    monkeypatch.setenv(_ENV_PROFILE_VAR, "muni_demo")
     significance_config.reset_cache()
 
-    # доменные добавки из muni_ru
+    # доменные добавки из именованного профиля
     assert ColumnMetadataHelper.is_semantic_significant_column("oktmo", {}) is True
     assert (
         ColumnMetadataHelper.is_semantic_significant_column(

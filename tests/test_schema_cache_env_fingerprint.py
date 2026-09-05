@@ -140,7 +140,7 @@ def test_dsn_host_port_db_pyodbc_url_uses_decoded_odbc_identity():
 def test_env_fingerprint_stable_for_same_env(monkeypatch):
     """Идентичный env → идентичный fingerprint (детерминированность)."""
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "alt_profile")
     fp1 = _compute_env_fingerprint()
     fp2 = _compute_env_fingerprint()
     assert fp1 == fp2
@@ -205,16 +205,41 @@ def test_env_fingerprint_changes_on_profile_change(monkeypatch):
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "default")
     fp_default = _compute_env_fingerprint()
-    monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "muni_ru")
-    fp_muni = _compute_env_fingerprint()
-    assert fp_default != fp_muni
+    monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "alt_profile")
+    fp_alt = _compute_env_fingerprint()
+    assert fp_default != fp_alt
+
+
+@pytest.mark.parametrize(
+    "path_var",
+    (
+        "TEXT_TO_SQL_COLUMN_ALIASES_PATH",
+        "TEXT_TO_SQL_JOINS_PATH",
+        "TEXT_TO_SQL_LLM_MODELS_PATH",
+        "TEXT_TO_SQL_MAIN_TABLE_SCORING_PATH",
+        "TEXT_TO_SQL_NLU_MORPHEMES_PATH",
+        "TEXT_TO_SQL_PROMPTS_PATH",
+        "TEXT_TO_SQL_SCHEMA_LINKING_EXAMPLES_PATH",
+        "TEXT_TO_SQL_SIGNIFICANCE_PATH",
+        "TEXT_TO_SQL_SIMILARITY_THRESHOLDS_PATH",
+        "TEXT_TO_SQL_TYPE_CATEGORIES_PATH",
+    ),
+)
+def test_env_fingerprint_changes_on_config_path_change(monkeypatch, path_var):
+    """Смена пути к yaml-конфигу (TEXT_TO_SQL_*_PATH) → fingerprint меняется."""
+    monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
+    monkeypatch.delenv(path_var, raising=False)
+    fp_default = _compute_env_fingerprint()
+    monkeypatch.setenv(path_var, "/etc/text2sql/alt-config.yaml")
+    fp_alt = _compute_env_fingerprint()
+    assert fp_default != fp_alt
 
 
 def test_env_fingerprint_changes_on_nlu_profile(monkeypatch):
     """W8-T1: TEXT_TO_SQL_NLU_PROFILE тоже инвалидирует."""
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     fp_unset = _compute_env_fingerprint()
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "alt_profile")
     fp_set = _compute_env_fingerprint()
     assert fp_unset != fp_set
 
@@ -223,7 +248,7 @@ def test_env_fingerprint_changes_on_umbrella_profile(monkeypatch):
     """W8-T1: TEXT2SQL_PROFILE тоже инвалидирует."""
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     fp_unset = _compute_env_fingerprint()
-    monkeypatch.setenv("TEXT2SQL_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT2SQL_PROFILE", "alt_profile")
     fp_set = _compute_env_fingerprint()
     assert fp_unset != fp_set
 
@@ -239,7 +264,7 @@ def test_env_fingerprint_changes_on_linking_profile_envs(monkeypatch, profile_en
     """Schema-linking cache must invalidate when linking profiles change."""
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     fp_unset = _compute_env_fingerprint()
-    monkeypatch.setenv(profile_env, "muni_ru")
+    monkeypatch.setenv(profile_env, "alt_profile")
     fp_set = _compute_env_fingerprint()
     assert fp_unset != fp_set
 
@@ -248,7 +273,7 @@ def test_env_fingerprint_changes_on_significance_profile(monkeypatch):
     """W8-T1: TEXT_TO_SQL_SIGNIFICANCE_PROFILE тоже инвалидирует."""
     monkeypatch.setenv("DB_DSN", "postgresql://u:p@host:5432/db")
     fp_unset = _compute_env_fingerprint()
-    monkeypatch.setenv("TEXT_TO_SQL_SIGNIFICANCE_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_SIGNIFICANCE_PROFILE", "alt_profile")
     fp_set = _compute_env_fingerprint()
     assert fp_unset != fp_set
 
@@ -286,11 +311,11 @@ def test_cache_key_changes_when_profile_changes(monkeypatch):
     monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "default")
     info_default = _prepare_cache_info(cache, entities, schema)
 
-    monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "muni_ru")
-    info_muni = _prepare_cache_info(cache, entities, schema)
+    monkeypatch.setenv("TEXT_TO_SQL_MAIN_TABLE_SCORING_PROFILE", "alt_profile")
+    info_alt = _prepare_cache_info(cache, entities, schema)
 
-    assert info_default["cache_key"] != info_muni["cache_key"]
-    assert info_default["env_fingerprint"] != info_muni["env_fingerprint"]
+    assert info_default["cache_key"] != info_alt["cache_key"]
+    assert info_default["env_fingerprint"] != info_alt["env_fingerprint"]
 
 
 def test_cache_key_changes_when_dsn_host_changes(monkeypatch):
@@ -355,6 +380,95 @@ def test_cache_key_stable_when_only_credentials_change(monkeypatch):
 
     # env_fingerprint идентичен — credentials не входят в identity.
     assert info_alice["env_fingerprint"] == info_bob["env_fingerprint"]
+
+
+# ---------------------------------------------------------------------------
+# W1-1.2 blocker 1: namespace/scoped-режим должен резолвить DSN-профиль
+# (sqlrag/<dsn>.profile.yaml) по РЕАЛЬНОМУ DSN клиента (effective_dsn),
+# а не по глобальной DB_DSN.
+# ---------------------------------------------------------------------------
+
+
+def _scoped_namespace(schema: dict) -> "SchemaNamespace":
+    from custom_tools.text_to_sql.schema_namespace import (
+        SchemaNamespace,
+        SchemaScope,
+        canonical_schema_fingerprint,
+    )
+
+    scope = SchemaScope.from_mapping(
+        {
+            "serialization_version": 1,
+            "tenant_id": "tenant-a",
+            "access_scope_id": "owner:alice",
+            "connection_view_id": "registry:db-1",
+            "transient": False,
+        }
+    )
+    return SchemaNamespace(
+        scope=scope, schema_fingerprint=canonical_schema_fingerprint(schema)
+    )
+
+
+def test_namespace_mode_profile_marker_uses_client_dsn_not_global_db_dsn(
+    tmp_path, monkeypatch
+):
+    """W1-1.2 blocker 1: раньше в namespace-режиме prepare_cache_info жёстко
+    форсировало effective_dsn=None, из-за чего _dsn_profile_file_marker внутри
+    _compute_env_fingerprint падал обратно на os.getenv("DB_DSN") — два разных
+    клиента с одной общей (несвязанной) DB_DSN процесса получали ОДИНАКОВЫЙ
+    маркер DSN-профиля (cross-tenant leak), а правка профиля СВОЕГО DSN не
+    инвалидировала кэш клиента, потому что маркер игнорировал переданный dsn.
+
+    Теперь dsn= клиента (schema_linker.py прокидывает effective_dsn) реально
+    используется для выбора sqlrag/<dsn>.profile.yaml, даже когда передан
+    namespace.
+    """
+    import custom_tools.text_to_sql.dsn_profile as dsn_profile_mod
+
+    monkeypatch.setattr(dsn_profile_mod, "get_repo_root", lambda: tmp_path)
+
+    schema = {"orders": {"columns": {"amount": {"type": "DECIMAL"}}}}
+    namespace = _scoped_namespace(schema)
+
+    # Глобальная DB_DSN — третий, не связанный ни с одним клиентом DSN.
+    # В namespace-режиме она должна полностью игнорироваться.
+    monkeypatch.setenv("DB_DSN", "postgresql://irrelevant-global-host:5432/global_db")
+
+    dsn_client_a = "postgresql://tenant-a-host:5432/tenant_a_db"
+    dsn_client_b = "postgresql://tenant-b-host:5432/tenant_b_db"
+
+    profile_path_a = dsn_profile_mod.dsn_profile_path(dsn_client_a)
+    profile_path_a.parent.mkdir(parents=True, exist_ok=True)
+    profile_path_a.write_text("stub-a", encoding="utf-8")
+
+    cache = SchemaCacheManager()
+    entities = {"metrics": ["revenue"]}
+
+    info_a = cache.prepare_cache_info(entities, schema, dsn=dsn_client_a, namespace=namespace)
+    info_b = cache.prepare_cache_info(entities, schema, dsn=dsn_client_b, namespace=namespace)
+
+    # У client_a есть файл профиля, у client_b — нет → разные fingerprints,
+    # несмотря на общий namespace и общую (нерелевантную) DB_DSN.
+    assert info_a["env_fingerprint"] != info_b["env_fingerprint"]
+
+    # Появление профиля client_b НЕ должно влиять на fingerprint client_a
+    # (никакого cross-tenant влияния через чужой DSN-профиль).
+    profile_path_b = dsn_profile_mod.dsn_profile_path(dsn_client_b)
+    profile_path_b.parent.mkdir(parents=True, exist_ok=True)
+    profile_path_b.write_text("stub-b", encoding="utf-8")
+
+    info_a_after_b_edit = cache.prepare_cache_info(
+        entities, schema, dsn=dsn_client_a, namespace=namespace
+    )
+    assert info_a_after_b_edit["env_fingerprint"] == info_a["env_fingerprint"]
+
+    # Правка СВОЕГО профиля (client_a) — инвалидирует fingerprint client_a.
+    profile_path_a.write_text("stub-a-changed-content", encoding="utf-8")
+    info_a_after_own_edit = cache.prepare_cache_info(
+        entities, schema, dsn=dsn_client_a, namespace=namespace
+    )
+    assert info_a_after_own_edit["env_fingerprint"] != info_a["env_fingerprint"]
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +548,7 @@ def test_load_from_cache_returns_miss_when_env_fingerprint_mismatch(monkeypatch)
     (как если бы запись сделали при другом профиле).
     """
     monkeypatch.setenv("DB_DSN", "sqlite:///tmp/test.db")
-    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "muni_ru")
+    monkeypatch.setenv("TEXT_TO_SQL_NLU_PROFILE", "alt_profile")
 
     cache = SchemaCacheManager()
     info = _prepare_cache_info(cache, {"x": []}, {"t": {"columns": {}}})

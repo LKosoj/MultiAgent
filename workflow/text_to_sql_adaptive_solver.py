@@ -22,6 +22,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchReentryStatus,
     ResearchState,
     SemanticItemKind,
+    SimilarSuccessfulSqlExample,
     SolverState,
     SolverStopReason,
 )
@@ -40,6 +41,14 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     canonical_json_bytes,
 )
 from custom_tools.text_to_sql.adaptive.serialization import canonical_digest
+from custom_tools.text_to_sql.adaptive.model_budget import (
+    APPROXIMATE_BYTES_PER_TOKEN,
+    ModelTokenUsage,
+)
+from custom_tools.text_to_sql.adaptive.policy import (
+    BudgetAdmissionError,
+    execute_model_call_with_budget_async,
+)
 from custom_tools.text_to_sql.adaptive.replay_inputs import (
     SolverReentryAdmissionReplayInput,
     SolverReentryCompletedReplayInput,
@@ -85,7 +94,10 @@ from ._text_to_sql_solver_execution_reducer import (
 from ._text_to_sql_solver_terminal_evidence import (
     build_verified_solver_terminal_evidence,
 )
-from ._text_to_sql_solver_reentry import settle_incomplete_reentry_model_call
+from ._text_to_sql_solver_reentry import (
+    settle_incomplete_reentry_model_call,
+    settle_incomplete_solver_model_call,
+)
 from ._text_to_sql_reentry_recovery import recover_prepared_targeted_reentry
 from .text_to_sql_contract import TextToSqlTerminalResult
 
@@ -178,6 +190,30 @@ async def run_production_adaptive_sql_generation(
         profile.instructions,
     )
     adapter = SqlSolverProposalAdapter(profile, provider)
+
+    async def _wait_for_model_claim(seconds: float) -> None:
+        """Deadline/cancellation-aware poll wait for the model-budget claim loop.
+
+        Mirrors ``_ResearchLoopCoordinator._wait_for_model_follower``
+        (custom_tools/text_to_sql/adaptive/research_loop.py): without this,
+        ``execute_model_call_with_budget_async``'s default ``wait=asyncio.sleep``
+        (custom_tools/text_to_sql/adaptive/_policy_model_budget.py) polls
+        forever, ignoring both cancellation and the workflow deadline.
+        ``runtime.deadline.require_remaining`` raises ``WorkflowDeadlineExceeded``,
+        which ``_commit_next_solver_proposal`` maps to
+        ``SolverStopReason.DEADLINE_EXCEEDED``; ``asyncio.CancelledError`` is not
+        an ``Exception`` subclass, so it passes through that handler's
+        ``except Exception`` unchanged.
+        """
+
+        if runtime.is_cancelled():
+            raise asyncio.CancelledError()
+        remaining = runtime.deadline.require_remaining("sql_solver_model_claim")
+        await asyncio.sleep(min(seconds, remaining))
+        if runtime.is_cancelled():
+            raise asyncio.CancelledError()
+        runtime.deadline.require_remaining("sql_solver_model_claim")
+
     if reenter is None:
         from custom_tools.text_to_sql.adaptive.schema_research_agent import (
             load_schema_research_agent_profile,
@@ -220,11 +256,68 @@ async def run_production_adaptive_sql_generation(
             repair_receipt,
             sql_parse_feedback,
         )
-        return await adapter.propose(
-            task=runtime.query,
-            solver_context=solver_context,
-            deadline=runtime.deadline,
+        limits = runtime.verified_research_policy.model_budget
+        if limits is None:
+            raise TypeError("adaptive solver requires configured model budget limits")
+        request_digest = canonical_digest(
+            {"task": runtime.query, "solver_context": solver_context}
         )
+        proposed: SolverProposalV1 | None = None
+        attempts = 0
+        call_attempt = None
+        while proposed is None:
+            # A replay of an already-reconciled ledger record for this exact
+            # call_id (idempotent restart) returns from
+            # execute_model_call_with_budget_async without invoking _call,
+            # leaving `proposed` as None. Retrying with the next durable
+            # attempt (the ledger has grown, so _next_solver_model_attempt
+            # returns a fresh call_id) mirrors how research_loop's own outer
+            # attempt loop handles the same replay outcome, instead of
+            # surfacing a spurious RuntimeError/TOOL_FAILURE here. The
+            # `attempts` bound below is the real anomaly backstop.
+            if attempts >= limits.model_calls:
+                raise RuntimeError(
+                    "SQL-solver model replay has no durable proposal after "
+                    f"{attempts} ledger attempts"
+                )
+            attempts += 1
+            ledger_attempt = _next_solver_model_attempt(
+                runtime.budget_ledger, runtime.run_id, runtime.run_incarnation, state.revision
+            )
+            # The call_id number normally tracks ledger growth directly; on
+            # retries floor it at the local counter too, so it keeps
+            # advancing even if the ledger read does not yet reflect the
+            # previous iteration's record.
+            call_attempt = (
+                ledger_attempt
+                if call_attempt is None
+                else max(call_attempt + 1, ledger_attempt)
+            )
+            call_id = f"solver-generate-{state.revision}-{call_attempt}"
+
+            async def _call(_: object) -> ModelTokenUsage:
+                nonlocal proposed
+                proposed, usage = await adapter.propose_with_usage(
+                    task=runtime.query,
+                    solver_context=solver_context,
+                    deadline=runtime.deadline,
+                )
+                return usage
+
+            await execute_model_call_with_budget_async(
+                runtime.run_id,
+                runtime.run_incarnation,
+                call_id,
+                request_digest,
+                _solver_model_identity(profile.model),
+                limits.input_tokens_per_call,
+                limits.output_tokens_per_call,
+                _call,
+                config=runtime.verified_research_policy,
+                ledger=runtime.budget_ledger,
+                wait=_wait_for_model_claim,
+            )
+        return proposed
 
     return await run_adaptive_sql_generation(
         runtime,
@@ -514,6 +607,14 @@ async def _resume_open_generation(
             research,
             requirements,
         )
+        # Same durable-restart problem as the research call above, but for the
+        # solver's own "solver-generate-*" model calls: the shared model-budget
+        # ledger allows only one outstanding (unreconciled) reservation ever, so
+        # a crash between that call's STARTED and RESULT events would otherwise
+        # durably block every later solver-generate-* attempt with
+        # BudgetConflictError (see settle_incomplete_solver_model_call's
+        # docstring). No-op if there is nothing outstanding to settle.
+        await settle_incomplete_solver_model_call(runtime)
 
     boundary = await _generation_boundary(runtime)
     if boundary is not None:
@@ -768,6 +869,8 @@ def _normalize_solver_proposal_source_id(
 
 
 def _proposal_failure_reason(exc):
+    if isinstance(exc, BudgetAdmissionError):
+        return SolverStopReason.BUDGET_EXHAUSTED
     if isinstance(exc, SolverCandidateLimitError):
         return SolverStopReason.NO_SAFE_CANDIDATE
     if isinstance(exc, SolverConflictError):
@@ -777,13 +880,147 @@ def _proposal_failure_reason(exc):
     return SolverStopReason.TOOL_FAILURE
 
 
-def _production_solver_model(runtime, profile_model, system_prompt):
-    return _production_json_model(
-        runtime,
-        profile_model,
-        "SQL-solver",
-        system_prompt,
+def _solver_model_identity(model: str) -> str:
+    """Return the unique model-ledger identity of the SQL-solver profile."""
+
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("SQL-solver model must be non-empty text")
+    return f"sql_solver_agent:{model}"
+
+
+def _next_solver_model_attempt(
+    ledger: object,
+    run_id: str,
+    run_incarnation: str,
+    revision: int,
+) -> int:
+    """Return the durable attempt index for the next solver model call.
+
+    Mirrors ``research_loop._next_model_attempt``: the attempt is the count of
+    ledger records already recorded for this exact solver-proposal revision.
+    """
+
+    prefix = f"solver-generate-{revision}-"
+    return sum(
+        record.reservation.call_id.startswith(prefix)
+        for record in ledger.load_model_records(run_id, run_incarnation)
     )
+
+
+def _production_solver_model(runtime, profile_model, system_prompt):
+    policy = runtime.verified_research_policy
+    limits = getattr(policy, "model_budget", None)
+    output_tokens = getattr(limits, "output_tokens_per_call", None)
+    if type(output_tokens) is not int or output_tokens <= 0:
+        raise TypeError("adaptive solver requires configured model limits")
+    # Same source ``run_production_adaptive_sql_generation``'s ``propose``
+    # uses to open the one ``solver-generate-*`` ledger reservation this
+    # wrapper's provider call runs inside (see the module's own
+    # ``limits.input_tokens_per_call`` reservation call a few hundred lines
+    # above) -- a retry's summed usage below is clamped to this exact cap,
+    # never a different one.
+    input_tokens = getattr(limits, "input_tokens_per_call", None)
+
+    from smolagents import ChatMessage, MessageRole
+
+    from agent_command import create_text_to_sql_model
+    from custom_tools.text_to_sql.adaptive._empty_response_retry import (
+        _is_blank_text,
+        _is_empty,
+        _raw_response_text,
+        retry_once_on_empty_response,
+        sum_model_token_usage,
+    )
+    from custom_tools.text_to_sql.adaptive.sql_solver_agent import (
+        SqlSolverModelResponse,
+    )
+    from .text_to_sql_typed_research import _provider_model_usage
+
+    provider = create_text_to_sql_model(
+        profile_model,
+        max_tokens=output_tokens,
+        temperature=0.3,
+    )
+
+    async def model(prompt: str) -> SqlSolverModelResponse:
+        messages = [
+            ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
+            ChatMessage(role=MessageRole.USER, content=prompt),
+        ]
+
+        async def _invoke_provider():
+            with llm_call_context(run_id=runtime.run_id, step_name="SQL-solver"):
+                return await asyncio.to_thread(
+                    provider,
+                    messages,
+                    max_tokens=output_tokens,
+                    temperature=0.3,
+                    response_format={"type": "json_object"},
+                )
+
+        # A retry (on an empty response) is a second *provider* call for
+        # this same logical model call, made from inside the caller's
+        # already-open ``solver-generate-*`` ledger reservation
+        # (run_production_adaptive_sql_generation's `propose`) -- it must
+        # not open a second, nested reservation of its own. See
+        # custom_tools/text_to_sql/adaptive/_empty_response_retry.py. Skip
+        # the retry once the deadline is exhausted: a second network call
+        # cannot help if there is no time left for one. Some callers
+        # (e.g. targeted re-entry test doubles) pass a ``runtime`` without a
+        # ``deadline`` attribute at all -- treat that as "unknown" rather
+        # than fail, and just take the retry path.
+        deadline = getattr(runtime, "deadline", None)
+        if deadline is not None and deadline.remaining_seconds() <= 0:
+            response = await _invoke_provider()
+            attempts = (response,)
+        else:
+            response, attempts = await retry_once_on_empty_response(
+                _invoke_provider,
+                is_empty=lambda candidate: _is_blank_text(_raw_response_text(candidate)),
+                log_context=f"SQL-solver (run_id={runtime.run_id})",
+            )
+        raw_response = _raw_response_text(response)
+        if _is_empty(raw_response):
+            raise ValueError("SQL-solver model response is empty")
+        response_size = (
+            len(raw_response)
+            if type(raw_response) is bytes
+            else len(raw_response.encode("utf-8"))
+        )
+        if response_size > max(1_024, output_tokens * 8):
+            raise ValueError("SQL-solver model response exceeds its safety envelope")
+        if len(attempts) == 1:
+            # No retry happened: charge the provider's usage as-is so a
+            # genuine cap overshoot still surfaces at reconciliation.
+            usage = _provider_model_usage(attempts[0])
+        elif input_tokens is None:
+            # ``limits`` had no ``input_tokens_per_call`` to read (an
+            # unexpected/duck-typed ``policy``) -- summing both attempts'
+            # usage without a known cap could overshoot the real reservation
+            # and make reconciliation fail unrecoverably (see
+            # custom_tools/text_to_sql/adaptive/_empty_response_retry.py).
+            # Charge only the successful attempt's own usage instead: that
+            # alone is exactly what a non-retried call would have charged,
+            # so it is guaranteed to fit under the cap.
+            logger.warning(
+                "SQL-solver (run_id=%s): retried usage cap is unavailable to "
+                "this wrapper; charging only the successful attempt, not "
+                "the sum across both attempts",
+                runtime.run_id,
+            )
+            usage = _provider_model_usage(attempts[-1])
+        else:
+            usage = sum_model_token_usage(
+                tuple(_provider_model_usage(attempt) for attempt in attempts),
+                max_input_tokens=input_tokens,
+                max_output_tokens=output_tokens,
+            )
+        return SqlSolverModelResponse(
+            raw_response=raw_response,
+            usage=usage,
+        )
+
+    return model
 
 
 def _production_json_model(runtime, profile_model, label, system_prompt):
@@ -825,6 +1062,157 @@ def _production_json_model(runtime, profile_model, label, system_prompt):
     return model
 
 
+# Truncation caps for `_solver_context` below. These stay code constants
+# (not adaptive.yaml keys) because every existing yaml budget knob is a
+# *ceiling* layered on top of the MAX_* policy constants in policy.py; these
+# three instead shape *how* an oversized prompt gets cut down to fit under
+# that ceiling, which is prompt-construction detail, not a policy budget.
+DOC_CONTENT_CHAR_CAP = 8_000
+HISTORY_KEEP = 2
+DIAG_CHAR_CAP = 500
+
+
+def _solver_context_sized(
+    core: Mapping[str, object],
+    applied_steps: list[str],
+    original_bytes: int,
+) -> tuple[dict, int]:
+    """Return ``(core + context_truncation marker, exact byte size)``.
+
+    ``final_bytes`` inside the marker must report the size of the payload
+    that *includes* the marker itself. That is solved with a small
+    fixed-point loop: reserialize with the previous size as the candidate
+    ``final_bytes`` until the encoded size stops changing (it converges in a
+    couple of iterations, since only the digit width of ``final_bytes`` can
+    move the total size).
+    """
+
+    final_bytes = 0
+    payload: dict = {}
+    size = -1
+    for _ in range(6):
+        payload = {
+            **core,
+            "context_truncation": {
+                "applied_steps": list(applied_steps),
+                "original_bytes": original_bytes,
+                "final_bytes": final_bytes,
+            },
+        }
+        size = len(canonical_json_bytes(payload))
+        if size == final_bytes:
+            break
+        final_bytes = size
+    return payload, size
+
+
+def _drop_similar_examples(solver_state: dict) -> dict:
+    """Drop cross-run successful-SQL memory hits: the least-authoritative source.
+
+    These are read-only retrieval hints from prior runs, not part of the
+    current run's own evidentiary record, so they are the first thing cut
+    when the context needs to shrink.
+    """
+
+    if not solver_state["similar_successful_sql_examples"]:
+        return solver_state
+    return {**solver_state, "similar_successful_sql_examples": []}
+
+
+def _truncate_document_content(documents: list[dict]) -> list[dict]:
+    """Cap each trusted document's content, marking what was cut."""
+
+    truncated = []
+    for document in documents:
+        content = document["content"]
+        if len(content) > DOC_CONTENT_CHAR_CAP:
+            cut = len(content) - DOC_CONTENT_CHAR_CAP
+            document = {
+                **document,
+                "content": f"{content[:DOC_CONTENT_CHAR_CAP]}…[truncated {cut} chars]",
+            }
+        truncated.append(document)
+    return truncated
+
+
+def _limit_document_count(
+    core: Mapping[str, object],
+    applied_steps: list[str],
+    original_bytes: int,
+    limit_bytes: int,
+) -> list[dict]:
+    """Admit documents in ``document_id`` order while the payload still fits.
+
+    Mirrors ``SchemaLimiter.build_schema_summary``'s incremental fit
+    (validators/schema_limiter.py): grow a copy one document at a time and
+    keep it only if the rendered size stays within budget, trying every
+    remaining document rather than stopping at the first one that fails.
+    """
+
+    fitted: list[dict] = []
+    for document in core["trusted_documents"]:
+        candidate = [*fitted, document]
+        _, size = _solver_context_sized(
+            {**core, "trusted_documents": candidate},
+            [*applied_steps, "limit_document_count"],
+            original_bytes,
+        )
+        if size <= limit_bytes:
+            fitted = candidate
+    return fitted
+
+
+def _truncate_solver_history(solver_state: dict) -> dict:
+    """Keep only the latest ``HISTORY_KEEP`` candidates and their history."""
+
+    candidates = solver_state["sql_candidates"]
+    kept_candidates = candidates[-HISTORY_KEEP:]
+    kept_candidate_ids = {candidate["candidate_id"] for candidate in kept_candidates}
+    return {
+        **solver_state,
+        "sql_candidates": kept_candidates,
+        "check_results": [
+            check
+            for check in solver_state["check_results"]
+            if check["candidate_id"] in kept_candidate_ids
+        ],
+        "execution_results": [
+            execution
+            for execution in solver_state["execution_results"]
+            if execution["candidate_id"] in kept_candidate_ids
+        ],
+        "action_history": solver_state["action_history"][-HISTORY_KEEP:],
+        "missing_evidence_requests": solver_state["missing_evidence_requests"][
+            -HISTORY_KEEP:
+        ],
+    }
+
+
+def _truncate_check_diagnostics(solver_state: dict) -> dict:
+    """Cap free-text diagnostics on check results not tied to the latest candidate."""
+
+    candidates = solver_state["sql_candidates"]
+    if not candidates:
+        return solver_state
+    latest_candidate_id = candidates[-1]["candidate_id"]
+
+    def _capped(check: dict) -> dict:
+        if check["candidate_id"] == latest_candidate_id:
+            return check
+        capped = dict(check)
+        for field_name in ("observed_error", "required_change"):
+            value = capped.get(field_name)
+            if type(value) is str and len(value) > DIAG_CHAR_CAP:
+                cut = len(value) - DIAG_CHAR_CAP
+                capped[field_name] = f"{value[:DIAG_CHAR_CAP]}…[truncated {cut} chars]"
+        return capped
+
+    return {
+        **solver_state,
+        "check_results": [_capped(check) for check in solver_state["check_results"]],
+    }
+
+
 def _solver_context(
     runtime,
     state,
@@ -839,7 +1227,10 @@ def _solver_context(
         raise TypeError("adaptive solver requires configured model limits")
     if repair_receipt is not None and type(repair_receipt) is not ResultReviewReceipt:
         raise TypeError("solver repair receipt must be an exact ResultReviewReceipt")
-    payload_data = {
+
+    limit_bytes = input_tokens * APPROXIMATE_BYTES_PER_TOKEN
+
+    core: dict[str, object] = {
         "coverage_requirements": requirements.model_dump(mode="json"),
         "solver_state": state.model_dump(mode="json"),
         "trusted_documents": [
@@ -848,15 +1239,65 @@ def _solver_context(
         ],
     }
     if repair_receipt is not None:
-        payload_data["deterministic_sql_repair_receipt"] = repair_receipt.model_dump(
+        core["deterministic_sql_repair_receipt"] = repair_receipt.model_dump(
             mode="json"
         )
     if sql_parse_feedback is not None:
-        payload_data["sql_parse_feedback"] = dict(sql_parse_feedback)
-    payload = canonical_json_bytes(payload_data)
-    if len(payload) > input_tokens * 4:
-        raise ValueError("adaptive solver context exceeds configured model input")
-    return payload.decode("utf-8")
+        core["sql_parse_feedback"] = dict(sql_parse_feedback)
+
+    original_bytes = len(canonical_json_bytes(core))
+    applied_steps: list[str] = []
+    payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        dropped_state = _drop_similar_examples(core["solver_state"])
+        if dropped_state != core["solver_state"]:
+            core = {**core, "solver_state": dropped_state}
+            applied_steps.append("drop_similar_successful_sql_examples")
+        payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        truncated_documents = _truncate_document_content(core["trusted_documents"])
+        if truncated_documents != core["trusted_documents"]:
+            core = {**core, "trusted_documents": truncated_documents}
+            applied_steps.append("truncate_document_content")
+        payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        limited_documents = _limit_document_count(
+            core, applied_steps, original_bytes, limit_bytes
+        )
+        if limited_documents != core["trusted_documents"]:
+            core = {**core, "trusted_documents": limited_documents}
+            applied_steps.append("limit_document_count")
+        payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        truncated_state = _truncate_solver_history(core["solver_state"])
+        if truncated_state != core["solver_state"]:
+            core = {**core, "solver_state": truncated_state}
+            applied_steps.append("truncate_solver_history")
+        payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        diagnosed_state = _truncate_check_diagnostics(core["solver_state"])
+        if diagnosed_state != core["solver_state"]:
+            core = {**core, "solver_state": diagnosed_state}
+            applied_steps.append("truncate_check_diagnostics")
+        payload, size = _solver_context_sized(core, applied_steps, original_bytes)
+
+    if size > limit_bytes:
+        raise ValueError(
+            "adaptive solver context exceeds configured model input after truncation"
+        )
+    if applied_steps:
+        logger.warning(
+            "solver context truncated: steps=%s original=%d final=%d",
+            applied_steps,
+            original_bytes,
+            size,
+        )
+    return canonical_json_bytes(payload).decode("utf-8")
 
 
 def _validated_generation_runtime(runtime: object):
@@ -883,6 +1324,26 @@ def _validated_generation_runtime(runtime: object):
 
 
 def _initial_solver_state(research: ResearchState) -> SolverState:
+    from custom_tools.text_to_sql.successful_sql_memory import (
+        retrieve_successful_sql_examples,
+        successful_sql_memory_enabled,
+    )
+
+    similar_examples: tuple[SimilarSuccessfulSqlExample, ...] = ()
+    if successful_sql_memory_enabled():
+        retrieval = retrieve_successful_sql_examples(
+            namespace_version_key=research.schema_namespace_version.split(":", 1)[-1],
+            user_query=research.query_spec.original_text,
+        )
+        if retrieval.status == "READY":
+            similar_examples = tuple(
+                SimilarSuccessfulSqlExample(
+                    user_query=entry["user_query"],
+                    sql=entry["sql"],
+                )
+                for entry in json.loads(retrieval.context_json)
+            )
+
     return SolverState(
         run_id=research.run_id,
         run_incarnation=research.run_incarnation,
@@ -893,6 +1354,7 @@ def _initial_solver_state(research: ResearchState) -> SolverState:
         check_results=(),
         execution_results=(),
         missing_evidence_requests=(),
+        similar_successful_sql_examples=similar_examples,
         action_history=(),
         selected_candidate_id=None,
         stop_reason=None,
