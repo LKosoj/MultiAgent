@@ -9,6 +9,7 @@ import { TextToSqlConnectionsTab } from "./TextToSqlConnectionsTab";
 import { TextToSqlSchemaTab } from "./TextToSqlSchemaTab";
 import { TextToSqlHistoryTab } from "./TextToSqlHistoryTab";
 import { TextToSqlGenerateTab } from "./TextToSqlGenerateTab";
+import { TextToSqlMetadataTab } from "./TextToSqlMetadataTab";
 import {
   type TextToSqlStartResponse,
 } from "../../utils/textToSqlStart";
@@ -19,6 +20,7 @@ import {
 import {
   textToSqlRunTerminalStatus,
 } from "../../lib/textToSqlContracts";
+import { type TextToSqlMetadataView } from "../../lib/textToSqlMetadataContracts";
 
 export {
   buildTextToSqlSchemaPayload,
@@ -35,6 +37,7 @@ export {
   textToSqlRunTerminalStatus,
 } from "../../lib/textToSqlContracts";
 export type { TextToSqlHistorySummary } from "../../lib/textToSqlContracts";
+export type { TextToSqlMetadataView } from "../../lib/textToSqlMetadataContracts";
 export {
   beginTextToSqlRunSelection,
   cancelTextToSqlResultRetries,
@@ -60,15 +63,16 @@ type Props = {
   ) => Promise<TextToSqlStartResponse>;
   isBusy: boolean;
   active: boolean;
+  isAdmin: boolean;
   notify?: (msg: string, type: "error" | "success" | "info") => void;
 };
 
-export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, active, notify }: Props) {
+export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, active, isAdmin, notify }: Props) {
   const textToSqlClient = useMemo(
     () => createTextToSqlClient(runServiceAction, startTextToSqlRun),
     [runServiceAction, startTextToSqlRun],
   );
-  const [tab, setTab] = useState<"generate" | "connections" | "schema" | "history">("generate");
+  const [tab, setTab] = useState<"generate" | "connections" | "schema" | "metadata" | "history">("generate");
   const [prompt, setPrompt] = useState("");
   const [naturalQuery, setNaturalQuery] = useState("");
   const [connectionRef, setConnectionRef] = useState("");
@@ -86,6 +90,7 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
   const [allowDbSchemaFallback, setAllowDbSchemaFallback] = useState(false);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [schemaResult, setSchemaResult] = useState<any | null>(null);
+  const [metadataView, setMetadataView] = useState<TextToSqlMetadataView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadedConnections, setLoadedConnections] = useState(false);
   const [historyFilterStatus, setHistoryFilterStatus] = useState("all");
@@ -188,6 +193,9 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
         <button className={`segment-button${tab === "schema" ? " active" : ""}`} onClick={() => setTab("schema")}>
           Схема БД
         </button>
+        <button className={`segment-button${tab === "metadata" ? " active" : ""}`} onClick={() => setTab("metadata")}>
+          Метаданные
+        </button>
         <button className={`segment-button${tab === "history" ? " active" : ""}`} onClick={() => setTab("history")}>
           История
         </button>
@@ -271,6 +279,20 @@ export function TextToSqlSection({ runServiceAction, startTextToSqlRun, isBusy, 
           setAllowDbSchemaFallback={setAllowDbSchemaFallback}
           schemaResult={schemaResult}
           setSchemaResult={setSchemaResult}
+        />
+      ) : null}
+
+      {tab === "metadata" ? (
+        <TextToSqlMetadataTab
+          connectionRef={connectionRef}
+          setConnectionRef={setConnectionRef}
+          connections={connections}
+          textToSqlClient={textToSqlClient}
+          isBusy={isBusy}
+          isAdmin={isAdmin}
+          setError={setError}
+          metadataView={metadataView}
+          setMetadataView={setMetadataView}
         />
       ) : null}
 

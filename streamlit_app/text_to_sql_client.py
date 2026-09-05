@@ -122,6 +122,171 @@ class SchemaResult:
     raw: Mapping[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class ColumnMetadata:
+    name: str
+    description: str
+    description_source: str
+    examples: list[Any]
+    examples_source: str
+
+
+@dataclass(frozen=True)
+class TableMetadata:
+    table_fqn: str
+    description: str
+    description_source: str
+    columns: list[ColumnMetadata]
+
+
+@dataclass(frozen=True)
+class GlossaryEntrySummary:
+    term: str
+    synonyms: list[str]
+    table: str
+    column: Optional[str]
+    kind: Optional[str]
+    note: Optional[str]
+
+
+@dataclass(frozen=True)
+class SemanticFactSummary:
+    fact_key: str
+    subject: str
+    table_fqn: str
+    column: Optional[str]
+    fact_kind: str
+    value: Any
+    status: str
+
+
+@dataclass(frozen=True)
+class MetadataView:
+    connection_ref: str
+    schema_digest: Optional[str]
+    tables: list[TableMetadata]
+    glossary_digest: str
+    glossary_entries: list[GlossaryEntrySummary]
+    facts: list[SemanticFactSummary]
+    raw: Mapping[str, Any] = field(default_factory=dict)
+
+
+def _column_metadata(name: object, value: object) -> ColumnMetadata:
+    if not isinstance(name, str) or not name:
+        raise TextToSqlApiError("metadata column name must be a non-empty string")
+    if not isinstance(value, Mapping):
+        raise TextToSqlApiError("metadata column entry must be an object")
+    description = value.get("description")
+    description_source = value.get("description_source")
+    examples = value.get("examples")
+    examples_source = value.get("examples_source")
+    if not isinstance(description, str):
+        raise TextToSqlApiError("metadata column description must be a string")
+    if not isinstance(description_source, str):
+        raise TextToSqlApiError("metadata column description_source must be a string")
+    if not isinstance(examples, list):
+        raise TextToSqlApiError("metadata column examples must be a list")
+    if not isinstance(examples_source, str):
+        raise TextToSqlApiError("metadata column examples_source must be a string")
+    return ColumnMetadata(
+        name=name,
+        description=description,
+        description_source=description_source,
+        examples=list(examples),
+        examples_source=examples_source,
+    )
+
+
+def _table_metadata(table_fqn: object, value: object) -> TableMetadata:
+    if not isinstance(table_fqn, str) or not table_fqn:
+        raise TextToSqlApiError("metadata table_fqn must be a non-empty string")
+    if not isinstance(value, Mapping):
+        raise TextToSqlApiError("metadata table entry must be an object")
+    description = value.get("description")
+    description_source = value.get("description_source")
+    columns = value.get("columns")
+    if not isinstance(description, str):
+        raise TextToSqlApiError("metadata table description must be a string")
+    if not isinstance(description_source, str):
+        raise TextToSqlApiError("metadata table description_source must be a string")
+    if not isinstance(columns, Mapping):
+        raise TextToSqlApiError("metadata table columns must be an object")
+    return TableMetadata(
+        table_fqn=table_fqn,
+        description=description,
+        description_source=description_source,
+        columns=[
+            _column_metadata(column_name, column_value)
+            for column_name, column_value in columns.items()
+        ],
+    )
+
+
+def _glossary_entry(value: object) -> GlossaryEntrySummary:
+    if not isinstance(value, Mapping):
+        raise TextToSqlApiError("glossary entry must be an object")
+    term = value.get("term")
+    synonyms = value.get("synonyms")
+    table = value.get("table")
+    if not isinstance(term, str) or not term:
+        raise TextToSqlApiError("glossary entry term must be a non-empty string")
+    if not isinstance(synonyms, list) or not all(
+        isinstance(item, str) for item in synonyms
+    ):
+        raise TextToSqlApiError("glossary entry synonyms must be a list of strings")
+    if not isinstance(table, str) or not table:
+        raise TextToSqlApiError("glossary entry table must be a non-empty string")
+    column = value.get("column")
+    if column is not None and not isinstance(column, str):
+        raise TextToSqlApiError("glossary entry column must be a string or null")
+    kind = value.get("kind")
+    if kind is not None and not isinstance(kind, str):
+        raise TextToSqlApiError("glossary entry kind must be a string or null")
+    note = value.get("note")
+    if note is not None and not isinstance(note, str):
+        raise TextToSqlApiError("glossary entry note must be a string or null")
+    return GlossaryEntrySummary(
+        term=term,
+        synonyms=list(synonyms),
+        table=table,
+        column=column,
+        kind=kind,
+        note=note,
+    )
+
+
+def _semantic_fact(value: object) -> SemanticFactSummary:
+    if not isinstance(value, Mapping):
+        raise TextToSqlApiError("semantic fact must be an object")
+    fact_key = value.get("fact_key")
+    subject = value.get("subject")
+    table_fqn = value.get("table_fqn")
+    fact_kind = value.get("fact_kind")
+    status = value.get("status")
+    if not isinstance(fact_key, str) or not fact_key:
+        raise TextToSqlApiError("semantic fact fact_key must be a non-empty string")
+    if not isinstance(subject, str):
+        raise TextToSqlApiError("semantic fact subject must be a string")
+    if not isinstance(table_fqn, str):
+        raise TextToSqlApiError("semantic fact table_fqn must be a string")
+    if not isinstance(fact_kind, str):
+        raise TextToSqlApiError("semantic fact fact_kind must be a string")
+    if not isinstance(status, str):
+        raise TextToSqlApiError("semantic fact status must be a string")
+    column = value.get("column")
+    if column is not None and not isinstance(column, str):
+        raise TextToSqlApiError("semantic fact column must be a string or null")
+    return SemanticFactSummary(
+        fact_key=fact_key,
+        subject=subject,
+        table_fqn=table_fqn,
+        column=column,
+        fact_kind=fact_kind,
+        value=value.get("value"),
+        status=status,
+    )
+
+
 def _contract_error(message: str) -> TextToSqlApiError:
     return TextToSqlApiError(f"invalid Text-to-SQL terminal outcome: {message}")
 
@@ -490,6 +655,122 @@ class TextToSqlApiClient:
             tables=[dict(table) for table in schema.get("tables") or []],
             raw=dict(schema),
         )
+
+    def load_metadata(self, connection_ref: str) -> MetadataView:
+        if not connection_ref.strip():
+            raise ValueError("connection_ref is required")
+        data = self._run_service_action(
+            "text_to_sql.metadata.load",
+            {"connection_ref": connection_ref},
+        )
+        tables_raw = data.get("tables")
+        if not isinstance(tables_raw, Mapping):
+            raise TextToSqlApiError("metadata tables must be an object")
+        glossary_raw = data.get("glossary")
+        if not isinstance(glossary_raw, Mapping):
+            raise TextToSqlApiError("metadata glossary must be an object")
+        glossary_digest = glossary_raw.get("digest")
+        if not isinstance(glossary_digest, str) or not glossary_digest:
+            raise TextToSqlApiError(
+                "metadata glossary digest must be a non-empty string"
+            )
+        glossary_entries_raw = glossary_raw.get("entries")
+        if not isinstance(glossary_entries_raw, list):
+            raise TextToSqlApiError("metadata glossary entries must be a list")
+        facts_raw = data.get("facts")
+        if not isinstance(facts_raw, list):
+            raise TextToSqlApiError("metadata facts must be a list")
+        schema_digest = data.get("schema_digest")
+        if schema_digest is not None and not isinstance(schema_digest, str):
+            raise TextToSqlApiError("metadata schema_digest must be a string or null")
+        return MetadataView(
+            connection_ref=connection_ref,
+            schema_digest=schema_digest,
+            tables=[
+                _table_metadata(table_fqn, table_payload)
+                for table_fqn, table_payload in tables_raw.items()
+            ],
+            glossary_digest=glossary_digest,
+            glossary_entries=[
+                _glossary_entry(entry) for entry in glossary_entries_raw
+            ],
+            facts=[_semantic_fact(entry) for entry in facts_raw],
+            raw=dict(data),
+        )
+
+    def save_metadata_descriptions(
+        self,
+        *,
+        connection_ref: str,
+        expected_schema_digest: Optional[str],
+        tables: list[Mapping[str, Any]],
+    ) -> str:
+        if not connection_ref.strip():
+            raise ValueError("connection_ref is required")
+        data = self._run_service_action(
+            "text_to_sql.metadata.save_descriptions",
+            {
+                "connection_ref": connection_ref,
+                "expected_schema_digest": expected_schema_digest,
+                "tables": [dict(table) for table in tables],
+            },
+        )
+        schema_digest = data.get("schema_digest")
+        if not isinstance(schema_digest, str) or not schema_digest:
+            raise TextToSqlApiError(
+                "metadata save must return a non-empty schema_digest"
+            )
+        return schema_digest
+
+    def save_metadata_glossary(
+        self,
+        *,
+        connection_ref: str,
+        expected_glossary_digest: str,
+        entries: list[Mapping[str, Any]],
+    ) -> str:
+        if not connection_ref.strip():
+            raise ValueError("connection_ref is required")
+        data = self._run_service_action(
+            "text_to_sql.metadata.save_glossary",
+            {
+                "connection_ref": connection_ref,
+                "expected_glossary_digest": expected_glossary_digest,
+                "entries": [dict(entry) for entry in entries],
+            },
+        )
+        glossary_digest = data.get("glossary_digest")
+        if not isinstance(glossary_digest, str) or not glossary_digest:
+            raise TextToSqlApiError(
+                "glossary save must return a non-empty glossary_digest"
+            )
+        return glossary_digest
+
+    def set_metadata_fact_status(
+        self,
+        *,
+        connection_ref: str,
+        fact_key: str,
+        status: str,
+    ) -> str:
+        if not connection_ref.strip():
+            raise ValueError("connection_ref is required")
+        if not fact_key.strip():
+            raise ValueError("fact_key is required")
+        data = self._run_service_action(
+            "text_to_sql.metadata.set_fact_status",
+            {
+                "connection_ref": connection_ref,
+                "fact_key": fact_key,
+                "status": status,
+            },
+        )
+        new_status = data.get("status")
+        if not isinstance(new_status, str) or not new_status:
+            raise TextToSqlApiError(
+                "fact status update must return a non-empty status"
+            )
+        return new_status
 
     def list_history(
         self,

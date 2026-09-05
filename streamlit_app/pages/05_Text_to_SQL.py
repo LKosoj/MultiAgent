@@ -12,7 +12,11 @@ from workflow.text_to_sql_provenance import format_text_to_sql_provenance_footer
 from streamlit_app.text_to_sql_client import (
     TERMINAL_RUN_STATUSES,
     ConnectionSummary,
+    GlossaryEntrySummary,
+    MetadataView,
     RunStatus,
+    SemanticFactSummary,
+    TableMetadata,
     TextToSqlApiClient,
     TextToSqlApiError,
     TextToSqlResult,
@@ -73,6 +77,7 @@ def init_session_state() -> None:
         "text_to_sql_query": "",
         "text_to_sql_max_rows": None,
         "current_schema": None,
+        "current_metadata": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -317,6 +322,240 @@ def show_database_schema(client: TextToSqlApiClient) -> None:
             st.json(table)
 
 
+def _build_description_rows(tables: list[TableMetadata]) -> list[dict[str, Any]]:
+    """Одна строка на описание таблицы (``column=""``) плюс строка на каждую колонку."""
+    rows: list[dict[str, Any]] = []
+    for table in tables:
+        rows.append(
+            {
+                "table": table.table_fqn,
+                "column": "",
+                "description": table.description,
+                "examples": "",
+            }
+        )
+        for column in table.columns:
+            rows.append(
+                {
+                    "table": table.table_fqn,
+                    "column": column.name,
+                    "description": column.description,
+                    "examples": ", ".join(str(example) for example in column.examples),
+                }
+            )
+    return rows
+
+
+def _parse_examples_text(text: str) -> list[str]:
+    return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def _diff_description_edits(
+    original_rows: list[dict[str, Any]],
+    edited_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Строит частичный payload §1.3: только реально изменённые таблицы/колонки."""
+    table_edits: dict[str, dict[str, Any]] = {}
+    for original, edited in zip(original_rows, edited_rows):
+        table_fqn = str(original["table"])
+        column = str(original["column"])
+        original_description = str(original["description"])
+        edited_description = str(edited.get("description") or "")
+        original_examples = str(original["examples"])
+        edited_examples = str(edited.get("examples") or "")
+        description_changed = edited_description != original_description
+        examples_changed = bool(column) and edited_examples != original_examples
+        if not description_changed and not examples_changed:
+            continue
+        table_edit = table_edits.setdefault(
+            table_fqn, {"table_fqn": table_fqn, "columns": []}
+        )
+        if not column:
+            if description_changed:
+                table_edit["description"] = edited_description
+        else:
+            column_edit: dict[str, Any] = {"column": column}
+            if description_changed:
+                column_edit["description"] = edited_description
+            if examples_changed:
+                column_edit["examples"] = _parse_examples_text(edited_examples)
+            table_edit["columns"].append(column_edit)
+    return list(table_edits.values())
+
+
+def _build_glossary_rows(entries: list[GlossaryEntrySummary]) -> list[dict[str, Any]]:
+    return [
+        {
+            "term": entry.term,
+            "synonyms": ", ".join(entry.synonyms),
+            "table": entry.table,
+            "column": entry.column or "",
+            "kind": entry.kind or "",
+            "note": entry.note or "",
+        }
+        for entry in entries
+    ]
+
+
+def _parse_glossary_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Полная замена глоссария (§1.4): пустые новые строки редактора отбрасываются."""
+    entries: list[dict[str, Any]] = []
+    for row in rows:
+        term = str(row.get("term") or "").strip()
+        table = str(row.get("table") or "").strip()
+        if not term and not table:
+            continue
+        if not term:
+            raise ValueError("У термина глоссария должно быть заполнено поле «term»")
+        if not table:
+            raise ValueError(f"У термина «{term}» должно быть заполнено поле «table»")
+        synonyms = [
+            item.strip()
+            for item in str(row.get("synonyms") or "").split(",")
+            if item.strip()
+        ]
+        entries.append(
+            {
+                "term": term,
+                "synonyms": synonyms,
+                "table": table,
+                "column": str(row.get("column") or "").strip() or None,
+                "kind": str(row.get("kind") or "").strip() or None,
+                "note": str(row.get("note") or "").strip() or None,
+            }
+        )
+    return entries
+
+
+def _handle_metadata_save_error(
+    client: TextToSqlApiClient,
+    connection_ref: str,
+    exc: TextToSqlApiError,
+) -> None:
+    # Backend-сообщение о конфликте версии (§1.3/§1.4) содержит "version conflict" —
+    # отличаем его от прочих ошибок валидации, чтобы предложить перезагрузку.
+    if "version conflict" in str(exc):
+        st.error(f"{exc} Перезагрузите метаданные и повторите правку.")
+        if st.button("Перезагрузить метаданные", key="reload_metadata_after_conflict"):
+            st.session_state.current_metadata = client.load_metadata(connection_ref)
+            st.rerun()
+    else:
+        st.error(str(exc))
+
+
+def show_metadata_editor(client: TextToSqlApiClient, *, is_admin: bool) -> None:
+    st.markdown("## Метаданные схемы")
+    connection_ref = st.session_state.selected_connection_ref
+    if not connection_ref:
+        st.info("Сначала выберите подключение.")
+        return
+    if st.button("Загрузить метаданные", key="load_metadata"):
+        try:
+            st.session_state.current_metadata = client.load_metadata(connection_ref)
+        except TextToSqlApiError as exc:
+            st.error(str(exc))
+
+    metadata: MetadataView | None = st.session_state.current_metadata
+    if metadata is None:
+        return
+    if not is_admin:
+        st.caption(
+            "Сохранение метаданных доступно только пользователям с ролью admin."
+        )
+
+    st.markdown("### Описания таблиц и колонок")
+    original_description_rows = _build_description_rows(metadata.tables)
+    edited_description_rows = st.data_editor(
+        original_description_rows,
+        num_rows="fixed",
+        disabled=["table", "column"],
+        use_container_width=True,
+        key="metadata_description_editor",
+    )
+    if st.button(
+        "Сохранить описания", disabled=not is_admin, key="save_descriptions"
+    ):
+        table_edits = _diff_description_edits(
+            original_description_rows, edited_description_rows
+        )
+        if not table_edits:
+            st.info("Нет изменений для сохранения.")
+        else:
+            try:
+                new_digest = client.save_metadata_descriptions(
+                    connection_ref=connection_ref,
+                    expected_schema_digest=metadata.schema_digest,
+                    tables=table_edits,
+                )
+                st.session_state.current_metadata = client.load_metadata(
+                    connection_ref
+                )
+                st.success(f"Описания сохранены (digest: {new_digest}).")
+            except TextToSqlApiError as exc:
+                _handle_metadata_save_error(client, connection_ref, exc)
+
+    st.markdown("### Глоссарий")
+    original_glossary_rows = _build_glossary_rows(metadata.glossary_entries)
+    edited_glossary_rows = st.data_editor(
+        original_glossary_rows,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="metadata_glossary_editor",
+        column_config={
+            "kind": st.column_config.SelectboxColumn(
+                "kind",
+                options=["", "dimension", "measure", "filter_value", "entity"],
+            ),
+        },
+    )
+    if st.button("Сохранить глоссарий", disabled=not is_admin, key="save_glossary"):
+        try:
+            entries = _parse_glossary_rows(edited_glossary_rows)
+            new_digest = client.save_metadata_glossary(
+                connection_ref=connection_ref,
+                expected_glossary_digest=metadata.glossary_digest,
+                entries=entries,
+            )
+            st.session_state.current_metadata = client.load_metadata(connection_ref)
+            st.success(f"Глоссарий сохранён (digest: {new_digest}).")
+        except ValueError as exc:
+            st.error(str(exc))
+        except TextToSqlApiError as exc:
+            _handle_metadata_save_error(client, connection_ref, exc)
+
+    st.markdown("### Семантические факты")
+    facts: list[SemanticFactSummary] = metadata.facts
+    if not facts:
+        st.info("Фактов нет.")
+    for fact in facts:
+        subject = fact.table_fqn + (f".{fact.column}" if fact.column else "")
+        with st.expander(f"{subject} · {fact.fact_kind} · {fact.status}"):
+            st.write(f"Значение: {fact.value!r}")
+            new_status = st.selectbox(
+                "Статус",
+                ["approved", "rejected"],
+                index=0 if fact.status == "approved" else 1,
+                key=f"fact_status_{fact.fact_key}",
+            )
+            if st.button(
+                "Применить",
+                disabled=not is_admin,
+                key=f"fact_apply_{fact.fact_key}",
+            ):
+                try:
+                    client.set_metadata_fact_status(
+                        connection_ref=connection_ref,
+                        fact_key=fact.fact_key,
+                        status=new_status,
+                    )
+                    st.session_state.current_metadata = client.load_metadata(
+                        connection_ref
+                    )
+                    st.success("Статус факта обновлён.")
+                except TextToSqlApiError as exc:
+                    st.error(str(exc))
+
+
 def show_sql_history(client: TextToSqlApiClient) -> None:
     st.markdown("## История SQL запросов")
     try:
@@ -362,6 +601,8 @@ def main() -> None:
     subject = principal.get("subject") if isinstance(principal, Mapping) else None
     if subject:
         st.caption(f"Пользователь: {subject}")
+    roles = principal.get("roles") if isinstance(principal, Mapping) else None
+    is_admin = isinstance(roles, list) and "admin" in roles
     try:
         connections = _authorized_connections(client)
     except TextToSqlApiError as exc:
@@ -369,8 +610,20 @@ def main() -> None:
         st.stop()
         return
 
-    generation_tab, connections_tab, schema_tab, history_tab = st.tabs(
-        ["🔍 Генерация SQL", "🔌 Подключения", "📊 Схема БД", "📚 История"]
+    (
+        generation_tab,
+        connections_tab,
+        schema_tab,
+        history_tab,
+        metadata_tab,
+    ) = st.tabs(
+        [
+            "🔍 Генерация SQL",
+            "🔌 Подключения",
+            "📊 Схема БД",
+            "📚 История",
+            "🗂️ Метаданные",
+        ]
     )
     with generation_tab:
         show_sql_generation(client, connections)
@@ -380,6 +633,8 @@ def main() -> None:
         show_database_schema(client)
     with history_tab:
         show_sql_history(client)
+    with metadata_tab:
+        show_metadata_editor(client, is_admin=is_admin)
 
 
 if __name__ == "__main__":

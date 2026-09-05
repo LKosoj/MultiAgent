@@ -215,6 +215,18 @@ export function createTextToSqlClient(
     loadSchema(payload: Record<string, unknown>): Promise<unknown> {
       return runServiceAction("text_to_sql.schema.load", payload);
     },
+    loadMetadata(connectionRef: string): Promise<unknown> {
+      return runServiceAction("text_to_sql.metadata.load", { connection_ref: connectionRef });
+    },
+    saveMetadataDescriptions(payload: Record<string, unknown>): Promise<unknown> {
+      return runServiceAction("text_to_sql.metadata.save_descriptions", payload);
+    },
+    saveMetadataGlossary(payload: Record<string, unknown>): Promise<unknown> {
+      return runServiceAction("text_to_sql.metadata.save_glossary", payload);
+    },
+    setMetadataFactStatus(payload: Record<string, unknown>): Promise<unknown> {
+      return runServiceAction("text_to_sql.metadata.set_fact_status", payload);
+    },
     getStatus(runId: string): Promise<unknown> {
       return runServiceAction("workflows.status", { run_id: runId })
         .then(normalizeTextToSqlBackendPayload);

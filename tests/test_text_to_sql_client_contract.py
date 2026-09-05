@@ -410,3 +410,220 @@ def test_default_transport_uses_configured_request_timeout(monkeypatch) -> None:
     )
 
     assert captured["timeout"] == 600
+
+
+def test_load_metadata_uses_service_action_and_parses_tables_and_glossary() -> None:
+    calls = []
+
+    def transport(method, path, *, json_body, headers):
+        calls.append((method, path, json_body, headers))
+        return {
+            "action": "text_to_sql.metadata.load",
+            "ok": True,
+            "data": {
+                "connection_ref": "connection-7",
+                "dsn_dialect": "postgresql",
+                "schema_digest": "digest-1",
+                "editable_file_enabled": True,
+                "tables": {
+                    "public.orders": {
+                        "description": "orders table",
+                        "description_source": "file",
+                        "columns": {
+                            "status": {
+                                "type": "text",
+                                "description": "order status",
+                                "description_source": "file",
+                                "examples": ["new", "paid"],
+                                "examples_source": "file",
+                            }
+                        },
+                    }
+                },
+                "glossary": {
+                    "digest": "glossary-digest-1",
+                    "profile_exists": True,
+                    "dsn_fingerprint": "postgresql://host:5432/db",
+                    "schema_namespace_version": "ns-1",
+                    "entries": [
+                        {
+                            "term": "выручка",
+                            "synonyms": ["revenue"],
+                            "table": "public.orders",
+                            "column": "amount",
+                            "kind": "measure",
+                            "note": None,
+                        }
+                    ],
+                },
+                "facts": [
+                    {
+                        "fact_key": "text2sql-semantic-fact-v1-abc",
+                        "subject": "column",
+                        "table_fqn": "public.orders",
+                        "column": "status",
+                        "fact_kind": "example",
+                        "value": "paid",
+                        "status": "approved",
+                    }
+                ],
+            },
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=transport,
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    metadata = client.load_metadata("connection-7")
+
+    method, path, body, headers = calls[0]
+    assert (method, path) == ("POST", "/v1/runs")
+    assert body["forwardedProps"]["service_action"] == "text_to_sql.metadata.load"
+    assert body["forwardedProps"]["service_payload"] == {
+        "connection_ref": "connection-7"
+    }
+    assert metadata.schema_digest == "digest-1"
+    assert metadata.glossary_digest == "glossary-digest-1"
+    assert len(metadata.tables) == 1
+    table = metadata.tables[0]
+    assert table.table_fqn == "public.orders"
+    assert table.columns[0].name == "status"
+    assert table.columns[0].examples == ["new", "paid"]
+    assert metadata.glossary_entries[0].term == "выручка"
+    assert metadata.facts[0].fact_key == "text2sql-semantic-fact-v1-abc"
+
+
+def test_save_metadata_descriptions_sends_expected_digest() -> None:
+    calls = []
+
+    def transport(method, path, *, json_body, headers):
+        calls.append((method, path, json_body, headers))
+        return {
+            "action": "text_to_sql.metadata.save_descriptions",
+            "ok": True,
+            "data": {"saved": True, "schema_digest": "digest-2"},
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=transport,
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    new_digest = client.save_metadata_descriptions(
+        connection_ref="connection-7",
+        expected_schema_digest="digest-1",
+        tables=[
+            {"table_fqn": "public.orders", "description": "updated", "columns": []}
+        ],
+    )
+
+    assert new_digest == "digest-2"
+    payload = calls[0][2]["forwardedProps"]["service_payload"]
+    assert payload == {
+        "connection_ref": "connection-7",
+        "expected_schema_digest": "digest-1",
+        "tables": [
+            {"table_fqn": "public.orders", "description": "updated", "columns": []}
+        ],
+    }
+
+
+def test_save_metadata_descriptions_surfaces_version_conflict_as_api_error() -> None:
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=lambda *_args, **_kwargs: {
+            "action": "text_to_sql.metadata.save_descriptions",
+            "ok": False,
+            "error": "metadata version conflict: reload table/column metadata before saving",
+        },
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    with pytest.raises(TextToSqlApiError, match="version conflict"):
+        client.save_metadata_descriptions(
+            connection_ref="connection-7",
+            expected_schema_digest="stale-digest",
+            tables=[{"table_fqn": "public.orders", "description": "x", "columns": []}],
+        )
+
+
+def test_save_metadata_glossary_replaces_full_entry_list() -> None:
+    calls = []
+
+    def transport(method, path, *, json_body, headers):
+        calls.append((method, path, json_body, headers))
+        return {
+            "action": "text_to_sql.metadata.save_glossary",
+            "ok": True,
+            "data": {"saved": True, "glossary_digest": "glossary-digest-2"},
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=transport,
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    entries = [
+        {
+            "term": "выручка",
+            "synonyms": ["revenue", "оборот"],
+            "table": "public.orders",
+            "column": "amount",
+            "kind": "measure",
+            "note": None,
+        }
+    ]
+
+    new_digest = client.save_metadata_glossary(
+        connection_ref="connection-7",
+        expected_glossary_digest="glossary-digest-1",
+        entries=entries,
+    )
+
+    assert new_digest == "glossary-digest-2"
+    payload = calls[0][2]["forwardedProps"]["service_payload"]
+    assert payload == {
+        "connection_ref": "connection-7",
+        "expected_glossary_digest": "glossary-digest-1",
+        "entries": entries,
+    }
+
+
+def test_set_metadata_fact_status_round_trips_status() -> None:
+    calls = []
+
+    def transport(method, path, *, json_body, headers):
+        calls.append((method, path, json_body, headers))
+        return {
+            "action": "text_to_sql.metadata.set_fact_status",
+            "ok": True,
+            "data": {
+                "saved": True,
+                "fact_key": "text2sql-semantic-fact-v1-abc",
+                "status": "rejected",
+            },
+        }
+
+    client = TextToSqlApiClient(
+        base_url="http://api.test",
+        transport=transport,
+        auth_headers=lambda: {"Authorization": "Bearer token"},
+    )
+
+    new_status = client.set_metadata_fact_status(
+        connection_ref="connection-7",
+        fact_key="text2sql-semantic-fact-v1-abc",
+        status="rejected",
+    )
+
+    assert new_status == "rejected"
+    payload = calls[0][2]["forwardedProps"]["service_payload"]
+    assert payload == {
+        "connection_ref": "connection-7",
+        "fact_key": "text2sql-semantic-fact-v1-abc",
+        "status": "rejected",
+    }

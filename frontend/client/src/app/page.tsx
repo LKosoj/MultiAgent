@@ -1623,6 +1623,7 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
               startTextToSqlRun={startTextToSqlRun}
               isBusy={isBusy}
               active={activeSection === "text-to-sql"}
+              isAdmin={isAdmin}
               notify={notify}
             />
           </div>
