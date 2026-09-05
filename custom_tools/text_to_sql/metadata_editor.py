@@ -40,28 +40,13 @@ from .dsn_profile import (
 )
 from .schema_loader import SchemaLoader, compute_editable_schema_digest
 from .schema_memory_sqlite import SchemaMemoryManager, SemanticFact, _semantic_fact_key
-from .schema_namespace import SchemaNamespace, SchemaScope, canonical_schema_fingerprint
+from .schema_namespace import SchemaScope, canonical_schema_fingerprint
 from .utils import (
     dsn_to_sanitized_name,
     get_table_columns,
     get_table_description,
     set_table_description,
 )
-
-# ---------------------------------------------------------------------------
-# Limits (§1.3/§1.4/§6 point 6 of the design doc — storage limits, distinct
-# from the SCHEMA_DESC_LIMIT prompt-truncation limit in validators/).
-# ---------------------------------------------------------------------------
-
-_MAX_TABLES_PER_SAVE = 500
-_MAX_COLUMNS_PER_TABLE = 200
-_MAX_TABLE_DESCRIPTION_LENGTH = 2000
-_MAX_COLUMN_DESCRIPTION_LENGTH = 1000
-_MAX_EXAMPLES_PER_COLUMN = 20
-_MAX_GLOSSARY_ENTRIES = 500
-_MAX_GLOSSARY_TERM_LENGTH = 200
-_MAX_GLOSSARY_NOTE_LENGTH = 2000
-
 
 class SchemaMetadataConflictError(ValueError):
     """``expected_*_digest`` did not match current state — client must reload."""
@@ -434,10 +419,6 @@ def metadata_view_to_mapping(view: MetadataView) -> dict[str, Any]:
 def _validate_and_filter_examples(
     examples: Sequence[object], table_fqn: str, column: str
 ) -> list[Any]:
-    if len(examples) > _MAX_EXAMPLES_PER_COLUMN:
-        raise ValueError(
-            f"too many examples for {table_fqn}.{column} (max {_MAX_EXAMPLES_PER_COLUMN})"
-        )
     filtered = [value for value in examples if SchemaLoader._is_example_value(value)]
     if examples and not filtered:
         raise ValueError(
@@ -454,9 +435,6 @@ def save_table_descriptions(
     table_edits: Sequence[TableDescriptionEdit],
 ) -> str:
     """Read-modify-write ``sqlrag/<dsn>.json``; returns the new schema digest."""
-    if len(table_edits) > _MAX_TABLES_PER_SAVE:
-        raise ValueError(f"too many tables in one save (max {_MAX_TABLES_PER_SAVE})")
-
     loader = SchemaLoader(project_root)
     live_schema = loader.introspect_live_schema(dsn)
     with _metadata_write_lock(loader, dsn):
@@ -491,11 +469,6 @@ def _save_table_descriptions_locked(
     for table_edit in table_edits:
         if table_edit.table_fqn not in live_schema:
             raise ValueError(f"unknown table: {table_edit.table_fqn}")
-        if len(table_edit.columns) > _MAX_COLUMNS_PER_TABLE:
-            raise ValueError(
-                f"too many columns for {table_edit.table_fqn} "
-                f"(max {_MAX_COLUMNS_PER_TABLE})"
-            )
         live_columns = get_table_columns(live_schema[table_edit.table_fqn])
 
         table_entry = schema_info.get(table_edit.table_fqn)
@@ -504,11 +477,6 @@ def _save_table_descriptions_locked(
             schema_info[table_edit.table_fqn] = table_entry
 
         if table_edit.description is not None:
-            if len(table_edit.description) > _MAX_TABLE_DESCRIPTION_LENGTH:
-                raise ValueError(
-                    f"description for {table_edit.table_fqn} exceeds "
-                    f"{_MAX_TABLE_DESCRIPTION_LENGTH} characters"
-                )
             set_table_description(table_entry, table_edit.description)
 
         if table_edit.columns:
@@ -526,11 +494,6 @@ def _save_table_descriptions_locked(
                     column_entry = {}
                     columns_entry[column_edit.column] = column_entry
                 if column_edit.description is not None:
-                    if len(column_edit.description) > _MAX_COLUMN_DESCRIPTION_LENGTH:
-                        raise ValueError(
-                            f"description for {table_edit.table_fqn}.{column_edit.column} "
-                            f"exceeds {_MAX_COLUMN_DESCRIPTION_LENGTH} characters"
-                        )
                     column_entry["description"] = column_edit.description
                 if column_edit.examples is not None:
                     column_entry["examples"] = _validate_and_filter_examples(
@@ -554,10 +517,6 @@ def _validate_and_clean_glossary_entry(
     term = entry.term.strip()
     if not term:
         raise ValueError("glossary term must be a non-empty string")
-    if len(term) > _MAX_GLOSSARY_TERM_LENGTH:
-        raise ValueError(
-            f"glossary term {term!r} exceeds {_MAX_GLOSSARY_TERM_LENGTH} characters"
-        )
 
     cleaned_synonyms: list[str] = []
     seen = {term.casefold()}
@@ -565,11 +524,6 @@ def _validate_and_clean_glossary_entry(
         stripped = synonym.strip()
         if not stripped:
             raise ValueError(f"glossary term {term!r}: synonyms must be non-empty strings")
-        if len(stripped) > _MAX_GLOSSARY_TERM_LENGTH:
-            raise ValueError(
-                f"glossary term {term!r}: synonym {stripped!r} exceeds "
-                f"{_MAX_GLOSSARY_TERM_LENGTH} characters"
-            )
         key = stripped.casefold()
         if key in seen:
             continue
@@ -590,11 +544,8 @@ def _validate_and_clean_glossary_entry(
             f"glossary term {term!r}: kind must be one of {_GLOSSARY_KIND_VALUES} or null"
         )
 
+
     note = entry.note
-    if note is not None and len(note) > _MAX_GLOSSARY_NOTE_LENGTH:
-        raise ValueError(
-            f"glossary term {term!r}: note exceeds {_MAX_GLOSSARY_NOTE_LENGTH} characters"
-        )
 
     return GlossaryEntry(
         term=term,
@@ -619,9 +570,6 @@ def save_glossary(
     (trimmed, synonyms deduplicated) so UIs can show the stored state without
     re-introspecting the database.
     """
-    if len(entries) > _MAX_GLOSSARY_ENTRIES:
-        raise ValueError(f"too many glossary entries (max {_MAX_GLOSSARY_ENTRIES})")
-
     loader = SchemaLoader(project_root)
     live_schema = loader.introspect_live_schema(dsn)
     with _metadata_write_lock(loader, dsn):

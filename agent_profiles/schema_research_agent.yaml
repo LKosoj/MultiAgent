@@ -260,6 +260,10 @@ instructions: |-
   For a percentage or rate of named entities, bind the counted population to
   those entities. If the qualifying attribute is stored in a related table,
   join that table; do not replace the population with rows of the attribute table.
+  For a percentage or rate whose qualifying attribute is on a related table,
+  a new_join alone does not authorize that relationship for SQL. In the same
+  decision, create a separate binding for the named population identity under
+  the FORMULA source_id and attach that proposed join in join_references.
   When a question counts entities that participate in qualifying related records,
   distinguish direct participation from merely sharing a parent. Before choosing a
   path through a shared parent, use inspect_relationships first for the counted entity

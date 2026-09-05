@@ -1736,6 +1736,18 @@ def test_profile_keeps_named_entity_as_percentage_population() -> None:
     )
 
 
+def test_profile_attaches_named_percentage_population_to_its_join() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a percentage or rate whose qualifying attribute is on a related table, "
+        "a new_join alone does not authorize that relationship for SQL. In the same "
+        "decision, create a separate binding for the named population identity under "
+        "the FORMULA source_id and attach that proposed join in join_references."
+        in instructions
+    )
+
+
 def test_profile_does_not_sum_identifiers_for_entity_percentage() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
