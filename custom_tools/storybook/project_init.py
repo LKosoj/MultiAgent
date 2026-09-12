@@ -3,6 +3,7 @@ import json
 import logging
 import random
 from typing import Dict, Any, Union
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +34,7 @@ def project_init_tool(session_id: str, project_id: str, brief: Union[str, Dict[s
         logger.info(f"📋 Ключи brief: {list(brief.keys())}")
     else:
         logger.info(f"📋 Значение brief: {brief}")
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     brief_path = f"{base}/00_brief.json"
     
     # Проверяем, существует ли уже бриф
@@ -64,5 +65,4 @@ def project_init_tool(session_id: str, project_id: str, brief: Union[str, Dict[s
     with open(brief_path, "w", encoding="utf-8") as f:
         json.dump(brief, f, ensure_ascii=False, indent=2)
     return brief_path
-
 

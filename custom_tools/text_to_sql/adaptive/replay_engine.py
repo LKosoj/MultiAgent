@@ -15,6 +15,7 @@ from .replay_contract import (
     SolverReentryAdmittedReplayAction,
     SolverReentryFinalizedReplayAction,
     SolverSemanticRepairFallbackReplayAction,
+    SolverResultReviewArbitrationReplayAction,
     SolverStopReplayAction,
     SolverTransitionReplayStep,
     _result_contradiction_receipt,
@@ -267,6 +268,16 @@ def _replay_solver_transition(step, state, research_states):
             normalized_ast_digest=action.normalized_ast_digest,
             base_revision=state.revision,
         )
+    if type(action) is SolverResultReviewArbitrationReplayAction:
+        if replay_input is not None:
+            raise ReplayContractError("result review arbitration cannot carry replay input")
+        from .solver_loop import accept_result_review_arbitration
+
+        return accept_result_review_arbitration(
+            state,
+            action=action,
+            base_revision=state.revision,
+        )
     raise ReplayContractError("unsupported solver transition action")
 
 
@@ -359,7 +370,7 @@ def _verify_solver_terminal(payload, state) -> None:
             )
     elif payload.solver_steps and type(payload.solver_steps[-1]) is SolverTransitionReplayStep and type(
         payload.solver_steps[-1].action
-    ) is SolverSemanticRepairFallbackReplayAction:
+    ) in {SolverSemanticRepairFallbackReplayAction, SolverResultReviewArbitrationReplayAction}:
         action = payload.solver_steps[-1].action
         from .result_review import ResultReviewReceipt
         from workflow._text_to_sql_solver_execution_reducer import (
@@ -389,15 +400,27 @@ def _verify_solver_terminal(payload, state) -> None:
                 execution_unknown_terminal_result(state.run_id, candidate.sql).to_mapping()
             )
         else:
-            receipts = [
-                _result_contradiction_receipt(step)
-                for step in payload.solver_steps[:-1]
-                if type(step) is SolverExecutionReplayStep
-                and step.action.candidate_id == action.candidate_id
-                and step.action.execution_id == action.execution_id
-                and step.action.normalized_ast_digest == action.normalized_ast_digest
-            ]
-            receipts = [receipt for receipt in receipts if receipt is not None]
+            if type(action) is SolverResultReviewArbitrationReplayAction:
+                try:
+                    receipts = [
+                        ResultReviewReceipt.model_validate_json(
+                            canonical_json_bytes(action.receipt)
+                        )
+                    ]
+                except (TypeError, ValueError) as exc:
+                    raise ReplayContractError(
+                        "result review arbitration receipt is invalid"
+                    ) from exc
+            else:
+                receipts = [
+                    _result_contradiction_receipt(step)
+                    for step in payload.solver_steps[:-1]
+                    if type(step) is SolverExecutionReplayStep
+                    and step.action.candidate_id == action.candidate_id
+                    and step.action.execution_id == action.execution_id
+                    and step.action.normalized_ast_digest == action.normalized_ast_digest
+                ]
+                receipts = [receipt for receipt in receipts if receipt is not None]
             candidate = next(
                 (
                     item
@@ -412,6 +435,14 @@ def _verify_solver_terminal(payload, state) -> None:
                 or fallback_terminal.sql != candidate.sql
                 or len(receipts) != 1
                 or type(receipts[0]) is not ResultReviewReceipt
+                or (
+                    type(action) is SolverResultReviewArbitrationReplayAction
+                    and (
+                        receipts[0].review_kind != "conflict_arbitration"
+                        or receipts[0].verdict != "consistent"
+                        or receipts[0].candidate_id != action.candidate_id
+                    )
+                )
                 or fallback_terminal.execution != receipts[0].execution
             ):
                 raise ReplayContractError(

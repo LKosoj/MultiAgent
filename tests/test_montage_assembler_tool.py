@@ -12,11 +12,36 @@ def _write_json(path: Path, payload):
 def _probe_payload(duration: float, with_audio: bool = False):
     streams = [{"codec_type": "video"}]
     if with_audio:
-        streams.append({"codec_type": "audio"})
+        streams.append({"codec_type": "audio", "start_time": "0", "duration": str(duration)})
     return {
         "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": str(duration)},
         "streams": streams,
     }
+
+
+def test_audio_check_rejects_short_or_late_audio_stream():
+    volume = {"mean_volume_db": -20.0}
+    short = _probe_payload(13.0, with_audio=True)
+    short["streams"][1]["duration"] = "11"
+    late = _probe_payload(13.0, with_audio=True)
+    late["streams"][1]["start_time"] = "1"
+    early = _probe_payload(13.0, with_audio=True)
+    early["streams"][1]["start_time"] = "-10"
+    full = _probe_payload(13.0, with_audio=True)
+
+    assert not montage_assembler._audio_check(short, volume, True, 13.0)["passed"]
+    assert not montage_assembler._audio_check(late, volume, True, 13.0)["passed"]
+    assert not montage_assembler._audio_check(early, volume, True, 13.0)["passed"]
+    assert montage_assembler._audio_check(full, volume, True, 13.0)["passed"]
+
+
+def test_audio_check_marks_missing_stream_coverage_unavailable():
+    probe = {"format": {"duration": "13"}, "streams": [{"codec_type": "video"}, {"codec_type": "audio"}]}
+
+    result = montage_assembler._audio_check(probe, {"mean_volume_db": -20.0}, True, 13.0)
+
+    assert not result["passed"]
+    assert result["status"] == "coverage_unavailable"
 
 
 def test_montage_assembler_writes_final_artifacts_with_monkeypatched_ffmpeg(tmp_path, monkeypatch):

@@ -119,6 +119,13 @@ def test_experiment_step_models_resolves_every_key() -> None:
     )
 
 
+def test_nlu_query_understanding_and_completeness_use_model_code() -> None:
+    for profile_name in ("default", "experiment"):
+        steps = get_active_profile(profile_name).sections["step_models"]
+        assert steps["nlu_query_understanding"] == "model_code"
+        assert steps["nlu_completeness"] == "model_code"
+
+
 def test_experiment_step_models_downgrades_exactly_three_steps() -> None:
     """Only research_stop_review/result_review/safety_llm_audit move off the
     ``default`` alias in ``experiment``. Every other step -- including

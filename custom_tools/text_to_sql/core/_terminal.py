@@ -72,7 +72,13 @@ def _verified_execution_from_result_review(
     if (
         type(receipt) is not ResultReviewReceipt
         or receipt.run_id != run_id
-        or receipt.repair_kind != "semantic_binding_mismatch"
+        or not (
+            receipt.repair_kind == "semantic_binding_mismatch"
+            or (
+                receipt.review_kind == "conflict_arbitration"
+                and receipt.verdict == "consistent"
+            )
+        )
         or type(sql_query) is not str
         or not sql_query.strip()
         or type(row_limit) is not int

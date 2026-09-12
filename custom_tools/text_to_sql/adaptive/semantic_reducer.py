@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from typing import Mapping
 
 from pydantic import ValidationError
@@ -42,13 +43,13 @@ from .models import (
     JoinCandidateStatus,
     JoinEdge,
     JoinType,
+    LiteralValue,
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
     ResearchAction,
     ResearchActionKind,
     ResearchState,
-    SemanticItem,
     TableRef,
     TargetRef,
     VerticalAttributeBinding,
@@ -276,9 +277,6 @@ def admit_semantic_turn(
     )
     _require_unique_ids((item.join_id for item in new_joins), "join")
     all_joins = {**joins_by_id, **{item.join_id: item for item in new_joins}}
-    semantic_items_by_source = {
-        item.source_id: item for item in current.query_spec.semantic_items
-    }
     for proposal in decision.proposals:
         if isinstance(proposal, NewBindingProposal):
             item = _new_binding(
@@ -287,7 +285,6 @@ def admit_semantic_turn(
                 all_joins,
                 proposal_ids,
                 current.schema_namespace_version,
-                semantic_items_by_source.get(proposal.source_id),
             )
             proposal_ids[proposal.proposal_key] = item.binding_id
             new_bindings.append(item)
@@ -537,7 +534,8 @@ def _new_join(
     )
     if not path:
         path = (JoinEdge(left=left, right=right, join_type=proposal.join_type),)
-    if proposal.join_type is JoinType.INNER and not _is_composite_relation(path):
+    composite_relation = _is_composite_relation(path)
+    if proposal.join_type is JoinType.INNER and not composite_relation:
         oriented_path = [path[0]]
         for edge in path[1:]:
             previous = oriented_path[-1]
@@ -553,10 +551,9 @@ def _new_join(
                 )
             oriented_path.append(edge)
         path = tuple(oriented_path)
-    endpoints_match = path[0].left == left and path[0].right == right
     if proposal.join_type is JoinType.INNER and _target_key(right) < _target_key(left):
         left, right = right, left
-        oriented_path = path if _is_composite_relation(path) else tuple(reversed(path))
+        oriented_path = path if composite_relation else tuple(reversed(path))
         path = tuple(
             JoinEdge(
                 left=edge.right,
@@ -565,6 +562,17 @@ def _new_join(
             )
             for edge in oriented_path
         )
+    connected_path = all(
+        previous.right.table == following.left.table
+        for previous, following in zip(path, path[1:], strict=False)
+    )
+    if len(path) > 1 and not composite_relation and connected_path:
+        left, right = path[0].left, path[-1].right
+        endpoints_match = True
+    elif len(path) > 1 and not composite_relation:
+        endpoints_match = False
+    else:
+        endpoints_match = path[0].left == left and path[0].right == right
     identity = {
         "schema": schema,
         "left": _target_data(left),
@@ -610,7 +618,6 @@ def _new_binding(
     joins: Mapping[str, JoinCandidate],
     proposal_ids: Mapping[str, str],
     schema: str,
-    semantic_item: SemanticItem | None,
 ) -> BindingBase:
     candidate = proposal.candidate
     referenced = tuple(
@@ -711,12 +718,6 @@ def _new_binding(
         discriminator_predicate = resolver.predicate(
             candidate.discriminator_predicate
         )
-        if semantic_item is not None and semantic_item.exact_physical_predicate:
-            discriminator_predicate = PredicateRef(
-                left=column,
-                operator=semantic_item.operator,
-                right=semantic_item.literal_or_reference,
-            )
         predicates = (
             discriminator_predicate,
             *(
@@ -1062,7 +1063,77 @@ def _discriminator_certificate(
             schema_columns,
         )
         and predicate_has_valid_literal(predicate)
+        and (
+            not _temporal_numeric_bound(predicate, cited)
+            or _cited_numeric_representation(predicate.left, cited)
+        )
         for predicate in item.predicates
+    )
+
+
+def _temporal_numeric_bound(
+    predicate: PredicateRef,
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    if predicate.operator not in {
+        PredicateOperator.GT,
+        PredicateOperator.GTE,
+        PredicateOperator.LT,
+        PredicateOperator.LTE,
+        PredicateOperator.BETWEEN,
+    }:
+        return False
+    values = predicate.right if type(predicate.right) is tuple else (predicate.right,)
+    if not any(_is_numeric_literal(value) for value in values):
+        return False
+    return any(_declares_temporal_column(record, predicate.left) for record in cited)
+
+
+def _declares_temporal_column(record: EvidenceRecord, column: ColumnRef) -> bool:
+    provenance, payload = _payload(record)
+    if (
+        provenance.probe_kind is not ResearchActionKind.INSPECT_COLUMN
+        or not _exact_column(record, column)
+        or not isinstance(payload, dict)
+    ):
+        return False
+    metadata = payload.get("metadata")
+    declared_type = metadata.get("type") if isinstance(metadata, dict) else None
+    return (
+        isinstance(declared_type, str)
+        and declared_type.strip().upper() in {"DATE", "TIME", "DATETIME", "TIMESTAMP"}
+    )
+
+
+def _cited_numeric_representation(
+    column: ColumnRef,
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    for record in cited:
+        provenance, payload = _payload(record)
+        if (
+            provenance.probe_kind
+            not in {ResearchActionKind.SEARCH_VALUE, ResearchActionKind.DISTINCT_VALUES}
+            or record.target != column
+            or not isinstance(payload, dict)
+            or payload.get("columns") != [column.column]
+            or not isinstance(payload.get("rows"), list)
+        ):
+            continue
+        if any(
+            isinstance(row, list)
+            and len(row) == 1
+            and _is_numeric_literal(row[0])
+            for row in payload["rows"]
+        ):
+            return True
+    return False
+
+
+def _is_numeric_literal(value: object) -> bool:
+    literal = value.value if type(value) is LiteralValue else value
+    return type(literal) in {int, float} and (
+        type(literal) is not float or math.isfinite(literal)
     )
 
 
@@ -1086,19 +1157,9 @@ def _derived_expression_certificate(
     *,
     schema_columns: tuple[ColumnRef, ...] = (),
 ) -> bool:
-    if item.document is None or item.rule_excerpt is None:
-        return False
-    if not all(
+    return all(
         _schema_or_evidence_column(column, cited, schema_columns)
         for column in item.input_columns
-    ):
-        return False
-    return any(
-        isinstance(raw.get("content"), str)
-        and item.rule_excerpt in raw["content"]
-        for record in cited
-        for raw in [_document_payload(record, item.document)]
-        if raw is not None
     )
 
 
@@ -1108,7 +1169,7 @@ def derived_expression_certificate(
     *,
     schema_columns: tuple[ColumnRef, ...] = (),
 ) -> bool:
-    """Return whether one formula binding has its exact document authority."""
+    """Return whether every formula input column exists."""
 
     return _derived_expression_certificate(
         item,
@@ -1122,8 +1183,8 @@ def _document_rule_certificate(
 ) -> bool:
     return any(
         isinstance(raw.get("content"), str)
-        and _normalized_document_text(raw["content"])
-        == _normalized_document_text(item.rule_text)
+        and _normalized_document_text(item.rule_text)
+        in _normalized_document_text(raw["content"])
         for record in cited
         for raw in [_document_payload(record, item.document)]
         if raw is not None

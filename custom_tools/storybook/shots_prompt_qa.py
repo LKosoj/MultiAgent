@@ -1241,9 +1241,9 @@ def shots_prompt_qa_tool(
 
     Returns:
         Updated shots_data dict (items.json compatible). Also writes updated shots.json and a QA report to disk.
-        If the shots.json write itself fails, the dict carries a "_qa_persist_error" key (the repairs are
-        only in memory). A failure writing the QA report alone is logged but does not set this key, since
-        shots.json was already persisted successfully.
+        If the shots.json write itself fails, raises RuntimeError so the next step cannot continue with stale
+        on-disk data. A failure writing the QA report alone is logged, because shots.json was already
+        persisted successfully.
     """
     if not enable:
         logger.info("🧪 shots_prompt_qa_tool: отключено (enable=False)")
@@ -2024,15 +2024,7 @@ If there are no issues, return {"repairs": [], "notes": "ok"}.
                     fcntl.flock(lock_f, fcntl.LOCK_UN)
         except Exception as e:
             logger.error(f"🧪 shots_prompt_qa_tool: не удалось сохранить shots.json: {e}")
-            # Правки применены только в памяти (atomic write либо пишет
-            # целиком, либо не трогает диск — см. _write_json_atomic), но
-            # вызывающий получает shots_data как обычно и не может отличить
-            # "сохранено" от "не сохранено". Тот же приём, что и у dry_run
-            # (`_qa_report` выше): маркер в самом возвращаемом словаре,
-            # а не смена status/raise — это не шаг с output_schema, и
-            # превращать проглоченную ошибку в исключение здесь опасно
-            # (money-path, шаг не должен падать там, где раньше продолжал).
-            shots_data["_qa_persist_error"] = str(e)
+            raise RuntimeError(f"shots_prompt_qa_tool: не удалось сохранить shots.json: {e}") from e
 
     # NOTE: We intentionally do NOT validate reference_image_paths against the filesystem here.
     # At this stage there may be zero generated images on disk; existence-based filtering is invalid and destructive.

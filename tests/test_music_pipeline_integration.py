@@ -46,7 +46,7 @@ def _make_clip(base: Path, scene: int, shot: int = 1) -> Path:
 def _probe_payload(duration: float, with_audio: bool = False) -> dict:
     streams = [{"codec_type": "video"}]
     if with_audio:
-        streams.append({"codec_type": "audio"})
+        streams.append({"codec_type": "audio", "start_time": "0", "duration": str(duration)})
     return {
         "format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2", "duration": str(duration)},
         "streams": streams,

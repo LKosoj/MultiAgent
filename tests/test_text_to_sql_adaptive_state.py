@@ -11,11 +11,14 @@ from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
     BudgetState,
     ColumnRef,
+    DerivedExpressionBinding,
     DiscriminatorValueBinding,
+    DocumentRef,
     EvidenceCost,
     EvidenceRecord,
     EvidenceSourceKind,
     EvidenceValidityScope,
+    ExpressionRef,
     ExpectedResultShape,
     Hypothesis,
     HypothesisStatus,
@@ -47,6 +50,7 @@ from custom_tools.text_to_sql.adaptive.state import (
     ResearchTransitionRevisionError,
     ResearchTransitionValidationError,
     apply_research_transition,
+    _derive_semantic_item,
 )
 
 
@@ -76,6 +80,44 @@ def _item(source_id: str = "source-1") -> SemanticItem:
         status=SemanticItemStatus.UNRESOLVED,
         binding_ids=(),
     )
+
+
+def test_state_writer_sets_exact_formula_binding_for_one_supported_derived_binding() -> None:
+    formula = SemanticItem(
+        source_id="source-formula",
+        kind=SemanticItemKind.FORMULA,
+        source_text="elapsed interval",
+        normalized_meaning="current time minus recorded time",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    recorded_at = ColumnRef(table=_table(), column="recorded_at")
+    binding = DerivedExpressionBinding(
+        binding_id="exact-formula-binding",
+        source_id=formula.source_id,
+        tables=(recorded_at.table,),
+        columns=(recorded_at,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=("evidence-1",),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:derived_expression",
+        expression=ExpressionRef(
+            expression_id="exact-formula-expression",
+            expression="CURRENT_TIMESTAMP - recorded_at",
+        ),
+        document=DocumentRef(document_id="document-1", namespace="main"),
+        rule_excerpt="CURRENT_TIMESTAMP - recorded_at",
+        input_columns=(recorded_at,),
+    )
+
+    derived = _derive_semantic_item(formula, (binding,))
+
+    assert derived.exact_formula_binding_id == binding.binding_id
 
 
 def _budget() -> BudgetState:
@@ -792,25 +834,17 @@ def test_transition_accepts_time_predicate_when_query_has_no_operator() -> None:
         (PredicateOperator.EQ, "priority"),
         (PredicateOperator.IN, ("priority", "deferred")),
         (PredicateOperator.IS_NULL, None),
+        (PredicateOperator.GT, 1),
+        (PredicateOperator.GTE, 1),
+        (PredicateOperator.LT, 1),
+        (PredicateOperator.LTE, 1),
     ),
 )
-def test_transition_accepts_candidate_discriminator_refinement_for_operatorless_filter(
+def test_transition_accepts_discriminator_for_operatorless_filter(
     operator: PredicateOperator,
     right: object,
 ) -> None:
-    initial_action = _action()
-    physical = _binding(evidence_ids=("evidence-1",))
-    first = apply_research_transition(
-        _state(),
-        initial_action,
-        evidence=(_evidence(initial_action),),
-        bindings=(physical,),
-    ).state
-    supported = apply_research_transition(
-        first,
-        _action(action_id="action-2", revision=1, detail="support"),
-        bindings=(physical.model_copy(update={"status": BindingStatus.SUPPORTED}),),
-    ).state
+    action = _action()
     predicate = PredicateRef(
         left=_column(),
         operator=operator,
@@ -832,101 +866,13 @@ def test_transition_accepts_candidate_discriminator_refinement_for_operatorless_
     )
 
     transitioned = apply_research_transition(
-        supported,
-        _action(action_id="action-3", revision=2, detail="value"),
+        _state(),
+        action,
+        evidence=(_evidence(action),),
         bindings=(binding,),
     )
 
-    assert transitioned.state.bindings[-1] == binding
-
-
-def test_transition_rejects_unrequested_additional_predicate_for_operatorless_filter() -> None:
-    initial_action = _action()
-    physical = _binding(evidence_ids=("evidence-1",))
-    first = apply_research_transition(
-        _state(),
-        initial_action,
-        evidence=(_evidence(initial_action),),
-        bindings=(physical,),
-    ).state
-    supported = apply_research_transition(
-        first,
-        _action(action_id="action-2", revision=1, detail="support"),
-        bindings=(physical.model_copy(update={"status": BindingStatus.SUPPORTED}),),
-    ).state
-    predicate = PredicateRef(
-        left=_column(),
-        operator=PredicateOperator.EQ,
-        right="priority",
-    )
-    extra_column = ColumnRef(table=_table(), column="other_status")
-    extra_predicate = PredicateRef(
-        left=extra_column,
-        operator=PredicateOperator.EQ,
-        right="hidden",
-    )
-    binding = DiscriminatorValueBinding(
-        binding_id="binding-filter-extra-predicate",
-        source_id="source-1",
-        tables=(_table(),),
-        columns=(_column(), extra_column),
-        predicates=(predicate, extra_predicate),
-        join_path=(),
-        evidence_ids=("evidence-1",),
-        confidence=0.0,
-        status=BindingStatus.CANDIDATE,
-        validator_rule=None,
-        discriminator_column=_column(),
-        discriminator_predicate=predicate,
-    )
-
-    with pytest.raises(
-        ResearchTransitionProtocolError,
-        match="FILTER discriminator refinement requires exactly one predicate",
-    ):
-        apply_research_transition(
-            supported,
-            _action(action_id="action-3", revision=2, detail="value"),
-            bindings=(binding,),
-        )
-
-
-def test_transition_rejects_filter_predicate_when_query_has_no_operator() -> None:
-    item = _item()
-    state = _state(
-        query_spec=_state().query_spec.model_copy(update={"semantic_items": (item,)})
-    )
-    predicate = PredicateRef(
-        left=_column(),
-        operator=PredicateOperator.EQ,
-        right="priority",
-    )
-    binding = DiscriminatorValueBinding(
-        binding_id="binding-filter-without-operator",
-        source_id=item.source_id,
-        tables=(_table(),),
-        columns=(_column(),),
-        predicates=(predicate,),
-        join_path=(),
-        evidence_ids=("evidence-1",),
-        confidence=0.0,
-        status=BindingStatus.CANDIDATE,
-        validator_rule=None,
-        discriminator_column=_column(),
-        discriminator_predicate=predicate,
-    )
-    action = _action()
-
-    with pytest.raises(
-        ResearchTransitionProtocolError,
-        match="FILTER discriminator refinement requires one supported physical binding",
-    ):
-        apply_research_transition(
-            state,
-            action,
-            evidence=(_evidence(action),),
-            bindings=(binding,),
-        )
+    assert transitioned.state.bindings == (binding,)
 
 
 def test_transition_accepts_researched_time_physical_predicate() -> None:

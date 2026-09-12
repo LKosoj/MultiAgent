@@ -184,7 +184,7 @@ def test_validated_join_is_eligible_without_legacy_binding_paths() -> None:
     )
 
 
-def test_required_formula_does_not_require_a_physical_binding() -> None:
+def test_binding_free_required_formula_must_be_resolved() -> None:
     state = _state(
         item_specs=(("formula", True, SemanticItemStatus.UNRESOLVED, ()),),
         bindings=(),
@@ -206,10 +206,32 @@ def test_required_formula_does_not_require_a_physical_binding() -> None:
         state, _context(), state.run_id, state.run_incarnation
     )
 
-    assert authority.allowed is True
-    assert authority.requirements is not None
-    assert authority.requirements.required_source_ids == ("formula",)
-    assert authority.requirements.selected_bindings == ()
+    assert authority.allowed is False
+    assert authority.reason is CoverageInputErrorCode.RESEARCH_STATE_INCOMPLETE
+    assert authority.affected_source_ids == ("formula",)
+
+    resolved_formula = formula.model_copy(
+        update={"status": SemanticItemStatus.RESOLVED}
+    )
+    resolved_state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (resolved_formula,)}
+            )
+        }
+    )
+    resolved_authority = evaluate_research_generation_authority(
+        resolved_state,
+        _context(),
+        resolved_state.run_id,
+        resolved_state.run_incarnation,
+    )
+
+    assert is_binding_free_semantic_item(resolved_formula) is True
+    assert resolved_authority.allowed is True
+    assert resolved_authority.requirements is not None
+    assert resolved_authority.requirements.required_source_ids == ("formula",)
+    assert resolved_authority.requirements.selected_bindings == ()
 
 
 def test_unsupported_formula_still_blocks_generation() -> None:

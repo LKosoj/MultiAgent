@@ -138,6 +138,40 @@ class TestMaybeApplyBlockoutReference(unittest.TestCase):
             self.assertEqual(item["reference_image_paths"], original_refs)
 
 
+class TestRequiredBlockoutReference(unittest.TestCase):
+    def test_missing_required_reference_stops_before_paid_preparation_or_edit(self):
+        with tempfile.TemporaryDirectory() as d:
+            continuity_ref = _touch(os.path.join(d, "continuity.png"))
+            other_ref = _touch(os.path.join(d, "other.png"))
+            item = {
+                "project_id": "required_ref", "scene_number": 1, "shot_number": 1,
+                "shot_type": "start", "video_prompt": "move", "english_prompt": "prompt",
+                "reference_image_paths": [continuity_ref, other_ref],
+                "output_path": os.path.join(d, "out.png"),
+            }
+            with patch(
+                "custom_tools.storybook.artist_batch_edit._load_blockout_ref_image_cache",
+                return_value={},
+            ), patch(
+                "custom_tools.storybook.artist_batch_edit._preprocess_canon_references",
+            ) as preprocess_call, patch(
+                "custom_tools.storybook.artist_batch_edit._ensure_references_exist",
+            ) as ensure_references_call, patch(
+                "custom_tools.storybook.artist_batch_edit.AgentFactory.create_agent",
+            ) as agent_factory_call, patch(
+                "custom_tools.storybook.artist_batch_edit.edit_image_vse_tool",
+            ) as edit_call:
+                with self.assertRaisesRegex(RuntimeError, "Обязательный blockout reference"):
+                    artist_agent_batch_edit_tool(
+                        session_id="s", items={"items": [item], "consistency_rules": []},
+                        max_concurrency=1, use_blockout_reference=True, generate_blockout=True,
+                    )
+            preprocess_call.assert_not_called()
+            ensure_references_call.assert_not_called()
+            agent_factory_call.assert_not_called()
+            edit_call.assert_not_called()
+
+
 class TestBuildBlockoutRoleBlock(unittest.TestCase):
     def test_empty_when_position_not_set(self):
         self.assertEqual(_build_blockout_role_block({}), "")

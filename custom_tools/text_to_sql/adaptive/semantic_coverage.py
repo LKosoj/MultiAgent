@@ -622,6 +622,13 @@ def _derive_row_preservation_requirements(
         for binding in bindings_by_source[item.source_id]
         for table in binding.tables
     }
+    qualifying_tables.update(
+        table
+        for item in qualifying_items
+        for binding in bindings_by_source[item.source_id]
+        for edge in binding.join_path
+        for table in (edge.left.table, edge.right.table)
+    )
     grouped: dict[bytes, tuple[TableRef, list[str], list[str]]] = {}
     for item in required_items:
         if item.source_id not in requested_source_ids:
@@ -841,7 +848,13 @@ def _binding_proves_required_predicate(
     else:
         return False
     if (
-        item.operator is None
+        (
+            item.operator is None
+            and not (
+                item.kind is SemanticItemKind.TIME
+                and isinstance(binding, DiscriminatorValueBinding)
+            )
+        )
         or not _filter_right_is_valid(
             source_predicate.operator,
             source_predicate.right,
@@ -978,9 +991,7 @@ def _evidence_is_current(
     context: FreshnessContext,
 ) -> bool:
     return (
-        evidence.observed_at <= context.evaluated_at
-        and evidence.created_at <= context.evaluated_at
-        and evaluate_evidence_freshness(evidence, context).status
+        evaluate_evidence_freshness(evidence, context).status
         is FreshnessStatus.FRESH
     )
 

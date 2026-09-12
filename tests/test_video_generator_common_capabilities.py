@@ -26,6 +26,48 @@ _EXPECTED_KEYS = {
 }
 
 
+def test_enhance_video_prompt_passes_end_facts_separately(monkeypatch):
+    captured = {}
+
+    def fake_call_openai_api(**kwargs):
+        captured.update(kwargs)
+        return "Camera pans right, hero walks through the forest"
+
+    import utils
+
+    monkeypatch.setattr(utils, "call_openai_api", fake_call_openai_api)
+
+    result = vgc.enhance_video_prompt(
+        "Camera pans right while the hero walks",
+        json.dumps({"content_analysis": "hero at the forest entrance"}),
+        json.dumps({"content_analysis": "hero reaches the castle gate"}),
+    )
+
+    assert result == "Camera pans right, hero walks through the forest"
+    assert "ACTUAL IMAGE ANALYSIS" in captured["prompt"]
+    assert "hero at the forest entrance" in captured["prompt"]
+    assert "END IMAGE FACTS" in captured["prompt"]
+    assert "hero reaches the castle gate" in captured["prompt"]
+
+
+def test_enhance_video_prompt_omits_end_block_without_end_description(monkeypatch):
+    captured = {}
+
+    def fake_call_openai_api(**kwargs):
+        captured.update(kwargs)
+        return "Camera pans right, hero walks through the forest"
+
+    import utils
+
+    monkeypatch.setattr(utils, "call_openai_api", fake_call_openai_api)
+    vgc.enhance_video_prompt(
+        "Camera pans right while the hero walks",
+        json.dumps({"content_analysis": "hero at the forest entrance"}),
+    )
+
+    assert "END IMAGE FACTS" not in captured["prompt"]
+
+
 # ---------------------------------------------------------------------------
 # parse_duration_seconds_from_timing (починка дефекта раздела 2.5)
 # ---------------------------------------------------------------------------

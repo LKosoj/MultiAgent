@@ -2,7 +2,7 @@
 Decision Engine для принятия решений о продолжении workflow
 """
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from datetime import datetime
 
 from ..models import Decision, ValidationResult, StepResult, WorkflowStep, WorkflowContext, DecisionType
@@ -85,6 +85,7 @@ class DecisionEngine:
         
         analysis = {
             "quality_status": "unknown",
+            "validation_passed": validation_result.validation_passed,
             "retry_count": step_result.retry_count,
             "error_class": validation_result.error_class,
             "improvement_potential": "unknown",
@@ -144,12 +145,19 @@ class DecisionEngine:
         retry_count = situation_analysis["retry_count"]
         error_class = situation_analysis["error_class"]
         escalation_triggers = situation_analysis["escalation_triggers"]
+        validation_passed = situation_analysis["validation_passed"]
         
         # Проверяем критичные ситуации
+        if error_class == "security_violation" or "security_violation" in str(escalation_triggers):
+            return DecisionType.STOP.value
+
+        if not validation_passed:
+            if retry_count < 3:
+                return DecisionType.RETRY.value
+            return DecisionType.ESCALATE.value
+
         if escalation_triggers:
-            if "security_violation" in str(escalation_triggers):
-                return DecisionType.STOP.value
-            elif "retry_budget_exhausted" in str(escalation_triggers):
+            if "retry_budget_exhausted" in str(escalation_triggers):
                 return DecisionType.HUMAN_REQUIRED.value
         
         # Проверяем качество

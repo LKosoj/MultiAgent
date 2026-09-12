@@ -1,7 +1,12 @@
 import json
 from pathlib import Path
 
+import pytest
+from PIL import Image
+
 from custom_tools.storybook import video_contract
+from custom_tools.storybook import video_generator_aitunnel_tool as aitunnel_module
+from custom_tools.storybook.video_generator_aitunnel_jobs import _build_input_hash, _hash_text
 
 
 def _write_shots(root: Path, project_id: str, items):
@@ -15,6 +20,37 @@ def _enable_video_env(monkeypatch):
     monkeypatch.setenv("AITUNNEL_API_KEY", "sk-test")
     monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", "video-model")
     monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+
+def _aitunnel_catalog(*, frame_images=("first_frame", "last_frame"), sizes=("1920x1080",), durations=(6,)):
+    return {
+        "video-model": {
+            "supported_frame_images": list(frame_images),
+            "supported_sizes": list(sizes),
+            "supported_durations": list(durations),
+            "supports_seed": True,
+        }
+    }
+
+
+def _write_frame(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"frame")
+
+
+class _AitunnelResponse:
+    def __init__(self, status_code=200, payload=None, content=b""):
+        self.status_code = status_code
+        self._payload = payload
+        self.content = content
+        self.text = ""
+
+    def json(self):
+        return self._payload
+
+    def iter_content(self, chunk_size=8192):
+        del chunk_size
+        yield self.content
 
 
 def test_preflight_writes_provider_menu_summary(tmp_path, monkeypatch):
@@ -106,11 +142,23 @@ def test_delivery_promise_blocks_enabled_run_without_capabilities_or_clips(tmp_p
 def test_delivery_promise_promises_video_when_enabled_and_ready(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     _enable_video_env(monkeypatch)
+    start_image = tmp_path / "images" / "start.png"
+    _write_frame(start_image)
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: _aitunnel_catalog())
     _write_shots(
         tmp_path,
         "project-1",
         [
-            {"scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": "video/1.mp4"},
+            {
+                "scene_number": 1,
+                "shot_number": 1,
+                "video_prompt": "pan right",
+                "video_path": "video/1.mp4",
+                "start_image": str(start_image),
+                "width": 1920,
+                "height": 1080,
+                "timing": "00:00 - 00:06",
+            },
             {"scene_number": 1, "shot_number": 2, "video_prompt": "   ", "video_path": "video/2.mp4"},
         ],
     )
@@ -126,6 +174,305 @@ def test_delivery_promise_promises_video_when_enabled_and_ready(tmp_path, monkey
     assert result["expected_video_count"] == 1
     assert result["expected_outputs"] == ["video/1.mp4"]
     assert result["blocking_reasons"] == []
+
+
+def test_delivery_promise_blocks_missing_start_frame_after_artist(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    _write_shots(
+        tmp_path,
+        "project-1",
+        [
+            {
+                "scene_number": 1,
+                "shot_number": 1,
+                "video_prompt": "pan right",
+                "video_path": str(tmp_path / "video" / "1.mp4"),
+                "start_image": str(tmp_path / "images" / "missing.png"),
+                "width": 1920,
+                "height": 1080,
+                "timing": "00:00 - 00:06",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        video_contract,
+        "_get_aitunnel_video_models",
+        lambda: _aitunnel_catalog(),
+        raising=False,
+    )
+
+    result = video_contract.storybook_video_delivery_promise_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+    )
+
+    assert result["will_generate_video"] is False
+    assert result["blocking_reasons"] == ["video_input_invalid:1-1"]
+
+
+def test_delivery_promise_blocks_unsupported_last_frame(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    start_image = tmp_path / "images" / "start.png"
+    end_image = tmp_path / "images" / "end.png"
+    _write_frame(start_image)
+    _write_frame(end_image)
+    _write_shots(tmp_path, "project-1", [{
+        "scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": "video/1.mp4",
+        "start_image": str(start_image), "end_image": str(end_image), "width": 1920, "height": 1080,
+        "timing": "00:00 - 00:06",
+    }])
+    monkeypatch.setattr(
+        video_contract, "_get_aitunnel_video_models", lambda: _aitunnel_catalog(frame_images=("first_frame",))
+    )
+
+    result = video_contract.storybook_video_delivery_promise_tool("session-1", "project-1", language="en")
+
+    assert result["will_generate_video"] is False
+    assert result["blocking_reasons"] == ["video_input_invalid:1-1"]
+
+
+def test_delivery_promise_blocks_unsupported_size_or_duration(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    start_image = tmp_path / "images" / "start.png"
+    _write_frame(start_image)
+    _write_shots(tmp_path, "project-1", [{
+        "scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": "video/1.mp4",
+        "start_image": str(start_image), "width": 1000, "height": 1000, "timing": "00:00 - 00:06",
+    }])
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: _aitunnel_catalog())
+
+    result = video_contract.storybook_video_delivery_promise_tool("session-1", "project-1", language="en")
+
+    assert result["will_generate_video"] is False
+    assert result["blocking_reasons"] == ["video_input_invalid:1-1"]
+
+
+def test_delivery_promise_blocks_model_without_supported_duration(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    start_image = tmp_path / "images" / "start.png"
+    _write_frame(start_image)
+    _write_shots(tmp_path, "project-1", [{
+        "scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": "video/1.mp4",
+        "start_image": str(start_image), "width": 1920, "height": 1080, "timing": "00:00 - 00:06",
+    }])
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: _aitunnel_catalog(durations=()))
+
+    result = video_contract.storybook_video_delivery_promise_tool("session-1", "project-1", language="en")
+
+    assert result["will_generate_video"] is False
+    assert result["blocking_reasons"] == ["video_input_invalid:1-1"]
+
+
+def test_delivery_promise_allows_trusted_aitunnel_resume_without_start_frame(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    video_path = tmp_path / "video" / "1.mp4"
+    _write_frame(video_path)
+    item = {
+        "scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": str(video_path),
+        "start_image": str(tmp_path / "images" / "removed.png"), "width": 1920, "height": 1080,
+        "timing": "00:00 - 00:06",
+    }
+    source_hashes = {"start_image": "saved-start-hash", "end_image": None}
+    input_hash = _build_input_hash(
+        model_name="video-model", prompt_hash=_hash_text("pan right"),
+        source_image_hashes=source_hashes, requested_duration=6, requested_width=1920, requested_height=1080,
+        seed=None, frame_types=["first_frame"],
+    )
+    _write_shots(tmp_path, "project-1", [item])
+    jobs_path = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots" / "provider_jobs.json"
+    jobs_path.write_text(json.dumps({"jobs": [{
+        "provider": "aitunnel", "shot_key": "1-1", "output_path": str(video_path), "status": "downloaded",
+        "source_image_hashes": source_hashes, "input_hash": input_hash, "original_input_hash": input_hash,
+        "original_prompt_language": "en",
+    }]}), encoding="utf-8")
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: (_ for _ in ()).throw(AssertionError()))
+
+    result = video_contract.storybook_video_delivery_promise_tool("session-1", "project-1", language="en")
+
+    assert result["will_generate_video"] is True
+    assert result["blocking_reasons"] == []
+
+
+@pytest.mark.parametrize(
+    ("resume_status", "remove_output", "use_blockout_reference"),
+    [
+        ("download_failed", True, False),
+        ("submitted", True, False),
+        ("downloaded", True, False),
+        ("submitted", False, False),
+        ("download_failed", True, True),
+    ],
+)
+def test_delivery_allows_matching_paid_task_without_frames(
+    tmp_path, monkeypatch, resume_status, remove_output, use_blockout_reference,
+):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    start_image = shots_dir / "start.png"
+    _write_frame(start_image)
+    video_path = shots_dir / "video.mp4"
+    item = {
+        "scene_number": 1, "shot_number": 1, "video_prompt": "pan right", "video_path": str(video_path),
+        "start_image": str(start_image), "width": 1920, "height": 1080, "timing": "00:00 - 00:06",
+    }
+    _write_shots(tmp_path, "project-1", [item])
+    catalog = _aitunnel_catalog()
+    job_store = aitunnel_module._ProviderJobStore(str(shots_dir / "provider_jobs.json"))
+
+    submitted_payloads = []
+
+    def first_post(*_args, **kwargs):
+        submitted_payloads.append(kwargs["json"])
+        return _AitunnelResponse(202, {"id": "job-1", "status": "pending"})
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", first_post)
+
+    def first_get(url, **_kwargs):
+        if url.endswith("/videos/job-1"):
+            return _AitunnelResponse(200, {"id": "job-1", "status": "completed", "unsigned_urls": ["https://cdn/old.mp4"]})
+        if url == "https://cdn/old.mp4":
+            return _AitunnelResponse(200, content=b"old")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "get", first_get)
+    assert aitunnel_module._generate_single_video_aitunnel(
+        item, "session-1", "sk-test", catalog, "video-model", None, "en", job_store,
+        use_blockout_reference=use_blockout_reference, generate_blockout=use_blockout_reference,
+    )["success"] is True
+    if use_blockout_reference:
+        assert "reference_video" not in submitted_payloads[0]
+
+    jobs_path = shots_dir / "provider_jobs.json"
+    jobs = json.loads(jobs_path.read_text(encoding="utf-8"))
+    jobs["jobs"][0].update({"status": resume_status, "video_url": "https://cdn/old.mp4"})
+    jobs_path.write_text(json.dumps(jobs), encoding="utf-8")
+    start_image.unlink()
+    assert video_path.read_bytes() == b"old"
+    if remove_output:
+        video_path.unlink()
+
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("resume must not POST")),
+    )
+
+    def resumed_get(url, **_kwargs):
+        if url.endswith("/videos/job-1"):
+            return _AitunnelResponse(200, {"id": "job-1", "status": "completed", "unsigned_urls": ["https://cdn/fresh.mp4"]})
+        if resume_status == "downloaded" and url == "https://cdn/old.mp4":
+            return _AitunnelResponse(200, content=b"fresh")
+        if url == "https://cdn/fresh.mp4":
+            return _AitunnelResponse(200, content=b"fresh")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "get", resumed_get)
+    monkeypatch.setattr(aitunnel_module, "_get_aitunnel_video_models", lambda: catalog)
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: catalog)
+    assert aitunnel_module.resumable_aitunnel_job_for_item(
+        item, aitunnel_module._ProviderJobStore(str(jobs_path)), "video-model", None, "en"
+    ) is True
+    promise = video_contract.storybook_video_delivery_promise_tool(
+        "session-1", "project-1", language="en",
+        generate_blockout=use_blockout_reference, use_blockout_reference=use_blockout_reference,
+    )
+
+    assert promise["blocking_reasons"] == []
+    assert promise["will_generate_video"] is True
+    resumed = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1",
+        project_id="project-1",
+        enable=True,
+        max_concurrency=1,
+        language="en",
+        skip_prompt_enhancement=True,
+        generate_blockout=use_blockout_reference,
+        use_blockout_reference=use_blockout_reference,
+    )
+    assert resumed["status"] == "success"
+    assert video_path.read_bytes() == b"fresh"
+    assert json.loads(jobs_path.read_text(encoding="utf-8"))["jobs"][0]["status"] == "downloaded"
+
+
+def test_delivery_promise_allows_ru_trusted_resume_without_retranslating(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _enable_video_env(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    start_image = shots_dir / "start.png"
+    start_image.parent.mkdir(parents=True)
+    Image.new("RGB", (1920, 1080)).save(start_image)
+    video_path = shots_dir / "video.mp4"
+    item = {
+        "scene_number": 1, "shot_number": 1, "shot_type": "start", "video_prompt": "Панорама вправо",
+        "video_path": str(video_path), "start_image": str(start_image), "width": 1920, "height": 1080,
+        "timing": "00:00 - 00:06",
+    }
+    _write_shots(tmp_path, "project-1", [item])
+    catalog = _aitunnel_catalog()
+    monkeypatch.setattr(
+        aitunnel_module, "translate_prompts_in_items", lambda source, _language: {**source, "video_prompt": "pan right"}
+    )
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post",
+        lambda *_args, **_kwargs: _AitunnelResponse(202, {"id": "job-1", "status": "pending"}),
+    )
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/videos/job-1"):
+            return _AitunnelResponse(200, {"id": "job-1", "status": "completed", "unsigned_urls": ["https://cdn/video.mp4"]})
+        if url == "https://cdn/video.mp4":
+            return _AitunnelResponse(200, content=b"video")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+    job_store = aitunnel_module._ProviderJobStore(str(shots_dir / "provider_jobs.json"))
+    generated = aitunnel_module._generate_single_video_aitunnel(
+        item, "session-1", "sk-test", catalog, "video-model", None, "ru", job_store
+    )
+    assert generated["success"] is True
+    saved_job = json.loads((shots_dir / "provider_jobs.json").read_text(encoding="utf-8"))["jobs"][0]
+    assert saved_job["prompt_hash"] == _hash_text("pan right")
+    assert saved_job["original_input_hash"]
+    saved_job.pop("original_input_hash")
+    (shots_dir / "provider_jobs.json").write_text(
+        json.dumps({"jobs": [saved_job]}), encoding="utf-8",
+    )
+    start_image.unlink()
+    translations = []
+    monkeypatch.setattr(
+        aitunnel_module,
+        "translate_prompts_in_items",
+        lambda source, _language: (translations.append(source), {**source, "video_prompt": "pan right"})[1],
+    )
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post", lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no POST"))
+    )
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: catalog)
+
+    result = video_contract.storybook_video_delivery_promise_tool("session-1", "project-1", language="ru")
+
+    assert result["will_generate_video"] is True
+    assert result["blocking_reasons"] == []
+    assert len(translations) == 1
+    migrated = json.loads((shots_dir / "provider_jobs.json").read_text(encoding="utf-8"))["jobs"][0]
+    assert migrated["original_input_hash"]
+    resumed = aitunnel_module._generate_single_video_aitunnel(
+        item, "session-1", "sk-test", catalog, "video-model", None, "ru",
+        aitunnel_module._ProviderJobStore(str(shots_dir / "provider_jobs.json")),
+    )
+    assert resumed["success"] is True
+    assert len(translations) == 1
+    wrong_language = aitunnel_module._generate_single_video_aitunnel(
+        item, "session-1", "sk-test", catalog, "video-model", None, "en",
+        aitunnel_module._ProviderJobStore(str(shots_dir / "provider_jobs.json")),
+    )
+    assert wrong_language["success"] is False
 
 
 def test_preflight_rejects_project_id_path_escape(tmp_path, monkeypatch):
@@ -414,7 +761,13 @@ def test_delivery_promise_promises_when_active_provider_configured(tmp_path, mon
     monkeypatch.setattr(
         video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool"
     )
-    _write_shots(tmp_path, "project-1", [{"video_prompt": "pan", "video_path": "video/1.mp4"}])
+    start_image = tmp_path / "images" / "start.png"
+    _write_frame(start_image)
+    monkeypatch.setattr(video_contract, "_get_aitunnel_video_models", lambda: _aitunnel_catalog())
+    _write_shots(tmp_path, "project-1", [{
+        "video_prompt": "pan", "video_path": "video/1.mp4", "start_image": str(start_image),
+        "width": 1920, "height": 1080, "timing": "00:00 - 00:06",
+    }])
 
     result = video_contract.storybook_video_delivery_promise_tool(
         session_id="session-1",

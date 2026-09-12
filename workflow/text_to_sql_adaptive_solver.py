@@ -6,10 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 from llm_call_context import llm_call_context
 
@@ -21,6 +22,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     PredicateOperator,
     ResearchReentryStatus,
     ResearchState,
+    ResearchStopReason,
     SemanticItemKind,
     SimilarSuccessfulSqlExample,
     SolverState,
@@ -57,18 +59,24 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
 from custom_tools.text_to_sql.adaptive.result_validation import (
     ResultContradictionReceipt,
 )
-from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
+from custom_tools.text_to_sql.adaptive.result_review import (
+    ResultReviewReceipt,
+    evaluate_result_review_arbitration_capability,
+)
+from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
 from custom_tools.text_to_sql.adaptive.solver_loop import (
     SolverCandidateLimitError,
     SolverConflictError,
     SolverProtocolError,
     apply_solver_proposal,
     accept_unreplaced_semantic_repair,
+    accept_result_review_arbitration,
     finalize_targeted_reentry,
     stop_solver,
 )
 from custom_tools.text_to_sql.adaptive.replay_contract import (
     SolverSemanticRepairFallbackReplayAction,
+    SolverResultReviewArbitrationReplayAction,
 )
 from custom_tools.text_to_sql.adaptive.solver_protocol import SolverProposalV1
 from custom_tools.text_to_sql.adaptive.solver_protocol import MissingEvidenceProposal
@@ -156,12 +164,122 @@ def _result_reentry_source_evidence(
     return receipt.source_id, receipt.evidence_id
 
 
+_ROOT_DISTINCT = re.compile(r"^\s*SELECT\s+DISTINCT\s+", re.IGNORECASE)
+
+
+def _root_distinct_pair(first, second) -> bool:
+    first_without = _ROOT_DISTINCT.sub("SELECT ", first.sql, count=1)
+    second_without = _ROOT_DISTINCT.sub("SELECT ", second.sql, count=1)
+    return first_without == second_without and (first.sql != first_without) != (
+        second.sql != second_without
+    )
+
+
+def _result_review_grain_conflict(store, checkpoint):
+    chain = store.load_replay_chain(
+        checkpoint.state.run_id, checkpoint.state.run_incarnation
+    )
+    if chain is None:
+        return None
+    records = []
+    for action in chain.actions:
+        if action.action_kind != "execution":
+            continue
+        reconciliation = next(
+            (
+                item
+                for item in chain.reconciliations
+                if item.action_revision == action.action_revision and item.outcome == "KNOWN"
+            ),
+            None,
+        )
+        if reconciliation is None:
+            continue
+        try:
+            receipt = _result_reentry_receipt(reconciliation.result)
+        except ValueError:
+            continue
+        records.append((action, receipt))
+    if len(records) < 2:
+        return None
+    (first_action, first), (second_action, second) = records[-2:]
+    if (
+        type(first) is not ResultReviewReceipt
+        or type(second) is not ResultReviewReceipt
+        or first.verdict != "contradicted"
+        or second.verdict != "contradicted"
+        or first.row_grain_requirement is None
+        or second.row_grain_requirement is None
+        or first.research_state_revision != second.research_state_revision
+        or first.requirements_digest != second.requirements_digest
+        or first.row_grain_requirement == second.row_grain_requirement
+    ):
+        return None
+    candidates = tuple(
+        next(
+            (item for item in checkpoint.state.sql_candidates if item.candidate_id == receipt.candidate_id),
+            None,
+        )
+        for receipt in (first, second)
+    )
+    if any(candidate is None for candidate in candidates):
+        return None
+    first_candidate, second_candidate = candidates
+    if (
+        first.candidate_id != first_action.candidate_id
+        or second.candidate_id != second_action.candidate_id
+        or first.normalized_ast_digest != first_action.normalized_ast_digest
+        or second.normalized_ast_digest != second_action.normalized_ast_digest
+        or not _root_distinct_pair(first_candidate, second_candidate)
+        or not all(
+            _candidate_has_passed_execution(
+                checkpoint.state, candidate.candidate_id, action.execution_id
+            )
+            for candidate, action in (
+                (first_candidate, first_action),
+                (second_candidate, second_action),
+            )
+        )
+    ):
+        return None
+    return (first_candidate, second_candidate), (first, second)
+
+
+def _candidate_has_passed_execution(state, candidate_id, execution_id) -> bool:
+    expected = (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+        CheckKind.EXPLAIN,
+        CheckKind.EXECUTION,
+    )
+    checks = tuple(
+        item for item in state.check_results if item.candidate_id == candidate_id
+    )
+    return (
+        len(checks) == len(expected)
+        and all(
+            item.check_kind is kind and item.status is CheckStatus.PASSED
+            for item, kind in zip(checks, expected, strict=True)
+        )
+        and any(
+            item.execution_id == execution_id
+            and item.candidate_id == candidate_id
+            and item.success
+            for item in state.execution_results
+        )
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SolverFinalizerPreparation:
     state: SolverState
     reservation: SolverExecutionReservation | None
     terminal: TextToSqlTerminalResult | None
     verified_execution: object | None = None
+    verified_completion_kind: Literal[
+        "semantic_repair_fallback", "result_review_arbitration"
+    ] | None = None
 
 
 async def run_production_adaptive_sql_generation(
@@ -405,6 +523,55 @@ async def run_adaptive_sql_generation(
         checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
         if checkpoint is None:
             raise RuntimeError("solver checkpoint initialization was not durable")
+    conflict = _result_review_grain_conflict(store, checkpoint)
+    if conflict is not None and _result_review_arbitration_action(store, checkpoint) is None:
+        from custom_tools.text_to_sql.adaptive.result_review_runtime import (
+            INVALID_RESULT_REVIEW_RUNTIME,
+            build_result_review_arbitration_runtime,
+        )
+
+        candidates, receipts = conflict
+        capability = build_result_review_arbitration_runtime(
+            runtime,
+            state=research,
+            requirements=requirements,
+            candidates=candidates,
+            receipts=receipts,
+        )
+        if capability is INVALID_RESULT_REVIEW_RUNTIME:
+            return _seal_stopped_generation(runtime, store, checkpoint)
+        resolution = evaluate_result_review_arbitration_capability(capability)
+        if resolution is None:
+            return _seal_stopped_generation(runtime, store, checkpoint)
+        execution = next(
+            (
+                item
+                for item in checkpoint.state.execution_results
+                if item.candidate_id == resolution.candidate_id and item.success
+            ),
+            None,
+        )
+        selected = next(
+            item
+            for item in checkpoint.state.sql_candidates
+            if item.candidate_id == resolution.candidate_id
+        )
+        if execution is None:
+            return _seal_stopped_generation(runtime, store, checkpoint)
+        action = SolverResultReviewArbitrationReplayAction(
+            first_candidate_id=candidates[0].candidate_id,
+            first_normalized_ast_digest=candidates[0].normalized_ast_digest,
+            first_receipt=receipts[0].model_dump(mode="json"),
+            second_candidate_id=candidates[1].candidate_id,
+            second_normalized_ast_digest=candidates[1].normalized_ast_digest,
+            second_receipt=receipts[1].model_dump(mode="json"),
+            candidate_id=selected.candidate_id,
+            execution_id=execution.execution_id,
+            normalized_ast_digest=selected.normalized_ast_digest,
+            receipt=resolution.model_dump(mode="json"),
+        )
+        checkpoint, _ = _reserve_result_review_arbitration(store, checkpoint, action)
+        return _ready_generation_output(runtime, checkpoint.state, selected)
     if repair_receipt is None:
         (
             checkpoint,
@@ -599,6 +766,7 @@ async def _resume_open_generation(
             research.run_id,
             research.run_incarnation,
         )
+        _synchronize_verified_research_outcome(runtime, research, freshness)
         before_reentry_recovery = checkpoint
     else:
         research = await settle_incomplete_reentry_model_call(
@@ -1239,9 +1407,10 @@ def _solver_context(
         ],
     }
     if repair_receipt is not None:
-        core["deterministic_sql_repair_receipt"] = repair_receipt.model_dump(
-            mode="json"
-        )
+        repair_receipt_context = repair_receipt.model_dump(mode="json")
+        repair_receipt_context["execution"] = dict(repair_receipt_context["execution"])
+        repair_receipt_context["execution"].pop("advisory_issues", None)
+        core["deterministic_sql_repair_receipt"] = repair_receipt_context
     if sql_parse_feedback is not None:
         core["sql_parse_feedback"] = dict(sql_parse_feedback)
 
@@ -1376,6 +1545,10 @@ def _resume_generation(runtime, store, checkpoint):
         runtime.verified_solver_state = checkpoint.state
         runtime.verified_solver_terminal = terminal
         return _terminal_generation_output(terminal)
+    arbitration = _result_review_arbitration_execution(store, checkpoint)
+    if arbitration is not None:
+        candidate, _receipt = arbitration
+        return _ready_generation_output(runtime, checkpoint.state, candidate)
     return None
 
 
@@ -1582,7 +1755,23 @@ async def _run_reentry(
         outcome.research_state.run_id,
         outcome.research_state.run_incarnation,
     )
+    _synchronize_verified_research_outcome(
+        runtime,
+        outcome.research_state,
+        refreshed,
+    )
     return checkpoint, outcome.research_state, rebuilt, refreshed
+
+
+def _synchronize_verified_research_outcome(runtime, research, freshness) -> None:
+    runtime.verified_research_outcome = ResearchLoopOutcome(
+        final_state=research,
+        stop_reason=ResearchStopReason.COMPLETE,
+        affected_source_ids=(),
+        citation_evidence_ids=(),
+        ambiguity=None,
+        freshness_context=freshness,
+    )
 
 
 def _completed_reentry_replay_input(
@@ -1800,6 +1989,73 @@ def _semantic_repair_fallback_action(store, checkpoint):
         return None
 
 
+def _result_review_arbitration_action(store, checkpoint):
+    chain = store.load_replay_chain(
+        checkpoint.state.run_id, checkpoint.state.run_incarnation
+    )
+    if chain is None or not chain.actions:
+        return None
+    last = chain.actions[-1]
+    if last.action_kind != "transition" or not isinstance(last.action, Mapping):
+        return None
+    try:
+        return SolverResultReviewArbitrationReplayAction.model_validate_json(
+            canonical_json_bytes(last.action)
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _result_review_arbitration_execution(store, checkpoint):
+    action = _result_review_arbitration_action(store, checkpoint)
+    if action is None or checkpoint.state.stop_reason is not SolverStopReason.SOLVED:
+        return None
+    from custom_tools.text_to_sql.adaptive.solver_loop import (
+        SolverConflictError,
+        _validate_result_review_arbitration_action,
+    )
+
+    try:
+        _validate_result_review_arbitration_action(checkpoint.state, action)
+    except SolverConflictError:
+        return None
+    candidate = next(
+        (item for item in checkpoint.state.sql_candidates if item.candidate_id == action.candidate_id),
+        None,
+    )
+    try:
+        receipt = ResultReviewReceipt.model_validate_json(canonical_json_bytes(action.receipt))
+    except (TypeError, ValueError):
+        return None
+    if (
+        candidate is None
+        or checkpoint.state.selected_candidate_id != candidate.candidate_id
+        or candidate.normalized_ast_digest != action.normalized_ast_digest
+        or receipt.review_kind != "conflict_arbitration"
+        or receipt.verdict != "consistent"
+        or receipt.candidate_id != candidate.candidate_id
+        or receipt.execution == {}
+    ):
+        return None
+    return candidate, receipt
+
+
+def _reserve_result_review_arbitration(store, checkpoint, action):
+    receipt = ResultReviewReceipt.model_validate_json(canonical_json_bytes(action.receipt))
+    accepted = accept_result_review_arbitration(
+        checkpoint.state,
+        action=action,
+        base_revision=checkpoint.state.revision,
+    )
+    committed = store.commit_non_execution(
+        checkpoint.state,
+        accepted,
+        action_revision=checkpoint.cursor.next_action_revision,
+        action=action.model_dump(mode="json"),
+    )
+    return committed, receipt
+
+
 def _reserve_unreplaced_semantic_repair(store, checkpoint, candidate, receipt):
     reentry = checkpoint.state.research_reentries[-1]
     execution = checkpoint.state.execution_results[-1]
@@ -1826,9 +2082,11 @@ def _reserve_unreplaced_semantic_repair(store, checkpoint, candidate, receipt):
     return committed, receipt
 
 
-def finalize_unreplaced_semantic_repair(
+def _finalize_verified_result_review(
     runtime: object,
     terminal_mapping: Mapping[str, object],
+    *,
+    arbitration: bool,
 ) -> SolverCheckpoint:
     runtime, research, store = _validated_generation_runtime(runtime)
     checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
@@ -1836,9 +2094,13 @@ def finalize_unreplaced_semantic_repair(
         raise RuntimeError("solver checkpoint is missing before semantic repair fallback")
     if checkpoint.terminal is not None:
         return checkpoint
-    action = _semantic_repair_fallback_action(store, checkpoint)
+    action = (
+        _result_review_arbitration_action(store, checkpoint)
+        if arbitration
+        else _semantic_repair_fallback_action(store, checkpoint)
+    )
     if action is None:
-        raise ValueError("semantic repair fallback action is missing")
+        raise ValueError("verified fallback action is missing")
     terminal = TextToSqlTerminalResult.from_mapping(terminal_mapping)
     candidate = next(
         (item for item in checkpoint.state.sql_candidates if item.candidate_id == action.candidate_id),
@@ -1852,16 +2114,20 @@ def finalize_unreplaced_semantic_repair(
         or terminal.run_id != checkpoint.state.run_id
         or terminal.sql != candidate.sql
     ):
-        raise ValueError("semantic repair fallback terminal is invalid")
-    receipt = _semantic_repair_execution_receipt(
-        store,
-        checkpoint,
-        candidate_id=action.candidate_id,
-        execution_id=action.execution_id,
-        normalized_ast_digest=action.normalized_ast_digest,
+        raise ValueError("verified fallback terminal is invalid")
+    receipt = (
+        ResultReviewReceipt.model_validate_json(canonical_json_bytes(action.receipt))
+        if arbitration
+        else _semantic_repair_execution_receipt(
+            store,
+            checkpoint,
+            candidate_id=action.candidate_id,
+            execution_id=action.execution_id,
+            normalized_ast_digest=action.normalized_ast_digest,
+        )
     )
     if terminal.execution != receipt.execution:
-        raise ValueError("semantic repair fallback terminal execution is invalid")
+        raise ValueError("verified fallback terminal execution is invalid")
     terminal_bytes = canonical_json_bytes(terminal.to_mapping())
     store.record_terminal(
         checkpoint.state,
@@ -1875,6 +2141,24 @@ def finalize_unreplaced_semantic_repair(
     runtime.verified_solver_candidate_id = None
     runtime.verified_solver_terminal = terminal
     return finalized
+
+
+def finalize_unreplaced_semantic_repair(
+    runtime: object,
+    terminal_mapping: Mapping[str, object],
+) -> SolverCheckpoint:
+    return _finalize_verified_result_review(
+        runtime, terminal_mapping, arbitration=False
+    )
+
+
+def finalize_result_review_arbitration(
+    runtime: object,
+    terminal_mapping: Mapping[str, object],
+) -> SolverCheckpoint:
+    return _finalize_verified_result_review(
+        runtime, terminal_mapping, arbitration=True
+    )
 
 
 def _recover_unsealed_semantic_repair_fallback(store, checkpoint):
@@ -1991,6 +2275,29 @@ def prepare_finalizer_execution(
     if checkpoint.pending_execution is not None:
         recovered = reconcile_pending_finalizer_unknown(store, checkpoint)
         return _prepared_terminal(runtime, recovered)
+    arbitration = _result_review_arbitration_execution(store, checkpoint)
+    if arbitration is not None:
+        from custom_tools.text_to_sql.core._terminal import (
+            _verified_execution_from_result_review,
+        )
+
+        candidate, receipt = arbitration
+        _validate_finalizer_request(request, candidate.sql)
+        runtime.verified_solver_state = checkpoint.state
+        runtime.verified_solver_candidate_id = candidate.candidate_id
+        return SolverFinalizerPreparation(
+            checkpoint.state,
+            None,
+            None,
+            _verified_execution_from_result_review(
+                receipt,
+                run_id=runtime.run_id,
+                sql_query=candidate.sql,
+                row_limit=request["row_limit"],
+                dry_run_only=request["dry_run_only"],
+            ),
+            "result_review_arbitration",
+        )
     fallback = _unreplaced_semantic_repair_execution(store, checkpoint)
     if fallback is not None:
         candidate, receipt = fallback
@@ -2020,6 +2327,7 @@ def prepare_finalizer_execution(
             None,
             None,
             capability,
+            "semantic_repair_fallback",
         )
     candidate = _ready_candidate(checkpoint.state)
     if candidate is None or (
@@ -2540,6 +2848,7 @@ def _reservation_authority(
 __all__ = (
     "SolverFinalizerPreparation",
     "apply_finalizer_checkpoint",
+    "finalize_result_review_arbitration",
     "finalize_unreplaced_semantic_repair",
     "prepare_finalizer_execution",
     "reconcile_known_finalizer",

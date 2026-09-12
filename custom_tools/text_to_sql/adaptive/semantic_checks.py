@@ -94,6 +94,33 @@ class _SemanticInputError(ValueError):
         self.ast_node_ids = tuple(sorted(set(ast_node_ids)))
 
 
+def _deferred_limit_mismatch(context: _SemanticContext) -> CheckResult | None:
+    deferred_limits = tuple(
+        item
+        for item in context.items_by_kind.get(SemanticItemKind.LIMIT, ())
+        if item.required and item.literal_or_reference is None
+    )
+    if not deferred_limits:
+        return None
+    root_limits = tuple(
+        limit
+        for limit in context.check_input.parsed_ast.limits
+        if limit.scope_id in context.root_scope_ids
+    )
+    if (
+        len(deferred_limits) == 1
+        and len(root_limits) == 1
+        and type(root_limits[0].count) is int
+        and root_limits[0].count > 0
+    ):
+        return None
+    return _failure(
+        context,
+        CheckFailureCode.LIMIT_MISMATCH,
+        sources=tuple(item.source_id for item in deferred_limits),
+    )
+
+
 def evaluate_semantic_authority_checks(
     check_input: SemanticCheckInput,
     research_state: ResearchState,
@@ -113,6 +140,8 @@ def evaluate_semantic_authority_checks(
         for code in _AUTHORITY_FAILURE_ORDER:
             if (result := checks[code](context)) is not None:
                 return result
+        if (result := _deferred_limit_mismatch(context)) is not None:
+            return result
         return _passed(candidate_id)
     except _SemanticInputError as exc:
         return _inconclusive(candidate_id, exc.ast_node_ids)

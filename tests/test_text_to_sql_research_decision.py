@@ -784,6 +784,47 @@ def test_invalid_stop_and_multiple_or_malformed_next_steps_are_rejected() -> Non
         _parse(_decision(next_step={"next_kind": "tool", "intent": _tool_next()}))
 
 
+def test_complete_stop_allows_framework_owned_empty_citations() -> None:
+    decision = _parse(
+        _decision(
+            next_step={
+                "next_kind": "stop",
+                "reason": "complete",
+                "source_ids": [],
+                "citation_evidence_ids": [],
+            }
+        )
+    )
+
+    assert decision.next.citation_evidence_ids == ()
+
+
+@pytest.mark.parametrize("reason", ("ambiguous", "unsupported"))
+def test_noncomplete_stop_still_requires_citations(reason: str) -> None:
+    with pytest.raises(ContractValidationError):
+        _parse(
+            _decision(
+                next_step={
+                    "next_kind": "stop",
+                    "reason": reason,
+                    "source_ids": [SOURCE_ID],
+                    "citation_evidence_ids": [],
+                    **(
+                        {
+                            "ambiguity": {
+                                "interpretations": ["First.", "Second."],
+                                "citation_evidence_ids": [],
+                                "missing_distinguishing_fact": "Missing fact.",
+                            }
+                        }
+                        if reason == "ambiguous"
+                        else {}
+                    ),
+                }
+            )
+        )
+
+
 def test_forbidden_fields_and_evidence_objects_are_rejected_inside_proposals() -> None:
     proposal = {
         "proposal_type": "new_binding",

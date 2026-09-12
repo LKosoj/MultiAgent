@@ -114,6 +114,8 @@ def test_multi_track_generates_all_tracks_from_plan(tmp_path, monkeypatch):
 
     assert result["status"] == "ok"
     assert result["tracks"] == 3
+    assert result["music_manifest_path"] == str(base / "98_audio" / "music_manifest.json")
+    assert result["music_path"] == str(base / "98_audio" / "music" / "hero.mp3")
 
     manifest_path = base / "98_audio" / "music_manifest.json"
     assert manifest_path.exists()
@@ -231,40 +233,126 @@ def test_multi_track_partial_failure_pushes_available_tracks(tmp_path, monkeypat
             wait_for_completion=True,
         )
 
-    assert result["status"] == "ok"
+    assert result["status"] == "partial"
     assert result["tracks"] == 2
 
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
-    assert set(manifest.keys()) == {"villain", "neutral"}
-    assert "hero" not in manifest
+    assert set(manifest.keys()) == {"hero", "villain", "neutral"}
+    assert manifest["hero"] == "music/neutral.mp3"
+
+    persisted_plan = json.loads((base / "98_audio" / "music_plan.json").read_text(encoding="utf-8"))
+    assert persisted_plan["scene_mapping"] == {
+        "scene_1": "hero", "scene_2": "villain", "scene_3": "neutral"
+    }
 
     warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("hero" in msg.lower() for msg in warning_messages), warning_messages
 
 
-def test_multi_track_all_tracks_fail_falls_back_to_legacy(tmp_path, monkeypatch, caplog):
-    """M4: when every leitmotif/neutral Suno submission fails, _multi_track_path must
-    fall back to _legacy_single_track_path (which uses its own manifest shape, not the
-    bare-id multi-track one)."""
+def test_multi_track_missing_neutral_returns_error_without_legacy_resubmission(tmp_path, monkeypatch):
+    _prepare_env(tmp_path, monkeypatch)
+    project_id = "proj_multi_track_missing_neutral"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    _write_json(base / "98_audio" / "music_plan.json", _valid_plan())
+
+    post_suno_generate = _make_fake_post_suno_generate(fail_on_calls={3})
+    _install_common_fakes(monkeypatch, post_suno_generate)
+
+    result = music_generator.storybook_music_generator_tool(
+        session_id="sess", project_id=project_id, enable=True, provider="suno", wait_for_completion=True,
+    )
+
+    assert result["status"] == "error"
+    assert "neutral" in result["message"].lower()
+    assert result["music_manifest_path"] == str(base / "98_audio" / "music_manifest.json")
+    assert result["music_path"] == str(base / "98_audio" / "music" / "hero.mp3")
+    assert post_suno_generate.calls == 3
+    audio_manifest = json.loads((base / "98_audio" / "audio_manifest.json").read_text(encoding="utf-8"))
+    assert audio_manifest["music_status"] == "error"
+
+
+def test_multi_track_missing_unused_neutral_keeps_covered_plan_successful(tmp_path, monkeypatch):
+    _prepare_env(tmp_path, monkeypatch)
+    project_id = "proj_multi_track_unused_neutral"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    plan = _valid_plan()
+    plan["scene_mapping"] = {"scene_1": "hero", "scene_2": "villain"}
+    _write_json(base / "98_audio" / "music_plan.json", plan)
+
+    post_suno_generate = _make_fake_post_suno_generate(fail_on_calls={3})
+    _install_common_fakes(monkeypatch, post_suno_generate)
+
+    result = music_generator.storybook_music_generator_tool("sess", project_id)
+
+    assert result["status"] == "ok"
+    assert result["missing_tracks"] == []
+    assert post_suno_generate.calls == 3
+
+
+def test_multi_track_rejects_manual_plan_with_invalid_track_id(tmp_path, monkeypatch):
+    _prepare_env(tmp_path, monkeypatch)
+    project_id = "proj_multi_track_invalid_id"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    plan = _valid_plan()
+    plan["leitmotifs"] = {"../outside": plan["leitmotifs"]["hero"]}
+    plan["scene_mapping"] = {"scene_1": "../outside", "scene_2": "neutral", "scene_3": "neutral"}
+    _write_json(base / "98_audio" / "music_plan.json", plan)
+
+    generated = []
+    monkeypatch.setattr(
+        music_generator,
+        "_generate_single_track",
+        lambda **kwargs: generated.append(kwargs["track_id"]),
+    )
+
+    result = music_generator.storybook_music_generator_tool(
+        session_id="sess",
+        project_id=project_id,
+        enable=True,
+        provider="suno",
+        wait_for_completion=True,
+    )
+
+    assert result["status"] == "error"
+    assert generated == []
+    assert not (base / "98_audio" / "music").exists()
+    assert not (base / "99_final" / "outside.mp3").exists()
+
+
+def test_multi_track_rejects_manual_plan_with_whitespace_track_id(tmp_path, monkeypatch):
+    _prepare_env(tmp_path, monkeypatch)
+    project_id = "proj_multi_track_whitespace_id"
+    base = tmp_path / "plots" / "storybooks" / project_id
+    plan = _valid_plan()
+    plan["leitmotifs"] = {" hero ": plan["leitmotifs"]["hero"]}
+    plan["scene_mapping"] = {"scene_1": " hero ", "scene_2": "neutral", "scene_3": "neutral"}
+    _write_json(base / "98_audio" / "music_plan.json", plan)
+    generated = []
+    monkeypatch.setattr(music_generator, "_generate_single_track", lambda **kwargs: generated.append(kwargs))
+
+    result = music_generator.storybook_music_generator_tool("sess", project_id)
+
+    assert result["status"] == "error"
+    assert generated == []
+
+
+def test_multi_track_all_tracks_fail_returns_error_without_legacy_resubmission(tmp_path, monkeypatch, caplog):
+    """A failed multi-track plan must not pay for a new legacy submission."""
     _prepare_env(tmp_path, monkeypatch)
     project_id = "proj_multi_track_all_fail"
     base = tmp_path / "plots" / "storybooks" / project_id
     _write_json(base / "98_audio" / "music_plan.json", _valid_plan())
 
-    # music_plan.json has 3 tracks (hero, villain, neutral) processed as calls #1-3;
-    # fail all of them so the multi-track manifest ends up empty. The legacy fallback's
-    # own submission is call #4 and is left free to succeed.
+    # music_plan.json has 3 tracks (hero, villain, neutral) processed as calls #1-3.
     post_suno_generate = _make_fake_post_suno_generate(fail_on_calls={1, 2, 3})
     _install_common_fakes(monkeypatch, post_suno_generate)
 
     legacy_calls = []
-    original_legacy = music_generator._legacy_single_track_path
-
-    def spy_legacy(*args, **kwargs):
-        legacy_calls.append((args, kwargs))
-        return original_legacy(*args, **kwargs)
-
-    monkeypatch.setattr(music_generator, "_legacy_single_track_path", spy_legacy)
+    monkeypatch.setattr(
+        music_generator,
+        "_legacy_single_track_path",
+        lambda *args, **kwargs: legacy_calls.append((args, kwargs)),
+    )
 
     with caplog.at_level(logging.WARNING, logger="custom_tools.storybook.music_generator"):
         result = music_generator.storybook_music_generator_tool(
@@ -275,18 +363,16 @@ def test_multi_track_all_tracks_fail_falls_back_to_legacy(tmp_path, monkeypatch,
             wait_for_completion=True,
         )
 
-    assert len(legacy_calls) == 1
-    # The multi-track result shape always carries a "tracks" count; legacy never does.
-    assert "tracks" not in result
-    assert result["status"] == "success"
+    assert legacy_calls == []
+    assert result["status"] == "error"
+    assert result["music_path"] == ""
 
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
-    assert manifest.get("status") == "success"
-    assert "hero" not in manifest
-    assert "villain" not in manifest
+    assert manifest == {}
+    audio_manifest = json.loads((base / "98_audio" / "audio_manifest.json").read_text(encoding="utf-8"))
+    assert audio_manifest["music_status"] == "error"
 
     warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    assert any("falling back to legacy" in msg.lower() for msg in warning_messages), warning_messages
     assert sum("suno failed for" in msg.lower() for msg in warning_messages) == 3
 
 

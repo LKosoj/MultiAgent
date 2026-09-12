@@ -1,8 +1,7 @@
 """WS-A / M-1 + M-2 + H-2: контракт надёжности storybook_pipeline.yaml.
 
 Проверяем на самом yaml (декларативный контракт):
-  * M-2: удалён декоративный no-op global_resource_limits.max_duration_seconds
-    (но max_api_calls_per_minute сохранён);
+  * M-2: Storybook declares its enforced global duration budget;
   * M-1: удалён декоративный error_handling.save_checkpoint_interval;
   * M-1: error_handling.auto_retry_transient присутствует (реализованный ключ);
   * H-2: дорогие side-effect-шаги (video_generator, storybook_music_generator,
@@ -25,14 +24,10 @@ def _load_raw():
         return yaml.safe_load(f)
 
 
-def test_max_duration_seconds_removed_from_resource_limits():
+def test_storybook_declares_enforced_duration_budget():
     data = _load_raw()
     grl = data.get("global_resource_limits", {})
-    # M-2: no-op wall-clock дедлайн удалён из yaml.
-    assert "max_duration_seconds" not in grl, (
-        "max_duration_seconds не enforce-ится (M-2) и должен быть убран из yaml"
-    )
-    # Реально применяемый лимит сохранён.
+    assert grl.get("max_duration_seconds") == 30720
     assert grl.get("max_api_calls_per_minute") == 15
 
 

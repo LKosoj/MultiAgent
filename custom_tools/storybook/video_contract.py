@@ -11,6 +11,15 @@ import yaml
 from custom_tools.storybook.blockout_assets import read_index as _read_blockout_asset_index
 from custom_tools.storybook.blockout_common import MIN_BLENDER_VERSION
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.video_generator_aitunnel_media import _resolve_frame_dimensions, _resolve_model_and_size
+from custom_tools.storybook.video_generator_aitunnel_tool import (
+    _ProviderJobStore,
+    _collect_video_items,
+    confirm_legacy_aitunnel_output_for_item,
+    resumable_aitunnel_job_for_item,
+    trusted_aitunnel_output_for_item,
+)
+from custom_tools.storybook.video_generator_common import _get_aitunnel_video_models, parse_duration_seconds_from_timing
 
 
 CONTRACT_VERSION = 1
@@ -373,7 +382,38 @@ def storybook_video_delivery_promise_tool(
     """
     enabled = _as_bool(enable)
     summary = _provider_summary(session_id, project_id, language, enabled, generate_blockout, use_blockout_reference)
-    expected_outputs = [item["video_path"] for item in summary["expected_video_items"]]
+    delivery_items = summary["expected_video_items"]
+    required_aitunnel_items = []
+    if summary["provider"] == "aitunnel":
+        _, shot_items, _ = _load_shots(project_id)
+        required_aitunnel_items = _required_aitunnel_video_items(shot_items)
+        delivery_items = _collect_video_items(shot_items, include_existing=True)
+        try:
+            job_store = _ProviderJobStore(str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"))
+        except Exception:
+            job_store = None
+        configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+        catalog = None
+        if _as_bool(generate_blockout) and _as_bool(use_blockout_reference):
+            try:
+                catalog = _get_aitunnel_video_models()
+            except Exception:
+                catalog = None
+        collected_keys = {_video_shot_key(item) for item in delivery_items}
+        for item in required_aitunnel_items:
+            if (
+                _video_shot_key(item) in collected_keys
+                or not resumable_aitunnel_job_for_item(
+                    item, job_store, configured_model, None, language,
+                    model_catalog=catalog,
+                    generate_blockout=_as_bool(generate_blockout),
+                    use_blockout_reference=_as_bool(use_blockout_reference),
+                )
+            ):
+                continue
+            delivery_items.append(item.copy())
+            collected_keys.add(_video_shot_key(item))
+    expected_outputs = [item["video_path"] for item in (required_aitunnel_items or delivery_items)]
 
     blocking_reasons = []
     if enabled and summary["shots_error"]:
@@ -386,6 +426,19 @@ def storybook_video_delivery_promise_tool(
         blocking_reasons.append("render_capability_unavailable")
     if enabled and not expected_outputs:
         blocking_reasons.append("no_expected_video_clips")
+    if enabled and required_aitunnel_items:
+        collected_keys = {_video_shot_key(item) for item in delivery_items}
+        blocking_reasons.extend(
+            f"video_input_invalid:{_video_shot_key(item)}"
+            for item in required_aitunnel_items
+            if _video_shot_key(item) not in collected_keys
+        )
+    if enabled and summary["provider"] == "aitunnel" and not blocking_reasons:
+        blocking_reasons.extend(
+            _aitunnel_delivery_input_blockers(
+                project_id, delivery_items, generate_blockout, use_blockout_reference, language
+            )
+        )
 
     artifact_path = str(_contract_dir(project_id) / "delivery_promise.json")
     will_generate = enabled and not blocking_reasons
@@ -950,6 +1003,99 @@ def _expected_video_items(items):
                 }
             )
     return expected
+
+
+def _required_aitunnel_video_items(items):
+    required = []
+    seen_keys = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if item.get("shot_type") and item.get("shot_type") != "start":
+            continue
+        if not str(item.get("video_prompt") or "").strip() or not str(item.get("video_path") or "").strip():
+            continue
+        shot_key = _video_shot_key(item)
+        if shot_key in seen_keys:
+            continue
+        seen_keys.add(shot_key)
+        required.append(item)
+    return required
+
+
+def _aitunnel_delivery_input_blockers(project_id, expected_items, generate_blockout, use_blockout_reference, language):
+    """Return per-shot blockers before the AITunnel step can submit a paid job."""
+    pending_items = []
+    blockers = []
+    try:
+        job_store = _ProviderJobStore(str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"))
+    except Exception:
+        job_store = None
+    configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+    catalog = None
+    for item in expected_items:
+        if use_blockout_reference and generate_blockout:
+            try:
+                catalog = catalog or _get_aitunnel_video_models()
+            except Exception:
+                catalog = None
+        if trusted_aitunnel_output_for_item(
+            item,
+            job_store,
+            configured_model,
+            None,
+            original_prompt=str(item.get("video_prompt") or "").strip(),
+            original_prompt_language=language,
+            model_catalog=catalog,
+            generate_blockout=_as_bool(generate_blockout),
+            use_blockout_reference=_as_bool(use_blockout_reference),
+        ):
+            continue
+        if confirm_legacy_aitunnel_output_for_item(
+            item, job_store, configured_model, None, language,
+            model_catalog=catalog,
+            generate_blockout=_as_bool(generate_blockout),
+            use_blockout_reference=_as_bool(use_blockout_reference),
+        ):
+            continue
+        if resumable_aitunnel_job_for_item(
+            item, job_store, configured_model, None, language,
+            model_catalog=catalog,
+            generate_blockout=_as_bool(generate_blockout),
+            use_blockout_reference=_as_bool(use_blockout_reference),
+        ):
+            continue
+        if not item.get("start_image"):
+            blockers.append(f"video_input_invalid:{_video_shot_key(item)}")
+            continue
+        pending_items.append(item)
+
+    if not pending_items:
+        return blockers
+    try:
+        catalog = catalog or _get_aitunnel_video_models()
+    except Exception:
+        return blockers + ["video_model_catalog_unavailable"]
+
+    for item in pending_items:
+        try:
+            width, height = _resolve_frame_dimensions(item, item.get("start_image"))
+            _resolve_model_and_size(
+                model_catalog=catalog,
+                configured_model=configured_model,
+                width=width,
+                height=height,
+                duration=int(parse_duration_seconds_from_timing(item.get("timing", "00:00 - 00:06"))),
+                requires_last_frame=bool(item.get("end_image")),
+                seed=None,
+            )
+        except Exception:
+            blockers.append(f"video_input_invalid:{_video_shot_key(item)}")
+    return blockers
+
+
+def _video_shot_key(item):
+    return f"{item.get('scene_number', '?')}-{item.get('shot_number', '?')}"
 
 
 def _active_video_tool_name():

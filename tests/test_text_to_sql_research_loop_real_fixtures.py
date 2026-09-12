@@ -1362,7 +1362,7 @@ def test_bounded_production_context_stays_within_synthetic_envelope() -> None:
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
 
 
-def test_bounded_production_context_omits_requeryable_old_facts_without_mutating_state() -> None:
+def test_bounded_production_context_keeps_completed_actions_nonreexecutable_when_evidence_omitted() -> None:
     policy_values = _policy(actions=1).model_dump(mode="python")
     policy_values["result_volume"]["inline_bytes"] = 16 * 1024
     policy_values["model_budget"]["input_tokens_per_call"] = 4_096
@@ -1413,6 +1413,13 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
         )
         for index in range(24)
     )
+    completed_action = _context_action("completed-inspect-table", None, 0)
+    evidence = (
+        evidence[0].model_copy(
+            update={"action_digest": completed_action.action_digest}
+        ),
+        *evidence[1:],
+    )
     binding = PhysicalColumnBinding(
         binding_id="binding-1",
         source_id=source.source_id,
@@ -1447,10 +1454,12 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
         {
             **base.model_dump(mode="python", round_trip=True),
             "query_spec": query,
+            "revision": 1,
             "evidence": evidence,
             "bindings": (binding,),
             "hypotheses": (hypothesis,),
             "join_candidates": (join,),
+            "action_history": (completed_action,),
         }
     )
     before = canonical_json_bytes(state)
@@ -1464,6 +1473,16 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
         profile=load_schema_research_agent_profile(),
         task=state.query_spec.original_text,
         validation_feedback=(),
+        rejected_duplicate_actions=(
+            {
+                "action_digest": completed_action.action_digest,
+                "kind": completed_action.kind.value,
+                "target": completed_action.target.model_dump(
+                    mode="json", by_alias=True
+                ),
+                "parameters": [list(item) for item in completed_action.parameters],
+            },
+        ),
     )
     prompt = build_schema_research_prompt(
         load_schema_research_agent_profile(),
@@ -1481,7 +1500,10 @@ def test_bounded_production_context_omits_requeryable_old_facts_without_mutating
     assert included["bindings"][0]["binding_id"] == binding.binding_id
     assert included["join_candidates"][0]["join_id"] == join.join_id
     assert evidence[-1].evidence_id in {item["evidence_id"] for item in included["evidence"]}
-    assert payload["requery_with_existing_probes"] is True
+    assert payload["completed_actions_are_not_reexecutable"] is True
+    assert payload["rejected_duplicate_actions"][0]["action_digest"] == (
+        completed_action.action_digest
+    )
     assert payload["omitted"]["evidence"] > 0
     assert payload["omitted"]["evidence"] == len(evidence) - len(included["evidence"])
     assert {
@@ -2321,6 +2343,215 @@ def test_production_research_assembles_available_document_freshness(tmp_path: Pa
     assert assembly.freshness_context.document_sources[0].availability is (
         DocumentSourceAvailability.AVAILABLE
     )
+
+
+def test_production_exact_document_formula_enables_initial_continuation(
+    tmp_path: Path,
+) -> None:
+    policy = _policy(actions=1)
+    database = create_sqlite_adaptive_fixture(
+        "F02_VERTICAL_EAV",
+        tmp_path / "fixture.sqlite",
+    )
+    dsn = f"sqlite://{database}"
+    scope = _scope()
+    loaded = SchemaLoader(tmp_path / "schema-cache").load_scoped_schema(
+        {}, dsn, scope
+    )
+    schema_version = f"sha256:{loaded.namespace.version_key}"
+    formula = "DIVIDE(COUNT(record_id WHERE qualifying), COUNT(record_id))*100"
+    base_state = _initial_state("F02_VERTICAL_EAV", schema_version, policy)
+    formula_item = base_state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "source_text": formula,
+            "normalized_meaning": f"{formula}; qualifying detail rows are shared.",
+            "operator": None,
+            "literal_or_reference": None,
+        }
+    )
+    state = ResearchState.model_validate(
+        {
+            **base_state.model_dump(mode="python", by_alias=True, round_trip=True),
+            "query_spec": base_state.query_spec.model_copy(
+                update={"semantic_items": (formula_item,)}
+            ),
+            "unresolved_items": (),
+        }
+    )
+    document = SchemaEvidenceDocument(
+        document_id="formula-authority",
+        namespace="main",
+        schema_namespace_version=schema_version,
+        source_version="v1",
+        title="Formula authority",
+        content=f"Exact formula: {formula}.",
+        target=None,
+    )
+    state_path = tmp_path / "production-state.sqlite"
+    state_store = AdaptiveResearchStateStore(state_path)
+    checkpoint_store = AdaptiveStateStore(state_path)
+    ledger = AdaptiveBudgetLedger(state_path)
+    profile = load_schema_research_agent_profile()
+    calls = 0
+
+    async def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps(
+            {
+                "decision_version": 1,
+                "proposals": [],
+                "next": {
+                    "next_kind": "stop",
+                    "reason": "ambiguous",
+                    "source_ids": [formula_item.source_id],
+                    "citation_evidence_ids": [],
+                    "ambiguity": {
+                        "interpretations": ["First reading.", "Second reading."],
+                        "citation_evidence_ids": [],
+                        "missing_distinguishing_fact": "A rule detail is absent.",
+                    },
+                },
+            }
+        )
+
+    try:
+        assembly = assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(document,),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+        )
+
+        assert assembly.semantic_repair_continuation
+        assert tuple(
+            (source_id, document_ref.document_id, document_ref.namespace)
+            for source_id, document_ref in assembly.exact_formula_documents
+        ) == ((formula_item.source_id, document.document_id, document.namespace),)
+        bounded_context = json.loads(assembly.research_context(state, ()))
+        assert bounded_context["exact_formula_documents"] == [
+            {
+                "source_id": formula_item.source_id,
+                "document": {
+                    "document_id": document.document_id,
+                    "namespace": document.namespace,
+                },
+            }
+        ]
+        outcome = asyncio.run(run_research_loop(**assembly.loop_arguments()))
+        assert calls == 1
+        assert outcome.stop_reason is not ResearchStopReason.COMPLETE
+
+        unmatched = document.model_copy(update={"content": "Another documented rule."})
+        duplicate = document.model_copy(update={"document_id": "formula-authority-2"})
+        assert not assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(unmatched,),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+        ).semantic_repair_continuation
+        assert not assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(unmatched,),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+        ).exact_formula_documents
+        assert not assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(document, duplicate),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+        ).exact_formula_documents
+        assert assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(unmatched,),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+            semantic_repair_continuation=True,
+        ).semantic_repair_continuation
+        assert not assemble_production_research(
+            initial_state=state,
+            query=state.query_spec.original_text,
+            loaded_schema=loaded,
+            documents=(document, duplicate),
+            dsn=dsn,
+            scope=scope,
+            table_namespace="main",
+            model=model,
+            model_identity=stable_schema_research_model_identity(profile.model),
+            profile=profile,
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=policy,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+        ).semantic_repair_continuation
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
 
 
 def test_production_registry_admits_sample_rows_with_its_planned_limit(

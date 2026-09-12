@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
@@ -12,6 +13,8 @@ from ._semantic_coverage_boundary import evidence_has_state_authority
 from .models import (
     Binding,
     BindingStatus,
+    CheckKind,
+    CheckStatus,
     DocumentRuleBinding,
     EvidenceSourceKind,
     HypothesisStatus,
@@ -354,6 +357,168 @@ def accept_unreplaced_semantic_repair(
     )
 
 
+_ROOT_DISTINCT = re.compile(r"^\s*SELECT\s+DISTINCT\s+", re.IGNORECASE)
+
+
+def _validate_result_review_arbitration_action(state: SolverState, action: object):
+    from .replay_contract import SolverResultReviewArbitrationReplayAction
+    from .result_review import ResultReviewReceipt
+
+    if type(action) is not SolverResultReviewArbitrationReplayAction:
+        raise SolverConflictError("result review arbitration action is invalid")
+    candidates = tuple(
+        next(
+            (item for item in state.sql_candidates if item.candidate_id == candidate_id),
+            None,
+        )
+        for candidate_id in (action.first_candidate_id, action.second_candidate_id)
+    )
+    if (
+        action.first_candidate_id == action.second_candidate_id
+        or any(candidate is None for candidate in candidates)
+    ):
+        raise SolverConflictError("result review arbitration candidates are invalid")
+    first_candidate, second_candidate = candidates
+    assert first_candidate is not None and second_candidate is not None
+    first_without = _ROOT_DISTINCT.sub("SELECT ", first_candidate.sql, count=1)
+    second_without = _ROOT_DISTINCT.sub("SELECT ", second_candidate.sql, count=1)
+    try:
+        first_receipt = ResultReviewReceipt.model_validate_json(
+            canonical_json_bytes(action.first_receipt)
+        )
+        second_receipt = ResultReviewReceipt.model_validate_json(
+            canonical_json_bytes(action.second_receipt)
+        )
+        selected_receipt = ResultReviewReceipt.model_validate_json(
+            canonical_json_bytes(action.receipt)
+        )
+    except (TypeError, ValueError) as exc:
+        raise SolverConflictError("result review arbitration receipts are invalid") from exc
+    pairs = (
+        (first_candidate, first_receipt, action.first_normalized_ast_digest),
+        (second_candidate, second_receipt, action.second_normalized_ast_digest),
+    )
+    if (
+        first_without != second_without
+        or (first_candidate.sql != first_without) == (second_candidate.sql != second_without)
+        or any(
+            receipt.verdict != "contradicted"
+            or receipt.row_grain_requirement is None
+            or candidate.normalized_ast_digest != digest
+            or receipt.candidate_id != candidate.candidate_id
+            or receipt.normalized_ast_digest != candidate.normalized_ast_digest
+            or receipt.run_id != state.run_id
+            or receipt.run_incarnation != state.run_incarnation
+            for candidate, receipt, digest in pairs
+        )
+        or first_receipt.row_grain_requirement == second_receipt.row_grain_requirement
+        or first_receipt.research_state_revision != second_receipt.research_state_revision
+        or first_receipt.requirements_digest != second_receipt.requirements_digest
+        or action.candidate_id not in {
+            first_candidate.candidate_id,
+            second_candidate.candidate_id,
+        }
+        or selected_receipt.review_kind != "conflict_arbitration"
+        or selected_receipt.verdict != "consistent"
+        or selected_receipt.candidate_id != action.candidate_id
+        or selected_receipt.normalized_ast_digest != action.normalized_ast_digest
+    ):
+        raise SolverConflictError("result review arbitration action is invalid")
+    selected_original = next(
+        receipt for candidate, receipt, _ in pairs if candidate.candidate_id == action.candidate_id
+    )
+    if selected_receipt.execution != selected_original.execution:
+        raise SolverConflictError("result review arbitration receipt is invalid")
+    if not any(
+        item.execution_id == action.execution_id
+        and item.candidate_id == action.candidate_id
+        and item.success
+        for item in state.execution_results
+    ):
+        raise SolverConflictError("result review arbitration execution is invalid")
+    expected = (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+        CheckKind.EXPLAIN,
+        CheckKind.EXECUTION,
+    )
+    for candidate, _receipt, _digest in pairs:
+        checks = tuple(
+            item for item in state.check_results if item.candidate_id == candidate.candidate_id
+        )
+        if (
+            len(checks) != len(expected)
+            or any(
+                item.check_kind is not kind or item.status is not CheckStatus.PASSED
+                for item, kind in zip(checks, expected, strict=True)
+            )
+            or not any(
+                item.success and item.candidate_id == candidate.candidate_id
+                for item in state.execution_results
+            )
+        ):
+            raise SolverConflictError("result review arbitration candidate is invalid")
+    return action
+
+
+def accept_result_review_arbitration(
+    state: SolverState,
+    *,
+    action: object,
+    base_revision: int,
+) -> SolverState:
+    """Accept one already-executed candidate selected by row-grain arbitration."""
+
+    state = _revalidate_exact(state, SolverState, SolverValidationError, "state")
+    _validate_solver_revision(state, base_revision)
+    if state.stop_reason is not SolverStopReason.MISSING_EVIDENCE:
+        raise SolverConflictError("result review arbitration requires MISSING_EVIDENCE")
+    action = _validate_result_review_arbitration_action(state, action)
+    candidate_id = action.candidate_id
+    execution_id = action.execution_id
+    normalized_ast_digest = action.normalized_ast_digest
+    candidate = next(
+        (item for item in state.sql_candidates if item.candidate_id == candidate_id),
+        None,
+    )
+    execution = next(
+        (item for item in state.execution_results if item.execution_id == execution_id),
+        None,
+    )
+    checks = tuple(
+        item for item in state.check_results if item.candidate_id == candidate_id
+    )
+    expected = (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+        CheckKind.EXPLAIN,
+        CheckKind.EXECUTION,
+    )
+    if (
+        candidate is None
+        or execution is None
+        or not execution.success
+        or execution.candidate_id != candidate_id
+        or candidate.normalized_ast_digest != normalized_ast_digest
+        or len(checks) != len(expected)
+        or any(
+            item.check_kind is not kind or item.status is not CheckStatus.PASSED
+            for item, kind in zip(checks, expected, strict=True)
+        )
+    ):
+        raise SolverConflictError("result review arbitration candidate is invalid")
+    return SolverState.model_validate(
+        {
+            **state.model_dump(mode="python"),
+            "revision": state.revision + 1,
+            "selected_candidate_id": candidate_id,
+            "stop_reason": SolverStopReason.SOLVED,
+        }
+    )
+
+
 def admit_targeted_reentry(
     state: SolverState,
     research_state: ResearchState,
@@ -595,8 +760,13 @@ def finalize_targeted_reentry(
                 or item.source_kind is request.required_evidence_kind
             )
             and evidence_has_state_authority(item, research_state)
-            and item.observed_at <= freshness_context.evaluated_at
-            and item.created_at <= freshness_context.evaluated_at
+            and (
+                research_continuation
+                or (
+                    item.observed_at <= freshness_context.evaluated_at
+                    and item.created_at <= freshness_context.evaluated_at
+                )
+            )
             and evaluate_evidence_freshness(item, freshness_context).status
             is FreshnessStatus.FRESH
             and (

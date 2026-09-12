@@ -1085,6 +1085,16 @@ def blockout_renderer_tool(
                 raise RuntimeError(f"{code}: {message}")
 
             any_chain_failed = True
+            failed_chain_patches = {}
+            for shot in chain_shots:
+                shot_number = shot.get("shot_number")
+                for shot_type in ("start", "end"):
+                    failed_chain_patches[(scene_number, shot_number, shot_type)] = {
+                        "blockout_ref_image": _REMOVE_FIELD,
+                        "blockout_video": _REMOVE_FIELD,
+                        "blockout_rendered_at": _REMOVE_FIELD,
+                    }
+            _merge_write_shots_blockout_fields(paths["shots"], failed_chain_patches)
             _report_append_checks(paths["report"], [{
                 "code": "B12", "level": "error", "chain_id": chain_id,
                 "message": f"chain {chain_id}: Blender render launch failed: {result.get('error')}",

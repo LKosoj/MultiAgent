@@ -1455,6 +1455,7 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                 finalize_text_to_sql_run,
             )
             from .text_to_sql_adaptive_solver import (
+                finalize_result_review_arbitration,
                 finalize_unreplaced_semantic_repair,
             )
 
@@ -1474,8 +1475,13 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             )
             if finalized.error is not None:
                 raise finalized.error
+            completion = (
+                finalize_result_review_arbitration
+                if prepared.verified_completion_kind == "result_review_arbitration"
+                else finalize_unreplaced_semantic_repair
+            )
             checkpoint_result = await _settle_thread_operation(
-                finalize_unreplaced_semantic_repair,
+                completion,
                 runtime,
                 finalized.value,
             )
@@ -2397,8 +2403,12 @@ class EnhancedWorkflowEngine(WorkflowEngine):
             # Post-step validation and decision.
             # M-4: LLM-судья валидирует output против text-плана и на детерминированных
             # tool-шагах даёт ложные RETRY/STOP (валидный dict/путь оценивается как «не text»).
-            # Судим только НЕ-tool (агентные) шаги.
-            if step.step_type == "tool":
+            # Судим только обычные агентные шаги: exact Typed sql_solving уже
+            # прошёл свой контракт и не соответствует generic text-output judge.
+            if step.step_type == "tool" or (
+                step.id == "sql_solving"
+                and self._exact_typed_runtime(workflow_context) is not None
+            ):
                 # M-4: детерминированный tool-шаг НЕ судим LLM-судьёй (он даёт
                 # ложные RETRY/STOP: валидный dict/путь оценивается как «не text»).
                 # Успешно завершённый tool-шаг детерминирован → присваиваем полную

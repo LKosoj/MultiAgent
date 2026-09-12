@@ -246,9 +246,17 @@ class SemanticItem(StrictModel):
     source_text: NonEmptyText
     normalized_meaning: NonEmptyText | None
     required: bool
+    owner_source_id: Id | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     exact_physical_predicate: bool = Field(
         default=False,
         exclude_if=lambda value: value is False,
+    )
+    exact_formula_binding_id: Id | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
     )
     operator: PredicateOperator | None
     literal_or_reference: (
@@ -260,9 +268,19 @@ class SemanticItem(StrictModel):
     @model_validator(mode="after")
     def validate_status(self) -> SemanticItem:
         if (
+            self.exact_formula_binding_id is not None
+            and self.kind is not SemanticItemKind.FORMULA
+        ):
+            raise ValueError("exact_formula_binding_id requires a FORMULA")
+        if (
             self.status is SemanticItemStatus.RESOLVED
             and not self.binding_ids
             and not is_structurally_resolved_limit(self)
+            and not (
+                self.required
+                and self.kind is SemanticItemKind.FORMULA
+                and self.status is SemanticItemStatus.RESOLVED
+            )
         ):
             raise ValueError("resolved SemanticItem requires binding_ids")
         return self
@@ -301,8 +319,7 @@ def is_binding_free_semantic_item(
     return (
         item.required
         and item.kind is SemanticItemKind.FORMULA
-        and item.status
-        in {SemanticItemStatus.UNRESOLVED, SemanticItemStatus.RESOLVED}
+        and item.status is SemanticItemStatus.RESOLVED
         and not item.binding_ids
     ) or is_binding_free_structural_limit(item, bindings)
 
@@ -323,6 +340,29 @@ class QuerySpec(ContractModel):
             if item.source_id in source_ids:
                 raise ValueError("semantic_items source_id must be unique")
             source_ids.add(item.source_id)
+        items_by_source_id = {item.source_id: item for item in self.semantic_items}
+        for item in self.semantic_items:
+            owner_source_id = item.owner_source_id
+            if owner_source_id is None:
+                continue
+            owner = items_by_source_id.get(owner_source_id)
+            if (
+                owner is None
+                or owner.source_id == item.source_id
+                or not owner.required
+                or owner.kind is not SemanticItemKind.DIMENSION
+            ):
+                raise ValueError("owner_source_id must reference another required DIMENSION")
+            seen = {item.source_id}
+            while owner.owner_source_id is not None:
+                if owner.source_id in seen:
+                    raise ValueError("owner_source_id must not be cyclic")
+                seen.add(owner.source_id)
+                owner = items_by_source_id.get(owner.owner_source_id)
+                if owner is None:
+                    raise ValueError(
+                        "owner_source_id must reference another required DIMENSION"
+                    )
         require_canonical_ids(
             self.requested_output_source_ids,
             "QuerySpec requested_output_source_ids",
@@ -794,9 +834,28 @@ class ResearchState(ContractModel):
                 raise ValueError(
                     "SemanticItem binding_ids must belong to the same source"
                 )
-            if is_structurally_resolved_limit(item) and not bindings_by_source[
-                item.source_id
-            ]:
+            if item.exact_formula_binding_id is not None:
+                exact_binding = bindings_by_id.get(item.exact_formula_binding_id)
+                if (
+                    not isinstance(exact_binding, DerivedExpressionBinding)
+                    or exact_binding.source_id != item.source_id
+                    or exact_binding.status is not BindingStatus.SUPPORTED
+                    or exact_binding.validator_rule
+                    != "semantic-certificate:v1:derived_expression"
+                ):
+                    raise ValueError(
+                        "exact_formula_binding_id must reference a supported derived formula binding"
+                    )
+            if (
+                is_structurally_resolved_limit(item)
+                and not bindings_by_source[item.source_id]
+            ) or (
+                item.required
+                and item.kind is SemanticItemKind.FORMULA
+                and item.status is SemanticItemStatus.RESOLVED
+                and not item.binding_ids
+                and not bindings_by_source[item.source_id]
+            ):
                 expected_status, expected_binding_ids = (
                     SemanticItemStatus.RESOLVED.value,
                     (),

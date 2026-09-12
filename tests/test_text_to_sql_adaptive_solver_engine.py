@@ -28,7 +28,14 @@ from custom_tools.text_to_sql.adaptive.solver_loop import (
 from workflow.adaptive_solver_checkpoint import AdaptiveSolverCheckpointStore
 from workflow.deadline import DeadlineBudget, WorkflowDeadlineExceeded
 from workflow.enhanced_engine import EnhancedWorkflowEngine
-from workflow.models import ResourceLimits, WorkflowContext, WorkflowDefinition, WorkflowStep
+from workflow.models import (
+    ResourceLimits,
+    StepResult,
+    StepStatus,
+    WorkflowContext,
+    WorkflowDefinition,
+    WorkflowStep,
+)
 from workflow.text_to_sql_adaptive_solver import run_adaptive_sql_generation
 from workflow.text_to_sql_typed_runtime import (
     TextToSqlTypedAdmission,
@@ -108,6 +115,47 @@ def test_sql_solving_dispatches_to_typed_solver(monkeypatch) -> None:
 
     assert result["sql"] == "SELECT 1"
     assert calls == ["typed"]
+
+
+def test_exact_typed_sql_solving_bypasses_generic_post_step_judge() -> None:
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime = _typed_runtime(solver_store=object())
+    context = _context(runtime)
+    step = WorkflowStep(id="sql_solving", task="solve", agent_type="sql_solver_agent")
+    completed = StepResult(
+        step_id=step.id,
+        status=StepStatus.COMPLETED,
+        output={"sql": "SELECT 1", "description": "ok"},
+    )
+
+    async def call_agent_safely(**_kwargs):
+        return completed
+
+    async def validate_result(*_args):
+        raise AssertionError("exact Typed sql_solving must bypass the generic judge")
+
+    engine.circuit_breaker_manager = SimpleNamespace(
+        call_agent_safely=call_agent_safely
+    )
+    engine.budget_manager = SimpleNamespace(consume_budget=lambda *_args: None)
+    engine.feature_manager = SimpleNamespace(
+        is_feature_enabled=lambda feature, *_args: feature == "post_step_judge"
+    )
+    engine.judge = SimpleNamespace(validate_result=validate_result)
+
+    result = asyncio.run(
+        engine._execute_single_step_attempt(
+            {
+                "step": step,
+                "workflow_context": context,
+                "previous_results": {},
+                "step_budget": object(),
+            }
+        )
+    )
+
+    assert result.status is StepStatus.COMPLETED
+    assert result.quality_score == 1.0
 
 
 def _finalizer_runtime(tmp_path):
@@ -427,6 +475,59 @@ def test_pending_finalizer_resume_returns_unknown_without_call(
     )
 
     assert terminal["reason_code"] == "EXECUTION_UNKNOWN"
+
+
+def test_finalizer_uses_arbitration_completion_for_verified_execution(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from custom_tools.text_to_sql.core import _terminal
+    from workflow import text_to_sql_adaptive_solver as solver
+
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime, state, store = _finalizer_runtime(tmp_path)
+    prepared = solver.SolverFinalizerPreparation(
+        state,
+        None,
+        None,
+        object(),
+        "result_review_arbitration",
+    )
+    calls: list[str] = []
+
+    def prepare(*_args, **_kwargs):
+        return prepared
+
+    def arbitration_completion(_runtime, terminal):
+        calls.append("arbitration")
+        assert terminal == {"status": "succeeded"}
+        return store.load(runtime.run_id, runtime.run_incarnation)
+
+    def semantic_completion(*_args, **_kwargs):
+        raise AssertionError("arbitration must not use semantic fallback completion")
+
+    monkeypatch.setattr(solver, "prepare_finalizer_execution", prepare)
+    monkeypatch.setattr(solver, "finalize_result_review_arbitration", arbitration_completion)
+    monkeypatch.setattr(solver, "finalize_unreplaced_semantic_repair", semantic_completion)
+    monkeypatch.setattr(
+        solver,
+        "apply_finalizer_checkpoint",
+        lambda *_args: {"completion": "arbitration"},
+    )
+    monkeypatch.setattr(
+        _terminal,
+        "finalize_text_to_sql_run",
+        lambda *_args, **_kwargs: {"status": "succeeded"},
+    )
+
+    result = asyncio.run(
+        engine._execute_reserved_text_to_sql_finalizer(
+            _finalizer_step(state), _context(runtime), "finalize"
+        )
+    )
+
+    assert result == {"completion": "arbitration"}
+    assert calls == ["arbitration"]
 
 
 @pytest.mark.parametrize("crash_before_terminal", (False, True))

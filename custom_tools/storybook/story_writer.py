@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from agent_command import model_hard, model_ultimate
 from utils import call_openai_api, extract_json_from_markdown
 import logging
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,7 @@ def story_writer_tool(
             "regenerated": bool  # True, если история была перегенерирована
         }
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     syn_dir = f"{base}/10_synopsis"
     story_path = f"{base}/20_story/story.json"
     
@@ -96,6 +97,15 @@ def story_writer_tool(
         except Exception as e:
             logger.warning(f"Не удалось загрузить locations.json: {e}")
 
+    style_data = {}
+    style_path = f"{base}/30_style/style_text.json"
+    if os.path.exists(style_path):
+        try:
+            with open(style_path, "r", encoding="utf-8") as f:
+                style_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"Не удалось загрузить style_text.json: {e}")
+
     # Подтягиваем бриф, чтобы не хардкодить язык/возраст
     brief_path = f"{base}/00_brief.json"
     brief: Dict[str, Any] = {}
@@ -120,10 +130,11 @@ def story_writer_tool(
         if lang.lower().startswith("ru"):
             sys_parts.append("Пиши по-русски, фразами, соответствующими возрасту целевой аудитории.")
         else:
-            sys_parts.append("Пиши на указанном языке, фразами, соответствующими возрасту целевой аудитории.")
+            sys_parts.append(f"Пиши на языке с кодом {lang}, фразами, соответствующими возрасту целевой аудитории.")
     if age:
         sys_parts.append(f"Аудитория: {age}.")
     sys_parts.append(f"Тон: {tone_text}.")
+    sys_parts.append("Язык, возраст, жанр, тон и объём из задания имеют приоритет над общими стилевыми рекомендациями.")
     if min_w or max_w:
         if min_w and max_w:
             sys_parts.append(f"ВАЖНО: Каждая страница должна содержать {min_w}-{max_w} слов. Это критически важно для качества книги!")
@@ -174,17 +185,27 @@ def story_writer_tool(
     sys_parts.append(
         "КРИТИЧНО: `pages` ДОЛЖЕН быть массивом объектов, `page` — целое число."
     )
-    sys_parts.append(
-        "Избегай повторов. Без насилия и мрачных деталей. Без комментариев и лишних полей в JSON."
+    age_text = str(age).lower().strip()
+    adult_audience = (
+        "18+" in age_text or "adult" in age_text
+        or age_text in {"взрослые", "для взрослых"}
     )
+    if adult_audience:
+        sys_parts.append("Избегай повторов. Без комментариев и лишних полей в JSON.")
+    else:
+        sys_parts.append("Избегай повторов. Без насилия и мрачных деталей. Без комментариев и лишних полей в JSON.")
     system = "\n".join(sys_parts)
 
     payload = {
+        "language": lang,
+        "genre": genre,
+        "target_age": age,
         "synopsis": synopsis,
         "beats": beats,
         "characters": characters_data,
         "locations": locations_data,
         "consistency_rules": consistency_rules,
+        "style_guidelines": style_data,
     }
 
     max_attempts = 3
@@ -225,5 +246,4 @@ def story_writer_tool(
         "story_path": out_path,
         "regenerated": True
     }
-
 

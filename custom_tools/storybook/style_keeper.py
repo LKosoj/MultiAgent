@@ -12,6 +12,7 @@ from custom_tools.storybook.style_library_config import (
 from custom_tools.storybook.screenplay_shots_generator_utils.technical import (
     _dedup_negative_prompt,
 )
+from .project_paths import safe_storybook_project_dir
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,7 @@ def style_keeper_tool(session_id: str, project_id: str) -> str:
     Returns:
         str: Путь к каталогу `30_style` с итоговыми файлами.
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     syn_dir = f"{base}/10_synopsis"
     bible_dir = f"{base}/20_bible"
     out_dir = f"{base}/30_style"
@@ -117,5 +118,4 @@ negative_list: строка с запятыми — только запреты,
     with open(f"{out_dir}/negative_prompt_list.txt", "w", encoding="utf-8") as f:
         f.write(negative_list)
     return out_dir
-
 

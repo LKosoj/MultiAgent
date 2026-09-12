@@ -321,12 +321,6 @@ def test_shared_schema_memory_allows_semantic_and_probe_facts(tmp_path: Path) ->
                     3,
                     '{"cache_kind":"schema_probe_fact"}',
                 ),
-                (
-                    "schema-session",
-                    "Schema-RAG-Agent",
-                    4,
-                    '{"cache_kind":"successful_sql_example"}',
-                ),
             ),
         )
         conn.commit()
@@ -335,7 +329,35 @@ def test_shared_schema_memory_allows_semantic_and_probe_facts(tmp_path: Path) ->
 
     receipt = verify_shared_schema_memory(root)
 
-    assert receipt["sqlite_records"] == 4
+    assert receipt["sqlite_records"] == 3
+
+
+def test_shared_schema_memory_allows_post_run_successful_sql_example(tmp_path: Path) -> None:
+    root = _prepared_shared_schema_memory(tmp_path, "db-successful-sql")
+    database = root / "smolagents_memory.db"
+    conn = sqlite3.connect(database)
+    try:
+        conn.execute(
+            "CREATE TABLE agent_memory (session_id TEXT, agent_name TEXT, step INTEGER, data TEXT)"
+        )
+        conn.executemany(
+            "INSERT INTO agent_memory (session_id, agent_name, step, data) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                ("schema-session", "Schema-RAG-Agent", 1, '{"cache_kind":"schema_table"}'),
+                (
+                    "schema-session",
+                    "Schema-RAG-Agent",
+                    2,
+                    '{"cache_kind":"successful_sql_example"}',
+                ),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert verify_shared_schema_memory(root)["sqlite_records"] == 2
 
 
 def test_schema_memory_copy_preserves_semantic_and_probe_facts(tmp_path: Path) -> None:
@@ -384,7 +406,53 @@ def test_schema_memory_copy_preserves_semantic_and_probe_facts(tmp_path: Path) -
             ('{"cache_kind":"schema_table"}',),
             ('{"cache_kind":"schema_semantic_fact"}',),
             ('{"cache_kind":"schema_probe_fact"}',),
-            ('{"cache_kind":"successful_sql_example"}',),
+        ]
+
+
+def test_schema_memory_copy_preserves_committed_wal_records(tmp_path: Path) -> None:
+    import shutil
+
+    from custom_tools.text_to_sql.eval.release_inputs import (
+        filter_schema_memory_copy,
+        schema_memory_source_identity,
+    )
+
+    source = tmp_path / "source" / "db" / "digest"
+    source.mkdir(parents=True)
+    database = source / "smolagents_memory.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE agent_memory "
+            "(session_id TEXT, agent_name TEXT, step INTEGER, data TEXT)"
+        )
+
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA wal_autocheckpoint=0")
+        connection.execute(
+            "INSERT INTO agent_memory VALUES (?, ?, ?, ?)",
+            (
+                "schema-session",
+                "Schema-RAG-Agent",
+                1,
+                '{"cache_kind":"schema_probe_fact"}',
+            ),
+        )
+        connection.commit()
+        source_identity = schema_memory_source_identity(tmp_path / "source")
+        destination = tmp_path / "destination"
+        shutil.copytree(tmp_path / "source", destination)
+    finally:
+        connection.close()
+
+    filter_schema_memory_copy(destination)
+
+    assert schema_memory_source_identity(destination)["digest"] == source_identity["digest"]
+    copied_database = destination / "db" / "digest" / "smolagents_memory.db"
+    with sqlite3.connect(copied_database) as copied:
+        assert copied.execute("SELECT data FROM agent_memory").fetchall() == [
+            ('{"cache_kind":"schema_probe_fact"}',)
         ]
 
 
@@ -615,6 +683,50 @@ def test_shared_schema_memory_chroma_rejects_schema_session_checkpoint(
 
     with pytest.raises(SandboxError, match="non-schema"):
         verify_shared_schema_memory(root)
+
+
+def test_schema_memory_copy_removes_successful_sql_example_from_chroma(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from custom_tools.text_to_sql.eval.release_inputs import filter_schema_memory_copy
+
+    root = _prepared_shared_schema_memory(tmp_path, "db-chroma-successful-sql-copy")
+    (root / "chromadb" / "chroma.sqlite3").touch()
+
+    class Collection:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def get(self, **_kwargs):
+            return {
+                "ids": ["schema-record", "successful-sql-record"],
+                "metadatas": [
+                    {"session_id": "schema-session", "cache_kind": "schema_table"},
+                    {
+                        "session_id": "schema-session",
+                        "cache_kind": "successful_sql_example",
+                    },
+                ],
+            }
+
+        def delete(self, *, ids: list[str]) -> None:
+            self.deleted.extend(ids)
+
+    collection = Collection()
+
+    class Client:
+        def list_collections(self):
+            return [collection]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "chromadb",
+        SimpleNamespace(PersistentClient=lambda **_kwargs: Client()),
+    )
+
+    filter_schema_memory_copy(root.parent)
+
+    assert collection.deleted == ["successful-sql-record"]
 
 
 def test_shared_schema_memory_chroma_rejects_untyped_checkpoint_in_schema_session(

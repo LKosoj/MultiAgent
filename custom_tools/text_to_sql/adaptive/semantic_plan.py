@@ -9,7 +9,6 @@ from ._sql_ast_identity import semantic_candidate_digest, source_sql_digest
 from ._sql_ast_models import (
     ExpressionFact,
     ParsedSqlCandidate,
-    QueryRole,
 )
 from .models import (
     AstExpressionPathSegment,
@@ -282,6 +281,30 @@ def collect_ast_columns(
         occurrences=tuple(occurrences),
         projection_columns=tuple(projection_columns),
         aggregate_columns=tuple(aggregate_columns),
+    )
+
+
+def direct_physical_projection_column(
+    parsed_ast: ParsedSqlCandidate,
+    expression: ExpressionFact,
+    table_namespace: str,
+    allowed_tables: tuple[TableRef, ...],
+    allowed_columns: tuple[ColumnRef, ...],
+) -> ColumnRef | None:
+    """Resolve a projection only when aliases still lead to one bare column."""
+
+    relation_tables = _relation_tables(
+        parsed_ast,
+        table_namespace,
+        allowed_tables,
+        parsed_ast.dialect,
+    )
+    return _formula_column_ref(
+        expression,
+        parsed_ast,
+        relation_tables,
+        allowed_columns,
+        parsed_ast.dialect,
     )
 
 
@@ -925,27 +948,6 @@ def _validated_inputs(
     )
     if requirements.required_source_ids != tuple(item.source_id for item in required):
         raise ValueError("semantic coverage sources contradict the query")
-    deferred_limits = tuple(
-        item
-        for item in required
-        if item.kind is SemanticItemKind.LIMIT
-        and item.literal_or_reference is None
-    )
-    root_scope_ids = {
-        scope.scope_id
-        for scope in parsed_ast.scopes
-        if scope.parent_scope_id is None and scope.query_role is QueryRole.ROOT
-    }
-    root_limits = tuple(
-        limit for limit in parsed_ast.limits if limit.scope_id in root_scope_ids
-    )
-    if deferred_limits and (
-        len(deferred_limits) != 1
-        or len(root_limits) != 1
-        or type(root_limits[0].count) is not int
-        or root_limits[0].count <= 0
-    ):
-        raise ValueError("unknown limit requires one positive outer literal LIMIT")
     items = {item.source_id: item for item in required}
     binding_required_source_ids = tuple(
         item.source_id for item in required if not is_binding_free_semantic_item(item)
@@ -995,7 +997,9 @@ def _table_ref(
         table=getattr(table, "name"),
     )
     if raw.schema_name is not None:
-        return raw
+        if dialect != "sqlite" or raw.schema_name != "main":
+            return raw
+        raw = TableRef(namespace=raw.namespace, schema=None, table=raw.table)
     matches = tuple(
         item
         for item in allowed_tables
@@ -1298,5 +1302,6 @@ __all__ = [
     "authenticate_semantic_ast",
     "build_semantic_ast",
     "collect_ast_columns",
+    "direct_physical_projection_column",
     "predicate_from_expression",
 ]

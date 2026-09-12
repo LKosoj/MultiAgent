@@ -14,6 +14,7 @@ from .models import (
     BindingStatus,
     BudgetState,
     DiscriminatorValueBinding,
+    DerivedExpressionBinding,
     EvidenceRecord,
     EvidenceSourceKind,
     Hypothesis,
@@ -592,35 +593,6 @@ def _validate_new_predicate_bindings(
             raise ResearchTransitionProtocolError(
                 "new discriminator binding must use its declared discriminator column"
             )
-        if item.kind is SemanticItemKind.FILTER and item.operator is None:
-            if binding.predicates != (binding.discriminator_predicate,):
-                raise ResearchTransitionProtocolError(
-                    "FILTER discriminator refinement requires exactly one predicate"
-                )
-            physical = tuple(
-                candidate
-                for candidate in existing
-                if isinstance(candidate, PhysicalColumnBinding)
-                and candidate.source_id == binding.source_id
-                and candidate.status is BindingStatus.SUPPORTED
-                and candidate.physical_column == binding.discriminator_column
-                and candidate.tables == binding.tables
-                and candidate.join_path == binding.join_path
-            )
-            if len(physical) != 1:
-                raise ResearchTransitionProtocolError(
-                    "FILTER discriminator refinement requires one supported physical binding"
-                )
-            if binding.discriminator_predicate.operator not in {
-                PredicateOperator.EQ,
-                PredicateOperator.IN,
-                PredicateOperator.IS_NULL,
-            }:
-                raise ResearchTransitionProtocolError(
-                    "FILTER discriminator refinement requires a discrete operator"
-                )
-
-
 def _validate_binding_update(previous: BindingBase, replacement: BindingBase) -> None:
     """Allow only the reducer's candidate-to-supported certificate annotation."""
 
@@ -797,8 +769,24 @@ def _derive_semantic_item(
             update={"status": SemanticItemStatus.RESOLVED, "binding_ids": ()}
         )
     status, binding_ids = derive_semantic_resolution(item.status.value, bindings)
+    exact_formula_bindings = tuple(
+        binding
+        for binding in bindings
+        if isinstance(binding, DerivedExpressionBinding)
+        and binding.status is BindingStatus.SUPPORTED
+        and binding.validator_rule == "semantic-certificate:v1:derived_expression"
+    )
     return item.model_copy(
-        update={"status": SemanticItemStatus(status), "binding_ids": binding_ids}
+        update={
+            "status": SemanticItemStatus(status),
+            "binding_ids": binding_ids,
+            "exact_formula_binding_id": (
+                exact_formula_bindings[0].binding_id
+                if item.kind is SemanticItemKind.FORMULA
+                and len(exact_formula_bindings) == 1
+                else None
+            ),
+        }
     )
 
 

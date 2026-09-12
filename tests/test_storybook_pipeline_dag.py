@@ -67,7 +67,10 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertIn("storybook_video_preflight", steps["storybook_video_delivery_promise"].depends_on)
         self.assertIn("storybook_video_delivery_promise", steps["video_generator"].depends_on)
         self.assertEqual(steps["storybook_audio_subtitle"].depends_on, ["video_generator"])
-        self.assertEqual(steps["storybook_music_generator"].depends_on, ["storybook_audio_subtitle"])
+        self.assertEqual(
+            steps["storybook_music_generator"].depends_on,
+            ["storybook_audio_subtitle", "music_planner"],
+        )
         self.assertEqual(steps["storybook_music_generator"].condition, "{generate_screenplay}")
         self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_music_generator"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
@@ -79,6 +82,26 @@ class TestStorybookPipelineDag(unittest.TestCase):
 
         self.assertEqual(params["allow_missing_audio"], "{final_allow_missing_audio}")
         self.assertEqual(params["music_enabled"], "{generate_music}")
+
+    def test_book_assembly_uses_initialized_project_root(self):
+        steps = {step.id: step for step in self._load_storybook().steps}
+
+        assemble_params = steps["assemble_md"].tool_params
+        pdf_params = steps["md_to_pdf"].tool_params
+
+        self.assertEqual(assemble_params["output_path"], "{story_planner}/../90_md/book.md")
+        self.assertEqual(assemble_params["image_globs"], ["{story_planner}/../50_images/**/img_final.png"])
+        self.assertEqual(assemble_params["story_json_path"], "{story_planner}/../20_story/story.json")
+        self.assertEqual(pdf_params["md_path"], assemble_params["output_path"])
+        self.assertEqual(pdf_params["pdf_path"], "{story_planner}/../95_pdf/book.pdf")
+
+    def test_storybook_declares_video_and_sequential_music_deadline_budget(self):
+        workflow_def = self._load_storybook()
+        steps = {step.id: step for step in workflow_def.steps}
+
+        self.assertEqual(workflow_def.global_resource_limits.max_duration_seconds, 30720)
+        self.assertEqual(steps["video_generator"].timeout, 9000)
+        self.assertEqual(steps["storybook_music_generator"].timeout, 2400)
 
     def test_pipeline_runner_knows_video_tail_artifacts(self):
         from StoryBookManager.core.pipeline_runner import PipelineRunner

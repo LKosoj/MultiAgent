@@ -963,3 +963,38 @@ def test_pure_replay_does_not_open_database_network_or_process(
     raw = encode_replay_artifact(_minimal_payload())
 
     assert _replay_trusted(raw).status is HistoricalReplayStatus.VERIFIED
+
+
+def test_result_review_arbitration_is_a_replayable_pure_transition() -> None:
+    from custom_tools.text_to_sql.adaptive.replay_contract import (
+        SolverResultReviewArbitrationReplayAction,
+        SolverTransitionReplayStep,
+        durable_action_digest,
+    )
+
+    action = SolverResultReviewArbitrationReplayAction(
+        first_candidate_id="candidate-plain",
+        first_normalized_ast_digest="sha256:" + "a" * 64,
+        first_receipt={"verdict": "contradicted"},
+        second_candidate_id="candidate-distinct",
+        second_normalized_ast_digest="sha256:" + "b" * 64,
+        second_receipt={"verdict": "contradicted"},
+        candidate_id="candidate-plain",
+        execution_id="execution-plain",
+        normalized_ast_digest="sha256:" + "a" * 64,
+        receipt={"review_kind": "conflict_arbitration", "verdict": "consistent"},
+    )
+    step = SolverTransitionReplayStep(
+        action_revision=4,
+        base_state_revision=7,
+        base_state_digest="sha256:" + "c" * 64,
+        result_state_revision=8,
+        result_state_digest="sha256:" + "d" * 64,
+        action=action,
+        action_digest=durable_action_digest(action),
+        replay_input=None,
+        created_at_ns=0,
+    )
+
+    assert step.action.kind == "result_review_arbitration"
+    assert step.replay_input is None

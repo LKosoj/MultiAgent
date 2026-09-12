@@ -13,7 +13,9 @@ from custom_tools.text_to_sql.validators import SchemaLimiter
 from .model_budget import APPROXIMATE_BYTES_PER_TOKEN
 from .result_review import (
     RESULT_REVIEW_RUNTIME_KEY,
+    _ArbitrationResponse,
     _ModelReviewResponse,
+    create_result_review_arbitration_capability,
     create_result_review_capability,
 )
 from .semantic_coverage import CoverageRequirements
@@ -21,6 +23,92 @@ from .result_validation_runtime import _persisted_sql_proposal_requirements
 
 
 INVALID_RESULT_REVIEW_RUNTIME = object()
+
+
+def build_result_review_arbitration_runtime(
+    runtime: object,
+    *,
+    state,
+    requirements,
+    candidates,
+    receipts,
+) -> object:
+    """Bind the independent one-shot row-grain arbiter to its existing route."""
+
+    try:
+        from agent_command import create_text_to_sql_model
+        from utils import call_openai_api
+
+        from ..llm_models_config import step_model_name
+
+        policy = getattr(runtime, "verified_research_policy", None)
+        limits = getattr(policy, "model_budget", None)
+        input_tokens = getattr(limits, "input_tokens_per_call", None)
+        output_tokens = getattr(limits, "output_tokens_per_call", None)
+        deadline = getattr(runtime, "deadline", None)
+        loaded_schema = getattr(runtime, "loaded_schema", None)
+        if (
+            type(input_tokens) is not int
+            or input_tokens <= 0
+            or type(output_tokens) is not int
+            or output_tokens <= 0
+            or type(deadline) is not DeadlineBudget
+            or not isinstance(loaded_schema, LoadedSchema)
+        ):
+            raise TypeError("result review arbitration runtime is incomplete")
+        schema = _bounded_review_schema(
+            loaded_schema, requirements, state.query_spec.original_text
+        )
+        response_schema = _ArbitrationResponse.model_json_schema()
+        response_schema["required"] = list(response_schema["properties"])
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ResultReviewArbitrationResponse",
+                "strict": True,
+                "schema": response_schema,
+            },
+        }
+
+        def arbitrate(prompt: str) -> str:
+            if len(prompt.encode("utf-8")) > input_tokens * APPROXIMATE_BYTES_PER_TOKEN:
+                raise ValueError("result review arbitration context exceeds configured model input")
+            provider = create_text_to_sql_model(
+                step_model_name("research_stop_review"),
+                max_tokens=output_tokens,
+                temperature=0.0,
+                timeout_seconds=deadline.require_remaining("text_to_sql_result_review_arbitration_call"),
+                client_max_retries=0,
+            )
+            with llm_call_context(
+                run_id=runtime.run_id,
+                step_name="text_to_sql_result_review_arbitration",
+            ):
+                response = call_openai_api(
+                    prompt=prompt,
+                    model=provider,
+                    max_tokens=output_tokens,
+                    temperature=0.0,
+                    max_retries=0,
+                    response_format=response_format,
+                )
+            if type(response) is bytes:
+                response = response.decode("utf-8", errors="strict")
+            if type(response) is not str:
+                raise TypeError("result review arbitration response is not text")
+            return response
+
+        return create_result_review_arbitration_capability(
+            state=state,
+            requirements=requirements,
+            candidates=candidates,
+            receipts=receipts,
+            documents=tuple(getattr(runtime, "document_snapshot", ())),
+            model=arbitrate,
+            schema=schema,
+        )
+    except Exception:
+        return INVALID_RESULT_REVIEW_RUNTIME
 
 
 def _bounded_review_schema(
@@ -253,4 +341,8 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
         return INVALID_RESULT_REVIEW_RUNTIME
 
 
-__all__ = ["INVALID_RESULT_REVIEW_RUNTIME", "build_result_review_runtime"]
+__all__ = [
+    "INVALID_RESULT_REVIEW_RUNTIME",
+    "build_result_review_arbitration_runtime",
+    "build_result_review_runtime",
+]

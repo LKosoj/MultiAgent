@@ -333,7 +333,6 @@ def _resolve_cue_text(
             "description",
             "shot_description",
             "initial_state_summary",
-            "video_prompt",
         ],
     )
     if item_text:

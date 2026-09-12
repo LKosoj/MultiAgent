@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 from agent_command import model_hard, model_ultimate
 from utils import call_openai_api, extract_json_from_markdown
 import logging
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def story_editor_tool(
     Returns:
         Путь к отредактированному файлу story.json.
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     story_path = f"{base}/20_story/story.json"
     
     if not os.path.exists(story_path):
@@ -93,14 +94,14 @@ def story_editor_tool(
             except Exception as e:
                 logger.warning(f"Не удалось загрузить {filename}: {e}")
     
-    # Проверяем стиль из 30_style
-    style_path = f"{base}/30_style/style.json"
+    # Проверяем текстовый стиль из 30_style
+    style_path = f"{base}/30_style/style_text.json"
     if os.path.exists(style_path):
         try:
             with open(style_path, "r", encoding="utf-8") as f:
                 style_data = json.load(f)
         except Exception as e:
-            logger.warning(f"Не удалось загрузить style.json: {e}")
+            logger.warning(f"Не удалось загрузить style_text.json: {e}")
     
     # Читаем бриф для получения настроек
     brief_path = f"{base}/00_brief.json"
@@ -115,6 +116,9 @@ def story_editor_tool(
     lang = brief.get("language", "ru")
     age = brief.get("target_age", "all")
     genre = brief.get("genre", "fiction")
+    tone = brief.get("tone")
+    min_words = brief.get("words_per_page_min")
+    max_words = brief.get("words_per_page_max")
     
     # Создаем копию данных для редактирования
     edited_pages = pages.copy()
@@ -124,6 +128,7 @@ def story_editor_tool(
     system_parts = [
         f"Ты опытный редактор книг и мастер стилистики. Жанр: {genre}.",
         f"Язык: {lang}. Целевая аудитория: {age}.",
+        "Язык, возраст, жанр, тон и длина из задания имеют приоритет над общими стилевыми рекомендациями.",
         "Твоя задача: отредактировать и улучшить текст глав истории.",
         "",
         "ОБЯЗАТЕЛЬНЫЕ ТРЕБОВАНИЯ:",
@@ -145,6 +150,14 @@ def story_editor_tool(
         "Не используй длинные тире, чрезмерные кавычки, корпоративный жаргон или бюрократический язык."
         "",
     ]
+    if tone:
+        system_parts.append(f"Тон: {tone}.")
+    if min_words and max_words:
+        system_parts.append(f"Длина страницы: {min_words}-{max_words} слов.")
+    elif min_words:
+        system_parts.append(f"Длина страницы: не менее {min_words} слов.")
+    elif max_words:
+        system_parts.append(f"Длина страницы: не более {max_words} слов.")
 
     if edit_all_chapters:
         # Редактируем все главы сразу

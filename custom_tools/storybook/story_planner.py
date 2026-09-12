@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Any
 from utils import call_openai_api, extract_json_from_markdown
 from agent_command import model_code
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def story_planner_tool(session_id: str, project_id: str, task: str = None) -> st
     Returns:
         str: Путь к каталогу с материалами синопсиса (`10_synopsis`).
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     brief_path = f"{base}/00_brief.json"
     synopsis_path = f"{base}/10_synopsis/synopsis.json"
     beats_path = f"{base}/10_synopsis/beats.json"
@@ -40,7 +41,7 @@ def story_planner_tool(session_id: str, project_id: str, task: str = None) -> st
     # Проверяем, существуют ли уже файлы
     if os.path.exists(synopsis_path) and os.path.exists(beats_path):
         logger.info(f"📖 Синопсис и биты уже существуют, пропускаем генерацию")
-        return f"Файлы уже существуют: {synopsis_path}, {beats_path}"
+        return f"{base}/10_synopsis"
     if not os.path.exists(brief_path):
         raise FileNotFoundError(f"Brief not found: {brief_path}")
     with open(brief_path, "r", encoding="utf-8") as f:
@@ -51,8 +52,14 @@ def story_planner_tool(session_id: str, project_id: str, task: str = None) -> st
     pages_max = brief.get("pages_max", 12)
     target_age = brief.get("target_age", "all")
     genre = brief.get("genre", "fiction")
+    language = str(brief.get("language", "ru") or "ru")
+    language_instruction = (
+        "Пиши по-русски."
+        if language.lower().startswith("ru")
+        else f"Пиши на языке с кодом {language}."
+    )
     
-    system = f"""Ты опытный литературный редактор. Пиши по-русски. Соблюдай возрастные ограничения, жанр и структуру арки. Строго следи за объемом произведения.
+    system = f"""Ты опытный литературный редактор. {language_instruction} Соблюдай возрастные ограничения, жанр и структуру арки. Строго следи за объемом произведения.
 
 Жанр: {genre}.
 
@@ -93,6 +100,9 @@ beats: [ {{ id, page_number, goal, characters_in_frame, key_object, emotion, loc
     # Создаем входные данные для генерации
     input_data = {
         "brief": brief,
+        "language": language,
+        "genre": genre,
+        "target_age": target_age,
         "pages_requirements": {
             "pages_min": pages_min,
             "pages_max": pages_max,
@@ -141,5 +151,4 @@ beats: [ {{ id, page_number, goal, characters_in_frame, key_object, emotion, loc
     with open(f"{syn_dir}/beats.json", "w", encoding="utf-8") as f:
         json.dump(data.get("beats", []), f, ensure_ascii=False, indent=2)
     return syn_dir
-
 

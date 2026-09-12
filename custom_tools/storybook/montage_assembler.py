@@ -666,6 +666,7 @@ def _render_legacy_single_track(
     command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
     if expected_duration > 0:
         command.extend(["-t", f"{expected_duration:.3f}"])
+    command.extend(["-f", "mp4"])
     command.append(str(tmp_path))
 
     result = _run_command(command, timeout=_RENDER_TIMEOUT_S)
@@ -687,19 +688,30 @@ def _build_audio_filter(audio_input_index: int, duration: float, loop_audio: boo
 
 
 def _group_scenes_from_clips(clips: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Group timeline clips into per-scene duration buckets, preserving clip order.
+    """Group timeline clips into per-scene timeline intervals, preserving order.
 
     Consecutive clips sharing the same scene_number are merged into one scene
-    whose duration is the sum of their planned durations.
+    whose interval retains the clips' planned absolute positions.
     """
     scenes: List[Dict[str, Any]] = []
     for clip in clips:
         scene_id = str(clip.get("scene_number"))
-        duration = _clip_duration(clip)
-        if scenes and scenes[-1]["scene_id"] == scene_id:
-            scenes[-1]["duration_seconds"] += duration
+        start = _clip_start(clip)
+        end = max(start, _clip_end(clip))
+        if (
+            scenes
+            and scenes[-1]["scene_id"] == scene_id
+            and start <= scenes[-1]["end_seconds"] + 0.001
+        ):
+            scenes[-1]["end_seconds"] = max(scenes[-1]["end_seconds"], end)
+            scenes[-1]["duration_seconds"] = scenes[-1]["end_seconds"] - scenes[-1]["start_seconds"]
         else:
-            scenes.append({"scene_id": scene_id, "duration_seconds": duration})
+            scenes.append({
+                "scene_id": scene_id,
+                "start_seconds": start,
+                "end_seconds": end,
+                "duration_seconds": end - start,
+            })
     return scenes
 
 
@@ -785,27 +797,6 @@ def _render_with_per_scene_audio(
         if warnings is not None:
             warnings.append(message)
 
-    # Scenes at/under _MIN_SCENE_AUDIO_DURATION_S leave no room for a trimmed/faded
-    # leitmotif clip; drop them from the audio chain instead of feeding ffmpeg a
-    # near-zero-length atrim.
-    kept_scenes = []
-    for scene in scenes:
-        duration = float(scene.get("duration_seconds") or 0.0)
-        if duration <= _MIN_SCENE_AUDIO_DURATION_S:
-            _warn(
-                f"Scene {scene['scene_id']!r} duration {duration:.3f}s <= "
-                f"{_MIN_SCENE_AUDIO_DURATION_S}s; skipping its leitmotif audio"
-            )
-            continue
-        kept_scenes.append(scene)
-    if not kept_scenes:
-        _warn(
-            "All scenes are at or under the minimum audio duration; "
-            "falling back to legacy single-track audio"
-        )
-        return _fallback()
-    scenes = kept_scenes
-
     scene_paths: List[Path] = []
     for scene in scenes:
         mp3_key = scene_mapping.get(scene["scene_id"], "neutral")
@@ -852,21 +843,54 @@ def _render_with_per_scene_audio(
         # Input index: video clips occupy [0, len(clips)); unique mp3 inputs follow.
         ffmpeg_input_index = len(clips) + input_index_by_path[scene_path]
         duration = max(0.0, float(scene.get("duration_seconds") or 0.0))
+        outgoing_crossfade = None
+        if index + 1 < scene_count:
+            start = float(scene.get("start_seconds") or 0.0)
+            next_start = float(scenes[index + 1].get("start_seconds") or start + duration)
+            if abs(next_start - (start + duration)) <= 0.001:
+                outgoing_crossfade = _crossfade_duration(
+                    duration,
+                    max(0.0, float(scenes[index + 1].get("duration_seconds") or 0.0)),
+                )
         track_duration = track_durations[scene_path]
-        out_label = "a_final" if scene_count == 1 else f"a_scene_{index}"
+        out_label = f"a_scene_{index}"
         audio_parts.append(
-            _build_scene_audio_chain(ffmpeg_input_index, duration, track_duration, out_label)
+            _build_scene_audio_chain(
+                ffmpeg_input_index,
+                duration + (outgoing_crossfade or 0.0),
+                track_duration,
+                out_label,
+            )
         )
 
     if scene_count > 1:
-        prev_label = "a_scene_0"
-        for index in range(1, scene_count):
+        cursor = 0.0
+        prev_label: Optional[str] = None
+        for index, scene in enumerate(scenes):
+            start = max(cursor, float(scene.get("start_seconds") or cursor))
+            if start > cursor:
+                gap_label = f"a_gap_{index}"
+                audio_parts.append(
+                    f"anullsrc=r=44100:cl=stereo,atrim=duration={start - cursor:.3f}[{gap_label}]"
+                )
+                if prev_label is None:
+                    prev_label = gap_label
+                else:
+                    joined = f"a_0{index}_gap"
+                    audio_parts.append(f"[{prev_label}][{gap_label}]concat=n=2:v=0:a=1[{joined}]")
+                    prev_label = joined
+            cur_label = f"a_scene_{index}"
+            if prev_label is None:
+                prev_label = cur_label
+                cursor = start + max(0.0, float(scene.get("duration_seconds") or 0.0))
+                continue
             cur_label = f"a_scene_{index}"
             out_label = "a_final" if index == scene_count - 1 else f"a_0{index}"
             duration_a = max(0.0, float(scenes[index - 1].get("duration_seconds") or 0.0))
-            duration_b = max(0.0, float(scenes[index].get("duration_seconds") or 0.0))
-            crossfade_d = _crossfade_duration(duration_a, duration_b)
-            if crossfade_d is None:
+            duration_b = max(0.0, float(scene.get("duration_seconds") or 0.0))
+            previous_end = float(scenes[index - 1].get("start_seconds") or cursor - duration_a) + duration_a
+            crossfade_d = _crossfade_duration(duration_a, duration_b) if abs(start - previous_end) <= 0.001 else None
+            if crossfade_d is None or start > cursor:
                 # Neither adjacent scene has room for any crossfade — hard-cut
                 # instead of letting ffmpeg reject an acrossfade longer than
                 # one of its inputs.
@@ -876,6 +900,14 @@ def _render_with_per_scene_audio(
                     f"[{prev_label}][{cur_label}]acrossfade=d={crossfade_d:.3f}[{out_label}]"
                 )
             prev_label = out_label
+            cursor = start + duration_b
+    else:
+        start = max(0.0, float(scenes[0].get("start_seconds") or 0.0))
+        if start > 0:
+            audio_parts.append(f"anullsrc=r=44100:cl=stereo,atrim=duration={start:.3f}[a_gap_0]")
+            audio_parts.append("[a_gap_0][a_scene_0]concat=n=2:v=0:a=1[a_final]")
+        else:
+            audio_parts.append("[a_scene_0]anull[a_final]")
 
     audio_filter = ";".join(audio_parts)
     video_filter = _build_video_filter(clips)
@@ -892,6 +924,7 @@ def _render_with_per_scene_audio(
     command.extend(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
     if expected_duration > 0:
         command.extend(["-t", f"{expected_duration:.3f}"])
+    command.extend(["-f", "mp4"])
     command.append(str(tmp_path))
 
     result = _run_command(command, timeout=_RENDER_TIMEOUT_S)
@@ -934,8 +967,8 @@ def _build_scene_audio_chain(
         stages = ["aloop=loop=-1:size=2147483647", f"atrim=0:{duration:.3f}"]
     if not skip_fades:
         fade_out_start = max(0.0, duration - _SCENE_FADE_S)
-        stages.append(f"afade=in:0:{_SCENE_FADE_S:.1f}")
-        stages.append(f"afade=out:st={fade_out_start:.3f}:d={_SCENE_FADE_S:.1f}")
+        stages.append(f"afade=t=in:st=0:d={_SCENE_FADE_S:.1f}")
+        stages.append(f"afade=t=out:st={fade_out_start:.3f}:d={_SCENE_FADE_S:.1f}")
     return f"[{input_index}:a]{','.join(stages)}[{out_label}]"
 
 
@@ -1108,7 +1141,7 @@ def _build_final_review(
     container = _container_check(output_path, final_probe)
     duration = _duration_check(expected_duration, final_probe)
     black_frame = _black_frame_check(blackdetect_result, clips, expected_duration)
-    audio = _audio_check(final_probe, volume_result, audio_required)
+    audio = _audio_check(final_probe, volume_result, audio_required, expected_duration)
     subtitles = _subtitle_check(subtitles_path)
     monotony = _monotony_check(items)
     freeze = _freeze_check(clips, expected_duration, ffprobe_available)
@@ -1291,6 +1324,7 @@ def _audio_check(
     final_probe: Optional[Dict[str, Any]],
     volume_result: Optional[Dict[str, Any]],
     audio_required: bool,
+    expected_duration: float,
 ) -> Dict[str, Any]:
     has_audio = _probe_has_audio(final_probe)
     volume = _extract_volume(volume_result)
@@ -1301,12 +1335,35 @@ def _audio_check(
             "volume_db": volume,
             "status": "not_available",
         }
-    passed = has_audio and volume is not None and volume > -55.0
+    audio_stream = next(
+        (stream for stream in ((final_probe or {}).get("streams") or []) if stream.get("codec_type") == "audio"),
+        {},
+    )
+    try:
+        start_time = float(audio_stream.get("start_time"))
+        duration = float(audio_stream.get("duration"))
+    except (TypeError, ValueError):
+        start_time = None
+        duration = None
+    tolerance = max(0.25, expected_duration * 0.02)
+    coverage_ok = (
+        expected_duration <= 0
+        or (start_time is not None and duration is not None and abs(start_time) <= tolerance and abs(duration - expected_duration) <= tolerance)
+    )
+    passed = has_audio and volume is not None and volume > -55.0 and coverage_ok
     return {
         "passed": passed,
         "has_audio": has_audio,
         "volume_db": volume,
-        "status": "ok" if passed else "missing_or_silent",
+        "start_time_seconds": start_time,
+        "duration_seconds": duration,
+        "expected_duration_seconds": expected_duration,
+        "coverage_tolerance_seconds": tolerance,
+        "status": (
+            "coverage_unavailable"
+            if has_audio and (start_time is None or duration is None)
+            else ("ok" if passed else "missing_silent_or_uncovered")
+        ),
     }
 
 

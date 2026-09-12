@@ -377,6 +377,20 @@ class SolverSemanticRepairFallbackReplayAction(StrictModel):
     normalized_ast_digest: Digest
 
 
+class SolverResultReviewArbitrationReplayAction(StrictModel):
+    kind: Literal["result_review_arbitration"] = "result_review_arbitration"
+    first_candidate_id: Id
+    first_normalized_ast_digest: Digest
+    first_receipt: dict[str, object]
+    second_candidate_id: Id
+    second_normalized_ast_digest: Digest
+    second_receipt: dict[str, object]
+    candidate_id: Id
+    execution_id: Id
+    normalized_ast_digest: Digest
+    receipt: dict[str, object]
+
+
 class SolverExecutionReplayAction(StrictModel):
     candidate_id: Id
     execution_id: Id
@@ -391,6 +405,7 @@ SolverReplayAction: TypeAlias = (
     | SolverReentryFinalizedReplayAction
     | SolverStopReplayAction
     | SolverSemanticRepairFallbackReplayAction
+    | SolverResultReviewArbitrationReplayAction
 )
 
 
@@ -1009,6 +1024,7 @@ __all__ = [
     "SolverReplayStep",
     "SolverReplayTerminal",
     "SolverSemanticRepairFallbackReplayAction",
+    "SolverResultReviewArbitrationReplayAction",
     "SolverStopReplayAction",
     "SolverTransitionReplayStep",
     "dedupe_artifact_references",

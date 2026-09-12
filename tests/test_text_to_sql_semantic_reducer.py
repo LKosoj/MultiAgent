@@ -61,6 +61,9 @@ from custom_tools.text_to_sql.adaptive.serialization import (
 from custom_tools.text_to_sql.adaptive._semantic_value_certificate import (
     evidence_observes_exact_value,
 )
+from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
+    canonical_join,
+)
 from custom_tools.text_to_sql.adaptive.state import apply_research_transition
 
 from custom_tools.text_to_sql.adaptive.semantic_reducer import (
@@ -480,12 +483,10 @@ def _formula_assessment_admission(
     )
 
 
-def test_required_formula_requires_document_certificate() -> None:
-    with pytest.raises(
-        SemanticReducerError,
-        match="binding assessment lacks the required semantic certificate",
-    ):
-        _formula_assessment_admission()
+def test_required_formula_accepts_existing_input_columns() -> None:
+    admission = _formula_assessment_admission()
+
+    assert admission.state.bindings[0].status is BindingStatus.CANDIDATE
 
 
 class _ArtifactStore:
@@ -1141,7 +1142,7 @@ def test_cross_run_and_future_revision_results_do_not_partially_commit(
     assert admission.state.evidence == ()
 
 
-def test_derived_expression_certificate_accepts_exact_excerpt_in_document_context() -> None:
+def test_derived_expression_certificate_requires_existing_input_columns() -> None:
     document = DocumentRef(document_id="doc-1", namespace="main")
     evidence = _document_evidence(
         document,
@@ -1198,7 +1199,40 @@ def test_derived_expression_certificate_accepts_exact_excerpt_in_document_contex
         (evidence,),
         schema_columns=(revenue, cost),
     ) is True
-    assert _document_rule_certificate(rule, (evidence,)) is False
+    assert _derived_expression_certificate(
+        expression,
+        (_column_evidence(revenue, "revenue-only-evidence"),),
+    ) is False
+    assert _derived_expression_certificate(
+        expression.model_copy(
+            update={
+                "expression": ExpressionRef(
+                    expression_id="different-expression",
+                    expression="revenue + cost",
+                )
+            }
+        ),
+        (*column_evidence, evidence),
+    ) is True
+    assert _derived_expression_certificate(
+        expression.model_copy(update={"rule_excerpt": "revenue subtracts cost"}),
+        (*column_evidence, evidence),
+    ) is True
+    separate_formula_evidence = _document_evidence(
+        document,
+        "Formula rule:\nrevenue - cost\nend of document",
+        "separate-formula-evidence",
+    )
+    assert _derived_expression_certificate(
+        expression.model_copy(
+            update={
+                "evidence_ids": (separate_formula_evidence.evidence_id,),
+                "rule_excerpt": "Formula rule:",
+            }
+        ),
+        (*column_evidence, separate_formula_evidence),
+    ) is True
+    assert _document_rule_certificate(rule, (evidence,)) is True
 
 
 def test_document_certificates_allow_only_safe_full_text_normalization() -> None:
@@ -1348,6 +1382,37 @@ def test_inner_multi_hop_mixed_edge_orientation_has_canonical_path() -> None:
 
     assert mixed.path == forward.path
     assert mixed.join_id == forward.join_id
+
+
+def test_inner_multi_hop_derives_outer_endpoints_from_connected_path() -> None:
+    candidate = _join_candidate(
+        ("opaque_alpha", "alpha_id"),
+        ("opaque_beta", "alpha_id"),
+        "inner",
+        (
+            (("opaque_alpha", "alpha_id"), ("opaque_beta", "alpha_id")),
+            (("opaque_beta", "beta_id"), ("opaque_gamma", "beta_id")),
+        ),
+    )
+
+    assert candidate.status is JoinCandidateStatus.VALIDATED
+    assert candidate.left == candidate.path[0].left
+    assert candidate.right == candidate.path[-1].right
+    assert canonical_join(candidate) == candidate
+
+
+def test_inner_multi_hop_does_not_validate_disconnected_path() -> None:
+    candidate = _join_candidate(
+        ("opaque_alpha", "alpha_id"),
+        ("opaque_beta", "alpha_id"),
+        "inner",
+        (
+            (("opaque_alpha", "alpha_id"), ("opaque_beta", "alpha_id")),
+            (("opaque_gamma", "gamma_id"), ("opaque_delta", "gamma_id")),
+        ),
+    )
+
+    assert candidate.status is JoinCandidateStatus.CANDIDATE
 
 
 def test_vertical_certificate_requires_the_two_exact_opaque_eav_joins() -> None:
@@ -1518,6 +1583,74 @@ def test_discriminator_certificate_accepts_exact_ordered_values(
     )
 
     assert _discriminator_certificate(binding, cited) is True
+
+
+@pytest.mark.parametrize(
+    ("declared_type", "right", "has_numeric_row", "expected"),
+    (
+        ("DATE", 18, False, False),
+        ("TIME", 18, False, False),
+        ("DATETIME", 18, False, False),
+        ("TIMESTAMP", 18, False, False),
+        ("INTEGER", 18, False, True),
+        ("DATE", "2025-01-01", False, True),
+        ("TIMESTAMP", "2025-01-01 00:00:00", False, True),
+        ("DATE", 18, True, True),
+    ),
+)
+def test_discriminator_certificate_requires_numeric_representation_for_temporal_bounds(
+    declared_type: str,
+    right: object,
+    has_numeric_row: bool,
+    expected: bool,
+) -> None:
+    column = _column("records", "observed_value")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.GTE,
+        right=right,
+    )
+    schema = _evidence(
+        ResearchActionKind.INSPECT_COLUMN,
+        column,
+        {
+            "status": "matched",
+            "column": column.model_dump(mode="json", by_alias=True),
+            "metadata": {"type": declared_type},
+        },
+        evidence_id="schema",
+    )
+    cited = (schema,)
+    if has_numeric_row:
+        cited += (
+            _evidence(
+                ResearchActionKind.SEARCH_VALUE,
+                column,
+                {"columns": [column.column], "rows": [[7]]},
+                evidence_id="numeric-row",
+            ),
+        )
+    binding = DiscriminatorValueBinding(
+        binding_id="binding-temporal-bound",
+        source_id="temporal-bound",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=tuple(record.evidence_id for record in cited),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=column,
+        discriminator_predicate=predicate,
+    )
+
+    assert _discriminator_certificate(binding, cited) is expected
+    if expected:
+        assert _assess_binding(binding, "consistent", cited, {}).status is BindingStatus.SUPPORTED
+    else:
+        with pytest.raises(SemanticReducerError, match="required semantic certificate"):
+            _assess_binding(binding, "consistent", cited, {})
 
 
 def test_discriminator_assessment_does_not_require_an_observed_matching_row() -> None:
@@ -2050,13 +2183,13 @@ def test_new_binding_cannot_be_assessed_in_the_same_decision() -> None:
         )
 
 
-def test_new_discriminator_binding_preserves_exact_query_predicate() -> None:
+def test_new_discriminator_binding_preserves_researched_physical_predicate() -> None:
     state = _state()
     semantic_item = state.query_spec.semantic_items[0].model_copy(
         update={
             "exact_physical_predicate": True,
             "operator": PredicateOperator.EQ,
-            "literal_or_reference": "2042-03-04 05:06:07.0",
+            "literal_or_reference": "2042-03-04",
         }
     )
     state = state.model_copy(
@@ -2082,8 +2215,8 @@ def test_new_discriminator_binding_preserves_exact_query_predicate() -> None:
                         },
                         "discriminator_predicate": {
                             "left": {"table": "logical", "column": "recorded_at"},
-                            "operator": PredicateOperator.EQ,
-                            "right": "2042-03-04 05:06:07",
+                            "operator": PredicateOperator.LIKE,
+                            "right": "2042-03-04%",
                         },
                     },
                     "join_references": (),
@@ -2119,7 +2252,11 @@ def test_new_discriminator_binding_preserves_exact_query_predicate() -> None:
 
     binding = admission.bindings[0]
     assert isinstance(binding, DiscriminatorValueBinding)
-    assert binding.discriminator_predicate.right == "2042-03-04 05:06:07.0"
+    assert binding.discriminator_predicate == PredicateRef(
+        left=_column("records", "recorded_at"),
+        operator=PredicateOperator.LIKE,
+        right="2042-03-04%",
+    )
     assert binding.predicates[0] == binding.discriminator_predicate
 
 

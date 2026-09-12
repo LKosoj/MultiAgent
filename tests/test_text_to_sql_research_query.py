@@ -449,6 +449,33 @@ def test_safe_predicate_subquery_is_admitted() -> None:
     assert admitted.output_columns == ("id",)
 
 
+def test_safe_set_operation_inside_predicate_subquery_is_admitted() -> None:
+    admitted = _admit(
+        "SELECT o.id FROM main.orders AS o "
+        "WHERE o.id IN ("
+        "SELECT MIN(i.id) FROM main.orders AS i "
+        "UNION SELECT MAX(j.id) FROM main.orders AS j"
+        ") ORDER BY o.id LIMIT 2"
+    )
+
+    assert admitted.output_columns == ("id",)
+
+
+@pytest.mark.parametrize(
+    "set_suffix",
+    ("LIMIT 999", "LIMIT 2 OFFSET 1"),
+)
+def test_predicate_set_operation_keeps_the_existing_limit_policy(set_suffix: str) -> None:
+    _reject(
+        "SELECT o.id FROM main.orders AS o "
+        "WHERE o.id IN ("
+        "SELECT i.id FROM main.orders AS i "
+        f"UNION SELECT j.id FROM main.orders AS j {set_suffix}"
+        ") ORDER BY o.id LIMIT 2",
+        "research_query_limit",
+    )
+
+
 def test_correlated_predicate_subqueries_resolve_outer_columns_in_outer_scope() -> None:
     admitted = _admit(
         "SELECT "

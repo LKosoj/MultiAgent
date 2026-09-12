@@ -30,7 +30,6 @@ _SYSTEM_SCHEMAS = frozenset(
 _SYSTEM_TABLES = frozenset(
     {"sqlite_master", "sqlite_schema", "sqlite_temp_master", "sqlite_temp_schema"}
 )
-_SET_OPERATIONS = (exp.Union, exp.Intersect, exp.Except)
 _MUTATIONS = (
     exp.Alter,
     exp.Command,
@@ -317,11 +316,13 @@ def _literal_row_limit(tree: exp.Select, maximum: int) -> int:
     for select in tree.find_all(exp.Select):
         if select is not tree:
             _literal_select_limit(select, maximum, required=False)
+    for set_operation in tree.find_all(exp.SetOperation):
+        _literal_select_limit(set_operation, maximum, required=False)
     return outer_limit
 
 
 def _literal_select_limit(
-    select: exp.Select,
+    select: exp.Expression,
     maximum: int,
     *,
     required: bool,
@@ -397,11 +398,6 @@ def _validate_closed_ast(tree: exp.Select) -> None:
             "research_query_star",
             "research SQL star must be a plain SELECT * or bare COUNT(*)",
         )
-    if tree.find(*_SET_OPERATIONS) is not None:
-        raise ResearchQueryAdmissionError(
-            "research_query_not_select",
-            "set operations are outside the research SQL contract",
-        )
     if tree.find(*_MUTATIONS) is not None or tree.find(exp.Into, exp.Lock) is not None:
         raise ResearchQueryAdmissionError(
             "research_query_not_select",
@@ -439,6 +435,21 @@ def _resolve_scopes(
             "research SQL row sources are ambiguous",
         ) from None
     for scope in scopes:
+        if isinstance(scope.expression, exp.SetOperation):
+            branch_outputs = tuple(
+                scope_outputs.get(id(branch)) for branch in scope.union_scopes
+            )
+            if (
+                not branch_outputs
+                or any(outputs is None for outputs in branch_outputs)
+                or len({len(outputs) for outputs in branch_outputs if outputs}) != 1
+            ):
+                raise ResearchQueryAdmissionError(
+                    "research_query_output",
+                    "set operation branches must have matching output columns",
+                )
+            scope_outputs[id(scope)] = branch_outputs[0]
+            continue
         if not isinstance(scope.expression, exp.Select):
             raise ResearchQueryAdmissionError(
                 "research_query_not_select",
@@ -453,7 +464,12 @@ def _resolve_scopes(
         outputs = _output_columns(
             scope.expression,
             sources=sources,
-            nested_non_row_source=scope.is_subquery,
+            nested_non_row_source=(
+                scope.is_subquery
+                or scope.is_union
+                and scope.parent is not None
+                and scope.parent.is_subquery
+            ),
             dialect=dialect,
         )
         _resolve_columns(scope, sources, outputs)

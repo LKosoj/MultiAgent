@@ -3965,7 +3965,10 @@ def test_text_to_sql_pipeline_is_typed_only():
     assert steps["db_audit"].tool_name == "finalize_text_to_sql_run"
     assert steps["db_audit"].condition == '{sql_solving.sql} != ""'
     assert "verification_status" not in steps["db_audit"].tool_params
-    assert all(step.retry_policy.max_retries == 0 for step in workflow.steps)
+    assert {
+        step.id: step.retry_policy.max_retries
+        for step in workflow.steps
+    } == {"schema_research": 0, "sql_solving": 0, "db_audit": 0}
 
 
 def test_workflow_engine_resolves_full_dotted_variable_to_object():

@@ -2072,7 +2072,7 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 - ВСЕГДА используй ТОЧНЫЕ имена из start_summary.characters (не изменяй регистр, не добавляй/убирай символы)
 
 ЗАДАЧА ДЛЯ ENGLISH_PROMPT:
-- Пиши `english_prompt` и `negative_prompt` строго на {prompt_language_label}; допустимы только стандартные camera/lens термины и авторизованные readable texts.
+- Пиши `english_prompt` строго на английском. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
 - **ОБЯЗАТЕЛЬНО ИСПОЛЬЗУЙ ВСЕ ДЕТАЛИ**: initial_state_summary + spatial_composition + camera_position + character_orientation + point_of_view + prop_continuity
 - **DIALOGUE IS AUDIO-ONLY**: реплики/междометия/крики персонажей передавай через мимику и артикуляцию рта/позу,
   но НЕ рендери буквенный текст в кадре (no speech bubbles, no subtitle/caption text, no on-image dialogue words).
@@ -2643,7 +2643,7 @@ SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовы
 - Субъект = из START/END main_subject. Не подменяй.
 - `world_physics` / `t0_mode` / `pose_signature` are top-level in INPUT — read them directly, do not dig into shot_frame_spec.
 - `world_physics.forbidden_implications` MUST NOT appear in video_prompt.
-- `t0_mode` == "frozen" → SUBJECT segment MUST NOT contain motion verbs (walking/running/descending); use frozen posture wording.
+- `t0_mode` == "frozen" → START is a frozen pre-action pose at T=0. If transition_spec contains an event/action, SUBJECT MUST describe its supported movement from START to END; otherwise use frozen posture wording and do not invent motion.
 - `t0_mode` == "early_motion" → SUBJECT MUST show first visible phase, no completed action.
 - `t0_mode` == "mid_action" → SUBJECT MUST show mid-phase, no start-position wording.
 
@@ -3116,7 +3116,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
 
 ЗАДАЧА:
 1. Создай english_prompt КАК ОДНУ КОМАНДУ РЕДАКТИРОВАНИЯ ИЗОБРАЖЕНИЯ:
-   - Пиши `english_prompt` и `negative_prompt` строго на {prompt_language_label}; не оставляй англоязычные хвосты вне разрешённых camera/lens терминов и readable texts.
+   - Пиши `english_prompt` строго на английском. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
    - `shot_frame_spec` — это source of truth. Сохрани все факты из `must_show`, не добавляй ничего вне spec и не подменяй `primary_subject`.
    - **НАЧНИ С ИНСТРУКЦИИ**: "{edit_prefix} {final_size_label}: [Zoom/Shift command if ratio/yaw changed]. [Action result]. [Atmosphere/Lighting from location_context]."
    - **КРИТИЧНО - ZOOM/SHIFT**: Если ratio ≠ 1.0, используй "Zoom in (scale Xx)" или "Pull back (scale Xx)". Если yaw ≠ 0, используй "Shift perspective [direction] by [degrees]°".

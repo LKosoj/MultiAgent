@@ -37,7 +37,6 @@ _SCHEMA_CACHE_KINDS = frozenset(
         "schema_ready",
         "schema_probe_fact",
         "schema_semantic_fact",
-        "successful_sql_example",
     }
 )
 
@@ -111,6 +110,9 @@ def filter_schema_memory_copy(root: Path) -> None:
     database_roots = _schema_memory_database_roots(root)
     schema_snapshots = _schema_snapshot_paths(root)
     for database_root in database_roots:
+        database = database_root / "smolagents_memory.db"
+        if database.is_file():
+            _filter_schema_memory_sqlite(database)
         for path in database_root.iterdir():
             if path.name in {"smolagents_memory.db", "chromadb"}:
                 continue
@@ -118,9 +120,6 @@ def filter_schema_memory_copy(root: Path) -> None:
                 shutil.rmtree(path)
             else:
                 path.unlink()
-        database = database_root / "smolagents_memory.db"
-        if database.is_file():
-            _filter_schema_memory_sqlite(database)
         chromadb_root = database_root / "chromadb"
         if chromadb_root.is_dir() and any(chromadb_root.iterdir()):
             _filter_schema_memory_chroma(chromadb_root)
@@ -177,6 +176,8 @@ def _filter_schema_memory_sqlite(database: Path) -> None:
             for table in tables - {"agent_memory"}:
                 quoted_table = '"' + table.replace('"', '""') + '"'
                 connection.execute(f"DELETE FROM {quoted_table}")
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error as exc:
         raise SandboxError("schema-memory SQLite filtering failed") from exc
 

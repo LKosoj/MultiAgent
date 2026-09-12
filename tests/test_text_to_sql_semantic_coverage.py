@@ -453,6 +453,55 @@ def test_researched_time_physical_predicate_is_accepted_at_coverage() -> None:
     assert requirements.selected_bindings == (binding,)
 
 
+def test_researched_time_predicate_without_query_operator_is_accepted() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    (binding,) = state.bindings
+    researched_period = PredicateRef(
+        left=binding.discriminator_column,
+        operator=PredicateOperator.BETWEEN,
+        right=("2024-06-01", "2024-06-30"),
+    )
+    binding = canonical_binding(
+        binding.model_copy(
+            update={
+                "predicates": (researched_period,),
+                "discriminator_predicate": researched_period,
+            }
+        )
+    )
+    item = item.model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "operator": None,
+            "literal_or_reference": "June 2024",
+            "exact_physical_predicate": False,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (binding,),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (binding,)
+
+
 def test_requested_time_output_does_not_require_a_predicate() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (schema_evidence,) = (

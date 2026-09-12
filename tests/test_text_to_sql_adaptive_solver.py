@@ -15,11 +15,14 @@ import pytest
 from custom_tools.text_to_sql.adaptive.models import (
     CheckFailureCode,
     CheckKind,
+    CheckRepair,
     CheckResult,
     CheckStatus,
     ColumnRef,
     EvidenceCost,
     EvidenceSourceKind,
+    ExecutionResult,
+    MissingEvidenceRequest,
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
@@ -28,11 +31,14 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchActionKind,
     ResearchReentryStatus,
     ResearchStopReason,
+    RepairKind,
     SemanticItemKind,
     ResultExpectation,
     ResultExpectationKind,
     SimilarSuccessfulSqlExample,
+    SqlCandidate,
     SolverActionKind,
+    SolverAction,
     SolverState,
     SolverStopReason,
     TableRef,
@@ -51,7 +57,6 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
     ResearchTerminalReplayInput,
     SolverMissingEvidenceReplayInput,
     SolverReentryAdmissionReplayInput,
-    SolverReentryCompletedReplayInput,
     SolverSqlProposalReplayInput,
 )
 from custom_tools.text_to_sql.adaptive.freshness import (
@@ -100,9 +105,11 @@ from custom_tools.text_to_sql.adaptive.result_validation import (
 )
 from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
 from custom_tools.text_to_sql.adaptive.solver_loop import (
+    accept_result_review_arbitration,
     admit_targeted_reentry,
     apply_solver_proposal,
     finalize_targeted_reentry,
+    SolverConflictError,
     SolverProtocolError,
 )
 from custom_tools.text_to_sql.adaptive.solver_protocol import (
@@ -165,7 +172,6 @@ from workflow.text_to_sql_adaptive_solver import (
     HISTORY_KEEP,
     _drop_similar_examples,
     _initial_solver_state,
-    _limit_document_count,
     _reservation_authority,
     _solver_context,
     _solver_context_sized,
@@ -236,6 +242,54 @@ def test_solver_context_includes_row_preservation_requirements() -> None:
     ]
 
 
+def test_solver_context_hides_repair_advisory_issues_from_model() -> None:
+    state, _, requirements, _ = _runtime()
+    candidate = state.sql_candidates[-1]
+    repair_receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=candidate.revision,
+        candidate_id=candidate.candidate_id,
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        requirements_digest=requirements.requirements_digest,
+        source_id="derived-total",
+        evidence_id="evidence-derived-total",
+        verdict="contradicted",
+        reason="deterministic repair conclusion",
+        execution={
+            "success": True,
+            "result": {"row_count": 2},
+            "advisory_issues": ["non-authoritative execution advisory"],
+        },
+        deterministic_failure_code=CheckFailureCode.FORMULA_SEMANTICS_MISMATCH,
+    )
+    runtime = SimpleNamespace(
+        verified_research_policy=SimpleNamespace(
+            model_budget=SimpleNamespace(input_tokens_per_call=16_000)
+        ),
+        document_snapshot=(),
+    )
+
+    payload = json.loads(_solver_context(runtime, state, requirements, repair_receipt))
+    model_receipt = payload["deterministic_sql_repair_receipt"]
+
+    assert "advisory_issues" not in model_receipt["execution"]
+    assert model_receipt["execution"] == {
+        "success": True,
+        "result": {"row_count": 2},
+    }
+    assert model_receipt["reason"] == repair_receipt.reason
+    assert model_receipt["verdict"] == "contradicted"
+    assert model_receipt["source_id"] == "derived-total"
+    assert model_receipt["evidence_id"] == "evidence-derived-total"
+    assert model_receipt["deterministic_failure_code"] == (
+        CheckFailureCode.FORMULA_SEMANTICS_MISMATCH.value
+    )
+    assert repair_receipt.execution["advisory_issues"] == [
+        "non-authoritative execution advisory"
+    ]
+
+
 def _add_sql_candidate(state, requirements, *, sql, candidate_id, action_id):
     ids = iter((candidate_id, action_id))
     return apply_solver_proposal(
@@ -250,6 +304,46 @@ def _add_sql_candidate(state, requirements, *, sql, candidate_id, action_id):
         requirements=requirements,
         id_factory=lambda: next(ids),
     ).state
+
+
+def test_solver_loop_accepts_limited_candidate_after_limit_semantic_failure() -> None:
+    state, _, requirements, _ = _runtime()
+    first_candidate_id = state.sql_candidates[-1].candidate_id
+    for kind in (CheckKind.SAFETY, CheckKind.SCHEMA):
+        state = append_solver_check_result(
+            state,
+            _check(first_candidate_id, kind),
+            base_revision=state.revision,
+        ).state
+    state = append_solver_check_result(
+        state,
+        CheckResult(
+            check_id=f"semantic:{first_candidate_id}:limit_mismatch",
+            candidate_id=first_candidate_id,
+            check_kind=CheckKind.SEMANTIC,
+            status=CheckStatus.FAILED,
+            failure_code=CheckFailureCode.LIMIT_MISMATCH,
+            affected_source_ids=("status",),
+            affected_ast_node_ids=(),
+            observed_error=None,
+            repair=CheckRepair(kind=RepairKind.REVISE_SQL, source_ids=("status",)),
+        ),
+        base_revision=state.revision,
+    ).state
+
+    updated = _add_sql_candidate(
+        state,
+        requirements,
+        sql="SELECT o.status FROM orders o WHERE o.status = 'active' LIMIT 1",
+        candidate_id="candidate-2",
+        action_id="action-2",
+    )
+
+    assert updated.stop_reason is None
+    assert tuple(candidate.candidate_id for candidate in updated.sql_candidates) == (
+        first_candidate_id,
+        "candidate-2",
+    )
 
 
 def _document_content_truncation_runtime(state, requirements, *, fill_char="x"):
@@ -1383,6 +1477,331 @@ def test_result_contradiction_reducer_keeps_successful_execution_open(tmp_path) 
     assert after.execution_results[-1].success is True
     assert after.selected_candidate_id is None
     assert after.stop_reason is None
+
+
+def _arbitration_state_and_action():
+    from custom_tools.text_to_sql.adaptive.replay_contract import (
+        SolverResultReviewArbitrationReplayAction,
+    )
+
+    base = _ready_state()
+    candidate = base.sql_candidates[-1]
+    distinct_candidate = SqlCandidate(
+        candidate_id="arbitration-distinct-candidate",
+        sql="SELECT DISTINCT o.status FROM orders o WHERE o.status = 'active'",
+        normalized_ast_digest="sha256:" + "d" * 64,
+        revision=candidate.revision,
+    )
+    execution = ExecutionResult(
+        execution_id="arbitration-execution",
+        candidate_id=candidate.candidate_id,
+        success=True,
+        row_count=1,
+        elapsed_ms=1,
+        error_code=None,
+    )
+    distinct_execution = ExecutionResult(
+        execution_id="arbitration-distinct-execution",
+        candidate_id=distinct_candidate.candidate_id,
+        success=True,
+        row_count=1,
+        elapsed_ms=1,
+        error_code=None,
+    )
+    request = MissingEvidenceRequest(
+        run_id=base.run_id,
+        run_incarnation=base.run_incarnation,
+        revision=base.revision + 2,
+        schema_namespace_version=base.schema_namespace_version,
+        missing_evidence_request_id="arbitration-request",
+        source_id="status",
+        question="Which rows are required?",
+        candidate_targets=(TableRef(namespace="main", schema=None, table="orders"),),
+        required_evidence_kind=EvidenceSourceKind.SCHEMA,
+        reason="opposite row-grain reviews require arbitration",
+    )
+    state = SolverState.model_validate(
+        {
+            **base.model_dump(mode="python"),
+            "revision": base.revision + 2,
+            "sql_candidates": (candidate, distinct_candidate),
+            "check_results": base.check_results
+            + (_check(candidate.candidate_id, CheckKind.EXECUTION),)
+            + tuple(
+                _check(distinct_candidate.candidate_id, kind)
+                for kind in (
+                    CheckKind.SAFETY,
+                    CheckKind.SCHEMA,
+                    CheckKind.SEMANTIC,
+                    CheckKind.EXPLAIN,
+                    CheckKind.EXECUTION,
+                )
+            ),
+            "execution_results": (execution, distinct_execution),
+            "missing_evidence_requests": (request,),
+            "action_history": base.action_history
+            + (
+                SolverAction(
+                    action_id="arbitration-distinct-action",
+                    kind=SolverActionKind.SQL_CANDIDATE,
+                    base_revision=base.revision,
+                    candidate_id=distinct_candidate.candidate_id,
+                    missing_evidence_request_id=None,
+                ),
+                SolverAction(
+                    action_id="arbitration-missing-evidence",
+                    kind=SolverActionKind.MISSING_EVIDENCE,
+                    base_revision=base.revision + 1,
+                    candidate_id=None,
+                    missing_evidence_request_id=request.missing_evidence_request_id,
+                ),
+            ),
+            "stop_reason": SolverStopReason.MISSING_EVIDENCE,
+        }
+    )
+    first_receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=candidate.revision,
+        candidate_id=candidate.candidate_id,
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        requirements_digest="sha256:" + "b" * 64,
+        source_id="status",
+        evidence_id="evidence-status",
+        verdict="contradicted",
+        reason="the candidate must preserve qualifying rows",
+        execution={"success": True},
+        deterministic_failure_code=None,
+        row_grain_requirement="preserve_qualifying_rows",
+    )
+    second_receipt = ResultReviewReceipt(
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        research_state_revision=distinct_candidate.revision,
+        candidate_id=distinct_candidate.candidate_id,
+        normalized_ast_digest=distinct_candidate.normalized_ast_digest,
+        requirements_digest=first_receipt.requirements_digest,
+        source_id="status",
+        evidence_id="evidence-status",
+        verdict="contradicted",
+        reason="the candidate must deduplicate the entity",
+        execution={"success": True},
+        deterministic_failure_code=None,
+        row_grain_requirement="deduplicate_entity",
+    )
+    action = SolverResultReviewArbitrationReplayAction(
+        first_candidate_id=candidate.candidate_id,
+        first_normalized_ast_digest=candidate.normalized_ast_digest,
+        first_receipt=first_receipt.model_dump(mode="json"),
+        second_candidate_id=distinct_candidate.candidate_id,
+        second_normalized_ast_digest=distinct_candidate.normalized_ast_digest,
+        second_receipt=second_receipt.model_dump(mode="json"),
+        candidate_id=candidate.candidate_id,
+        execution_id="arbitration-execution",
+        normalized_ast_digest=candidate.normalized_ast_digest,
+        receipt=ResultReviewReceipt(
+            run_id=state.run_id,
+            run_incarnation=state.run_incarnation,
+            research_state_revision=candidate.revision,
+            candidate_id=candidate.candidate_id,
+            normalized_ast_digest=candidate.normalized_ast_digest,
+            requirements_digest="sha256:" + "b" * 64,
+            source_id=None,
+            evidence_id=None,
+            verdict="consistent",
+            reason="independent arbitration selected an existing candidate",
+            execution=first_receipt.execution,
+            deterministic_failure_code=None,
+            review_kind="conflict_arbitration",
+        ).model_dump(mode="json"),
+    )
+
+    return state, action
+
+
+def test_result_review_arbitration_replay_rejects_missing_second_candidate() -> None:
+    from custom_tools.text_to_sql.adaptive.replay_engine import _replay_solver_transition
+
+    state, action = _arbitration_state_and_action()
+    action = action.model_copy(update={"second_candidate_id": "missing-candidate"})
+
+    with pytest.raises(SolverConflictError, match="arbitration"):
+        _replay_solver_transition(
+            SimpleNamespace(action=action, replay_input=None), state, {}
+        )
+
+
+def test_result_review_arbitration_restart_restores_verified_candidate() -> None:
+    from workflow.text_to_sql_adaptive_solver import _resume_generation
+
+    state, action = _arbitration_state_and_action()
+    accepted = accept_result_review_arbitration(
+        state,
+        action=action,
+        base_revision=state.revision,
+    )
+    runtime = SimpleNamespace(
+        verified_solver_state=None,
+        verified_solver_candidate_id=None,
+        verified_solver_terminal=None,
+    )
+    checkpoint = SimpleNamespace(terminal=None, pending_execution=None, state=accepted)
+    store = SimpleNamespace(
+        load_replay_chain=lambda *_args: SimpleNamespace(
+            actions=(SimpleNamespace(action_kind="transition", action=action.model_dump()),)
+        )
+    )
+
+    resumed = _resume_generation(runtime, store, checkpoint)
+
+    selected = next(
+        item for item in state.sql_candidates if item.candidate_id == action.candidate_id
+    )
+    assert resumed["sql"] == selected.sql
+    assert runtime.verified_solver_candidate_id == selected.candidate_id
+
+
+def test_result_review_grain_conflict_requires_adjacent_execution_reviews(monkeypatch) -> None:
+    from workflow import text_to_sql_adaptive_solver as solver
+
+    plain = SqlCandidate(
+        candidate_id="plain-candidate",
+        sql="SELECT o.status FROM orders o",
+        normalized_ast_digest="sha256:" + "a" * 64,
+        revision=1,
+    )
+    distinct = SqlCandidate(
+        candidate_id="distinct-candidate",
+        sql="SELECT DISTINCT o.status FROM orders o",
+        normalized_ast_digest="sha256:" + "b" * 64,
+        revision=1,
+    )
+
+    def receipt(candidate, grain):
+        return ResultReviewReceipt(
+            run_id="arbitration-run",
+            run_incarnation="arbitration-incarnation",
+            research_state_revision=1,
+            candidate_id=candidate.candidate_id,
+            normalized_ast_digest=candidate.normalized_ast_digest,
+            requirements_digest="sha256:" + "c" * 64,
+            source_id="status",
+            evidence_id="evidence-status",
+            verdict="contradicted",
+            reason="row grain differs",
+            execution={"success": True},
+            deterministic_failure_code=None,
+            row_grain_requirement=grain,
+        )
+
+    first = receipt(plain, "preserve_qualifying_rows")
+    intervening = ResultReviewReceipt(
+        run_id="arbitration-run",
+        run_incarnation="arbitration-incarnation",
+        research_state_revision=1,
+        candidate_id=plain.candidate_id,
+        normalized_ast_digest=plain.normalized_ast_digest,
+        requirements_digest="sha256:" + "c" * 64,
+        source_id="status",
+        evidence_id="evidence-status",
+        verdict="contradicted",
+        reason="another review concern intervened",
+        execution={"success": True},
+        deterministic_failure_code=None,
+    )
+    second = receipt(distinct, "deduplicate_entity")
+    actions = tuple(
+        SimpleNamespace(action_kind="execution", action_revision=index)
+        for index in (1, 2, 3)
+    )
+    reconciliations = tuple(
+        SimpleNamespace(action_revision=index, outcome="KNOWN", result=value)
+        for index, value in ((1, first), (2, intervening), (3, second))
+    )
+    checkpoint = SimpleNamespace(
+        state=SimpleNamespace(
+            run_id="arbitration-run",
+            run_incarnation="arbitration-incarnation",
+            sql_candidates=(plain, distinct),
+        )
+    )
+    store = SimpleNamespace(
+        load_replay_chain=lambda *_args: SimpleNamespace(
+            actions=actions, reconciliations=reconciliations
+        )
+    )
+    monkeypatch.setattr(solver, "_result_reentry_receipt", lambda value: value)
+
+    assert solver._result_review_grain_conflict(store, checkpoint) is None
+
+
+@pytest.mark.parametrize(
+    ("failed_gate", "expects_conflict"),
+    ((None, True), (CheckKind.EXPLAIN, False)),
+)
+def test_result_review_grain_conflict_requires_passed_gates_for_both_candidates(
+    monkeypatch, failed_gate, expects_conflict
+) -> None:
+    from workflow import text_to_sql_adaptive_solver as solver
+
+    state, action = _arbitration_state_and_action()
+    if failed_gate is not None:
+        state = SolverState.model_validate(
+            {
+                **state.model_dump(mode="python"),
+                "check_results": tuple(
+                    _check(
+                        action.second_candidate_id,
+                        failed_gate,
+                        CheckStatus.INCONCLUSIVE,
+                    )
+                    if item.candidate_id == action.second_candidate_id
+                    and item.check_kind is failed_gate
+                    else item
+                    for item in state.check_results
+                ),
+            }
+        )
+    first = ResultReviewReceipt.model_validate(action.first_receipt)
+    second = ResultReviewReceipt.model_validate(action.second_receipt)
+    execution_actions = (
+        SimpleNamespace(
+            action_kind="execution",
+            action_revision=1,
+            candidate_id=action.first_candidate_id,
+            execution_id="arbitration-execution",
+            normalized_ast_digest=action.first_normalized_ast_digest,
+        ),
+        SimpleNamespace(
+            action_kind="execution",
+            action_revision=2,
+            candidate_id=action.second_candidate_id,
+            execution_id="arbitration-distinct-execution",
+            normalized_ast_digest=action.second_normalized_ast_digest,
+        ),
+    )
+    store = SimpleNamespace(
+        load_replay_chain=lambda *_args: SimpleNamespace(
+            actions=execution_actions,
+            reconciliations=(
+                SimpleNamespace(action_revision=1, outcome="KNOWN", result=first),
+                SimpleNamespace(action_revision=2, outcome="KNOWN", result=second),
+            ),
+        )
+    )
+    checkpoint = SimpleNamespace(state=state)
+    monkeypatch.setattr(solver, "_result_reentry_receipt", lambda value: value)
+
+    conflict = solver._result_review_grain_conflict(store, checkpoint)
+
+    if not expects_conflict:
+        assert conflict is None
+        return
+    assert conflict is not None
+    assert tuple(item.candidate_id for item in conflict[0]) == (
+        action.first_candidate_id,
+        action.second_candidate_id,
+    )
 
 
 def test_result_contradiction_reconciles_as_open_execution_evidence(tmp_path) -> None:
@@ -2605,7 +3024,7 @@ def test_result_reentry_receipt_opens_only_actionable_review(tmp_path, verdict, 
             _result_reentry_receipt(review.model_dump(mode="json"))
 
 
-def test_resume_completed_result_contradiction_reentry_proposes_new_candidate(
+def test_live_completed_result_contradiction_reentry_replaces_stale_research_outcome(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -2632,7 +3051,6 @@ def test_resume_completed_result_contradiction_reentry_proposes_new_candidate(
         requirements,
         table_namespace="main",
     )
-    request = checkpoint.state.missing_evidence_requests[-1]
     action = ResearchAction(
         action_id="result-contradiction-refresh-action",
         kind=ResearchActionKind.SEARCH_VALUE,
@@ -2698,54 +3116,47 @@ def test_resume_completed_result_contradiction_reentry_proposes_new_candidate(
                 completed_research.revision + 1,
             ),
         )
-    admitted = admit_targeted_reentry(
-        checkpoint.state,
-        research,
-        request.missing_evidence_request_id,
-        base_revision=checkpoint.state.revision,
-        id_factory=iter(("result-contradiction-reentry-1",)).__next__,
-    )
-    checkpoint = store.commit_non_execution(
-        checkpoint.state,
-        admitted.state,
-        action_revision=checkpoint.cursor.next_action_revision,
-        action={
-            "kind": "research_reentry_admitted",
-            "record": admitted.record.model_dump(mode="json"),
-        },
-        replay_input=SolverReentryAdmissionReplayInput(
-            research_state_revision=research.revision,
-            research_state_digest=canonical_digest(research),
-            missing_evidence_request_id=request.missing_evidence_request_id,
-            generated_reentry_id=admitted.record.research_reentry_id,
-        ),
-    )
-    finalized = finalize_targeted_reentry(
-        checkpoint.state,
-        admitted.record.research_reentry_id,
-        ResearchReentryStatus.COMPLETED,
-        base_revision=checkpoint.state.revision,
-        research_state=completed_research,
-        freshness_context=freshness,
-        requirements=completed_requirements,
-    )
-    checkpoint = store.commit_non_execution(
-        checkpoint.state,
-        finalized.state,
-        action_revision=checkpoint.cursor.next_action_revision,
-        action={
-            "kind": "research_reentry_finalized",
-            "record": finalized.record.model_dump(mode="json"),
-        },
-        replay_input=SolverReentryCompletedReplayInput(
-            research_reentry_id=finalized.record.research_reentry_id,
-            research_state_revision=completed_research.revision,
-            research_state_digest=canonical_digest(completed_research),
+    async def reenter(
+        solver_state,
+        research_state,
+        request_id,
+        *,
+        commit_solver_admission,
+        id_factory,
+        **_kwargs,
+    ):
+        admitted = admit_targeted_reentry(
+            solver_state,
+            research_state,
+            request_id,
+            base_revision=solver_state.revision,
+            id_factory=id_factory,
+        )
+        committed = commit_solver_admission(admitted)
+        finalized = finalize_targeted_reentry(
+            committed,
+            admitted.record.research_reentry_id,
+            ResearchReentryStatus.COMPLETED,
+            base_revision=committed.revision,
+            research_state=completed_research,
             freshness_context=freshness,
             requirements=completed_requirements,
-        ),
+        )
+        return SimpleNamespace(
+            solver_state=finalized.state,
+            research_state=completed_research,
+            record=finalized.record,
+            freshness_context=freshness,
+            requirements=completed_requirements,
+        )
+
+    runtime.verified_research_state = research
+    runtime.verified_research_outcome = SimpleNamespace(
+        final_state=research,
+        stop_reason=ResearchStopReason.STAGNATED,
+        ambiguity=SimpleNamespace(reason="stale research outcome"),
+        freshness_context=None,
     )
-    runtime.verified_research_state = completed_research
     calls = {"propose": 0}
 
     async def propose(_state, _requirements):
@@ -2789,11 +3200,16 @@ def test_resume_completed_result_contradiction_reentry_proposes_new_candidate(
             row_limit=10,
             dry_run_only=False,
             table_namespace="main",
+            reenter=reenter,
         )
     )
 
     assert calls == {"propose": 1}
     assert output["sql"].endswith("'inactive'")
+    assert runtime.verified_research_outcome.final_state == completed_research
+    assert runtime.verified_research_outcome.stop_reason is ResearchStopReason.COMPLETE
+    assert runtime.verified_research_outcome.ambiguity is None
+    assert runtime.verified_research_outcome.freshness_context == freshness
 
 
 def test_deterministic_rejection_seals_without_execution_result(tmp_path) -> None:
@@ -3773,6 +4189,13 @@ def test_restart_recovers_prepared_successor_and_same_reentry_record(
         original_prepared_commit,
     )
     runtime.verified_research_state = latest
+    stale_outcome = SimpleNamespace(
+        final_state=research,
+        stop_reason=ResearchStopReason.STAGNATED,
+        ambiguity=SimpleNamespace(reason="stale recovered outcome"),
+        freshness_context=None,
+    )
+    runtime.verified_research_outcome = stale_outcome
     runtime.deadline = DeadlineBudget.from_duration(30)
     if crash_window != "tampered_plan":
         runtime.mark_cancelled()
@@ -3867,6 +4290,12 @@ def test_restart_recovers_prepared_successor_and_same_reentry_record(
     )
     assert latest is not None and latest.revision == research.revision + 1
     assert runtime.research_state_store.is_prepared_targeted_reentry_committed(plan)
+    assert runtime.verified_research_outcome.final_state == latest
+    assert runtime.verified_research_outcome.stop_reason is ResearchStopReason.COMPLETE
+    assert runtime.verified_research_outcome.ambiguity is None
+    assert runtime.verified_research_outcome.freshness_context == (
+        solver_document_freshness_reference(runtime, latest)
+    )
 
     from workflow._text_to_sql_document_authority import (
         DocumentAuthorityError,
@@ -5052,6 +5481,13 @@ def test_resume_durable_missing_evidence_calls_reentry_before_model(
         replay_input=proposal_transition.replay_input,
     )
     calls = {"proposal": 0, "reentry": 0}
+    stale_outcome = SimpleNamespace(
+        final_state=research,
+        stop_reason=ResearchStopReason.STAGNATED,
+        ambiguity=SimpleNamespace(reason="unrelated prior outcome"),
+        freshness_context=None,
+    )
+    runtime.verified_research_outcome = stale_outcome
 
     async def forbidden_proposal(*_args):
         calls["proposal"] += 1
@@ -5107,6 +5543,7 @@ def test_resume_durable_missing_evidence_calls_reentry_before_model(
     assert checkpoint.state.research_reentries[0].status is reentry_status
     assert runtime.verified_solver_terminal.status.value == terminal_status
     assert runtime.verified_solver_terminal.reason_code == reason_code
+    assert runtime.verified_research_outcome is stale_outcome
 
 
 def test_reentry_admission_and_finalization_are_separate_durable_revisions(

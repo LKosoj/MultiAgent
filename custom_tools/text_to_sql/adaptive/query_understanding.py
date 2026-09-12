@@ -37,6 +37,7 @@ _ITEM_FIELDS = frozenset(
         "normalized_meaning",
         "required",
         "requested_output",
+        "owner_item_ordinal",
         "exact_physical_predicate",
         "operator",
         "literal_or_reference",
@@ -80,11 +81,23 @@ def understand_query(
         _decode_item(query_id, raw_item, raw_ordinal)
         for raw_ordinal, raw_item in enumerate(raw_items)
     )
-    items = tuple(item for item, _ in decoded_items)
+    items = tuple(item for item, _, _ in decoded_items)
+    items = tuple(
+        item.model_copy(
+            update={
+                "owner_source_id": _owner_source_id(
+                    owner_item_ordinal,
+                    items,
+                    raw_ordinal,
+                )
+            }
+        )
+        for raw_ordinal, (item, _, owner_item_ordinal) in enumerate(decoded_items)
+    )
     requested_output_source_ids = tuple(
         sorted(
             item.source_id
-            for item, requested_output in decoded_items
+            for item, requested_output, _ in decoded_items
             if requested_output
         )
     )
@@ -120,9 +133,14 @@ def understand_query(
 
 def _decode_item(
     query_id: str, raw_item: object, raw_ordinal: int
-) -> tuple[SemanticItem, bool]:
+) -> tuple[SemanticItem, bool, int | None]:
     if not isinstance(raw_item, Mapping):
         raise QueryUnderstandingDecodeError("semantic item must be an object")
+    if (
+        set(raw_item) == _ITEM_FIELDS - {"owner_item_ordinal"}
+        and raw_item.get("requested_output") is False
+    ):
+        raw_item = {**raw_item, "owner_item_ordinal": None}
     _require_exact_keys(raw_item, _ITEM_FIELDS, "semantic item")
     kind = _enum_value(SemanticItemKind, raw_item["kind"], "semantic item kind")
     status = _enum_value(SemanticItemStatus, raw_item["status"], "semantic item status")
@@ -150,12 +168,23 @@ def _decode_item(
         raise QueryUnderstandingSemanticError(
             "requested_output semantic items must be required"
         )
+    owner_item_ordinal = raw_item["owner_item_ordinal"]
+    if owner_item_ordinal is not None and (
+        type(owner_item_ordinal) is not int or owner_item_ordinal < 0
+    ):
+        raise QueryUnderstandingDecodeError(
+            "owner_item_ordinal must be a non-negative integer or null"
+        )
+    if owner_item_ordinal is not None and not requested_output:
+        owner_item_ordinal = None
     exact_physical_predicate = raw_item["exact_physical_predicate"]
     if type(exact_physical_predicate) is not bool:
         raise QueryUnderstandingDecodeError(
             "exact_physical_predicate must be a boolean"
         )
     operator_value = raw_item["operator"]
+    if type(operator_value) is str and operator_value == "null":
+        operator_value = None
     operator = (
         None
         if operator_value is None
@@ -200,7 +229,25 @@ def _decode_item(
             binding_ids=(),
         ),
         requested_output,
+        owner_item_ordinal,
     )
+
+
+def _owner_source_id(
+    owner_item_ordinal: int | None,
+    items: tuple[SemanticItem, ...],
+    raw_ordinal: int,
+) -> str | None:
+    if owner_item_ordinal is None:
+        return None
+    if owner_item_ordinal >= len(items) or owner_item_ordinal == raw_ordinal:
+        raise QueryUnderstandingSemanticError("owner_item_ordinal is invalid")
+    owner = items[owner_item_ordinal]
+    if not owner.required or owner.kind is not SemanticItemKind.DIMENSION:
+        raise QueryUnderstandingSemanticError(
+            "owner_item_ordinal must reference a required DIMENSION"
+        )
+    return owner.source_id
 
 
 def _decode_literal(value: object) -> object:

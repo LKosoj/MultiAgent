@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from agent_command import model_hard
 from utils import call_openai_api, parse_llm_json
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,7 @@ def brief_from_prompt_tool(
         Словарь с брифом.
     """
 
-    story_path = f"plots/storybooks/{project_id}/00_brief.json"
+    story_path = str(safe_storybook_project_dir(project_id) / "00_brief.json")
     # Проверяем, существует ли уже история
     if os.path.exists(story_path):
         logger.info(f"📖 История уже существует: {story_path}, пропускаем генерацию")

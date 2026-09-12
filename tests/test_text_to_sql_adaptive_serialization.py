@@ -907,3 +907,35 @@ def test_query_spec_roundtrip_has_no_source_span_field() -> None:
 
     assert b"source_span" not in payload
     assert deserialize_contract(payload) == spec
+
+
+def test_query_spec_roundtrip_preserves_exact_formula_binding_reference() -> None:
+    spec = QuerySpec(
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        revision=0,
+        schema_namespace_version=None,
+        query_id="query-exact-formula",
+        original_text="return elapsed interval",
+        semantic_items=(
+            SemanticItem(
+                source_id="source-formula",
+                kind=SemanticItemKind.FORMULA,
+                source_text="elapsed interval",
+                normalized_meaning="CURRENT_TIMESTAMP - recorded_at",
+                required=True,
+                exact_formula_binding_id="binding-exact-formula",
+                operator=None,
+                literal_or_reference=None,
+                status=SemanticItemStatus.UNRESOLVED,
+                binding_ids=(),
+            ),
+        ),
+        requested_output_source_ids=("source-formula",),
+        expected_result_shape=ExpectedResultShape.SCALAR,
+        global_constraints=(),
+    )
+
+    restored = deserialize_contract(serialize_contract(spec))
+
+    assert restored.semantic_items[0].exact_formula_binding_id == "binding-exact-formula"

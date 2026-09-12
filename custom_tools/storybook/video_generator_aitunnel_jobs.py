@@ -361,6 +361,8 @@ def _new_provider_job(
     provider_name: str = _PROVIDER_NAME,
     video_reference: Optional[str] = None,
     video_reference_rejected_reason: Optional[str] = None,
+    original_input_hash: Optional[str] = None,
+    original_prompt_language: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "shot_key": shot_key,
@@ -369,6 +371,8 @@ def _new_provider_job(
         "prompt_hash": prompt_hash,
         "source_image_hashes": source_image_hashes,
         "input_hash": input_hash,
+        "original_input_hash": original_input_hash,
+        "original_prompt_language": original_prompt_language,
         "hash_inputs_version": _CURRENT_HASH_INPUTS_VERSION,
         "resolved_size_params": resolved_size_params,
         "resolved_duration": resolved_duration,

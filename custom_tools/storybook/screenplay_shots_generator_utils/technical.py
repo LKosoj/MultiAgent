@@ -299,8 +299,8 @@ T=0 TRANSLATION PATTERNS:
   "Прыгает"                   | "crouched low ready to spring"
   "Язык хватает муху"         | "mouth open, tongue inside; fly airborne nearby"
   "Тянется к чашке"           | "hand near body, gaze on cup"
-  "Пол -> люк-ловушка"        | "standing on plate, first hairline crack at edges"
-  "Дверь распахивается"       | "door barely ajar, just beginning to open"
+  "Пол -> люк-ловушка"        | "standing on an intact, stable plate before it opens"
+  "Дверь распахивается"       | "door fully closed before it opens"
   T=0 static templates        | "standing motionless" / "static pose with" / "frozen in mid-action" / "in pre-action posture"
 
 LINGUISTIC MAPPING (Russian -> camera):
@@ -459,7 +459,7 @@ PRIMARY SOURCE OF TRUTH: END выводится из shot_description + shot_fra
 - Все параметры наследуются из START, если shot_description/shot_frame_spec не указывают изменений.
 
 **ШАГ 2 -- DELTA/RATIO CALCULATION:**
-- При ЛЮБОМ движении (dolly/zoom/crane/closer/farther/approaches/pulls back) -> ОБЯЗАТЕЛЬНО числовые дельты. НЕ оставляй delta=0 при движении!
+- При явном изменении дистанции или крупности (dolly/zoom/closer/farther/pulls back/tighter/wider) -> ОБЯЗАТЕЛЬНО числовые дельты. Pan/tilt, поза, темп или crane сами по себе допускают delta=0 и ratio=1.0.
 - Камера + персонаж в ОДНОМ направлении -> СЛОЖЕНИЕ; в РАЗНЫХ -> КОМПЕНСАЦИЯ. Пример: "dolly in +30% + steps back -10%" = delta +20%, ratio 1.3/0.9 ~ 1.4.
 - ОГРАНИЧЕНИЯ: delta in [-60,+60] целое, ratio in [0.5,2.0] округленное до 0.1.
 - ИЗМЕНЕНИЕ ПОЗЫ ПРИ СТАТИЧНОЙ КАМЕРЕ (stands up/sits down/kneels): меняет РАКУРС (pitch), НЕ крупность! delta=0, ratio=1.0, фон неизменен.
@@ -589,7 +589,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
 - Если указаны "rack focus/focus pulls" — заполни `final_focus_target` и `final_depth_of_field`.
 - Если персонажей несколько — укажи `main_subject` и `final_depth_order`.
 
-**КРИТИЧНО**: При ЛЮБОМ явном упоминании движения в shot_description/camera_plan/optional video_prompt ("dolly", "zoom", "crane", "pan", "tilt", "slowly", "closer", "farther", "in", "out", "up", "down", "moves", "approaches", "pulls back", "tighter", "wider") — ОБЯЗАТЕЛЬНО установи числовые дельты framing_delta_percent и subject_scale_ratio. НЕ оставляй 0 при наличии движения!
+**КРИТИЧНО**: При явном изменении дистанции или крупности в shot_description/camera_plan/optional video_prompt ("dolly", "zoom", "closer", "farther", "in", "out", "pulls back", "tighter", "wider") — ОБЯЗАТЕЛЬНО установи числовые дельты framing_delta_percent и subject_scale_ratio. Pan/tilt, "slowly", "up", "down", смена позы и crane без изменения дистанции/крупности допускают delta=0 и ratio=1.0.
 **КРИТИЧНО**: При ЛЮБОМ упоминании поворота камеры в video_prompt определи угол поворота камеры и финальное положение персонажей относительно нее.
 Проанализируй каждый параметр и определи его ФИНАЛЬНОЕ значение."""
 

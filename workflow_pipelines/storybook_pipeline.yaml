@@ -42,6 +42,7 @@ global_retry_policy:
   - timeout
 global_resource_limits:
   max_api_calls_per_minute: 15
+  max_duration_seconds: 30720
 steps:
 - id: brief_from_prompt
   step_type: tool
@@ -163,9 +164,9 @@ steps:
   tool_params:
     session_id: '{session_id}'
     mode: 'discovery'
-    output_path: 'plots/storybooks/{project_id}/90_md/book.md'
-    image_globs: ['plots/storybooks/{project_id}/50_images/**/img_final.png']
-    story_json_path: 'plots/storybooks/{project_id}/20_story/story.json'
+    output_path: '{story_planner}/../90_md/book.md'
+    image_globs: ['{story_planner}/../50_images/**/img_final.png']
+    story_json_path: '{story_planner}/../20_story/story.json'
     text_mode: 'body'
     title: '{brief_from_prompt.title}'
     skip_if_exists: true
@@ -179,8 +180,8 @@ steps:
   tool_name: md_to_pdf_tool
   tool_params:
     session_id: '{session_id}'
-    md_path: 'plots/storybooks/{project_id}/90_md/book.md'
-    pdf_path: 'plots/storybooks/{project_id}/95_pdf/book.pdf'
+    md_path: '{story_planner}/../90_md/book.md'
+    pdf_path: '{story_planner}/../95_pdf/book.pdf'
     css_path: 'doc/storybook_pdf.css'
     skip_if_up_to_date: true
     page_size: 'A4'
@@ -370,7 +371,7 @@ steps:
 - id: video_generator
   step_type: tool
   task: Generate video from shots
-  timeout: 1200
+  timeout: 9000
   # Дорогой side-effect-шаг: движковый retry запрещён до появления настоящей
   # идемпотентности (полагаемся на provider_jobs.json), иначе слепой повтор
   # пере-триггерит платную генерацию. См. H-2.
@@ -436,7 +437,7 @@ steps:
 - id: storybook_music_generator
   step_type: tool
   task: Generate or reuse background music and register it in audio manifest
-  timeout: 900
+  timeout: 2400
   # Дорогой side-effect-шаг: движковый retry запрещён (идемпотентность на уровне
   # тула через music-манифест). См. H-2.
   metadata:

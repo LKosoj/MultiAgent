@@ -39,8 +39,8 @@ profiles:
       intent_max_tokens: 800
       query_understanding_max_tokens: 16000
     step_models:
-      schema_research: model_code
-      sql_solver: model_code
+      schema_research: model_hard
+      sql_solver: model_hard
       research_stop_review: model_code
       result_review: model_hard
       safety_llm_audit: model_code
@@ -110,8 +110,8 @@ profiles:
       intent_max_tokens: 800
       query_understanding_max_tokens: 16000
     step_models:
-      schema_research: model_code
-      sql_solver: model_code
+      schema_research: model_hard
+      sql_solver: model_hard
       research_stop_review: model_lite
       result_review: model_lite
       safety_llm_audit: model_lite

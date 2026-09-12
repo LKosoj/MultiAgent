@@ -3,15 +3,23 @@
 See docs/plans/2026-08-18-4a-music-per-scene-leitmotif-design.md for the ffmpeg
 templates (atrim/aloop/afade/acrossfade) and fallback guards being verified here.
 
-No real ffmpeg/ffprobe is invoked: `_run_command` and `_probe_media` are
-monkeypatched, matching the style of tests/test_montage_assembler_tool.py.
+Most checks monkeypatch `_run_command` and `_probe_media`, matching the style
+of tests/test_montage_assembler_tool.py. The dedicated temporary-file
+regression invokes local `ffmpeg`/`ffprobe` to verify the real MP4 path.
 """
 
 import json
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
+import pytest
+
 from custom_tools.storybook import montage_assembler
+
+
+_HAS_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def _write_json(path: Path, payload) -> None:
@@ -130,9 +138,11 @@ def test_multi_track_per_scene_filter_complex_correct_for_two_scenes(tmp_path, m
     render_command = _render_command(commands)
     assert render_command.count("-i") == 4  # 2 video + 2 unique audio inputs
     filter_complex = _filter_complex_of(render_command)
-    assert "atrim=0:4.000" in filter_complex
+    # First input is extended by its 1s outgoing crossfade, preserving the
+    # second scene's absolute start after acrossfade subtracts that second.
     assert "atrim=0:5.000" in filter_complex
-    assert filter_complex.count("afade=in:0:0.5") == 2
+    assert "atrim=0:5.000" in filter_complex
+    assert filter_complex.count("afade=t=in:st=0:d=0.5") == 2
     # crossfade duration is clamped (min(1.0, min(a,b)/2 - 0.05)); relax the exact-digits
     # match but still confirm 4-5s scenes land on the un-clamped 1.000s value.
     match = re.search(
@@ -211,7 +221,7 @@ def test_multi_track_single_scene_skips_crossfade(tmp_path, monkeypatch):
     filter_complex = _filter_complex_of(_render_command(commands))
     assert "acrossfade" not in filter_complex
     assert "atrim=0:4.000" in filter_complex
-    assert "afade=in:0:0.5" in filter_complex
+    assert "afade=t=in:st=0:d=0.5" in filter_complex
     assert "[a_final]" in filter_complex
 
 
@@ -307,3 +317,195 @@ def test_multi_track_dedups_repeated_leitmotif_track_across_scenes(tmp_path, mon
     # scenes 1 and 3 both reference hero.mp3 -> same ffmpeg input index reused.
     assert filter_complex.count("[3:a]") == 2
     assert "[4:a]" in filter_complex
+
+
+def test_group_scenes_preserves_absolute_timeline_and_gap():
+    scenes = montage_assembler._group_scenes_from_clips([
+        {"scene_number": 1, "planned_start_seconds": 0, "planned_end_seconds": 4, "planned_duration_seconds": 4},
+        {"scene_number": 2, "planned_start_seconds": 6, "planned_end_seconds": 10, "planned_duration_seconds": 4},
+    ])
+
+    assert scenes == [
+        {"scene_id": "1", "start_seconds": 0.0, "end_seconds": 4.0, "duration_seconds": 4.0},
+        {"scene_id": "2", "start_seconds": 6.0, "end_seconds": 10.0, "duration_seconds": 4.0},
+    ]
+
+
+@pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg and ffprobe are required")
+def test_real_ffmpeg_renders_mp4_through_temporary_file_in_both_audio_paths(tmp_path):
+    video_path = tmp_path / "clip.mp4"
+    audio_path = tmp_path / "theme.mp3"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=1",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p", str(video_path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=2", str(audio_path)],
+        check=True,
+        capture_output=True,
+    )
+    clips = [{
+        "path": str(video_path),
+        "planned_start_seconds": 0,
+        "planned_end_seconds": 1,
+        "planned_duration_seconds": 1,
+    }]
+
+    legacy_output = tmp_path / "legacy.mp4"
+    legacy_result = montage_assembler._render_legacy_single_track(
+        "ffmpeg", clips, [{"path": str(audio_path)}], legacy_output, expected_duration=1,
+    )
+    scene_output = tmp_path / "per_scene.mp4"
+    scene_result = montage_assembler._render_with_per_scene_audio(
+        "ffmpeg",
+        clips,
+        [{"scene_id": "1", "duration_seconds": 1}],
+        {"scene_mapping": {"1": "neutral"}},
+        {"neutral": audio_path.name},
+        tmp_path,
+        [{"path": str(audio_path)}],
+        scene_output,
+        expected_duration=1,
+    )
+
+    assert legacy_result["returncode"] == 0, legacy_result
+    assert scene_result["returncode"] == 0, scene_result
+    for output_path in (legacy_output, scene_output):
+        probe = montage_assembler._probe_media(output_path)
+        assert "mp4" in probe["format"]["format_name"]
+        assert any(stream["codec_type"] == "video" for stream in probe["streams"])
+        assert any(stream["codec_type"] == "audio" for stream in probe["streams"])
+
+
+@pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg and ffprobe are required")
+def test_real_ffmpeg_crossfades_keep_thirteen_second_audio_timeline(tmp_path):
+    clips = []
+    scenes = []
+    manifest = {}
+    for index, duration in enumerate((4, 5, 4), start=1):
+        clip_path = tmp_path / f"clip_{index}.mp4"
+        audio_path = tmp_path / f"theme_{index}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=blue:s=320x180:d={duration}", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip_path)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=15", str(audio_path)],
+            check=True, capture_output=True,
+        )
+        start = sum((4, 5, 4)[:index - 1])
+        clips.append({"path": str(clip_path), "planned_start_seconds": start, "planned_end_seconds": start + duration, "planned_duration_seconds": duration})
+        scenes.append({"scene_id": str(index), "duration_seconds": duration})
+        manifest[str(index)] = audio_path.name
+
+    output_path = tmp_path / "final.mp4"
+    result = montage_assembler._render_with_per_scene_audio(
+        "ffmpeg", clips, scenes, {"scene_mapping": {"1": "1", "2": "2", "3": "3"}}, manifest,
+        tmp_path, [], output_path, expected_duration=13,
+    )
+
+    assert result["returncode"] == 0, result
+    probe = montage_assembler._probe_media(output_path)
+    audio_stream = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
+    assert abs(float(audio_stream["duration"]) - 13.0) <= 0.15
+
+
+@pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg and ffprobe are required")
+def test_real_ffmpeg_short_scene_keeps_next_theme_at_absolute_start(tmp_path):
+    """A <=0.1s music scene must not remove or delay the following theme."""
+    clips = []
+    scenes = []
+    manifest = {}
+    for index, (duration, audio_source) in enumerate(
+        ((0.1, "anullsrc=r=44100:cl=stereo:d=5"), (4, "sine=frequency=880:duration=5")),
+        start=1,
+    ):
+        clip_path = tmp_path / f"short_clip_{index}.mp4"
+        audio_path = tmp_path / f"short_theme_{index}.mp3"
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", f"color=c=blue:s=320x180:d={duration}", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip_path)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "lavfi", "-i", audio_source, str(audio_path)],
+            check=True, capture_output=True,
+        )
+        start = 0 if index == 1 else 0.1
+        clips.append({"path": str(clip_path), "planned_start_seconds": start, "planned_end_seconds": start + duration, "planned_duration_seconds": duration})
+        scenes.append({"scene_id": str(index), "start_seconds": start, "duration_seconds": duration})
+        manifest[str(index)] = audio_path.name
+
+    output_path = tmp_path / "short_scene_final.mp4"
+    result = montage_assembler._render_with_per_scene_audio(
+        "ffmpeg", clips, scenes, {"scene_mapping": {"1": "1", "2": "2"}}, manifest,
+        tmp_path, [], output_path, expected_duration=4.1,
+    )
+
+    assert result["returncode"] == 0, result
+    probe = montage_assembler._probe_media(output_path)
+    audio_stream = next(stream for stream in probe["streams"] if stream["codec_type"] == "audio")
+    assert abs(float(audio_stream["duration"]) - 4.1) <= 0.15
+    detected = subprocess.run(
+        ["ffmpeg", "-i", str(output_path), "-af", "silencedetect=n=-50dB:d=0.03", "-f", "null", "-"],
+        capture_output=True, text=True, check=True,
+    )
+    matches = re.findall(r"silence_start: ([0-9.]+).*?silence_end: ([0-9.]+)", detected.stderr, re.S)
+    assert any(abs(float(start)) <= 0.03 and abs(float(end) - 0.1) <= 0.05 for start, end in matches), detected.stderr
+
+
+@pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg and ffprobe are required")
+@pytest.mark.parametrize("starts, expected_silence", [((0, 6), (4, 6)), ((2, 6), (0, 2))])
+def test_real_ffmpeg_preserves_music_timeline_gaps(tmp_path, starts, expected_silence):
+    clips = []
+    manifest = {}
+    for index, start in enumerate(starts, start=1):
+        clip_path = tmp_path / f"clip_{index}.mp4"
+        audio_path = tmp_path / f"theme_{index}.mp3"
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip_path)], check=True, capture_output=True)
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", f"sine=frequency={index * 440}:duration=10", str(audio_path)], check=True, capture_output=True)
+        clips.append({"path": str(clip_path), "planned_start_seconds": start, "planned_end_seconds": start + 4, "planned_duration_seconds": 4})
+        manifest[str(index)] = audio_path.name
+    output_path = tmp_path / "final.mp4"
+    result = montage_assembler._render_with_per_scene_audio(
+        "ffmpeg", clips,
+        [{"scene_id": "1", "start_seconds": starts[0], "duration_seconds": 4}, {"scene_id": "2", "start_seconds": starts[1], "duration_seconds": 4}],
+        {"scene_mapping": {"1": "1", "2": "2"}}, manifest, tmp_path, [], output_path, expected_duration=10,
+    )
+    assert result["returncode"] == 0, result
+    detected = subprocess.run(["ffmpeg", "-i", str(output_path), "-af", "silencedetect=n=-50dB:d=1", "-f", "null", "-"], capture_output=True, text=True, check=True)
+    matches = re.findall(r"silence_start: ([0-9.]+).*?silence_end: ([0-9.]+)", detected.stderr, re.S)
+    assert any(abs(float(start) - expected_silence[0]) <= 0.2 and abs(float(end) - expected_silence[1]) <= 0.2 for start, end in matches), detected.stderr
+
+
+@pytest.mark.skipif(not _HAS_FFMPEG, reason="ffmpeg and ffprobe are required")
+def test_real_ffmpeg_single_scene_initial_gap_and_same_scene_gap(tmp_path):
+    audio_path = tmp_path / "theme.mp3"
+    subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=12", str(audio_path)], check=True, capture_output=True)
+    clips = []
+    for index, start in enumerate((0, 6), start=1):
+        clip_path = tmp_path / f"clip_{index}.mp4"
+        subprocess.run(["ffmpeg", "-y", "-f", "lavfi", "-i", "color=c=blue:s=320x180:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(clip_path)], check=True, capture_output=True)
+        clips.append({"path": str(clip_path), "scene_number": 1, "planned_start_seconds": start, "planned_end_seconds": start + 4, "planned_duration_seconds": 4})
+    scenes = montage_assembler._group_scenes_from_clips(clips)
+    assert len(scenes) == 2
+    output_path = tmp_path / "same_scene_gap.mp4"
+    result = montage_assembler._render_with_per_scene_audio("ffmpeg", clips, scenes, {"scene_mapping": {"1": "theme"}}, {"theme": audio_path.name}, tmp_path, [], output_path, 10)
+    assert result["returncode"] == 0, result
+    probe = montage_assembler._probe_media(output_path)
+    assert abs(float(next(s for s in probe["streams"] if s["codec_type"] == "audio")["duration"]) - 10) <= 0.15
+    detected = subprocess.run(["ffmpeg", "-i", str(output_path), "-af", "silencedetect=n=-50dB:d=1", "-f", "null", "-"], capture_output=True, text=True, check=True)
+    matches = re.findall(r"silence_start: ([0-9.]+).*?silence_end: ([0-9.]+)", detected.stderr, re.S)
+    assert any(abs(float(start) - 4) <= 0.2 and abs(float(end) - 6) <= 0.2 for start, end in matches), detected.stderr
+
+    initial_clip = [{**clips[0], "scene_number": 2, "planned_start_seconds": 2, "planned_end_seconds": 6}]
+    initial_output = tmp_path / "initial_gap.mp4"
+    initial_result = montage_assembler._render_with_per_scene_audio("ffmpeg", initial_clip, [{"scene_id": "2", "start_seconds": 2, "duration_seconds": 4}], {"scene_mapping": {"2": "theme"}}, {"theme": audio_path.name}, tmp_path, [], initial_output, 6)
+    assert initial_result["returncode"] == 0, initial_result
+    initial_probe = montage_assembler._probe_media(initial_output)
+    assert abs(float(next(s for s in initial_probe["streams"] if s["codec_type"] == "audio")["duration"]) - 6) <= 0.15
+    initial_detected = subprocess.run(["ffmpeg", "-i", str(initial_output), "-af", "silencedetect=n=-50dB:d=1", "-f", "null", "-"], capture_output=True, text=True, check=True)
+    assert re.search(r"silence_start: 0(?:\.\d+)?", initial_detected.stderr)

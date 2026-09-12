@@ -73,6 +73,73 @@ def _evaluate(case):
     )
 
 
+def _deferred_limit_case(sql: str) -> tuple[ResearchState, SemanticCheckInput]:
+    state = build_state(
+        (_item("minimum", SemanticItemKind.METRIC, "amount"),)
+    )
+    deferred_limit = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "source_id": "take-one",
+            "kind": SemanticItemKind.LIMIT,
+            "source_text": "one result",
+            "normalized_meaning": "one result",
+            "literal_or_reference": None,
+            "status": SemanticItemStatus.UNRESOLVED,
+            "binding_ids": (),
+        }
+    )
+    query_spec = state.query_spec.model_copy(
+        update={
+            "semantic_items": (*state.query_spec.semantic_items, deferred_limit),
+            "requested_output_source_ids": ("minimum",),
+        }
+    )
+    state = state.model_copy(update={"query_spec": query_spec})
+    requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
+    parsed_ast = parse_sql_candidate(sql, POSTGRES_DSN, "deferred-limit-candidate")
+    candidate = SqlCandidate(
+        candidate_id="deferred-limit-candidate",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+    return state, SemanticCheckInput(
+        semantic_ast=build_semantic_ast(
+            candidate, parsed_ast, state.query_spec, requirements, "main"
+        ),
+        query_spec=state.query_spec,
+        requirements=requirements,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_status"),
+    (
+        (
+            "SELECT (SELECT MIN(o.amount) FROM orders o) AS minimum",
+            CheckStatus.FAILED,
+        ),
+        (
+            "SELECT (SELECT MIN(o.amount) FROM orders o) AS minimum LIMIT 1",
+            CheckStatus.PASSED,
+        ),
+    ),
+)
+def test_deferred_limit_requires_one_positive_root_literal_limit(
+    sql: str, expected_status: CheckStatus
+) -> None:
+    state, check_input = _deferred_limit_case(sql)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is expected_status
+    if expected_status is CheckStatus.FAILED:
+        assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+        assert result.affected_source_ids == ("take-one",)
+        assert result.repair is not None
+        assert result.repair.kind is RepairKind.REVISE_SQL
+
+
 def _item(
     source_id: str,
     kind: SemanticItemKind,
@@ -464,6 +531,28 @@ def test_sqlite_unqualified_intermediate_join_table_is_authorized() -> None:
     result = evaluate_semantic_authority_checks(case.check_input, case.state, SQLITE_DSN)
 
     assert result.status is CheckStatus.PASSED
+
+
+def test_sqlite_main_qualified_table_resolves_to_allowed_casefolded_table() -> None:
+    case = build_case(
+        "SELECT main.Player.player_name FROM main.Player LIMIT 1",
+        (
+            _item("name", SemanticItemKind.DIMENSION, "player_name", table="Player"),
+            _item(
+                "limit",
+                SemanticItemKind.LIMIT,
+                "player_name",
+                table="Player",
+                literal=1,
+            ),
+        ),
+        dsn=SQLITE_DSN,
+    )
+
+    result = evaluate_semantic_authority_checks(case.check_input, case.state, SQLITE_DSN)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 def test_sqlite_ambiguous_casefold_table_stays_unauthorized() -> None:
@@ -950,6 +1039,41 @@ def test_coverage_skips_row_preservation_when_related_table_qualifies() -> None:
     )
     assert not validate_coverage_inputs(
         related_filter_state, _context(), RUN_ID, INCARNATION
+    ).row_preservation_requirements
+
+
+def test_coverage_skips_row_preservation_when_filter_path_uses_output_table() -> None:
+    path = (inner_join("transactions", "station_id", "stations", "id"),)
+    state = build_state(
+        (
+            _item(
+                "station-chain",
+                SemanticItemKind.FILTER,
+                "chain_id",
+                table="stations",
+                operator=PredicateOperator.EQ,
+                literal=11,
+                join_path=path,
+            ),
+            _item(
+                "transaction-time",
+                SemanticItemKind.DIMENSION,
+                "event_time",
+                table="transactions",
+                join_path=path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"requested_output_source_ids": ("transaction-time",)}
+            )
+        }
+    )
+
+    assert not validate_coverage_inputs(
+        state, _context(), RUN_ID, INCARNATION
     ).row_preservation_requirements
 
 

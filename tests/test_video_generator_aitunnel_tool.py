@@ -84,6 +84,227 @@ def _read_provider_jobs(shots_dir: Path):
     return json.loads((shots_dir / "provider_jobs.json").read_text(encoding="utf-8"))["jobs"]
 
 
+def test_video_budget_counts_logical_batches_and_reserves_storybook_tail():
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(1, 0, 2) == 5160
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(2, 0, 2) == 5160
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 0, 2) == 6240
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 2, 2) == 5160
+    assert aitunnel_module._remaining_video_batch_wait_seconds(21, 0, 2) == 11880
+
+
+def test_video_does_not_submit_batch_that_exceeds_workflow_deadline(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    items = [_make_project_item(tmp_path, index) for index in (1, 2, 3)]
+
+    class _Deadline:
+        def remaining_seconds(self):
+            return 4979
+
+    monkeypatch.setattr(aitunnel_module, "get_runtime_context_deadline", lambda: _Deadline())
+    monkeypatch.setattr(
+        aitunnel_module.requests,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deadline-rejected batch must not POST")),
+    )
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", items={"items": items}, enable=True, max_concurrency=2,
+    )
+
+    assert result["status"] == "error"
+    assert result["stats"] == {"total": 3, "successful": 0, "failed": 3}
+
+
+def test_new_video_submission_respects_elapsed_step_budget(monkeypatch):
+    class _Deadline:
+        def remaining_seconds(self):
+            return 10000
+
+    with pytest.raises(RuntimeError, match="срока шага"):
+        aitunnel_module._require_budget_for_new_video_submission(
+            _Deadline(), aitunnel_module.time.monotonic() - 8101,
+        )
+
+
+def test_one_batch_at_5160_seconds_is_admitted():
+    class _Deadline:
+        def remaining_seconds(self):
+            return 5160
+
+    aitunnel_module._require_budget_for_new_video_submission(_Deadline(), aitunnel_module.time.monotonic())
+
+
+def test_three_clips_at_4980_seconds_do_not_submit_first_batch(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    items = [_make_project_item(tmp_path, index) for index in (1, 2, 3)]
+    monkeypatch.setattr(
+        aitunnel_module,
+        "get_runtime_context_deadline",
+        lambda: type("Deadline", (), {"remaining_seconds": lambda self: 4980})(),
+    )
+    monkeypatch.setattr(
+        aitunnel_module.requests,
+        "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("insufficient batch plan must not POST")),
+    )
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", items={"items": items}, enable=True, max_concurrency=2,
+    )
+
+    assert result["status"] == "error"
+    assert result["stats"] == {"total": 3, "successful": 0, "failed": 3}
+
+
+def test_three_stale_outputs_at_4980_seconds_do_not_submit(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    items = [_make_project_item(shots_dir, index, prompt="Current prompt") for index in (1, 2, 3)]
+    jobs = []
+    for item in items:
+        Path(item["video_path"]).write_bytes(b"stale-video")
+        source_hashes = {"start_image": aitunnel_module._hash_source_image(item["start_image"]), "end_image": None}
+        old_hash = aitunnel_module._build_input_hash(
+            model_name="installed-model", prompt_hash=aitunnel_module._hash_text("Old prompt"),
+            source_image_hashes=source_hashes, requested_duration=6, requested_width=1920,
+            requested_height=1080, seed=None, frame_types=["first_frame"],
+        )
+        jobs.append({
+            **aitunnel_module._new_provider_job(
+                shot_key=f"1-{item['shot_number']}", model="installed-model",
+                prompt_hash=aitunnel_module._hash_text("Old prompt"), source_image_hashes=source_hashes,
+                input_hash=old_hash, output_path=item["video_path"],
+            ),
+            "status": "downloaded",
+        })
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, items)
+    (shots_dir / "provider_jobs.json").write_text(json.dumps({"jobs": jobs}), encoding="utf-8")
+    monkeypatch.setattr(
+        aitunnel_module, "get_runtime_context_deadline",
+        lambda: type("Deadline", (), {"remaining_seconds": lambda self: 4980})(),
+    )
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stale outputs must not POST")),
+    )
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=2,
+    )
+
+    assert result["status"] == "error"
+    assert result["stats"] == {"total": 3, "successful": 0, "failed": 3}
+
+
+def test_legacy_changed_raw_prompt_is_not_confirmed(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    start = tmp_path / "start.png"
+    output = tmp_path / "video.mp4"
+    _create_png(start)
+    output.write_bytes(b"video")
+    item = {
+        "scene_number": 1, "shot_number": 1, "video_prompt": "changed raw",
+        "video_path": str(output), "start_image": str(start), "width": 1920,
+        "height": 1080, "timing": "00:00 - 00:06",
+    }
+    source_hashes = {"start_image": aitunnel_module._hash_source_image(str(start)), "end_image": None}
+    old_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model", prompt_hash=aitunnel_module._hash_text("old translated"),
+        source_image_hashes=source_hashes, requested_duration=6, requested_width=1920,
+        requested_height=1080, seed=None, frame_types=["first_frame"],
+    )
+    store = aitunnel_module._ProviderJobStore(str(tmp_path / "provider_jobs.json"))
+    store.ensure_job(aitunnel_module._new_provider_job(
+        shot_key="1-1", model="installed-model", prompt_hash=aitunnel_module._hash_text("old translated"),
+        source_image_hashes=source_hashes, input_hash=old_hash, output_path=str(output),
+    ))
+    store.update_job("1-1", old_hash, {"status": "downloaded"})
+    monkeypatch.setattr(
+        aitunnel_module, "translate_prompts_in_items",
+        lambda source, _language: {**source, "video_prompt": "new translated"},
+    )
+
+    assert not aitunnel_module.confirm_legacy_aitunnel_output_for_item(
+        item, store, "installed-model", None, "ru", model_catalog=aitunnel_module._get_aitunnel_video_models(),
+    )
+    assert store.find_current_job("1-1", old_hash).get("original_input_hash") is None
+
+
+def test_prepared_current_job_cannot_trust_old_output(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    item = _make_project_item(tmp_path, 1, prompt="Current prompt")
+    Path(item["video_path"]).write_bytes(b"old-video")
+    source_hashes = {"start_image": aitunnel_module._hash_source_image(item["start_image"]), "end_image": None}
+    input_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model", prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+        source_image_hashes=source_hashes, requested_duration=6, requested_width=1920,
+        requested_height=1080, seed=None, frame_types=["first_frame"],
+    )
+    store = aitunnel_module._ProviderJobStore(str(tmp_path / "provider_jobs.json"))
+    store.ensure_job(aitunnel_module._new_provider_job(
+        shot_key="1-1", model="installed-model", prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+        source_image_hashes=source_hashes, input_hash=input_hash, output_path=item["video_path"],
+        original_input_hash=input_hash, original_prompt_language="en",
+    ))
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("prepared job must not trust old output")),
+    )
+    result = aitunnel_module._generate_single_video_aitunnel(
+        item, "s", "sk-test", aitunnel_module._get_aitunnel_video_models(), "installed-model", None, "en", store,
+    )
+    assert result["success"] is False
+    assert Path(item["video_path"]).read_bytes() == b"old-video"
+
+
+def test_ru_paid_resume_uses_stored_provider_identity_without_retranslating(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    item = _make_project_item(tmp_path, 1, prompt="Панорама вправо")
+    source_hashes = {"start_image": aitunnel_module._hash_source_image(item["start_image"]), "end_image": None}
+    provider_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model", prompt_hash=aitunnel_module._hash_text("first translation"),
+        source_image_hashes=source_hashes, requested_duration=6, requested_width=1920,
+        requested_height=1080, seed=None, frame_types=["first_frame"],
+    )
+    raw_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model", prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+        source_image_hashes=source_hashes, requested_duration=6, requested_width=1920,
+        requested_height=1080, seed=None, frame_types=["first_frame"],
+    )
+    store = aitunnel_module._ProviderJobStore(str(tmp_path / "provider_jobs.json"))
+    store.ensure_job(aitunnel_module._new_provider_job(
+        shot_key="1-1", model="installed-model", prompt_hash=aitunnel_module._hash_text("first translation"),
+        source_image_hashes=source_hashes, input_hash=provider_hash, output_path=item["video_path"],
+        original_input_hash=raw_hash, original_prompt_language="ru",
+    ))
+    store.update_job("1-1", provider_hash, {"status": "submitted", "task_id": "job-1"})
+    Path(item["start_image"]).unlink()
+    monkeypatch.setattr(
+        aitunnel_module, "translate_prompts_in_items",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paid resume must not retranslate")),
+    )
+    monkeypatch.setattr(
+        aitunnel_module.requests, "post",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("paid resume must not POST")),
+    )
+
+    def fake_get(url, **_kwargs):
+        if url.endswith("/videos/job-1"):
+            return _FakeResponse(status_code=200, json_payload=_completed_job_payload("job-1", "https://cdn.example/fresh.mp4"))
+        if url == "https://cdn.example/fresh.mp4":
+            return _FakeResponse(status_code=200, content=b"fresh")
+        raise AssertionError(f"unexpected GET {url}")
+
+    monkeypatch.setattr(aitunnel_module.requests, "get", fake_get)
+    result = aitunnel_module._generate_single_video_aitunnel(
+        item, "s", "sk-test", aitunnel_module._get_aitunnel_video_models(), "installed-model", None, "ru", store,
+    )
+
+    assert result["success"] is True
+    assert Path(item["video_path"]).read_bytes() == b"fresh"
+
+
 def test_video_generator_aitunnel_tool_generates_video_with_installed_model_and_optimized_params(tmp_path, monkeypatch):
     monkeypatch.setenv("AITUNNEL_API_KEY", "sk-test")
     monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", "installed-model")
@@ -272,12 +493,32 @@ def test_disabled_project_run_updates_shot_descriptions_before_skipping(tmp_path
     assert result["status"] == "skipped"
     assert calls == [
         {
-            "shots_file_path": "plots/storybooks/project-1/97_shots/shots.json",
+            "shots_file_path": str(shots_dir / "shots.json"),
             "items_count": 1,
             "force_update": True,
             "skip_prompt_enhancement": True,
         }
     ]
+
+
+def test_project_mode_uses_configured_projects_root_for_shots_and_job_store(tmp_path, monkeypatch):
+    _patch_project_mode(monkeypatch)
+    projects_root = tmp_path / "configured-projects"
+    other_cwd = tmp_path / "other-cwd"
+    other_cwd.mkdir()
+    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_root))
+    monkeypatch.chdir(other_cwd)
+    shots_dir = projects_root / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1)
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id="project-1", enable=False,
+    )
+
+    assert result["status"] == "skipped"
+    assert not (other_cwd / "plots" / "storybooks" / "project-1").exists()
 
 
 def test_disabled_project_run_does_not_reload_after_failed_description_write(tmp_path, monkeypatch, caplog):
@@ -567,7 +808,7 @@ def test_project_id_fallback_content_download_keeps_bearer_token(tmp_path, monke
     assert result["status"] == "success"
 
 
-def test_project_id_completed_download_failed_job_downloads_without_post(tmp_path, monkeypatch):
+def test_project_id_download_failed_job_replaces_old_output_without_post(tmp_path, monkeypatch):
     _patch_project_mode(monkeypatch)
     shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
     shots_dir.mkdir(parents=True)
@@ -608,7 +849,9 @@ def test_project_id_completed_download_failed_job_downloads_without_post(tmp_pat
     provider_jobs = json.loads(provider_jobs_path.read_text(encoding="utf-8"))
     provider_jobs["jobs"][0]["status"] = "download_failed"
     provider_jobs_path.write_text(json.dumps(provider_jobs), encoding="utf-8")
-    Path(item["video_path"]).unlink()
+    # Atomic download may leave the prior file behind after its replacement failed.
+    # The resumable task must re-poll and replace it, rather than accepting these bytes.
+    assert Path(item["video_path"]).read_bytes() == b"first"
 
     def forbidden_post(url, headers=None, json=None, timeout=None):
         del url, headers, json, timeout
@@ -727,6 +970,11 @@ def test_project_id_existing_output_marks_downloaded_without_post(tmp_path, monk
         raise AssertionError("existing output must not POST")
 
     monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+    monkeypatch.setattr(
+        aitunnel_module,
+        "get_runtime_context_deadline",
+        lambda: type("Deadline", (), {"remaining_seconds": lambda self: 4979})(),
+    )
 
     result = aitunnel_module.video_generator_aitunnel_tool(
         session_id="session-1",
@@ -864,6 +1112,91 @@ def test_project_id_existing_output_with_previous_job_survives_missing_end_frame
     assert second["status"] == "success"
     assert len(post_calls) == 1
     assert [job["status"] for job in _read_provider_jobs(shots_dir)] == ["downloaded"]
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("video_prompt", "Changed prompt"),
+        ("timing", "00:00 - 00:12"),
+        ("width", 1280),
+        ("model", "other-installed-model"),
+    ],
+)
+def test_missing_source_frame_does_not_trust_output_after_input_changes(
+    tmp_path, monkeypatch, changed_field, changed_value,
+):
+    _patch_project_mode(monkeypatch)
+    shots_dir = tmp_path / "plots" / "storybooks" / "project-1" / "97_shots"
+    shots_dir.mkdir(parents=True)
+    item = _make_project_item(shots_dir, 1, prompt="Original prompt")
+    original_source_hashes = {
+        "start_image": aitunnel_module._hash_source_image(item["start_image"]),
+        "end_image": None,
+    }
+    original_input_hash = aitunnel_module._build_input_hash(
+        model_name="installed-model",
+        prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+        source_image_hashes=original_source_hashes,
+        requested_duration=6,
+        requested_width=1920,
+        requested_height=1080,
+        seed=None,
+        frame_types=["first_frame"],
+    )
+    Path(item["video_path"]).write_bytes(b"trusted-old-video")
+    project_id, shots_dir = _write_project(tmp_path, monkeypatch, [item])
+    (shots_dir / "provider_jobs.json").write_text(
+        json.dumps({"jobs": [{
+            **aitunnel_module._new_provider_job(
+                shot_key="1-1",
+                model="installed-model",
+                prompt_hash=aitunnel_module._hash_text(item["video_prompt"]),
+                source_image_hashes=original_source_hashes,
+                input_hash=original_input_hash,
+                output_path=item["video_path"],
+            ),
+            "status": "downloaded",
+        }]}),
+        encoding="utf-8",
+    )
+    Path(item["start_image"]).unlink()
+    if changed_field == "model":
+        monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", changed_value)
+        monkeypatch.setattr(
+            aitunnel_module,
+            "_get_aitunnel_video_models",
+            lambda force_refresh=False: {
+                name: {
+                    "min_price_per_second": 1,
+                    "max_price_per_second": 2,
+                    "supported_sizes": ["1920x1080"],
+                    "supported_resolutions": ["1080p"],
+                    "supported_aspect_ratios": ["16:9"],
+                    "supported_durations": [6],
+                    "supported_frame_images": ["first_frame", "last_frame"],
+                    "supports_seed": True,
+                }
+                for name in ("installed-model", changed_value)
+            },
+        )
+    else:
+        item[changed_field] = changed_value
+    (shots_dir / "shots.json").write_text(json.dumps({"items": [item]}), encoding="utf-8")
+
+    def forbidden_post(url, headers=None, json=None, timeout=None):
+        del url, headers, json, timeout
+        raise AssertionError("missing source must not submit a changed input")
+
+    monkeypatch.setattr(aitunnel_module.requests, "post", forbidden_post)
+
+    result = aitunnel_module.video_generator_aitunnel_tool(
+        session_id="session-1", project_id=project_id, enable=True, max_concurrency=1,
+    )
+
+    assert result["status"] == "error"
+    assert result["results"][0]["success"] is False
+    assert Path(item["video_path"]).read_bytes() == b"trusted-old-video"
 
 
 def test_project_id_failed_provider_job_submits_new_task_instead_of_resuming(tmp_path, monkeypatch):

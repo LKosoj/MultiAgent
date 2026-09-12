@@ -34,6 +34,7 @@ from custom_tools.text_to_sql.adaptive.semantic_coverage import CoverageInputErr
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
     ColumnRef,
+    DocumentRef,
     EvidenceCost,
     EvidenceRecord,
     EvidenceSourceKind,
@@ -152,6 +153,48 @@ def _decision_payload(
             },
         }
     )
+
+
+def test_profile_requires_typed_next_and_durable_evidence_for_proposals() -> None:
+    from custom_tools.text_to_sql.adaptive.research_decision import (
+        parse_research_decision,
+    )
+
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    required_rule = (
+        "next must always be a JSON object, never an escaped JSON string. "
+        "verified_probe_fact_hints and approved_semantic_fact_hints are informational "
+        "only; hint[0] is not a citation ID. If a durable evidence_id is absent, return "
+        "proposals: [] and exactly one typed tool request; create bindings only after "
+        "durable evidence exists."
+    )
+
+    assert required_rule in instructions
+    valid = parse_research_decision(_decision_payload())
+    assert valid.proposals == ()
+    assert valid.next.next_kind == "tool"
+
+    escaped_next = json.loads(_decision_payload())
+    escaped_next["next"] = json.dumps(escaped_next["next"])
+    with pytest.raises(ContractValidationError):
+        parse_research_decision(json.dumps(escaped_next))
+
+    hint_citation = json.loads(_decision_payload())
+    hint_citation["proposals"] = [
+        {
+            "proposal_type": "new_binding",
+            "proposal_key": "proposal:field",
+            "source_id": "source-1",
+            "candidate": {
+                "kind": "physical_column",
+                "physical_column": {"table": "entities", "column": "id"},
+            },
+            "join_references": [],
+            "citation_evidence_ids": ["hint[0]"],
+        }
+    ]
+    with pytest.raises(ContractValidationError):
+        parse_research_decision(json.dumps(hint_citation))
 
 
 class _RecordingModel:
@@ -1007,10 +1050,27 @@ def test_profile_distinguishes_entity_attribute_from_event_snapshot() -> None:
 
     assert "requested as an attribute of a named entity" in instructions
     assert (
+        "When an output is requested as an attribute of a named entity and source text or "
+        "normalized meaning explicitly assigns that attribute to the entity, including an "
+        "unambiguous possessive pronoun referring to that entity, keep that entity as its owner"
+        in instructions
+    )
+    assert (
+        "Qualifying event, record, or transaction conditions restrict which entity "
+        "qualifies; they do not transfer another requested attribute to the event, record, "
+        "or transaction"
+        in instructions
+    )
+    assert (
+        "Use a row-local attribute only when the question or trusted context explicitly "
+        "assigns that requested attribute to that event, record, or transaction. Do not "
+        "guess the owner of an ambiguous pronoun"
+        in instructions
+    )
+    assert (
         "inspect the named entity table before committing the binding"
         in instructions
     )
-    assert "preserve the output described in the qualifying row scope" in instructions
     assert (
         "only when the question explicitly requests a current, canonical, or persistent "
         "attribute"
@@ -1020,7 +1080,8 @@ def test_profile_distinguishes_entity_attribute_from_event_snapshot() -> None:
     assert "Within that scope, prefer a full label over a partial or nullable label" in instructions
     assert (
         "a label explicitly described as full or official for the row supplying a required "
-        "condition or formula is the row-local output"
+        "condition or formula is the row-local output only when the question does not "
+        "explicitly assign that requested attribute to a named entity"
         in instructions
     )
     assert (
@@ -1192,15 +1253,13 @@ def test_invalid_stop_with_resolved_metric_gets_derived_metric_continuation() ->
             "derived metric result."
         ),
     }
-
-
-def test_invalid_stop_without_validated_join_does_not_request_derived_metric_result() -> None:
+def test_invalid_stop_with_disconnected_required_bindings_requests_relationship_continuation() -> None:
     policy = _minimal_research_context_policy()
     state = _minimal_research_state(policy)
-    metrics = TableRef(namespace="main", schema=None, table="metrics")
-    filters = TableRef(namespace="main", schema=None, table="filters")
-    metric_column = ColumnRef(table=metrics, column="amount")
-    filter_column = ColumnRef(table=filters, column="status")
+    orders = TableRef(namespace="main", schema=None, table="orders")
+    order_items = TableRef(namespace="main", schema=None, table="order_items")
+    metric_column = ColumnRef(table=orders, column="amount")
+    filter_column = ColumnRef(table=order_items, column="status")
     evidence = EvidenceRecord(
         run_id=state.run_id,
         run_incarnation=state.run_incarnation,
@@ -1208,9 +1267,9 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
         schema_namespace_version=state.schema_namespace_version,
         evidence_id="schema-evidence",
         source_kind=EvidenceSourceKind.SCHEMA,
-        target=metrics,
+        target=orders,
         action_digest="sha256:" + "b" * 64,
-        observation="metric and filter columns",
+        observation="order and item columns",
         validity_scope=EvidenceValidityScope.SCHEMA_VERSION,
         data_snapshot_token=None,
         observed_at=datetime(2026, 9, 1, tzinfo=UTC),
@@ -1222,13 +1281,13 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
             model_tokens=0,
             db_probe_ms=1,
             rows=0,
-            bytes=25,
+            bytes=22,
         ),
     )
     metric_binding = PhysicalColumnBinding(
         binding_id="metric-binding",
-        source_id="metric",
-        tables=(metrics,),
+        source_id="order-total",
+        tables=(orders,),
         columns=(metric_column,),
         predicates=(),
         join_path=(),
@@ -1240,8 +1299,8 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
     )
     filter_binding = PhysicalColumnBinding(
         binding_id="filter-binding",
-        source_id="filter",
-        tables=(filters,),
+        source_id="line-status",
+        tables=(order_items,),
         columns=(filter_column,),
         predicates=(),
         join_path=(),
@@ -1252,10 +1311,10 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
         physical_column=filter_column,
     )
     metric = SemanticItem(
-        source_id="metric",
-        kind=SemanticItemKind.METRIC,
-        source_text="average amount",
-        normalized_meaning="AVG(amount)",
+        source_id="order-total",
+        kind=SemanticItemKind.FORMULA,
+        source_text="order total",
+        normalized_meaning="order total",
         required=True,
         operator=None,
         literal_or_reference=None,
@@ -1263,7 +1322,7 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
         binding_ids=(metric_binding.binding_id,),
     )
     filter_item = SemanticItem(
-        source_id="filter",
+        source_id="line-status",
         kind=SemanticItemKind.FILTER,
         source_text="selected rows",
         normalized_meaning="status equals selected",
@@ -1294,7 +1353,7 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
             state,
             policy,
             profile=load_schema_research_agent_profile(),
-            task="Calculate the average amount for selected rows.",
+            task="Return the qualifying order total.",
             validation_feedback=("INVALID_STOP",),
             invalid_stop_generation_authority=(
                 CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
@@ -1303,7 +1362,86 @@ def test_invalid_stop_without_validated_join_does_not_request_derived_metric_res
         )
     )
 
-    assert "required_continuation" not in context
+    assert context["required_continuation"] == {
+        "kind": "establish_required_relationship",
+        "source_ids": ["line-status", "order-total"],
+        "table_references": [
+            {"namespace": "main", "schema": None, "table": "order_items"},
+            {"namespace": "main", "schema": None, "table": "orders"},
+        ],
+        "instruction": (
+            "Do not stop. Use ordinary typed investigation to inspect or validate "
+            "the missing relationship between the listed supported tables."
+        ),
+    }
+    validated_join = JoinCandidate(
+        join_id="orders-order-items",
+        left=ColumnRef(table=order_items, column="order_id"),
+        right=ColumnRef(table=orders, column="id"),
+        join_type=JoinType.INNER,
+        path=(
+            JoinEdge(
+                left=ColumnRef(table=order_items, column="order_id"),
+                right=ColumnRef(table=orders, column="id"),
+            ),
+        ),
+        status=JoinCandidateStatus.VALIDATED,
+        evidence_ids=(evidence.evidence_id,),
+    )
+    joined_context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state.model_copy(update={"join_candidates": (validated_join,)}),
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Return the qualifying order total.",
+            validation_feedback=("INVALID_STOP",),
+            invalid_stop_generation_authority=(
+                CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
+                (filter_item.source_id, metric.source_id),
+            ),
+        )
+    )
+
+    assert "required_continuation" not in joined_context
+
+
+def test_stop_review_prompt_requires_relationship_investigation_without_reassessment() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return a qualifying total.",
+            research_context=json.dumps(
+                {
+                    "required_continuation": {
+                        "kind": "establish_required_relationship",
+                        "source_ids": ["line-status", "order-total"],
+                        "table_references": [
+                            {"namespace": "main", "schema": None, "table": "order_items"},
+                            {"namespace": "main", "schema": None, "table": "orders"},
+                        ],
+                    }
+                }
+            ),
+            stop_reason="invalid_stop",
+        )
+    )
+
+    instructions = prompt["instructions"]
+    assert "establish_required_relationship" in instructions
+    assert "return continue" in instructions
+    assert "inspect or validate the missing relationship" in instructions
+    assert "not propose SQL, terminal computation, aggregation, latest/current/time grain" in instructions
+    assert "not reassess already SUPPORTED bindings" in instructions
+    assert (
+        "Schema or foreign-key evidence alone does not close this continuation: when durable "
+        "state lacks a VALIDATED JoinCandidate covering the required tables and the affected "
+        "binding lacks that path, return continue."
+    ) in instructions
+    assert (
+        "Direct the ordinary agent to preserve exactly one new_join from exact durable "
+        "relationship evidence and attach that path to the affected binding; return "
+        "stop_confirmed only after this typed persistence."
+    ) in instructions
 
 
 def test_research_context_serializes_targetless_semantic_commit_action() -> None:
@@ -1384,6 +1522,10 @@ def test_profile_requires_exact_document_excerpt_for_derived_expression() -> Non
         "contiguous substring of the cited document, including its original spacing "
         "and punctuation; do not normalize or rephrase it"
         in instructions
+    )
+    assert (
+        "expression_claim must be one parseable exact RHS expression and must appear "
+        "verbatim in rule_excerpt and the cited document" in instructions
     )
 
 
@@ -1649,7 +1791,7 @@ def test_new_profile_is_disabled_and_has_no_executable_tools() -> None:
     assert not {"tools", "type", "max_steps", "memory_policy"} & raw_profile.keys()
     assert profile.enable is False
     assert profile.profile_version == 1
-    assert profile.model == "model_code"
+    assert profile.model == "model_hard"
 
 
 def test_profile_directs_literal_filters_to_typed_value_bindings() -> None:
@@ -1672,6 +1814,20 @@ def test_profile_preserves_confirmed_like_pattern_in_predicate_binding() -> None
     )
 
 
+def test_profile_requires_calendar_day_predicate_to_preserve_confirmed_timestamp_range() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a calendar-day TIME request, do not save a bare column = day when a "
+        "successful probe on that same column used or observed a fuller timestamp "
+        "value. That probe confirms the format, not the predicate. First confirm a "
+        "physical predicate for the whole day, then preserve its exact left, operator, "
+        "and literal in the binding. A full timestamp stated by the request may use "
+        "exact equality."
+        in instructions
+    )
+
+
 def test_profile_limits_proposals_to_the_current_task() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -1687,6 +1843,19 @@ def test_profile_limits_proposals_to_the_current_task() -> None:
     )
 
 
+def test_profile_does_not_invent_aggregation_for_a_row_extremum() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "MIN or MAX in a direct row extremum defines the ordering direction; it does "
+        "not authorize SUM, totals, aggregation, or GROUP BY per output entity. "
+        "Research probes and hypotheses may use aggregation or grouping only when "
+        "QuerySpec or an authoritative context document explicitly requires that "
+        "calculation or computation grain."
+        in instructions
+    )
+
+
 def test_profile_preserves_requested_output_semantics_when_selecting_a_binding() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -1697,6 +1866,39 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
     assert (
         "Use physical_column only when the requested output itself is stored in that column."
         in instructions
+    )
+    assert (
+        "A requested human-readable name must not be replaced by a reference, key, code, slug, or handle, "
+        "even when its description calls it a reference name, unless the request explicitly asks for that identifier. "
+        "When the name is stored as separate components, bind every component under the one requested DIMENSION."
+        in instructions
+    )
+    assert (
+        "Same name, type, or unit is insufficient: for any requested summary, standing, or cumulative measure, "
+        "prefer a schema-described summary, standing, or cumulative measure over an event or detail measure. "
+        "An explicit event or operation request may use the detail measure."
+        in instructions
+    )
+
+
+def test_profile_leaves_derived_alternative_label_synthesis_to_solver() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    formula_rule = "Query formula needs no direct result binding; verify physical inputs."
+    alternative_rule = (
+        "A requested derived alternative label or role is synthesized by the SQL "
+        "solver: do not create a physical_column binding for an inner entity name, "
+        "ID, or attribute, and do not require a document-backed derived_expression "
+        "merely to carry that output role."
+    )
+
+    assert formula_rule in instructions
+    assert alternative_rule in instructions
+    assert instructions.index(formula_rule) < instructions.index(alternative_rule)
+    assert (
+        "For a requested derived alternative label or role, use derived_expression "
+        "with exact document evidence and its input columns."
+        not in instructions
     )
 
 
@@ -1713,18 +1915,6 @@ def test_profile_preserves_qualifying_rows_when_related_output_is_optional() -> 
         "reject a reversed LEFT join."
         in instructions
     )
-    assert (
-        "Do not substitute an inner entity name, ID, or attribute for a requested derived "
-        "alternative label or role."
-        in instructions
-    )
-    assert (
-        "For a requested derived alternative label or role, use derived_expression with "
-        "exact document evidence and its input columns."
-        in instructions
-    )
-
-
 def test_profile_keeps_named_entity_as_percentage_population() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -1805,7 +1995,8 @@ def test_profile_reacquires_omitted_facts_without_guessing_identifiers() -> None
     instructions = load_schema_research_agent_profile().instructions
 
     assert re.search(
-        r"reports omissions.*cite only IDs present.*existing typed probe.*never guess",
+        r"reports omissions.*cite only IDs present.*different typed action.*never "
+        r"execute an action\s+in completed_action_index or rejected_duplicate_actions.*never guess",
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -1832,6 +2023,20 @@ def test_profile_binds_every_physical_input_of_a_formula() -> None:
         in instructions
     )
     assert (
+        "A discriminator binding for another semantic item does not resolve a "
+        "separate FORMULA, even when it repeats part of the formula condition. "
+        "Keep the FORMULA unresolved until every physical input has its own binding "
+        "under that FORMULA source; do not move the formula predicate onto a "
+        "qualifying DIMENSION."
+        in instructions
+    )
+    assert (
+        "When a FORMULA contains a physical predicate with an operator and literal, "
+        "create a discriminator_value binding for that predicate column under the "
+        "FORMULA source_id, using that operator and literal."
+        in instructions
+    )
+    assert (
         "Using a column only inside execute_research_probe does not make it available "
         "to the SQL solver"
         in instructions
@@ -1844,6 +2049,71 @@ def test_profile_binds_every_physical_input_of_a_formula() -> None:
     assert "Do not create physical_column bindings for that FILTER or TIME" in instructions
 
 
+def test_profile_precommit_checklist_keeps_formula_and_ordering_bindings_separate() -> None:
+    from custom_tools.text_to_sql.adaptive.research_decision import (
+        parse_research_decision,
+    )
+
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Before semantic_commit, check: every local proposal_key and the proposal_key field of every "
+        "proposed reference has format proposal:<non-empty-id>; a proposed reference remains the object "
+        '{"reference_kind":"proposed","proposal_key":"proposal:<id>"}; every new_binding includes '
+        "join_references ([] when none); when the same physical column serves required FORMULA and "
+        "ORDERING, create a separate new_binding for each source_id."
+        in instructions
+    )
+
+    embedded_example = next(
+        line
+        for line in load_schema_research_agent_profile().instructions.splitlines()
+        if line.startswith('{"decision_version":1,"proposals":[{')
+    )
+    embedded_decision = parse_research_decision(embedded_example)
+    assert embedded_decision.next.next_kind == "tool"
+    assert embedded_decision.next.hypothesis_ref.reference_kind == "proposed"
+    assert embedded_decision.next.hypothesis_ref.proposal_key == "proposal:h"
+
+    decision = parse_research_decision(
+        json.dumps(
+            {
+                "decision_version": 1,
+                "proposals": [
+                    {
+                        "proposal_type": "new_binding",
+                        "proposal_key": "proposal:max-balance",
+                        "source_id": "formula-max-balance",
+                        "candidate": {
+                            "kind": "physical_column",
+                            "physical_column": {"table": "ledger", "column": "balance"},
+                        },
+                        "join_references": [],
+                        "citation_evidence_ids": ["evidence-ledger"],
+                    },
+                    {
+                        "proposal_type": "new_binding",
+                        "proposal_key": "proposal:order-balance",
+                        "source_id": "ordering-ledger-balance",
+                        "candidate": {
+                            "kind": "physical_column",
+                            "physical_column": {"table": "ledger", "column": "balance"},
+                        },
+                        "join_references": [],
+                        "citation_evidence_ids": ["evidence-ledger"],
+                    },
+                ],
+                "next": {"next_kind": "semantic_commit"},
+            }
+        )
+    )
+
+    assert [proposal.source_id for proposal in decision.proposals] == [
+        "formula-max-balance",
+        "ordering-ledger-balance",
+    ]
+
+
 def test_profile_persists_document_backed_formula_as_derived_expression() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -1851,6 +2121,13 @@ def test_profile_persists_document_backed_formula_as_derived_expression() -> Non
         "A FORMULA supplied by an external context document is an external rule: "
         "create a document-backed derived_expression; physical input bindings alone "
         "do not bind that rule"
+        in instructions
+    )
+    assert (
+        "When an external document maps one composite concept to multiple physical "
+        "fields, do not semantic_commit after confirming only those input fields. "
+        "First create one document-backed derived_expression that combines all of "
+        "them according to the document rule."
         in instructions
     )
 
@@ -1867,6 +2144,16 @@ def test_profile_requires_birth_and_reference_dates_for_age_at_an_event() -> Non
         "A birth-date component compared directly with an age threshold is incomplete"
         in instructions
     )
+    assert (
+        "For FILTER with a literal value that directly names a physical discriminator, "
+        "use discriminator_value"
+        in instructions
+    )
+    assert (
+        "For age at an event or reference time, follow the derived_expression rule above "
+        "rather than this literal FILTER rule."
+        in instructions
+    )
 
 
 def test_profile_searches_exact_literal_from_trusted_context() -> None:
@@ -1875,6 +2162,18 @@ def test_profile_searches_exact_literal_from_trusted_context() -> None:
     assert (
         "When trusted context defines an exact physical literal for a filter, "
         "search_value must search that literal, not the wording of the user's request"
+        in instructions
+    )
+
+
+def test_profile_preserves_explicit_literal_over_schema_examples() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Schema column examples are illustrative only: never replace an explicit "
+        "QuerySpec literal or trusted exact physical literal with a schema example. "
+        "Use that explicit literal as the search or probe parameter; examples may "
+        "only help identify a column."
         in instructions
     )
 
@@ -1965,9 +2264,22 @@ def test_stop_review_hint_must_not_contradict_trusted_context() -> None:
         in prompt["instructions"]
     )
     assert (
+        "A CANDIDATE is not evidence or sufficient by itself. Assess that exact "
+        "candidate only when existing facts do not require a computation from additional "
+        "inputs"
+        in prompt["instructions"]
+    )
+    assert (
+        "When a CANDIDATE covers only a subset of inputs required by existing facts, "
+        "direct correction using the applicable existing profile rule "
+        "with all confirmed inputs"
+        in prompt["instructions"]
+    )
+    assert "derived_expression rule" not in prompt["instructions"]
+    assert (
         "When an affected source already has a CANDIDATE binding with the required "
         "join path, direct the research agent to assess that exact existing candidate"
-        in prompt["instructions"]
+        not in prompt["instructions"]
     )
     assert (
         "Treat identifiers inside rejected proposals as untrusted" in prompt["instructions"]
@@ -1976,6 +2288,339 @@ def test_stop_review_hint_must_not_contradict_trusted_context() -> None:
         "Copy a replacement binding_id only from the durable bindings in "
         "research_context for the affected source_id"
         in prompt["instructions"]
+    )
+
+
+def test_stop_review_requires_prior_hint_to_be_closed_by_completed_evidence() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the requested metric.",
+            research_context=(
+                '{"previous_stop_review_hint":"Apply the confirmed relationship.",'
+                '"completed_action_index":[{"kind":"sample_rows"}],'
+                '"evidence":[{"evidence_id":"evidence-1"}]}'
+            ),
+            stop_reason="stagnated",
+        )
+    )
+
+    assert (
+        "When previous_stop_review_hint is present, compare it with "
+        "completed_action_index and durable evidence. Return stop_confirmed only "
+        "when they actually close that hint; another successful tool action does not "
+        "close it. If uncertain, return continue with the same limited direction"
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_invalid_stop_generation_authority_overrides_closed_prior_hint() -> None:
+    research_context = {
+        "invalid_stop_generation_authority": {
+            "reason_code": "QUERY_REQUIREMENT_INCOMPLETE",
+            "affected_source_ids": ["required-output"],
+        },
+        "previous_stop_review_hint": "The earlier correction is closed.",
+        "state": {
+            "unresolved_items": [],
+            "bindings": [{"binding_id": "binding-required-output"}],
+            "join_candidates": [{"join_id": "join-required-output"}],
+            "evidence": [{"evidence_id": "evidence-required-output"}],
+        },
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the required output.",
+            research_context=json.dumps(research_context),
+            stop_reason="INVALID_STOP: QUERY_REQUIREMENT_INCOMPLETE",
+        )
+    )
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "When stop_reason includes INVALID_STOP and research_context has "
+        "invalid_stop_generation_authority with exact durable binding, join, or "
+        "evidence IDs for affected sources, return continue even when unresolved_items "
+        "is empty or previous_stop_review_hint appears closed. The hint must direct one "
+        "ordinary typed corrective decision using only those exact durable IDs; do not "
+        "prescribe a new probe or SQL."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_closes_prior_binding_assessment_after_semantic_commit() -> None:
+    research_context = {
+        "previous_stop_review_hint": "Assess existing binding binding:display-label.",
+        "completed_action_index": [{"kind": "semantic_commit"}],
+        "state": {
+            "bindings": [
+                {
+                    "binding_id": "binding:display-label",
+                    "status": "SUPPORTED",
+                    "evidence_ids": ["evidence-display-label"],
+                }
+            ],
+            "evidence": [{"evidence_id": "evidence-display-label"}],
+            "unresolved_items": [{"source_id": "remaining-required-output"}],
+        },
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the requested display label.",
+            research_context=json.dumps(research_context),
+            stop_reason="stagnated",
+        )
+    )
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "When a previous hint requires assessment of an existing binding, a matching "
+        "SUPPORTED binding with linked durable evidence closes that assessment even when "
+        "completed_action_index records semantic_commit rather than binding_assessment; do not "
+        "repeat it. Assess remaining unresolved items independently."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_continues_unsupported_after_confirmed_empty_composition() -> None:
+    research_context = {
+        "state": {
+            "unresolved_items": [{"source_id": "dependent-output"}],
+            "bindings": [{"binding_id": "binding-primary"}],
+            "join_candidates": [{"join_id": "join-primary"}],
+            "evidence": [{"evidence_id": "evidence-primary"}],
+        },
+        "confirmed_columns": ["primary_field", "role_field"],
+        "confirmed_physical_predicate": {
+            "evidence_id": "evidence-primary",
+            "column": {"table": "activities", "column": "state", "type": "TEXT"},
+            "operator": "eq",
+            "literal": "active",
+        },
+        "zero_row_composed_probe": {"predicate_source_id": "primary-filter"},
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the selected record role.",
+            research_context=json.dumps(research_context),
+            stop_reason="unsupported",
+        )
+    )
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "For unsupported, only when research_context has confirmed columns/relationship, "
+        "exact durable physical predicate evidence for its column/type/operator/literal, a "
+        "zero-row composed probe for a required predicate, and unresolved dependent items, "
+        "return continue. Direct only the exact existing schema-supported bindings and "
+        "semantic_commit/complete; do not direct a new probe or SQL. Otherwise return "
+        "continue only to confirm the predicate; do not direct semantic_commit/complete or SQL."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_continues_after_exhaustive_empty_composed_formula_probe() -> None:
+    research_context = {
+        "state": {
+            "unresolved_items": [
+                {"source_id": "event-role"},
+                {"source_id": "documented-duration"},
+            ],
+            "bindings": [{"binding_id": "binding-event-label"}],
+            "join_candidates": [{"join_id": "join-event-measurements"}],
+            "evidence": [
+                {"evidence_id": "evidence-event-label"},
+                {"evidence_id": "evidence-event-year"},
+                {"evidence_id": "evidence-formula"},
+            ],
+        },
+        "confirmed_columns": ["events.label", "events.year", "measurements.duration"],
+        "confirmed_relationship": "measurements.event_id = events.id",
+        "confirmed_physical_predicates": [
+            {
+                "evidence_id": "evidence-event-label",
+                "column": {"table": "events", "column": "label", "type": "TEXT"},
+                "operator": "eq",
+                "literal": "target",
+            },
+            {
+                "evidence_id": "evidence-event-year",
+                "column": {"table": "events", "column": "year", "type": "INTEGER"},
+                "operator": "eq",
+                "literal": 2030,
+            },
+        ],
+        "document_formula": "DIVIDE(SUM(duration), COUNT(rank))",
+        "zero_row_composed_probe": {"rows": 0, "exhaustive_negative_observations": True},
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the documented duration for the selected event.",
+            research_context=json.dumps(research_context),
+            stop_reason="unsupported",
+        )
+    )
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "For unsupported after exhaustive negative observations of a zero-row composed "
+        "probe with confirmed schema columns, relationship, durable physical predicate evidence "
+        "for each exact column/type/operator/literal with its linked evidence ID, and document "
+        "formula, return continue. Direct only preservation of those schema-supported bindings "
+        "by semantic_commit/complete; do not direct a new probe, SQL, a value-level claim, or "
+        "an unbindable/unsupported conclusion."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_does_not_commit_empty_composition_without_exact_predicate() -> None:
+    research_context = {
+        "state": {
+            "unresolved_items": [{"source_id": "dependent-output"}],
+            "bindings": [{"binding_id": "binding-primary"}],
+            "join_candidates": [{"join_id": "join-primary"}],
+            "evidence": [{"evidence_id": "evidence-primary"}],
+        },
+        "confirmed_columns": ["primary_field", "role_field"],
+        "zero_row_composed_probe": {"predicate_source_id": "primary-filter"},
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the selected record role.",
+            research_context=json.dumps(research_context),
+            stop_reason="unsupported",
+        )
+    )
+
+    assert "confirmed_physical_predicate" not in prompt["input"]["research_context"]
+    assert (
+        "durable physical predicate evidence for each exact column/type/operator/literal "
+        "with its linked evidence ID"
+        in prompt["instructions"]
+    )
+    assert (
+        "Otherwise return continue only to confirm the predicate; do not direct "
+        "semantic_commit/complete or SQL."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_requires_document_backed_formula_binding_before_completion() -> None:
+    formula = SemanticItem(
+        source_id="rule-output",
+        kind=SemanticItemKind.FORMULA,
+        source_text="documented ratio",
+        normalized_meaning="DIVIDE(SUM(value),COUNT(record_id))",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=("physical-value",),
+    )
+    document = DocumentRef(document_id="rule-document", namespace="trusted-rules")
+    research_context = {
+        "state": {
+            "query_spec": {
+                "semantic_items": [formula.model_dump(mode="json")],
+            },
+            "bindings": [
+                {
+                    "binding_id": "physical-value",
+                    "source_id": formula.source_id,
+                    "status": "SUPPORTED",
+                    "kind": "physical_column",
+                    "columns": [{"table": "records", "column": "value"}],
+                }
+            ],
+        },
+        "exact_formula_documents": [
+            {
+                "source_id": formula.source_id,
+                "document": document.model_dump(mode="json"),
+            }
+        ],
+    }
+    assert research_context["exact_formula_documents"] == [
+        {
+            "source_id": formula.source_id,
+            "document": {"document_id": "rule-document", "namespace": "trusted-rules"},
+        }
+    ]
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the documented ratio.",
+            research_context=json.dumps(research_context),
+            stop_reason="invalid_stop",
+        )
+    )
+
+    instructions = prompt["instructions"]
+    assert (
+        "When research_context.exact_formula_documents identifies a required FORMULA without "
+        "a matching SUPPORTED document-backed derived_expression for the same source, document, "
+        "and formula, return continue."
+    ) in instructions
+    assert (
+        "Hint only to preserve the derived_expression from the existing trusted document and "
+        "confirmed inputs; do not generate SQL, terminal computation, recheck physical bindings, "
+        "or create authority."
+    ) in instructions
+
+
+def test_stop_review_treats_missing_join_reference_as_routing_repair_only() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Resolve a composite measurement.",
+            research_context=(
+                '{"feedback":{"kind":"missing_join_reference"},'
+                '"composition":{"inputs":["first_input","second_input"]}}'
+            ),
+            stop_reason="incomplete",
+        )
+    )
+
+    instructions = prompt["instructions"]
+    routing_rule = (
+        "When feedback identifies only a missing or stale join reference, it is routing "
+        "repair only: do not recommend, copy, or assess a CANDIDATE binding"
+    )
+    assert routing_rule in instructions
+    routing_instructions = instructions[
+        instructions.index(routing_rule) : instructions.index(
+            "Copy a replacement binding_id only from the durable bindings"
+        )
+    ]
+    assert (
+        "If a CANDIDATE remains unverified or omits inputs of an already tested composition, "
+        "direct only correction to the confirmed join; do not prescribe semantic correction"
+        in routing_instructions
+    )
+    assert "applicable existing profile rule" not in routing_instructions
+
+
+def test_stop_review_repairs_invalid_terminal_action_without_inventing_aggregation() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Which item has the lowest measurement?",
+            research_context=(
+                '{"query_spec":{"ordering":"MIN(measurement) ascending",'
+                '"limit":1},"bindings":["supported"],"evidence":["durable"]}'
+            ),
+            stop_reason='stagnated:[["invalid_stop","INVALID_STOP"]]',
+        )
+    )
+
+    instructions = prompt["instructions"]
+    assert (
+        "When INVALID_STOP or STOP_WITH_PROPOSALS identifies an invalid terminal "
+        "action that can be corrected from durable bindings and evidence, return "
+        "continue rather than stop_confirmed"
+        in instructions
+    )
+    assert (
+        "For a direct row MIN or MAX extremum, do not introduce totals, aggregation, "
+        "GROUP BY, or a different computation grain unless QuerySpec or authoritative "
+        "context explicitly requires it"
+        in instructions
     )
 
 
@@ -2010,8 +2655,8 @@ def test_profile_states_stop_invariants_before_any_correction() -> None:
         flags=re.IGNORECASE | re.DOTALL,
     )
     assert re.search(
-        r"\bevery stop request\b.*\bone or more\b.*\bcitation_evidence_ids\b.*"
-        r"\bcopied\b.*\bfresh evidence\b.*\bcurrent state\b",
+        r"\bfor complete\b.*\bcitation_evidence_ids:\s*\[\].*"
+        r"\bframework\b.*\bexact evidence IDs\b",
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -2090,6 +2735,77 @@ def test_profile_assesses_existing_candidate_join_binding_after_incomplete_stop(
     assert "Do not ask the user at this stage." in instructions
 
 
+def test_profile_parameterizes_context_values_in_raw_research_queries() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For each data value copied from the task or research context into "
+        "execute_research_probe SQL, use an anonymous ? placeholder and put the "
+        "corresponding scalar in parameters in occurrence order. Do not interpolate "
+        "such values into SQL; LIMIT remains a required literal."
+        in instructions
+    )
+
+
+def test_profile_attaches_an_existing_join_before_semantic_commit() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert re.search(
+        r"\bbefore semantic_commit\b.*\brequired bindings\b.*\bdifferent tables\b.*"
+        r"\bvalidated join\b.*\bnew_binding\b.*\bsame source\b.*"
+        r"\bjoin_references\b.*\bdo not request.*(?:probe|evidence)\b",
+        instructions,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
+def test_profile_reuses_an_existing_candidate_join_instead_of_reproposing_it() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "A route already represented by an existing validated join must not be "
+        "proposed again as new_join"
+        in instructions
+    )
+    assert (
+        "If the binding already has that route, assess the existing CANDIDATE or "
+        "use semantic_commit when no required work remains"
+        in instructions
+    )
+
+
+def test_profile_creates_join_when_relationship_is_not_yet_durable() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When relationship evidence confirms a required route but durable "
+        "join_candidates contain no join for it, create one new_join with the exact "
+        "confirmed path and cite that relationship evidence"
+        in instructions
+    )
+    assert (
+        "Never use an evidence ID or digest as an existing join_id; existing join_id "
+        "values come only from durable join_candidates"
+        in instructions
+    )
+    assert (
+        "Attach it to affected bindings through a proposed reference to its local "
+        "proposal_key"
+        in instructions
+    )
+
+
+def test_profile_uses_inner_join_for_output_entity_participating_in_event() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When a requested related entity or its attribute is explicitly described "
+        "as participating in the qualifying event, that participation requires a "
+        "matched related row: use INNER and do not preserve unmatched base rows"
+        in instructions
+    )
+
+
 def test_profile_discloses_closed_research_query_output_contract() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -2118,6 +2834,11 @@ def test_profile_discloses_predicate_query_and_binding_assessment_rules() -> Non
     assert tuple(match.group(1).split(", ")) == tuple(
         operator.value for operator in PredicateOperator
     )
+    assert (
+        "For discriminator_value, discriminator_predicate.left must exactly repeat "
+        "discriminator_column"
+        in instructions
+    )
     assert "exactly one read-only SELECT statement" in instructions
     assert "every nested scope must be SELECT" in instructions
     assert "stable deterministic ordering without ties" not in instructions
@@ -2132,7 +2853,7 @@ def test_profile_discloses_predicate_query_and_binding_assessment_rules() -> Non
         "optional assessment instead."
     ) in instructions
     assert (
-        "Query formula needs no binding; verify physical inputs."
+        "Query formula needs no direct result binding; verify physical inputs."
     ) in instructions
     assert (
         "Only external rules need document-backed derived_expression."
@@ -2146,6 +2867,10 @@ def test_profile_discloses_predicate_query_and_binding_assessment_rules() -> Non
         "When rejected feedback supplies existing_binding_id, assess only that exact "
         "existing binding when fresh evidence permits; otherwise omit the duplicate "
         "new_binding proposal."
+    ) in instructions
+    assert (
+        'binding_assessment existing subject: {"reference_kind":"existing",'
+        '"binding_id":"binding:EXISTING_BINDING_ID"}; "id" is invalid.'
     ) in instructions
 
 
@@ -2487,8 +3212,10 @@ def test_validation_feedback_changes_only_trusted_instructions(feedback: str) ->
         (
             "DUPLICATE_ACTION",
             "Previous decision rejected: DUPLICATE_ACTION. Correct the decision "
-            "using the profile rules and return a replacement typed decision. Use "
-            "the rejected action details in the research context.",
+            "using the profile rules and return a replacement typed decision. Do not "
+            "repeat any rejected action. Use the rejected action details in the "
+            "research context: use the evidence already in the durable state to "
+            "submit proposals, or choose a different useful probe.",
         ),
         (
             "UNRESOLVABLE_PREFLIGHT",
@@ -2620,15 +3347,27 @@ def test_profile_requires_exact_durable_evidence_ids_after_invalid_stop() -> Non
 def test_profile_requires_physical_values_for_new_predicate_bindings() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
-    assert "For FILTER with a literal value, use discriminator_value" in instructions
+    assert (
+        "For FILTER with a literal value that directly names a physical discriminator, "
+        "use discriminator_value"
+        in instructions
+    )
     assert "For FILTER without an operator or literal, use physical_column" in instructions
     assert (
-        "For an operator-less FILTER, first support its physical_column, then use "
-        "search_value or get_distinct_values on that exact column before proposing a "
-        "discriminator_value with EQ, IN, or IS_NULL and citing the exact-value evidence"
+        "When an operator-less FILTER's source text or normalized meaning explicitly "
+        "states a physical comparison, propose discriminator_value on that physical "
+        "column with the stated operator and literal; no prior physical_column binding "
+        "is required"
         in instructions
     )
     assert "A literal in execute_research_probe WHERE is not literal authority" in instructions
+    assert (
+        "When a successful composed probe applies a literal to a physical display "
+        "or discriminator column on a related table, the new discriminator_value "
+        "binding must retain that exact physical column and the confirmed join; "
+        "never transfer the literal to a joining primary or foreign key"
+        in instructions
+    )
     assert "attach the confirmed join_references" in instructions
     assert (
         "A FILTER/TIME binding with an operator needs exact-column evidence and a "
@@ -2641,6 +3380,106 @@ def test_profile_requires_physical_values_for_new_predicate_bindings() -> None:
     assert "rejected new_binding proposal is included unchanged" in instructions
     assert "a replacement exactly repeated an already rejected decision" in instructions
     assert "Do not return that decision again" in instructions
+
+
+def test_profile_rejects_time_predicate_contradicted_by_zero_row_probe() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert "Zero-row probe results do not by themselves mean unsupported" in instructions
+    assert (
+        "A zero-row result cannot confirm a TIME predicate that conflicts with a "
+        "trusted period mapping or observed column values or range"
+        in instructions
+    )
+    assert "Investigate reachable compatible time columns" in instructions
+    assert "No separate exact-value lookup is required for that TIME predicate" in instructions
+
+
+def test_profile_preserves_confirmed_bindings_for_an_empty_qualifying_result() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    rule = (
+        "With confirmed schema table/column/type/predicate, zero qualifying rows mean "
+        "empty SQL result: semantic_commit discriminator_value, FORMULA/DIMENSION inputs and "
+        "joins; never mark dependent required FORMULA/DIMENSION unsupported; complete "
+        "after coverage. Zero rows prove neither model-invented literal/alias nor "
+        "conflicting TIME."
+    )
+
+    assert rule in instructions
+
+
+def test_profile_preserves_confirmed_composite_selection_for_an_empty_result() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    rule = (
+        "For required composite selection, use one discriminator_value with its primary "
+        "predicate and additional_predicates only from confirmed schema/predicate/join "
+        "evidence; preserve dependent role/filter bindings in that semantic_commit."
+    )
+
+    assert rule in instructions
+
+
+def test_profile_preserves_schema_bindings_after_exhaustive_empty_composed_probe() -> None:
+    research_context = {
+        "schema": {
+            "events": {"columns": {"label": "TEXT", "year": "INTEGER"}},
+            "measurements": {
+                "columns": {
+                    "event_id": "INTEGER",
+                    "rank": "INTEGER",
+                    "duration": "REAL",
+                }
+            },
+        },
+        "relationship": "measurements.event_id = events.id",
+        "document_formula": "DIVIDE(SUM(duration), COUNT(rank))",
+        "confirmed_physical_predicates": [
+            {
+                "evidence_id": "evidence-event-label",
+                "column": {"table": "events", "column": "label", "type": "TEXT"},
+                "operator": "eq",
+                "literal": "target",
+            },
+            {
+                "evidence_id": "evidence-event-year",
+                "column": {"table": "events", "column": "year", "type": "INTEGER"},
+                "operator": "eq",
+                "literal": 2030,
+            },
+        ],
+        "durable_evidence": ["evidence-event-label", "evidence-event-year"],
+        "zero_row_composed_probe": {"rows": 0},
+    }
+    prompt = json.loads(
+        build_schema_research_prompt(
+            load_schema_research_agent_profile(),
+            task="Return the documented duration for the selected event.",
+            research_context=json.dumps(research_context),
+        )
+    )
+    instructions = " ".join(prompt["instructions"].split())
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "After exhaustive zero-row observations from a composed qualifying probe with "
+        "confirmed schema columns, relationship, durable physical predicate evidence for each "
+        "exact column/type/operator/literal with its linked evidence ID, and document formula, "
+        "preserve the same schema-supported discriminator (including additional_predicates), "
+        "role/input columns, formula, and joins in semantic_commit; complete after coverage. "
+        "Do not make a value-level claim or mark those required sources unsupported."
+        in instructions
+    )
+
+
+def test_profile_explains_predicate_right_shape_by_operator() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Use one scalar right value for eq, neq, gt, gte, lt, lte, and like; "
+        "use an array for in and not_in, exactly two array values for between, "
+        "and null for is_null and is_not_null"
+        in instructions
+    )
 
 
 def test_profile_preserves_explicit_physical_mapping_from_document() -> None:
@@ -2768,7 +3607,9 @@ def test_duplicate_action_feedback_requires_a_different_existing_action() -> Non
     instructions = json.loads(prompt)["instructions"]
 
     assert "Previous decision rejected: DUPLICATE_ACTION." in instructions
-    assert instructions.endswith("Use the rejected action details in the research context.")
+    assert "Do not repeat any rejected action." in instructions
+    assert "use the evidence already in the durable state to submit proposals" in instructions
+    assert "choose a different useful probe" in instructions
 
 
 def test_multiple_validation_feedback_is_ordered_deduplicated_and_keeps_input() -> None:

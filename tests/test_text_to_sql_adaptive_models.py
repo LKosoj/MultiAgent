@@ -459,6 +459,34 @@ def test_query_spec_checks_resolved_binding() -> None:
         item(status=SemanticItemStatus.RESOLVED)
 
 
+def test_resolved_binding_free_formula_does_not_open_unbound_limit() -> None:
+    formula = SemanticItem(
+        source_id="formula",
+        kind=SemanticItemKind.FORMULA,
+        source_text="derived value",
+        normalized_meaning="derived value",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(),
+    )
+
+    assert formula.binding_ids == ()
+    with pytest.raises(ValidationError, match="binding_ids"):
+        SemanticItem(
+            source_id="limit",
+            kind=SemanticItemKind.LIMIT,
+            source_text="one row",
+            normalized_meaning="one row",
+            required=True,
+            operator=None,
+            literal_or_reference=None,
+            status=SemanticItemStatus.RESOLVED,
+            binding_ids=(),
+        )
+
+
 def test_query_spec_requires_canonical_requested_output_source_ids() -> None:
     first = item(source_id="source-1")
     second = item(source_id="source-2")

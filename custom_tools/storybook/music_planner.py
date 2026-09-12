@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +22,7 @@ _MIN_PROMPT_LEN = 30
 _MAX_PROMPT_LEN = 500
 _PROMPT_FILLER = "warm cinematic instrumental theme, gentle orchestral texture, clear melody"
 _VOCAL_TOKEN_RE = re.compile(r"\b(vocals?|vocalist\w*|singing|lyrics?|voices?)\b", re.IGNORECASE)
+_TRACK_ID_RE = re.compile(r"^[a-z0-9_]+$")
 
 _SCENE_ACTION_CLIP = 400
 _SCENE_SOUND_CLIP = 150
@@ -73,6 +75,27 @@ def music_planner_tool(
 
     duration_sec = _estimate_duration_sec(shots, screenplay, scenes)
     budget = _MAX_LEITMOTIFS_SHORT if duration_sec < _DURATION_THRESHOLD_SEC else _MAX_LEITMOTIFS_LONG
+    plan_path = base_path / "98_audio" / "music_plan.json"
+    input_fingerprint = _input_fingerprint(
+        screenplay=screenplay,
+        story=story,
+        brief=brief,
+        shots=shots,
+        language=language,
+        budget=budget,
+    )
+    existing_plan = _read_json(plan_path)
+    if _is_reusable_plan(existing_plan, input_fingerprint, scene_ids):
+        plan = existing_plan
+        status = str(plan.get("_planner_status") or ("fallback" if not scene_ids else "ok"))
+        return {
+            "status": status,
+            "plan_path": str(plan_path),
+            "leitmotif_count": len(plan.get("leitmotifs", {})),
+            "scene_count": len(scene_ids),
+            "budget_used": budget,
+            "rationale": plan.get("rationale", ""),
+        }
 
     if not scene_ids:
         logger.warning("music_planner: no scenes found under %s; writing neutral-only fallback plan", base_path)
@@ -87,7 +110,8 @@ def music_planner_tool(
         else:
             plan, status = _validate_and_fix(raw_plan, scene_ids, budget)
 
-    plan_path = base_path / "98_audio" / "music_plan.json"
+    plan["_input_fingerprint"] = input_fingerprint
+    plan["_planner_status"] = status
     _write_json(plan_path, plan)
 
     return {
@@ -98,6 +122,48 @@ def music_planner_tool(
         "budget_used": budget,
         "rationale": plan.get("rationale", ""),
     }
+
+
+def _input_fingerprint(
+    screenplay: Any,
+    story: Any,
+    brief: Any,
+    shots: Any,
+    language: str,
+    budget: int,
+) -> str:
+    payload = {
+        "screenplay": screenplay,
+        "story": story,
+        "brief": brief,
+        "shots": shots,
+        "language": language,
+        "budget": budget,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _is_reusable_plan(plan: Any, input_fingerprint: str, scene_ids: List[str]) -> bool:
+    if not isinstance(plan, dict) or plan.get("_input_fingerprint") != input_fingerprint:
+        return False
+    leitmotifs = plan.get("leitmotifs")
+    neutral = plan.get("neutral")
+    scene_mapping = plan.get("scene_mapping")
+    if not isinstance(leitmotifs, dict) or not isinstance(neutral, dict) or not isinstance(scene_mapping, dict):
+        return False
+    if not isinstance(neutral.get("suno_prompt"), str) or not neutral["suno_prompt"].strip():
+        return False
+    valid_ids = set(leitmotifs) | {"neutral"}
+    for scene_id in scene_ids:
+        track_id = scene_mapping.get(scene_id)
+        if track_id not in valid_ids:
+            return False
+        if track_id != "neutral":
+            track = leitmotifs[track_id]
+            if not isinstance(track, dict) or not isinstance(track.get("suno_prompt"), str) or not track["suno_prompt"].strip():
+                return False
+    return True
 
 
 def _plan_via_llm(context: Dict[str, Any], budget: int, language: str) -> Optional[Dict[str, Any]]:
@@ -146,8 +212,8 @@ def _system_prompt(budget: int, language: str) -> str:
         '  "scene_mapping": {"<scene_id>": "<leitmotif_id or neutral>"},\n'
         '  "rationale": "short string explaining the choices"\n'
         "}\n\n"
-        "Every suno_prompt must end with \"instrumental only, no vocals\" and must never mention "
-        "singing/vocals/lyrics/voice.\n"
+        "Every suno_prompt must end with \"instrumental only, no vocals\"; apart from that required suffix, "
+        "do not request singing, lyrics, or a voice.\n"
         f"Scene/character/story context below is in {source_language} (project source language) - "
         "keep names as given, but write every suno_prompt, description and rationale in English."
     )
@@ -212,11 +278,15 @@ def _validate_and_fix(plan: Dict[str, Any], scene_ids: List[str], budget: int) -
     status = "ok"
 
     raw_leitmotifs = plan.get("leitmotifs")
-    leitmotifs = {
-        str(lm_id).strip(): lm
-        for lm_id, lm in (raw_leitmotifs.items() if isinstance(raw_leitmotifs, dict) else [])
-        if str(lm_id).strip() and str(lm_id).strip() != "neutral" and isinstance(lm, dict)
-    }
+    leitmotifs = {}
+    for lm_id, leitmotif in (raw_leitmotifs.items() if isinstance(raw_leitmotifs, dict) else []):
+        track_id = str(lm_id)
+        if track_id == "neutral" or not _TRACK_ID_RE.fullmatch(track_id) or not isinstance(leitmotif, dict):
+            if track_id:
+                logger.warning("music_planner: ignoring invalid leitmotif id %r", track_id)
+            status = "degraded"
+            continue
+        leitmotifs[track_id] = leitmotif
 
     if len(leitmotifs) > budget:
         logger.warning(
@@ -249,7 +319,7 @@ def _validate_and_fix(plan: Dict[str, Any], scene_ids: List[str], budget: int) -
     raw_mapping = raw_mapping if isinstance(raw_mapping, dict) else {}
     scene_mapping: Dict[str, str] = {}
     for scene_id in scene_ids:
-        target = str(raw_mapping.get(scene_id) or "").strip()
+        target = str(raw_mapping.get(scene_id) or "")
         if target not in valid_ids:
             logger.warning(
                 "music_planner: scene %s has no valid leitmotif mapping (got %r); defaulting to neutral",

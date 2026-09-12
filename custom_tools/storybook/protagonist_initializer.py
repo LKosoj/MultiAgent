@@ -98,7 +98,7 @@ def protagonist_initializer_tool(session_id: str, project_id: str) -> str:
 
     # 2) Пытаемся сгенерировать героя на основе канона
     characters_path = f"{base_dir}/20_bible/characters.json"
-    english_prompt = "Hero protagonist full-body, neutral pose, clean background"
+    prompt = "Hero protagonist full-body, neutral pose, clean background"
     # Попробуем подмешать стили изображений и негативный список, если они есть
     style_images_path = f"{base_dir}/30_style/style_images.json"
     negative_list_path = f"{base_dir}/30_style/negative_prompt_list.txt"
@@ -218,9 +218,6 @@ def protagonist_initializer_tool(session_id: str, project_id: str) -> str:
   - negative_prompt: "усиленный_негативный_промпт" - базовый + противоположная стилистика
   - width: 1920
   - height: 1080
-  - true_cfg_scale: 5.0
-  - num_inference_steps: 50
-  - output_path: "{base_path}"
 
 В ответе верни только финальный путь к файлу.
 """

@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -20,6 +21,7 @@ CLERK_BASE_URL = "https://auth.suno.com"
 CLERK_API_VERSION = "2025-11-10"
 CLERK_JS_VERSION = "5.117.0"
 DEFAULT_MODEL = "chirp-fenix"  # Suno v5.5 (latest as of 2026-06); override via SUNO_MODEL
+_TRACK_ID_RE = re.compile(r"^[a-z0-9_]+$")
 _USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -79,6 +81,9 @@ def storybook_music_generator_tool(
             base_dir = None
         plan = _load_music_plan(base_dir) if base_dir is not None else None
         if plan is not None:
+            invalid_track_id = _invalid_track_id(plan)
+            if invalid_track_id is not None:
+                return _error_result(f"music_plan.json has invalid track id: {invalid_track_id!r}")
             return _multi_track_path(
                 base_dir=base_dir,
                 plan=plan,
@@ -141,17 +146,32 @@ def _tracks_from_plan(plan: Dict[str, Any]) -> List[Tuple[str, str]]:
     leitmotifs = plan.get("leitmotifs")
     if isinstance(leitmotifs, dict):
         for leitmotif_id, spec in leitmotifs.items():
-            if not leitmotif_id or not isinstance(spec, dict):
+            track_id = str(leitmotif_id)
+            if not _TRACK_ID_RE.fullmatch(track_id) or not isinstance(spec, dict):
                 continue
             suno_prompt = str(spec.get("suno_prompt") or "").strip()
             if suno_prompt:
-                tracks.append((str(leitmotif_id), suno_prompt))
+                tracks.append((track_id, suno_prompt))
     neutral = plan.get("neutral")
     if isinstance(neutral, dict):
         suno_prompt = str(neutral.get("suno_prompt") or "").strip()
         if suno_prompt:
             tracks.append(("neutral", suno_prompt))
     return tracks
+
+
+def _invalid_track_id(plan: Dict[str, Any]) -> Optional[str]:
+    leitmotifs = plan.get("leitmotifs")
+    if isinstance(leitmotifs, dict):
+        for track_id in leitmotifs:
+            if not _TRACK_ID_RE.fullmatch(str(track_id)):
+                return str(track_id)
+    scene_mapping = plan.get("scene_mapping")
+    if isinstance(scene_mapping, dict):
+        for track_id in scene_mapping.values():
+            if not _TRACK_ID_RE.fullmatch(str(track_id)):
+                return str(track_id)
+    return None
 
 
 def _multi_track_path(
@@ -171,10 +191,9 @@ def _multi_track_path(
 ) -> Dict[str, Any]:
     """Generate one Suno track per leitmotif plus a neutral track from music_plan.json.
 
-    A single track's Suno failure is logged and that track is simply omitted
-    from the manifest (montage falls back to "neutral" for its scenes). Only a
-    fully empty manifest (every track failed) falls back to the legacy
-    single-track path.
+    A failed required track is aliased to an already generated neutral track.
+    If required coverage is unavailable, return an error without submitting a
+    new legacy track.
     """
     audio_dir = base_dir / "98_audio"
     audio_dir.mkdir(parents=True, exist_ok=True)
@@ -207,24 +226,6 @@ def _multi_track_path(
         except Exception as exc:
             logger.warning("Suno failed for %s: %s", track_id, exc)
 
-    if not manifest:
-        logger.warning(
-            "Multi-track music generation produced no tracks; falling back to legacy single-track path"
-        )
-        return _legacy_single_track_path(
-            session_id=session_id,
-            project_id=project_id,
-            language=language,
-            enable=enable,
-            provider=provider,
-            prompt=prompt,
-            instrumental=instrumental,
-            wait_for_completion=wait_for_completion,
-            poll_interval_seconds=poll_interval_seconds,
-            timeout_seconds=timeout_seconds,
-            force_regenerate=force_regenerate,
-        )
-
     manifest_path = _write_manifest(base_dir, manifest)
 
     # C2: montage_assembler_tool's allow_missing_audio gate reads 98_audio/audio_manifest.json's
@@ -234,14 +235,52 @@ def _multi_track_path(
     # Mirror _legacy_single_track_path's _merge_music_status call, using the first successfully
     # generated track as the canonical entry for legacy consumers.
     audio_manifest_path = audio_dir / "audio_manifest.json"
+    if not manifest:
+        message = "Multi-track music generation produced no tracks"
+        _merge_music_status(
+            audio_manifest_path,
+            {"status": "error", "provider": provider, "manifest_path": str(manifest_path)},
+            track=None,
+        )
+        return _error_result(message, manifest_path=manifest_path)
+
     canonical_relpath = next(iter(manifest.values()))
     canonical_music_path = audio_dir / canonical_relpath
     canonical_track = _music_track(canonical_music_path, provider, task_id=None, reused=False)
     canonical_track["path"] = canonical_relpath  # relative to audio_dir, e.g. "music/hero.mp3"
+    missing_track_ids = {
+        track_id
+        for track_id in plan["scene_mapping"].values()
+        if track_id not in manifest
+    }
+    generated_tracks = len(manifest)
+    if missing_track_ids:
+        if "neutral" not in manifest:
+            message = "Music plan has unavailable themes and no generated neutral track"
+            _merge_music_status(
+                audio_manifest_path,
+                {
+                    "status": "error",
+                    "provider": provider,
+                    "manifest_path": str(manifest_path),
+                    "music_path": str(canonical_music_path),
+                },
+                track=None,
+            )
+            return _error_result(message, manifest_path=manifest_path, music_path=canonical_music_path)
+        for track_id in missing_track_ids:
+            manifest[track_id] = manifest["neutral"]
+        _write_manifest(base_dir, manifest)
+        logger.warning(
+            "Replaced unavailable music themes with neutral: %s",
+            ", ".join(sorted(missing_track_ids)),
+        )
+
+    status = "partial" if missing_track_ids else "ok"
     _merge_music_status(
         audio_manifest_path,
         {
-            "status": "ok",
+            "status": status,
             "provider": provider,
             "manifest_path": str(manifest_path),
             "music_path": str(canonical_music_path),
@@ -250,10 +289,13 @@ def _multi_track_path(
     )
 
     return {
-        "status": "ok",
-        "tracks": len(manifest),
+        "status": status,
+        "tracks": generated_tracks,
         "manifest_path": str(manifest_path),
         "manifest": manifest,
+        "music_manifest_path": str(manifest_path),
+        "music_path": str(canonical_music_path),
+        "missing_tracks": sorted(missing_track_ids),
     }
 
 

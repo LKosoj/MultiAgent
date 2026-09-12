@@ -667,6 +667,7 @@ async def test_unbound_formula_missing_evidence_continues_existing_research(
         "formula-probe-evidence",
         QueryProbeRef(probe_id="formula-probe", namespace="main"),
         kind=ResearchActionKind.EXECUTE_PROBE,
+        completed_at=_context().evaluated_at + timedelta(microseconds=1),
         revision=final_revision,
     ).model_copy(
         update={
@@ -754,6 +755,7 @@ async def test_unbound_formula_missing_evidence_continues_existing_research(
     )
 
     assert len(continued) == 1
+    assert evidence.observed_at > _context().evaluated_at
     assert outcome.record.status is ResearchReentryStatus.COMPLETED
     assert outcome.research_state == final
     assert outcome.solver_state.stop_reason is None

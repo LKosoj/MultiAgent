@@ -134,16 +134,9 @@ def test_write_json_atomic_removes_tmp_on_failure(tmp_path):
     assert not path.exists()
 
 
-def test_qa_persist_failure_marks_shots_data_instead_of_silent_success(tmp_path, monkeypatch, stub_llm):
-    """До фикса `except Exception as e: logger.error(...)` в конце
-    shots_prompt_qa_tool глушил ошибку записи shots.json/report целиком:
-    вызывающий получал shots_data как при обычном успехе и не мог отличить
-    "правки сохранены на диск" от "правки только в памяти". Инструмент
-    по-прежнему не поднимает исключение и не выставляет status="error"
-    (money-path, шаг не должен падать там, где раньше продолжал — и это не
-    шаг с output_schema/required-полями) — вместо этого returned shots_data
-    несёт маркер `_qa_persist_error`, тем же приёмом, что уже используется
-    для `_qa_report` в dry_run-ветке."""
+def test_qa_persist_failure_raises_before_stale_data_can_continue(tmp_path, monkeypatch, stub_llm):
+    """Критическая запись shots.json не может завершиться успешным результатом:
+    следующий шаг читает файл с диска и иначе получил бы старую версию."""
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
     _write_screenplay(tmp_path, "proj", [_scene(1)])
 
@@ -159,12 +152,11 @@ def test_qa_persist_failure_marks_shots_data_instead_of_silent_success(tmp_path,
 
     monkeypatch.setattr(sq, "_write_json_atomic", boom)
 
-    result = sq.shots_prompt_qa_tool(
-        session_id="s", project_id="proj", shots_data=json.loads(json.dumps(shots_data)),
-        enable=True, force=True, model="hard", global_max_repairs=0, dry_run=False,
-    )
-
-    assert "disk full" in result.get("_qa_persist_error", "")
+    with pytest.raises(RuntimeError, match="disk full"):
+        sq.shots_prompt_qa_tool(
+            session_id="s", project_id="proj", shots_data=json.loads(json.dumps(shots_data)),
+            enable=True, force=True, model="hard", global_max_repairs=0, dry_run=False,
+        )
     # Атомарная запись ничего не тронула — на диске всё ещё исходная версия.
     assert json.loads(shots_path.read_text(encoding="utf-8")) == shots_data
 

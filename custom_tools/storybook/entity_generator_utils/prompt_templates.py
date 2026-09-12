@@ -23,7 +23,9 @@ def get_character_nature(entity_data: Dict[str, Any]) -> str:
             yield obj
             return
         if isinstance(obj, dict):
-            for v in obj.values():
+            for key, v in obj.items():
+                if key == "no_go_rules":
+                    continue
                 yield from _iter_texts(v)
             return
         if isinstance(obj, list):
@@ -59,8 +61,8 @@ def _nature_constraints_text(entity_name: str, nature: str) -> str:
         )
     if nature == "anthropomorphic_animal":
         return (
-            "ANTHROPOMORPHIC-ANIMAL CONSTRAINT: This character is an ANTHROPOMORPHIC ANIMAL (furry). "
-            "Must have clear animal traits (fur + muzzle/snout + animal ears and/or tail) while keeping humanoid posture. "
+            "ANTHROPOMORPHIC-ANIMAL CONSTRAINT: This character is an ANTHROPOMORPHIC ANIMAL. "
+            "Preserve canonical species traits and visible anatomy while keeping humanoid posture. "
             "Do NOT render as a normal human; do NOT render as a robot/cyborg. "
         )
     if nature == "animal":

@@ -1115,6 +1115,7 @@ class WorkflowManager:
         reserved_text_to_sql = is_text_to_sql_workflow_name(
             reserved_workflow_name
         )
+        project_lock = None
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             preexisting_run = self.active_runs.get(run_id)
             if (
@@ -1164,6 +1165,17 @@ class WorkflowManager:
                 raise WorkflowExecutionError(
                     f"Loaded workflow does not match reservation for run_id {run_id}"
                 )
+            if workflow_def.name == "storybook_pipeline":
+                from custom_tools.storybook.project_paths import acquire_storybook_project_lock
+
+                project_id = (
+                    parameters["project_id"]
+                    if "project_id" in parameters
+                    else workflow_def.inputs.get("project_id")
+                )
+                project_lock = acquire_storybook_project_lock(project_id)
+                if project_lock is None:
+                    raise WorkflowExecutionError("Storybook project is already running")
 
             # Инициализируем статус выполнения и пишем метаданные в одном блоке под локом
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
@@ -1587,6 +1599,10 @@ class WorkflowManager:
                 return fallback_resolution.resolved_payload
             self._notify_progress(run_id, "failed", {"error": append_error})
             raise WorkflowExecutionError(append_error) from e
+        finally:
+            from custom_tools.storybook.project_paths import release_storybook_project_lock
+
+            release_storybook_project_lock(project_lock)
 
     def _notify_progress(self, run_id: str, event_type: str, data: Dict[str, Any]):
         """Уведомление о прогрессе выполнения workflow"""

@@ -58,3 +58,36 @@ def safe_storybook_project_dir(project_id: str, *, must_exist: bool = False) -> 
     if must_exist and not candidate.is_dir():
         raise ValueError(f"project not found: {project_id}")
     return candidate
+
+
+def acquire_storybook_project_lock(project_id: str):
+    """Acquire the existing non-blocking advisory lock for one project."""
+    project_dir = safe_storybook_project_dir(project_id)
+    project_dir.mkdir(parents=True, exist_ok=True)
+    handle = (project_dir / ".pipeline.lock").open("a+", encoding="utf-8")
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except ImportError:
+        pass
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
+
+
+def release_storybook_project_lock(handle) -> None:
+    if handle is None:
+        return
+    try:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        pass
+    finally:
+        try:
+            handle.close()
+        except Exception:
+            pass

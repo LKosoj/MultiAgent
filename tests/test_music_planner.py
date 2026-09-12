@@ -216,3 +216,120 @@ def test_music_planner_llm_failure_writes_fallback(tmp_path, monkeypatch, caplog
     assert plan["scene_mapping"] == {"1": "neutral", "2": "neutral"}
 
     assert "boom" in caplog.text
+
+
+def test_music_planner_reuses_matching_input_plan_without_llm_call(tmp_path, monkeypatch):
+    base = tmp_path
+    _write_scenes(
+        base,
+        [{"scene_number": 1, "location_time": "Forest", "action": "Hero walks", "sound": "birds", "characters": ["Hero"]}],
+    )
+    calls = []
+    response = {
+        "leitmotifs": {
+            "hero": {
+                "suno_prompt": "bright orchestral hero theme, brass and strings, adventurous, instrumental only, no vocals",
+                "description": "Hero",
+                "target": "character",
+            },
+        },
+        "neutral": {
+            "suno_prompt": "gentle ambient piano and strings, calm and warm, instrumental only, no vocals",
+            "description": "Neutral",
+        },
+        "scene_mapping": {"1": "hero"},
+        "rationale": "Hero scene.",
+    }
+
+    def _call(**kwargs):
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr(music_planner, "call_openai_api", _call)
+
+    first = music_planner.music_planner_tool(str(base), language="ru")
+    plan_path = base / "98_audio" / "music_plan.json"
+    first_contents = plan_path.read_text(encoding="utf-8")
+    second = music_planner.music_planner_tool(str(base), language="ru")
+
+    assert first["status"] == "ok"
+    assert second["status"] == "ok"
+    assert len(calls) == 1
+    assert plan_path.read_text(encoding="utf-8") == first_contents
+
+    corrupted = json.loads(first_contents)
+    corrupted["neutral"] = {}
+    _write_json(plan_path, corrupted)
+    music_planner.music_planner_tool(str(base), language="ru")
+    assert len(calls) == 2
+
+
+def test_music_planner_replans_when_fingerprint_inputs_change(tmp_path, monkeypatch):
+    base = tmp_path
+    _write_scenes(
+        base,
+        [{"scene_number": 1, "location_time": "Forest", "action": "Hero walks", "sound": "birds", "characters": ["Hero"]}],
+    )
+    calls = []
+    response = {
+        "leitmotifs": {},
+        "neutral": {
+            "suno_prompt": "gentle ambient piano and strings, calm and warm, instrumental only, no vocals",
+            "description": "Neutral",
+        },
+        "scene_mapping": {"1": "neutral"},
+        "rationale": "Neutral.",
+    }
+    monkeypatch.setattr(music_planner, "call_openai_api", lambda **kwargs: calls.append(1) or response)
+
+    music_planner.music_planner_tool(str(base), language="ru")
+    _write_json(
+        base / "91_screenplay" / "screenplay.json",
+        {"screenplay": [{"scene_number": 1, "location_time": "Forest", "action": "Hero runs", "sound": "birds", "characters": ["Hero"]}]},
+    )
+    music_planner.music_planner_tool(str(base), language="ru")
+    _write_json(base / "20_story" / "story.json", {"pages": [{"body": "Changed story"}]})
+    music_planner.music_planner_tool(str(base), language="ru")
+    _write_json(base / "00_brief.json", {"title": "Changed", "genre": "adventure", "target_age": "8-12"})
+    music_planner.music_planner_tool(str(base), language="ru")
+    _write_json(base / "97_shots" / "shots.json", {"shots": [{"duration_sec": 601}]})
+    music_planner.music_planner_tool(str(base), language="ru")
+    music_planner.music_planner_tool(str(base), language="en")
+
+    assert len(calls) == 6
+    plan = json.loads((base / "98_audio" / "music_plan.json").read_text(encoding="utf-8"))
+    assert plan["_input_fingerprint"]
+
+
+def test_music_planner_rejects_invalid_leitmotif_id(tmp_path, monkeypatch):
+    base = tmp_path
+    _write_scenes(
+        base,
+        [{"scene_number": 1, "location_time": "Forest", "action": "Hero walks", "sound": "birds", "characters": ["Hero"]}],
+    )
+    monkeypatch.setattr(
+        music_planner,
+        "call_openai_api",
+        lambda **kwargs: {
+            "leitmotifs": {
+                "../outside": {
+                    "suno_prompt": "bright orchestral hero theme, brass and strings, adventurous, instrumental only, no vocals",
+                    "description": "Hero",
+                    "target": "character",
+                },
+            },
+            "neutral": {
+                "suno_prompt": "gentle ambient piano and strings, calm and warm, instrumental only, no vocals",
+                "description": "Neutral",
+            },
+            "scene_mapping": {"1": "../outside"},
+            "rationale": "Invalid id.",
+        },
+    )
+
+    result = music_planner.music_planner_tool(str(base), language="ru")
+
+    plan = json.loads((base / "98_audio" / "music_plan.json").read_text(encoding="utf-8"))
+    assert result["status"] == "degraded"
+    assert plan["leitmotifs"] == {}
+    assert plan["scene_mapping"] == {"1": "neutral"}

@@ -3,6 +3,7 @@ import json
 from typing import Dict, Any
 from utils import call_openai_api, parse_llm_json
 from agent_command import model_code
+from .project_paths import safe_storybook_project_dir
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ def bible_builder_tool(session_id: str, project_id: str, language: str = "ru") -
     Returns:
         str: Путь к каталогу `20_bible` с созданными файлами и референсами.
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     syn_dir = f"{base}/10_synopsis"
     out_dir = f"{base}/20_bible"
     characters_path = f"{out_dir}/characters.json"
@@ -87,8 +88,11 @@ def bible_builder_tool(session_id: str, project_id: str, language: str = "ru") -
   ]
 }
 
-НЕ добавляй комментарии в JSON. НЕ используй trailing commas."""
-    prompt = json.dumps({"synopsis": synopsis, "beats": beats}, ensure_ascii=False)
+НЕ добавляй комментарии в JSON. НЕ используй trailing commas.""" + (
+        f"\n\nLANGUAGE CONTRACT: Generate every descriptive text value in the requested "
+        f"language `{language}`. Keep JSON keys unchanged and preserve proper names unchanged."
+    )
+    prompt = json.dumps({"language": language, "synopsis": synopsis, "beats": beats}, ensure_ascii=False)
 
     resp = call_openai_api(
         prompt=prompt,
@@ -114,5 +118,4 @@ def bible_builder_tool(session_id: str, project_id: str, language: str = "ru") -
     os.makedirs(f"{out_dir}/references/characters", exist_ok=True)
     os.makedirs(f"{out_dir}/references/locations", exist_ok=True)
     return out_dir
-
 

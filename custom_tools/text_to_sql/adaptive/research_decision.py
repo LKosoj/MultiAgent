@@ -524,7 +524,9 @@ class StopRequest(StrictModel):
     next_kind: Literal["stop"] = "stop"
     reason: Literal["complete", "ambiguous", "unsupported"]
     source_ids: Annotated[tuple[Id, ...], Field(max_length=MAX_SOURCE_IDS)]
-    citation_evidence_ids: CitationEvidenceIds
+    citation_evidence_ids: Annotated[
+        tuple[Id, ...], Field(max_length=MAX_EVIDENCE_CITATIONS)
+    ]
     ambiguity: AmbiguityReport | None = None
 
     @field_validator("source_ids", mode="before")
@@ -545,6 +547,8 @@ class StopRequest(StrictModel):
     def require_affected_source(self) -> StopRequest:
         if self.reason in {"ambiguous", "unsupported"} and not self.source_ids:
             raise ValueError("ambiguous/unsupported stop requires source_ids")
+        if self.reason in {"ambiguous", "unsupported"} and not self.citation_evidence_ids:
+            raise ValueError("ambiguous/unsupported stop requires evidence citations")
         if (self.reason == "ambiguous") != (self.ambiguity is not None):
             raise ValueError("ambiguity report is required only for ambiguous stop")
         if (

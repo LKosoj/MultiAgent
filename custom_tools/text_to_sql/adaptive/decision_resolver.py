@@ -69,6 +69,7 @@ from .research_decision import (
     LogicalTableTarget,
     NewBindingProposal,
     NewJoinProposal,
+    ProposedBindingRef,
     ResearchDecisionV1,
     ToolIntent,
 )
@@ -103,18 +104,6 @@ class UnresolvableModelDecisionError(DecisionResolverError):
     ) -> None:
         self.exact_column = exact_column
         super().__init__(message)
-
-
-class DuplicateExistingBindingProposalError(UnresolvableModelDecisionError):
-    """A new-binding proposal resolves to an already durable binding."""
-
-    def __init__(
-        self, existing_binding_ids_by_proposal_key: tuple[tuple[str, str], ...]
-    ) -> None:
-        self.existing_binding_ids_by_proposal_key = (
-            existing_binding_ids_by_proposal_key
-        )
-        super().__init__("new binding already exists")
 
 
 class DuplicateResearchActionError(DecisionResolverError):
@@ -525,6 +514,70 @@ def resolve_research_decision(
             resolver.record_declared_join(join)
             proposed_join_ids[proposal.proposal_key] = join.join_id
             proposed_joins[join.join_id] = join
+    batch = resolver.batch()
+    semantic_resolver = _SemanticResolver(batch)
+    all_joins = {**joins_by_id, **proposed_joins}
+    duplicate_binding_ids_by_proposal_key: dict[str, str] = {}
+    for proposal in parsed.proposals:
+        if isinstance(proposal, NewBindingProposal):
+            try:
+                binding = _new_binding(
+                    proposal,
+                    semantic_resolver,
+                    all_joins,
+                    proposed_join_ids,
+                    current.schema_namespace_version,
+                )
+            except SemanticReducerError as exc:
+                raise UnresolvableModelDecisionError(
+                    "model semantic decision is not admissible"
+                ) from exc
+            if binding.binding_id in bindings_by_id:
+                duplicate_binding_ids_by_proposal_key[proposal.proposal_key] = (
+                    binding.binding_id
+                )
+    if duplicate_binding_ids_by_proposal_key:
+        duplicate_ids = tuple(duplicate_binding_ids_by_proposal_key.values())
+        if len(duplicate_ids) != len(set(duplicate_ids)):
+            raise UnresolvableModelDecisionError(
+                "multiple proposals repeat the same existing binding"
+            )
+        for proposal in parsed.proposals:
+            if not isinstance(proposal, BindingAssessment):
+                continue
+            if (
+                isinstance(proposal.subject, ExistingBindingRef)
+                and proposal.subject.binding_id in duplicate_ids
+            ) or (
+                isinstance(proposal.subject, ProposedBindingRef)
+                and proposal.subject.proposal_key
+                in duplicate_binding_ids_by_proposal_key
+            ):
+                raise UnresolvableModelDecisionError(
+                    "existing binding is assessed more than once"
+                )
+        parsed = ResearchDecisionV1.model_validate(
+            {
+                **parsed.model_dump(mode="python", round_trip=True),
+                "proposals": tuple(
+                    BindingAssessment(
+                        subject=ExistingBindingRef(
+                            binding_id=duplicate_binding_ids_by_proposal_key[
+                                proposal.proposal_key
+                            ]
+                        ),
+                        certificate="consistent",
+                        citation_evidence_ids=proposal.citation_evidence_ids,
+                    )
+                    if isinstance(proposal, NewBindingProposal)
+                    and proposal.proposal_key
+                    in duplicate_binding_ids_by_proposal_key
+                    else proposal
+                    for proposal in parsed.proposals
+                ),
+            },
+            strict=True,
+        )
     decision_digest = canonical_digest(
         parsed.model_dump(mode="json", by_alias=True, warnings="error")
     )
@@ -600,32 +653,7 @@ def resolve_research_decision(
             deadline=deadline,
         )
 
-    batch = resolver.batch()
     try:
-        semantic_resolver = _SemanticResolver(batch)
-        all_joins = {**joins_by_id, **proposed_joins}
-        semantic_items_by_source = {
-            item.source_id: item for item in current.query_spec.semantic_items
-        }
-        duplicate_existing_binding_ids_by_proposal_key: list[tuple[str, str]] = []
-        for proposal in parsed.proposals:
-            if isinstance(proposal, NewBindingProposal):
-                binding = _new_binding(
-                    proposal,
-                    semantic_resolver,
-                    all_joins,
-                    proposed_join_ids,
-                    current.schema_namespace_version,
-                    semantic_items_by_source.get(proposal.source_id),
-                )
-                if binding.binding_id in bindings_by_id:
-                    duplicate_existing_binding_ids_by_proposal_key.append(
-                        (proposal.proposal_key, binding.binding_id)
-                    )
-        if duplicate_existing_binding_ids_by_proposal_key:
-            raise DuplicateExistingBindingProposalError(
-                tuple(sorted(duplicate_existing_binding_ids_by_proposal_key))
-            )
         admission = admit_semantic_turn(
             current,
             parsed,
@@ -634,8 +662,6 @@ def resolve_research_decision(
             tool_claim=tool_claim,
             budget_state=current.budget_state,
         )
-    except DuplicateExistingBindingProposalError:
-        raise
     except SemanticReducerError as exc:
         baseline_next = parsed.next
         if isinstance(baseline_next, ToolIntent):

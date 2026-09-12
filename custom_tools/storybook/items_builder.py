@@ -2,6 +2,7 @@ import os
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from .project_paths import safe_storybook_project_dir
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ def load_bible_data(project_id: str) -> tuple[List[Dict], List[Dict], List[Dict]
     Returns:
         tuple: (characters, locations, consistency_rules)
     """
-    base = f"plots/storybooks/{project_id}/20_bible"
+    base = str(safe_storybook_project_dir(project_id) / "20_bible")
     
     # Загрузка персонажей
     characters_path = f"{base}/characters.json"
@@ -108,7 +109,7 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
             - items: массив сцен с персонажами и локациями
             - consistency_rules: массив правил консистентности
     """
-    base = f"plots/storybooks/{project_id}"
+    base = str(safe_storybook_project_dir(project_id))
     prompts_dir = f"{base}/40_prompts"
     items_path = f"{base}/50_items/items.json"
     
@@ -118,8 +119,11 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
     items: List[Dict[str, Any]] = []
     # единый базовый герой
     protagonist_base = f"{base}/30_assets/protagonist/base.png"
+    beats_path = f"{base}/10_synopsis/beats.json"
+    with open(beats_path, "r", encoding="utf-8") as f:
+        expected_page_count = len(json.load(f))
     page = 1
-    while True:
+    while page <= expected_page_count:
         prompt_path = f"{prompts_dir}/page_{page:02d}_prompt.json"
         if not os.path.exists(prompt_path):
             break
@@ -180,5 +184,4 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
         f.write(result_json)
     
     return result_json
-
 

@@ -74,7 +74,7 @@ def test_profile_is_disabled_toolless_and_unregistered() -> None:
     assert raw_profile["profile_kind"] == "sql_solver_one_turn"
     assert not {"tools", "type", "max_steps", "memory_policy"} & raw_profile.keys()
     assert profile.enable is False
-    assert profile.model == "model_code"
+    assert profile.model == "model_hard"
     assert "sql_solver_agent" not in profiles_text
 
 
@@ -296,6 +296,24 @@ def test_prompt_prioritizes_row_preservation_path_for_sql_generation() -> None:
     assert "row_preservation_requirements.effective_join_path" in instructions
     assert "overrides legacy join_type or endpoint orientation" in instructions
     assert "only while generating SQL" in instructions
+
+
+def test_prompt_uses_inner_join_for_output_entity_participating_in_event() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List device labels for devices recorded by qualifying inspections.",
+        solver_context="No row_preservation_requirements are present.",
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When no row_preservation_requirement applies and a requested related entity "
+        "or its attribute is explicitly described as participating in the qualifying "
+        "event, require a matched related row with INNER JOIN"
+        in instructions
+    )
 
 
 def test_prompt_orders_unspecified_requested_outputs_by_semantic_kind() -> None:
@@ -633,6 +651,21 @@ def test_prompt_does_not_infer_limit_from_scalar_result_shape() -> None:
     )
 
 
+def test_prompt_preserves_all_groups_tied_at_aggregate_extreme() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Which categories have the maximum total recorded amount?",
+        solver_context="The QuerySpec has no required LIMIT or tie-break item.",
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "preserve every tied extreme" in normalized_instructions
+    assert "Do not use ORDER BY aggregate with LIMIT 1" in normalized_instructions
+    assert "overall MIN or MAX aggregate" in normalized_instructions
+
+
 def test_prompt_excludes_unknown_values_when_selecting_an_extreme() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -699,6 +732,15 @@ def test_prompt_preserves_document_defined_formula_in_target_dialect() -> None:
         normalized_instructions
     )
     assert "different units or meaning" in normalized_instructions
+    assert (
+        "do not replace it with a domain calculation, duration conversion, "
+        "date-difference helper, unit normalization, or rounding"
+        in normalized_instructions.lower()
+    )
+    assert (
+        "when an exact trusted formula applies arithmetic to its confirmed inputs, "
+        "retain that operator and those inputs" in normalized_instructions.lower()
+    )
 
 
 def test_prompt_preserves_calendar_year_boundaries() -> None:
@@ -711,11 +753,35 @@ def test_prompt_preserves_calendar_year_boundaries() -> None:
     )
     instructions = " ".join(json.loads(prompt)["instructions"].split())
     rule = (
-        "For a calendar-year boundary, compare the year component or a trusted "
-        "equivalent; do not translate 'after YYYY' to > 'YYYY-01-01'. Exact dates "
-        "remain exact."
+        "For a calendar-year condition on a full date/time column, use the year "
+        "component or a trusted full-date boundary in every SQL expression, including "
+        "CASE. Never compare the full date/time value directly to a bare numeric or "
+        "string YYYY. Exact dates remain exact."
     )
 
+    assert rule in instructions
+
+
+def test_prompt_uses_calendar_year_form_inside_case_for_full_text_datetime() -> None:
+    profile = load_sql_solver_agent_profile()
+    task = "What percentage of records were created after calendar year 2018?"
+    solver_context = "records.created_at is stored as a full TEXT date/time value."
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task=task,
+        solver_context=solver_context,
+    )
+    envelope = json.loads(prompt)
+    instructions = " ".join(envelope["instructions"].split())
+    rule = (
+        "For a calendar-year condition on a full date/time column, use the year "
+        "component or a trusted full-date boundary in every SQL expression, including "
+        "CASE. Never compare the full date/time value directly to a bare numeric or "
+        "string YYYY. Exact dates remain exact."
+    )
+
+    assert envelope["input"] == {"solver_context": solver_context, "task": task}
     assert rule in instructions
 
 
@@ -754,19 +820,29 @@ def test_prompt_preserves_formula_column_ownership() -> None:
     )
 
 
-def test_prompt_preserves_exact_arithmetic_operation_order() -> None:
+def test_prompt_preserves_exact_arithmetic_division_before_scale() -> None:
     profile = load_sql_solver_agent_profile()
 
     prompt = build_sql_solver_prompt(
         profile,
         task="Calculate a ratio from an exact trusted formula.",
         solver_context=(
-            "Trusted context requires MULTIPLY(DIVIDE(SUBTRACT(a, b), b), c)."
+            "Trusted context requires MULTIPLY(DIVIDE(SUBTRACT(opening_value, "
+            "closing_value), baseline_value), 100)."
         ),
     )
     normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
 
     assert "Preserve the stated order of arithmetic operations" in (
+        normalized_instructions
+    )
+    assert (
+        "Priority: for an exact trusted formula, preserve its exact operators, operands, "
+        "and stated order. When it is DIVIDE(numerator, denominator) followed by a stated "
+        "scale, divide first and apply the scale only afterwards."
+        in normalized_instructions
+    )
+    assert "trusted formula does not state another operation order" in (
         normalized_instructions
     )
 
@@ -814,6 +890,67 @@ def test_prompt_preserves_entity_grain_in_ratio_across_one_to_many_join() -> Non
     )
 
 
+def test_prompt_preserves_exact_join_row_ratio_formula_before_entity_dedup() -> None:
+    profile = load_sql_solver_agent_profile()
+    solver_context = (
+        "A required FORMULA from a trusted document is "
+        "DIVIDE(COUNT(qualifying joined rows), COUNT(joined_row_id))*100. "
+        "Its counting unit is joined rows, and one entity can have many such rows."
+    )
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Compute the documented percentage across qualifying joined rows.",
+        solver_context=solver_context,
+    )
+    payload = json.loads(prompt)
+    normalized_instructions = " ".join(payload["instructions"].split())
+
+    assert payload["input"]["solver_context"] == solver_context
+    assert (
+        "Do not apply this rule when a required exact trusted aggregate formula "
+        "specifies its aggregate operations and counting unit, and the AST follows it."
+        in normalized_instructions
+    )
+    assert "exact aggregate formula and its counting unit" in normalized_instructions
+    assert "explicitly requests unique, distinct, or entity-once counting" in (
+        normalized_instructions
+    )
+
+
+def test_prompt_preserves_exact_same_scope_count_formula_without_distinct() -> None:
+    profile = load_sql_solver_agent_profile()
+    solver_context = (
+        "A trusted document requires DIVIDE(COUNT(record_id WHERE qualifying), "
+        "COUNT(record_id))*100. Both COUNT(record_id) terms use the same qualifying "
+        "event-row scope across a one-to-many account relationship."
+    )
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Compute the documented percentage of accounts with qualifying events.",
+        solver_context=solver_context,
+    )
+    payload = json.loads(prompt)
+    normalized_instructions = " ".join(payload["instructions"].split())
+
+    assert payload["input"]["solver_context"] == solver_context
+    assert (
+        "When a required METRIC or FORMULA and a trusted document explicitly specify "
+        "the exact aggregate formula and its counting unit, and the AST follows that "
+        "exact formula, preserve each aggregate operation, argument, and shared formula "
+        "row scope; preserve the qualifying join-row multiset. "
+        "COUNT(identifier) in that formula is "
+        "non-DISTINCT at that same scope; do not reinterpret it as COUNT of entities "
+        "or all entities."
+        in normalized_instructions
+    )
+    assert "explicitly requests unique, distinct, or entity-once counting" in (
+        normalized_instructions
+    )
+    assert "separate denominator scope" in normalized_instructions
+
+
 def test_prompt_multiplies_percentage_numerator_before_division() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -851,6 +988,31 @@ def test_prompt_preserves_counted_row_scope_without_unrequested_distinct() -> No
     )
     assert "do not add DISTINCT" in normalized_instructions
     assert "explicitly requires unique entities" in normalized_instructions
+
+
+def test_prompt_preserves_exact_aggregate_formula_join_multiset() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Compute the documented aggregate from qualifying joined rows.",
+        solver_context=(
+            "A trusted document gives the exact SUM/COUNT operation and its row unit; "
+            "one entity can have several qualifying joined rows."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "a required METRIC or FORMULA and a trusted document explicitly specify the exact aggregate formula and its counting unit" in (
+        normalized_instructions
+    )
+    assert "preserve the qualifying join-row multiset" in normalized_instructions
+    assert "does not authorize DISTINCT, a unique subquery, or EXISTS" in (
+        normalized_instructions
+    )
+    assert "explicitly requests unique, distinct, or entity-once counting" in (
+        normalized_instructions
+    )
 
 
 def test_prompt_deduplicates_counted_entities_repeated_by_join() -> None:
@@ -912,6 +1074,11 @@ def test_prompt_derives_substring_bounds_from_storage_format_and_sql_dialect() -
     assert "would select a separator or a different component" in (
         normalized_instructions
     )
+    assert (
+        "When the storage format is not confirmed in solver_context, return "
+        "missing_evidence for that FORMULA"
+    ) in normalized_instructions
+    assert "instead of guessing substring bounds" in normalized_instructions
 
 
 def test_sync_callable_is_rejected_before_it_is_called() -> None:

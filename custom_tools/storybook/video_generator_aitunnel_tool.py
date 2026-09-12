@@ -26,13 +26,23 @@ from custom_tools.storybook.video_generator_aitunnel_media import (
     _should_attach_blockout_reference,
 )
 from custom_tools.storybook.video_generator_common import (
+    _PREPARED_ENGLISH_VIDEO_PROMPT_KEY,
     _get_aitunnel_video_models,
     parse_duration_seconds_from_timing,
     sync_items_to_memory,
     update_shots_with_descriptions,
 )
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from tool_runtime_context import get_runtime_context_deadline
 
 logger = logging.getLogger(__name__)
+
+
+_AITUNNEL_MAX_WAIT_SECONDS = 900
+_VIDEO_STEP_TIMEOUT_SECONDS = 9_000
+# The remaining Storybook tail after video: audio/subtitles (180), music plan
+# (180), at most four sequential 600-second tracks, montage (1200), log (120).
+_STORYBOOK_VIDEO_TAIL_SECONDS = 4_080
 
 _DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1"
 _DEFAULT_TIMEOUT_SECONDS = 60
@@ -40,6 +50,7 @@ _DEFAULT_MAX_WAIT_SECONDS = 900
 _DEFAULT_POLL_INTERVAL_SECONDS = 15
 _DEFAULT_POLL_MAX_TRANSIENT_ERRORS = 5
 _DEFAULT_POLL_BACKOFF_CAP_SECONDS = 120
+_AITUNNEL_BATCH_RESERVE_SECONDS = _DEFAULT_MAX_WAIT_SECONDS + 3 * _DEFAULT_TIMEOUT_SECONDS
 
 
 class _PollTransientError(Exception):
@@ -129,6 +140,7 @@ def video_generator_aitunnel_tool(
     Returns:
         Словарь со статусом, сообщением и списком results по шотам.
     """
+    video_step_started_at = time.monotonic()
     enable = _as_bool(enable)
     force_update_prompts = _as_bool(force_update_prompts)
     skip_prompt_enhancement = _as_bool(skip_prompt_enhancement)
@@ -145,9 +157,11 @@ def video_generator_aitunnel_tool(
 
     shots_file_path: Optional[str] = None
     items_list: List[Dict[str, Any]] = []
+    project_dir: Optional[Path] = None
 
     if project_id:
-        shots_file_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
+        project_dir = safe_storybook_project_dir(project_id)
+        shots_file_path = str(project_dir / "97_shots" / "shots.json")
         if os.path.exists(shots_file_path):
             try:
                 with open(shots_file_path, "r", encoding="utf-8") as shots_file:
@@ -199,11 +213,21 @@ def video_generator_aitunnel_tool(
             # устаревшая версия, это откатило бы их.
             logger.error("❌ Не удалось сохранить обновлённые описания в %s, используем данные из памяти", shots_file_path)
         elif descriptions_updated:
+            prepared_prompts = {
+                (item.get("scene_number"), item.get("shot_number"), item.get("video_prompt"))
+                for item in items_list
+                if item.get(_PREPARED_ENGLISH_VIDEO_PROMPT_KEY) == item.get("video_prompt")
+            }
             logger.info("🔄 Описания обновлены, перезагружаем данные из shots.json")
             try:
                 with open(shots_file_path, "r", encoding="utf-8") as shots_file:
                     shots_data = json.load(shots_file)
                 items_list = shots_data.get("items", []) if isinstance(shots_data, dict) else shots_data
+                for item in items_list:
+                    if (
+                        item.get("scene_number"), item.get("shot_number"), item.get("video_prompt")
+                    ) in prepared_prompts:
+                        item[_PREPARED_ENGLISH_VIDEO_PROMPT_KEY] = item["video_prompt"]
             except Exception as exc:
                 logger.error("❌ Ошибка перезагрузки shots.json после обновления описаний: %s", exc)
                 return _error_result(f"Ошибка перезагрузки shots.json: {exc}")
@@ -233,11 +257,28 @@ def video_generator_aitunnel_tool(
         return _error_result(f"Не удалось получить список моделей AITUNNEL: {exc}")
 
     try:
-        job_store = _ProviderJobStore(f"plots/storybooks/{project_id}/97_shots/provider_jobs.json") if project_id else None
+        job_store = _ProviderJobStore(str(project_dir / "97_shots" / "provider_jobs.json")) if project_dir else None
     except Exception as exc:
         logger.error("❌ Ошибка чтения provider_jobs.json: %s", exc)
         return _error_result(f"Ошибка чтения provider_jobs.json: {exc}")
     video_items = _collect_video_items(items_list, include_existing=job_store is not None)
+    if job_store:
+        collected_keys = {_shot_key(item) for item in video_items}
+        for item in items_list:
+            if (
+                _shot_key(item) in collected_keys
+                or (item.get("shot_type") and item.get("shot_type") != "start")
+                or not str(item.get("video_prompt") or "").strip()
+                or not str(item.get("video_path") or "").strip()
+                or not resumable_aitunnel_job_for_item(
+                    item, job_store, configured_model, seed, language,
+                    model_catalog=model_catalog, generate_blockout=generate_blockout,
+                    use_blockout_reference=use_blockout_reference,
+                )
+            ):
+                continue
+            video_items.append(item.copy())
+            collected_keys.add(_shot_key(item))
     if not video_items:
         logger.info("ℹ️ Нет кадров для генерации видео AITUNNEL")
         return _error_result("Нет кадров для обработки")
@@ -263,9 +304,24 @@ def video_generator_aitunnel_tool(
 
     results: List[Dict[str, Any]] = []
     worker_count = max(1, int(max_concurrency or 1))
+    deadline = get_runtime_context_deadline()
 
     for batch_start in range(0, len(video_items), worker_count):
         batch_items = video_items[batch_start:batch_start + worker_count]
+        remaining_new_output_items = sum(
+            not trusted_aitunnel_output_for_item(
+                candidate,
+                job_store,
+                configured_model,
+                seed,
+                original_prompt=str(candidate.get("video_prompt") or "").strip(),
+                original_prompt_language=language,
+                model_catalog=model_catalog,
+                generate_blockout=generate_blockout,
+                use_blockout_reference=use_blockout_reference,
+            )
+            for candidate in video_items[batch_start:]
+        )
         logger.info(
             "🎬 AITUNNEL: пакет %s, видео %s",
             batch_start // worker_count + 1,
@@ -285,6 +341,10 @@ def video_generator_aitunnel_tool(
                     job_store,
                     generate_blockout,
                     use_blockout_reference,
+                    deadline,
+                    video_step_started_at,
+                    remaining_new_output_items,
+                    worker_count,
                 ): item
                 for item in batch_items
             }
@@ -331,6 +391,234 @@ def video_generator_aitunnel_tool(
             "stats": stats,
         }
     return _error_result(message, results=results, stats=stats)
+
+
+def _minimum_remaining_video_budget_seconds(
+    total_items: int, batch_start: int, worker_count: int,
+) -> int:
+    """Maximum provider wait for unsubmitted logical video batches plus the tail."""
+    return _remaining_video_batch_wait_seconds(
+        total_items, batch_start, worker_count,
+    ) + _STORYBOOK_VIDEO_TAIL_SECONDS
+
+
+def _remaining_video_batch_wait_seconds(
+    total_items: int, batch_start: int, worker_count: int,
+) -> int:
+    remaining_items = max(0, total_items - batch_start)
+    batches = (remaining_items + worker_count - 1) // worker_count
+    return batches * _AITUNNEL_BATCH_RESERVE_SECONDS
+
+
+def trusted_aitunnel_output_for_item(
+    item: Dict[str, Any],
+    job_store: Optional[_ProviderJobStore],
+    configured_model: str,
+    seed: Optional[int],
+    *,
+    prompt: Optional[str] = None,
+    original_prompt: Optional[str] = None,
+    original_prompt_language: Optional[str] = None,
+    model_catalog: Optional[Dict[str, Dict[str, Any]]] = None,
+    generate_blockout: bool = False,
+    use_blockout_reference: bool = False,
+) -> bool:
+    """Whether a nonempty output has the current V10 input identity, without I/O writes.
+
+    ``prompt`` must already be the provider prompt.  Deliberately do not translate
+    here: delivery validation must not make a second LLM/API request.
+    """
+    if not job_store or (not prompt and original_prompt is None):
+        return False
+    video_path = str(item.get("video_path") or "")
+    if not _is_non_empty_file(video_path):
+        return False
+
+    shot_key = _shot_key(item)
+    trusted_job = job_store.find_latest_output_job_for_shot(shot_key, video_path)
+    if not trusted_job or trusted_job.get("status") != "downloaded":
+        return False
+    if not prompt and trusted_job.get("original_prompt_language") != original_prompt_language:
+        return False
+    start_image = item.get("start_image")
+    end_image = item.get("end_image")
+    source_hashes = {
+        "start_image": _hash_source_image(start_image),
+        "end_image": _hash_source_image(end_image),
+    }
+    stored_hashes = trusted_job.get("source_image_hashes") or {}
+    for name, source_hash in source_hashes.items():
+        if source_hash is None and stored_hashes.get(name):
+            source_hashes[name] = stored_hashes[name]
+
+    requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    requested_width, requested_height = _requested_frame_dimensions(item)
+    duration = requested_duration
+    size_params: Dict[str, str] = {}
+    if use_blockout_reference and generate_blockout and model_catalog is None:
+        return False
+    try:
+        width, height = _resolve_frame_dimensions(item, start_image)
+        _model_name, size_params, duration = _resolve_model_and_size(
+            model_catalog=model_catalog or {},
+            configured_model=configured_model,
+            width=width,
+            height=height,
+            duration=requested_duration,
+            requires_last_frame=bool(end_image),
+            seed=seed,
+        )
+    except Exception:
+        pass
+    should_attach_reference, reference_info = _should_attach_blockout_reference(
+        item, generate_blockout, use_blockout_reference, duration, size_params,
+    )
+    reference_hash = _hash_source_image(reference_info) if should_attach_reference else None
+    input_hash = _build_input_hash(
+        model_name=configured_model,
+        prompt_hash=_hash_text(prompt) if prompt else _hash_text(str(original_prompt or "").strip()),
+        source_image_hashes=source_hashes,
+        requested_duration=requested_duration,
+        requested_width=requested_width,
+        requested_height=requested_height,
+        seed=seed,
+        frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
+        reference_video_hash=reference_hash,
+    )
+    return trusted_job.get("input_hash" if prompt else "original_input_hash") == input_hash
+
+
+def resumable_aitunnel_job_for_item(
+    item: Dict[str, Any], job_store: Optional[_ProviderJobStore], configured_model: str,
+    seed: Optional[int], original_prompt_language: Optional[str], *,
+    model_catalog: Optional[Dict[str, Dict[str, Any]]] = None,
+    generate_blockout: bool = False, use_blockout_reference: bool = False,
+) -> bool:
+    """Whether existing metadata can resume a paid job without source frames."""
+    if not job_store:
+        return False
+    job = job_store.find_latest_output_job_for_shot(_shot_key(item), str(item.get("video_path") or ""))
+    if (
+        not job
+        or not job.get("task_id")
+        or job.get("status") in {"stale", "failed", "prepared"}
+        or job.get("original_prompt_language") != original_prompt_language
+    ):
+        return False
+    source_hashes = {
+        "start_image": _hash_source_image(item.get("start_image")),
+        "end_image": _hash_source_image(item.get("end_image")),
+    }
+    stored_hashes = job.get("source_image_hashes") or {}
+    for name, source_hash in source_hashes.items():
+        if source_hash is None and stored_hashes.get(name):
+            source_hashes[name] = stored_hashes[name]
+    requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    requested_width, requested_height = _requested_frame_dimensions(item)
+    duration, size_params = requested_duration, {}
+    if use_blockout_reference and generate_blockout and model_catalog is None:
+        return False
+    try:
+        width, height = _resolve_frame_dimensions(item, item.get("start_image"))
+        _model, size_params, duration = _resolve_model_and_size(
+            model_catalog=model_catalog or {}, configured_model=configured_model,
+            width=width, height=height, duration=requested_duration,
+            requires_last_frame=bool(item.get("end_image")), seed=seed,
+        )
+    except Exception:
+        pass
+    attach_reference, reference = _should_attach_blockout_reference(
+        item, generate_blockout, use_blockout_reference, duration, size_params,
+    )
+    input_hash = _build_input_hash(
+        model_name=configured_model,
+        prompt_hash=_hash_text(str(item.get("video_prompt") or "").strip()),
+        source_image_hashes=source_hashes,
+        requested_duration=requested_duration,
+        requested_width=requested_width,
+        requested_height=requested_height,
+        seed=seed,
+        frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
+        reference_video_hash=_hash_source_image(reference) if attach_reference else None,
+    )
+    return job.get("original_input_hash") == input_hash
+
+
+def confirm_legacy_aitunnel_output_for_item(
+    item: Dict[str, Any], job_store: Optional[_ProviderJobStore], configured_model: str,
+    seed: Optional[int], language: str, *, model_catalog: Optional[Dict[str, Dict[str, Any]]] = None,
+    generate_blockout: bool = False, use_blockout_reference: bool = False,
+) -> bool:
+    """Migrate one legacy completed output only after its existing provider identity verifies."""
+    if not job_store:
+        return False
+    job = job_store.find_latest_output_job_for_shot(
+        _shot_key(item), str(item.get("video_path") or ""),
+    )
+    if not job or job.get("original_input_hash"):
+        return False
+    provider_prompt = _resolve_video_prompt(item, language)
+    if not trusted_aitunnel_output_for_item(
+        item, job_store, configured_model, seed, prompt=provider_prompt,
+        model_catalog=model_catalog, generate_blockout=generate_blockout,
+        use_blockout_reference=use_blockout_reference,
+    ):
+        return False
+    raw_prompt = str(item.get("video_prompt") or "").strip()
+    start_image, end_image = item.get("start_image"), item.get("end_image")
+    source_hashes = {"start_image": _hash_source_image(start_image), "end_image": _hash_source_image(end_image)}
+    for name, source_hash in source_hashes.items():
+        if source_hash is None and (job.get("source_image_hashes") or {}).get(name):
+            source_hashes[name] = job["source_image_hashes"][name]
+    duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
+    size_params: Dict[str, str] = {}
+    if use_blockout_reference and generate_blockout and model_catalog is None:
+        return False
+    try:
+        width, height = _resolve_frame_dimensions(item, start_image)
+        _unused_model, size_params, duration = _resolve_model_and_size(
+            model_catalog=model_catalog or {}, configured_model=configured_model,
+            width=width, height=height, duration=duration,
+            requires_last_frame=bool(end_image), seed=seed,
+        )
+    except Exception:
+        pass
+    attached, reference = _should_attach_blockout_reference(
+        item, generate_blockout, use_blockout_reference, duration, size_params,
+    )
+    requested_width, requested_height = _requested_frame_dimensions(item)
+    original_hash = _build_input_hash(
+        model_name=configured_model, prompt_hash=_hash_text(raw_prompt), source_image_hashes=source_hashes,
+        requested_duration=_parse_duration_from_timing(item.get("timing", "00:00 - 00:06")),
+        requested_width=requested_width, requested_height=requested_height, seed=seed,
+        frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
+        reference_video_hash=_hash_source_image(reference) if attached else None,
+    )
+    job_store.update_job(job["shot_key"], job["input_hash"], {"original_input_hash": original_hash, "original_prompt_language": language})
+    return True
+
+
+def _require_budget_for_new_video_submission(
+    deadline: Any,
+    video_step_started_at: Optional[float],
+    remaining_new_output_items: int = 1,
+    worker_count: int = 1,
+) -> None:
+    """Free output/task reuse is always allowed; this guard is only for a new paid POST."""
+    if deadline is None:
+        return
+    required_total_seconds = _minimum_remaining_video_budget_seconds(
+        max(0, remaining_new_output_items), 0, max(1, worker_count),
+    )
+    required_video_seconds = required_total_seconds - _STORYBOOK_VIDEO_TAIL_SECONDS
+    if deadline.remaining_seconds() < required_total_seconds:
+        raise RuntimeError("Недостаточно срока workflow для новой платной задачи видео")
+    if (
+        video_step_started_at is not None
+        and time.monotonic() - video_step_started_at + required_video_seconds
+        > _VIDEO_STEP_TIMEOUT_SECONDS
+    ):
+        raise RuntimeError("Недостаточно срока шага video_generator для новой платной задачи")
 
 
 def _parse_items_payload(items: Any) -> Tuple[List[Dict[str, Any]], Optional[str]]:
@@ -568,6 +856,10 @@ def _generate_single_video_aitunnel(
     job_store: Optional[_ProviderJobStore] = None,
     generate_blockout: bool = False,
     use_blockout_reference: bool = False,
+    deadline: Any = None,
+    video_step_started_at: Optional[float] = None,
+    remaining_new_output_items: int = 1,
+    worker_count: int = 1,
 ) -> Dict[str, Any]:
     del session_id
 
@@ -583,58 +875,63 @@ def _generate_single_video_aitunnel(
     # ниже). Предобъявлено, чтобы быть доступным и в except-обработчике.
     video_reference_rejected_reason: Optional[str] = None
 
-    try:
-        prompt = _resolve_video_prompt(item, language)
-        if not prompt:
-            raise ValueError("Пустой video_prompt")
-
-        prompt_hash = _hash_text(prompt)
-        source_image_hashes = {
-            "start_image": _hash_source_image(start_image),
-            "end_image": _hash_source_image(end_image),
+    if trusted_aitunnel_output_for_item(
+        item, job_store, configured_model, seed,
+        original_prompt=str(item.get("video_prompt") or "").strip(),
+        original_prompt_language=language,
+        model_catalog=model_catalog, generate_blockout=generate_blockout,
+        use_blockout_reference=use_blockout_reference,
+    ):
+        return {
+            "success": True, "video_path": video_path,
+            "scene_number": scene_number, "shot_number": shot_number,
+            "task_id": None, "video_url": None, "error": None,
+            "model": configured_model,
         }
+
+    confirmed_resume_job = None
+    if resumable_aitunnel_job_for_item(
+        item, job_store, configured_model, seed, language,
+        model_catalog=model_catalog, generate_blockout=generate_blockout,
+        use_blockout_reference=use_blockout_reference,
+    ):
+        confirmed_resume_job = job_store.find_latest_output_job_for_shot(shot_key, str(video_path))
+
+    try:
+        if confirmed_resume_job:
+            prompt = ""
+            prompt_hash = str(confirmed_resume_job["prompt_hash"])
+            source_image_hashes = dict(confirmed_resume_job.get("source_image_hashes") or {})
+        else:
+            prompt = _resolve_video_prompt(item, language)
+            if not prompt:
+                raise ValueError("Пустой video_prompt")
+            prompt_hash = _hash_text(prompt)
+            source_image_hashes = {
+                "start_image": _hash_source_image(start_image),
+                "end_image": _hash_source_image(end_image),
+            }
         output_exists = _is_non_empty_file(str(video_path or ""))
         trusted_output_job = (
             job_store.find_latest_output_job_for_shot(shot_key, str(video_path))
-            if job_store and output_exists
+            if job_store
             else None
         )
         trusted_source_hashes = trusted_output_job.get("source_image_hashes") if trusted_output_job else {}
-        missing_trusted_source_hash = any(
-            source_image_hashes.get(name) is None and bool((trusted_source_hashes or {}).get(name))
-            for name in source_image_hashes
-        )
-        if trusted_output_job and missing_trusted_source_hash:
-            job_store.update_job(
-                trusted_output_job["shot_key"],
-                trusted_output_job["input_hash"],
-                {
-                    "status": "downloaded",
-                    "output_path": str(video_path),
-                    "error": None,
-                },
-                "downloaded_at",
-            )
-            return {
-                "success": True,
-                "video_path": video_path,
-                "scene_number": scene_number,
-                "shot_number": shot_number,
-                "task_id": trusted_output_job.get("task_id"),
-                "video_url": trusted_output_job.get("video_url"),
-                "error": None,
-                "model": trusted_output_job.get("model") or configured_model,
-                "cost_rub": trusted_output_job.get("cost") if trusted_output_job.get("currency") == "RUB" else None,
-                "cost": trusted_output_job.get("cost"),
-                "currency": trusted_output_job.get("currency"),
-            }
+        # An already downloaded clip remains usable when an image was cleaned up
+        # after its provider job was recorded.  Reuse only that image's recorded
+        # digest; the input hash below still compares every other current input.
+        for name, source_hash in source_image_hashes.items():
+            if source_hash is None and (trusted_source_hashes or {}).get(name):
+                source_image_hashes[name] = trusted_source_hashes[name]
         requested_duration = _parse_duration_from_timing(item.get("timing", "00:00 - 00:06"))
         requested_width, requested_height = _requested_frame_dimensions(item)
-        frame_types = ["first_frame"] + (["last_frame"] if end_image else [])
+        frame_types = ["first_frame"] + (["last_frame"] if source_image_hashes["end_image"] else [])
         model_name = configured_model
         size_params: Dict[str, str] = {}
         duration = requested_duration
 
+        can_resume_without_frames = bool(confirmed_resume_job)
         try:
             width, height = _resolve_frame_dimensions(item, start_image)
             model_name, size_params, duration = _resolve_model_and_size(
@@ -647,7 +944,7 @@ def _generate_single_video_aitunnel(
                 seed=seed,
             )
         except Exception:
-            if not output_exists:
+            if not output_exists and not can_resume_without_frames:
                 raise
 
         # Раздел 11.3: подавать ли ролик болванки видео-референсом. Пять условий
@@ -667,17 +964,32 @@ def _generate_single_video_aitunnel(
         # shots — now with an explicit P16 warning + shot list instead of silently.
         # Э8 (раздел 11.3): reference_video_hash входит в словарь только когда референс
         # действительно подан — иначе состав словаря и хеш остаются прежними (A31/A37).
-        input_hash = _build_input_hash(
-            model_name=configured_model,
-            prompt_hash=prompt_hash,
-            source_image_hashes=source_image_hashes,
-            requested_duration=requested_duration,
-            requested_width=requested_width,
-            requested_height=requested_height,
-            seed=seed,
-            frame_types=frame_types,
-            reference_video_hash=reference_video_hash,
-        )
+        if confirmed_resume_job:
+            input_hash = str(confirmed_resume_job["input_hash"])
+            original_input_hash = str(confirmed_resume_job["original_input_hash"])
+        else:
+            input_hash = _build_input_hash(
+                model_name=configured_model,
+                prompt_hash=prompt_hash,
+                source_image_hashes=source_image_hashes,
+                requested_duration=requested_duration,
+                requested_width=requested_width,
+                requested_height=requested_height,
+                seed=seed,
+                frame_types=frame_types,
+                reference_video_hash=reference_video_hash,
+            )
+            original_input_hash = _build_input_hash(
+                model_name=configured_model,
+                prompt_hash=_hash_text(str(item.get("video_prompt") or "").strip()),
+                source_image_hashes=source_image_hashes,
+                requested_duration=requested_duration,
+                requested_width=requested_width,
+                requested_height=requested_height,
+                seed=seed,
+                frame_types=frame_types,
+                reference_video_hash=reference_video_hash,
+            )
 
         if job_store:
             job_store.mark_stale_for_changed_input(shot_key, input_hash)
@@ -695,13 +1007,19 @@ def _generate_single_video_aitunnel(
                     resolved_duration=duration,
                     video_reference=reference_video_path,
                     video_reference_rejected_reason=video_reference_rejected_reason,
+                    original_input_hash=original_input_hash,
+                    original_prompt_language=language,
                 )
             )
         else:
             existing_job = None
             has_prior_job_for_shot = False
 
-        if output_exists and (not job_store or existing_job or not has_prior_job_for_shot):
+        if output_exists and (
+            not job_store
+            or (existing_job and existing_job.get("status") == "downloaded")
+            or not has_prior_job_for_shot
+        ):
             if job_store:
                 job_store.update_job(
                     shot_key,
@@ -730,23 +1048,6 @@ def _generate_single_video_aitunnel(
                 "currency": None,
                 "video_reference_rejected_reason": video_reference_rejected_reason,
             }
-
-        frame_images = [_build_frame_image_payload(start_image, "first_frame")]
-        if end_image:
-            frame_images.append(_build_frame_image_payload(end_image, "last_frame"))
-
-        payload: Dict[str, Any] = {
-            "model": model_name,
-            "prompt": prompt,
-            "duration": duration,
-            "frame_images": frame_images,
-            "generate_audio": False,
-        }
-        payload.update(size_params)
-        if seed is not None:
-            payload["seed"] = seed
-        if reference_video_path:
-            payload["reference_video"] = _build_reference_video_payload(reference_video_path)
 
         video_dir = os.path.dirname(video_path)
         if video_dir:
@@ -844,6 +1145,27 @@ def _generate_single_video_aitunnel(
                         "submitted_at",
                     )
             else:
+                frame_images = [_build_frame_image_payload(start_image, "first_frame")]
+                if end_image:
+                    frame_images.append(_build_frame_image_payload(end_image, "last_frame"))
+                payload: Dict[str, Any] = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "duration": duration,
+                    "frame_images": frame_images,
+                    "generate_audio": False,
+                }
+                payload.update(size_params)
+                if seed is not None:
+                    payload["seed"] = seed
+                if reference_video_path:
+                    payload["reference_video"] = _build_reference_video_payload(reference_video_path)
+                _require_budget_for_new_video_submission(
+                    deadline,
+                    video_step_started_at,
+                    remaining_new_output_items,
+                    worker_count,
+                )
                 if job_store:
                     job_store.update_job(
                         shot_key,
@@ -992,8 +1314,11 @@ def _generate_single_video_aitunnel(
 
 
 def _resolve_video_prompt(item: Dict[str, Any], language: str) -> str:
+    prompt = str(item.get("video_prompt", "") or "").strip()
+    if item.get(_PREPARED_ENGLISH_VIDEO_PROMPT_KEY) == prompt:
+        return prompt
     if language == "en" or translate_prompts_in_items is None:
-        return str(item.get("video_prompt", "") or "").strip()
+        return prompt
 
     translated_item = translate_prompts_in_items(item, "en")
     return str(translated_item.get("video_prompt", item.get("video_prompt", "")) or "").strip()

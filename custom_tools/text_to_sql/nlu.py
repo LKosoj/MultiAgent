@@ -147,7 +147,11 @@ class NLUProcessor:
         )
         system_prompt = (
             "Ты выделяешь только смысловые элементы запроса Text-to-SQL "
-            "без привязки к схеме. Верни только JSON."
+            "без привязки к схеме. Верни только JSON. normalized_meaning "
+            "всегда должен быть непустой JSON-строкой или null; числа, "
+            "boolean, массивы и объекты запрещены. Если operator или "
+            "literal_or_reference отсутствует, указывай JSON null без кавычек; "
+            'строка "null" не означает отсутствующее значение.'
         )
         max_tokens = _nlu_max_tokens("query_understanding_max_tokens")
         response = call_openai_api(

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
 import inspect
 import json
 import logging
@@ -16,6 +15,8 @@ from typing import Awaitable, Literal
 import uuid
 
 from pydantic import ValidationError
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError, TokenError
 
 from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
 from workflow.adaptive_research_state_store import (
@@ -40,7 +41,6 @@ from ..utils import get_table_columns
 from .decision_resolver import (
     DecisionExecutionError,
     DecisionResolverError,
-    DuplicateExistingBindingProposalError,
     DuplicateResearchActionError,
     ResolvedResearchDecision,
     UnresolvableModelDecisionError,
@@ -54,7 +54,9 @@ from .models import (
     BudgetState,
     ColumnRef,
     DiscriminatorValueBinding,
+    DocumentRef,
     DerivedExpressionBinding,
+    EvidenceSourceKind,
     EvidenceRecord,
     JoinCandidate,
     JoinCandidateStatus,
@@ -65,6 +67,7 @@ from .models import (
     ResearchActionKind,
     ResearchState,
     ResearchStopReason,
+    SemanticItem,
     SemanticItemKind,
     SemanticItemStatus,
     TableRef,
@@ -78,20 +81,23 @@ from .policy import (
     validate_state_model_budget_policy,
 )
 from .probes import ProbeResult, ProbeStatus, deserialize_probe_result
-from .provenance import parse_probe_observation
+from .provenance import MalformedProvenanceError, parse_probe_observation
 from .replay_inputs import (
     ResearchSemanticReplayInput,
     ResearchTerminalReplayInput,
 )
 from .research_decision import (
     BindingAssessment,
+    DerivedExpressionCandidate,
     ExistingBindingRef,
     ExistingHypothesisRef,
     ExistingJoinRef,
     ExecuteResearchProbeIntent,
     HypothesisAssessment,
     JoinAssessment,
+    LogicalColumnRef,
     NewBindingProposal,
+    PhysicalColumnCandidate,
     ProposedHypothesisRef,
     ResearchDecisionV1,
     SemanticCommitRequest,
@@ -149,6 +155,75 @@ logger = logging.getLogger(__name__)
 _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS = 5
 _MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS = 2
 _MAX_REPEATED_MODEL_REJECTIONS_WITHOUT_PROGRESS = 2
+_BINDING_ID_IN_HINT = re.compile(r"\bbinding:[A-Za-z0-9][A-Za-z0-9._:-]*")
+_SOURCE_ID_IN_HINT = re.compile(r"\bsemantic:[A-Za-z0-9][A-Za-z0-9._:-]*")
+
+
+def _validated_stop_review_hint(hint: str, state: ResearchState) -> str:
+    """Do not let an advisory hint override durable identifiers."""
+
+    durable_binding_ids = {binding.binding_id for binding in state.bindings}
+    durable_source_ids = {
+        item.source_id for item in state.query_spec.semantic_items
+    }
+
+    def replace_unknown_binding(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        if candidate in durable_binding_ids:
+            return candidate
+        without_sentence_punctuation = candidate.rstrip(".,;!?")
+        if without_sentence_punctuation in durable_binding_ids:
+            return candidate
+        return "the exact durable binding_id for the affected source_id"
+
+    validated_hint = _BINDING_ID_IN_HINT.sub(
+        replace_unknown_binding,
+        hint,
+    )
+
+    def replace_unknown_source(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        if candidate in durable_source_ids:
+            return candidate
+        without_sentence_punctuation = candidate.rstrip(".,;!?")
+        if without_sentence_punctuation in durable_source_ids:
+            return candidate
+        return "the exact durable source_id for the affected semantic item"
+
+    validated_hint = _SOURCE_ID_IN_HINT.sub(replace_unknown_source, validated_hint)
+    durable_evidence_ids = {record.evidence_id for record in state.evidence}
+    assessment_binding_ids = {
+        binding_id
+        for item in state.query_spec.semantic_items
+        if item.required and item.status is not SemanticItemStatus.RESOLVED
+        for binding_id in item.binding_ids
+    }
+    physical_candidates = [
+        {
+            "binding_id": binding.binding_id,
+            "evidence_ids": sorted(
+                evidence_id
+                for evidence_id in binding.evidence_ids
+                if evidence_id in durable_evidence_ids
+            ),
+        }
+        for binding in state.bindings
+        if isinstance(binding, PhysicalColumnBinding)
+        and binding.status is BindingStatus.CANDIDATE
+        and binding.binding_id in assessment_binding_ids
+        and any(
+            evidence_id in durable_evidence_ids
+            for evidence_id in binding.evidence_ids
+        )
+    ]
+    if not physical_candidates:
+        return validated_hint
+    return (
+        f"{validated_hint} Use binding_assessment, not new_binding, for these "
+        "existing CANDIDATE bindings, citing only their listed durable evidence_ids: "
+        f"{json.dumps(physical_candidates, ensure_ascii=False, separators=(',', ':'))}. "
+        "do not create a replacement binding."
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -197,6 +272,7 @@ class _ResearchLoopCoordinator:
         model_owner_token_factory: Callable[[], str],
         model_wait: Callable[[float], Awaitable[None]] | None,
         semantic_repair_continuation: bool = False,
+        exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
         stop_review_model: SchemaResearchDecisionModel | None = None,
     ) -> None:
         self._initial_state = _revalidate_state(initial_state)
@@ -219,12 +295,14 @@ class _ResearchLoopCoordinator:
         self._model_owner_token_factory = model_owner_token_factory
         self._model_wait = model_wait or self._wait_for_model_follower
         self._semantic_repair_continuation = semantic_repair_continuation
+        self._exact_formula_documents = exact_formula_documents
         self._latest_state = self._initial_state
         self._model_stagnation_signatures: tuple[tuple[str, str], ...] = ()
         self._pending_rejected_preflight_assessments: tuple[
             dict[str, object], ...
         ] = ()
         self._pending_stop_review_hint: str | None = None
+        self._last_stop_review_hint: str | None = None
 
     async def run(self) -> ResearchLoopOutcome:
         state, failed = self._load_or_save_initial()
@@ -249,7 +327,11 @@ class _ResearchLoopCoordinator:
                 continue_unbound_formula = (
                     self._semantic_repair_continuation
                     and terminal["reason"] == ResearchStopReason.COMPLETE.value
-                    and _has_pending_required_formula_continuation(state)
+                    and _has_pending_required_formula_continuation(
+                        state,
+                        self._freshness_context,
+                        self._exact_formula_documents,
+                    )
                 )
                 if continue_unbound_formula:
                     snapshot = replace(snapshot, terminal=None)
@@ -365,9 +447,7 @@ class _ResearchLoopCoordinator:
                     authority_reason,
                     affected_source_ids=authority.affected_source_ids,
                 )
-            terminal_freshness_context = _terminal_freshness_context(
-                self._freshness_context
-            )
+            terminal_freshness_context = self._freshness_context
             terminal_authority = evaluate_research_generation_authority(
                 state,
                 terminal_freshness_context,
@@ -384,7 +464,14 @@ class _ResearchLoopCoordinator:
             if terminal_reason is ResearchStopReason.COMPLETE:
                 pending_formula_continuation = (
                     self._semantic_repair_continuation
-                    and _has_pending_required_formula_continuation(state)
+                    and (
+                        _has_pending_required_formula_continuation(
+                            state,
+                            self._freshness_context,
+                            self._exact_formula_documents,
+                        )
+                        or _has_unbound_latest_probe_evidence(state)
+                    )
                 )
                 selected_binding_ids = {
                     binding_id
@@ -402,9 +489,21 @@ class _ResearchLoopCoordinator:
                         terminal_reason,
                         freshness_context=terminal_freshness_context,
                     )
-            if _consecutive_non_novel(self._checkpoint_store, state) >= 3:
+            if _consecutive_non_novel(self._checkpoint_store, state) >= 2:
                 if self._pending_stop_review_hint is None:
-                    context = self._research_context(state, ())
+                    generation_authority = None
+                    if (
+                        not terminal_authority.allowed
+                        and terminal_reason is None
+                    ):
+                        assert terminal_authority.reason is not None
+                        generation_authority = (
+                            terminal_authority.reason,
+                            tuple(sorted(terminal_authority.affected_source_ids)),
+                        )
+                    context = self._research_context(
+                        state, (), (), (), generation_authority
+                    )
                     hint, _ = await self._review_stop(
                         state,
                         ResearchStopReason.STAGNATED,
@@ -797,6 +896,53 @@ class _ResearchLoopCoordinator:
             if reason is not None:
                 return None, reason, None
             if captured is not None:
+                pending_formula_continuation_source_ids: tuple[str, ...] = ()
+                if (
+                    isinstance(captured.next, StopRequest)
+                    and captured.next.reason == "complete"
+                    and self._semantic_repair_continuation
+                ):
+                    pending_formula_continuation_source_ids = (
+                        _pending_required_formula_continuation_source_ids(
+                            state,
+                            self._freshness_context,
+                            self._exact_formula_documents,
+                        )
+                    )
+                complete_repair_pending = (
+                    bool(pending_formula_continuation_source_ids)
+                )
+                if not complete_repair_pending:
+                    captured = _normalize_complete_stop_citations(
+                        state,
+                        captured,
+                        self._freshness_context,
+                    )
+                if (
+                    isinstance(captured.next, ToolIntent)
+                    and isinstance(
+                        captured.next.intent, ExecuteResearchProbeIntent
+                    )
+                    and state.budget_state.remaining_rows > 0
+                ):
+                    runtime = self._registry.context.data_runtime
+                    dsn = getattr(runtime, "dsn", None)
+                    get_plugin = getattr(runtime, "get_plugin", None)
+                    if get_plugin is None:
+                        from db_plugins import get_plugin as default_get_plugin
+
+                        get_plugin = default_get_plugin
+                    if type(dsn) is str and callable(get_plugin):
+                        try:
+                            captured = _cap_execute_research_probe_limit(
+                                captured,
+                                maximum_row_limit=(
+                                    state.budget_state.remaining_rows
+                                ),
+                                dialect=dialect_for_plugin(get_plugin(dsn)),
+                            )
+                        except ResearchQueryAdmissionError:
+                            pass
                 invalid_stop_generation_authority = None
                 if isinstance(captured.next, StopRequest):
                     if captured.proposals:
@@ -815,21 +961,37 @@ class _ResearchLoopCoordinator:
                         continue
                     stop_freshness_context = self._freshness_context
                     if _model_stop_reason(captured) is ResearchStopReason.COMPLETE:
-                        stop_freshness_context = _terminal_freshness_context(
-                            self._freshness_context
-                        )
-                    if (
+                        stop_freshness_context = self._freshness_context
+                    if complete_repair_pending or (
                         _validate_model_stop(
                             state, captured, stop_freshness_context
                         )
                         is ResearchStopReason.PROTOCOL_FAILURE
                     ):
                         invalid_stop_generation_authority = (
-                            _invalid_complete_generation_authority(
+                            (
+                                CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
+                                pending_formula_continuation_source_ids,
+                            )
+                            if complete_repair_pending
+                            else _invalid_complete_generation_authority(
                                 state, captured, stop_freshness_context
                             )
                         )
                         if reject_model_decision("INVALID_STOP", "invalid_stop"):
+                            if invalid_stop_generation_authority is not None:
+                                try:
+                                    context = self._research_context(
+                                        state,
+                                        validation_feedbacks,
+                                        rejected_duplicate_actions,
+                                        rejected_preflight_assessments,
+                                        invalid_stop_generation_authority,
+                                    )
+                                except BudgetAdmissionError:
+                                    return None, ResearchStopReason.BUDGET_EXHAUSTED, None
+                                except Exception:
+                                    return None, ResearchStopReason.PROTOCOL_FAILURE, None
                             stop_review_hint, attempt = await self._review_stop(
                                 state,
                                 ResearchStopReason.STAGNATED,
@@ -893,6 +1055,23 @@ class _ResearchLoopCoordinator:
                         self._preflight_model_decision(state, captured)
                     )
                     if preflight_feedback is not None:
+                        if (
+                            preflight_feedback == "DUPLICATE_ACTION"
+                            and captured.proposals
+                        ):
+                            proposal_commit = captured.model_copy(
+                                update={"next": SemanticCommitRequest()}
+                            )
+                            fallback_feedback, fallback_reason, _, _ = (
+                                self._preflight_model_decision(
+                                    state, proposal_commit
+                                )
+                            )
+                            if fallback_feedback is None:
+                                if fallback_reason is not None:
+                                    return None, fallback_reason, None
+                                decision = proposal_commit
+                                break
                         baseline = _proposal_free_tool_baseline(captured)
                         if (
                             preflight_feedback == "UNRESOLVABLE_PREFLIGHT"
@@ -1018,6 +1197,22 @@ class _ResearchLoopCoordinator:
         limits = self._policy.model_budget
         assert limits is not None
         reason_text = reason.value
+        if self._last_stop_review_hint is not None:
+            try:
+                context_payload = json.loads(context)
+            except json.JSONDecodeError:
+                context_payload = None
+            if isinstance(context_payload, dict):
+                context_payload["previous_stop_review_hint"] = (
+                    self._last_stop_review_hint
+                )
+                context = json.dumps(
+                    context_payload,
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
         if reason is ResearchStopReason.STAGNATED and self._model_stagnation_signatures:
             reason_text += ":" + json.dumps(
                 self._model_stagnation_signatures,
@@ -1080,7 +1275,9 @@ class _ResearchLoopCoordinator:
             return None, attempt + 1
         if captured is None or captured.decision == "stop_confirmed":
             return None, attempt + 1
-        return captured.hint, attempt + 1
+        hint = _validated_stop_review_hint(captured.hint, state)
+        self._last_stop_review_hint = hint
+        return hint, attempt + 1
 
     def _stop_review_used_for_revision(self, state: ResearchState) -> bool:
         prefix = f"research-stop-review-{state.revision}-"
@@ -1188,11 +1385,6 @@ class _ResearchLoopCoordinator:
                     decision,
                     self._freshness_context,
                     self._preflight_requested_action(state, decision),
-                    duplicate_existing_binding_ids_by_proposal_key=(
-                        error.existing_binding_ids_by_proposal_key
-                        if isinstance(error, DuplicateExistingBindingProposalError)
-                        else ()
-                    ),
                     exact_column=error.exact_column,
                     loaded_schema=self._loaded_schema,
                 ),
@@ -1533,7 +1725,11 @@ class _ResearchLoopCoordinator:
                     self._semantic_repair_continuation
                     and stored_terminal["reason"]
                     == ResearchStopReason.COMPLETE.value
-                    and _has_pending_required_formula_continuation(state)
+                    and _has_pending_required_formula_continuation(
+                        state,
+                        self._freshness_context,
+                        self._exact_formula_documents,
+                    )
                 )
                 if not continue_unbound_formula:
                     stored_freshness_context = (
@@ -1608,7 +1804,11 @@ class _ResearchLoopCoordinator:
             terminal = _terminal_envelope(snapshot.terminal.action, state)
             if not (
                 terminal["reason"] == ResearchStopReason.COMPLETE.value
-                and _has_pending_required_formula_continuation(state)
+                and _has_pending_required_formula_continuation(
+                    state,
+                    self._freshness_context,
+                    self._exact_formula_documents,
+                )
             ):
                 return key
             return replace(key, revision=key.revision + 1)
@@ -1627,7 +1827,11 @@ class _ResearchLoopCoordinator:
             return key
         terminal = _terminal_envelope(snapshot.terminal.action, state)
         if terminal["reason"] != ResearchStopReason.COMPLETE.value or not (
-            _has_pending_required_formula_continuation(state)
+            _has_pending_required_formula_continuation(
+                state,
+                self._freshness_context,
+                self._exact_formula_documents,
+            )
         ):
             return key
         return replace(key, revision=key.revision + 1)
@@ -1717,6 +1921,7 @@ async def run_research_loop(
     model_owner_token_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
     model_wait: Callable[[float], Awaitable[None]] | None = None,
     semantic_repair_continuation: bool = False,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
     stop_review_model: SchemaResearchDecisionModel | None = None,
 ) -> ResearchLoopOutcome:
     """Run private schema research coordination without taking SQL authority."""
@@ -1741,6 +1946,7 @@ async def run_research_loop(
         model_owner_token_factory=model_owner_token_factory,
         model_wait=model_wait,
         semantic_repair_continuation=semantic_repair_continuation,
+        exact_formula_documents=exact_formula_documents,
         stop_review_model=stop_review_model,
     )
     try:
@@ -1751,21 +1957,229 @@ async def run_research_loop(
         )
 
 
-def _has_pending_required_formula_continuation(state: ResearchState) -> bool:
-    formula_source_ids = {
+def _has_pending_required_formula_continuation(
+    state: ResearchState,
+    freshness_context: FreshnessContext,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
+) -> bool:
+    return bool(
+        _pending_required_formula_continuation_source_ids(
+            state, freshness_context, exact_formula_documents
+        )
+    )
+
+
+def _pending_required_formula_continuation_source_ids(
+    state: ResearchState,
+    freshness_context: FreshnessContext,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
+) -> tuple[str, ...]:
+    bindings_by_id = {binding.binding_id: binding for binding in state.bindings}
+    source_ids = {
         item.source_id
         for item in state.query_spec.semantic_items
-        if item.required and item.kind is SemanticItemKind.FORMULA
+        if item.required
+        and item.kind is SemanticItemKind.FORMULA
+        and (
+            not item.binding_ids
+            or any(
+                bindings_by_id.get(binding_id, None) is not None
+                and bindings_by_id[binding_id].status is BindingStatus.CANDIDATE
+                for binding_id in item.binding_ids
+            )
+        )
+    }
+    source_ids.update(
+        _exact_document_formula_continuation_source_ids(state, freshness_context)
+    )
+    source_ids.update(
+        _runtime_exact_formula_continuation_source_ids(
+            state, exact_formula_documents
+        )
+    )
+    return tuple(sorted(source_ids))
+
+
+def _runtime_exact_formula_continuation_source_ids(
+    state: ResearchState,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...],
+) -> tuple[str, ...]:
+    """Return supplied exact formulas lacking their selected derived binding."""
+
+    documents_by_source = dict(exact_formula_documents)
+    bindings_by_id = {binding.binding_id: binding for binding in state.bindings}
+    source_ids: list[str] = []
+    for item in state.query_spec.semantic_items:
+        if not item.required or item.kind is not SemanticItemKind.FORMULA:
+            continue
+        document = documents_by_source.get(item.source_id)
+        formula = _formula_part(item.normalized_meaning)
+        if document is None or formula is None:
+            continue
+        selected = _selected_exact_formula_binding_matches_document(
+            item, bindings_by_id, document
+        )
+        if selected is not None:
+            if selected:
+                continue
+            source_ids.append(item.source_id)
+            continue
+        if any(
+            isinstance(binding := bindings_by_id.get(binding_id), DerivedExpressionBinding)
+            and binding.status is BindingStatus.SUPPORTED
+            and binding.validator_rule == "semantic-certificate:v1:derived_expression"
+            and binding.document == document
+            and _formula_part(binding.expression.expression) == formula
+            for binding_id in item.binding_ids
+        ):
+            continue
+        source_ids.append(item.source_id)
+    return tuple(sorted(source_ids))
+
+
+def _exact_document_formula_continuation_source_ids(
+    state: ResearchState,
+    freshness_context: FreshnessContext,
+) -> tuple[str, ...]:
+    """Return required exact document formulas lacking their selected derived binding."""
+
+    bindings_by_id = {binding.binding_id: binding for binding in state.bindings}
+    source_ids: list[str] = []
+    for item in state.query_spec.semantic_items:
+        if not item.required or item.kind is not SemanticItemKind.FORMULA:
+            continue
+        formula = _formula_part(item.normalized_meaning)
+        if formula is None:
+            continue
+        documents = {
+            (evidence.target.document_id, evidence.target.namespace)
+            for evidence in state.evidence
+            if evidence.source_kind is EvidenceSourceKind.DOCUMENT
+            and isinstance(evidence.target, DocumentRef)
+            and evaluate_evidence_freshness(evidence, freshness_context).status
+            is FreshnessStatus.FRESH
+            and (observation := parse_probe_observation(evidence.observation)) is not None
+            and isinstance(observation.payload, dict)
+            and isinstance(content := observation.payload.get("content"), str)
+            and formula in "".join(content.split())
+        }
+        if len(documents) != 1:
+            continue
+        document_id, namespace = next(iter(documents))
+        selected = _selected_exact_formula_binding_matches_document(
+            item,
+            bindings_by_id,
+            DocumentRef(document_id=document_id, namespace=namespace),
+        )
+        if selected is not None:
+            if selected:
+                continue
+            source_ids.append(item.source_id)
+            continue
+        if any(
+            isinstance(binding := bindings_by_id.get(binding_id), DerivedExpressionBinding)
+            and binding.status is BindingStatus.SUPPORTED
+            and binding.validator_rule == "semantic-certificate:v1:derived_expression"
+            and binding.document.document_id == document_id
+            and binding.document.namespace == namespace
+            and _formula_part(binding.expression.expression) == formula
+            for binding_id in item.binding_ids
+        ):
+            continue
+        source_ids.append(item.source_id)
+    return tuple(sorted(source_ids))
+
+
+def _selected_exact_formula_binding_matches_document(
+    item: SemanticItem,
+    bindings_by_id: Mapping[str, object],
+    document: DocumentRef,
+) -> bool | None:
+    """Return whether a selected exact formula binding matches its trusted document."""
+
+    if item.exact_formula_binding_id is None:
+        return None
+    binding = bindings_by_id.get(item.exact_formula_binding_id)
+    formula = _formula_part(item.normalized_meaning)
+    return (
+        isinstance(binding, DerivedExpressionBinding)
+        and binding.status is BindingStatus.SUPPORTED
+        and binding.source_id == item.source_id
+        and binding.validator_rule == "semantic-certificate:v1:derived_expression"
+        and binding.document == document
+        and formula is not None
+        and _formula_part(binding.expression.expression) == formula
+    )
+
+
+def _formula_part(value: str | None) -> str | None:
+    """Return the whitespace-normalized exact formula before explanatory text."""
+
+    if value is None:
+        return None
+    depth = 0
+    quote: str | None = None
+    index = 0
+    formula_end = len(value)
+    equals_index: int | None = None
+    while index < formula_end:
+        character = value[index]
+        if quote is not None:
+            if character == quote:
+                if index + 1 < formula_end and value[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if character in "'\"":
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif depth == 0 and character == ";":
+            formula_end = index
+            break
+        elif depth == 0 and character == "=" and equals_index is None:
+            equals_index = index
+        index += 1
+    formula = value[:formula_end].strip()
+    if equals_index is not None:
+        left = value[:equals_index].strip()
+        right = value[equals_index + 1 : formula_end].strip()
+        try:
+            expressions = parse(left)
+        except (ParseError, TokenError, ValueError):
+            expressions = ()
+        if right and (len(expressions) != 1 or isinstance(expressions[0], exp.Alias)):
+            formula = right
+    formula = "".join(formula.split())
+    return formula or None
+
+
+def _has_unbound_latest_probe_evidence(state: ResearchState) -> bool:
+    if not any(
+        item.required and item.kind is SemanticItemKind.FORMULA
+        for item in state.query_spec.semantic_items
+    ) or not state.action_history:
+        return False
+    latest_action = state.action_history[-1]
+    if latest_action.kind is ResearchActionKind.SEMANTIC_COMMIT:
+        return False
+    bound_evidence_ids = {
+        evidence_id
+        for binding in state.bindings
+        for evidence_id in binding.evidence_ids
+    } | {
+        evidence_id
+        for join in state.join_candidates
+        for evidence_id in join.evidence_ids
     }
     return any(
-        item.required
-        and item.kind is SemanticItemKind.FORMULA
-        and not item.binding_ids
-        for item in state.query_spec.semantic_items
-    ) or any(
-        binding.status is BindingStatus.CANDIDATE
-        and binding.source_id in formula_source_ids
-        for binding in state.bindings
+        evidence.action_digest == latest_action.action_digest
+        and evidence.evidence_id not in bound_evidence_ids
+        for evidence in state.evidence
     )
 
 
@@ -1865,6 +2279,7 @@ def _normalize_model_source_ids(
     source_ids = tuple(
         item.source_id for item in state.query_spec.semantic_items
     )
+    binding_ids = tuple(binding.binding_id for binding in state.bindings)
     proposals = []
     changed = False
     for proposal in decision.proposals:
@@ -1872,21 +2287,220 @@ def _normalize_model_source_ids(
             matches = tuple(
                 source_id
                 for source_id in source_ids
-                if len(source_id) == len(proposal.source_id)
-                and sum(
-                    left != right
-                    for left, right in zip(source_id, proposal.source_id, strict=True)
-                )
-                == 1
+                if _edit_distance_one(source_id, proposal.source_id)
             )
             if len(matches) == 1:
                 proposal = proposal.model_copy(update={"source_id": matches[0]})
                 changed = True
+        if (
+            isinstance(proposal, BindingAssessment)
+            and isinstance(proposal.subject, ExistingBindingRef)
+            and proposal.subject.binding_id not in binding_ids
+        ):
+            matches = tuple(
+                binding_id
+                for binding_id in binding_ids
+                if _edit_distance_one(binding_id, proposal.subject.binding_id)
+            )
+            if len(matches) == 1:
+                proposal = proposal.model_copy(
+                    update={"subject": ExistingBindingRef(binding_id=matches[0])}
+                )
+                changed = True
+        normalized = _normalize_physical_column_citation(state, proposal)
+        if normalized is not proposal:
+            proposal = normalized
+            changed = True
+        normalized = _normalize_derived_expression_citation(state, proposal)
+        if normalized is not proposal:
+            proposal = normalized
+            changed = True
+        normalized = _normalize_existing_binding_assessment_citation(state, proposal)
+        if normalized is not proposal:
+            proposal = normalized
+            changed = True
         proposals.append(proposal)
     if not changed:
         return _canonicalize_unknown_binding_assessment_reference(state, decision)
     return _canonicalize_unknown_binding_assessment_reference(
         state, decision.model_copy(update={"proposals": tuple(proposals)})
+    )
+
+
+def _edit_distance_one(left: str, right: str) -> bool:
+    if abs(len(left) - len(right)) > 1 or left == right:
+        return False
+    if len(left) == len(right):
+        return sum(first != second for first, second in zip(left, right, strict=True)) == 1
+    longer, shorter = (left, right) if len(left) > len(right) else (right, left)
+    index = 0
+    while index < len(shorter) and longer[index] == shorter[index]:
+        index += 1
+    return longer[index + 1 :] == shorter[index:]
+
+
+def _normalize_physical_column_citation(
+    state: ResearchState,
+    proposal: object,
+) -> object:
+    if (
+        not isinstance(proposal, NewBindingProposal)
+        or not isinstance(proposal.candidate, PhysicalColumnCandidate)
+        or len(proposal.citation_evidence_ids) != 1
+        or proposal.citation_evidence_ids[0]
+        in {evidence.evidence_id for evidence in state.evidence}
+    ):
+        return proposal
+    logical = proposal.candidate.physical_column
+    matches = tuple(
+        evidence.evidence_id
+        for evidence in state.evidence
+        if isinstance(evidence.target, ColumnRef)
+        and evidence.target.column == logical.column
+        and logical.table
+        in {
+            evidence.target.table.table,
+            _logical_table_name(evidence.target.table),
+        }
+    )
+    if len(matches) != 1:
+        return proposal
+    return proposal.model_copy(update={"citation_evidence_ids": matches})
+
+
+def _normalize_derived_expression_citation(
+    state: ResearchState,
+    proposal: object,
+) -> object:
+    if (
+        not isinstance(proposal, NewBindingProposal)
+        or not isinstance(proposal.candidate, DerivedExpressionCandidate)
+    ):
+        return proposal
+    durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
+    known = tuple(
+        evidence_id
+        for evidence_id in proposal.citation_evidence_ids
+        if evidence_id in durable_evidence_ids
+    )
+    unknown = tuple(
+        evidence_id
+        for evidence_id in proposal.citation_evidence_ids
+        if evidence_id not in durable_evidence_ids
+    )
+    if len(unknown) != 1:
+        return proposal
+    try:
+        candidates = tuple(
+            sorted(
+                evidence.evidence_id
+                for evidence in state.evidence
+                if evidence.evidence_id not in known
+                and any(
+                    _evidence_observes_exact_derived_input_column(
+                        evidence, input_column
+                    )
+                    for input_column in proposal.candidate.input_columns
+                )
+            )
+        )
+    except (ExactValueCertificateError, MalformedProvenanceError):
+        return proposal
+    if len(candidates) != 1:
+        return proposal
+    return proposal.model_copy(
+        update={"citation_evidence_ids": tuple(sorted((*known, candidates[0])))}
+    )
+
+
+def _evidence_observes_exact_derived_input_column(
+    evidence: EvidenceRecord,
+    input_column: LogicalColumnRef,
+) -> bool:
+    if isinstance(evidence.target, ColumnRef):
+        return (
+            input_column.column == evidence.target.column
+            and input_column.table
+            in {
+                evidence.target.table.table,
+                _logical_table_name(evidence.target.table),
+            }
+            and evidence_observes_exact_column(evidence, evidence.target)
+        )
+    if (
+        not isinstance(evidence.target, TableRef)
+        or evidence.source_kind is not EvidenceSourceKind.SCHEMA
+        or input_column.table
+        not in {
+            evidence.target.table,
+            _logical_table_name(evidence.target),
+        }
+    ):
+        return False
+    observation = parse_probe_observation(evidence.observation)
+    if observation is None or not isinstance(observation.payload, dict):
+        return False
+    columns = observation.payload.get("columns")
+    return (
+        observation.provenance.probe_kind is ResearchActionKind.INSPECT_TABLE
+        and observation.payload.get("status") == "matched"
+        and observation.payload.get("table")
+        == evidence.target.model_dump(mode="json", by_alias=True)
+        and isinstance(columns, list)
+        and sum(
+            type(column) is dict
+            and type(column.get("name")) is str
+            and column["name"] == input_column.column
+            for column in columns
+        )
+        == 1
+    )
+
+
+def _normalize_existing_binding_assessment_citation(
+    state: ResearchState,
+    proposal: object,
+) -> object:
+    if (
+        not isinstance(proposal, BindingAssessment)
+        or not isinstance(proposal.subject, ExistingBindingRef)
+    ):
+        return proposal
+    binding = next(
+        (
+            item
+            for item in state.bindings
+            if item.binding_id == proposal.subject.binding_id
+        ),
+        None,
+    )
+    if binding is None:
+        return proposal
+    durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
+    known = tuple(
+        evidence_id
+        for evidence_id in proposal.citation_evidence_ids
+        if evidence_id in durable_evidence_ids
+    )
+    unknown = tuple(
+        evidence_id
+        for evidence_id in proposal.citation_evidence_ids
+        if evidence_id not in durable_evidence_ids
+    )
+    if (
+        len(unknown) == 1
+        and binding.evidence_ids
+        and set(binding.evidence_ids) <= durable_evidence_ids
+        and known == tuple(sorted(binding.evidence_ids))
+    ):
+        return proposal.model_copy(update={"citation_evidence_ids": known})
+    candidates = tuple(
+        sorted((set(binding.evidence_ids) - set(known)) & durable_evidence_ids)
+    )
+    if len(unknown) != 1 or len(candidates) != 1:
+        return proposal
+    return proposal.model_copy(
+        update={"citation_evidence_ids": tuple(sorted((*known, candidates[0])))}
     )
 
 
@@ -1945,7 +2559,6 @@ def _rejected_preflight_assessment_context(
     freshness_context: FreshnessContext,
     requested_action: ResearchAction | None,
     *,
-    duplicate_existing_binding_ids_by_proposal_key: tuple[tuple[str, str], ...] = (),
     exact_column: ColumnRef | None = None,
     loaded_schema: LoadedSchema | None = None,
 ) -> tuple[dict[str, object], ...]:
@@ -1960,9 +2573,6 @@ def _rejected_preflight_assessment_context(
         item.source_id: item for item in state.query_spec.semantic_items
     }
     source_ids = set(source_items)
-    existing_binding_id_by_proposal_key = dict(
-        duplicate_existing_binding_ids_by_proposal_key
-    )
     durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
     try:
         fresh_evidence = tuple(
@@ -2003,32 +2613,12 @@ def _rejected_preflight_assessment_context(
             ):
                 item["rejection_reason"] = "source_id does not exist"
                 item["available_source_ids"] = sorted(source_ids)
-            if (
-                proposal.proposal_key in existing_binding_id_by_proposal_key
-                and "rejection_reason" not in item
-            ):
-                item["rejection_reason"] = "binding already exists"
-                item["existing_binding_id"] = existing_binding_id_by_proposal_key[
-                    proposal.proposal_key
-                ]
             if any(
                 isinstance(reference, ExistingJoinRef)
                 and reference.join_id not in joins
                 for reference in proposal.join_references
             ) and "rejection_reason" not in item:
                 item["rejection_reason"] = "referenced join_id does not exist"
-            source_item = source_items.get(proposal.source_id)
-            if (
-                "rejection_reason" not in item
-                and source_item is not None
-                and source_item.required
-                and source_item.kind is SemanticItemKind.FILTER
-                and source_item.operator is None
-                and proposal.candidate.kind == "discriminator_value"
-            ):
-                item["rejection_reason"] = (
-                    "FILTER without operator cannot use discriminator_value"
-                )
             if (
                 "rejection_reason" not in item
                 and exact_column is not None
@@ -2635,6 +3225,8 @@ def _is_semantically_novel_turn(
 
     novelty = committed.novelty
     next_state = committed.state
+    if not state.unresolved_items and not next_state.unresolved_items:
+        return False
     if any(
         (
             novelty.updated_hypothesis_ids,
@@ -2706,6 +3298,74 @@ def _proposal_free_tool_baseline(
     if isinstance(decision.next.hypothesis_ref, ProposedHypothesisRef):
         next_request = decision.next.model_copy(update={"hypothesis_ref": None})
     return decision.model_copy(update={"proposals": (), "next": next_request})
+
+
+def _cap_execute_research_probe_limit(
+    decision: ResearchDecisionV1,
+    *,
+    maximum_row_limit: int,
+    dialect: str,
+) -> ResearchDecisionV1:
+    if (
+        type(maximum_row_limit) is not int
+        or maximum_row_limit <= 0
+        or not isinstance(decision.next, ToolIntent)
+        or not isinstance(decision.next.intent, ExecuteResearchProbeIntent)
+    ):
+        return decision
+    arguments = decision.next.intent.arguments
+    try:
+        statements = parse(arguments.sql, read=dialect)
+    except (ParseError, TokenError, ValueError):
+        return decision
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        return decision
+    tree = statements[0]
+    selections = tuple(tree.find_all(exp.Select))
+    limited_scopes: tuple[exp.Expression, ...] = selections + tuple(
+        tree.find_all(exp.SetOperation)
+    )
+    if not selections or any(
+        scope.args.get("offset") is not None for scope in limited_scopes
+    ):
+        return decision
+    limits: list[tuple[exp.Limit, int]] = []
+    for scope in limited_scopes:
+        limit = scope.args.get("limit")
+        expression = limit.expression if isinstance(limit, exp.Limit) else None
+        if limit is None:
+            if scope is tree:
+                return decision
+            continue
+        if not isinstance(expression, exp.Literal) or expression.is_string:
+            return decision
+        try:
+            value = int(expression.this)
+        except (TypeError, ValueError):
+            return decision
+        if str(value) != expression.this or value <= 0:
+            return decision
+        limits.append((limit, value))
+    if not any(value > maximum_row_limit for _, value in limits):
+        return decision
+    for limit, value in limits:
+        if value > maximum_row_limit:
+            limit.set("expression", exp.Literal.number(maximum_row_limit))
+    bounded_arguments = arguments.model_copy(
+        update={
+            "sql": tree.sql(
+                dialect=dialect,
+                comments=False,
+                normalize=False,
+                pretty=False,
+            )
+        }
+    )
+    bounded_intent = decision.next.intent.model_copy(
+        update={"arguments": bounded_arguments}
+    )
+    bounded_next = decision.next.model_copy(update={"intent": bounded_intent})
+    return decision.model_copy(update={"next": bounded_next})
 
 
 def _model_research_query_admission_feedback(
@@ -2807,6 +3467,46 @@ def _validate_model_stop(
     return requested
 
 
+def _normalize_complete_stop_citations(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+    context: FreshnessContext,
+) -> ResearchDecisionV1:
+    if (
+        not isinstance(decision.next, StopRequest)
+        or decision.next.reason != "complete"
+        or decision.proposals
+    ):
+        return decision
+    authority = evaluate_research_generation_authority(
+        state,
+        context,
+        state.run_id,
+        state.run_incarnation,
+    )
+    if not authority.allowed or authority.requirements is None:
+        return decision
+    citations = set(authority.requirements.eligible_evidence_ids)
+    if _has_unbound_latest_probe_evidence(state):
+        latest_action_digest = state.action_history[-1].action_digest
+        citations.update(
+            evidence.evidence_id
+            for evidence in state.evidence
+            if evidence.action_digest == latest_action_digest
+            and evaluate_evidence_freshness(evidence, context).status
+            is FreshnessStatus.FRESH
+        )
+    return decision.model_copy(
+        update={
+            "next": decision.next.model_copy(
+                update={
+                    "citation_evidence_ids": tuple(sorted(citations))
+                }
+            )
+        }
+    )
+
+
 def _invalid_complete_generation_authority(
     state: ResearchState,
     decision: ResearchDecisionV1,
@@ -2865,17 +3565,6 @@ def _revalidate_state(value: ResearchState) -> ResearchState:
         )
     except (AttributeError, TypeError, ValidationError, ValueError) as error:
         raise TypeError("initial_state must satisfy ResearchState") from error
-
-
-def _terminal_freshness_context(context: FreshnessContext) -> FreshnessContext:
-    return FreshnessContext(
-        evaluated_at=datetime.now(UTC),
-        run_id=context.run_id,
-        run_incarnation=context.run_incarnation,
-        schema_namespace_version=context.schema_namespace_version,
-        document_sources=context.document_sources,
-        data_snapshots=context.data_snapshots,
-    )
 
 
 def _revalidate_freshness(value: FreshnessContext) -> FreshnessContext:

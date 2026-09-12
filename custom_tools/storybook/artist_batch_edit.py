@@ -14,6 +14,7 @@ from custom_tools.storybook.entity_generator_utils import build_canon_image_prom
 from custom_tools.storybook.screenplay_shots_generator_utils.shared_utils import (
     black_screen_storyboard_shot,
 )
+from custom_tools.storybook.project_paths import safe_storybook_project_dir
 
 # Локальные импорты
 from agent_factory import AgentFactory
@@ -237,7 +238,7 @@ def _load_visible_text_story_context(item: Dict[str, Any]) -> Dict[str, Any]:
     if not project_id or not page_number:
         return {}
 
-    base_dir = f"plots/storybooks/{project_id}"
+    base_dir = str(safe_storybook_project_dir(project_id))
     story_path = f"{base_dir}/20_story/story.json"
     beats_path = f"{base_dir}/10_synopsis/beats.json"
     context: Dict[str, Any] = {}
@@ -1012,7 +1013,7 @@ def _build_image_generation_prompts(
         english_prompt = translated_item.get("english_prompt", scene_prompt)
         negative_prompt = translated_item.get("negative_prompt", base_negative_prompt)
     else:
-        english_prompt = scene_prompt
+        english_prompt = scene_prompt_for_translation
         negative_prompt = base_negative_prompt
 
     english_prompt = _strip_text_lock_markers(english_prompt)
@@ -1141,7 +1142,7 @@ def _build_edit_instruction(
     
     # Получаем project_id для формирования правильных путей к референсам
     project_id = item.get("project_id", "")
-    reference_base = f"plots/storybooks/{project_id}/20_bible/references" if project_id else "plots/references"
+    reference_base = str(safe_storybook_project_dir(project_id) / "20_bible" / "references") if project_id else "plots/references"
     
     reference_paths = item.get("reference_image_paths") or item.get("references") or []
     
@@ -1174,8 +1175,12 @@ def _build_edit_instruction(
             corrected_path = os.path.join(reference_base, ref_path[11:])  # 11 = len("references/")
             corrected_reference_paths.append(corrected_path)
         elif ref_path.startswith("plots/storybooks/") and "/97_shots/" in ref_path:
-            # Это путь к start изображению - оставляем как есть
-            corrected_reference_paths.append(ref_path)
+            # Legacy relative shot path: anchor it to the configured project
+            # root rather than the process cwd.
+            relative_shot_path = ref_path.split("/", 3)[3]
+            corrected_reference_paths.append(
+                str(safe_storybook_project_dir(project_id) / relative_shot_path)
+            )
         else:
             # Оставляем путь как есть, если он уже корректный
             corrected_reference_paths.append(ref_path)
@@ -1217,7 +1222,7 @@ def _build_edit_instruction(
         except Exception:
             page_num = 1
         base_dir = (
-            f"plots/storybooks/{project_id}/50_images/page_{page_num:02d}"
+            str(safe_storybook_project_dir(project_id) / "50_images" / f"page_{page_num:02d}")
             if project_id and page_num else "plots"
         )
         os.makedirs(base_dir, exist_ok=True)
@@ -1399,7 +1404,7 @@ def _find_entity_by_reference_path(items_data: List[Dict[str, Any]], ref_path: s
 
 def _collect_project_references(project_id: str, entity_type: str, max_count: int = 10) -> List[str]:
     """Собирает до max_count существующих референсных файлов из проектных каталогов с приоритетом."""
-    references_dir = f"plots/storybooks/{project_id}/20_bible/references"
+    references_dir = str(safe_storybook_project_dir(project_id) / "20_bible" / "references")
     
     # Определяем приоритетный каталог
     primary_dir = f"{references_dir}/{entity_type}s/"  # characters/ или locations/
@@ -1796,7 +1801,7 @@ def _create_canon_reference(
         
         # Переводим промпт на английский
         from utils import translate_prompts_in_items
-        translated_item = translate_prompts_in_items({"prompt": prompt}, 'en')
+        translated_item = translate_prompts_in_items({"english_prompt": prompt}, 'en')
         english_prompt = translated_item.get('english_prompt', prompt)
         
         # ОБХОДИМ ПРОБЛЕМУ С АГЕНТОМ: вызываем edit_image_vse_tool напрямую
@@ -1889,7 +1894,7 @@ def _preprocess_canon_references(
             canon_path = os.path.abspath(ref_path)
         else:
             # Если файл внешний, строим путь в проектном каталоге
-            canon_path = f"plots/storybooks/{project_id}/20_bible{entity_data.get('reference_image_path', '')}"
+            canon_path = str(safe_storybook_project_dir(project_id) / "20_bible") + str(entity_data.get("reference_image_path", ""))
             canon_path = os.path.abspath(canon_path)
         
         # Проверяем, существует ли уже канон
@@ -2238,7 +2243,7 @@ def artist_agent_batch_edit_tool(
     # Читаем seed из brief.json или items_obj
     seed = random.randint(1, 1000000)  # Значение по умолчанию
     if project_id_for_seed:
-        brief_path = f"plots/storybooks/{project_id_for_seed}/00_brief.json"
+        brief_path = str(safe_storybook_project_dir(project_id_for_seed) / "00_brief.json")
         if os.path.exists(brief_path):
             try:
                 with open(brief_path, "r", encoding="utf-8") as f:
@@ -2257,18 +2262,6 @@ def artist_agent_batch_edit_tool(
         seed = items_obj.get("seed", seed)
         logger.info(f"📋 Получена новая структура данных: {len(items_data)} сцен, {len(consistency_rules)} правил")
         
-        # Предобрабатываем канонические референсы
-        logger.info("🔍 Запуск предобработки канонических референсов...")
-        canon_results = _preprocess_canon_references(
-            items_data=items_data,
-            consistency_rules=consistency_rules,
-            session_id=session_id,
-            max_concurrency=1,
-            pipeline_type=pipeline_type,
-            seed=seed
-        )
-        logger.info(f"📝 Предобработка завершена, создано канонов: {len([r for r in canon_results if r.get('success')])}")
-        
     elif isinstance(items_obj, list):
         # Старая структура - просто список
         items_data = items_obj
@@ -2279,6 +2272,40 @@ def artist_agent_batch_edit_tool(
     
     if not items_data:
         raise ValueError("items_data не может быть пустым")
+
+    blockout_cache = (
+        _load_blockout_ref_image_cache(items_data)
+        if use_blockout_reference and generate_blockout
+        else {}
+    )
+    if use_blockout_reference and generate_blockout and _is_video_batch(items_obj):
+        for item in items_data:
+            try:
+                key = _blockout_cache_key(
+                    item.get("project_id"), int(item.get("scene_number")),
+                    int(item.get("shot_number")), item.get("shot_type"),
+                )
+            except (TypeError, ValueError):
+                raise RuntimeError("Обязательный blockout reference не может быть сопоставлен с shot")
+            blockout_ref_image = blockout_cache.get(key)
+            if not blockout_ref_image or not os.path.isfile(blockout_ref_image):
+                raise RuntimeError(
+                    "Обязательный blockout reference отсутствует для "
+                    f"scene={item.get('scene_number')}, shot={item.get('shot_number')}, "
+                    f"type={item.get('shot_type')}"
+                )
+
+    if isinstance(items_obj, dict) and "items" in items_obj:
+        logger.info("🔍 Запуск предобработки канонических референсов...")
+        canon_results = _preprocess_canon_references(
+            items_data=items_data,
+            consistency_rules=consistency_rules,
+            session_id=session_id,
+            max_concurrency=1,
+            pipeline_type=pipeline_type,
+            seed=seed
+        )
+        logger.info(f"📝 Предобработка завершена, создано канонов: {len([r for r in canon_results if r.get('success')])}")
 
     project_id = items_data[0].get("project_id") if items_data else None
     if project_id:
@@ -2297,13 +2324,6 @@ def artist_agent_batch_edit_tool(
     # попытке сборки запроса (см. вызов _check_p18_reference_order ниже).
     p18_findings: List[Dict[str, Any]] = []
 
-    # ТЗ §11.2 п.2: shots.json c полями болванки читается один раз на батч (не на элемент).
-    blockout_cache = (
-        _load_blockout_ref_image_cache(items_data)
-        if use_blockout_reference and generate_blockout
-        else {}
-    )
-
     def _generate_base_image(
         session_id: str, 
         project_id: Optional[str], 
@@ -2315,7 +2335,7 @@ def artist_agent_batch_edit_tool(
         """Генерирует базовое изображение через artist_agent, если не указано image_path."""
         spec = item.get("_shot_frame_spec") or item.get("shot_frame_spec")
         if black_screen_storyboard_shot(str(item.get("camera_plan") or ""), spec if isinstance(spec, dict) else None):
-            base_dir = f"plots/storybooks/{project_id}/50_images/page_{page_number:02d}" if project_id and page_number else "plots"
+            base_dir = str(safe_storybook_project_dir(project_id) / "50_images" / f"page_{page_number:02d}") if project_id and page_number else "plots"
             os.makedirs(base_dir, exist_ok=True)
             base_path = os.path.join(base_dir, "base.png")
             w = int(item.get("width", 1920))
@@ -2324,7 +2344,7 @@ def artist_agent_batch_edit_tool(
             logger.info(f"⬛ BLACK SCREEN: базовый кадр без API (локальный #000000) -> {base_path}")
             return os.path.abspath(base_path)
         # Путь для сохранения
-        base_dir = f"plots/storybooks/{project_id}/50_images/page_{page_number:02d}" if project_id and page_number else "plots"
+        base_dir = str(safe_storybook_project_dir(project_id) / "50_images" / f"page_{page_number:02d}") if project_id and page_number else "plots"
         os.makedirs(base_dir, exist_ok=True)
         base_path = os.path.join(base_dir, "base.png")
                 
@@ -2337,7 +2357,6 @@ def artist_agent_batch_edit_tool(
         )
         width = int(item.get("width", 1920))
         height = int(item.get("height", 1080))
-        true_cfg_scale = item.get("true_cfg_scale", 4.0)
         # Убираем неиспользуемые параметры
         # steps = item.get("num_inference_steps", 50)
         # seed = item.get("seed", None)
@@ -2358,9 +2377,6 @@ def artist_agent_batch_edit_tool(
    - negative_prompt: "{negative_prompt}"
    - width: {width}
    - height: {height}
-   - true_cfg_scale: {float(true_cfg_scale)}
-   - output_path: "{base_path}"
-   - seed: {seed}
 
 КРИТИЧЕСКИ ВАЖНО:
 - Язык описания изображения (prompt) — ТОЛЬКО английский.
@@ -2514,6 +2530,7 @@ def artist_agent_batch_edit_tool(
                     result = edit_image_vse_tool(
                         prompt=english_prompt,
                         image_paths=paths_list,
+                        negative_prompt=scene_negative,
                         session_id=session_id,
                         output_path=item.get("output_path"),
                         seed=seed,
@@ -2760,7 +2777,7 @@ def _generate_image_from_scratch(
     pipeline_type: str
 ) -> bool:
     """Генерирует изображение протагониста с нуля, используя логику из protagonist_initializer."""
-    base_dir = f"plots/storybooks/{project_id}"
+    base_dir = str(safe_storybook_project_dir(project_id))
     
     # Собираем промпт на основе данных о персонаже
     name = protagonist_data.get("name") or "Hero"
@@ -2838,9 +2855,6 @@ def _generate_image_from_scratch(
   - negative_prompt: "усиленный_негативный_промпт"
   - width: 1920
   - height: 1080
-  - true_cfg_scale: 5.0
-  - num_inference_steps: 50
-  - output_path: "{output_path}"
 В ответе верни только финальный путь к файлу.
 """
     try:
@@ -2891,7 +2905,7 @@ def _generate_canon_reference_from_scratch(
             negative_prompt = "watermark, text, logo, nsfw, lowres, extra limbs, extra fingers, malformed hands"
 
         from utils import translate_prompts_in_items
-        translated_item = translate_prompts_in_items({"prompt": prompt}, 'en')
+        translated_item = translate_prompts_in_items({"english_prompt": prompt}, 'en')
         english_prompt = translated_item.get('english_prompt', prompt)
 
         task = f"""
@@ -2908,9 +2922,6 @@ def _generate_canon_reference_from_scratch(
    - negative_prompt: "{negative_prompt}"
    - width: 1920
    - height: 1080
-   - true_cfg_scale: 5.0
-   - num_inference_steps: 50
-   - output_path: "{output_path}"
 
 КРИТИЧЕСКИ ВАЖНО:
 - Язык описания изображения (prompt) — ТОЛЬКО английский.
@@ -2957,7 +2968,7 @@ def _ensure_references_exist(
 ):
     """Проверяет наличие всех изображений в image_paths содержащих 20_bible/references/ и генерирует недостающие."""
     
-    base_dir = f"plots/storybooks/{project_id}/20_bible"
+    base_dir = str(safe_storybook_project_dir(project_id) / "20_bible")
 
     # Загружаем bible-данные, чтобы при генерации недостающих канонов
     # использовать ПОЛНОЕ описание персонажа/локации (а не фиктивные заглушки).
@@ -3081,7 +3092,7 @@ def _ensure_references_exist(
     
     # Собираем все существующие референсы проекта для использования в генерации
     existing_paths = []
-    project_refs_dir = f"plots/storybooks/{project_id}/20_bible/references"
+    project_refs_dir = str(safe_storybook_project_dir(project_id) / "20_bible" / "references")
     if os.path.exists(project_refs_dir):
         for root, dirs, files in os.walk(project_refs_dir):
             for file in files:

@@ -39,6 +39,7 @@ from .models import (
     BudgetState,
     DerivedExpressionBinding,
     DiscriminatorValueBinding,
+    DocumentRef,
     DocumentRuleBinding,
     EvidenceCost,
     EvidenceRecord,
@@ -58,8 +59,12 @@ from .models import (
 )
 from .policy import AdaptivePolicyConfig, BudgetAdmissionError, initial_budget_state
 from .provenance import parse_probe_observation
+from ._research_terminal_authority import _disconnected_required_source_ids
 from .research_loop import (
     ResearchLoopOutcome,
+    _exact_document_formula_continuation_source_ids,
+    _formula_part,
+    _runtime_exact_formula_continuation_source_ids,
     _state_with_reconciled_model_budget,
 )
 from .schema_probes import (
@@ -123,6 +128,7 @@ class ProductionResearchAssembly:
     deadline: DeadlineBudget
     is_cancelled: Callable[[], bool]
     semantic_repair_continuation: bool
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...]
     stop_review_model: SchemaResearchDecisionModel | None = None
 
     def loop_arguments(self) -> dict[str, object]:
@@ -143,6 +149,7 @@ class ProductionResearchAssembly:
             "deadline": self.deadline,
             "is_cancelled": self.is_cancelled,
             "semantic_repair_continuation": self.semantic_repair_continuation,
+            "exact_formula_documents": self.exact_formula_documents,
             "stop_review_model": self.stop_review_model,
         }
 
@@ -176,6 +183,29 @@ def _bounded_hierarchical_table_hints(
             if neighbour not in selected:
                 selected.append(neighbour)
     return tuple(selected)
+
+
+def _exact_formula_documents(
+    state: ResearchState,
+    documents: tuple[SchemaEvidenceDocument, ...],
+) -> tuple[tuple[str, DocumentRef], ...]:
+    """Keep one supplied exact document for each required formula source."""
+
+    matches: list[tuple[str, DocumentRef]] = []
+    for item in state.query_spec.semantic_items:
+        if not item.required or item.kind is not SemanticItemKind.FORMULA:
+            continue
+        formula = _formula_part(item.normalized_meaning)
+        if formula is None:
+            continue
+        document_matches = tuple(
+            DocumentRef(document_id=document.document_id, namespace=document.namespace)
+            for document in documents
+            if formula in "".join(document.content.split())
+        )
+        if len(document_matches) == 1:
+            matches.append((item.source_id, document_matches[0]))
+    return tuple(sorted(matches, key=lambda item: item[0]))
 
 
 def assemble_production_research(
@@ -239,6 +269,10 @@ def assemble_production_research(
         )
     ):
         raise ProductionResearchAssemblyError("documents differ from captured schema")
+    exact_formula_documents = _exact_formula_documents(initial_state, documents)
+    semantic_repair_continuation = (
+        semantic_repair_continuation or bool(exact_formula_documents)
+    )
     if loaded_schema.namespace.scope != scope:
         raise ProductionResearchAssemblyError("captured schema scope changed")
     if not isinstance(query, str) or not query.strip():
@@ -393,6 +427,21 @@ def assemble_production_research(
         )
     )
 
+    freshness_context = FreshnessContext(
+        evaluated_at=datetime.now(UTC),
+        run_id=initial_state.run_id,
+        run_incarnation=initial_state.run_incarnation,
+        schema_namespace_version=initial_state.schema_namespace_version,
+        document_sources=tuple(
+            DocumentSourceState(
+                document_id=document.document_id,
+                availability=DocumentSourceAvailability.AVAILABLE,
+                source_version=document.source_version,
+            )
+            for document in documents
+        ),
+    )
+
     def research_context(
         state: ResearchState,
         validation_feedback: tuple[SchemaResearchValidationFeedback, ...],
@@ -417,6 +466,8 @@ def assemble_production_research(
             verified_probe_fact_hints=verified_probe_fact_hints[:5],
             approved_semantic_fact_hints=approved_semantic_fact_hints,
             semantic_repair_continuation=semantic_repair_continuation,
+            freshness_context=freshness_context,
+            exact_formula_documents=exact_formula_documents,
         )
 
     return ProductionResearchAssembly(
@@ -427,20 +478,7 @@ def assemble_production_research(
         model_identity=model_identity,
         adapter=SchemaResearchDecisionAdapter(profile),
         loaded_schema=loaded_schema,
-        freshness_context=FreshnessContext(
-            evaluated_at=datetime.now(UTC),
-            run_id=initial_state.run_id,
-            run_incarnation=initial_state.run_incarnation,
-            schema_namespace_version=initial_state.schema_namespace_version,
-            document_sources=tuple(
-                DocumentSourceState(
-                    document_id=document.document_id,
-                    availability=DocumentSourceAvailability.AVAILABLE,
-                    source_version=document.source_version,
-                )
-                for document in documents
-            ),
-        ),
+        freshness_context=freshness_context,
         registry=registry,
         state_store=state_store,
         checkpoint_store=checkpoint_store,
@@ -449,6 +487,7 @@ def assemble_production_research(
         deadline=deadline,
         is_cancelled=is_cancelled,
         semantic_repair_continuation=semantic_repair_continuation,
+        exact_formula_documents=exact_formula_documents,
         stop_review_model=stop_review_model,
     )
 
@@ -654,6 +693,58 @@ def _derived_metric_continuation_after_invalid_stop(
     }
 
 
+def _required_relationship_continuation_after_invalid_stop(
+    state: ResearchState,
+    invalid_stop_generation_authority: tuple[CoverageInputErrorCode, tuple[str, ...]],
+) -> dict[str, object] | None:
+    """Request ordinary relationship research for resolved disconnected requirements."""
+
+    reason_code, affected_source_ids = invalid_stop_generation_authority
+    if (
+        reason_code is not CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+        or any(
+            item.required and item.status is not SemanticItemStatus.RESOLVED
+            for item in state.query_spec.semantic_items
+        )
+    ):
+        return None
+    disconnected_source_ids = set(_disconnected_required_source_ids(state))
+    source_ids = tuple(sorted(disconnected_source_ids & set(affected_source_ids)))
+    if not source_ids:
+        return None
+    bindings_by_id = {binding.binding_id: binding for binding in state.bindings}
+    tables = {
+        table
+        for item in state.query_spec.semantic_items
+        if item.source_id in source_ids
+        for binding_id in item.binding_ids
+        if (binding := bindings_by_id.get(binding_id)) is not None
+        and binding.status is BindingStatus.SUPPORTED
+        for table in binding.tables
+    }
+    if not tables:
+        return None
+    return {
+        "kind": "establish_required_relationship",
+        "source_ids": list(source_ids),
+        "table_references": [
+            table.model_dump(mode="json", by_alias=True)
+            for table in sorted(
+                tables,
+                key=lambda table: (
+                    table.namespace,
+                    table.schema_name or "",
+                    table.table,
+                ),
+            )
+        ],
+        "instruction": (
+            "Do not stop. Use ordinary typed investigation to inspect or validate "
+            "the missing relationship between the listed supported tables."
+        ),
+    }
+
+
 def _bounded_research_context(
     loaded_schema: LoadedSchema,
     state: ResearchState,
@@ -672,6 +763,8 @@ def _bounded_research_context(
     verified_probe_fact_hints: tuple[dict[str, object], ...] = (),
     approved_semantic_fact_hints: tuple[SemanticFact, ...] = (),
     semantic_repair_continuation: bool = False,
+    freshness_context: FreshnessContext | None = None,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
 ) -> str:
     """Return the bounded, deterministic model view of the durable state."""
 
@@ -716,7 +809,7 @@ def _bounded_research_context(
     context = {
         "state": state_view,
         "documents": document_catalog,
-        "requery_with_existing_probes": True,
+        "completed_actions_are_not_reexecutable": True,
         "completed_action_index": [
             {
                 "kind": action.kind.value,
@@ -731,6 +824,14 @@ def _bounded_research_context(
             for action in sorted(state.action_history, key=lambda action: action.action_digest)
         ],
     }
+    if exact_formula_documents:
+        context["exact_formula_documents"] = [
+            {
+                "source_id": source_id,
+                "document": document.model_dump(mode="json", by_alias=True),
+            }
+            for source_id, document in exact_formula_documents
+        ]
     if rejected_duplicate_actions:
         context["rejected_duplicate_actions"] = list(rejected_duplicate_actions)
     if rejected_preflight_assessments:
@@ -743,9 +844,12 @@ def _bounded_research_context(
             "reason_code": reason_code.value,
             "affected_source_ids": list(sorted(affected_source_ids)),
         }
-        if continuation := _derived_metric_continuation_after_invalid_stop(
+        continuation = _required_relationship_continuation_after_invalid_stop(
             state, invalid_stop_generation_authority
-        ):
+        ) or _derived_metric_continuation_after_invalid_stop(
+            state, invalid_stop_generation_authority
+        )
+        if continuation:
             context["required_continuation"] = continuation
     if semantic_table_hints:
         context["semantic_table_hints"] = list(semantic_table_hints)
@@ -767,6 +871,8 @@ def _bounded_research_context(
         maximum_bytes,
         fits_prompt,
         semantic_repair_continuation,
+        freshness_context,
+        exact_formula_documents,
     )
     if verified_probe_fact_hints:
         included_hints: list[dict[str, object]] = []
@@ -1013,6 +1119,8 @@ def _fill_bounded_state_view(
     maximum_bytes: int,
     fits_prompt: Callable[[bytes], bool],
     semantic_repair_continuation: bool,
+    freshness_context: FreshnessContext,
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...],
 ) -> None:
     """Pack complete facts in the deterministic order required for a decision."""
 
@@ -1220,13 +1328,24 @@ def _fill_bounded_state_view(
         _refresh_omitted_counts(state_payload, view, context)
         return False
 
+    exact_formula_continuation_sources = (
+        set(_exact_document_formula_continuation_source_ids(state, freshness_context))
+        if freshness_context is not None
+        else set()
+    )
+    exact_formula_continuation_sources.update(
+        _runtime_exact_formula_continuation_source_ids(state, exact_formula_documents)
+    )
     continuation_sources = {
         item.source_id
         for item in state.query_spec.semantic_items
         if semantic_repair_continuation
         and item.required
         and item.kind is SemanticItemKind.FORMULA
-        and not item.binding_ids
+        and (
+            not item.binding_ids
+            or item.source_id in exact_formula_continuation_sources
+        )
     }
     included_source_ids: set[str] = set()
     for source_id in sorted(continuation_sources):

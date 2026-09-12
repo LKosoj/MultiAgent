@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import logging
 import threading
 import fcntl
@@ -367,13 +368,46 @@ SELF-CHECK before output: every noun phrase either from original prompt OR from 
 
         # Формируем user_prompt
         image_analysis = "\n".join(actual_image_facts) if actual_image_facts else "No detailed analysis available"
+        end_image_facts = []
+        if end_data:
+            for key, label in (
+                ("content_analysis", "CONTENT"),
+                ("object_recognition", "OBJECTS"),
+                ("face_analysis", "FACES/PEOPLE"),
+                ("color_analysis", "LIGHTING/COLORS"),
+                ("background_analysis", "BACKGROUND"),
+                ("composition_analysis", "COMPOSITION"),
+                ("angle_analysis", "CAMERA ANGLE"),
+            ):
+                value = end_data.get(key)
+                if value:
+                    end_image_facts.append(f"{label}: {value}")
+        end_facts_block = ""
+        if end_image_facts:
+            end_facts_block = (
+                "\n\nEND IMAGE FACTS (target state only; do not use these as the start state):\n"
+                + "\n".join(end_image_facts)
+            )
         original_word_count = len(original_prompt.split())
         
+        context_values = {
+            key: value for key, value in (item_context or {}).items()
+            if key in {"camera_plan", "timing", "scene_pacing", "spatial_changes_from_start"} and value
+        }
+        context_block = ""
+        if context_values:
+            context_block = (
+                "\n\nITEM CONTEXT (authoritative camera, timing, pacing and spatial-transition constraints; "
+                "do not override START/END facts or invent details):\n"
+                + json.dumps(context_values, ensure_ascii=False)
+            )
+
         user_prompt = f"""ORIGINAL VIDEO PROMPT (intended description):
 "{original_prompt}"
 
 ACTUAL IMAGE ANALYSIS (what is REALLY in the generated image):
 {image_analysis}
+{end_facts_block}{context_block}
 
 TASK:
 1. Correct the prompt to match what is ACTUALLY in the image
@@ -507,6 +541,14 @@ _UPDATE_SHOTS_WRITABLE_FIELDS = (
     "video_prompt",
     "video_prompt_updated_timestamp",
 )
+_PREPARED_ENGLISH_VIDEO_PROMPT_KEY = "_prepared_english_video_prompt"
+
+
+def _serialized_shot_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: value for key, value in item.items()
+        if key != _PREPARED_ENGLISH_VIDEO_PROMPT_KEY
+    }
 
 
 def update_shots_with_descriptions(
@@ -703,6 +745,10 @@ def update_shots_with_descriptions(
         if enhanced_prompt:
             with _changes_lock:
                 item["video_prompt"] = enhanced_prompt
+                if re.search(r"[А-Яа-яЁё]", original_video_prompt):
+                    item[_PREPARED_ENGLISH_VIDEO_PROMPT_KEY] = enhanced_prompt
+                else:
+                    item.pop(_PREPARED_ENGLISH_VIDEO_PROMPT_KEY, None)
                 if max_image_timestamp > 0:
                     item["video_prompt_updated_timestamp"] = max_image_timestamp
                 else:
@@ -789,9 +835,9 @@ def update_shots_with_descriptions(
                                 seen_keys.add(key)
                                 fresh_item = fresh_by_key.get(key)
                                 if fresh_item is None:
-                                    merged_items.append(disk_item)
+                                    merged_items.append(_serialized_shot_item(disk_item))
                                     continue
-                                merged = dict(disk_item)
+                                merged = _serialized_shot_item(disk_item)
                                 for field in _UPDATE_SHOTS_WRITABLE_FIELDS:
                                     if field in fresh_item:
                                         merged[field] = fresh_item[field]
@@ -800,13 +846,13 @@ def update_shots_with_descriptions(
                             # this key) are appended as-is: nothing to merge onto.
                             for key, fresh_item in fresh_by_key.items():
                                 if key not in seen_keys:
-                                    merged_items.append(fresh_item)
+                                    merged_items.append(_serialized_shot_item(fresh_item))
                             existing_data["items"] = merged_items
                         else:
-                            existing_data["items"] = items_list
+                            existing_data["items"] = [_serialized_shot_item(item) for item in items_list]
                         shots_data = existing_data
                     else:
-                        shots_data = {"items": items_list}
+                        shots_data = {"items": [_serialized_shot_item(item) for item in items_list]}
 
                     tmp = f"{shots_file_path}.{os.getpid()}.tmp"
                     try:

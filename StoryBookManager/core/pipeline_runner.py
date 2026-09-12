@@ -157,39 +157,16 @@ class PipelineRunner:
         `.pipeline.lock` фиксируется здесь, чтобы позже на неё сели Streamlit/AG-UI.
         flock снимается ОС при закрытии fd/завершении процесса → stale-lock не остаётся.
         """
-        from custom_tools.storybook.project_paths import safe_storybook_project_dir
+        from custom_tools.storybook.project_paths import acquire_storybook_project_lock
 
-        project_dir = safe_storybook_project_dir(project_id)
-        project_dir.mkdir(parents=True, exist_ok=True)
-        handle = (project_dir / ".pipeline.lock").open("a+", encoding="utf-8")
-        try:
-            import fcntl
-
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except ImportError:
-            # Не-POSIX окружение: advisory-lock недоступен, продолжаем без него.
-            pass
-        except BlockingIOError:
-            handle.close()
-            return None
-        return handle
+        return acquire_storybook_project_lock(project_id)
 
     @staticmethod
     def _release_project_lock(handle) -> None:
         """Снимает advisory-lock проекта (симметрично _acquire_project_lock)."""
-        if handle is None:
-            return
-        try:
-            import fcntl
+        from custom_tools.storybook.project_paths import release_storybook_project_lock
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-        finally:
-            try:
-                handle.close()
-            except Exception:
-                pass
+        release_storybook_project_lock(handle)
 
     @staticmethod
     def _normalize_workflow_status(result: Any) -> Optional[str]:

@@ -57,6 +57,10 @@
     "TEXT_TO_SQL_LLM_MODELS_PROFILE": "default"
   },
   "model_routes": {
+    "model_lite": {
+      "model_id": "llmgateway/light_model",
+      "max_tokens": 32768
+    },
     "model_code": {
       "model_id": "llmgateway/qwen3.5",
       "max_tokens": 32768,

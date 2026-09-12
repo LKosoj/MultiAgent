@@ -462,6 +462,75 @@ def test_pre_execution_runner_commits_schema_failure_before_semantic_rebuild(
     assert result.check_results[-1].status is CheckStatus.FAILED
 
 
+def test_pre_execution_runner_stops_on_limit_semantic_failure_before_explain(
+    monkeypatch,
+):
+    state, research_state, requirements, loaded_schema = _runtime()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: calls.append("safety")
+        or {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: calls.append("schema") or {"is_valid": True, "issues": []},
+    )
+
+    def semantic(check_input, *_args):
+        calls.append("semantic")
+        return CheckResult(
+            check_id=f"semantic:{check_input.candidate.candidate_id}:limit_mismatch",
+            candidate_id=check_input.candidate.candidate_id,
+            check_kind=CheckKind.SEMANTIC,
+            status=CheckStatus.FAILED,
+            failure_code=CheckFailureCode.LIMIT_MISMATCH,
+            affected_source_ids=("status",),
+            affected_ast_node_ids=(),
+            observed_error=None,
+            repair=CheckRepair(kind=RepairKind.REVISE_SQL, source_ids=("status",)),
+        )
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.evaluate_semantic_authority_checks",
+        semantic,
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_explain",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("EXPLAIN called")),
+    )
+
+    result = run_solver_candidate_pre_execution_gates(
+        state,
+        candidate_id="candidate-1",
+        research_state=research_state,
+        requirements=requirements,
+        loaded_schema=loaded_schema,
+        dsn=POSTGRES_DSN,
+        safety_policy=load_startup_safety_policy(),
+        row_limit=10,
+        dry_run_only=False,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+        commit_transition=lambda transition: transition.state,
+    )
+
+    assert calls == ["safety", "schema", "semantic"]
+    assert tuple(item.check_kind for item in result.check_results) == (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+    )
+    assert result.check_results[-1].failure_code is CheckFailureCode.LIMIT_MISMATCH
+
+
 def test_pre_execution_runner_propagates_semantic_rebuild_failure_after_schema(
     monkeypatch,
 ):

@@ -1,5 +1,6 @@
 import os
 import json
+import hashlib
 import re
 import logging
 from typing import Dict, Any, List
@@ -35,6 +36,34 @@ def _get_prompt_language_label(language: str) -> str:
         "de": "немецком языке",
     }
     return language_map.get(language, f"языке с кодом {language}")
+
+
+def _prompt_inputs_fingerprint(
+    *, beats: List[Dict[str, Any]], story: Dict[str, Any],
+    characters: List[Dict[str, Any]], locations: List[Dict[str, Any]],
+    style_images: Dict[str, Any], negative_list: str, language: str,
+) -> str:
+    payload = {
+        "beats": beats, "story": story, "characters": characters,
+        "locations": locations, "style_images": style_images,
+        "negative_list": negative_list, "language": language,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _prompt_cache_is_current(prompts_dir: str, expected_names: set[str], inputs_fingerprint: str) -> bool:
+    if not expected_names or not os.path.isdir(prompts_dir):
+        return False
+    for name in expected_names:
+        try:
+            with open(os.path.join(prompts_dir, name), "r", encoding="utf-8") as f:
+                prompt = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(prompt, dict) or prompt.get("_inputs_fingerprint") != inputs_fingerprint:
+            return False
+    return True
 
 
 def _build_reference_roles_instruction(language: str, role_entries: List[str]) -> str:
@@ -1029,21 +1058,6 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
     with open(beats_path, "r", encoding="utf-8") as f:
         beats = json.load(f)
     expected_count = len(beats)
-    if expected_count > 0 and os.path.isdir(prompts_dir):
-        existing = [
-            name for name in os.listdir(prompts_dir)
-            if name.startswith("page_") and name.endswith("_prompt.json")
-        ]
-        if len(existing) >= expected_count:
-            logger.info(
-                f"✏️ Промпты уже существуют ({len(existing)}/{expected_count} файлов в {prompts_dir}), пропускаем генерацию"
-            )
-            return prompts_dir
-        elif existing:
-            logger.warning(
-                f"⚠️ Неполный набор промптов ({len(existing)}/{expected_count}), перегенерируем"
-            )
-
     for _req_path in [
         f"{base}/20_bible/characters.json",
         f"{base}/20_bible/locations.json",
@@ -1064,6 +1078,15 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
         negative_list = f.read().strip()
     with open(f"{base}/20_story/story.json", "r", encoding="utf-8") as f:
         story = json.load(f)
+
+    expected_names = {f"page_{idx:02d}_prompt.json" for idx in range(1, expected_count + 1)}
+    inputs_fingerprint = _prompt_inputs_fingerprint(
+        beats=beats, story=story, characters=characters, locations=locations,
+        style_images=style_images, negative_list=negative_list, language=language,
+    )
+    if _prompt_cache_is_current(prompts_dir, expected_names, inputs_fingerprint):
+        logger.info("✏️ Промпты текущих страниц совпадают с входами, пропускаем генерацию")
+        return prompts_dir
 
     prompt_language_label = _get_prompt_language_label(language)
     story_pages = _build_story_page_lookup(story)
@@ -1310,6 +1333,7 @@ __STYLE_DIRECTIVES__
     out_dir = f"{base}/40_prompts"
     os.makedirs(out_dir, exist_ok=True)
     for idx, p in enumerate(prompts, start=1):
+        p["_inputs_fingerprint"] = inputs_fingerprint
         with open(f"{out_dir}/page_{idx:02d}_prompt.json", "w", encoding="utf-8") as f:
             json.dump(p, f, ensure_ascii=False, indent=2)
     return out_dir
