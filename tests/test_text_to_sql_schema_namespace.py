@@ -257,6 +257,80 @@ def test_scoped_loader_applies_editable_dsn_schema_only_to_live_objects(
     assert reloaded.schema["public.orders"]["description"] == "Corrected invoice ledger"
 
 
+def test_dsn_overlay_merge_preserves_file_metadata_and_fills_examples(
+    tmp_path: Path,
+) -> None:
+    loader = SchemaLoader(tmp_path)
+    dsn = "sqlite:///overlay.db"
+    loader.file_manager.ensure_sqlrag_directory()
+    loader.file_manager.get_schema_file_path(dsn).write_text(
+        json.dumps(
+            {
+                "enable": True,
+                "unknown_top_level": {"keep": True},
+                "schema_info": {
+                    "public.records": {
+                        "description": "File-owned table",
+                        "columns": {
+                            "kind": {
+                                "description": "File-owned kind",
+                                "examples": ["kept"],
+                                "unknown_column_metadata": "keep",
+                            }
+                        },
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    document = loader.merge_enriched_schema_metadata(
+        dsn,
+        {
+            "public.records": {
+                "description": "Generated table",
+                "columns": {
+                    "kind": {
+                        "description": "Generated kind",
+                        "examples": ["replace"],
+                    },
+                    "record_code": {
+                        "description": "Generated code",
+                        "examples": [
+                            "r-1",
+                            7,
+                            1.5,
+                            True,
+                            None,
+                            b"invalid",
+                            {"invalid": "value"},
+                            ["invalid"],
+                            float("nan"),
+                            float("inf"),
+                        ],
+                    },
+                },
+            }
+        },
+    )
+
+    assert document["unknown_top_level"] == {"keep": True}
+    stored = loader.load_raw_sqlrag_document(dsn)
+    assert stored is not None
+    table = stored["schema_info"]["public.records"]
+    assert table["description"] == "File-owned table"
+    assert table["columns"]["kind"] == {
+        "description": "File-owned kind",
+        "examples": ["kept"],
+        "unknown_column_metadata": "keep",
+    }
+    assert table["columns"]["record_code"] == {
+        "description": "Generated code",
+        "examples": ["r-1", 7, 1.5, True, None],
+    }
+
+
 def test_transient_scope_is_live_only_and_freshness_failure_never_uses_snapshot(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

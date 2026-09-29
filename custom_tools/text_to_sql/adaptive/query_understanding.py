@@ -39,6 +39,7 @@ _ITEM_FIELDS = frozenset(
         "requested_output",
         "owner_item_ordinal",
         "exact_physical_predicate",
+        "exact_physical_column_name",
         "operator",
         "literal_or_reference",
         "status",
@@ -95,11 +96,9 @@ def understand_query(
         for raw_ordinal, (item, _, owner_item_ordinal) in enumerate(decoded_items)
     )
     requested_output_source_ids = tuple(
-        sorted(
-            item.source_id
-            for item, requested_output, _ in decoded_items
-            if requested_output
-        )
+        item.source_id
+        for item, requested_output, _ in decoded_items
+        if requested_output
     )
     ordered_items = tuple(
         sorted(
@@ -182,6 +181,13 @@ def _decode_item(
         raise QueryUnderstandingDecodeError(
             "exact_physical_predicate must be a boolean"
         )
+    exact_physical_column_name = raw_item["exact_physical_column_name"]
+    if exact_physical_column_name is not None and (
+        type(exact_physical_column_name) is not str or not exact_physical_column_name
+    ):
+        raise QueryUnderstandingDecodeError(
+            "exact_physical_column_name must be non-empty text or null"
+        )
     operator_value = raw_item["operator"]
     if type(operator_value) is str and operator_value == "null":
         operator_value = None
@@ -194,17 +200,29 @@ def _decode_item(
             "semantic item operator",
         )
     )
-    if kind not in {
+    discard_exact_predicate_metadata = kind not in {
         SemanticItemKind.FILTER,
         SemanticItemKind.TIME,
         SemanticItemKind.FORMULA,
-    }:
+    } and (exact_physical_predicate or exact_physical_column_name is not None)
+    if discard_exact_predicate_metadata:
         exact_physical_predicate = False
+        exact_physical_column_name = None
+        operator = None
+        normalized = source_text
+    if exact_physical_column_name is not None and (
+        not exact_physical_predicate or operator is None
+    ):
+        raise QueryUnderstandingSemanticError(
+            "exact_physical_column_name requires exact_physical_predicate with an operator"
+        )
     if exact_physical_predicate and operator is None:
         raise QueryUnderstandingSemanticError(
             "exact_physical_predicate requires FILTER, TIME, or FORMULA with an operator"
         )
     literal = _decode_literal(raw_item["literal_or_reference"])
+    if discard_exact_predicate_metadata:
+        literal = None
     source_id = _stable_id(
         "semantic",
         {
@@ -223,6 +241,7 @@ def _decode_item(
             normalized_meaning=normalized,
             required=required,
             exact_physical_predicate=exact_physical_predicate,
+            exact_physical_column_name=exact_physical_column_name,
             operator=operator,
             literal_or_reference=literal,
             status=status,
@@ -243,7 +262,9 @@ def _owner_source_id(
     if owner_item_ordinal >= len(items) or owner_item_ordinal == raw_ordinal:
         raise QueryUnderstandingSemanticError("owner_item_ordinal is invalid")
     owner = items[owner_item_ordinal]
-    if not owner.required or owner.kind is not SemanticItemKind.DIMENSION:
+    if owner.kind is not SemanticItemKind.DIMENSION:
+        return None
+    if not owner.required:
         raise QueryUnderstandingSemanticError(
             "owner_item_ordinal must reference a required DIMENSION"
         )

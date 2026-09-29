@@ -381,15 +381,30 @@ class SQLSchemaValidator:
             if has_from_tables and not current_referenced_tables and not current_row_sources and ambiguous_names:
                 continue
 
-            column_matches = (
-                self._columns.find_column_matches(column_name, current_referenced_tables, db_schema)
-                + self._columns.find_row_source_column_matches(column_name, current_row_sources)
+            physical_matches = (
+                self._columns.find_column_matches(
+                    column_name, current_referenced_tables, db_schema
+                )
+                if current_referenced_tables or not current_row_sources
+                else []
+            )
+            column_matches = physical_matches + self._columns.find_row_source_column_matches(
+                column_name, current_row_sources
             )
             if not column_matches:
                 inherited_tables = self._scope.referenced_schema_tables(inherited_aliases, db_schema)
+                inherited_physical_matches = (
+                    self._columns.find_column_matches(
+                        column_name, inherited_tables, db_schema
+                    )
+                    if inherited_tables
+                    else []
+                )
                 column_matches = (
-                    self._columns.find_column_matches(column_name, inherited_tables, db_schema)
-                    + self._columns.find_row_source_column_matches(column_name, inherited_row_sources)
+                    inherited_physical_matches
+                    + self._columns.find_row_source_column_matches(
+                        column_name, inherited_row_sources
+                    )
                 )
             if len(column_matches) > 1:
                 issues.append({

@@ -100,7 +100,26 @@ def test_benchmark_client_allows_long_running_status_requests(monkeypatch) -> No
 
     benchmark_runner._client("http://127.0.0.1:8000", "token")
 
-    assert captured["request_timeout_seconds"] == 600
+    assert captured["request_timeout_seconds"] == 1200
+
+
+def test_diagnostic_bwrap_runtime_environment_defaults_to_benchmark_lease() -> None:
+    assert public_benchmark_bwrap._sandbox_runtime_env(
+        SimpleNamespace(canonical_runtime_env=None, sandbox_env=[])
+    ) == {"WORKFLOW_PROCESS_LEASE_SECONDS": "1200"}
+    assert public_benchmark_bwrap._sandbox_runtime_env(
+        SimpleNamespace(canonical_runtime_env=None, sandbox_env=["EXTRA_SETTING=value"])
+    ) == {
+        "EXTRA_SETTING": "value",
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
+    }
+    with pytest.raises(ValueError, match="WORKFLOW_PROCESS_LEASE_SECONDS is fixed"):
+        public_benchmark_bwrap._sandbox_runtime_env(
+            SimpleNamespace(
+                canonical_runtime_env=None,
+                sandbox_env=["WORKFLOW_PROCESS_LEASE_SECONDS=1"],
+            )
+        )
 
 
 def test_load_bird_cases_does_not_put_gold_sql_in_prompt(tmp_path: Path) -> None:
@@ -884,6 +903,28 @@ def test_run_watcher_reports_checkpoint_execution_terminal_exit_and_stale_trace(
     ]
 
 
+def test_run_watcher_default_reports_stale_once_at_six_hundred_seconds() -> None:
+    events: list[dict[str, object]] = []
+    watcher = benchmark_runner.BenchmarkRunWatcher("run-1", events.append)
+
+    watcher.observe("running", observed_at=10.0)
+    watcher.observe("running", observed_at=609.9)
+
+    assert [event for event in events if event["event"] == "stale_trace"] == []
+
+    watcher.observe("running", observed_at=610.0)
+    watcher.observe("running", observed_at=700.0)
+
+    assert [event for event in events if event["event"] == "stale_trace"] == [
+        {
+            "event": "stale_trace",
+            "run_id": "run-1",
+            "workflow_status": "running",
+            "stale_seconds": 600.0,
+        }
+    ]
+
+
 def test_manifest_records_verifiable_pipeline_provenance(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1002,7 +1043,7 @@ def test_bwrap_manifest_uses_v2_execution_policy_from_source_snapshot(
         "adaptive_policy": {
             "policy_version": 2,
             "wall_clock": {"wall_clock_seconds": 14_400},
-            "resource_limits": {"model_tokens": 1_048_576, "db_probe_ms": 14_400_000},
+            "resource_limits": {"model_tokens": 4_194_304, "db_probe_ms": 14_400_000},
             "operation_counts": {
                 "actions": 512,
                 "model_decisions": 256,
@@ -1012,9 +1053,9 @@ def test_bwrap_manifest_uses_v2_execution_policy_from_source_snapshot(
             "per_action": {"sample_rows": 50},
             "model_budget": {
                 "model_calls": 256,
-                "input_tokens_per_call": 32_768,
+                "input_tokens_per_call": 262_144,
                 "output_tokens_per_call": 32_000,
-                "total_tokens": 1_048_576,
+                "total_tokens": 4_194_304,
             },
         },
         "workflow_retry_policy": {
@@ -2319,6 +2360,7 @@ def test_canonical_environment_is_closed_typed_and_forces_empty_memory() -> None
         "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
         "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
         "TEXT_TO_SQL_LLM_MODELS_PROFILE": "default",
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
     }
     policy_path = (
         Path(__file__).resolve().parents[1]

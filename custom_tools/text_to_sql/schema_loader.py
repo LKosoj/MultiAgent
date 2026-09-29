@@ -16,6 +16,7 @@ from .utils import (
     get_runtime_context_dsn,
     get_schema_version,
     get_table_columns,
+    get_table_description,
     mask_dsn,
     set_table_description,
 )
@@ -345,6 +346,60 @@ class SchemaLoader:
                 f"schema_loader: 'enable' key is required in {json_path}"
             )
         return obj
+
+    def merge_enriched_schema_metadata(
+        self,
+        dsn: str,
+        enriched_schema: Dict[str, Dict[str, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Persist only absent description/examples into the raw DSN document."""
+
+        document = self.load_raw_sqlrag_document(dsn) or {"enable": True}
+        editable_schema = document.get("schema_info")
+        if not isinstance(editable_schema, dict):
+            editable_schema = {}
+            document["schema_info"] = editable_schema
+        for table_name, enriched_table in enriched_schema.items():
+            if not isinstance(enriched_table, dict):
+                continue
+            editable_table = editable_schema.setdefault(table_name, {})
+            if not isinstance(editable_table, dict):
+                continue
+            description = get_table_description(enriched_table)
+            if description and not get_table_description(editable_table):
+                set_table_description(editable_table, description)
+            editable_columns = editable_table.get("columns")
+            if not isinstance(editable_columns, dict):
+                editable_columns = get_table_columns(editable_table)
+                if not editable_columns:
+                    editable_columns = {}
+                    editable_table["columns"] = editable_columns
+            for column_name, enriched_column in get_table_columns(enriched_table).items():
+                if not isinstance(enriched_column, dict):
+                    continue
+                editable_column = editable_columns.setdefault(column_name, {})
+                if not isinstance(editable_column, dict):
+                    continue
+                description = enriched_column.get("description")
+                if isinstance(description, str) and description.strip() and not str(
+                    editable_column.get("description", "")
+                ).strip():
+                    editable_column["description"] = description.strip()
+                examples = enriched_column.get("examples")
+                example_values = (
+                    [
+                        value for value in examples if self._is_example_value(value)
+                    ]
+                    if isinstance(examples, list)
+                    else []
+                )
+                if (
+                    example_values
+                    and not editable_column.get("examples")
+                ):
+                    editable_column["examples"] = example_values
+        self.file_manager.save_schema_document_atomic(dsn, document)
+        return document
 
     def _load_sqlrag_schema(self, dsn: str) -> Optional[Dict[str, Dict[str, Dict[str, Any]]]]:
         """Загружает схему из sqlrag/<sanitized>.json (только при enable=true)."""

@@ -159,6 +159,7 @@ def run_solver_candidate_pre_execution_gates(
     is_cancelled: Callable[[], bool],
     commit_transition: CommitTransition,
     parsed_candidate: object | None = None,
+    result_review_repair: bool = False,
 ) -> SolverState:
     """Commit safety through EXPLAIN without invoking the final executor."""
 
@@ -176,6 +177,7 @@ def run_solver_candidate_pre_execution_gates(
         is_cancelled=is_cancelled,
         commit_transition=commit_transition,
         parsed_candidate=parsed_candidate,
+        result_review_repair=result_review_repair,
     )
 
 
@@ -194,6 +196,7 @@ def _run_solver_candidate_pre_execution_gates(
     is_cancelled: Callable[[], bool],
     commit_transition: CommitTransition,
     parsed_candidate: object | None = None,
+    result_review_repair: bool = False,
 ) -> SolverState:
 
     current, research, authority = _validate_runner_inputs(
@@ -206,6 +209,7 @@ def _run_solver_candidate_pre_execution_gates(
         safety_policy,
         row_limit,
         dry_run_only,
+        result_review_repair,
         deadline,
         is_cancelled,
         commit_transition,
@@ -245,6 +249,7 @@ def _run_solver_candidate_pre_execution_gates(
         deadline,
         is_cancelled,
         commit_transition,
+        result_review_repair,
     )
 
 
@@ -300,6 +305,7 @@ def _run_pre_execution_stages(
     deadline: DeadlineBudget,
     is_cancelled: Callable[[], bool],
     commit_transition: CommitTransition,
+    result_review_repair: bool,
 ) -> SolverState:
     candidate = state.sql_candidates[-1]
     semantic_input: SemanticCheckInput | None = None
@@ -310,6 +316,21 @@ def _run_pre_execution_stages(
         deterministic_result = evaluate_semantic_authority_checks(
             semantic_input, research_state, dsn
         )
+        if (
+            result_review_repair
+            and deterministic_result.failure_code
+            is CheckFailureCode.UNAUTHORIZED_LITERAL
+        ):
+            return CheckResult(
+                check_id=f"semantic:{candidate.candidate_id}:passed",
+                candidate_id=candidate.candidate_id,
+                check_kind=CheckKind.SEMANTIC,
+                status=CheckStatus.PASSED,
+                failure_code=None,
+                affected_source_ids=(),
+                affected_ast_node_ids=(),
+                observed_error=None,
+            )
         return adapt_semantic_authority_check_result(semantic_input, deterministic_result)
 
     stages = (
@@ -461,6 +482,7 @@ def _validate_runner_inputs(
     safety_policy: TextToSqlSafetyPolicy,
     row_limit: object,
     dry_run_only: object,
+    result_review_repair: object,
     deadline: DeadlineBudget,
     is_cancelled: object,
     commit_transition: object,
@@ -489,6 +511,7 @@ def _validate_runner_inputs(
         safety_policy,
         row_limit,
         dry_run_only,
+        result_review_repair,
         deadline,
         is_cancelled,
         commit_transition,
@@ -525,6 +548,7 @@ def _validate_runner_options(
     safety_policy: TextToSqlSafetyPolicy,
     row_limit: object,
     dry_run_only: object,
+    result_review_repair: object,
     deadline: DeadlineBudget,
     is_cancelled: object,
     commit_transition: object,
@@ -545,6 +569,10 @@ def _validate_runner_options(
         raise SolverRunnerValidationError("row_limit must be a positive integer")
     if type(dry_run_only) is not bool:
         raise SolverRunnerValidationError("dry_run_only must be a boolean")
+    if type(result_review_repair) is not bool:
+        raise SolverRunnerValidationError(
+            "result_review_repair must be a boolean"
+        )
     _validate_deadline(deadline)
     callbacks = (is_cancelled, commit_transition)
     if not all(callable(value) for value in callbacks):

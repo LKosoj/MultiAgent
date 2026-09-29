@@ -262,6 +262,47 @@ def test_prompt_preserves_common_rowset_for_overall_and_conditional_aggregate() 
     assert "common FROM, JOIN, and filter scope" in instructions
 
 
+def test_prompt_keeps_parent_qualified_outer_aggregate_at_global_parent_grain() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task=(
+            "Return the overall average account balance and credit limit for accounts "
+            "with more than 7 activity records."
+        ),
+        solver_context="Account fields and activity records are confirmed.",
+    )
+    instructions = json.loads(prompt)["instructions"]
+    normalized_instructions = " ".join(instructions.split())
+
+    assert "a child aggregate only qualifies a parent set" in normalized_instructions
+    assert "outer aggregate once over that parent-grain set" in normalized_instructions
+    assert "raw child rows" in normalized_instructions
+    assert "GROUP BY each parent unless the question explicitly requests a per-parent result" in (
+        normalized_instructions
+    )
+    assert "exact formula that explicitly counts joined/detail rows" in normalized_instructions
+    assert "requested child/detail output" in normalized_instructions
+
+
+def test_prompt_computes_explicit_per_entity_quantity_before_outer_aggregate() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="What is the average number of late items in each shipment?",
+        solver_context="The item flag and shipment identity are confirmed.",
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "aggregate of a quantity computed separately for each entity" in instructions
+    assert "compute the inner value once per entity" in instructions
+    assert "include zero matching children" in instructions
+    assert "does not erase that explicit entity grain" in instructions
+    assert "explicitly states another row scope or counting unit" in instructions
+
+
 def test_prompt_preserves_requested_output_order() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -298,22 +339,174 @@ def test_prompt_prioritizes_row_preservation_path_for_sql_generation() -> None:
     assert "only while generating SQL" in instructions
 
 
-def test_prompt_uses_inner_join_for_output_entity_participating_in_event() -> None:
+def test_prompt_uses_inner_join_for_required_related_output() -> None:
     profile = load_sql_solver_agent_profile()
 
     prompt = build_sql_solver_prompt(
         profile,
-        task="List device labels for devices recorded by qualifying inspections.",
+        task="List account display labels.",
         solver_context="No row_preservation_requirements are present.",
     )
     instructions = " ".join(json.loads(prompt)["instructions"].split())
 
     assert (
-        "When no row_preservation_requirement applies and a requested related entity "
-        "or its attribute is explicitly described as participating in the qualifying "
-        "event, require a matched related row with INNER JOIN"
+        "Without an explicit row_preservation_requirement or the evidence-backed "
+        "extension rule below, a required output from a related table uses "
+        "INNER JOIN"
         in instructions
     )
+
+
+def test_prompt_uses_left_join_only_for_explicit_unmatched_related_output() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Include accounts without a category.",
+        solver_context="row_preservation_requirements requires unmatched base rows.",
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "Use LEFT JOIN when the question or QuerySpec explicitly requires "
+        "unmatched base rows or marks that relation optional"
+        in instructions
+    )
+
+
+def test_prompt_preserves_explicit_base_population_across_output_only_join() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List each qualifying account with its measured value.",
+        solver_context=(
+            "Trusted QuerySpec explicitly says that each qualifying account remains "
+            "in the result when a requested value is absent. The selected binding "
+            "contains a confirmed LEFT path to an output-only measurement relation."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When the trusted question or QuerySpec explicitly says that a base entity "
+        "remains in the result when a requested value is absent, preserve that base "
+        "population through output-only related joins"
+        in instructions
+    )
+    assert (
+        "Do not infer this exception merely from a nullable column, a base predicate, "
+        "an output-only relation, or a research-authored LEFT path"
+        in instructions
+    )
+
+
+def test_prompt_honours_only_evidence_backed_dependent_extension_left_join() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List qualifying accounts and their optional detail score.",
+        solver_context=(
+            "Eligible schema evidence proves account_details.account_id is both its "
+            "primary key and a foreign key to accounts.id. The committed path is LEFT; "
+            "the base filter is on accounts and details supplies only the score output."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "Use base-left LEFT for an output-only zero-or-one dependent extension when "
+        "eligible schema and relationship evidence proves that the extension foreign key "
+        "points to the base primary or unique key and is itself the extension primary or "
+        "unique key"
+        in instructions
+    )
+
+
+def test_prompt_uses_proven_extension_left_despite_research_inner() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List qualifying project records and their optional badge label.",
+        solver_context=(
+            "Eligible evidence proves record_badges.record_key is primary or unique "
+            "and is a foreign key to the unique project_records.record_key. All "
+            "conditions qualify project_records; record_badges supplies only the "
+            "requested label. Research committed the same endpoints as INNER."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    default_rule = (
+        "Without an explicit row_preservation_requirement or the evidence-backed "
+        "extension rule below"
+    )
+    extension_rule = (
+        "When eligible schema and relationship evidence proves this extension shape"
+    )
+
+    assert (
+        "When eligible schema and relationship evidence proves this extension shape, "
+        "choose base-left LEFT even if research committed the same endpoints as INNER; "
+        "an inferred research join type is routing input, not evidence that unmatched "
+        "base rows must be excluded."
+        in instructions
+    )
+    assert instructions.index(default_rule) < instructions.index(extension_rule)
+
+
+@pytest.mark.parametrize(
+    ("task", "solver_context"),
+    [
+        (
+            "List orders and their customer names.",
+            "Eligible evidence proves orders.customer_id references customers.id.",
+        ),
+        (
+            "List orders and their line descriptions.",
+            (
+                "Eligible evidence proves order_lines.order_id references orders.id "
+                "and is not unique in order_lines."
+            ),
+        ),
+    ],
+)
+def test_prompt_keeps_parent_lookup_and_nonunique_child_output_inner(
+    task: str,
+    solver_context: str,
+) -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task=task,
+        solver_context=solver_context,
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "A parent lookup, a non-unique child relation, or a bare research-authored "
+        "LEFT or INNER path without the proven extension shape keeps the default INNER join"
+        in instructions
+    )
+
+
+def test_prompt_preserves_sequential_verb_output_order() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Calculate an average and then list a category and description.",
+        solver_context="The average, category, and description are requested outputs.",
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+    rule = (
+        "With sequential output verbs, calculate or compute A, then list or show B, C "
+        "means project A, B, C; a later verb does not reset that order. Use the "
+        "semantic-kind fallback only when the question states no sequence."
+    )
+
+    assert rule in instructions
 
 
 def test_prompt_orders_unspecified_requested_outputs_by_semantic_kind() -> None:
@@ -352,6 +545,24 @@ def test_prompt_keeps_internal_technical_keys_out_of_root_select() -> None:
     assert "window partition, or dedup may be used internally" in instructions
     assert "must not be root SELECT" in instructions
     assert "explicitly requests that identifier or label output" in instructions
+
+
+def test_prompt_keeps_filter_only_columns_out_of_root_select() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List the devices that are active and assigned.",
+        solver_context=(
+            "QuerySpec requests only the device identifier; active and assigned "
+            "are confirmed filters backed by separate physical columns."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "physical column used only for filtering" in instructions
+    assert "must not be root SELECT" in instructions
+    assert "explicitly requests that column as output" in instructions
 
 
 def test_prompt_keeps_separate_physical_dimension_outputs_separate() -> None:
@@ -453,6 +664,10 @@ def test_prompt_preserves_fractional_result_for_average_or_explicit_division() -
     assert "integer-valued" in normalized_instructions
     assert "For SQLite" in normalized_instructions
     assert "CAST the numerator AS REAL" in normalized_instructions
+    assert "trusted exact formula" in normalized_instructions
+    assert "does not change its operands, division operator, order, or scale" in (
+        normalized_instructions
+    )
 
 
 def test_prompt_preserves_named_unit_for_variable_width_text_component() -> None:
@@ -493,6 +708,32 @@ def test_prompt_preserves_explicit_average_denominator() -> None:
     assert "same rows" in normalized_instructions
 
 
+def test_prompt_maps_exact_count_all_entity_words_to_count_star() -> None:
+    profile = load_sql_solver_agent_profile()
+    solver_context = (
+        "Trusted context defines the exact required formula as "
+        "DIVIDE(SUM(amount), COUNT(all transaction rows))."
+    )
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the documented average amount over transaction rows.",
+        solver_context=solver_context,
+    )
+    payload = json.loads(prompt)
+    normalized_instructions = " ".join(payload["instructions"].split())
+    rule = (
+        "In an exact trusted FORMULA, COUNT(all <entity words>) denotes all rows of "
+        "that formula's current row scope. Generate COUNT(*); do not concatenate those "
+        "words into a SQL identifier. This applies only to separate alphabetic entity "
+        "words, not COUNT(identifier) or an identifier containing _, digits, a dot, or "
+        "an operator."
+    )
+
+    assert payload["input"]["solver_context"] == solver_context
+    assert rule in normalized_instructions
+
+
 def test_prompt_keeps_ratio_denominator_in_its_own_row_scope() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -522,6 +763,94 @@ def test_prompt_keeps_ratio_denominator_in_its_own_row_scope() -> None:
     assert "multiple scalar values for one answer" in normalized_instructions
     assert "columns of one row rather than UNION rows" in normalized_instructions
     assert "unless separate rows are explicitly requested" in normalized_instructions
+
+
+def test_prompt_keeps_one_requested_attribute_in_one_output_column() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Which categories occur at either endpoint of each relationship?",
+        solver_context=(
+            "QuerySpec has one requested DIMENSION. Its values can be reached "
+            "through two endpoint roles of the same related entity."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "One requested semantic item remains one root output column" in (
+        normalized_instructions
+    )
+    assert "multiple bindings or relationship roles" in normalized_instructions
+    assert "do not turn each binding or role into a separate output column" in (
+        normalized_instructions
+    )
+
+
+def test_prompt_aggregates_distinct_child_populations_before_combining() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Divide the count of qualifying shipments by the count of package items.",
+        solver_context=(
+            "Shipments and package items are separate one-to-many children of orders. "
+            "The required formula aggregates one input from each child population."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+    required_rule = (
+        "When aggregate operands come from different one-to-many child tables that share "
+        "only a parent population, do not join the child tables before aggregating: that "
+        "multiplies one child's rows by the other's. Compute each aggregate independently "
+        "with the shared parent filters, then combine the scalar aggregates."
+    )
+
+    assert required_rule in normalized_instructions
+
+
+def test_prompt_preserves_measured_child_population_from_qualifying_sibling() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Count items on orders that have a completed inspection.",
+        solver_context=(
+            "Items and inspections are separate one-to-many children of orders. "
+            "The aggregate measures item rows; inspections only qualify orders."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+    required_rule = (
+        "When an aggregate measures rows of one child relation and a separate child "
+        "relation only qualifies their common parent, preserve the measured child "
+        "population. Use existence filtering or a deduplicated qualifying-parent set "
+        "instead of joining qualifying child rows before aggregation. This does not "
+        "apply when the question or trusted exact formula explicitly requests "
+        "relationship or detail rows as its counting unit."
+    )
+
+    assert required_rule in normalized_instructions
+
+
+def test_prompt_applies_required_population_predicates_to_both_formula_terms() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the share of records in one reporting period.",
+        solver_context=(
+            "A required TIME predicate defines the reporting-period population for "
+            "both terms of the formula."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "each required FILTER or TIME predicate that defines a formula's population "
+        "to every numerator and denominator term" in normalized_instructions
+    )
+    assert "explicitly requires separate populations" in normalized_instructions
 
 
 def test_prompt_returns_two_valued_result_for_requested_yes_no_formula() -> None:
@@ -608,6 +937,78 @@ def test_prompt_does_not_aggregate_dimension_only_output() -> None:
     )
 
 
+def test_prompt_distinguishes_attribute_value_list_from_entity_rows() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List the first three status values alphabetically.",
+        solver_context=(
+            "The requested output is the status attribute itself, not order rows. "
+            "Several orders may share one status value."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When the question requests the values of an attribute themselves as a set, "
+        "whether bounded or unbounded" in normalized_instructions
+    )
+    assert "return each value once" in normalized_instructions
+    assert (
+        "When the question requests rows or entities and merely displays that attribute, "
+        "preserve separate rows" in normalized_instructions
+    )
+
+
+def test_prompt_deduplicates_unbounded_attribute_value_set_not_entity_rows() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List all material values.",
+        solver_context=(
+            "The requested output is the material attribute as a set, not product rows. "
+            "Several products may share one material value."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When the question requests the values of an attribute themselves as a set, "
+        "whether bounded or unbounded" in normalized_instructions
+    )
+    assert "return each value once" in normalized_instructions
+    assert (
+        "When the question requests rows or entities and merely displays that attribute, "
+        "preserve separate rows" in normalized_instructions
+    )
+
+
+def test_prompt_deduplicates_root_identity_when_child_only_qualifies_it() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="List the accounts that have a matching event.",
+        solver_context=(
+            "The requested output is the unique account_id. The event relation is used "
+            "only to qualify accounts and contributes no requested output."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When the requested output is a proven unique identity of a root entity and a "
+        "joined child relation is used only to qualify that entity, with no child output "
+        "requested, return each qualifying root identity once"
+        in normalized_instructions
+    )
+    assert "does not apply to counts, metrics, formulas, or requested child rows" in (
+        normalized_instructions
+    )
+
+
 def test_prompt_does_not_aggregate_dimension_output_for_filter_formula() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -628,6 +1029,57 @@ def test_prompt_does_not_aggregate_dimension_output_for_filter_formula() -> None
         normalized_instructions
     )
     assert "aggregation or grouping" in normalized_instructions
+
+
+def test_prompt_scopes_universal_child_condition_to_required_filter() -> None:
+    profile = load_sql_solver_agent_profile()
+    rule = (
+        "For an explicit every/each/all observed-child condition, qualify the requested root. "
+        "If a required FILTER or TIME binds that same child relation, form the universe after "
+        "that filter and evaluate the universal condition in the same scope; do not include other "
+        "child rows unless explicitly requested. When child rows are not requested, return each "
+        "qualifying root entity once, not child-grain rows. This narrow rule does not authorize "
+        "generic DISTINCT or GROUP BY. An explicit all-children-regardless-of-filter request uses "
+        "the full universe; a request for child rows keeps child grain. Only for that explicit "
+        "universal condition, evaluate the filtered child universe once per (root, child) before "
+        "qualifying the root; do not repeat the same child-group aggregation for an outer child row "
+        "that cannot change the condition, but an outer-child correlation remains allowed when it "
+        "changes the condition."
+    )
+
+    for task in (
+        "Return each collection for which every observed entry has a required label.",
+        "Return each entry, including all entries regardless of the collection filter.",
+        "Return each collection with a required label.",
+    ):
+        prompt = build_sql_solver_prompt(
+            profile,
+            task=task,
+            solver_context="The required filter and universal condition use the entry relation.",
+        )
+        assert rule in " ".join(json.loads(prompt)["instructions"].split())
+
+
+def test_prompt_excludes_null_nullable_root_identity_for_universal_condition() -> None:
+    profile = load_sql_solver_agent_profile()
+    rule = (
+        "With an explicit every/each/all condition, if the requested existing root entity is "
+        "represented by a nullable child key or FK, exclude NULL from the universal universe "
+        "and root projection; preserve NULL only when missing, unknown, unassigned, or absent "
+        "entities are explicitly requested, and do not apply this to ordinary nullable "
+        "attributes, FORMULAs, or optional related rows."
+    )
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return each account for which every observed event has a required label.",
+        solver_context=(
+            "The requested account identity is a nullable account key on the qualifying event. "
+            "No missing or unassigned accounts are requested."
+        ),
+    )
+
+    assert rule in " ".join(json.loads(prompt)["instructions"].split())
 
 
 def test_prompt_does_not_infer_limit_from_scalar_result_shape() -> None:
@@ -651,6 +1103,26 @@ def test_prompt_does_not_infer_limit_from_scalar_result_shape() -> None:
     )
 
 
+def test_prompt_preserves_required_root_limit_after_row_expanding_join() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the detail value for the single earliest matching entity.",
+        solver_context=(
+            "The QuerySpec requires LIMIT 1, and the selected entity can have multiple "
+            "matching detail rows."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "A LIMIT inside a subquery does not satisfy that final row limit when a later "
+        "one-to-many join can expand the selected rows"
+        in normalized_instructions
+    )
+
+
 def test_prompt_preserves_all_groups_tied_at_aggregate_extreme() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -666,7 +1138,22 @@ def test_prompt_preserves_all_groups_tied_at_aggregate_extreme() -> None:
     assert "overall MIN or MAX aggregate" in normalized_instructions
 
 
-def test_prompt_excludes_unknown_values_when_selecting_an_extreme() -> None:
+def test_prompt_preserves_all_entities_tied_at_raw_row_extreme() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Which records have the lowest recorded amount?",
+        solver_context="The QuerySpec has raw-row amount ordering and no required LIMIT or tie-break.",
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "preserve every tied extreme" in normalized_instructions
+    assert "Do not use ORDER BY raw value alone" in normalized_instructions
+    assert "overall MIN or MAX raw value" in normalized_instructions
+
+
+def test_prompt_orders_null_after_known_values_when_selecting_an_extreme() -> None:
     profile = load_sql_solver_agent_profile()
 
     prompt = build_sql_solver_prompt(
@@ -676,9 +1163,14 @@ def test_prompt_excludes_unknown_values_when_selecting_an_extreme() -> None:
     )
     normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
 
-    assert "minimum or maximum known value" in normalized_instructions
-    assert "exclude NULL from the ordering column" in normalized_instructions
-    assert "explicitly requests unknown values" in normalized_instructions
+    assert "order NULL after known values rather than filtering them out" in (
+        normalized_instructions
+    )
+    assert "Known values win in a mixed set" in normalized_instructions
+    assert "retain an all-NULL qualifying set under the requested LIMIT and tie policy" in (
+        normalized_instructions
+    )
+    assert "explicit request for unknown or missing values" in normalized_instructions
 
 
 def test_prompt_preserves_all_rows_for_filtered_metric_formula() -> None:
@@ -743,6 +1235,32 @@ def test_prompt_preserves_document_defined_formula_in_target_dialect() -> None:
     )
 
 
+def test_prompt_treats_total_of_numeric_input_as_sum_in_trusted_formula() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="What percentage of vendors has qualifying revenue?",
+        solver_context=(
+            "A trusted document defines the exact required formula as "
+            "total(revenue) & qualifying / total(revenue) * 100. The revenue "
+            "column and qualifying predicate have confirmed evidence."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "In an exact trusted aggregate formula, total(<confirmed numeric input>) "
+        "means SUM of that input" in
+        normalized_instructions
+    )
+    assert (
+        "Do not return missing_evidence merely because the question names an entity "
+        "while the trusted formula names its confirmed numeric input"
+        in normalized_instructions
+    )
+
+
 def test_prompt_preserves_calendar_year_boundaries() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -760,6 +1278,35 @@ def test_prompt_preserves_calendar_year_boundaries() -> None:
     )
 
     assert rule in instructions
+
+
+def test_prompt_preserves_named_base_population_and_calendar_year_at_final_boundary() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="How many accounts with qualifying activities opened in or after 2018?",
+        solver_context=(
+            "accounts is the named base entity; activities can contain several qualifying "
+            "rows per account; accounts.opened_on stores full TEXT dates. No exact formula "
+            "or relationship/detail-row counting unit is required."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    final_rule = (
+        "Final mandatory population and time check: for an ordinary requested count of "
+        "named base entities, when no trusted exact formula explicitly establishes another "
+        "counting unit, preserve the base-entity population. Related rows may qualify that "
+        "population through EXISTS or a deduplicated qualifying-key set without adding "
+        "DISTINCT or entity-once semantics. Explicit relationship/detail-row counting units "
+        "and trusted exact formula counting units, including their existing plain COUNT "
+        "behavior, remain exceptions. For a calendar-year condition on a full date/time "
+        "value, use calendar-year extraction or a trusted full-date boundary. Never compare "
+        "a full date/time value directly with a bare calendar-year literal."
+    )
+
+    assert instructions.endswith(final_rule)
 
 
 def test_prompt_uses_calendar_year_form_inside_case_for_full_text_datetime() -> None:
@@ -888,6 +1435,12 @@ def test_prompt_preserves_entity_grain_in_ratio_across_one_to_many_join() -> Non
     assert "deduplicate the same entity identity in both numerator and denominator" in (
         normalized_instructions
     )
+    assert (
+        "An unqualified identifier in a formula does not explicitly establish a "
+        "joined or detail row counting unit."
+        in normalized_instructions
+    )
+    assert "the entity-once rule wins" in normalized_instructions
 
 
 def test_prompt_preserves_exact_join_row_ratio_formula_before_entity_dedup() -> None:
@@ -969,6 +1522,26 @@ def test_prompt_multiplies_percentage_numerator_before_division() -> None:
     assert "multiply the numerator by 100 before division" in normalized_instructions
 
 
+def test_prompt_keeps_decimal_place_metric_numeric() -> None:
+    profile = load_sql_solver_agent_profile()
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the event rate as a percentage with five decimal places.",
+        solver_context="The requested output is a numeric metric.",
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When a numeric metric is requested with a fixed number of decimal places"
+        in normalized_instructions
+    )
+    assert "keep the SQL result numeric" in normalized_instructions
+    assert "Do not use text formatting or append a display suffix" in (
+        normalized_instructions
+    )
+
+
 def test_prompt_preserves_counted_row_scope_without_unrequested_distinct() -> None:
     profile = load_sql_solver_agent_profile()
 
@@ -1013,6 +1586,46 @@ def test_prompt_preserves_exact_aggregate_formula_join_multiset() -> None:
     assert "explicitly requests unique, distinct, or entity-once counting" in (
         normalized_instructions
     )
+
+
+def test_prompt_does_not_invent_join_row_scope_from_count_identifier_and_predicate() -> None:
+    profile = load_sql_solver_agent_profile()
+    solver_context = (
+        "A trusted document requires DIVIDE(COUNT(assets.asset_id WHERE inspection "
+        "is passed), COUNT(assets.asset_id))*100. Assets and inspections are separate "
+        "one-to-many children of portfolios; inspections qualify portfolios. The document "
+        "does not name relationship or detail rows as the counting unit."
+    )
+
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="What percentage of assets belong to portfolios with a passed inspection?",
+        solver_context=solver_context,
+    )
+    payload = json.loads(prompt)
+    normalized_instructions = " ".join(payload["instructions"].split())
+    required_rule = (
+        "COUNT(identifier) with a predicate from a related relation preserves those stated "
+        "operations but does not itself establish physical joined-row multiplicity. When a "
+        "measured child relation and a sibling relation only qualifies their common parent, "
+        "preserve the measured population with existence filtering or a deduplicated "
+        "qualifying-parent set. A multiplied relationship/detail-row population is allowed "
+        "only when the question or trusted document explicitly names those rows as its "
+        "counting unit. Within an already established population, COUNT(identifier) remains "
+        "non-DISTINCT unless unique, distinct, or entity-once counting is explicit."
+    )
+    priority_rule = (
+        "For a ratio or percentage over entities, when a one-to-many join can repeat one "
+        "entity, deduplicate the same entity identity in both numerator and denominator. Do "
+        "not apply this rule when a trusted formula explicitly states plain COUNT(identifier) "
+        "in an already established population: preserve that COUNT and its predicate; use "
+        "existence filtering or a deduplicated qualifying-parent set only to prevent sibling "
+        "fanout, not to deduplicate counted rows."
+    )
+
+    assert payload["input"]["solver_context"] == solver_context
+    assert required_rule in normalized_instructions
+    assert priority_rule in normalized_instructions
 
 
 def test_prompt_deduplicates_counted_entities_repeated_by_join() -> None:
@@ -1290,3 +1903,127 @@ def test_profile_model_is_strict() -> None:
                 "tools": [],
             }
         )
+
+
+def test_prompt_rebuilds_formula_semantics_mismatch_from_trusted_binding() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the percentage of active accounts.",
+        solver_context=(
+            "deterministic_sql_repair_receipt failure_code=FORMULA_SEMANTICS_MISMATCH; "
+            "trusted exact binding uses accounts.status = 'active'."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+    exact_binding = "accounts.status = 'active'"
+    required_rule = (
+        "When deterministic_sql_repair_receipt has failure_code "
+        "FORMULA_SEMANTICS_MISMATCH, rebuild the root formula from the trusted exact binding "
+        "and do not return the same normalized semantic AST; formatting or alias-only change "
+        "is not a repair."
+    )
+
+    assert exact_binding in json.loads(prompt)["input"]["solver_context"]
+    assert required_rule in normalized_instructions
+
+
+def test_prompt_repair_preserves_independent_confirmed_predicates() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return hubs whose occupancy ratio qualifies.",
+        solver_context=(
+            "deterministic_sql_repair_receipt source_id=occupancy_ratio; "
+            "independent confirmed predicate hubs.qualified_count > 0."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When deterministic_sql_repair_receipt targets one source_id, change only the SQL "
+        "parts that implement that source_id"
+        in normalized_instructions
+    )
+    assert (
+        "Preserve every independently confirmed predicate for every other source_id with "
+        "the same column, operator, and literal; do not replace it with an algebraically "
+        "equivalent spelling unless the receipt explicitly targets that predicate"
+        in normalized_instructions
+    )
+
+
+def test_prompt_preserves_each_filter_source_binding() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task=(
+            "Count channels that publish the blue label, then list channels that "
+            "display the blue label and count channels that publish it per display group."
+        ),
+        solver_context=(
+            "Required FILTER source_id=published-blue is bound to catalog.published_label; "
+            "required FILTER source_id=displayed-blue is bound to catalog.displayed_label."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "Implement each required FILTER or TIME item with the selected binding for that "
+        "item's own source_id" in normalized_instructions
+    )
+    assert (
+        "A matching literal or attribute in another semantic item does not permit using "
+        "that other item's binding" in normalized_instructions
+    )
+
+
+def test_prompt_uses_exact_confirmed_discriminator_predicate() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task="Return the measurement recorded on 2001/2/3.",
+        solver_context=(
+            "The required TIME item says 2001/2/3, while its selected "
+            "discriminator_value binding confirms records.recorded_on = '2001-02-03'."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "For a selected discriminator_value binding, copy its exact physical column, "
+        "operator, and right-hand literal into SQL" in normalized_instructions
+    )
+    assert (
+        "Do not substitute the item's source text, normalized meaning, or an equivalent "
+        "spelling from the question or a trusted document" in normalized_instructions
+    )
+
+
+def test_prompt_keeps_entity_set_scope_separate_from_per_entity_calculation() -> None:
+    profile = load_sql_solver_agent_profile()
+    prompt = build_sql_solver_prompt(
+        profile,
+        task=(
+            "Count published reports, then count regions that publish the bulletin and "
+            "for each such region count reviewed bulletins."
+        ),
+        solver_context=(
+            "QuerySpec has entity-set FILTER source_id=published-region-set for regions "
+            "counted in the second result and per-entity FILTER source_id=reviewed-bulletins "
+            "for the third result. Required FILTER source_id=published-region-set is bound "
+            "to catalog.published_bulletin; required FILTER source_id=reviewed-bulletins is "
+            "bound to audits.reviewed_bulletin."
+        ),
+    )
+    normalized_instructions = " ".join(json.loads(prompt)["instructions"].split())
+    rule = (
+        "When QuerySpec distinguishes an entity set for one result from a per-entity "
+        "calculation for another, build that entity set only with the selected bindings "
+        "of its own FILTER/TIME sources. Bindings for the per-entity calculation apply "
+        "only to that calculation and must not replace the entity-set bindings, even when "
+        "literal or attribute matches; retain selected entities with zero matching "
+        "calculation rows."
+    )
+
+    assert rule in normalized_instructions

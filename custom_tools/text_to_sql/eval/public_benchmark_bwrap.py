@@ -80,11 +80,13 @@ def _sandbox_runtime_env(args: argparse.Namespace) -> dict[str, str]:
         return {
             str(name): str(value) for name, value in canonical_environment.items()
         }
-    values: dict[str, str] = {}
+    values: dict[str, str] = {"WORKFLOW_PROCESS_LEASE_SECONDS": "1200"}
     for raw in getattr(args, "sandbox_env", []):
         name, separator, value = raw.partition("=")
         if not separator or not name:
             raise ValueError("--sandbox-env must use NAME=VALUE")
+        if name == "WORKFLOW_PROCESS_LEASE_SECONDS":
+            raise ValueError("WORKFLOW_PROCESS_LEASE_SECONDS is fixed for bwrap")
         values[name] = value
     return values
 

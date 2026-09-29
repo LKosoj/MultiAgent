@@ -59,8 +59,16 @@ SourceIds: TypeAlias = Annotated[
     tuple[Id, ...],
     Field(min_length=1, max_length=MAX_SOURCE_IDS),
 ]
+SourceHandles: TypeAlias = Annotated[
+    tuple[Annotated[str, Field(pattern=r"^s[1-9][0-9]*$")], ...],
+    Field(min_length=1, max_length=MAX_SOURCE_IDS),
+]
 CitationEvidenceIds: TypeAlias = Annotated[
     tuple[Id, ...],
+    Field(min_length=1, max_length=MAX_EVIDENCE_CITATIONS),
+]
+CitationEvidenceHandles: TypeAlias = Annotated[
+    tuple[Annotated[str, Field(pattern=r"^e[1-9][0-9]*$")], ...],
     Field(min_length=1, max_length=MAX_EVIDENCE_CITATIONS),
 ]
 JsonScalar: TypeAlias = str | int | float | bool
@@ -96,6 +104,7 @@ def _semantic_proposal_key(value: StrictModel) -> str:
     semantic = value.model_dump(mode="json", by_alias=True)
     semantic.pop("proposal_key", None)
     semantic.pop("citation_evidence_ids", None)
+    semantic.pop("citation_evidence_handles", None)
     return json.dumps(
         semantic,
         ensure_ascii=False,
@@ -140,6 +149,15 @@ def _unique_models_in_order(
     if len(keys) != len(set(keys)):
         raise ValueError(f"{label} must be unique")
     return values
+
+
+def _exactly_one_identifier_form(
+    raw: object,
+    handles: object,
+    label: str,
+) -> None:
+    if (raw is None) == (handles is None):
+        raise ValueError(f"{label} requires exactly one raw-ID or handle form")
 
 
 class LogicalTableRef(StrictModel):
@@ -354,18 +372,40 @@ CandidateBinding: TypeAlias = Annotated[
 
 
 class _CitedProposal(StrictModel):
-    citation_evidence_ids: CitationEvidenceIds
+    citation_evidence_ids: CitationEvidenceIds | None = None
+    citation_evidence_handles: CitationEvidenceHandles | None = None
 
     @field_validator("citation_evidence_ids")
     @classmethod
-    def normalize_citations(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def normalize_citations(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is None:
+            return None
         return _sorted_unique_ids(value, "citation_evidence_ids")
+
+    @field_validator("citation_evidence_handles")
+    @classmethod
+    def normalize_citation_handles(
+        cls, value: tuple[str, ...] | None
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        return _sorted_unique_ids(value, "citation_evidence_handles")
+
+    @model_validator(mode="after")
+    def require_citation_form(self) -> _CitedProposal:
+        _exactly_one_identifier_form(
+            self.citation_evidence_ids,
+            self.citation_evidence_handles,
+            "citation evidence",
+        )
+        return self
 
 
 class NewHypothesisProposal(_CitedProposal):
     proposal_type: Literal["new_hypothesis"] = "new_hypothesis"
     proposal_key: ProposalKey
-    source_ids: SourceIds
+    source_ids: SourceIds | None = None
+    source_handles: SourceHandles | None = None
     claim: SemanticText
     candidate_targets: Annotated[
         tuple[LogicalTarget, ...],
@@ -374,8 +414,28 @@ class NewHypothesisProposal(_CitedProposal):
 
     @field_validator("source_ids")
     @classmethod
-    def normalize_source_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def normalize_source_ids(cls, value: tuple[str, ...] | None) -> tuple[str, ...] | None:
+        if value is None:
+            return None
         return _sorted_unique_ids(value, "source_ids")
+
+    @field_validator("source_handles")
+    @classmethod
+    def normalize_source_handles(
+        cls, value: tuple[str, ...] | None
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        return _sorted_unique_ids(value, "source_handles")
+
+    @model_validator(mode="after")
+    def require_source_form(self) -> NewHypothesisProposal:
+        _exactly_one_identifier_form(
+            self.source_ids,
+            self.source_handles,
+            "hypothesis source",
+        )
+        return self
 
     @field_validator("candidate_targets")
     @classmethod
@@ -395,7 +455,8 @@ class HypothesisAssessment(_CitedProposal):
 class NewBindingProposal(_CitedProposal):
     proposal_type: Literal["new_binding"] = "new_binding"
     proposal_key: ProposalKey
-    source_id: Id
+    source_id: Id | None = None
+    source_handle: Annotated[str, Field(pattern=r"^s[1-9][0-9]*$")] | None = None
     candidate: CandidateBinding
     join_references: Annotated[
         tuple[JoinReference, ...],
@@ -412,6 +473,15 @@ class NewBindingProposal(_CitedProposal):
         if len(keys) != len(set(keys)):
             raise ValueError("join_references must be unique")
         return value
+
+    @model_validator(mode="after")
+    def require_source_form(self) -> NewBindingProposal:
+        _exactly_one_identifier_form(
+            self.source_id,
+            self.source_handle,
+            "binding source",
+        )
+        return self
 
 
 class BindingAssessment(_CitedProposal):
@@ -523,37 +593,94 @@ class ToolIntent(StrictModel):
 class StopRequest(StrictModel):
     next_kind: Literal["stop"] = "stop"
     reason: Literal["complete", "ambiguous", "unsupported"]
-    source_ids: Annotated[tuple[Id, ...], Field(max_length=MAX_SOURCE_IDS)]
+    source_ids: Annotated[tuple[Id, ...], Field(max_length=MAX_SOURCE_IDS)] | None = None
+    source_handles: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^s[1-9][0-9]*$")], ...],
+        Field(max_length=MAX_SOURCE_IDS),
+    ] | None = None
     citation_evidence_ids: Annotated[
         tuple[Id, ...], Field(max_length=MAX_EVIDENCE_CITATIONS)
-    ]
+    ] | None = None
+    citation_evidence_handles: Annotated[
+        tuple[Annotated[str, Field(pattern=r"^e[1-9][0-9]*$")], ...],
+        Field(max_length=MAX_EVIDENCE_CITATIONS),
+    ] | None = None
     ambiguity: AmbiguityReport | None = None
 
     @field_validator("source_ids", mode="before")
     @classmethod
-    def normalize_source_ids(cls, value: object) -> tuple[str, ...]:
+    def normalize_source_ids(cls, value: object) -> tuple[str, ...] | None:
+        if value is None:
+            return None
         if isinstance(value, list):
             value = tuple(value)
         return _sorted_unique_ids(value, "source_ids")
 
+    @field_validator("source_handles", mode="before")
+    @classmethod
+    def normalize_source_handles(cls, value: object) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            value = tuple(value)
+        return _sorted_unique_ids(value, "source_handles")
+
     @field_validator("citation_evidence_ids", mode="before")
     @classmethod
-    def normalize_citations(cls, value: object) -> tuple[str, ...]:
+    def normalize_citations(cls, value: object) -> tuple[str, ...] | None:
+        if value is None:
+            return None
         if isinstance(value, list):
             value = tuple(value)
         return _sorted_unique_ids(value, "citation_evidence_ids")
 
+    @field_validator("citation_evidence_handles", mode="before")
+    @classmethod
+    def normalize_citation_handles(cls, value: object) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if isinstance(value, list):
+            value = tuple(value)
+        return _sorted_unique_ids(value, "citation_evidence_handles")
+
     @model_validator(mode="after")
     def require_affected_source(self) -> StopRequest:
-        if self.reason in {"ambiguous", "unsupported"} and not self.source_ids:
+        _exactly_one_identifier_form(
+            self.source_ids,
+            self.source_handles,
+            "stop source",
+        )
+        _exactly_one_identifier_form(
+            self.citation_evidence_ids,
+            self.citation_evidence_handles,
+            "stop citation evidence",
+        )
+        source_ids = self.source_ids or self.source_handles or ()
+        citation_evidence_ids = (
+            self.citation_evidence_ids or self.citation_evidence_handles or ()
+        )
+        if self.reason in {"ambiguous", "unsupported"} and not source_ids:
             raise ValueError("ambiguous/unsupported stop requires source_ids")
-        if self.reason in {"ambiguous", "unsupported"} and not self.citation_evidence_ids:
+        if self.reason in {"ambiguous", "unsupported"} and not citation_evidence_ids:
             raise ValueError("ambiguous/unsupported stop requires evidence citations")
         if (self.reason == "ambiguous") != (self.ambiguity is not None):
             raise ValueError("ambiguity report is required only for ambiguous stop")
         if (
             self.ambiguity is not None
-            and self.ambiguity.citation_evidence_ids != self.citation_evidence_ids
+            and (
+                (self.citation_evidence_ids is None)
+                != (self.ambiguity.citation_evidence_ids is None)
+                or (
+                    self.ambiguity.citation_evidence_ids is not None
+                    and self.ambiguity.citation_evidence_ids
+                    != self.citation_evidence_ids
+                )
+                or (
+                    self.ambiguity.citation_evidence_handles is not None
+                    and self.ambiguity.citation_evidence_handles
+                    != self.citation_evidence_handles
+                )
+            )
         ):
             raise ValueError("ambiguity citations must equal stop citations")
         return self

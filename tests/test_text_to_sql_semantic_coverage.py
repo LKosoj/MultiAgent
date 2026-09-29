@@ -23,12 +23,15 @@ from custom_tools.text_to_sql.adaptive.models import (
     BudgetState,
     CheckKind,
     CheckStatus,
+    DerivedExpressionBinding,
     DiscriminatorValueBinding,
+    DocumentRef,
     EvidenceCost,
     EvidenceRecord,
     EvidenceSourceKind,
     EvidenceValidityScope,
     ExpectedResultShape,
+    ExpressionRef,
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
@@ -50,6 +53,7 @@ from custom_tools.text_to_sql.adaptive.replay_inputs import (
     ResearchTerminalReplayInput,
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
+    CoverageInputError,
     validate_coverage_inputs,
 )
 from custom_tools.text_to_sql.adaptive.serialization import (
@@ -502,6 +506,144 @@ def test_researched_time_predicate_without_query_operator_is_accepted() -> None:
     assert requirements.selected_bindings == (binding,)
 
 
+def test_researched_filter_predicate_without_query_operator_is_accepted() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    item = item.model_copy(
+        update={
+            "source_text": "orders from the northern area",
+            "normalized_meaning": "orders assigned to the northern area",
+            "operator": None,
+            "literal_or_reference": "northern area",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == state.bindings
+
+
+@pytest.mark.parametrize("formula_contains_time", (True, False))
+def test_exact_physical_time_is_covered_only_by_matching_trusted_formula_input(
+    formula_contains_time: bool,
+) -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    schema_evidence = next(
+        evidence
+        for evidence in state.evidence
+        if evidence.source_kind is EvidenceSourceKind.SCHEMA
+    )
+    column = _column()
+    formula_column = (
+        column
+        if formula_contains_time
+        else ColumnRef(table=column.table, column="different_column")
+    )
+    time_binding = canonical_binding(
+        PhysicalColumnBinding(
+            binding_id="binding-event-time",
+            source_id="event-time",
+            tables=(column.table,),
+            columns=(column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=(schema_evidence.evidence_id,),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="schema column",
+            physical_column=column,
+        )
+    )
+    formula_binding = canonical_binding(
+        DerivedExpressionBinding(
+            binding_id="binding-calculated-metric",
+            source_id="calculated-metric",
+            tables=(column.table,),
+            columns=(formula_column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=(schema_evidence.evidence_id,),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="trusted formula",
+            document=DocumentRef(document_id="metric-rule", namespace="main"),
+            expression=ExpressionRef(
+                expression_id="metric-expression",
+                expression="COUNT(event_id WHERE YEAR(event_time)=2024)",
+            ),
+            rule_excerpt="COUNT(event_id WHERE YEAR(event_time)=2024)",
+            input_columns=(formula_column,),
+        )
+    )
+    formula_item = SemanticItem(
+        source_id="calculated-metric",
+        kind=SemanticItemKind.FORMULA,
+        source_text="calculated metric",
+        normalized_meaning="COUNT(event_id WHERE YEAR(event_time)=2024)",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(formula_binding.binding_id,),
+    )
+    time_item = SemanticItem(
+        source_id="event-time",
+        kind=SemanticItemKind.TIME,
+        source_text="during the requested year",
+        normalized_meaning="YEAR(event_time)=2024",
+        required=True,
+        operator=PredicateOperator.EQ,
+        literal_or_reference=2024,
+        exact_physical_predicate=True,
+        status=SemanticItemStatus.RESOLVED,
+        binding_ids=(time_binding.binding_id,),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (formula_item, time_item),
+                    "requested_output_source_ids": (formula_item.source_id,),
+                }
+            ),
+            "evidence": (schema_evidence,),
+            "bindings": (formula_binding, time_binding),
+        }
+    )
+
+    freshness = FreshnessContext(
+        evaluated_at=_OBSERVED_AT,
+        run_id=_RUN_ID,
+        run_incarnation=_INCARNATION,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    if formula_contains_time:
+        requirements = validate_coverage_inputs(
+            state, freshness, _RUN_ID, _INCARNATION
+        )
+        assert requirements.selected_bindings == (formula_binding, time_binding)
+    else:
+        with pytest.raises(CoverageInputError, match="QUERY_REQUIREMENT_INCOMPLETE"):
+            validate_coverage_inputs(state, freshness, _RUN_ID, _INCARNATION)
+
+
 def test_requested_time_output_does_not_require_a_predicate() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (schema_evidence,) = (
@@ -627,6 +769,7 @@ def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (item,) = state.query_spec.semantic_items
     (binding,) = state.bindings
+    schema_evidence, value_evidence = state.evidence
     secondary_column = ColumnRef(table=binding.tables[0], column="region")
     primary = binding.discriminator_predicate.model_copy(update={"right": "Elijah"})
     secondary = PredicateRef(
@@ -634,12 +777,59 @@ def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
         operator=PredicateOperator.EQ,
         right="Allen",
     )
+
+    def exact_value_evidence(
+        evidence_id: str,
+        column: ColumnRef,
+        value: str,
+    ) -> EvidenceRecord:
+        payload = {"columns": [column.column], "rows": [[value]]}
+        payload_bytes = canonical_json_bytes(payload)
+        observation = json.loads(value_evidence.observation)
+        observation.update(
+            {
+                "byte_count": len(payload_bytes),
+                "invocation_id": evidence_id,
+                "payload": payload,
+                "payload_digest": canonical_digest(payload),
+                "row_count": 1,
+            }
+        )
+        observation["provenance"].update(
+            {
+                "invocation_id": evidence_id,
+                "payload_digest": canonical_digest(payload),
+                "target": column.model_dump(mode="json", by_alias=True),
+            }
+        )
+        return value_evidence.model_copy(
+            update={
+                "evidence_id": evidence_id,
+                "target": column,
+                "observation": canonical_json_bytes(observation).decode("utf-8"),
+                "cost": value_evidence.cost.model_copy(
+                    update={"rows": 1, "bytes": len(payload_bytes)}
+                ),
+            }
+        )
+
+    primary_evidence = exact_value_evidence(
+        "evidence-status-elijah", primary.left, "Elijah"
+    )
+    secondary_evidence = exact_value_evidence(
+        "evidence-region-allen", secondary.left, "Allen"
+    )
     binding = canonical_binding(
         binding.model_copy(
             update={
                 "columns": (binding.discriminator_column, secondary_column),
                 "predicates": (primary, secondary),
                 "discriminator_predicate": primary,
+                "evidence_ids": (
+                    schema_evidence.evidence_id,
+                    primary_evidence.evidence_id,
+                    secondary_evidence.evidence_id,
+                ),
             }
         )
     )
@@ -654,6 +844,7 @@ def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
             "query_spec": state.query_spec.model_copy(
                 update={"semantic_items": (item,)}
             ),
+            "evidence": (schema_evidence, primary_evidence, secondary_evidence),
             "bindings": (binding,),
         }
     )
@@ -671,6 +862,118 @@ def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
     )
 
     assert requirements.selected_bindings == (binding,)
+
+
+def test_generation_authority_excludes_uncertified_discriminator_aliases() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    (physical_binding,) = state.bindings
+    schema_evidence, positive_evidence = state.evidence
+    physical_predicate = physical_binding.discriminator_predicate.model_copy(
+        update={"operator": PredicateOperator.IN, "right": ("active",)}
+    )
+    alias_predicate = PredicateRef(
+        left=physical_binding.discriminator_column,
+        operator=PredicateOperator.IN,
+        right=("+-", "-"),
+    )
+
+    def zero_row_search(evidence_id: str) -> EvidenceRecord:
+        record = _evidence(
+            evidence_id,
+            source_kind=EvidenceSourceKind.VALUE_SEARCH,
+            action=state.action_history[0],
+            schema_version=state.schema_namespace_version,
+            revision=state.revision,
+            observed_at=_OBSERVED_AT,
+        )
+        payload = {"columns": [physical_predicate.left.column], "rows": []}
+        payload_bytes = canonical_json_bytes(payload)
+        observation = json.loads(record.observation)
+        observation.update(
+            {
+                "byte_count": len(payload_bytes),
+                "payload": payload,
+                "payload_digest": canonical_digest(payload),
+                "row_count": 0,
+            }
+        )
+        observation["provenance"]["payload_digest"] = canonical_digest(payload)
+        return record.model_copy(
+            update={
+                "observation": canonical_json_bytes(observation).decode("utf-8"),
+                "cost": record.cost.model_copy(
+                    update={"rows": 0, "bytes": len(payload_bytes)}
+                ),
+            }
+        )
+
+    alias_evidence = (
+        zero_row_search("evidence-fictional-alias-plus-minus"),
+        zero_row_search("evidence-fictional-alias-minus"),
+    )
+    physical_binding = canonical_binding(
+        physical_binding.model_copy(
+            update={
+                "binding_id": "binding-fictional-physical",
+                "source_id": "fictional-category",
+                "predicates": (physical_predicate,),
+                "discriminator_predicate": physical_predicate,
+                "evidence_ids": (
+                    schema_evidence.evidence_id,
+                    positive_evidence.evidence_id,
+                ),
+            }
+        )
+    )
+    alias_binding = canonical_binding(
+        physical_binding.model_copy(
+            update={
+                "binding_id": "binding-fictional-aliases",
+                "predicates": (alias_predicate,),
+                "discriminator_predicate": alias_predicate,
+                "evidence_ids": tuple(
+                    evidence.evidence_id for evidence in alias_evidence
+                ),
+            }
+        )
+    )
+    item = item.model_copy(
+        update={
+            "source_id": "fictional-category",
+            "source_text": "fictional categorical filter",
+            "normalized_meaning": "stored physical category active",
+            "literal_or_reference": ("active",),
+            "binding_ids": (
+                alias_binding.binding_id,
+                physical_binding.binding_id,
+            ),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "evidence": (schema_evidence, positive_evidence, *alias_evidence),
+            "bindings": (physical_binding, alias_binding),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (physical_binding,)
+    assert requirements.allowed_predicates == (physical_predicate,)
 
 
 def _create_fixture(

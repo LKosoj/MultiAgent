@@ -604,6 +604,7 @@ async def run_adaptive_sql_generation(
         boundary = await _generation_boundary(runtime)
         if boundary is not None:
             return _stop_and_project(runtime, store, checkpoint, boundary)
+        result_review_repair = repair_receipt is not None
         (
             checkpoint,
             proposal_failure,
@@ -665,6 +666,7 @@ async def run_adaptive_sql_generation(
             row_limit,
             dry_run_only,
             parsed_candidate,
+            result_review_repair=result_review_repair,
         )
         ready = _ready_candidate(checkpoint.state)
         if ready is not None:
@@ -806,15 +808,6 @@ async def _resume_open_generation(
         terminal = _seal_stopped_generation(runtime, store, checkpoint)
         return checkpoint, research, requirements, freshness, terminal
     if checkpoint.state.stop_reason is SolverStopReason.MISSING_EVIDENCE:
-        candidate = _unreplaced_semantic_repair_candidate(checkpoint.state)
-        if candidate is not None:
-            return (
-                checkpoint,
-                research,
-                requirements,
-                freshness,
-                _ready_generation_output(runtime, checkpoint.state, candidate),
-            )
         return await _continue_after_missing_evidence(
             runtime,
             store,
@@ -913,15 +906,6 @@ async def _continue_after_missing_evidence(
         terminal = _seal_stopped_generation(runtime, store, checkpoint)
         return checkpoint, research, requirements, freshness, terminal
     if checkpoint.state.stop_reason is not None:
-        candidate = _unreplaced_semantic_repair_candidate(checkpoint.state)
-        if candidate is not None:
-            return (
-                checkpoint,
-                research,
-                requirements,
-                freshness,
-                _ready_generation_output(runtime, checkpoint.state, candidate),
-            )
         terminal = _seal_stopped_generation(runtime, store, checkpoint)
         return checkpoint, research, requirements, freshness, terminal
     return checkpoint, research, requirements, freshness, None
@@ -1398,6 +1382,20 @@ def _solver_context(
 
     limit_bytes = input_tokens * APPROXIMATE_BYTES_PER_TOKEN
 
+    research = getattr(runtime, "verified_research_state", None)
+    eligible_evidence = []
+    if type(research) is ResearchState:
+        eligible_ids = set(requirements.eligible_evidence_ids)
+        eligible_evidence = [
+            {
+                "evidence_id": item.evidence_id,
+                "observation": item.observation,
+                "source_kind": item.source_kind.value,
+            }
+            for item in sorted(research.evidence, key=lambda value: value.evidence_id)
+            if item.evidence_id in eligible_ids
+        ]
+
     core: dict[str, object] = {
         "coverage_requirements": requirements.model_dump(mode="json"),
         "solver_state": state.model_dump(mode="json"),
@@ -1406,6 +1404,8 @@ def _solver_context(
             for document in runtime.document_snapshot
         ],
     }
+    if eligible_evidence:
+        core["eligible_evidence"] = eligible_evidence
     if repair_receipt is not None:
         repair_receipt_context = repair_receipt.model_dump(mode="json")
         repair_receipt_context["execution"] = dict(repair_receipt_context["execution"])
@@ -1583,6 +1583,8 @@ def _run_pre_execution(
     row_limit,
     dry_run_only,
     parsed_candidate=None,
+    *,
+    result_review_repair=False,
 ):
     def commit(transition):
         nonlocal checkpoint
@@ -1612,6 +1614,7 @@ def _run_pre_execution(
         is_cancelled=runtime.is_cancelled,
         commit_transition=commit,
         parsed_candidate=parsed_candidate,
+        result_review_repair=result_review_repair,
     )
     return checkpoint
 

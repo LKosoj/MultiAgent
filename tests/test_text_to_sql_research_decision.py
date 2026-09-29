@@ -175,6 +175,114 @@ def test_decision_has_no_model_authored_revision_or_runtime_identity() -> None:
             _parse(malformed)
 
 
+def test_identifier_handles_are_exclusive_alternatives_to_legacy_ids() -> None:
+    long_source_id = "semantic:fictional:long:opaque:source:identifier:for:handles"
+    long_evidence_id = "invocation:fictional:long:opaque:evidence:identifier:for:handles"
+    handled = _parse(
+        _decision(
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:handled",
+                "source_handle": "s1",
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {"table": "orders", "column": "id"},
+                },
+                "join_references": [],
+                "citation_evidence_handles": ["e1"],
+            }
+        )
+    )
+    proposal = handled.proposals[0]
+    assert isinstance(proposal, NewBindingProposal)
+    assert proposal.source_handle == "s1"
+    assert proposal.source_id is None
+    assert proposal.citation_evidence_handles == ("e1",)
+    assert proposal.citation_evidence_ids is None
+
+    legacy = _parse(
+        _decision(
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:legacy",
+                "source_id": long_source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {"table": "orders", "column": "id"},
+                },
+                "join_references": [],
+                "citation_evidence_ids": [long_evidence_id],
+            }
+        )
+    )
+    legacy_proposal = legacy.proposals[0]
+    assert isinstance(legacy_proposal, NewBindingProposal)
+    assert legacy_proposal.source_id == long_source_id
+    assert legacy_proposal.citation_evidence_ids == (long_evidence_id,)
+
+    mixed = _decision(
+        {
+            "proposal_type": "new_binding",
+            "proposal_key": "proposal:mixed",
+            "source_id": long_source_id,
+            "source_handle": "s1",
+            "candidate": {
+                "kind": "physical_column",
+                "physical_column": {"table": "orders", "column": "id"},
+            },
+            "join_references": [],
+            "citation_evidence_ids": [long_evidence_id],
+            "citation_evidence_handles": ["e1"],
+        }
+    )
+    with pytest.raises(ContractValidationError):
+        _parse(mixed)
+
+
+def test_ambiguous_stop_accepts_only_matching_handle_citation_form() -> None:
+    handled = _parse(
+        _decision(
+            next_step={
+                "next_kind": "stop",
+                "reason": "ambiguous",
+                "source_handles": ["s1"],
+                "citation_evidence_handles": ["e1"],
+                "ambiguity": {
+                    "interpretations": ["First reading.", "Second reading."],
+                    "citation_evidence_handles": ["e1"],
+                    "missing_distinguishing_fact": "A definition is absent.",
+                },
+            }
+        )
+    )
+    assert handled.next.source_handles == ("s1",)
+    assert handled.next.citation_evidence_handles == ("e1",)
+    assert handled.next.ambiguity.citation_evidence_handles == ("e1",)
+
+    mixed = handled.model_dump(mode="json")
+    mixed["next"]["ambiguity"] = {
+        "interpretations": ["First reading.", "Second reading."],
+        "citation_evidence_ids": ["evidence-1"],
+        "missing_distinguishing_fact": "A definition is absent.",
+    }
+    with pytest.raises(ContractValidationError):
+        _parse(mixed)
+
+
+def test_stop_source_handles_are_unique() -> None:
+    with pytest.raises(ContractValidationError):
+        _parse(
+            _decision(
+                next_step={
+                    "next_kind": "stop",
+                    "reason": "complete",
+                    "source_handles": ["s1", "s1"],
+                    "citation_evidence_handles": [],
+                }
+            )
+        )
+
+
 def test_all_five_candidate_binding_variants_are_transient_and_logical() -> None:
     candidates = (
         {

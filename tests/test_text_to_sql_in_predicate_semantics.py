@@ -2,6 +2,10 @@
 
 import pytest
 
+from custom_tools.text_to_sql.adaptive.freshness import (
+    DocumentSourceAvailability,
+    DocumentSourceState,
+)
 from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
     canonical_binding,
 )
@@ -16,6 +20,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     PredicateOperator,
     ResearchState,
     SemanticItemKind,
+    SemanticItemStatus,
     SqlCandidate,
 )
 from custom_tools.text_to_sql.adaptive.semantic_checks import evaluate_semantic_authority_checks
@@ -34,6 +39,13 @@ from text_to_sql_semantic_checks_helpers import (
     _value_evidence,
     build_state,
     column,
+)
+from tests.text_to_sql_semantic_coverage_helpers import (
+    _document_binding,
+    _document_evidence,
+    _physical_binding,
+    _state,
+    _validate,
 )
 
 
@@ -152,6 +164,81 @@ def _in_case(
         POSTGRES_DSN,
     )
     return (result, semantic_ast) if include_semantic_ast else result
+
+
+def test_document_only_binding_has_no_semantic_ast_targets() -> None:
+    document_binding = _document_binding(
+        "document-rule",
+        "binding-document-rule",
+        "evidence-document-rule",
+    )
+    physical_binding = _physical_binding(
+        "physical-output",
+        "binding-physical-output",
+        "evidence-physical-output",
+    )
+    state = _state(
+        item_specs=(
+            (
+                "document-rule",
+                True,
+                SemanticItemStatus.RESOLVED,
+                (document_binding.binding_id,),
+            ),
+            (
+                "physical-output",
+                True,
+                SemanticItemStatus.RESOLVED,
+                (physical_binding.binding_id,),
+            ),
+        ),
+        bindings=(document_binding, physical_binding),
+        evidence=(
+            _document_evidence("evidence-document-rule", content="validated rule"),
+            _schema_evidence(
+                "evidence-physical-output", physical_binding.physical_column
+            ),
+        ),
+    )
+    requirements = _validate(
+        state,
+        _context(
+            documents=(
+                DocumentSourceState(
+                    document_id="coverage-document",
+                    availability=DocumentSourceAvailability.AVAILABLE,
+                    source_version="v1",
+                ),
+            ),
+        ),
+    )
+    sql = (
+        'SELECT p."column-physical-output" '
+        'FROM "table-physical-output" AS p'
+    )
+    parsed_ast = parse_sql_candidate(sql, POSTGRES_DSN, "candidate-document-rule")
+    candidate = SqlCandidate(
+        candidate_id="candidate-document-rule",
+        sql=sql,
+        normalized_ast_digest=parsed_ast.candidate_digest,
+        revision=state.revision,
+    )
+
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        state.query_spec,
+        requirements,
+        "main",
+    )
+
+    annotation_source_ids = {
+        source_id
+        for annotation in semantic_ast.coverage.annotations
+        for source_id in annotation.source_ids
+    }
+    assert "document-rule" not in annotation_source_ids
+    assert "physical-output" in annotation_source_ids
 
 
 def test_physical_filter_value_may_differ_from_query_literal() -> None:

@@ -9,6 +9,7 @@ Fallback-эвристика (``_fallback_extract_intent``/``_fallback_tokenize``
 """
 from __future__ import annotations
 
+import copy
 import re
 import logging
 import os
@@ -58,6 +59,90 @@ def _nlu_model(step: str):
 _TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}|\d+[.,]?\d*|[\w\-]+", re.IGNORECASE | re.UNICODE)
 _DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}")
 _NUM_TOKEN_PATTERN = re.compile(r"\d+[.,]?\d*")
+_DOCUMENTED_IN_PREDICATE_PATTERN = re.compile(
+    r"(?P<column>[A-Za-z_]\w*)\s+IN\s*\((?P<literals>'[^']*'(?:\s*,\s*'[^']*')+)\)",
+    re.IGNORECASE,
+)
+_SAME_COLUMN_MAPPING_PAIR_PATTERN = re.compile(
+    r"\s*(?P<column>[A-Za-z_]\w*)\s*=\s*'(?P<left>[^']*)'\s+"
+    r"(?:means|refers\s+to)\s+'(?P<right>[^']*)'\s*\.?\s*",
+    re.IGNORECASE,
+)
+
+
+def _unwrap_exact_answer_object(value: Any) -> Any:
+    if isinstance(value, dict) and set(value) == {"answer"} and isinstance(value["answer"], dict):
+        return value["answer"]
+    return value
+
+
+def _normalize_complete_same_column_pair_mapping(
+    response: Any, context_documents: tuple[str, ...]
+) -> Any:
+    """Нормализует только полный явный same-column mapping для exact FILTER."""
+    normalized = copy.deepcopy(response)
+    if not isinstance(normalized, dict):
+        return normalized
+    items = normalized.get("semantic_items")
+    if not isinstance(items, list):
+        return normalized
+
+    for item in items:
+        if not (
+            isinstance(item, dict)
+            and item.get("kind") == "filter"
+            and item.get("exact_physical_predicate") is True
+            and item.get("operator") == "in"
+            and isinstance(item.get("exact_physical_column_name"), str)
+            and isinstance(item.get("literal_or_reference"), list)
+        ):
+            continue
+        response_literals = item["literal_or_reference"]
+        if not all(isinstance(literal, str) for literal in response_literals):
+            continue
+
+        replacements: list[list[str]] = []
+        for document in context_documents:
+            for predicate in _DOCUMENTED_IN_PREDICATE_PATTERN.finditer(document):
+                column = predicate.group("column")
+                aliases = re.findall(r"'([^']*)'", predicate.group("literals"))
+                if (
+                    column != item["exact_physical_column_name"]
+                    or len(aliases) != len(set(aliases))
+                    or response_literals != aliases
+                ):
+                    continue
+
+                tail = document[predicate.end() :]
+                if not tail.lstrip().startswith(";"):
+                    continue
+                pairs: dict[str, str] = {}
+                for statement in tail.split(";")[1:]:
+                    pair = _SAME_COLUMN_MAPPING_PAIR_PATTERN.fullmatch(statement)
+                    if pair is None or pair.group("column") != column:
+                        break
+                    left, right = pair.group("left"), pair.group("right")
+                    matching_aliases = [literal for literal in (left, right) if literal in aliases]
+                    if len(matching_aliases) == 2:
+                        pairs = {}
+                        break
+                    if len(matching_aliases) == 1:
+                        alias = matching_aliases[0]
+                        replacement = right if alias == left else left
+                        if alias in pairs:
+                            pairs = {}
+                            break
+                        pairs[alias] = replacement
+
+                if set(pairs) == set(aliases):
+                    replacements.append([pairs[alias] for alias in aliases])
+
+        if len(replacements) == 1:
+            item["literal_or_reference"] = replacements[0]
+
+    return normalized
+
+
 class NLUProcessor:
     """Обработчик естественного языка для извлечения намерений и сущностей."""
 
@@ -151,7 +236,21 @@ class NLUProcessor:
             "всегда должен быть непустой JSON-строкой или null; числа, "
             "boolean, массивы и объекты запрещены. Если operator или "
             "literal_or_reference отсутствует, указывай JSON null без кавычек; "
-            'строка "null" не означает отсутствующее значение.'
+            'строка "null" не означает отсутствующее значение. '
+            "Если exact_physical_predicate=false или operator=null, "
+            "exact_physical_column_name также должен быть JSON null. "
+            "Если вопрос или trusted context document прямо требует считать каждую "
+            "именованную сущность один раз и не учитывать её повторные строки, сохрани "
+            "entity-once в normalized_meaning соответствующего requested_output METRIC. "
+            "Не добавляй entity-once только из-за JOIN, идентификатора или нескольких "
+            "строк без такого явного требования. "
+            "Если однозначная числовая граница из вопроса и trusted exact FORMULA "
+            "отличаются только включением или исключением того же значения границы, "
+            "сохраняй оператор из вопроса. "
+            "Если вопрос отбирает сущности по участию в событиях за явно названную "
+            "историческую дату или период и одновременно задаёт возраст этих сущностей, "
+            "считай возраст на дату соответствующего события, если вопрос прямо не "
+            "говорит о текущем возрасте."
         )
         max_tokens = _nlu_max_tokens("query_understanding_max_tokens")
         response = call_openai_api(
@@ -161,7 +260,10 @@ class NLUProcessor:
             model=_nlu_model("nlu_query_understanding"),
             response_format={"type": "json_object"},
         )
-        decoded = parse_llm_json_response(response)
+        decoded = _unwrap_exact_answer_object(parse_llm_json_response(response))
+        decoded = _normalize_complete_same_column_pair_mapping(
+            decoded, context_documents
+        )
         understand_query(
             text,
             run_id=run_id,
@@ -180,7 +282,12 @@ class NLUProcessor:
             model=_nlu_model("nlu_completeness"),
             response_format={"type": "json_object"},
         )
-        corrected = parse_llm_json_response(completeness_response)
+        corrected = _unwrap_exact_answer_object(
+            parse_llm_json_response(completeness_response)
+        )
+        corrected = _normalize_complete_same_column_pair_mapping(
+            corrected, context_documents
+        )
         return understand_query(
             text,
             run_id=run_id,

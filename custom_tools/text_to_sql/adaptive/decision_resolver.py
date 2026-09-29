@@ -44,6 +44,7 @@ from .models import (
     DocumentRef,
     DiscriminatorValueBinding,
     JoinCandidate,
+    JoinCandidateStatus,
     JoinEdge,
     JoinType,
     PhysicalColumnBinding,
@@ -55,6 +56,7 @@ from .models import (
     VerticalAttributeBinding,
 )
 from .probes import ProbeResult, ProbeStatus
+from .provenance import parse_probe_observation, read_evidence_provenance
 from .research_decision import (
     BindingAssessment,
     DerivedExpressionCandidate,
@@ -70,6 +72,7 @@ from .research_decision import (
     NewBindingProposal,
     NewJoinProposal,
     ProposedBindingRef,
+    ProposedJoinRef,
     ResearchDecisionV1,
     ToolIntent,
 )
@@ -89,6 +92,17 @@ from .serialization import canonical_digest, canonical_json_bytes
 from .tool_registry import AdaptiveResearchToolRegistry, resolve_research_tool_claim
 
 
+def _captured_schema_has_column_name(
+    loaded_schema: LoadedSchema,
+    column_name: str,
+) -> bool:
+    return any(
+        isinstance(table_body, Mapping)
+        and column_name in get_table_columns(table_body)
+        for table_body in loaded_schema.schema.values()
+    )
+
+
 class DecisionResolverError(ValueError):
     """A parsed decision cannot be trusted in the supplied current context."""
 
@@ -101,8 +115,10 @@ class UnresolvableModelDecisionError(DecisionResolverError):
         message: str,
         *,
         exact_column: ColumnRef | None = None,
+        normalized_decision: ResearchDecisionV1 | None = None,
     ) -> None:
         self.exact_column = exact_column
+        self.normalized_decision = normalized_decision
         super().__init__(message)
 
 
@@ -426,7 +442,11 @@ class _ScopedResolver:
         self._resolved_documents[document_id] = resolved
         return resolved
 
-    def batch(self) -> TrustedSemanticBatch:
+    def batch(
+        self,
+        *,
+        exact_physical_column_names: tuple[tuple[str, str], ...] = (),
+    ) -> TrustedSemanticBatch:
         return TrustedSemanticBatch(
             schema_namespace_version=self._schema_version,
             tables=tuple(
@@ -448,6 +468,7 @@ class _ScopedResolver:
             ),
             schema_columns=tuple(self._schema_columns),
             declared_join_ids=tuple(sorted(self._declared_join_ids)),
+            exact_physical_column_names=exact_physical_column_names,
         )
 
 
@@ -492,6 +513,7 @@ def resolve_research_decision(
     joins_by_id = {item.join_id: item for item in current.join_candidates}
     proposed_join_ids: dict[str, str] = {}
     proposed_joins: dict[str, JoinCandidate] = {}
+    duplicate_join_ids_by_proposal_key: dict[str, str] = {}
     for proposal in parsed.proposals:
         if (
             isinstance(proposal, BindingAssessment)
@@ -511,10 +533,91 @@ def resolve_research_decision(
             resolver.record_declared_join(join)
         elif isinstance(proposal, NewJoinProposal):
             join = _new_join(proposal, resolver, current.schema_namespace_version)
-            resolver.record_declared_join(join)
             proposed_join_ids[proposal.proposal_key] = join.join_id
-            proposed_joins[join.join_id] = join
-    batch = resolver.batch()
+            existing = joins_by_id.get(join.join_id)
+            if (
+                existing is not None
+                and existing.status is JoinCandidateStatus.VALIDATED
+                and (
+                    existing.left,
+                    existing.right,
+                    existing.join_type,
+                    existing.path,
+                )
+                == (join.left, join.right, join.join_type, join.path)
+            ):
+                resolver.record_declared_join(existing)
+                duplicate_join_ids_by_proposal_key[proposal.proposal_key] = (
+                    existing.join_id
+                )
+            else:
+                resolver.record_declared_join(join)
+                proposed_joins[join.join_id] = join
+    if duplicate_join_ids_by_proposal_key:
+        proposals = tuple(
+            proposal
+            for proposal in parsed.proposals
+            if not (
+                isinstance(proposal, NewJoinProposal)
+                and proposal.proposal_key in duplicate_join_ids_by_proposal_key
+            )
+        )
+        proposals = tuple(
+            proposal.model_copy(
+                update={
+                    "join_references": tuple(
+                        ExistingJoinRef(
+                            join_id=duplicate_join_ids_by_proposal_key[
+                                reference.proposal_key
+                            ]
+                        )
+                        if isinstance(reference, ProposedJoinRef)
+                        and reference.proposal_key
+                        in duplicate_join_ids_by_proposal_key
+                        else reference
+                        for reference in proposal.join_references
+                    )
+                }
+            )
+            if isinstance(proposal, NewBindingProposal)
+            else proposal.model_copy(
+                update={
+                    "subject": ExistingJoinRef(
+                        join_id=duplicate_join_ids_by_proposal_key[
+                            proposal.subject.proposal_key
+                        ]
+                    )
+                }
+            )
+            if isinstance(proposal, JoinAssessment)
+            and isinstance(proposal.subject, ProposedJoinRef)
+            and proposal.subject.proposal_key in duplicate_join_ids_by_proposal_key
+            else proposal
+            for proposal in proposals
+        )
+        try:
+            parsed = ResearchDecisionV1.model_validate(
+                {
+                    **parsed.model_dump(mode="python", round_trip=True),
+                    "proposals": proposals,
+                },
+                strict=True,
+            )
+        except ValidationError as exc:
+            raise UnresolvableModelDecisionError(
+                "model semantic decision is not admissible"
+            ) from exc
+    batch = resolver.batch(
+        exact_physical_column_names=tuple(
+            (item.source_id, item.exact_physical_column_name)
+            for item in current.query_spec.semantic_items
+            if item.exact_physical_column_name is not None
+            and _captured_schema_has_column_name(
+                loaded_schema,
+                item.exact_physical_column_name,
+            )
+        )
+    )
     semantic_resolver = _SemanticResolver(batch)
     all_joins = {**joins_by_id, **proposed_joins}
     duplicate_binding_ids_by_proposal_key: dict[str, str] = {}
@@ -542,13 +645,27 @@ def resolve_research_decision(
             raise UnresolvableModelDecisionError(
                 "multiple proposals repeat the same existing binding"
             )
+        redundant_proposal_keys: set[str] = set()
         for proposal in parsed.proposals:
             if not isinstance(proposal, BindingAssessment):
                 continue
             if (
                 isinstance(proposal.subject, ExistingBindingRef)
                 and proposal.subject.binding_id in duplicate_ids
-            ) or (
+            ):
+                if proposal.certificate == "consistent":
+                    redundant_proposal_keys.update(
+                        proposal_key
+                        for proposal_key, binding_id in (
+                            duplicate_binding_ids_by_proposal_key.items()
+                        )
+                        if binding_id == proposal.subject.binding_id
+                    )
+                    continue
+                raise UnresolvableModelDecisionError(
+                    "existing binding is assessed more than once"
+                )
+            if (
                 isinstance(proposal.subject, ProposedBindingRef)
                 and proposal.subject.proposal_key
                 in duplicate_binding_ids_by_proposal_key
@@ -572,8 +689,13 @@ def resolve_research_decision(
                     if isinstance(proposal, NewBindingProposal)
                     and proposal.proposal_key
                     in duplicate_binding_ids_by_proposal_key
+                    and proposal.proposal_key not in redundant_proposal_keys
                     else proposal
                     for proposal in parsed.proposals
+                    if not (
+                        isinstance(proposal, NewBindingProposal)
+                        and proposal.proposal_key in redundant_proposal_keys
+                    )
                 ),
             },
             strict=True,
@@ -685,7 +807,8 @@ def resolve_research_decision(
                 "semantic decision admission failed"
             ) from exc
         raise UnresolvableModelDecisionError(
-            "model semantic decision is not admissible"
+            "model semantic decision is not admissible",
+            normalized_decision=parsed,
         ) from exc
     except (TypeError, ValueError, ValidationError) as exc:
         raise DecisionResolverError("semantic decision admission failed") from exc
@@ -954,6 +1077,8 @@ def _validate_admitted_identity(
         raise DecisionResolverError("resolved action_id is already present")
     if action.action_digest in {item.action_digest for item in state.action_history}:
         raise DuplicateResearchActionError(action)
+    if _repeats_complete_distinct_values(state, action):
+        raise DuplicateResearchActionError(action)
     if invocation.invocation_id in {item.evidence_id for item in state.evidence}:
         raise DecisionResolverError("resolved invocation was already observed")
     identifiers = {
@@ -963,6 +1088,42 @@ def _validate_admitted_identity(
     }
     if len(identifiers) != 3:
         raise DecisionResolverError("resolved tool identifiers must be distinct")
+
+
+def _repeats_complete_distinct_values(
+    state: ResearchState,
+    action: ResearchAction,
+) -> bool:
+    if (
+        action.kind is not ResearchActionKind.DISTINCT_VALUES
+        or type(action.target) is not ColumnRef
+    ):
+        return False
+    return any(
+        prior_action.kind is ResearchActionKind.DISTINCT_VALUES
+        and type(prior_action.target) is ColumnRef
+        and prior_action.target == action.target
+        and evidence.action_digest == prior_action.action_digest
+        and evidence.target == prior_action.target
+        and (provenance := read_evidence_provenance(evidence)) is not None
+        and provenance.probe_kind is ResearchActionKind.DISTINCT_VALUES
+        and (observation := parse_probe_observation(evidence.observation)) is not None
+        and observation.truncated is False
+        and (
+            (
+                observation.storage == "artifact"
+                and observation.row_count > 0
+            )
+            or (
+                observation.storage == "inline"
+                and isinstance(observation.payload, dict)
+                and isinstance(observation.payload.get("rows"), list)
+                and bool(observation.payload["rows"])
+            )
+        )
+        for prior_action in state.action_history
+        for evidence in state.evidence
+    )
 
 
 def _state_digest(state: ResearchState) -> str:

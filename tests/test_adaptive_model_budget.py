@@ -178,8 +178,8 @@ def test_v1_model_budget_stays_disabled_and_v2_defaults_are_explicit(tmp_path) -
                 ledger=ledger,
             )
         state = initial_model_budget_state(_config())
-        assert state.initial_total_tokens == 1_048_576
-        assert state.initial_input_tokens == 256 * 32_768
+        assert state.initial_total_tokens == 4_194_304
+        assert state.initial_input_tokens == 256 * 262_144
         assert MAX_MODEL_OUTPUT_TOKENS_PER_CALL == 32_000
         assert state.initial_output_tokens == 256 * 32_000
     finally:
@@ -234,6 +234,31 @@ def test_reported_usage_is_charged_once_across_duplicate_execution(tmp_path) -> 
         record = ledger.load_model_records(RUN_ID, INCARNATION)[0]
         assert record.started is not None
         assert record.reconciliation == first
+    finally:
+        ledger.close()
+
+
+def test_default_input_reservation_reconciles_large_reported_usage(tmp_path) -> None:
+    ledger = AdaptiveBudgetLedger(tmp_path / "large-reported-usage.sqlite")
+    try:
+        reconciliation = execute_model_call_with_budget(
+            RUN_ID,
+            INCARNATION,
+            "large-reported-usage",
+            _request_digest("large-reported-usage"),
+            MODEL_IDENTITY,
+            MAX_MODEL_INPUT_TOKENS_PER_CALL,
+            MAX_MODEL_OUTPUT_TOKENS_PER_CALL,
+            lambda _reservation: ModelTokenUsage(input_tokens=196_608, output_tokens=1),
+            config=_config(),
+            ledger=ledger,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "large-reported-usage-owner",
+        )
+
+        assert reconciliation.charged_input_tokens == 196_608
+        assert reconciliation.charged_output_tokens == 1
+        assert reconciliation.usage_was_conservative is False
     finally:
         ledger.close()
 

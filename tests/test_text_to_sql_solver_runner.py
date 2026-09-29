@@ -18,6 +18,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     CheckStatus,
     EvidenceSourceKind,
     PredicateOperator,
+    PredicateRef,
     RepairKind,
     ResearchState,
     SemanticItemKind,
@@ -27,6 +28,7 @@ from custom_tools.text_to_sql.adaptive.models import (
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
     validate_coverage_inputs,
 )
+from custom_tools.text_to_sql.adaptive.sql_ast import parse_sql_candidate
 from custom_tools.text_to_sql.adaptive.solver_loop import apply_solver_proposal
 from custom_tools.text_to_sql.adaptive.solver_protocol import (
     MissingEvidenceProposal,
@@ -529,6 +531,257 @@ def test_pre_execution_runner_stops_on_limit_semantic_failure_before_explain(
         CheckKind.SEMANTIC,
     )
     assert result.check_results[-1].failure_code is CheckFailureCode.LIMIT_MISMATCH
+
+
+def test_pre_execution_runner_allows_review_repair_to_rebind_literals(monkeypatch):
+    state, research_state, requirements, loaded_schema = _runtime()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: {"is_valid": True, "issues": []},
+    )
+
+    def semantic(check_input, *_args):
+        calls.append("semantic")
+        return CheckResult(
+            check_id=f"semantic:{check_input.candidate.candidate_id}:unauthorized_literal",
+            candidate_id=check_input.candidate.candidate_id,
+            check_kind=CheckKind.SEMANTIC,
+            status=CheckStatus.FAILED,
+            failure_code=CheckFailureCode.UNAUTHORIZED_LITERAL,
+            affected_source_ids=("status",),
+            affected_ast_node_ids=(),
+            observed_error=None,
+            repair=CheckRepair(kind=RepairKind.REVISE_SQL, source_ids=("status",)),
+        )
+
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.evaluate_semantic_authority_checks",
+        semantic,
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_explain",
+        lambda *_a, **_kw: calls.append("explain")
+        or {
+            "plan": "SCAN orders",
+            "estimated_cost": 1,
+            "rows_to_scan": 1,
+            "issues": [],
+            "profile_name": "default",
+            "policy_version": "v1",
+        },
+    )
+
+    result = run_solver_candidate_pre_execution_gates(
+        state,
+        candidate_id="candidate-1",
+        research_state=research_state,
+        requirements=requirements,
+        loaded_schema=loaded_schema,
+        dsn=POSTGRES_DSN,
+        safety_policy=load_startup_safety_policy(),
+        row_limit=10,
+        dry_run_only=False,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+        commit_transition=lambda transition: transition.state,
+        result_review_repair=True,
+    )
+
+    assert calls == ["semantic", "explain"]
+    assert result.check_results[-2].check_kind is CheckKind.SEMANTIC
+    assert result.check_results[-2].status is CheckStatus.PASSED
+    assert result.check_results[-1].check_kind is CheckKind.EXPLAIN
+
+
+def test_pre_execution_runner_rejects_non_boolean_review_repair_flag():
+    state, research_state, requirements, loaded_schema = _runtime()
+
+    with pytest.raises(
+        SolverRunnerValidationError,
+        match="result_review_repair must be a boolean",
+    ):
+        run_solver_candidate_pre_execution_gates(
+            state,
+            candidate_id="candidate-1",
+            research_state=research_state,
+            requirements=requirements,
+            loaded_schema=loaded_schema,
+            dsn=POSTGRES_DSN,
+            safety_policy=load_startup_safety_policy(),
+            row_limit=10,
+            dry_run_only=False,
+            deadline=DeadlineBudget.from_duration(60),
+            is_cancelled=lambda: False,
+            commit_transition=lambda transition: transition.state,
+            result_review_repair=1,
+        )
+
+
+def test_pre_execution_runner_commits_binary_null_semantic_failure_before_explain(
+    monkeypatch,
+):
+    state, research_state, requirements, loaded_schema = _runtime()
+    candidate_id = state.sql_candidates[-1].candidate_id
+    sql = "SELECT o.status FROM orders o WHERE o.status = NULL"
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, candidate_id)
+    state = state.model_copy(
+        update={
+            "sql_candidates": (
+                state.sql_candidates[-1].model_copy(
+                    update={"sql": sql, "normalized_ast_digest": parsed.candidate_digest}
+                ),
+            )
+        }
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: calls.append("safety")
+        or {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: calls.append("schema") or {"is_valid": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_explain",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("EXPLAIN called")),
+    )
+
+    result = run_solver_candidate_pre_execution_gates(
+        state,
+        candidate_id=candidate_id,
+        research_state=research_state,
+        requirements=requirements,
+        loaded_schema=loaded_schema,
+        dsn=POSTGRES_DSN,
+        safety_policy=load_startup_safety_policy(),
+        row_limit=10,
+        dry_run_only=False,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+        commit_transition=lambda transition: transition.state,
+    )
+
+    assert calls == ["safety", "schema"]
+    assert tuple(item.check_kind for item in result.check_results) == (
+        CheckKind.SAFETY,
+        CheckKind.SCHEMA,
+        CheckKind.SEMANTIC,
+    )
+    assert result.check_results[-1].status is CheckStatus.FAILED
+    assert (
+        result.check_results[-1].failure_code
+        is CheckFailureCode.AST_SHAPE_UNSUPPORTED
+    )
+
+
+def test_pre_execution_runner_accepts_generation_authorized_binding_subset(monkeypatch):
+    state, research_state, _requirements, loaded_schema = _runtime()
+    (physical_binding,) = research_state.bindings
+    alias_predicate = PredicateRef(
+        left=physical_binding.discriminator_column,
+        operator=PredicateOperator.EQ,
+        right="unverified-alias",
+    )
+    alias_binding = physical_binding.model_copy(
+        update={
+            "binding_id": "binding-status-alias",
+            "predicates": (alias_predicate,),
+            "discriminator_predicate": alias_predicate,
+        }
+    )
+    (item,) = research_state.query_spec.semantic_items
+    item = item.model_copy(
+        update={"binding_ids": (physical_binding.binding_id, alias_binding.binding_id)}
+    )
+    research_state = research_state.model_copy(
+        update={
+            "query_spec": research_state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (physical_binding, alias_binding),
+        }
+    )
+    requirements = validate_coverage_inputs(
+        research_state,
+        _context(schema=research_state.schema_namespace_version),
+        research_state.run_id,
+        research_state.run_incarnation,
+    )
+    state = state.model_copy(update={"query_spec": research_state.query_spec})
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_safety_check",
+        lambda *_a, **_kw: calls.append("safety")
+        or {
+            "is_safe": True,
+            "issues": [],
+            "advisory_issues": [],
+            "safety_status": "safe",
+            "llm_audit": "skipped_static_only",
+        },
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.SQLSchemaValidator.validate_sql_against_schema",
+        lambda *_a, **_kw: calls.append("schema") or {"is_valid": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "custom_tools.text_to_sql.adaptive.solver_runner.core.sql_explain",
+        lambda *_a, **_kw: calls.append("explain")
+        or {
+            "plan": "SCAN orders",
+            "estimated_cost": 1,
+            "rows_to_scan": 1,
+            "issues": [],
+            "profile_name": "default",
+            "policy_version": "v1",
+        },
+    )
+
+    result = run_solver_candidate_pre_execution_gates(
+        state,
+        candidate_id="candidate-1",
+        research_state=research_state,
+        requirements=requirements,
+        loaded_schema=loaded_schema,
+        dsn=POSTGRES_DSN,
+        safety_policy=load_startup_safety_policy(),
+        row_limit=10,
+        dry_run_only=False,
+        deadline=DeadlineBudget.from_duration(60),
+        is_cancelled=lambda: False,
+        commit_transition=lambda transition: transition.state,
+    )
+
+    assert tuple(binding.binding_id for binding in requirements.selected_bindings) == (
+        physical_binding.binding_id,
+    )
+    assert calls == ["safety", "schema", "explain"]
+    assert tuple(item.status for item in result.check_results) == (
+        CheckStatus.PASSED,
+        CheckStatus.PASSED,
+        CheckStatus.PASSED,
+        CheckStatus.PASSED,
+    )
 
 
 def test_pre_execution_runner_propagates_semantic_rebuild_failure_after_schema(

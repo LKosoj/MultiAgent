@@ -530,155 +530,12 @@ def test_finalizer_uses_arbitration_completion_for_verified_execution(
     assert calls == ["arbitration"]
 
 
-@pytest.mark.parametrize("crash_before_terminal", (False, True))
-def test_verified_semantic_repair_execution_is_durable_and_never_reexecutes(
-    monkeypatch,
-    tmp_path,
-    crash_before_terminal,
-) -> None:
-    engine = object.__new__(EnhancedWorkflowEngine)
-    runtime, store, _, research, _, _, _, _ = _persisted_result_contradiction_checkpoint(
-        tmp_path,
-        result_review_reason="selected binding has no verified replacement",
-        result_review_verdict="contradicted",
-        repair_kind="semantic_binding_mismatch",
-    )
-
-    async def reenter(
-        solver_state,
-        research_state,
-        request_id,
-        *,
-        commit_solver_admission,
-        id_factory,
-        **_kwargs,
-    ):
-        admitted = admit_targeted_reentry(
-            solver_state,
-            research_state,
-            request_id,
-            base_revision=solver_state.revision,
-            id_factory=id_factory,
-        )
-        committed = commit_solver_admission(admitted)
-        finalized = finalize_targeted_reentry(
-            committed,
-            admitted.record.research_reentry_id,
-            ResearchReentryStatus.PROTOCOL_FAILURE,
-            base_revision=committed.revision,
-        )
-        return SimpleNamespace(
-            solver_state=finalized.state,
-            research_state=research_state,
-            record=finalized.record,
-        )
-
-    async def forbidden_proposal(*_args, **_kwargs):
-        raise AssertionError("semantic repair must exhaust its durable re-entry first")
-
-    generated = asyncio.run(
-        run_adaptive_sql_generation(
-            runtime,
-            propose=forbidden_proposal,
-            safety_policy=object(),
-            row_limit=10,
-            dry_run_only=False,
-            table_namespace="main",
-            reenter=reenter,
-            id_factory=iter(("semantic-repair-reentry-1",)).__next__,
-        )
-    )
-    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
-    assert checkpoint is not None
-    assert checkpoint.state.research_reentries[-1].status is (
-        ResearchReentryStatus.PROTOCOL_FAILURE
-    )
-    assert generated["sql"] == checkpoint.state.sql_candidates[-1].sql
-
-    def forbidden_executor(*_args, **_kwargs):
-        raise AssertionError("verified fallback must not execute SQL again")
-
-    def forbidden_result_review(*_args, **_kwargs):
-        raise AssertionError("verified fallback must not review SQL again")
-
-    async def forbidden_db_audit(*_args, **_kwargs):
-        raise AssertionError("verified fallback must not use the db_audit tool")
-
-    side_effects = {"audit": 0, "persistence": 0}
-    persistence_calls = []
-
-    def audit_logger(_entry):
-        side_effects["audit"] += 1
-        return {"status": "logged", "log_id": "audit"}
-
-    def save_successful_sql(**kwargs):
-        side_effects["persistence"] += 1
-        persistence_calls.append(kwargs)
-        return {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}
-
-    monkeypatch.setattr(core, "secure_db_executor", forbidden_executor)
-    monkeypatch.setattr(
-        "custom_tools.text_to_sql.adaptive.result_review.evaluate_result_review_capability",
-        forbidden_result_review,
-    )
-    monkeypatch.setattr(core, "audit_logger", audit_logger)
-    monkeypatch.setattr(
-        core,
-        "save_successful_sql",
-        save_successful_sql,
-    )
-    monkeypatch.setattr(engine, "_execute_on_db_audit_tool_once", forbidden_db_audit)
-    step = _finalizer_step(checkpoint.state)
-
-    if crash_before_terminal:
-        from workflow.text_to_sql_adaptive_solver import prepare_finalizer_execution
-
-        prepared = prepare_finalizer_execution(
-            runtime,
-            {"operation": "finalize_text_to_sql_run", **step.tool_params},
-        )
-        assert prepared.verified_execution is not None
-        marker = store.load(runtime.run_id, runtime.run_incarnation)
-        assert marker is not None and marker.terminal is None
-        assert marker.state.stop_reason.name == "SOLVED"
-        recovered = asyncio.run(
-            engine._execute_reserved_text_to_sql_finalizer(
-                step, _context(runtime), "finalize"
-            )
-        )
-        assert recovered["reason_code"] == "EXECUTION_UNKNOWN"
-        assert side_effects == {"audit": 0, "persistence": 0}
-        return
-
-    result = asyncio.run(
-        engine._execute_reserved_text_to_sql_finalizer(
-            step, _context(runtime), "finalize"
-        )
-    )
-    replay = asyncio.run(
-        engine._execute_reserved_text_to_sql_finalizer(
-            step, _context(runtime), "finalize"
-        )
-    )
-
-    assert result["status"] == "succeeded"
-    assert replay == result
-    assert side_effects == {"audit": 1, "persistence": 1}
-    # W2-2.3: the finalizer must thread the run's own schema namespace
-    # version (hex-only, "sha256:" prefix stripped) through to the
-    # successful-SQL memory write, not merely call it.
-    assert len(persistence_calls) == 1
-    assert persistence_calls[0]["namespace_version_key"] == (
-        research.schema_namespace_version.split(":", 1)[-1]
-    )
-
-
-def test_semantic_repair_fallback_cancellation_settles_before_terminal(
+def test_failed_semantic_repair_does_not_enter_success_finalizer(
     monkeypatch,
     tmp_path,
 ) -> None:
     engine = object.__new__(EnhancedWorkflowEngine)
-    runtime, store, _, research, _, _, _, _ = _persisted_result_contradiction_checkpoint(
+    runtime, store, _, _, _, _, _, _ = _persisted_result_contradiction_checkpoint(
         tmp_path,
         result_review_reason="selected binding has no verified replacement",
         result_review_verdict="contradicted",
@@ -732,62 +589,27 @@ def test_semantic_repair_fallback_cancellation_settles_before_terminal(
     checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
     assert checkpoint is not None
 
-    audit_started = threading.Event()
-    release_audit = threading.Event()
-    side_effects = {"audit": 0, "persistence": 0}
-
-    def audit_logger(_entry):
-        audit_started.set()
-        assert release_audit.wait(timeout=10)
-        side_effects["audit"] += 1
-        return {"status": "logged", "log_id": "audit"}
-
-    persistence_calls = []
-
-    def save_successful_sql(**kwargs):
-        side_effects["persistence"] += 1
-        persistence_calls.append(kwargs)
-        return {"status": "saved", "filename": "query.md", "path": "/tmp/query.md"}
+    def forbidden_side_effect(*_args, **_kwargs):
+        raise AssertionError("failed semantic repair must not run success side effects")
 
     def forbidden_executor(*_args, **_kwargs):
-        raise AssertionError("verified fallback must not execute SQL again")
+        raise AssertionError("failed semantic repair must not execute SQL")
 
     async def forbidden_db_audit(*_args, **_kwargs):
-        raise AssertionError("verified fallback must not use the db_audit tool")
+        raise AssertionError("failed semantic repair must not use the db_audit tool")
 
     monkeypatch.setattr(core, "secure_db_executor", forbidden_executor)
-    monkeypatch.setattr(core, "audit_logger", audit_logger)
-    monkeypatch.setattr(core, "save_successful_sql", save_successful_sql)
+    monkeypatch.setattr(core, "audit_logger", forbidden_side_effect)
+    monkeypatch.setattr(core, "save_successful_sql", forbidden_side_effect)
     monkeypatch.setattr(engine, "_execute_on_db_audit_tool_once", forbidden_db_audit)
     step = _finalizer_step(checkpoint.state)
     context = _context(runtime)
 
-    async def cancel_during_audit():
-        task = asyncio.create_task(
-            engine._execute_reserved_text_to_sql_finalizer(step, context, "finalize")
-        )
-        assert await asyncio.to_thread(audit_started.wait, 10)
-        task.cancel("cancel-during-semantic-repair-audit")
-        release_audit.set()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-
-    asyncio.run(cancel_during_audit())
-
-    checkpoint = store.load(runtime.run_id, runtime.run_incarnation)
-    assert checkpoint is not None and checkpoint.terminal is not None
-    assert side_effects == {"audit": 1, "persistence": 1}
-    replay = asyncio.run(
+    result = asyncio.run(
         engine._execute_reserved_text_to_sql_finalizer(step, context, "finalize")
     )
-    assert replay["status"] == "succeeded"
-    assert side_effects == {"audit": 1, "persistence": 1}
-    # W2-2.3: same namespace-version-key propagation as the non-cancellation
-    # variant above, exercised through the cancel-during-audit path instead.
-    assert len(persistence_calls) == 1
-    assert persistence_calls[0]["namespace_version_key"] == (
-        research.schema_namespace_version.split(":", 1)[-1]
-    )
+    assert result["status"] == "failed"
+    assert result["reason_code"] == "RESEARCH_PROTOCOL_FAILURE"
 
 
 @pytest.mark.parametrize(

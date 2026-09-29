@@ -9,6 +9,11 @@ from pydantic import ValidationError
 
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
+    ColumnRef,
+    DerivedExpressionBinding,
+    DiscriminatorValueBinding,
+    DocumentRef,
+    ExpressionRef,
     JoinCandidate,
     JoinCandidateStatus,
     JoinEdge,
@@ -20,6 +25,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     ResearchState,
     SemanticItemKind,
     SemanticItemStatus,
+    TableRef,
     is_binding_free_semantic_item,
 )
 from custom_tools.text_to_sql.adaptive.policy import (
@@ -29,6 +35,9 @@ from custom_tools.text_to_sql.adaptive.semantic_coverage import (
     CoverageInputErrorCode,
     CoverageRequirements,
     validate_coverage_inputs,
+)
+from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
+    disconnected_binding_source_ids,
 )
 from custom_tools.text_to_sql.adaptive.serialization import (
     canonical_digest,
@@ -66,6 +75,328 @@ def _assert_forged_requirements_rejected(
     payload["requirements_digest"] = canonical_digest(payload_without_digest)
     with pytest.raises(ValidationError):
         CoverageRequirements.model_validate(payload)
+
+
+def _independent_aggregate_bindings(
+    expression: str,
+    *,
+    input_columns: tuple[ColumnRef, ...] | None = None,
+    include_physical_dimensions: bool = False,
+) -> tuple[object, ...]:
+    columns = input_columns or (
+        _column("accounts", "account_id"),
+        _column("entries", "entry_id"),
+    )
+    left, right = columns[:2]
+    canonical_columns = tuple(sorted(columns, key=canonical_json_bytes))
+    formula = DerivedExpressionBinding(
+        binding_id="independent-formula-binding",
+        source_id="independent-formula",
+        tables=tuple(
+            sorted(
+                {column.table for column in canonical_columns}, key=canonical_json_bytes
+            )
+        ),
+        columns=canonical_columns,
+        predicates=(),
+        join_path=(),
+        evidence_ids=("accounts-evidence", "entries-evidence", "formula-evidence"),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="coverage",
+        document=DocumentRef(document_id="coverage-document", namespace="main"),
+        expression=ExpressionRef(
+            expression_id="independent-formula-expression", expression=expression
+        ),
+        rule_excerpt=expression,
+        input_columns=columns,
+    )
+    bindings: tuple[object, ...] = (
+        formula,
+        DiscriminatorValueBinding(
+            binding_id="accounts-filter-binding",
+            source_id="accounts-filter",
+            tables=(left.table,),
+            columns=(left,),
+            predicates=(
+                PredicateRef(
+                    left=left, operator=PredicateOperator.EQ, right="kept"
+                ),
+            ),
+            join_path=(),
+            evidence_ids=("accounts-evidence",),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="coverage",
+            discriminator_column=left,
+            discriminator_predicate=PredicateRef(
+                left=left, operator=PredicateOperator.EQ, right="kept"
+            ),
+        ),
+        DiscriminatorValueBinding(
+            binding_id="entries-filter-binding",
+            source_id="entries-filter",
+            tables=(right.table,),
+            columns=(right,),
+            predicates=(
+                PredicateRef(
+                    left=right, operator=PredicateOperator.EQ, right="kept"
+                ),
+            ),
+            join_path=(),
+            evidence_ids=("entries-evidence",),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="coverage",
+            discriminator_column=right,
+            discriminator_predicate=PredicateRef(
+                left=right, operator=PredicateOperator.EQ, right="kept"
+            ),
+        ),
+    )
+    if not include_physical_dimensions:
+        return bindings
+    return (
+        *bindings,
+        PhysicalColumnBinding(
+            binding_id="accounts-dimension-binding",
+            source_id="accounts-dimension",
+            tables=(left.table,),
+            columns=(left,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=("accounts-evidence",),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="coverage",
+            physical_column=left,
+        ),
+        PhysicalColumnBinding(
+            binding_id="entries-dimension-binding",
+            source_id="entries-dimension",
+            tables=(right.table,),
+            columns=(right,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=("entries-evidence",),
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="coverage",
+            physical_column=right,
+        ),
+    )
+
+
+def test_independent_aggregate_formula_does_not_require_a_join() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(accounts.account_id), COUNT(entries.entry_id))"
+    )
+
+    assert not disconnected_binding_source_ids(bindings, ())
+
+
+def test_independent_aggregate_formula_allows_logical_qualifier_from_certificate() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(record.id), COUNT(events.event_id))",
+        input_columns=(
+            _column("records", "id"),
+            _column("events", "event_id"),
+        ),
+    )
+
+    assert not disconnected_binding_source_ids(bindings, ())
+
+
+def test_independent_aggregate_formula_uses_ordered_input_certificate() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(record.id), COUNT(event.event_id))",
+        input_columns=(
+            _column("events", "event_id"),
+            _column("records", "id"),
+        ),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_rejects_bare_exact_table_in_wrong_position() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(accounts.id), COUNT(events.id))",
+        input_columns=(
+            _column("events", "id"),
+            _column("accounts", "id"),
+        ),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_allows_nested_constant_from_certificate() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(ADD(COUNT(primary.id), 1), COUNT(events.event_id))",
+        input_columns=(
+            _column("records", "id"),
+            _column("events", "event_id"),
+        ),
+    )
+
+    assert not disconnected_binding_source_ids(bindings, ())
+
+
+def test_independent_aggregate_formula_rejects_ambiguous_logical_qualifier() -> None:
+    first = ColumnRef(
+        table=TableRef(namespace="first", schema="public", table="records"),
+        column="id",
+    )
+    second = ColumnRef(
+        table=TableRef(namespace="second", schema="archive", table="records"),
+        column="id",
+    )
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(record.id), COUNT(events.event_id))",
+        input_columns=(first, second, _column("events", "event_id")),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_rejects_reversed_fully_qualified_inputs() -> None:
+    first = ColumnRef(
+        table=TableRef(namespace="first", schema="public", table="ledger"),
+        column="amount",
+    )
+    second = ColumnRef(
+        table=TableRef(namespace="second", schema="archive", table="ledger"),
+        column="amount",
+    )
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(first.public.ledger.amount), COUNT(second.archive.ledger.amount))",
+        input_columns=(second, first),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_rejects_repeated_semantic_column_across_tables() -> None:
+    first = ColumnRef(
+        table=TableRef(namespace="first", schema="public", table="records"),
+        column="id",
+    )
+    second = ColumnRef(
+        table=TableRef(namespace="second", schema="archive", table="records"),
+        column="id",
+    )
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(record.id), COUNT(record.id))",
+        input_columns=(first, second),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_rejects_leaf_input_count_mismatch() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(record.id), COUNT(events.event_id))",
+        input_columns=(
+            _column("records", "id"),
+            _column("events", "event_id"),
+            _column("totals", "total_id"),
+        ),
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    (
+        "SUBTRACT(accounts.account_id, entries.entry_id)",
+        "DIVIDE(COUNT(accounts.account_id), COUNT(accounts.account_id))",
+    ),
+    ids=("non_aggregate", "overlapping_aggregate_scope"),
+)
+def test_disconnected_nonindependent_formula_still_requires_a_join(
+    expression: str,
+) -> None:
+    bindings = _independent_aggregate_bindings(expression)
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-filter",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+def test_independent_aggregate_formula_cannot_authorize_requested_dimensions() -> None:
+    bindings = _independent_aggregate_bindings(
+        "DIVIDE(COUNT(accounts.account_id), COUNT(entries.entry_id))",
+        include_physical_dimensions=True,
+    )
+
+    assert disconnected_binding_source_ids(bindings, ()) == (
+        "accounts-dimension",
+        "accounts-filter",
+        "entries-dimension",
+        "entries-filter",
+        "independent-formula",
+    )
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected_disconnected"),
+    (
+        (
+            "DIVIDE(COUNT(ledger.amount), COUNT(ledger.amount))",
+            True,
+        ),
+        (
+            "DIVIDE(COUNT(first.public.ledger.amount), COUNT(second.archive.ledger.amount))",
+            False,
+        ),
+    ),
+    ids=("ambiguous_table_column", "fully_qualified_columns"),
+)
+def test_independent_aggregate_formula_matches_full_table_identity(
+    expression: str, expected_disconnected: bool
+) -> None:
+    first = ColumnRef(
+        table=TableRef(namespace="first", schema="public", table="ledger"),
+        column="amount",
+    )
+    second = ColumnRef(
+        table=TableRef(namespace="second", schema="archive", table="ledger"),
+        column="amount",
+    )
+    bindings = _independent_aggregate_bindings(
+        expression,
+        input_columns=(first, second),
+    )
+
+    assert bool(disconnected_binding_source_ids(bindings, ())) is expected_disconnected
 
 
 @pytest.mark.parametrize(

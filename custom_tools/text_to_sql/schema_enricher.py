@@ -16,6 +16,7 @@ from .utils import (
 )
 from .prompts import build_column_description_prompt_with_context
 from .schema_metadata import is_fk
+from .schema_loader import SchemaLoader
 from .core import pii_masking
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,7 @@ class SchemaEnricher:
         # Собираем список колонок без описаний и таблицы без описаний
         to_describe: Dict[str, Dict[str, Dict[str, Any]]] = {}
         tables_need_description = set()
+        columns_need_examples: Dict[str, set[str]] = {}
 
         for table_name, table_schema in schema_obj.items():
             # Проверяем, есть ли описание таблицы
@@ -140,9 +142,11 @@ class SchemaEnricher:
                 if not desc:
                     # Сохраняем полную metadata, а не только тип
                     to_describe.setdefault(table_name, {})[col_name] = meta if isinstance(meta, dict) else {"type": str(meta)}
+                if isinstance(meta, dict) and not meta.get("examples"):
+                    columns_need_examples.setdefault(table_name, set()).add(col_name)
 
         # Если нет ни колонок для описания, ни таблиц для описания
-        if not to_describe and not tables_need_description:
+        if not to_describe and not tables_need_description and not columns_need_examples:
             logger.info("All columns and tables already have descriptions - LLM enrichment skipped")
             return
 
@@ -159,14 +163,17 @@ class SchemaEnricher:
             table_context.append(table_name)
 
         # Объединяем все таблицы, которые нуждаются в обработке
-        all_tables_to_process = set(to_describe.keys()) | tables_need_description
+        all_tables_to_process = (
+            set(to_describe) | tables_need_description | set(columns_need_examples)
+        )
 
         # Обрабатываем каждую таблицу отдельно
         for table_name in all_tables_to_process:
             cols_to_describe = to_describe.get(table_name, {})
             needs_table_desc = table_name in tables_need_description
+            example_columns = columns_need_examples.get(table_name, set())
 
-            if not cols_to_describe and not needs_table_desc:
+            if not cols_to_describe and not needs_table_desc and not example_columns:
                 continue
 
             col_count_msg = f"{len(cols_to_describe)} columns" if cols_to_describe else "no columns"
@@ -198,6 +205,23 @@ class SchemaEnricher:
                 sample_data = sample_result.get('sample_rows', []) if isinstance(sample_result, dict) else sample_result
                 column_stats = sample_result.get('column_stats', {}) if isinstance(sample_result, dict) else {}
                 fk_previews = sample_result.get('fk_previews', {}) if isinstance(sample_result, dict) else {}
+
+                table_columns = get_table_columns(table_schema)
+                for column_name in example_columns:
+                    values = [
+                        row[column_name]
+                        for row in sample_data
+                        if (
+                            isinstance(row, dict)
+                            and column_name in row
+                            and SchemaLoader._is_example_value(row[column_name])
+                        )
+                    ]
+                    if values and isinstance(table_columns.get(column_name), dict):
+                        table_columns[column_name]["examples"] = values
+
+                if not cols_to_describe and not needs_table_desc:
+                    continue
 
                 # EPIC 3.8: маскируем PII в sample_data ДО отправки в LLM.
                 # Используется существующий helper core/_pii.py::pii_masking

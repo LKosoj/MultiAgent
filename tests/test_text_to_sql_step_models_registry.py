@@ -119,11 +119,17 @@ def test_experiment_step_models_resolves_every_key() -> None:
     )
 
 
-def test_nlu_query_understanding_and_completeness_use_model_code() -> None:
+def test_nlu_query_understanding_and_completeness_use_model_hard() -> None:
     for profile_name in ("default", "experiment"):
         steps = get_active_profile(profile_name).sections["step_models"]
-        assert steps["nlu_query_understanding"] == "model_code"
-        assert steps["nlu_completeness"] == "model_code"
+        assert steps["nlu_query_understanding"] == "model_hard"
+        assert steps["nlu_completeness"] == "model_hard"
+
+
+def test_default_stop_review_uses_model_hard() -> None:
+    default_steps = get_active_profile("default").sections["step_models"]
+
+    assert default_steps["research_stop_review"] == "model_hard"
 
 
 def test_experiment_step_models_downgrades_exactly_three_steps() -> None:

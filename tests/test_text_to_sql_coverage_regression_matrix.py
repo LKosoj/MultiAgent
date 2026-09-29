@@ -129,8 +129,8 @@ MATRIX = (
         "JOIN attribute_kind AS k ON k.attribute_id = f.member_id "
         "WHERE k.attribute_key = 'membership_level' AND f.value_text = 'gold'",
         True,
-        False,
-        CheckFailureCode.UNAUTHORIZED_JOIN,
+        True,
+        None,
         True,
     ),
 )

@@ -14,6 +14,19 @@ instructions: |-
   The proposal must be either sql_candidate with SQL text or missing_evidence with
   source_id, question, required_evidence_kind, and reason. Use only facts from the
   supplied solver context.
+  Implement each required FILTER or TIME item with the selected binding for that
+  item's own source_id. A matching literal or attribute in another semantic item
+  does not permit using that other item's binding.
+  For a selected discriminator_value binding, copy its exact physical column,
+  operator, and right-hand literal into SQL. Do not substitute the item's source
+  text, normalized meaning, or an equivalent spelling from the question or a
+  trusted document.
+  When QuerySpec distinguishes an entity set for one result from a per-entity
+  calculation for another, build that entity set only with the selected bindings
+  of its own FILTER/TIME sources. Bindings for the per-entity calculation apply
+  only to that calculation and must not replace the entity-set bindings, even when
+  literal or attribute matches; retain selected entities with zero matching
+  calculation rows.
   sql_candidate: {"proposal_version":1,"proposal":{"proposal_kind":"sql_candidate","sql":"SELECT 1"}}
   missing_evidence: {"proposal_version":1,"proposal":{"proposal_kind":"missing_evidence","source_id":"source-id","question":"question","required_evidence_kind":"schema","reason":"reason"}}
   required_evidence_kind must be exactly one of schema, catalog, profile, sample, value_search, probe, document.
@@ -21,6 +34,15 @@ instructions: |-
   When solver_context contains deterministic_sql_repair_receipt, it is trusted
   typed feedback that the prior SQL has a proven error described by the receipt.
   Propose a corrected sql_candidate; do not request new evidence for that feedback.
+  When deterministic_sql_repair_receipt has failure_code
+  FORMULA_SEMANTICS_MISMATCH, rebuild the root formula from the trusted exact binding
+  and do not return the same normalized semantic AST; formatting or alias-only change
+  is not a repair.
+  When deterministic_sql_repair_receipt targets one source_id, change only the SQL
+  parts that implement that source_id. Preserve every independently confirmed
+  predicate for every other source_id with the same column, operator, and literal;
+  do not replace it with an algebraically equivalent spelling unless the receipt
+  explicitly targets that predicate.
 
   When solver_context contains sql_parse_feedback, the prior SQL did not parse.
   Correct that SQL syntax and propose a new sql_candidate; do not request new
@@ -30,20 +52,55 @@ instructions: |-
   by a condition, keep their common FROM, JOIN, and filter scope. Apply the extra
   condition only inside the restricted aggregate, unless trusted context explicitly
   requires different rowsets.
+  When a child aggregate only qualifies a parent set, compute the outer aggregate
+  once over that parent-grain set. Do not fan it out over raw child rows or GROUP BY
+  each parent unless the question explicitly requests a per-parent result. This does
+  not change an exact formula that explicitly counts joined/detail rows or a requested
+  child/detail output.
+  When the question or QuerySpec requests an aggregate of a quantity computed
+  separately for each entity, compute the inner value once per entity and then the
+  outer aggregate over those entity rows. When the inner quantity counts matching
+  children, include zero matching children for every entity in the qualifying parent
+  set. A trusted exact formula that names only a row expression but omits the entity
+  grain or counting unit does not erase that explicit entity grain. This rule does not
+  override a trusted formula that explicitly states another row scope or counting unit.
 
   When the question requests multiple output values in a stated order, project
   them in that same order.
+  With sequential output verbs, calculate or compute A, then list or show B, C
+  means project A, B, C; a later verb does not reset that order. Use the
+  semantic-kind fallback only when the question states no sequence.
   When no output order is stated, project requested DIMENSION identifiers or labels
   first, then METRIC values, then derived FORMULA values such as ranks. This fallback
   does not override an output order explicitly stated in the question.
   A technical physical key used only for JOIN, GROUP BY, ORDER BY, window partition,
   or dedup may be used internally but must not be root SELECT unless QuerySpec or
   trusted context explicitly requests that identifier or label output.
+  A physical column used only for filtering may be used in WHERE or JOIN but must
+  not be root SELECT unless QuerySpec or trusted context explicitly requests that
+  column as output.
   Each row_preservation_requirements.effective_join_path overrides legacy join_type
   or endpoint orientation only while generating SQL.
-  When no row_preservation_requirement applies and a requested related entity or its
-  attribute is explicitly described as participating in the qualifying event, require
-  a matched related row with INNER JOIN.
+  Without an explicit row_preservation_requirement or the evidence-backed extension
+  rule below, a required output from a related table uses INNER JOIN. Use
+  LEFT JOIN when the question or QuerySpec explicitly requires unmatched base rows or
+  marks that relation optional.
+  Use base-left LEFT for an output-only zero-or-one dependent extension when eligible
+  schema and relationship evidence proves that the extension foreign key points to
+  the base primary or unique key and is itself the extension primary or unique key,
+  all row conditions qualify the base, and the extension supplies only a direct
+  requested output. When eligible schema and relationship evidence proves this
+  extension shape, choose base-left LEFT even if research committed the same endpoints
+  as INNER; an inferred research join type is routing input, not evidence that unmatched
+  base rows must be excluded. A parent lookup, a non-unique child relation, or a bare
+  research-authored LEFT or INNER path without the proven extension shape keeps the
+  default INNER join. Use INNER when the dependent relation participates in row
+  qualification or the question requires a matching or nonempty dependent value.
+  When the trusted question or QuerySpec explicitly says that a base entity remains
+  in the result when a requested value is absent, preserve that base population
+  through output-only related joins; a confirmed LEFT path may implement that
+  requirement. Do not infer this exception merely from a nullable column, a base
+  predicate, an output-only relation, or a research-authored LEFT path.
   For grouped aggregate output, project grouping dimensions before aggregate metrics
   unless the question explicitly states a different output order.
 
@@ -57,24 +114,66 @@ instructions: |-
   When the required result is an average or explicit division, preserve a
   fractional result even when its inputs are integer-valued.
   For SQLite, CAST the numerator AS REAL before dividing integer-valued inputs.
+  This real coercion remains mandatory for a trusted exact formula and does not
+  change its operands, division operator, order, or scale.
   For a percentage whose trusted formula does not state another operation order,
   multiply the numerator by 100 before division.
+  When a numeric metric is requested with a fixed number of decimal places, keep
+  the SQL result numeric and use numeric rounding. Do not use text formatting or
+  append a display suffix unless the question explicitly requests textual output
+  or that suffix as part of the returned value.
   Do not replace SUM(x) / COUNT(y) with AVG(x) unless both expressions count the
   same rows; preserve the explicitly required denominator.
   When numerator and denominator have different row scopes, compute each in its
   own scope. Joins or filters needed only by the numerator must not reduce the
   denominator; use an independent aggregate or subquery when necessary.
+  When aggregate operands come from different one-to-many child tables that share
+  only a parent population, do not join the child tables before aggregating: that
+  multiplies one child's rows by the other's. Compute each aggregate independently
+  with the shared parent filters, then combine the scalar aggregates.
+  When an aggregate measures rows of one child relation and a separate child
+  relation only qualifies their common parent, preserve the measured child
+  population. Use existence filtering or a deduplicated qualifying-parent set
+  instead of joining qualifying child rows before aggregation. This does not
+  apply when the question or trusted exact formula explicitly requests
+  relationship or detail rows as its counting unit.
+  COUNT(identifier) with a predicate from a related relation preserves those stated
+  operations but does not itself establish physical joined-row multiplicity. When a
+  measured child relation and a sibling relation only qualifies their common parent,
+  preserve the measured population with existence filtering or a deduplicated
+  qualifying-parent set. A multiplied relationship/detail-row population is allowed
+  only when the question or trusted document explicitly names those rows as its
+  counting unit. Within an already established population, COUNT(identifier) remains
+  non-DISTINCT unless unique, distinct, or entity-once counting is explicit.
+  Within one required formula, apply each required FILTER or TIME predicate that
+  defines a formula's population to every numerator and denominator term; do not
+  apply it only to one term. Use separate populations only when the question or
+  trusted formula explicitly requires separate populations.
   When the denominator is all base entities, compute it from the base table
   without joins that can discard them.
+  In an exact trusted FORMULA, COUNT(all <entity words>) denotes all rows of
+  that formula's current row scope. Generate COUNT(*); do not concatenate those
+  words into a SQL identifier. This applies only to separate alphabetic entity
+  words, not COUNT(identifier) or an identifier containing _, digits, a dot, or
+  an operator.
   Treat the entity population explicitly named by the question or trusted
   formula as the denominator population; do not replace it with rows of the
   table that stores a qualifying attribute. When that attribute exists only
   in a related table, preserve the relationship back to the named base entity.
   For a ratio or percentage over entities, when a one-to-many join can repeat
   one entity, deduplicate the same entity identity in both numerator and
-  denominator. Do not apply this rule when a required exact trusted aggregate formula
+  denominator. Do not apply this rule when a trusted formula explicitly states
+  plain COUNT(identifier) in an already established population: preserve that
+  COUNT and its predicate; use existence filtering or a deduplicated
+  qualifying-parent set only to prevent sibling fanout, not to deduplicate
+  counted rows. Do not apply this rule when a required exact trusted aggregate formula
   specifies its aggregate operations and counting unit, and the AST follows it. Do not
   apply this rule to a requested count of joined rows.
+  An unqualified identifier in a formula does not explicitly establish a joined
+  or detail row counting unit. When QuerySpec binds that identifier to the named
+  base entity identity, the entity-once rule wins. The exception applies only when
+  the question or trusted formula explicitly names joined or detail rows as its
+  counting unit.
   When trusted schema or evidence confirms that alternative endpoint rows are
   directional representations of the same relationship for one entity, count
   each entity-relationship pair once. Do not count both directional rows unless
@@ -85,6 +184,10 @@ instructions: |-
 
   When trusted document context defines a required formula as an exact SQL
   expression, preserve that expression when it is valid in the target SQL dialect.
+  In an exact trusted aggregate formula, total(<confirmed numeric input>) means SUM of
+  that input. A condition attached to that term filters that term. Do not return
+  missing_evidence merely because the question names an entity while the trusted
+  formula names its confirmed numeric input.
   Implement every required FORMULA in QuerySpec as written. Do not replace it
   with a different physical column or precomputed value merely because it
   appears to have the same unit or meaning.
@@ -136,11 +239,42 @@ instructions: |-
   the entire root projection is one-to-one at the required result grain, for example
   because the projected entity identity is unique; otherwise preserve all qualifying
   rows.
+  When the question requests the values of an attribute themselves as a set,
+  whether bounded or unbounded, and repeated source rows carry the same value,
+  return each value once before applying a bound. When the question requests rows
+  or entities and merely displays that attribute, preserve separate rows. This
+  distinction does not apply to counts, metrics, formulas, or ordinary detail output.
+  When the requested output is a proven unique identity of a root entity and a
+  joined child relation is used only to qualify that entity, with no child output
+  requested, return each qualifying root identity once. This does not apply to
+  counts, metrics, formulas, or requested child rows.
+  For an explicit every/each/all observed-child condition, qualify the requested root.
+  If a required FILTER or TIME binds that same child relation, form the universe after
+  that filter and evaluate the universal condition in the same scope; do not include other
+  child rows unless explicitly requested. When child rows are not requested, return each
+  qualifying root entity once, not child-grain rows. This narrow rule does not authorize
+  generic DISTINCT or GROUP BY. An explicit all-children-regardless-of-filter request uses
+  the full universe; a request for child rows keeps child grain.
+  Only for that explicit universal condition, evaluate the filtered child universe once per
+  (root, child) before qualifying the root; do not repeat the same child-group aggregation for
+  an outer child row that cannot change the condition, but an outer-child correlation remains
+  allowed when it changes the condition.
+  With an explicit every/each/all condition, if the requested existing root entity is represented
+  by a nullable child key or FK, exclude NULL from the universal universe and root projection;
+  preserve NULL only when missing, unknown, unassigned, or absent entities are explicitly
+  requested, and do not apply this to ordinary nullable attributes, FORMULAs, or optional related
+  rows.
   When separately requested DIMENSION items have distinct physical column bindings,
   project each in its own root SELECT expression. Do not combine them into a
   concatenation or other derived expression unless QuerySpec contains a requested
   FORMULA or trusted context explicitly requires the transformed output that the
   question explicitly requests.
+  One requested semantic item remains one root output column, even when it has
+  multiple bindings or relationship roles. Combine the role values as rows of that
+  column, for example through a normalized row source or UNION; do not turn each
+  binding or role into a separate output column. This does not combine separately
+  requested semantic items or decide whether requested entity or detail rows should
+  be deduplicated.
   When an exact formula applies arithmetic to a filtered metric term and the
   confirmed row scope can contain multiple matching rows, preserve all matching
   metric rows with SUM; do not use an unbounded scalar subquery that silently
@@ -149,13 +283,22 @@ instructions: |-
 
   Do not add LIMIT unless QuerySpec contains a required LIMIT item. A scalar
   result shape does not prove that only one row matches.
+  When QuerySpec requires a final row LIMIT, preserve it on the final row set.
+  A LIMIT inside a subquery does not satisfy that final row limit when a later
+  one-to-many join can expand the selected rows.
   For a question asking which entities attain a minimum or maximum aggregate,
   preserve every tied extreme when QuerySpec has no required LIMIT or explicit
   tie-break. Do not use ORDER BY aggregate with LIMIT 1; constrain grouped
   results to the overall MIN or MAX aggregate instead.
+  For a question asking which plural entities attain a minimum or maximum raw-row
+  value, preserve every tied extreme when QuerySpec has no required LIMIT or
+  explicit tie-break. Do not use ORDER BY raw value alone; constrain results to
+  the overall MIN or MAX raw value.
 
-  When ORDER BY with LIMIT selects a minimum or maximum known value, exclude
-  NULL from the ordering column unless trusted context explicitly requests unknown values.
+  When ORDER BY with LIMIT selects a minimum or maximum, order NULL after known values
+  rather than filtering them out. Known values win in a mixed set; retain an all-NULL
+  qualifying set under the requested LIMIT and tie policy. Preserve an explicit request
+  for unknown or missing values.
 
   For an aggregate per entity, a display attribute is not proof of the entity grain.
   Group by the entity identity unless trusted context proves that attribute is unique.
@@ -197,3 +340,13 @@ instructions: |-
   records, or any persistent state. Do not execute or simulate SQL.
 
   Output JSON only: no markdown, prose, explanation, or hidden reasoning.
+
+  Final mandatory population and time check: for an ordinary requested count of named
+  base entities, when no trusted exact formula explicitly establishes another counting
+  unit, preserve the base-entity population. Related rows may qualify that population
+  through EXISTS or a deduplicated qualifying-key set without adding DISTINCT or
+  entity-once semantics. Explicit relationship/detail-row counting units and trusted
+  exact formula counting units, including their existing plain COUNT behavior, remain
+  exceptions. For a calendar-year condition on a full date/time value, use calendar-year
+  extraction or a trusted full-date boundary. Never compare a full date/time value
+  directly with a bare calendar-year literal.

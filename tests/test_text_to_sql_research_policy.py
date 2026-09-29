@@ -616,7 +616,7 @@ def test_policy_config_closes_every_budget_dimension() -> None:
         config.resource_limits.db_probe_ms,
     ) == (14_400, 14_400_000)
     assert config.policy_version == 2
-    assert config.resource_limits.model_tokens == 1_048_576
+    assert config.resource_limits.model_tokens == 4_194_304
     assert config.operation_counts.actions == 512
     assert config.operation_counts.model_decisions == 256
     assert config.operation_counts.db_probes == 384
@@ -625,11 +625,24 @@ def test_policy_config_closes_every_budget_dimension() -> None:
     assert config.per_action.sample_rows == 50
     assert config.model_budget is not None
     assert config.model_budget.model_calls == 256
-    assert config.model_budget.input_tokens_per_call == 32_768
+    assert config.model_budget.input_tokens_per_call == 262_144
     assert config.model_budget.output_tokens_per_call == 32_000
-    assert config.model_budget.total_tokens == 1_048_576
+    assert config.model_budget.total_tokens == 4_194_304
     with pytest.raises(ValidationError):
         config.resource_limits.db_probe_ms = 1
+
+
+def test_default_model_budget_keeps_three_call_reserve_after_large_usage() -> None:
+    config = load_adaptive_policy_config()
+    assert config.model_budget is not None
+
+    remaining_tokens = config.model_budget.total_tokens - 501_797
+    three_call_reserve = 3 * (
+        config.model_budget.input_tokens_per_call
+        + config.model_budget.output_tokens_per_call
+    )
+
+    assert remaining_tokens >= three_call_reserve
 
 
 @pytest.mark.parametrize(

@@ -43,6 +43,10 @@ instructions: |-
   - execute_research_probe(sql; parameters optional: up to 64 finite JSON scalars)
   - read_schema_evidence(document_id)
   Every table field in tool arguments and proposals must be the logical table-name string from the context, never a physical table object.
+  Use execute_research_probe only with physical SQL tables and columns represented
+  in the supplied scoped schema. Never query database system catalogs, metadata
+  tables, or schema internals such as sqlite_master, sqlite_schema,
+  information_schema, or pg_catalog; use the typed schema tools instead.
 
   Predicate operator tokens are exactly: eq, neq, gt, gte, lt, lte, in,
   not_in, between, like, is_null, is_not_null.
@@ -57,21 +61,23 @@ instructions: |-
 
   Proposal rules: use only the fields in one listed form; do not add fields.
   proposal_key is local to this decision. proposed references may name only a
-  matching local proposal_key; existing references and citation_evidence_ids copy
-  current-state IDs.
+  matching local proposal_key. Use only source_handle/source_handles and
+  citation_evidence_handles from research_context for source and evidence references;
+  never emit their raw-ID alternatives.
   Compact proposal forms:
-  - new_hypothesis(proposal_key, source_ids, claim, candidate_targets, citation_evidence_ids)
-  - hypothesis_assessment(subject: hypothesis reference, certificate, citation_evidence_ids)
-  - new_binding(proposal_key, source_id, candidate, join_references, citation_evidence_ids)
-  - binding_assessment(subject: binding reference, certificate, citation_evidence_ids)
-  - new_join(proposal_key, left, right, join_type, path, citation_evidence_ids)
-  - join_assessment(subject: join reference, certificate, citation_evidence_ids)
+  - new_hypothesis(proposal_key, source_handles, claim, candidate_targets, citation_evidence_handles)
+  - hypothesis_assessment(subject: hypothesis reference, certificate, citation_evidence_handles)
+  - new_binding(proposal_key, source_handle, candidate, join_references, citation_evidence_handles)
+  - binding_assessment(subject: binding reference, certificate, citation_evidence_handles)
+  - new_join(proposal_key, left, right, join_type, path, citation_evidence_handles)
+  - join_assessment(subject: join reference, certificate, citation_evidence_handles)
   Join path edge: {"left":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"LEFT_COLUMN_FROM_CURRENT_CONTEXT"},"right":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"RIGHT_COLUMN_FROM_CURRENT_CONTEXT"},"operator":"eq","join_type":"inner"}. path is an array of these objects, not evidence IDs.
   certificate is consistent, contradicted, or insufficient.
   Candidate target: target: table(table) | column(table, column) | document(document_id).
   Logical predicate: predicate: left(table, column), operator, right.
   Reference: reference: existing(hypothesis_id | binding_id | join_id) | proposed(proposal_key).
   binding_assessment existing subject: {"reference_kind":"existing","binding_id":"binding:EXISTING_BINDING_ID"}; "id" is invalid.
+  Each new_binding.join_references existing element: {"reference_kind":"existing","join_id":"JOIN_ID_FROM_CURRENT_STATE"}; copy join_id verbatim from durable join_candidates; bare join-ID strings are invalid.
   An assessment may reference only an existing durable ID; never assess an object
   created in the same decision.
   Candidate forms:
@@ -81,33 +87,41 @@ instructions: |-
   For discriminator_value, discriminator_predicate.left must exactly repeat discriminator_column.
   - derived_expression: {"kind":"derived_expression","expression_claim":"CLAIM_FROM_CURRENT_CONTEXT","document_id":"DOCUMENT_FROM_CURRENT_STATE","rule_excerpt":"RULE_FROM_DOCUMENT","input_columns":[{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"COLUMN_FROM_CURRENT_CONTEXT"}]}; expression_claim must be one parseable exact RHS expression and must appear verbatim in rule_excerpt and the cited document; put these fields directly in candidate and never add a candidate.derived_expression wrapper.
   - document_rule(document_id, rule_id, rule_text)
-  citation_evidence_ids: non-empty unique evidence IDs from current state.
+  citation_evidence_handles: non-empty unique evidence handles from current state.
 
   The following is one combined shape example only. Every ALL_CAPS value is a
   placeholder: replace it with a valid value from the current context or state;
   never emit any placeholder literally.
-  {"decision_version":1,"proposals":[{"proposal_type":"new_hypothesis","proposal_key":"proposal:h","source_ids":["SOURCE_FROM_CURRENT_STATE"],"claim":"CLAIM_FROM_CURRENT_CONTEXT","candidate_targets":[{"target_kind":"table","table":"TABLE_FROM_CURRENT_CONTEXT"}],"citation_evidence_ids":["EVIDENCE_FROM_CURRENT_STATE"]},{"proposal_type":"new_binding","proposal_key":"proposal:b","source_id":"SOURCE_FROM_CURRENT_STATE","candidate":{"kind":"physical_column","physical_column":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"COLUMN_FROM_CURRENT_CONTEXT"}},"join_references":[{"reference_kind":"proposed","proposal_key":"proposal:j"}],"citation_evidence_ids":["EVIDENCE_FROM_CURRENT_STATE"]},{"proposal_type":"new_join","proposal_key":"proposal:j","left":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"LEFT_COLUMN_FROM_CURRENT_CONTEXT"},"right":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"RIGHT_COLUMN_FROM_CURRENT_CONTEXT"},"join_type":"inner","path":[],"citation_evidence_ids":["EVIDENCE_FROM_CURRENT_STATE"]}],"next":{"next_kind":"tool","hypothesis_ref":{"reference_kind":"proposed","proposal_key":"proposal:h"},"intent":{"tool_name":"inspect_table","arguments":{"table":"TABLE_FROM_CURRENT_CONTEXT"}}}}
+  {"decision_version":1,"proposals":[{"proposal_type":"new_hypothesis","proposal_key":"proposal:h","source_handles":["s1"],"claim":"CLAIM_FROM_CURRENT_CONTEXT","candidate_targets":[{"target_kind":"table","table":"TABLE_FROM_CURRENT_CONTEXT"}],"citation_evidence_handles":["e1"]},{"proposal_type":"new_binding","proposal_key":"proposal:b","source_handle":"s1","candidate":{"kind":"physical_column","physical_column":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"COLUMN_FROM_CURRENT_CONTEXT"}},"join_references":[{"reference_kind":"proposed","proposal_key":"proposal:j"}],"citation_evidence_handles":["e1"]},{"proposal_type":"new_join","proposal_key":"proposal:j","left":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"LEFT_COLUMN_FROM_CURRENT_CONTEXT"},"right":{"table":"TABLE_FROM_CURRENT_CONTEXT","column":"RIGHT_COLUMN_FROM_CURRENT_CONTEXT"},"join_type":"inner","path":[],"citation_evidence_handles":["e1"]}],"next":{"next_kind":"tool","hypothesis_ref":{"reference_kind":"proposed","proposal_key":"proposal:h"},"intent":{"tool_name":"inspect_table","arguments":{"table":"TABLE_FROM_CURRENT_CONTEXT"}}}}
 
-  Every stop request must use proposals: [] and include source_ids; never use stop
-  to submit a proposal. For complete, return citation_evidence_ids: []; the framework
+  Every stop request must use proposals: [] and include source_handles; never use stop
+  to submit a proposal. For complete, return citation_evidence_handles: []; the framework
   fills the exact evidence IDs from generation authority. Return complete
   only when the supplied durable research state already covers every required semantic item,
-  with empty source_ids. If required work remains, return one
+  with empty source_handles. If required work remains, return one
   typed tool request, unless the remaining required items are genuinely ambiguous or
-  unsupported. For ambiguous or unsupported, source_ids must identify exactly
-  the unresolved required items, and citation_evidence_ids must name only fresh evidence
+  unsupported. For ambiguous or unsupported, source_handles must identify exactly
+  the unresolved required items, and citation_evidence_handles must name only fresh evidence
   from the supplied state. An ambiguous stop must also include ambiguity
   with exactly interpretations (at least two distinct non-empty readings),
-  citation_evidence_ids (exactly the same as the stop's citation_evidence_ids), and a
+  citation_evidence_handles (exactly the same as the stop's citation_evidence_handles), and a
   non-empty missing_distinguishing_fact. Do not
   include ambiguity for complete or unsupported stops.
 
   When research_context contains invalid_stop_generation_authority, its reason_code
-  and affected_source_ids are the closed generation-authority reason for a rejected
+  and affected_source_handles are the closed generation-authority reason for a rejected
   complete stop. Do not return complete until the affected items are corrected using
   the existing typed research actions.
   After INVALID_STOP without invalid_stop_generation_authority, copy every
-  citation_evidence_id exactly from the durable state; do not invent or alter an ID.
+  citation_evidence_handle exactly from research_context; do not invent or alter a handle.
+  When invalid_stop_generation_authority has reason_code
+  QUERY_REQUIREMENT_INCOMPLETE for an affected required FILTER or TIME with an
+  exact physical predicate, a supported discriminator binding, its confirmed join
+  route, and no eligible positive exact-value certificate, the next ordinary
+  decision must make exactly one search_value request for that binding's exact
+  physical column and literal. Do not recreate the binding or join, assess, probe,
+  or complete before that request. After a positive result, use the existing typed
+  flow to cite it and bind the exact value.
   When reason_code is QUERY_REQUIREMENT_INCOMPLETE and the affected items already
   have supported bindings, first check that each binding kind proves its item. For
   an affected FILTER or TIME with an operator, first replace a physical_column
@@ -143,6 +157,42 @@ instructions: |-
   When the named entity table has no direct output attribute, prefer a directly
   named or described candidate on a reachable related table over an indirect proxy,
   without requiring the physical table's entity label to repeat the question wording.
+  When exhaustive inspection confirms that the requested entity attribute is absent,
+  but the same entity has exactly one schema-described categorical attribute that can
+  serve as a plausible answer proxy, prefer that entity-owned attribute over an
+  unrelated attribute of the qualifying event or location. Do not claim that the proxy
+  is literally equivalent to the missing attribute, and do not use it when multiple
+  plausible entity-owned proxies remain.
+  For that best-available proxy exception only, a consistent binding assessment
+  requires evidence that the candidate belongs to the requested entity, its described
+  role makes it a plausible answer, and exhaustive inspection found neither a direct
+  attribute nor multiple plausible entity-owned proxies. It does not require evidence
+  that the proxy is literally equivalent to the absent requested attribute.
+  An entity-owned categorical column is not a plausible competing proxy merely because it is
+  categorical. Its schema description or observed values must support the requested semantic
+  role; a column explicitly described as a different role does not create ambiguity or
+  invalidate an already SUPPORTED proxy.
+  When both are semantically relevant candidates, before selecting a denormalized or
+  indirect proxy for a required entity attribute, inspect the directly named or
+  schema-described candidate reachable through a declared relationship. A zero-row
+  result does not make either candidate nonmatching.
+  When choosing between a schema/value-confirmed row-local predicate and a candidate
+  on another relation, treat the other predicate as semantically relevant only when a
+  declared relationship proves it applies at the same record grain. A description,
+  representative, or metadata-record foreign key is not that proof; retain the
+  row-local predicate. A genuine association relationship permits the related candidate.
+  This row-local preference does not override a trusted exact FORMULA that explicitly
+  names a predicate or aggregate operand: when matching loaded columns and declared
+  population relationships are confirmed, retain and bind those formula inputs even if
+  a row-local predicate is confirmed. If a named column or population path is
+  unconfirmed, leave the FORMULA unresolved; do not substitute the row-local predicate.
+  For a trusted exact FORMULA over a stated base record population, a same-named
+  lifecycle field on a related entity is not a matching formula input merely because
+  a declared relationship reaches it. When schema descriptions distinguish the base
+  record's event or creation time from the related entity's lifecycle time, inspect and
+  bind the base-record field first, including a differently named physical field;
+  otherwise leave the FORMULA unresolved. Keep the related field only when the question
+  or trusted FORMULA explicitly assigns the time condition to that related entity.
 
   A non-stop decision may include semantic proposals supported by fresh evidence
   already present in the durable state. Those proposals are validated and saved
@@ -150,11 +200,34 @@ instructions: |-
   When some required item still needs evidence, continue research. Include proposals only for required
   semantic items that do not already have a SUPPORTED durable binding. The only
   exception is a FILTER or TIME with an operator whose supported binding is only
-  physical_column: propose the required predicate binding instead. Choose one useful,
+  physical_column: propose the required predicate binding instead. The only additional exception is a supported
+  categorical IN binding whose trusted literal lacks its exact certificate: replace it only
+  after untruncated distinct evidence establishes exactly one meaningful stored spelling and
+  search_value for that spelling returns rows. Do not replace any other SUPPORTED binding. Choose one useful,
   non-duplicate request for the missing item. The same physical column may be proposed
   for a different unresolved source_id. A CANDIDATE, REJECTED, or STALE binding does
   not resolve the source_id and must not block a newly supported proposal. Never repeat
   a completed probe or a SUPPORTED durable binding merely to carry a new proposal.
+  A persisted consistent assessment closes confirmation only while no later durable
+  evidence contradicts the binding's exact facts. Without later contradictory
+  evidence, the existing closure behavior remains unchanged. Do not request another
+  probe, binding, or assessment for it, and do not report it as unresolved; continue
+  only with other required facts.
+  After a successful zero-row execute_research_probe, do not repeat the same FROM, JOIN,
+  WHERE predicates, and parameter values with a different projection. Change the tested
+  hypothesis or choose a different typed action.
+  A later positive probe for the same unresolved semantic item, literal, and confirmed
+  conditions on a different schema-supported column or expression establishes the positive
+  alternative even when it has no special alternative label. Treat the earlier zero-row
+  hypothesis as closed: do not inspect, search, or probe it again. Continue only with proposals,
+  assessments, or semantic_commit for the positive interpretation and its unresolved dependent
+  outputs.
+  After a later probe, preserve every already SUPPORTED predicate, its owning relation,
+  and confirmed grain; do not replace it with a similarly named measure on another entity.
+  Probe only an explicitly named unresolved schema, document, or value fact, not to select
+  or test a final SQL shape including a complete universal or existence calculation. If no such
+  fact remains, semantic_commit proposals or finish normally. A targeted probe remains allowed
+  when a required calculation result itself is the unresolved evidence fact.
 
   Limit proposals and assessments to semantic items needed to answer the supplied task.
   When the task asks to repair one semantic item, do not propose or assess bindings for
@@ -172,25 +245,53 @@ instructions: |-
   When an Independent stop review hint is present, follow that hint in the next
   decision before semantic_commit unless the hint itself explicitly requires a
   corrected semantic_commit.
+  When that hint names exact durable relationship evidence and directs new_join,
+  the next decision must submit that one new_join with semantic_commit. Do not run
+  another relationship inspection or probe for the same route.
+  When that hint names exact durable evidence IDs for a proposal, cite exactly
+  those IDs and no additional evidence IDs.
+  When an Independent stop review hint names one or more exact unresolved
+  source_ids, the next decision may propose bindings only for those named source_ids.
+  Do not include proposals for other unresolved sources in that decision; handle them
+  in later decisions.
+  After DUPLICATE_ACTION, if a completed durable probe already contains the facts named
+  by the Independent stop review hint and no other required schema, document, or value
+  fact remains absent, return nonempty proposals citing that durable evidence and
+  semantic_commit; do not repeat or modify the probe's LIMIT, ordering, aliases, or SQL.
+  If any other required fact is absent, do not make unsupported proposals; one different
+  typed tool remains allowed only for that exact fact.
+
+  Use source and evidence handles exactly as supplied by research_context; never emit,
+  retype, reconstruct, abbreviate, or infer their raw durable IDs.
 
   When the research_context contains rejected_preflight_assessments, it contains
   the complete rejected assessment batch in deterministic order, and any rejected
   new_binding proposal is included unchanged; none of its assessments was saved.
-  Correct every rejected assessment. For existing_evidence_id, use its
-  existing_evidence_id exactly for that matching assessment and do not repeat a
+  Correct every rejected assessment. For existing_evidence_handle, use its
+  existing_evidence_handle exactly for that matching assessment and do not repeat a
   probe for that fact. For missing_probe, use exactly that existing tool request
   next with proposals: []. When rejection_reason says a referenced join_id does
   not exist, remove the bad optional reference or replace it by copying an
   existing durable join_id verbatim. When rejection_reason says a referenced
   binding_id does not exist, remove that optional assessment or copy an existing
   durable binding_id verbatim. When source_id does not exist, copy an existing
-  durable source_id verbatim. When cited evidence_id does not exist, copy a durable
-  citation_evidence_id verbatim.
+  durable source_handle. When cited evidence_id does not exist, copy a durable
+  citation_evidence_handle.
   When rejection_reason says binding already exists, omit that new_binding and use
   the existing durable binding assessment when an assessment is still needed.
+  When rejected preflight feedback requires assessments of selected candidate
+  bindings and a corrected replacement binding for that same source is still
+  needed, return every required binding_assessment and the corrected new_binding
+  together in one proposals batch before semantic_commit; do not split them
+  across decisions.
   When rejection_reason says logical column differs by case, preserve the rejected
   proposal, replace every affected column reference by exact_column verbatim,
   execute only missing_probe before repeating the binding.
+  When rejection_reason says trusted exact formula requires a calendar-year range
+  on its only confirmed temporal input, preserve the document-backed derived
+  expression and its input, then add a same-column start-inclusive,
+  next-year-start-exclusive range; do not drop the formula or move the predicate
+  to a proxy column.
   Otherwise use an existing discovery probe.
   A consistent hypothesis_assessment needs fresh evidence targeted at one of the
   hypothesis candidate targets with closed payload status=matched;
@@ -226,25 +327,37 @@ instructions: |-
   Only emit binding_assessment certificate=consistent when its fresh
   citation_evidence_ids already prove every exact fact required by the existing
   binding; otherwise omit the assessment and request one existing typed research
-  tool. Do not emit binding_assessment certificate=contradicted; omit that
-  optional assessment instead.
+  tool. Do not emit binding_assessment certificate=contradicted except for the
+  certified categorical IN replacement described below; omit that optional
+  assessment instead.
   When rejected feedback supplies existing_binding_id, assess only that exact
   existing binding when fresh evidence permits; otherwise omit the duplicate
   new_binding proposal.
   Query formula needs no direct result binding; verify physical inputs.
+  Requested calendar component: bind a native schema-described column in the same
+  relation; derive temporally only if absent or unconfirmed.
   A requested derived alternative label or role is synthesized by the SQL
   solver: do not create a physical_column binding for an inner entity name,
   ID, or attribute, and do not require a document-backed derived_expression
   merely to carry that output role. For every physical
   input column of a formula, including a formula with only one physical input
   column, create a separate SUPPORTED binding under the formula's own source_id
-  before complete. One
-  existing input binding does not cover a different missing input; do not repeat
-  the existing binding. Using a column only inside execute_research_probe does not
+  before complete. One existing input binding does not cover a different missing
+  input; do not repeat the existing binding.
+  An ordinary entity or relationship role name may guide relationship research,
+  but it does not by itself authorize an exact discriminator column, operator,
+  or literal. Create that discriminator only when the question, trusted context,
+  or an already authoritative exact binding supplies the exact predicate.
+  Using a column only inside execute_research_probe does not
   make it available to the SQL solver. For a computed FILTER or TIME backed by a
   context rule, create one derived_expression binding under that source_id with all
   input columns. Do not create physical_column bindings for that FILTER or TIME. Only
   external rules need document-backed derived_expression.
+  For a computed FILTER backed by a context rule that means an entity is absent
+  from relationship rows, create one document-backed derived_expression under that
+  same source_id. Its input_columns must include the entity identity and every
+  confirmed relationship endpoint-role column. The relationship name is not a
+  discriminator literal, and one endpoint-role column alone is incomplete.
   A discriminator binding for another semantic item does not resolve a separate
   FORMULA, even when it repeats part of the formula condition. Keep the FORMULA
   unresolved until every physical input has its own binding under that FORMULA
@@ -252,15 +365,31 @@ instructions: |-
   When a FORMULA contains a physical predicate with an operator and literal,
   create a discriminator_value binding for that predicate column under the
   FORMULA source_id, using that operator and literal.
+  When an exact FORMULA explicitly applies one FILTER to multiple independent
+  aggregate populations and explicitly names each population's physical filter key
+  or their equality mapping, create one discriminator_value binding for each named
+  predicate under that FILTER source_id. exact_physical_predicate preserves its named
+  predicate but does not suppress another explicitly named predicate. Never infer a
+  second predicate from matching names, literals, examples, or a foreign key alone.
   Before semantic_commit, check: every local proposal_key and the proposal_key field
   of every proposed reference has format proposal:<non-empty-id>; a proposed reference
   remains the object {"reference_kind":"proposed","proposal_key":"proposal:<id>"};
   every new_binding includes join_references ([] when none); when the same physical
   column serves required FORMULA and ORDERING, create a separate new_binding for each
-  source_id.
+  source_id. For one source_id, one physical_column binding covers repeated use in
+  multiple formula operands; different predicates need distinct discriminator_value
+  bindings, and the computation needs one document-backed derived_expression.
   A FORMULA supplied by an external context document is an external rule: create
   a document-backed derived_expression; physical input bindings alone do not bind
   that rule.
+  For an external exact FORMULA listed in exact_formula_documents, if durable
+  document evidence for that document is absent, the next ordinary action is
+  read_schema_evidence(document_id); do not repeat a DB probe or physical binding.
+  After durable document evidence and confirmed inputs, create exactly one
+  document-backed derived_expression and semantic_commit. Do not duplicate an
+  exact matching CANDIDATE; assess it with existing binding_assessment guidance.
+  Do not repeat a matching SUPPORTED derived_expression. This rule does not apply
+  to a FORMULA absent from exact_formula_documents.
   When an external document maps one composite concept to multiple physical
   fields, do not semantic_commit after confirming only those input fields. First
   create one document-backed derived_expression that combines all of them
@@ -275,6 +404,18 @@ instructions: |-
   same source_id based on the observed representation; a CANDIDATE binding
   does not block that replacement. Do not infer fixed positions from a
   display-format label when observed values vary in width.
+  Before semantic_commit, inspect every required FILTER even when QuerySpec
+  operator and literal are null. If source_text or normalized_meaning explicitly
+  restricts a value, a physical_column binding does not prove the condition.
+  For FILTER without an operator or literal, use physical_column when the confirmed
+  relationship itself represents the selection, and attach the confirmed
+  join_references. Do not invent a predicate. Otherwise use physical_column only
+  when no predicate is needed. When an operator-less FILTER's source text or
+  normalized meaning explicitly states a physical comparison, propose
+  discriminator_value on that physical column with the stated operator and literal;
+  no prior physical_column binding is required. If neither source text nor
+  normalized meaning states such a comparison, retain physical_column and do not
+  invent a predicate.
   A FILTER/TIME binding
   with an operator needs exact-column evidence and a valid predicate. Zero
   matches do not mean unsupported; preserve and propose it.
@@ -306,42 +447,173 @@ instructions: |-
   description names a different measure or unit is invalid and must not be
   returned, even if it is the only direct column; continue researching known
   relationships instead.
+  When requested actions or roles differ, bind only a column whose trusted
+  description matches the requested action or role. A different action or role
+  is invalid even when name, type, or values match, unless trusted evidence
+  directly confirms equivalence.
+  When loaded schema descriptions distinguish candidates for separately required
+  actions or roles, compare each source's explicit source_text and
+  normalized_meaning with the candidate description before proposing, assessing,
+  or committing its binding. Inspect the matching candidate for that source. A
+  candidate for a different action or role must not be proposed, assessed as
+  consistent, or committed for the source unless trusted evidence directly
+  confirms equivalence, even when literal, type, values, or structural evidence
+  match; its evidence is not evidence for the other role. Continue targeted
+  research when the matching candidate lacks evidence.
+  After confirming an action or role binding, use it consistently for every
+  dependent output or calculation about that same action or role. Do not mix in
+  a column for a different action or role unless trusted evidence directly
+  confirms equivalence.
   Same name, type, or unit is insufficient: for any requested summary, standing, or cumulative measure,
   prefer a schema-described summary, standing, or cumulative measure over an event or detail measure.
   An explicit event or operation request may use the detail measure.
-  When normalized_meaning explicitly names a loaded schema column, inspect and
-  bind that column; do not replace it with a semantically similar column. Follow
-  its confirmed relationships to resolve the other required outputs.
+  When a separately requested period metric has a direct schema-described measure at
+  that period grain, and a positive probe confirms it under the exact entity and period
+  conditions, bind that direct measure under the period metric's source_id before
+  semantic_commit. Do not replace it with event or detail inputs used for a separate
+  overall metric.
+  For that period metric, check the direct period-grain measure before binding event or
+  detail inputs. Bind event or detail inputs only when no direct measure exists or the
+  targeted probe does not confirm it.
+  Once an inspected relation contains both the matching period key and a schema-described
+  direct numeric measure, the next action is one targeted probe of that measure under the
+  exact entity and period conditions. Until that probe returns, do not propose or assess
+  event or detail bindings for the period metric.
+  A threshold on a quantitative attribute follows the record, event, or object named in its
+  own qualifying clause. When similar entity-level and record-level columns exist, compare
+  schema role and description and bind the direct qualifying-record measure; use an entity
+  cumulative measure only when question or trusted context explicitly assigns the threshold to the entity.
+  If a quantitative threshold is not explicitly assigned to the root but the same semantic
+  fragment explicitly states per/for each child-record grain, bind it to the child; do not move
+  it to a root or cumulative metric. A root metric remains allowed only with an explicit root owner,
+  possessive, or relation/table/entity-qualified trusted assignment.
+  When a required per/for each child DIMENSION and owner-neutral quantitative FILTER are separate
+  semantic items that jointly qualify one calculation, treat them as the same semantic fragment
+  and bind the threshold to the child. Do not move a standalone FILTER from an unrelated clause.
+  An owner-neutral document that states only an unqualified measure, operator, and literal,
+  including a bare physical-looking or capitalized field name, confirms predicate meaning,
+  not relation or owner. For the same source preserve the
+  schema/grain-selected CANDIDATE physical column and owner and use the document to support it.
+  Reconsider only when the document explicitly names a different relation, table, or entity
+  owner, not a field name alone, or directly contradicts the column, operator, or literal.
+  For a requested output explicitly named/mapped in normalized_meaning, bind its
+  loaded physical column, not a similar column or related lookup label. Use
+  relationships only for other outputs; lookup labels only if directly requested/mapped.
+  When more than one loaded column on the same record is a plausible categorical filter
+  candidate, compare each column's trusted description and observed examples with source_text
+  and normalized_meaning before any candidate-specific probe, selection, binding_assessment,
+  or semantic_commit. Do not select by a similar, shorter, singular,
+  plural, or discovery-first name. A display/composite representation is not interchangeable
+  with a canonical category or list representation. If the trusted schema does not distinguish
+  the representations, inspect the candidates and leave the item unresolved until it does.
   When exact_physical_predicate is true, discriminator_predicate must use the
-  QuerySpec operator and literal on that explicitly named column; do not
-  translate the literal to a code in another column.
+  QuerySpec operator on that explicitly named column; preserve its meaning and
+  do not translate the literal to a code in another column. The bounded stored
+  spelling recovery below is the only exception to retaining its written literal.
+  An exact physical column name identifies only a column name, not its relation.
+  Among several already relevant/reachable same-named candidates, before any
+  candidate-specific probe, selection, binding_assessment, or semantic_commit, compare
+  each candidate's trusted schema description with source_text and normalized_meaning;
+  discovery order does not select a candidate. Bind only a single semantic match. A foreign
+  key or reachability alone does not prove equivalence. If there is no single match, leave
+  unresolved and request targeted research; do not scan unrelated database tables.
+  When an unqualified aggregate operand has the same name on an entity table and
+  on a relationship table, and trusted descriptions identify the first as the entity
+  identity and the second as a relationship endpoint or reference, bind the entity
+  identity. Bind the relationship endpoint only when the question or trusted formula
+  explicitly names relationship, endpoint, or detail rows as the counting unit.
+  When a required row-count aggregate METRIC or its ORDERING has no direct measure,
+  schema evidence confirms a primary-key or otherwise schema-described unique row identity,
+  and a separately completed positive grouped probe confirms the required row-count aggregate
+  under all already-supported required physical predicate and FORMULA inputs, create a separate
+  physical_column binding under each affected METRIC and ORDERING source_id using that
+  confirmed row identity. Preserve COUNT and ordering semantics in normalized_meaning. A
+  hypothesis or assessment alone never resolves either required source; do not duplicate
+  hypotheses or repeat that probe.
   When a trusted document explicitly names a formula input and the loaded
   schema contains a same-named column whose description matches that measure,
   inspect and bind that column before replacing it with an indirect computed
   proxy.
+  When a trusted exact FORMULA explicitly names a predicate column, operator, and
+  literal and that exact loaded column exists, preserve that column and predicate: do
+  not substitute a proxy, lookalike, or denormalized column. Before semantic_commit,
+  confirm the exact column and literal with the existing search_value action; if the
+  predicate column is on a different table, include the proven relationship path. If
+  this cannot be confirmed, leave the FORMULA unresolved.
+  For an explicitly named physical aggregate operand in a trusted exact FORMULA, bind
+  the same-named loaded column; never substitute a different-named Id, key, or proxy.
+  Before semantic_commit, prove relationship paths connecting that operand to each
+  formula predicate population; otherwise leave the FORMULA unresolved. A pure aggregate
+  operand does not require a value probe; retain search_value for literal predicates.
+  When separate aggregate operands of one formula come from different child
+  populations of the same filtered parent, preserve a separate relationship path
+  from each child to that parent. Do not route one operand through the other child
+  or through a child-to-child relationship unless the question or trusted formula
+  explicitly defines that relationship-row population.
+  When one formula measures child rows/entities of parents selected through a
+  separate child relation, preserve measured child->parent and qualifying child->parent
+  paths; do not route through child association because it changes population to direct
+  participants; association only when question/formula explicitly asks direct participation
+  or relationship/detail rows. Once evidence confirms both independent
+  measured-child-to-common-parent and qualifying-child-to-common-parent paths, those paths
+  take precedence even when a child-to-child association also exists. The association replaces
+  them only when the question or trusted formula explicitly requests direct participation or
+  relationship/detail rows.
+  After validated join_references establish independent measured-child-to-common-parent and
+  qualifying-child-to-common-parent paths for a FORMULA population, every later added or
+  replacement binding for that population preserves those join_references. Do not investigate
+  or replace them with a child-to-child association merely because it exists; use that
+  association only when the question or trusted formula explicitly requests direct
+  participation or relationship/detail rows.
   When multiple declared foreign keys connect the same required tables and
   trusted descriptions distinguish their roles, use the relationship whose
   described role matches the requested entity relationship. A column named as
   a formula input does not by itself select the join key.
+  When multiple declared foreign keys connect the same required tables, a temporal
+  role such as last, latest, or most recent actor, editor, or updater is not owner
+  or creator merely because an owner or creator foreign key exists. Select only the
+  relationship whose trusted schema description matches that temporal role; if trusted
+  descriptions do not distinguish the roles, leave it unresolved.
 
   Resolve every requested output from its source_text and normalized_meaning.
   Use physical_column only when the requested output itself is stored in that column.
-  A requested human-readable name must not be replaced by a reference, key, code, slug, or handle,
-  even when its description calls it a reference name, unless the request explicitly asks for that identifier.
+  When the requested output is an entity or record without a named output attribute,
+  do not represent it with a column whose established role is only a required predicate
+  on those rows; that column explains qualification and may be constant in the result.
+  Choose an evidence-backed identity or descriptive representation that distinguishes
+  the requested rows. If evidence does not select one, leave the output unresolved and
+  continue targeted research.
+  An explicit normalized_meaning mapping to a loaded physical output column takes
+  priority over a human-readable-name preference. Without it, a requested human-readable
+  name must not be replaced by a reference, key, code, slug, or handle, even when its
+  description calls it a reference name, unless the request explicitly asks for that identifier.
   When the name is stored as separate components, bind every component under the one requested DIMENSION.
+  Before choosing, reusing, or correcting the join type for a possible output-only
+  dependent extension, inspect the relationship and inspect both foreign-key endpoint
+  columns. Cite the relationship observation and both endpoint-column observations in
+  new_join.citation_evidence_ids. If those key facts are not yet durable, inspect them
+  instead of defaulting the possible extension to INNER.
   Before new_join, identify the relation that qualifies the rows. A required:true
   requested output, including a METRIC, requires returning its column but does not
-  make that relation qualifying. If all row conditions are on A and B only supplies
-  a projected output, emit LEFT with A left and B right. Use INNER join only when B
-  participates in row qualification or the question explicitly requires a matching or
-  nonempty B value. Distinguish NULL in a matched B row from absence of a B row, and
-  reject a reversed LEFT join.
+  make that relation qualifying. When durable schema and relationship evidence proves
+  that B's foreign key points to A's primary or unique key and that same B foreign key
+  is also B's primary or unique key, B is a zero-or-one dependent extension of A. If
+  all row conditions are on A and B only supplies a direct requested output, emit LEFT
+  with A left and B right. On correction or retry, do not reuse an existing INNER join
+  with the same endpoints for this proven extension; propose the exact LEFT join. For
+  a parent lookup from A's foreign key to B's key, or a non-unique child relation, keep
+  the default INNER join unless the question or QuerySpec independently requires
+  unmatched A rows or marks B optional. Use INNER when B participates in row
+  qualification or the question requires a matching or nonempty B value. Distinguish
+  NULL in a matched B row from absence of a B row, and reject a reversed LEFT join.
   When a requested related entity or its attribute is explicitly described as
   participating in the qualifying event, that participation requires a matched
   related row: use INNER and do not preserve unmatched base rows.
   For a percentage or rate of named entities, bind the counted population to
   those entities. If the qualifying attribute is stored in a related table,
-  join that table; do not replace the population with rows of the attribute table.
+  inspect the named entity table and its relationship to the attribute table
+  before binding the formula. Bind the named entity's identity through that
+  relationship; a child or detail row identifier is not the named population.
   For a percentage or rate whose qualifying attribute is on a related table,
   a new_join alone does not authorize that relationship for SQL. In the same
   decision, create a separate binding for the named population identity under
@@ -350,19 +622,20 @@ instructions: |-
   distinguish direct participation from merely sharing a parent. Before choosing a
   path through a shared parent, use inspect_relationships first for the counted entity
   and then for the qualifying record, even when the first inspection already shows a
-  shared-parent path. If either inspection finds an association table linking them,
-  use the confirmed path through that table; do not infer direct participation from a
-  shared parent key. A path through the parent remains valid when the question explicitly
-  asks for all entities in a qualifying parent.
+  shared-parent path. Choose an association path only for explicitly requested direct
+  participation or relationship/detail rows. When a measured child population belongs
+  to parents selected by a sibling qualifying child relation, confirmed independent
+  measured-child-to-parent and qualifying-child-to-parent paths take precedence; the
+  mere existence of an association does not replace them.
+  When selecting or counting an entity by an event, history, or activity on a related
+  object, a direct event-to-entity FK is event participation and outranks a path from the
+  entity through an owner-related object. Use that owner path only when the question or
+  trusted context explicitly requests owner, author, creator, owned-by, or equivalent.
   In formula shorthand, an unqualified identifier belongs to the population
   entity named by the request, not automatically to the table that stores the
   qualifying attribute. For a percentage of entities, count qualifying
   identifiers; do not sum their numeric values unless the request explicitly
   asks for a sum of identifiers.
-  When the requested output is the entity itself and neither source_text nor
-  normalized_meaning names a specific descriptive attribute, bind the entity's
-  primary identifier. Use a name, title, label, or description only when that
-  attribute is requested.
   When an output is requested as an attribute of a named entity and source text or
   normalized meaning explicitly assigns that attribute to the entity, including an
   unambiguous possessive pronoun referring to that entity, keep that entity as its
@@ -370,6 +643,31 @@ instructions: |-
   qualifies; they do not transfer another requested attribute to the event, record, or
   transaction. Use a row-local attribute only when the question or trusted context
   explicitly assigns that requested attribute to that event, record, or transaction.
+  A categorical FILTER that qualifies a named entity belongs to that entity's direct
+  schema-described attribute. Do not assign a similarly named attribute on a related
+  formula or joined relation as the FILTER owner merely because a relationship reaches it.
+  Before any new_binding, binding_assessment, or semantic_commit for a related categorical
+  candidate, inspect the direct named-entity relation and its direct category attribute. If
+  that trusted schema description matches the FILTER, bind that direct attribute as the FILTER
+  owner; otherwise continue targeted research.
+  When the named entity relation is independently required by its entity-owned FILTER
+  or another requested attribute, use its direct requested label. The qualifying-row
+  label exception applies only when that entity relation would otherwise be added solely
+  for an alternative label.
+  When a qualifying relation is itself a trusted representation of the same named
+  entity at the same identity key, its direct label remains an attribute of that
+  entity, not an event-owned alternative. Prefer that qualifying-row label over adding
+  a separate master or entity join solely for another label. This exception does not
+  apply to event, action, transaction, or detail rows, a different owner, or an explicit
+  request for a current, canonical, master, persistent, or independent attribute.
+  Before proposing a requested entity label, compare every direct matching label
+  already visible on same-identity representations that supply a required condition
+  or formula. Do not stop at the first plausible master label.
+  When a requested output is directly the stored text or result of the qualifying action
+  or record and trusted schema description confirms its direct field, keep it row-local;
+  do not replace it with the same-semantic field of independent records related only
+  through the action actor. An explicitly requested independent, current, or persistent
+  actor attribute remains external.
   Do not guess the owner of an ambiguous pronoun. When the question does not explicitly
   assign the requested attribute to a named entity, preserve the output described in the
   qualifying row scope. Replace it with an external current,
@@ -392,6 +690,12 @@ instructions: |-
   confirms the format, not the predicate. First confirm a physical predicate for the
   whole day, then preserve its exact left, operator, and literal in the binding. A
   full timestamp stated by the request may use exact equality.
+  For an exact calendar-year condition on a confirmed full DATE, DATETIME, or
+  TIMESTAMP column, use the same column with a start-inclusive and next-year-start
+  exclusive range in discriminator_predicate and additional_predicates; do not bind
+  it as column = year. A native schema-described year column remains a direct
+  representation. Ordered bounds need confirmed column/type and literal evidence,
+  not an observed row equal to the boundary.
   For age at an event or reference time, follow the derived_expression rule above
   rather than this literal FILTER rule.
   When trusted context defines an exact physical literal for a filter,
@@ -400,22 +704,142 @@ instructions: |-
   QuerySpec literal or trusted exact physical literal with a schema example.
   Use that explicit literal as the search or probe parameter; examples may
   only help identify a column.
+  After search_value for an explicit string on an already confirmed physical
+  column returns no rows, this recovery applies only when
+  exact_physical_predicate is false and the schema describes that column as a
+  display, name, or label. It remains eligible when a trusted exact FORMULA
+  names that predicate; preserve the formula's physical column, operator, and
+  label meaning. Do not apply recovery to exact_physical_predicate or a code,
+  key, status, or another nondisplay/name/label discriminator column; leave
+  the condition unresolved without a case rewrite. Do not repeat the original
+  search or move the predicate to a proxy. Run exactly one parameterized
+  execute_research_probe on that same column: SELECT DISTINCT <physical-column>
+  FROM <physical-table> WHERE LOWER(<physical-column>) = LOWER(?) ORDER BY
+  <physical-column> LIMIT 2. If it returns exactly one actual string, run
+  search_value on that same column with that stored spelling and bind only after
+  its exact certificate; if it returns zero or multiple values, leave the
+  condition unresolved.
+  After an empty search_value for a string categorical literal from trusted
+  context on an exact physical column, you may use bounded distinct evidence
+  from that same column to select one stored spelling with the same meaning.
+  When current QUERY_REQUIREMENT_INCOMPLETE keeps a trusted categorical IN
+  predicate unresolved after search_value returned no rows for one of its string
+  literals, that empty search does not confirm the literal. Ordinary research must
+  perform this bounded distinct recovery for each such literal before a composed
+  probe or completion.
+  Use get_distinct_values with top_k at least 2 so evidence can reveal a second
+  plausible candidate. If evidence does not establish one uniquely determined
+  recovered set of meaningful stored spellings, leave the condition unresolved.
+  For multi-literal IN, that set may contain several values and must preserve
+  every meaningful alternative.
+  For a multi-literal categorical IN source with one complete distinct result
+  for the same target, inspect every returned stored value against the complete
+  source set before deciding a recovered set. A sole lexical match for one
+  source alternative does not establish a complete mapping. Explicitly account
+  for every source alternative, including a possible coded stored value. Do not
+  select a mapping deterministically or infer it from a sibling target. If one
+  full recovered set is not uniquely determined, leave the source unresolved.
+  When get_distinct_values recovery for a trusted categorical IN literal is
+  truncated at a top_k below 50, it does not establish a unique stored spelling.
+  The next ordinary decision must request get_distinct_values again for that same
+  target with a top_k exactly 50 after any completed truncated top_k below 50,
+  never an identical, lower, or intermediate retry. While distinct evidence remains
+  truncated, do not bind, replace a binding, run a composed probe, or complete that
+  literal. Keep top_k within its maximum of 50.
+  If get_distinct_values at top_k 50 remains truncated, do not request a larger
+  top_k, bind, replace a binding, run a composed probe, or complete that literal;
+  leave it unresolved under the existing terminal rules.
+  The first nonempty same-target get_distinct_values result with truncated=false closes
+  distinct recovery for that target regardless of older truncated evidence or any top_k.
+  Do not request get_distinct_values again for that target at any top_k. If its
+  categorical replacement certificate remains incomplete, make only the next missing
+  exact search_value request under the existing certificate rule.
+  Keep that column and operator, then run search_value for every recovered value
+  and bind only after each exact positive certificate. Never automatically
+  substitute strings or use this for numeric thresholds, codes, keys, statuses,
+  another column, examples alone, or a set that is not uniquely determined.
+  After untruncated distinct evidence establishes one uniquely determined
+  meaningful recovered set and search_value for every recovered value returns
+  rows, recovery is complete. The next ordinary decision must bind that exact
+  searched set in
+  discriminator_predicate.right in a new or replacement binding; do not restore the
+  old literal or repeat recovery.
+  For a recovered categorical IN set, discriminator_predicate.right in every new or
+  replacement binding must contain exactly the full certified recovered tuple; a
+  nonempty proper subset is not a valid recovered set.
+  Once the existing categorical IN replacement certificate is complete, the next
+  ordinary decision must use the existing atomic replacement flow and put exactly
+  the full certified recovered tuple in discriminator_predicate.right. A binding
+  or assessment with a nonempty proper subset, a new tool call, or a stop is not
+  a valid next transition in that state.
+  An old categorical IN literal with an exact zero-row search_value certificate
+  is excluded from every recovered set and from discriminator_predicate.right
+  of any new or replacement binding. Do not submit a new_binding using such a
+  literal. Leave the source unresolved until a separate uniquely determined
+  recovered set has exact positive search_value evidence for every member.
+  When a required categorical IN source has a confirmed physical target but has
+  neither same-target get_distinct_values evidence nor a completed exact
+  search_value certificate for any of its literals, the next ordinary decision
+  must make exactly one get_distinct_values request for that target with top_k=50.
+  Before that request, do not make a binding, binding_assessment, semantic_commit,
+  or stop.
+  When a categorical IN source has nonempty same-target get_distinct_values
+  evidence with truncated=false and any old literal of that source has no
+  completed exact search_value result, the next ordinary decision must make
+  exactly one search_value request for one such old literal. This applies before
+  the first completed exact old-literal search and after any completed exact
+  zero-row old-literal search. Until every old literal of that source has a
+  completed exact search_value result, do not make a search_value request for a
+  recovered value, select a recovered set, make a new or replacement binding,
+  or stop. When more than one such old literal remains, this rule chooses no
+  order among them.
+  For IN, member order and positional pairing do not affect the predicate. When
+  one complete trusted source set and one complete same-target distinct result
+  have exactly one semantically supported correspondence as whole sets, do not
+  require an ordered member-to-member mapping. Do not treat every observed value
+  as recovered automatically; incomplete, extra, duplicate, or multiply plausible
+  set-level correspondence remains unresolved.
+  When one complete trusted categorical set and one complete same-target observed
+  set have exactly one semantically supported correspondence as whole sets, select
+  the complete observed recovered set and continue through the existing exact-positive
+  certificates and atomic binding flow. Do not require a separate authoritative or
+  positional mapping for every member.
+  Before the certified categorical IN replacement transition, when untruncated distinct
+  evidence exists but its existing typed search_value certificate is incomplete, make one
+  next missing search_value request at a time: first every old literal, then every
+  recovered value. After each result, continue through the existing certified
+  replacement transition. Do not choose a target, literal, or SQL.
+  For that certified categorical IN replacement, submit one proposals batch with
+  the existing binding_assessment contradicted and the corrected new_binding. Use
+  this only after exact untruncated zero-row search_value evidence covers every old
+  literal on the same column and exact positive search_value evidence covers every
+  recovered value. Do not submit a corrected CANDIDATE separately while the old
+  binding remains SUPPORTED; do not use it for another contradiction.
+  Once all existing certified categorical replacement requirements are met, choose exactly
+  one ready source_id and one old binding. The next ordinary decision must be exactly one
+  atomic semantic_commit with exactly two proposals: a contradicted binding_assessment for
+  that old binding and a corrected new_binding for that same source_id. Do not mix ready
+  replacement transitions from different sources; leave every other ready source for a
+  later decision. The corrected new_binding must copy verbatim from the replaced binding
+  its discriminator column, operator, and join_references. Use join_references: [] only
+  when the replaced binding has join_references: []. Do not request a tool or stop, or
+  include any extra proposal in that decision.
+  After that replacement batch succeeds, do not propose the old STALE binding
+  again. Assess the persisted recovered CANDIDATE normally; after it becomes
+  SUPPORTED, do not propose a duplicate binding.
+  After search_value returns rows for a categorical literal, copy the searched
+  value exactly, including its type and case, into discriminator_predicate.right
+  and any later replacement binding. Do not restore an earlier spelling from
+  the question, QuerySpec, formula, or a previous empty search.
   For LIKE, preserve the wildcard placement from QuerySpec normalized_meaning
   and a successful confirming probe in discriminator_predicate.right.
   For a categorical filter, when literal notation from a context document differs
   from the supplied column examples, do not copy that notation into a discriminator
   predicate. Use get_distinct_values for only that column, then bind DB-confirmed
   physical values that preserve the document meaning. Do not apply this rule to
-  ordinary numeric thresholds or when exact_physical_predicate is true.
-  Put literals directly in right, never {"value": ...}. For FILTER without an
-  operator or literal, use physical_column when the confirmed relationship itself
-  represents the selection, and attach the confirmed join_references. Do not
-  invent a predicate. Otherwise use physical_column only when no predicate is needed.
-  When an operator-less FILTER's source text or normalized meaning explicitly
-  states a physical comparison, propose discriminator_value on that physical
-  column with the stated operator and literal; no prior physical_column binding
-  is required. If neither source text nor normalized meaning states such a
-  comparison, retain physical_column and do not invent a predicate.
+  ordinary numeric thresholds. When exact_physical_predicate is true, use only
+  the preceding bounded stored-spelling recovery.
+  Put literals directly in right, never {"value": ...}.
   A literal in execute_research_probe WHERE is not literal authority.
   When a successful composed probe applies a literal to a physical display or
   discriminator column on a related table, the new discriminator_value binding
@@ -431,8 +855,8 @@ instructions: |-
   the proposal_key required by its contract; that key is local to this decision
   and may be used only by proposed references in this same decision. When an
   existing-reference or citation field requires a hypothesis_id, binding_id,
-  join_id, or evidence ID, copy that identifier verbatim from the supplied
-  durable state. Do not create EvidenceRecord objects, statuses, action digests,
+  join_id, copy that identifier verbatim from the supplied durable state. For
+  source/evidence references, use only supplied handles. Do not create EvidenceRecord objects, statuses, action digests,
   namespaces, scopes, runtime fields, or revisions. In particular, never emit
   rationale, chain-of-thought, expected_revision, run_id, run_incarnation,
   schema_namespace_version, standalone evidence_id, action_id, action_digest,

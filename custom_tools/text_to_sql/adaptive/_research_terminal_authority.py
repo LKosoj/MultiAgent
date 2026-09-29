@@ -119,8 +119,10 @@ def _terminal_replay_is_authorized(
     if reason in {ResearchStopReason.AMBIGUOUS, ResearchStopReason.UNSUPPORTED}:
         return (
             not authority.allowed
-            and affected == _canonical_outcome_affected_source_ids(state, reason)
             and bool(affected)
+            and set(affected).issubset(
+                _canonical_outcome_affected_source_ids(state, reason)
+            )
         )
     return affected == _affected_source_ids(state) and citations == tuple(
         sorted(item.evidence_id for item in state.evidence)

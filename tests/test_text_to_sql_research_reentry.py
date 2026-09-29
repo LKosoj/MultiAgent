@@ -867,6 +867,152 @@ async def test_bound_formula_missing_schema_continues_existing_research() -> Non
     assert outcome.research_state == final
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("candidate_source_id", "expects_continuation"),
+    (("status", True), ("other", False), (None, False)),
+    ids=("same-source-candidate", "other-source-candidate", "no-candidate"),
+)
+async def test_schema_reentry_continues_only_for_same_source_candidate(
+    candidate_source_id: str | None,
+    expects_continuation: bool,
+) -> None:
+    from custom_tools.text_to_sql.adaptive.research_loop import ResearchLoopOutcome
+
+    case = _case()
+    supported = case.state.bindings[0]
+    query_spec = case.query_spec
+    if candidate_source_id == "other":
+        other_item = query_spec.semantic_items[0].model_copy(
+            update={
+                "source_id": "other",
+                "source_text": "other status",
+                "required": False,
+                "status": SemanticItemStatus.PARTIALLY_RESOLVED,
+                "binding_ids": ("candidate-binding",),
+            }
+        )
+        query_spec = query_spec.model_copy(
+            update={"semantic_items": (*query_spec.semantic_items, other_item)}
+        )
+    candidate = supported.model_copy(
+        update={
+            "binding_id": "candidate-binding",
+            "source_id": candidate_source_id or supported.source_id,
+            "status": BindingStatus.CANDIDATE,
+        }
+    )
+    current = (
+        ResearchState.model_validate(
+            {
+                **case.state.model_dump(mode="python"),
+                "query_spec": query_spec,
+                "bindings": (supported, candidate),
+            }
+        )
+        if candidate_source_id is not None
+        else case.state
+    )
+    continuation_freshness = _context(
+        evaluated_at=_context().evaluated_at + timedelta(microseconds=1)
+    )
+    promotion_evidence = _schema_evidence(
+        "candidate-promotion-evidence",
+        case.requirements.allowed_columns[0],
+        revision=current.revision + 1,
+        completed_at=continuation_freshness.evaluated_at,
+    )
+    final = _fresh(case) if not expects_continuation else ResearchState.model_validate(
+        {
+            **current.model_dump(mode="python"),
+            "revision": current.revision + 1,
+            "query_spec": current.query_spec.model_copy(
+                update={
+                    "revision": current.query_spec.revision + 1,
+                    "semantic_items": (
+                        current.query_spec.semantic_items[0].model_copy(
+                            update={"binding_ids": (candidate.binding_id,)}
+                        ),
+                    ),
+                }
+            ),
+            "bindings": (
+                supported.model_copy(update={"status": BindingStatus.STALE}),
+                candidate.model_copy(
+                    update={
+                        "status": BindingStatus.SUPPORTED,
+                        "evidence_ids": (
+                            *candidate.evidence_ids,
+                            promotion_evidence.evidence_id,
+                        ),
+                    }
+                ),
+            ),
+            "evidence": (*current.evidence, promotion_evidence),
+            "action_history": (
+                *current.action_history,
+                research_action(
+                    (("revision", current.revision),), index=current.revision
+                ),
+            ),
+        }
+    )
+    calls = {"continue": 0, "propose": 0}
+
+    async def continue_research(_state, _request):
+        calls["continue"] += 1
+        return ResearchLoopOutcome(
+            final_state=final,
+            stop_reason=ResearchStopReason.COMPLETE,
+            affected_source_ids=(),
+            citation_evidence_ids=tuple(
+                evidence.evidence_id for evidence in final.evidence
+            ),
+            ambiguity=None,
+            freshness_context=continuation_freshness if expects_continuation else None,
+        )
+
+    def propose(**_kwargs):
+        calls["propose"] += 1
+        return _decision()
+
+    outcome = await run_targeted_research_reentry(
+        _stopped(case).model_copy(update={"query_spec": current.query_spec}),
+        current,
+        "request-1",
+        requirements=validate_coverage_inputs(
+            current,
+            _context(),
+            current.run_id,
+            current.run_incarnation,
+        ),
+        freshness_context=_context(),
+        loaded_schema=object(),
+        registry=object(),
+        decision_model_type=ResearchDecisionV1,
+        propose_decision=propose,
+        resolve_decision=lambda *_args, **_kwargs: SimpleNamespace(
+            tool_claim=SimpleNamespace(target=case.requirements.allowed_columns[0]),
+            admission=object(),
+            invocation=object(),
+        ),
+        execute_probe=lambda *_args, **_kwargs: SimpleNamespace(
+            status=ProbeStatus.SUCCESS
+        ),
+        commit_research_turn=lambda *_args, **_kwargs: SimpleNamespace(state=final),
+        continue_research=continue_research,
+        deadline=None,
+        is_cancelled=lambda: False,
+        id_factory=iter(("reentry-1",)).__next__,
+    )
+
+    assert calls == {
+        "continue": int(expects_continuation),
+        "propose": int(not expects_continuation),
+    }
+    assert outcome.record.status is ResearchReentryStatus.COMPLETED
+
+
 def test_unbound_formula_continuation_preserves_and_may_extend_other_sources() -> None:
     case = build_case(
         "SELECT o.amount, o.status FROM orders o",

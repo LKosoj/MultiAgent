@@ -17,6 +17,7 @@ from .models import (
     ColumnRef,
     DerivedExpressionBinding,
     DiscriminatorValueBinding,
+    DocumentRuleBinding,
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
@@ -334,6 +335,11 @@ def predicate_from_expression(
         right = _predicate_operand(
             children["expression"], relation_tables, allowed_columns, dialect
         )
+        if (
+            operator in {PredicateOperator.EQ, PredicateOperator.NEQ}
+            and any(child.kind == "null" for child in children.values())
+        ):
+            return None
         return (
             PredicateRef(left=left, operator=operator, right=right)
             if left is not None and right is not _UNRESOLVED
@@ -675,6 +681,8 @@ def _binding_targets(
                         dialect,
                     )
                 )
+    elif type(binding) is DocumentRuleBinding:
+        return targets
     else:
         raise ValueError("semantic binding subtype is unsupported")
     return targets

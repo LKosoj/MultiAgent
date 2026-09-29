@@ -158,14 +158,15 @@ async def run_targeted_research_reentry(
             if item.missing_evidence_request_id == missing_evidence_request_id
         )
         if resume_admitted:
-            formula_needs_continuation = _formula_needs_research_continuation(
+            needs_research_continuation = _needs_research_continuation(
                 request.source_id,
                 admitted.state,
+                current_research,
                 request.required_evidence_kind,
             )
             if (
                 request.repair_kind != "semantic_binding_mismatch"
-                and not formula_needs_continuation
+                and not needs_research_continuation
                 and request.predicate_authority is None
             ):
                 raise ResearchReentryError(
@@ -179,7 +180,7 @@ async def run_targeted_research_reentry(
                 freshness,
                 continue_research,
                 allow_current_result=(
-                    formula_needs_continuation or request.predicate_authority is not None
+                    needs_research_continuation or request.predicate_authority is not None
                 ),
             )
         authority = revalidate_exact_model(
@@ -198,9 +199,10 @@ async def run_targeted_research_reentry(
             raise ResearchReentryError(
                 "requirements must be exact current W4 authority"
             )
-        if _formula_needs_research_continuation(
+        if _needs_research_continuation(
             request.source_id,
             admitted.state,
+            current_research,
             request.required_evidence_kind,
         ):
             return await _complete_research_continuation(
@@ -491,21 +493,30 @@ async def _complete_research_continuation(
     )
 
 
-def _formula_needs_research_continuation(
+def _needs_research_continuation(
     source_id: str,
     state: SolverState,
+    research_state: ResearchState,
     required_evidence_kind: EvidenceSourceKind,
 ) -> bool:
     item = next(
         (item for item in state.query_spec.semantic_items if item.source_id == source_id),
         None,
     )
-    return (
+    formula_needs_continuation = (
         item is not None
         and item.kind is SemanticItemKind.FORMULA
         and (
             not item.binding_ids
             or required_evidence_kind is EvidenceSourceKind.SCHEMA
+        )
+    )
+    return formula_needs_continuation or (
+        required_evidence_kind is EvidenceSourceKind.SCHEMA
+        and any(
+            binding.source_id == source_id
+            and binding.status is BindingStatus.CANDIDATE
+            for binding in research_state.bindings
         )
     )
 

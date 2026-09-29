@@ -49,7 +49,11 @@ def test_restore_descriptions_from_exact_schema_memory(monkeypatch, tmp_path):
         "public.orders": {
             "description": "",
             "columns": {
-                "id": {"type": "INTEGER", "description": "Existing ID"},
+                "id": {
+                    "type": "INTEGER",
+                    "description": "Existing ID",
+                    "examples": ["kept"],
+                },
                 "amount": {"type": "DECIMAL", "description": ""},
             },
         }
@@ -73,11 +77,17 @@ def test_restore_descriptions_from_exact_schema_memory(monkeypatch, tmp_path):
                 "table_info": {
                     "description": "Customer orders",
                     "columns": [
-                        {"name": "id", "type": "TEXT", "description": "Memory ID"},
+                        {
+                            "name": "id",
+                            "type": "TEXT",
+                            "description": "Memory ID",
+                            "examples": ["memory"],
+                        },
                         {
                             "name": "amount",
                             "type": "TEXT",
                             "description": "Order amount",
+                            "examples": [4, 9, b"invalid", {"invalid": "value"}],
                         },
                         {"name": "missing", "description": "Not in live schema"},
                     ],
@@ -109,10 +119,12 @@ def test_restore_descriptions_from_exact_schema_memory(monkeypatch, tmp_path):
     assert schema["public.orders"]["columns"]["id"] == {
         "type": "INTEGER",
         "description": "Existing ID",
+        "examples": ["kept"],
     }
     assert schema["public.orders"]["columns"]["amount"] == {
         "type": "DECIMAL",
         "description": "Order amount",
+        "examples": [4, 9],
     }
     assert calls == [
         {
@@ -826,7 +838,10 @@ def test_schema_memory_new_format_still_supported(monkeypatch, tmp_path):
             "description": "Пользователи",
             "columns": {
                 "id": {"type": "INTEGER", "constraint_type": "PK"},
-                "email": {"type": "TEXT"},
+                "email": {
+                    "type": "TEXT",
+                    "examples": ["contact-1", b"invalid", ["invalid"]],
+                },
             },
         }
     }
@@ -842,6 +857,9 @@ def test_schema_memory_new_format_still_supported(monkeypatch, tmp_path):
     assert table_info["description"] == "Пользователи"
     column_names = {c["name"] for c in table_info["columns"]}
     assert column_names == {"id", "email"}
+    assert next(column for column in table_info["columns"] if column["name"] == "email")[
+        "examples"
+    ] == ["contact-1"]
 
 
 # ---------------------------------------------------------------------------

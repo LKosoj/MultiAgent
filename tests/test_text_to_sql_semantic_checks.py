@@ -13,6 +13,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     JoinCandidate,
     JoinCandidateStatus,
     JoinEdge,
+    JoinType,
     PhysicalColumnBinding,
     PredicateOperator,
     RepairKind,
@@ -36,6 +37,7 @@ from custom_tools.text_to_sql.adaptive.serialization import (
 )
 from custom_tools.text_to_sql.adaptive.semantic_coverage import (
     CoverageRequirements,
+    RowPreservationRequirement,
     validate_coverage_inputs,
 )
 from custom_tools.text_to_sql.adaptive.semantic_plan import (
@@ -49,6 +51,7 @@ POSTGRES_DSN,
     ItemSpec,
     build_case,
     build_state,
+    build_vertical_case,
     build_vertical_state,
     column,
     inner_join,
@@ -136,6 +139,45 @@ def test_deferred_limit_requires_one_positive_root_literal_limit(
     if expected_status is CheckStatus.FAILED:
         assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
         assert result.affected_source_ids == ("take-one",)
+        assert result.repair is not None
+        assert result.repair.kind is RepairKind.REVISE_SQL
+
+
+@pytest.mark.parametrize(
+    ("condition", "expected_status"),
+    (
+        ("o.status = NULL", CheckStatus.FAILED),
+        ("o.status != NULL", CheckStatus.FAILED),
+        ("NULL = o.status", CheckStatus.FAILED),
+        ("NULL != o.status", CheckStatus.FAILED),
+        ("o.status IS NULL", CheckStatus.PASSED),
+        ("o.status IS NOT NULL", CheckStatus.PASSED),
+    ),
+    ids=(
+        "eq_null",
+        "neq_null",
+        "null_eq",
+        "null_neq",
+        "is_null",
+        "is_not_null",
+    ),
+)
+def test_binary_null_comparison_is_revised_without_corrupting_semantic_ast(
+    condition: str, expected_status: CheckStatus
+) -> None:
+    case = build_case(
+        f"SELECT o.status FROM orders o WHERE {condition}",
+        (_item("status", SemanticItemKind.DIMENSION, "status"),),
+    )
+
+    result = _evaluate(case)
+
+    assert result.status is expected_status
+    if expected_status is CheckStatus.FAILED:
+        assert result.failure_code is CheckFailureCode.AST_SHAPE_UNSUPPORTED
+        assert result.affected_ast_node_ids == tuple(
+            item.node_id for item in case.check_input.parsed_ast.predicates
+        )
         assert result.repair is not None
         assert result.repair.kind is RepairKind.REVISE_SQL
 
@@ -624,7 +666,7 @@ def test_physical_formula_binding_is_authorized() -> None:
     assert result.status is CheckStatus.PASSED
 
 
-def _formula_predicate_binding_case(*, vertical: bool):
+def _formula_predicate_binding_case(*, vertical: bool, sql_override: str | None = None):
     if vertical:
         state = build_vertical_state()
         sql = (
@@ -646,6 +688,8 @@ def _formula_predicate_binding_case(*, vertical: bool):
             )
         )
         sql = "SELECT SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) FROM orders"
+    if sql_override is not None:
+        sql = sql_override
     formula = state.query_spec.semantic_items[0].model_copy(
         update={
             "kind": SemanticItemKind.FORMULA,
@@ -677,6 +721,54 @@ def _formula_predicate_binding_case(*, vertical: bool):
 @pytest.mark.parametrize("vertical", (False, True), ids=("discriminator", "vertical"))
 def test_formula_allows_confirmed_predicate_binding(vertical: bool) -> None:
     check_input, state = _formula_predicate_binding_case(vertical=vertical)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+@pytest.mark.parametrize(
+    "sql",
+    (
+        "SELECT COUNT(*) FROM orders AS o",
+        "SELECT COUNT(CASE WHEN o.status LIKE 'active' THEN 1 END) FROM orders AS o",
+    ),
+    ids=("missing", "wrong_operator"),
+)
+def test_formula_predicate_shape_is_left_to_result_review(sql: str) -> None:
+    check_input, state = _formula_predicate_binding_case(
+        vertical=False,
+        sql_override=sql,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_formula_accepts_supported_discriminator_inside_conditional_aggregate() -> None:
+    check_input, state = _formula_predicate_binding_case(
+        vertical=False,
+        sql_override=(
+            "SELECT COUNT(CASE WHEN o.status = 'active' THEN 1 END) "
+            "FROM orders AS o"
+        ),
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_formula_discriminator_does_not_require_literal_shape_before_result_review() -> None:
+    check_input, state = _formula_predicate_binding_case(
+        vertical=False,
+        sql_override=(
+            "SELECT COUNT(CASE WHEN o.status = "
+            "(SELECT MAX(status) FROM orders) THEN 1 END) FROM orders AS o"
+        ),
+    )
 
     result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
 
@@ -857,7 +949,7 @@ def test_cross_join_with_authorized_endpoints_is_not_blocked_by_join_path() -> N
     assert result.failure_code is None
 
 
-def test_coverage_derives_row_preservation_for_output_only_metric() -> None:
+def test_coverage_does_not_derive_row_preservation_for_base_filter_and_related_output() -> None:
     path = (inner_join("organizations", "id", "ratings", "organization_id"),)
     state = build_state(
         (
@@ -888,18 +980,10 @@ def test_coverage_derives_row_preservation_for_output_only_metric() -> None:
 
     requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
 
-    assert len(requirements.row_preservation_requirements) == 1
-    requirement = requirements.row_preservation_requirements[0]
-    assert requirement.base_table == column("organizations", "id").table
-    assert requirement.related_table == column("ratings", "score").table
-    assert requirement.related_source_ids == ("rating",)
-    assert requirement.related_binding_ids == ("binding-rating",)
-    assert requirement.effective_join_path == (
-        path[0].model_copy(update={"join_type": "left"}),
-    )
+    assert not requirements.row_preservation_requirements
 
 
-def test_coverage_derives_row_preservation_for_non_output_formula_only() -> None:
+def test_coverage_does_not_derive_row_preservation_for_non_output_formula_only() -> None:
     path = (inner_join("schools", "id", "satscores", "school_id"),)
     state = build_state(
         (
@@ -1002,10 +1086,7 @@ def test_coverage_derives_row_preservation_for_non_output_formula_only() -> None
 
     requirements = validate_coverage_inputs(state, _context(), RUN_ID, INCARNATION)
 
-    assert len(requirements.row_preservation_requirements) == 1
-    requirement = requirements.row_preservation_requirements[0]
-    assert requirement.base_table == column("schools", "id").table
-    assert requirement.related_table == column("satscores", "score").table
+    assert not requirements.row_preservation_requirements
 
 
 def test_coverage_skips_row_preservation_when_related_table_qualifies() -> None:
@@ -1132,19 +1213,16 @@ def test_coverage_skips_row_preservation_when_base_is_ambiguous() -> None:
         "WHERE o.is_active = TRUE",
     ),
 )
-def test_row_preservation_rejects_inner_or_reversed_left_join(sql: str) -> None:
+def test_row_preservation_join_shape_is_not_a_semantic_authority_gate(sql: str) -> None:
     state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
 
     result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_JOIN
-    assert result.affected_source_ids == ("rating",)
-    assert result.repair is not None
-    assert result.repair.kind is RepairKind.REVISE_SQL
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
-def test_row_preservation_rejects_ambiguous_base_table_roles() -> None:
+def test_row_preservation_ambiguous_base_roles_are_not_a_semantic_authority_gate() -> None:
     sql = (
         "SELECT r.score FROM organizations o1 "
         "INNER JOIN organizations o2 ON o1.parent_id = o2.id "
@@ -1155,11 +1233,8 @@ def test_row_preservation_rejects_ambiguous_base_table_roles() -> None:
 
     result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_JOIN
-    assert result.affected_source_ids == ("rating",)
-    assert result.repair is not None
-    assert result.repair.kind is RepairKind.REVISE_SQL
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 def test_coverage_skips_row_preservation_for_equal_validated_paths() -> None:
@@ -1281,6 +1356,72 @@ def test_row_preservation_accepts_effective_left_join_and_skips_no_qualifier() -
     ).status is CheckStatus.PASSED
 
 
+def test_row_preservation_accepts_effective_left_join_in_reachable_cte() -> None:
+    sql = (
+        "WITH scoped_ratings AS ("
+        "SELECT o.id, r.score FROM organizations o "
+        "LEFT JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+        ") SELECT scoped_ratings.score FROM scoped_ratings"
+    )
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_row_preservation_inner_join_in_reachable_cte_is_not_a_semantic_authority_gate() -> None:
+    sql = (
+        "WITH scoped_ratings AS ("
+        "SELECT o.id, r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+        ") SELECT scoped_ratings.score FROM scoped_ratings"
+    )
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_multiple_reachable_physical_cte_scopes_are_not_a_semantic_authority_gate() -> None:
+    sql = (
+        "WITH preserved_ratings AS ("
+        "SELECT o.id, r.score FROM organizations o "
+        "LEFT JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+        "), narrowed_ratings AS ("
+        "SELECT o.id, r.score FROM organizations o "
+        "INNER JOIN ratings r ON o.id = r.organization_id "
+        "WHERE o.is_active = TRUE"
+        ") SELECT narrowed_ratings.score FROM narrowed_ratings "
+        "JOIN preserved_ratings ON narrowed_ratings.id = preserved_ratings.id"
+    )
+    state, _, check_input = _row_preservation_case(sql, qualifying_filter=True)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_vertical_attribute_join_shape_is_not_a_semantic_authority_gate() -> None:
+    case = build_vertical_case(
+        "SELECT v.value FROM customers AS c "
+        "JOIN attribute_values AS v ON c.id = v.attribute_id "
+        "JOIN attributes AS a ON a.id = v.customer_id "
+        "WHERE a.name = 'membership_level' AND v.value = 'premium'"
+    )
+
+    result = _evaluate(case)
+
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
 def test_row_preservation_rejects_forged_requirements_even_with_new_digest() -> None:
     sql = (
         "SELECT r.score FROM organizations o "
@@ -1288,7 +1429,22 @@ def test_row_preservation_rejects_forged_requirements_even_with_new_digest() -> 
         "WHERE o.is_active = TRUE"
     )
     state, requirements, _ = _row_preservation_case(sql, qualifying_filter=True)
-    unsigned = requirements.model_copy(update={"row_preservation_requirements": ()})
+    path = state.join_candidates[0].path
+    unsigned = requirements.model_copy(
+        update={
+            "row_preservation_requirements": (
+                RowPreservationRequirement(
+                    base_table=column("organizations", "id").table,
+                    related_table=column("ratings", "score").table,
+                    related_source_ids=("rating",),
+                    related_binding_ids=("binding-rating",),
+                    effective_join_path=(
+                        path[0].model_copy(update={"join_type": JoinType.LEFT}),
+                    ),
+                ),
+            )
+        }
+    )
     payload = unsigned.model_dump(mode="python")
     payload["requirements_digest"] = requirements_digest(unsigned)
     forged = CoverageRequirements.model_validate(payload)
@@ -1745,7 +1901,7 @@ def test_explicit_formula_allows_its_conditional_literal() -> None:
         required=True,
         operator=None,
         literal_or_reference=None,
-        status=SemanticItemStatus.UNRESOLVED,
+        status=SemanticItemStatus.RESOLVED,
         binding_ids=(),
     )
     state = state.model_copy(

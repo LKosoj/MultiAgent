@@ -494,6 +494,7 @@ def canonical_runtime_environment(
         "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
         "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
         "TEXT_TO_SQL_LLM_MODELS_PROFILE": resolved_llm_models_profile,
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
     }
     return environment
 

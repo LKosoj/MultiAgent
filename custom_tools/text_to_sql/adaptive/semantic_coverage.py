@@ -55,6 +55,7 @@ from .models import (
     JoinType,
     LiteralValue,
     NonNegativeInt,
+    PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
     ResearchState,
@@ -463,6 +464,12 @@ def _validate_coverage_inputs(
                 bindings_by_id[binding_id],
                 binding_citations[binding_id],
             )
+            or _selected_trusted_formula_contains_exact_predicate_input(
+                item,
+                bindings_by_id[binding_id],
+                required_items,
+                tuple(selected),
+            )
             for binding_id in item.binding_ids
         )
     )
@@ -524,7 +531,18 @@ def _validate_coverage_inputs(
             eligible_joins.append(candidate)
 
     selected_bindings = tuple(
-        sorted(selected, key=lambda binding: (binding.source_id, binding.binding_id))
+        sorted(
+            (
+                binding
+                for binding in selected
+                if _binding_has_generation_authority(
+                    binding,
+                    required_items,
+                    binding_citations[binding.binding_id],
+                )
+            ),
+            key=lambda binding: (binding.source_id, binding.binding_id),
+        )
     )
     protected_join_ids = {
         candidate.join_id
@@ -587,131 +605,7 @@ def _derive_row_preservation_requirements(
     selected_bindings: tuple[Binding, ...],
     eligible_joins: tuple[JoinCandidate, ...],
 ) -> tuple[RowPreservationRequirement, ...]:
-    requested_source_ids = set(query_spec.requested_output_source_ids)
-    bindings_by_source = {
-        source_id: tuple(
-            binding for binding in selected_bindings if binding.source_id == source_id
-        )
-        for source_id in {item.source_id for item in required_items}
-    }
-    qualifying_items = tuple(
-        item
-        for item in required_items
-        if item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
-        or (
-            item.source_id not in requested_source_ids
-            and (
-                item.kind is SemanticItemKind.FORMULA
-                or item.operator is not None
-                or item.literal_or_reference is not None
-            )
-        )
-    )
-    base_tables = {
-        table
-        for item in qualifying_items
-        for binding in bindings_by_source[item.source_id]
-        for table in binding.tables
-    }
-    if len(base_tables) != 1:
-        return ()
-    base_table = next(iter(base_tables))
-    qualifying_tables = {
-        table
-        for item in qualifying_items
-        for binding in bindings_by_source[item.source_id]
-        for table in binding.tables
-    }
-    qualifying_tables.update(
-        table
-        for item in qualifying_items
-        for binding in bindings_by_source[item.source_id]
-        for edge in binding.join_path
-        for table in (edge.left.table, edge.right.table)
-    )
-    grouped: dict[bytes, tuple[TableRef, list[str], list[str]]] = {}
-    for item in required_items:
-        if item.source_id not in requested_source_ids:
-            continue
-        bindings = bindings_by_source[item.source_id]
-        tables = {table for binding in bindings for table in binding.tables}
-        if len(tables) != 1:
-            continue
-        related_table = next(iter(tables))
-        if related_table == base_table or related_table in qualifying_tables:
-            continue
-        key = canonical_json_bytes(related_table)
-        table, source_ids, binding_ids = grouped.setdefault(
-            key, (related_table, [], [])
-        )
-        source_ids.append(item.source_id)
-        binding_ids.extend(binding.binding_id for binding in bindings)
-
-    requirements: list[RowPreservationRequirement] = []
-    for related_table, source_ids, binding_ids in grouped.values():
-        effective_join_path = _unique_effective_left_path(
-            base_table,
-            related_table,
-            eligible_joins,
-        )
-        if effective_join_path is None:
-            continue
-        requirements.append(
-            RowPreservationRequirement(
-                base_table=base_table,
-                related_table=related_table,
-                related_source_ids=tuple(sorted(source_ids)),
-                related_binding_ids=tuple(sorted(binding_ids)),
-                effective_join_path=effective_join_path,
-            )
-        )
-    return tuple(sorted(requirements, key=canonical_json_bytes))
-
-
-def _unique_effective_left_path(
-    base_table: TableRef,
-    related_table: TableRef,
-    eligible_joins: tuple[JoinCandidate, ...],
-) -> tuple[JoinEdge, ...] | None:
-    paths = tuple(
-        path
-        for candidate in eligible_joins
-        if (path := _orient_left_path(candidate.path, base_table, related_table)) is not None
-    )
-    return paths[0] if len(paths) == 1 else None
-
-
-def _orient_left_path(
-    path: tuple[JoinEdge, ...],
-    base_table: TableRef,
-    related_table: TableRef,
-) -> tuple[JoinEdge, ...] | None:
-    remaining = list(path)
-    current = base_table
-    oriented: list[JoinEdge] = []
-    while remaining:
-        choices = [
-            (index, edge, False)
-            for index, edge in enumerate(remaining)
-            if edge.left.table == current
-        ] + [
-            (index, edge, True)
-            for index, edge in enumerate(remaining)
-            if edge.right.table == current
-        ]
-        if len(choices) != 1:
-            return None
-        index, edge, reverse = choices[0]
-        remaining.pop(index)
-        if reverse:
-            edge = edge.model_copy(
-                update={"left": edge.right, "right": edge.left, "join_type": JoinType.LEFT}
-            )
-        else:
-            edge = edge.model_copy(update={"join_type": JoinType.LEFT})
-        oriented.append(edge)
-        current = edge.right.table
-    return tuple(oriented) if current == related_table else None
+    return ()
 
 
 def _shortest_connecting_joins(
@@ -823,6 +717,31 @@ def _shortest_join_path(
     return ()
 
 
+def _selected_trusted_formula_contains_exact_predicate_input(
+    item: SemanticItem,
+    binding: Binding,
+    required_items: tuple[SemanticItem, ...],
+    selected_bindings: tuple[Binding, ...],
+) -> bool:
+    if (
+        item.kind not in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+        or not item.exact_physical_predicate
+        or type(binding) is not PhysicalColumnBinding
+    ):
+        return False
+    required_formula_sources = {
+        candidate.source_id
+        for candidate in required_items
+        if candidate.kind is SemanticItemKind.FORMULA
+    }
+    return any(
+        type(candidate) is DerivedExpressionBinding
+        and candidate.source_id in required_formula_sources
+        and binding.physical_column in candidate.input_columns
+        for candidate in selected_bindings
+    )
+
+
 def _binding_proves_required_predicate(
     item: SemanticItem,
     binding: Binding,
@@ -851,7 +770,7 @@ def _binding_proves_required_predicate(
         (
             item.operator is None
             and not (
-                item.kind is SemanticItemKind.TIME
+                item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
                 and isinstance(binding, DiscriminatorValueBinding)
             )
         )
@@ -884,9 +803,20 @@ def _binding_proves_required_predicate(
             return False
         requirement_matches = predicate_matches(required_predicate, source_predicate)
     if isinstance(binding, DiscriminatorValueBinding):
-        return requirement_matches and all(
-            predicate_has_valid_literal(predicate) for predicate in predicates
-        )
+        try:
+            return requirement_matches and all(
+                predicate_has_exact_value_certificate(predicate, citations)
+                if predicate.operator
+                in {
+                    PredicateOperator.EQ,
+                    PredicateOperator.IN,
+                    PredicateOperator.IS_NULL,
+                }
+                else predicate_has_valid_literal(predicate)
+                for predicate in predicates
+            )
+        except ExactValueCertificateError:
+            return False
     try:
         return requirement_matches and all(
             predicate_has_exact_value_certificate(predicate, citations)
@@ -894,6 +824,28 @@ def _binding_proves_required_predicate(
         )
     except ExactValueCertificateError:
         return False
+
+
+def _binding_has_generation_authority(
+    binding: Binding,
+    required_items: tuple[SemanticItem, ...],
+    citations: tuple[EvidenceRecord, ...],
+) -> bool:
+    if (
+        not isinstance(binding, DiscriminatorValueBinding)
+        or binding.discriminator_predicate.operator
+        not in {
+            PredicateOperator.EQ,
+            PredicateOperator.IN,
+            PredicateOperator.IS_NULL,
+        }
+    ):
+        return True
+    return any(
+        _binding_proves_required_predicate(item, binding, citations)
+        for item in required_items
+        if binding.binding_id in item.binding_ids
+    )
 
 
 def _filter_right_is_valid(

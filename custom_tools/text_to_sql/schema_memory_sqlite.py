@@ -266,7 +266,8 @@ def _approved_semantic_facts_from_probe_fact(
         return ()
     table_ref = target.get("table")
     column = target.get("column")
-    values = payload.get("values")
+    columns = payload.get("columns")
+    rows = payload.get("rows")
     if not isinstance(table_ref, dict) or not isinstance(column, str):
         return ()
     table_parts = [
@@ -274,7 +275,19 @@ def _approved_semantic_facts_from_probe_fact(
         for name in ("namespace", "schema", "table")
         if isinstance(table_ref.get(name), str) and table_ref[name]
     ]
-    if not table_parts or not isinstance(values, list):
+    if (
+        not table_parts
+        or columns != [column]
+        or not isinstance(rows, list)
+        or any(not isinstance(row, list) or len(row) != 1 for row in rows)
+    ):
+        return ()
+    if any(
+        value is not None
+        and not isinstance(value, (str, int, bool))
+        and not (isinstance(value, float) and math.isfinite(value))
+        for (value,) in rows
+    ):
         return ()
     return tuple(
         SemanticFact(
@@ -286,10 +299,7 @@ def _approved_semantic_facts_from_probe_fact(
             source="typed_probe",
             status="approved",
         )
-        for value in values
-        if value is None
-        or isinstance(value, (str, int, bool))
-        or (isinstance(value, float) and math.isfinite(value))
+        for (value,) in rows
     )
 
 
@@ -645,6 +655,7 @@ class SchemaMemoryManager:
     ) -> bool:
         """Fill missing descriptions from the exact persisted schema namespace."""
         from memory.tools import get_memory, memory_requester_context
+        from .schema_loader import SchemaLoader
 
         with memory_requester_context("Schema-RAG-Agent"):
             records = get_memory(
@@ -698,6 +709,23 @@ class SchemaMemoryManager:
                     and description.strip()
                 ):
                     live_column["description"] = description.strip()
+                    changed = True
+                examples = memory_column.get("examples")
+                valid_examples = (
+                    [
+                        value
+                        for value in examples
+                        if SchemaLoader._is_example_value(value)
+                    ]
+                    if isinstance(examples, list)
+                    else []
+                )
+                if (
+                    isinstance(live_column, dict)
+                    and not live_column.get("examples")
+                    and valid_examples
+                ):
+                    live_column["examples"] = valid_examples
                     changed = True
         return changed
 
@@ -1228,6 +1256,7 @@ class SchemaMemoryManager:
           (нет таблиц для индексации) — это штатное "нет данных".
         """
         from memory.tools import save_memory
+        from .schema_loader import SchemaLoader
 
         if not save_memory:
             # Сигнализируем отсутствие memory-стека явно — раньше это
@@ -1285,6 +1314,14 @@ class SchemaMemoryManager:
                             "name": col_name,
                             "type": col_info.get("type", "") if isinstance(col_info, dict) else str(col_info),
                             "description": col_info.get("description", "") if isinstance(col_info, dict) else "",
+                            "examples": [
+                                value
+                                for value in col_info.get("examples", [])
+                                if SchemaLoader._is_example_value(value)
+                            ]
+                            if isinstance(col_info, dict)
+                            and isinstance(col_info.get("examples", []), list)
+                            else [],
                             "not_null": col_info.get("not_null", "") if isinstance(col_info, dict) else "",
                             "default_value": col_info.get("default_value", "") if isinstance(col_info, dict) else "",
                             "constraint_type": col_info.get("constraint_type", "") if isinstance(col_info, dict) else "",

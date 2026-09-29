@@ -25,6 +25,59 @@ from custom_tools.text_to_sql.schema_enricher import (
 )
 
 
+def test_fully_described_schema_samples_missing_examples_without_llm(monkeypatch):
+    monkeypatch.setenv("SCHEMA_DESCRIBE_WITH_LLM", "1")
+    enricher = SchemaEnricher()
+    sample_calls: list[str] = []
+    monkeypatch.setattr(
+        enricher,
+        "get_table_sample_data",
+        lambda table_name: (
+            sample_calls.append(table_name)
+            or {
+                "sample_rows": [
+                    {"record_code": "r-1", "kind": "plain"},
+                    {"record_code": 4, "kind": "plain"},
+                    {"record_code": 3.5, "kind": "plain"},
+                    {"record_code": True, "kind": "plain"},
+                    {"record_code": None, "kind": "plain"},
+                    {"record_code": b"invalid", "kind": "plain"},
+                    {"record_code": {"invalid": "value"}, "kind": "plain"},
+                    {"record_code": ["invalid"], "kind": "plain"},
+                ],
+                "column_stats": {},
+                "fk_previews": {},
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        enricher_module,
+        "call_openai_api",
+        lambda *_args, **_kwargs: pytest.fail("LLM must not run for examples only"),
+    )
+    schema = {
+        "public.records": {
+            "description": "Captured records",
+            "columns": {
+                "record_code": {"description": "Stable code"},
+                "kind": {"description": "Classification", "examples": ["kept"]},
+            },
+        }
+    }
+
+    enricher.enrich_descriptions_with_llm(schema)
+
+    assert sample_calls == ["public.records"]
+    assert schema["public.records"]["columns"]["record_code"]["examples"] == [
+        "r-1",
+        4,
+        3.5,
+        True,
+        None,
+    ]
+    assert schema["public.records"]["columns"]["kind"]["examples"] == ["kept"]
+
+
 # ---------------------------------------------------------------------------
 # 3.28: relative/safe imports работают и monkeypatch-friendly
 # ---------------------------------------------------------------------------

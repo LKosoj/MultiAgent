@@ -7,6 +7,8 @@ from datetime import UTC
 from typing import TypeVar
 
 from pydantic import ValidationError
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError, TokenError
 
 from .freshness import FreshnessContext
 from .models import (
@@ -95,7 +97,125 @@ def disconnected_binding_source_ids(
                 pending.append(neighbor)
     if required_tables.issubset(seen):
         return ()
+    for binding in bindings:
+        if (
+            _independent_aggregate_tables(binding) == required_tables
+            and all(
+                candidate.source_id == binding.source_id
+                or type(candidate) is DiscriminatorValueBinding
+                for candidate in bindings
+            )
+        ):
+            return ()
     return tuple(sorted(binding.source_id for binding in bindings))
+
+
+def _independent_aggregate_tables(binding: Binding) -> frozenset[bytes] | None:
+    if (
+        type(binding) is not DerivedExpressionBinding
+        or binding.status is not BindingStatus.SUPPORTED
+        or binding.join_path
+    ):
+        return None
+    try:
+        parsed = parse(binding.expression.expression)
+    except (ParseError, TokenError, ValueError):
+        return None
+    if len(parsed) != 1:
+        return None
+    aggregate_columns = _arithmetic_aggregate_columns(parsed[0])
+    if (
+        aggregate_columns is None
+        or len(aggregate_columns) != len(binding.input_columns)
+    ):
+        return None
+    tables: list[bytes] = []
+    semantic_columns: dict[tuple[str, str, str, str], bytes] = {}
+    for expression_column, input_column in zip(
+        aggregate_columns, binding.input_columns, strict=True
+    ):
+        if (
+            not expression_column.table
+            or expression_column.name.casefold() != input_column.column.casefold()
+        ):
+            return None
+        if expression_column.db or expression_column.catalog:
+            if (
+                input_column.table.table.casefold()
+                != expression_column.table.casefold()
+                or (
+                    expression_column.db
+                    and (
+                        input_column.table.schema_name is None
+                        or input_column.table.schema_name.casefold()
+                        != expression_column.db.casefold()
+                    )
+                )
+                or (
+                    expression_column.catalog
+                    and input_column.table.namespace.casefold()
+                    != expression_column.catalog.casefold()
+                )
+            ):
+                return None
+        else:
+            exact_candidates = tuple(
+                candidate
+                for candidate in binding.input_columns
+                if candidate.column.casefold() == expression_column.name.casefold()
+                and candidate.table.table.casefold()
+                == expression_column.table.casefold()
+            )
+            if exact_candidates and (
+                len(exact_candidates) != 1 or exact_candidates[0] != input_column
+            ):
+                return None
+        semantic_column = (
+            (expression_column.catalog or "").casefold(),
+            (expression_column.db or "").casefold(),
+            expression_column.table.casefold(),
+            expression_column.name.casefold(),
+        )
+        physical_table = canonical_json_bytes(input_column.table)
+        if semantic_columns.setdefault(semantic_column, physical_table) != physical_table:
+            return None
+        tables.append(physical_table)
+    if len(set(tables)) < 2:
+        return None
+    return frozenset(tables)
+
+
+def _arithmetic_aggregate_columns(
+    expression: exp.Expression,
+) -> tuple[exp.Column, ...] | None:
+    if isinstance(expression, (exp.Add, exp.Sub, exp.Mul, exp.Div)):
+        children = (expression.this, expression.expression)
+    elif isinstance(expression, exp.Anonymous) and expression.name.casefold() in {
+        "add",
+        "subtract",
+        "multiply",
+        "divide",
+    }:
+        children = tuple(expression.expressions)
+        if len(children) != 2:
+            return None
+    elif isinstance(expression, (exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max)):
+        column = expression.this
+        if not isinstance(column, exp.Column) or not column.table:
+            return None
+        return (column,)
+    elif isinstance(expression, exp.Literal) and not expression.is_string:
+        return ()
+    else:
+        return None
+    columns: list[exp.Column] = []
+    for child in children:
+        if child is None or (
+            child_columns := _arithmetic_aggregate_columns(child)
+        ) is None:
+            return None
+        columns.extend(child_columns)
+    return tuple(columns)
 
 
 def derive_coverage_footprint(
@@ -302,8 +422,6 @@ def canonical_join(candidate: JoinCandidate) -> JoinCandidate:
         raise FootprintError("join is not strict") from exc
     if not checked.path or any(type(edge) is not JoinEdge for edge in checked.path):
         raise FootprintError("join path must contain typed edges")
-    if any(edge.join_type is not checked.join_type for edge in checked.path):
-        raise FootprintError("join type contradicts its path")
 
     first = checked.path[0]
     same_table_pair = all(
@@ -311,6 +429,8 @@ def canonical_join(candidate: JoinCandidate) -> JoinCandidate:
         for edge in checked.path
     )
     if same_table_pair:
+        if any(edge.join_type is not checked.join_type for edge in checked.path):
+            raise FootprintError("join type contradicts its path")
         if any(
             edge.left.table != first.left.table or edge.right.table != first.right.table
             for edge in checked.path
@@ -327,6 +447,8 @@ def canonical_join(candidate: JoinCandidate) -> JoinCandidate:
             )
         ):
             raise FootprintError("multi-hop join path is disconnected")
+        if checked.join_type is not checked.path[-1].join_type:
+            raise FootprintError("join type contradicts its path")
         expected_left, expected_right = first.left, checked.path[-1].right
     if checked.left != expected_left or checked.right != expected_right:
         raise FootprintError("join endpoints contradict its path")

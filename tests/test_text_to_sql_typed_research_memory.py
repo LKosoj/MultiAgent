@@ -31,7 +31,10 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     canonical_digest,
     canonical_json_bytes,
 )
-from custom_tools.text_to_sql.schema_loader import LoadedSchema
+from custom_tools.text_to_sql.schema_loader import (
+    LoadedSchema,
+    compute_editable_schema_digest,
+)
 from custom_tools.text_to_sql.schema_namespace import (
     SchemaNamespace,
     SchemaScope,
@@ -151,7 +154,7 @@ def _probe_fact_state(
         ),
         expected_revision=0,
     )
-    payload = {"values": ["revenue"]}
+    payload = {"columns": ["amount"], "rows": [["revenue"]]}
     now = datetime(2026, 8, 13, tzinfo=UTC)
     cost = EvidenceCost(
         wall_clock_ms=1,
@@ -298,6 +301,10 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
         def load_scoped_schema(self, *_args):
             return loaded
 
+        def merge_enriched_schema_metadata(self, dsn, schema):
+            calls.append(("save_dsn_overlay", dsn, schema))
+            return {"enable": True, "schema_info": schema}
+
     class Enricher:
         def enrich_descriptions_with_llm(self, schema, *, dsn=None):
             calls.append(("enrich", schema, dsn))
@@ -306,6 +313,9 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
                 schema["public.revenue"]["columns"]["amount"]["description"]
                 == "Recorded revenue amount"
             )
+            schema["public.revenue"]["columns"]["amount"]["examples"] = [
+                "amount-sample"
+            ]
 
     async def run_research(**kwargs):
         captured.update(kwargs)
@@ -368,6 +378,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     assert calls == [
         ("restore", loaded.namespace, loaded.schema),
         ("enrich", loaded.schema, _runtime(loaded).dsn),
+        ("save_dsn_overlay", _runtime(loaded).dsn, loaded.schema),
         (
             "save_snapshot",
             loaded.namespace.scope,
@@ -376,6 +387,9 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
                 "schema_scope": loaded.namespace.scope.to_mapping(),
                 "schema_fingerprint": loaded.namespace.schema_fingerprint,
                 "schema_info": loaded.schema,
+                "editable_schema_digest": compute_editable_schema_digest(
+                    loaded.schema
+                ),
             },
         ),
         ("ensure", loaded.namespace, loaded.schema),
@@ -392,6 +406,12 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     )
     assert captured["approved_semantic_fact_hints"] == ()
     assert captured["stop_review_model"] is not None
+    assert calls[3][2]["schema_info"]["public.revenue"]["columns"]["amount"][
+        "examples"
+    ] == ["amount-sample"]
+    assert calls[4][2]["public.revenue"]["columns"]["amount"]["examples"] == [
+        "amount-sample"
+    ]
     assert runtime.loaded_schema_digest == canonical_digest(
         {
             "namespace_version": loaded.namespace.version_key,
@@ -435,7 +455,7 @@ def test_verified_probe_fact_extractor_accepts_only_complete_typed_data_probes()
                 "column": "amount",
             },
             "parameters": [["limit", 1]],
-            "payload": {"values": ["revenue"]},
+            "payload": {"columns": ["amount"], "rows": [["revenue"]]},
         }
     ]
     assert _verified_probe_facts(
@@ -524,7 +544,7 @@ def test_verified_column_value_probe_is_promoted_to_an_approved_semantic_fact(
     ]
 
 
-def test_probe_promotion_ignores_non_finite_example_values() -> None:
+def test_probe_promotion_rejects_payload_with_non_finite_example_value() -> None:
     from custom_tools.text_to_sql.schema_memory_sqlite import (
         _approved_semantic_facts_from_probe_fact,
     )
@@ -536,11 +556,33 @@ def test_probe_promotion_ignores_non_finite_example_values() -> None:
                 "table": {"namespace": "public", "schema": None, "table": "revenue"},
                 "column": "amount",
             },
-            "payload": {"values": [1.0, float("nan"), float("inf"), -float("inf")]},
+            "payload": {
+                "columns": ["amount"],
+                "rows": [[1.0], [float("nan")], [float("inf")], [-float("inf")]],
+            },
         }
     )
 
-    assert [fact.value for fact in facts] == [1.0]
+    assert facts == ()
+
+
+def test_probe_promotion_rejects_multi_column_payload() -> None:
+    from custom_tools.text_to_sql.schema_memory_sqlite import (
+        _approved_semantic_facts_from_probe_fact,
+    )
+
+    facts = _approved_semantic_facts_from_probe_fact(
+        {
+            "probe_kind": "search_value",
+            "target": {
+                "table": {"namespace": "public", "schema": None, "table": "revenue"},
+                "column": "amount",
+            },
+            "payload": {"columns": ["amount", "currency"], "rows": [[1.0, "RUB"]]},
+        }
+    )
+
+    assert facts == ()
 
 
 def test_non_promotable_probe_does_not_replace_file_semantic_facts(
@@ -664,6 +706,9 @@ def test_typed_research_merges_dsn_glossary_after_snapshot_and_persists_facts(
 
         def load_scoped_schema(self, *_args):
             return loaded
+
+        def merge_enriched_schema_metadata(self, _dsn, schema):
+            return {"enable": True, "schema_info": schema}
 
     class Enricher:
         def enrich_descriptions_with_llm(self, schema, *, dsn=None):

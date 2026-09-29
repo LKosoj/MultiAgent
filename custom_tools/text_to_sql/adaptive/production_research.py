@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +20,7 @@ from workflow.adaptive_state_store import (
 from workflow.deadline import DeadlineBudget
 
 from ..schema_loader import LoadedSchema
+from ..utils import get_table_columns
 from ..schema_memory import SemanticFact
 from ..schema_metadata import get_foreign_key_constraints
 from ..schema_namespace import SchemaScope
@@ -64,6 +66,7 @@ from .research_loop import (
     ResearchLoopOutcome,
     _exact_document_formula_continuation_source_ids,
     _formula_part,
+    _normalize_formula_whitespace,
     _runtime_exact_formula_continuation_source_ids,
     _state_with_reconciled_model_budget,
 )
@@ -92,7 +95,7 @@ from .tool_registry import AdaptiveResearchToolContext, AdaptiveResearchToolRegi
 logger = logging.getLogger(__name__)
 
 
-_MAX_SCHEMA_RESEARCH_PROMPT_BYTES = 65_536
+_MAX_SCHEMA_RESEARCH_PROMPT_BYTES = 131_072
 
 
 class ProductionResearchAssemblyError(RuntimeError):
@@ -129,6 +132,9 @@ class ProductionResearchAssembly:
     is_cancelled: Callable[[], bool]
     semantic_repair_continuation: bool
     exact_formula_documents: tuple[tuple[str, DocumentRef], ...]
+    exact_formula_predicate_constraints: tuple[
+        tuple[str, DocumentRef, str, str], ...
+    ] = ()
     stop_review_model: SchemaResearchDecisionModel | None = None
 
     def loop_arguments(self) -> dict[str, object]:
@@ -150,6 +156,7 @@ class ProductionResearchAssembly:
             "is_cancelled": self.is_cancelled,
             "semantic_repair_continuation": self.semantic_repair_continuation,
             "exact_formula_documents": self.exact_formula_documents,
+            "exact_formula_predicate_constraints": self.exact_formula_predicate_constraints,
             "stop_review_model": self.stop_review_model,
         }
 
@@ -196,16 +203,194 @@ def _exact_formula_documents(
         if not item.required or item.kind is not SemanticItemKind.FORMULA:
             continue
         formula = _formula_part(item.normalized_meaning)
-        if formula is None:
+        if formula is None or not _has_one_root_formula(formula):
             continue
         document_matches = tuple(
             DocumentRef(document_id=document.document_id, namespace=document.namespace)
             for document in documents
-            if formula in "".join(document.content.split())
+            if formula in _normalize_formula_whitespace(document.content)
         )
         if len(document_matches) == 1:
             matches.append((item.source_id, document_matches[0]))
     return tuple(sorted(matches, key=lambda item: item[0]))
+
+
+def _balanced_aggregate_fragments(formula: str) -> tuple[str, ...]:
+    fragments: list[str] = []
+    for match in re.finditer(r"\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(", formula, re.I):
+        depth = 0
+        quote: str | None = None
+        index = match.end() - 1
+        while index < len(formula):
+            character = formula[index]
+            if quote is not None:
+                if character == quote:
+                    if index + 1 < len(formula) and formula[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+            elif character in {"'", '"'}:
+                quote = character
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    fragments.append(formula[match.start() : index + 1])
+                    break
+            index += 1
+    return tuple(fragments)
+
+
+def _formula_prefix(text: str) -> str:
+    """Keep formula siblings before a prose explanation delimiter."""
+
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if quote is not None:
+            if character == quote:
+                if index + 1 < len(text) and text[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == ";":
+            return text[:index]
+        index += 1
+    return text
+
+
+def _exact_formula_predicate_constraints(
+    state: ResearchState,
+    documents: tuple[SchemaEvidenceDocument, ...],
+    loaded_schema: LoadedSchema,
+) -> tuple[tuple[str, DocumentRef, str, str], ...]:
+    exact_formula_documents = dict(_exact_formula_documents(state, documents))
+    known_columns = {
+        column.casefold()
+        for table in loaded_schema.schema.values()
+        if isinstance(table, Mapping)
+        for column in get_table_columns(table)
+    }
+    constraints: list[tuple[str, DocumentRef, str, str]] = []
+    for item in state.query_spec.semantic_items:
+        if (
+            not item.required
+            or item.kind is not SemanticItemKind.FORMULA
+            or (
+                not item.exact_physical_predicate
+                and item.source_id not in exact_formula_documents
+            )
+        ):
+            continue
+        formula = _formula_prefix(item.normalized_meaning)
+        for fragment in _balanced_aggregate_fragments(formula):
+            match = re.search(
+                r"WHERE\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'((?:''|[^'])*)'\s*\)$",
+                fragment,
+                re.I,
+            )
+            if match is None or match.group(1).casefold() not in known_columns:
+                continue
+            normalized_fragment = _normalize_formula_whitespace(fragment)
+            if item.exact_physical_predicate:
+                matching_documents = tuple(
+                    DocumentRef(
+                        document_id=document.document_id,
+                        namespace=document.namespace,
+                    )
+                    for document in documents
+                    if normalized_fragment
+                    in _normalize_formula_whitespace(document.content)
+                )
+            else:
+                matching_documents = (exact_formula_documents[item.source_id],)
+            if len(matching_documents) == 1:
+                constraints.append(
+                    (
+                        item.source_id,
+                        matching_documents[0],
+                        match.group(1),
+                        match.group(2).replace("''", "'"),
+                    )
+                )
+    return tuple(sorted(constraints, key=lambda item: (item[0], item[2], item[3])))
+
+
+def _has_one_root_formula(formula: str) -> bool:
+    """Reject sibling expressions while preserving quoted formula literals."""
+
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(formula):
+        character = formula[index]
+        if quote is not None:
+            if character == quote:
+                if index + 1 < len(formula) and formula[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")" and depth:
+            depth -= 1
+        elif character == "," and depth == 0:
+            return _is_legacy_split_divide_formula(formula, index)
+        index += 1
+    return True
+
+
+def _is_legacy_split_divide_formula(formula: str, separator_index: int) -> bool:
+    """Recognize the legacy ``DIVIDE(numerator), denominator`` formula shape."""
+
+    numerator = formula[:separator_index].strip()
+    denominator = formula[separator_index + 1 :].strip()
+    divide = re.match(r"^DIVIDE\s*\(", numerator, re.IGNORECASE)
+    if divide is None or not denominator or not numerator.endswith(")"):
+        return False
+    depth = 0
+    quote: str | None = None
+    for index, character in enumerate(numerator[divide.end() - 1 :]):
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0 and index != len(numerator[divide.end() - 1 :]) - 1:
+                return False
+        elif character == "," and depth == 1:
+            return False
+        if depth < 0:
+            return False
+    if depth != 0 or quote is not None or not numerator[divide.end() : -1].strip():
+        return False
+    depth = 0
+    quote = None
+    for character in denominator:
+        if quote is not None:
+            if character == quote:
+                quote = None
+        elif character in {"'", '"'}:
+            quote = character
+        elif character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            return False
+        if depth < 0:
+            return False
+    return depth == 0 and quote is None
 
 
 def assemble_production_research(
@@ -270,6 +455,9 @@ def assemble_production_research(
     ):
         raise ProductionResearchAssemblyError("documents differ from captured schema")
     exact_formula_documents = _exact_formula_documents(initial_state, documents)
+    exact_formula_predicate_constraints = _exact_formula_predicate_constraints(
+        initial_state, documents, loaded_schema
+    )
     semantic_repair_continuation = (
         semantic_repair_continuation or bool(exact_formula_documents)
     )
@@ -488,6 +676,7 @@ def assemble_production_research(
         is_cancelled=is_cancelled,
         semantic_repair_continuation=semantic_repair_continuation,
         exact_formula_documents=exact_formula_documents,
+        exact_formula_predicate_constraints=exact_formula_predicate_constraints,
         stop_review_model=stop_review_model,
     )
 
@@ -696,6 +885,7 @@ def _derived_metric_continuation_after_invalid_stop(
 def _required_relationship_continuation_after_invalid_stop(
     state: ResearchState,
     invalid_stop_generation_authority: tuple[CoverageInputErrorCode, tuple[str, ...]],
+    exact_formula_documents: tuple[tuple[str, DocumentRef], ...],
 ) -> dict[str, object] | None:
     """Request ordinary relationship research for resolved disconnected requirements."""
 
@@ -705,6 +895,12 @@ def _required_relationship_continuation_after_invalid_stop(
         or any(
             item.required and item.status is not SemanticItemStatus.RESOLVED
             for item in state.query_spec.semantic_items
+        )
+    ):
+        return None
+    if set(affected_source_ids) & set(
+        _runtime_exact_formula_continuation_source_ids(
+            state, exact_formula_documents
         )
     ):
         return None
@@ -845,7 +1041,7 @@ def _bounded_research_context(
             "affected_source_ids": list(sorted(affected_source_ids)),
         }
         continuation = _required_relationship_continuation_after_invalid_stop(
-            state, invalid_stop_generation_authority
+            state, invalid_stop_generation_authority, exact_formula_documents
         ) or _derived_metric_continuation_after_invalid_stop(
             state, invalid_stop_generation_authority
         )
@@ -873,6 +1069,14 @@ def _bounded_research_context(
         semantic_repair_continuation,
         freshness_context,
         exact_formula_documents,
+    )
+    _add_exact_physical_column_candidates(
+        state_view,
+        context,
+        research_schema,
+        policy,
+        maximum_bytes,
+        fits_prompt,
     )
     if verified_probe_fact_hints:
         included_hints: list[dict[str, object]] = []
@@ -996,6 +1200,7 @@ def _bounded_research_context(
                 if not included_cascade_hints:
                     context.pop("code_label_cascade_hints")
     _refresh_omitted_counts(state_payload, state_view, context)
+    context = _with_model_identifier_handles(context, state)
     encoded = _encode_context(
         research_schema,
         context,
@@ -1008,6 +1213,60 @@ def _bounded_research_context(
             "research state exceeds the model input safety envelope"
         )
     return encoded.decode("utf-8")
+
+
+def _with_model_identifier_handles(
+    context: dict[str, object],
+    state: ResearchState,
+) -> dict[str, object]:
+    """Replace model-facing source and evidence IDs with deterministic handles."""
+
+    source_ids = tuple(sorted(item.source_id for item in state.query_spec.semantic_items))
+    evidence_ids = tuple(sorted(record.evidence_id for record in state.evidence))
+    source_handles = {value: f"s{index}" for index, value in enumerate(source_ids, 1)}
+    evidence_handles = {value: f"e{index}" for index, value in enumerate(evidence_ids, 1)}
+
+    def source_handle(value: object) -> object:
+        return source_handles.get(value, "unknown_source_handle")
+
+    def evidence_handle(value: object) -> object:
+        return evidence_handles.get(value, "unknown_evidence_handle")
+
+    replacements = {
+        "source_id": ("source_handle", source_handle),
+        "source_ids": ("source_handles", source_handle),
+        "affected_source_ids": ("affected_source_handles", source_handle),
+        "citation_evidence_ids": ("citation_evidence_handles", evidence_handle),
+        "evidence_ids": ("evidence_handles", evidence_handle),
+        "evidence_id": ("evidence_handle", evidence_handle),
+        "existing_evidence_id": ("existing_evidence_handle", evidence_handle),
+        "available_evidence_ids": ("available_evidence_handles", evidence_handle),
+        "unresolved_items": ("unresolved_source_handles", source_handle),
+    }
+
+    def replace(value: object) -> object:
+        if isinstance(value, list):
+            return [replace(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        replaced: dict[str, object] = {}
+        for key, item in value.items():
+            replacement = replacements.get(key)
+            if replacement is None:
+                replaced[key] = replace(item)
+                continue
+            output_key, handler = replacement
+            if isinstance(item, list):
+                replaced[output_key] = [handler(value) for value in item]
+            elif isinstance(item, tuple):
+                replaced[output_key] = [handler(value) for value in item]
+            else:
+                replaced[output_key] = handler(item)
+        return replaced
+
+    transformed = replace(context)
+    assert isinstance(transformed, dict)
+    return transformed
 
 
 _MODEL_VIEW_COLLECTIONS = (
@@ -1100,13 +1359,92 @@ def _model_semantic_item_view(full_payload: dict[str, object]) -> dict[str, obje
             "kind",
             "source_text",
             "normalized_meaning",
+            "exact_physical_predicate",
+            "exact_physical_column_name",
             "operator",
             "literal_or_reference",
             "status",
             "binding_ids",
         )
-        if full_payload[name] is not None
+        if full_payload.get(name) is not None
     }
+
+
+def _add_exact_physical_column_candidates(
+    view: dict[str, object],
+    context: dict[str, object],
+    schema: object,
+    policy: AdaptivePolicyConfig,
+    maximum_bytes: int,
+    fits_prompt: Callable[[bytes], bool],
+) -> None:
+    """Add exact-name schema candidates for semantic items kept in the model view."""
+
+    query_view = view["query_spec"]
+    assert type(query_view) is dict
+    semantic_items = query_view["semantic_items"]
+    assert type(semantic_items) is list
+    if not isinstance(schema, Mapping):
+        return
+    candidates_by_source = sorted(
+        (
+            item
+            for item in semantic_items
+            if isinstance(item, dict)
+            and isinstance(item.get("source_id"), str)
+            and isinstance(item.get("exact_physical_column_name"), str)
+            and item["exact_physical_column_name"]
+        ),
+        key=lambda item: item["source_id"],
+    )
+    if not candidates_by_source:
+        return
+    included_entries: list[dict[str, object]] = []
+    context["exact_physical_column_candidates"] = included_entries
+    tables = sorted(
+        (
+            (table_name, table_body)
+            for table_name, table_body in schema.items()
+            if isinstance(table_name, str) and isinstance(table_body, Mapping)
+        ),
+        key=lambda item: (item[0].casefold(), item[0]),
+    )
+    for item in candidates_by_source:
+        column_name = item["exact_physical_column_name"]
+        assert isinstance(column_name, str)
+        matches: list[dict[str, str]] = []
+        for table_name, table_body in tables:
+            columns = get_table_columns(table_body)
+            if column_name not in columns:
+                continue
+            metadata = columns[column_name]
+            description = (
+                metadata.get("description", "").strip()
+                if isinstance(metadata, Mapping)
+                and isinstance(metadata.get("description", ""), str)
+                else ""
+            )
+            matches.append(
+                {
+                    "table": table_name,
+                    "column": column_name,
+                    "description": description,
+                }
+            )
+        included_entries.append(
+            {
+                "source_id": item["source_id"],
+                "source_text": item["source_text"],
+                "normalized_meaning": item.get("normalized_meaning"),
+                "column": column_name,
+                "candidates": matches,
+            }
+        )
+        if _encode_context(schema, context, policy, maximum_bytes, fits_prompt) is None:
+            included_entries.pop()
+            break
+    if not included_entries:
+        context.pop("exact_physical_column_candidates")
 
 
 def _fill_bounded_state_view(
@@ -1534,14 +1872,35 @@ def _truncated_schema_snapshot(
     maximum_bytes: int,
     fits_prompt: Callable[[bytes], bool],
 ) -> dict[str, object]:
-    """Keep a lexical schema prefix; omitted tables remain reachable by probes."""
+    """Keep ranked hint details first; omitted tables remain reachable by probes."""
 
-    table_items = sorted(
+    all_table_items = tuple(
         ((name, body) for name, body in schema.items() if isinstance(name, str)),
-        key=lambda item: (item[0].casefold(), item[0]),
     )
-    if len(table_items) != len(schema):
+    if len(all_table_items) != len(schema):
         raise ProductionResearchAssemblyError("captured schema table names must be text")
+    tables_by_name = dict(all_table_items)
+    hint_names = context.get("semantic_table_hints")
+    ranked_names = tuple(
+        dict.fromkeys(
+            hint
+            for hint in hint_names
+            if isinstance(hint, str) and hint in tables_by_name
+        )
+    ) if isinstance(hint_names, list) else ()
+    table_items = (
+        tuple((name, tables_by_name[name]) for name in ranked_names)
+        + tuple(
+            sorted(
+                (
+                    item
+                    for item in all_table_items
+                    if item[0] not in ranked_names
+                ),
+                key=lambda item: (item[0].casefold(), item[0]),
+            )
+        )
+    )
     snapshot: dict[str, object] = {
         "catalog": [],
         "tables": {},

@@ -254,6 +254,10 @@ class SemanticItem(StrictModel):
         default=False,
         exclude_if=lambda value: value is False,
     )
+    exact_physical_column_name: NonEmptyText | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     exact_formula_binding_id: Id | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
@@ -267,6 +271,19 @@ class SemanticItem(StrictModel):
 
     @model_validator(mode="after")
     def validate_status(self) -> SemanticItem:
+        if self.exact_physical_column_name is not None and (
+            not self.exact_physical_predicate
+            or self.kind
+            not in {
+                SemanticItemKind.FILTER,
+                SemanticItemKind.TIME,
+                SemanticItemKind.FORMULA,
+            }
+            or self.operator is None
+        ):
+            raise ValueError(
+                "exact_physical_column_name requires exact_physical_predicate with an operator"
+            )
         if (
             self.exact_formula_binding_id is not None
             and self.kind is not SemanticItemKind.FORMULA
@@ -363,10 +380,10 @@ class QuerySpec(ContractModel):
                     raise ValueError(
                         "owner_source_id must reference another required DIMENSION"
                     )
-        require_canonical_ids(
-            self.requested_output_source_ids,
-            "QuerySpec requested_output_source_ids",
-        )
+        if len(self.requested_output_source_ids) != len(
+            set(self.requested_output_source_ids)
+        ):
+            raise ValueError("QuerySpec requested_output_source_ids must be unique")
         required_source_ids = {
             item.source_id for item in self.semantic_items if item.required
         }

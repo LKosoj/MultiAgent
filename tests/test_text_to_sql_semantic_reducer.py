@@ -83,6 +83,7 @@ from custom_tools.text_to_sql.adaptive.semantic_reducer import (
     _negative_hypothesis_certificate,
     _physical_column_certificate,
     _discriminator_certificate,
+    _reject_partial_selected_candidate_commit,
     _vertical_certificate,
 )
 
@@ -206,28 +207,30 @@ def _evidence(
     *,
     evidence_id: str,
     truncated: bool = False,
+    expected_revision: int = 0,
+    parameters: tuple[tuple[str, str | int | float | bool | None], ...] = (),
 ):
     digest = canonical_action_digest(
         kind=kind,
         hypothesis_id=None,
         target=target,
-        parameters=(),
-        expected_revision=0,
+        parameters=parameters,
+        expected_revision=expected_revision,
     )
     action = ResearchAction(
         action_id=f"action-{evidence_id}",
         kind=kind,
         hypothesis_id=None,
         target=target,
-        parameters=(),
+        parameters=parameters,
         action_digest=digest,
-        expected_revision=0,
+        expected_revision=expected_revision,
     )
     raw = canonical_json_bytes(payload)
     result = build_probe_result(
         run_id=RUN,
         run_incarnation=INCARNATION,
-        revision=0,
+        revision=expected_revision,
         schema_namespace_version=SCHEMA,
         invocation_id=evidence_id,
         action_digest=digest,
@@ -254,12 +257,18 @@ def _evidence(
     return evidence
 
 
-def _column_evidence(column: ColumnRef, evidence_id: str):
+def _column_evidence(
+    column: ColumnRef,
+    evidence_id: str,
+    *,
+    expected_revision: int = 0,
+):
     return _evidence(
         ResearchActionKind.INSPECT_COLUMN,
         column,
         {"status": "matched", "column": column.model_dump(mode="json", by_alias=True)},
         evidence_id=evidence_id,
+        expected_revision=expected_revision,
     )
 
 
@@ -2028,6 +2037,768 @@ def test_sample_absence_cannot_reject_a_binding() -> None:
         _assess_binding(binding, "contradicted", (sample,), {})
 
 
+@pytest.mark.parametrize(
+    ("old_status", "old_confidence", "old_validator_rule"),
+    (
+        (
+            BindingStatus.SUPPORTED,
+            1.0,
+            "semantic-certificate:v1:discriminator_value",
+        ),
+        (BindingStatus.CANDIDATE, 0.0, None),
+    ),
+)
+def test_certified_categorical_in_recovery_replaces_supported_or_candidate_binding(
+    old_status: BindingStatus,
+    old_confidence: float,
+    old_validator_rule: str | None,
+) -> None:
+    column = _column("catalog", "hue")
+    old_literal = "mist-blue"
+    recovered_literal = "Mist Blue"
+    schema = _column_evidence(
+        column,
+        "hue-schema",
+        expected_revision=0,
+    ).model_copy(update={"revision": 1})
+    empty_search = _evidence(
+        ResearchActionKind.SEARCH_VALUE,
+        column,
+        {"columns": [column.column], "requested_value": old_literal, "rows": []},
+        evidence_id="hue-empty-search",
+        expected_revision=1,
+        parameters=(("value", old_literal),),
+    ).model_copy(update={"revision": 2})
+    distinct = _evidence(
+        ResearchActionKind.DISTINCT_VALUES,
+        column,
+        {
+            "columns": [column.column],
+            "rows": [[recovered_literal], ["distractor-hue"]],
+        },
+        evidence_id="hue-distinct",
+        expected_revision=2,
+    ).model_copy(update={"revision": 3})
+    recovered_search = _evidence(
+        ResearchActionKind.SEARCH_VALUE,
+        column,
+        {
+            "columns": [column.column],
+            "requested_value": recovered_literal,
+            "rows": [[recovered_literal]],
+        },
+        evidence_id="hue-recovered-search",
+        expected_revision=3,
+        parameters=(("value", recovered_literal),),
+    ).model_copy(update={"revision": 4})
+    old = DiscriminatorValueBinding(
+        binding_id="binding:fictional-hue-old",
+        source_id="source-1",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(
+            PredicateRef(
+                left=column,
+                operator=PredicateOperator.IN,
+                right=(old_literal,),
+            ),
+        ),
+        join_path=(),
+        evidence_ids=(schema.evidence_id,),
+        confidence=old_confidence,
+        status=old_status,
+        validator_rule=old_validator_rule,
+        discriminator_column=column,
+        discriminator_predicate=PredicateRef(
+            left=column,
+            operator=PredicateOperator.IN,
+            right=(old_literal,),
+        ),
+    )
+    state = _state()
+    for kind, record, parameters in (
+        (ResearchActionKind.INSPECT_COLUMN, schema, ()),
+        (ResearchActionKind.SEARCH_VALUE, empty_search, (("value", old_literal),)),
+        (ResearchActionKind.DISTINCT_VALUES, distinct, ()),
+        (
+            ResearchActionKind.SEARCH_VALUE,
+            recovered_search,
+            (("value", recovered_literal),),
+        ),
+    ):
+        action = ResearchAction(
+            action_id=f"action-{record.evidence_id}",
+            kind=kind,
+            hypothesis_id=None,
+            target=column,
+            parameters=parameters,
+            action_digest=record.action_digest,
+            expected_revision=state.revision,
+        )
+        state = apply_research_transition(state, action, evidence=(record,)).state
+    source = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "status": (
+                SemanticItemStatus.RESOLVED
+                if old_status is BindingStatus.SUPPORTED
+                else SemanticItemStatus.PARTIALLY_RESOLVED
+            ),
+            "binding_ids": (old.binding_id,),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (source,)}
+            ),
+            "bindings": (old,),
+            "unresolved_items": (
+                ()
+                if old_status is BindingStatus.SUPPORTED
+                else (source.source_id,)
+            ),
+        }
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": old.binding_id,
+                    },
+                    "certificate": "contradicted",
+                    "citation_evidence_ids": (
+                        empty_search.evidence_id,
+                        distinct.evidence_id,
+                        recovered_search.evidence_id,
+                    ),
+                },
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:fictional-hue-recovered",
+                    "source_id": old.source_id,
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "catalog",
+                            "column": "hue",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "catalog", "column": "hue"},
+                            "operator": PredicateOperator.IN,
+                            "right": (recovered_literal,),
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (
+                        schema.evidence_id,
+                        recovered_search.evidence_id,
+                    ),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    with pytest.raises(SemanticReducerError, match="no permitted certificate"):
+        admit_semantic_turn(
+            state,
+            decision.model_copy(update={"proposals": decision.proposals[:1]}),
+            batch=TrustedSemanticBatch(
+                schema_namespace_version=SCHEMA,
+                tables=(),
+                columns=(
+                    ResolvedColumn(
+                        logical_table="catalog",
+                        logical_column="hue",
+                        physical_column=column,
+                    ),
+                ),
+            ),
+            freshness_context=_context(),
+        )
+
+    first_admission = admit_semantic_turn(
+        state,
+        decision,
+        batch=TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(
+                ResolvedColumn(
+                    logical_table="catalog",
+                    logical_column="hue",
+                    physical_column=column,
+                ),
+            ),
+        ),
+        freshness_context=_context(),
+    )
+    first = commit_semantic_turn(first_admission).state
+    recovered = next(
+        binding
+        for binding in first.bindings
+        if binding.binding_id != old.binding_id
+    )
+    second_decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": recovered.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (
+                        schema.evidence_id,
+                        recovered_search.evidence_id,
+                    ),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+    second = commit_semantic_turn(
+        admit_semantic_turn(
+            first,
+            second_decision,
+            batch=TrustedSemanticBatch(
+                schema_namespace_version=SCHEMA,
+                tables=(),
+                columns=(
+                    ResolvedColumn(
+                        logical_table="catalog",
+                        logical_column="hue",
+                        physical_column=column,
+                    ),
+                ),
+            ),
+            freshness_context=_context(),
+        )
+    ).state
+
+    assert next(
+        binding for binding in second.bindings if binding.binding_id == old.binding_id
+    ).status is BindingStatus.STALE
+    assert second.revision == state.revision + 2
+    assert [
+        binding.binding_id
+        for binding in second.bindings
+        if binding.source_id == old.source_id and binding.status is BindingStatus.SUPPORTED
+    ] == [recovered.binding_id]
+
+
+def test_certified_categorical_in_recovery_stales_equivalent_supported_bindings() -> None:
+    column = _column("catalog", "hue")
+    old_literal = "mist-blue"
+    recovered_literal = "Mist Blue"
+    schema = _column_evidence(
+        column,
+        "hue-schema",
+        expected_revision=0,
+    ).model_copy(update={"revision": 1})
+    empty_search = _evidence(
+        ResearchActionKind.SEARCH_VALUE,
+        column,
+        {"columns": [column.column], "requested_value": old_literal, "rows": []},
+        evidence_id="hue-empty-search",
+        expected_revision=1,
+        parameters=(("value", old_literal),),
+    ).model_copy(update={"revision": 2})
+    distinct = _evidence(
+        ResearchActionKind.DISTINCT_VALUES,
+        column,
+        {
+            "columns": [column.column],
+            "rows": [[recovered_literal], ["distractor-hue"]],
+        },
+        evidence_id="hue-distinct",
+        expected_revision=2,
+    ).model_copy(update={"revision": 3})
+    recovered_search = _evidence(
+        ResearchActionKind.SEARCH_VALUE,
+        column,
+        {
+            "columns": [column.column],
+            "requested_value": recovered_literal,
+            "rows": [[recovered_literal]],
+        },
+        evidence_id="hue-recovered-search",
+        expected_revision=3,
+        parameters=(("value", recovered_literal),),
+    ).model_copy(update={"revision": 4})
+    old = DiscriminatorValueBinding(
+        binding_id="binding:fictional-hue-old",
+        source_id="source-1",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(
+            PredicateRef(
+                left=column,
+                operator=PredicateOperator.IN,
+                right=(old_literal,),
+            ),
+        ),
+        join_path=(),
+        evidence_ids=(schema.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:discriminator_value",
+        discriminator_column=column,
+        discriminator_predicate=PredicateRef(
+            left=column,
+            operator=PredicateOperator.IN,
+            right=(old_literal,),
+        ),
+    )
+    peer = old.model_copy(update={"binding_id": "binding:fictional-hue-peer"})
+    non_equivalent_predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.IN,
+        right=("other-hue",),
+    )
+    non_equivalent = old.model_copy(
+        update={
+            "binding_id": "binding:fictional-hue-non-equivalent",
+            "predicates": (non_equivalent_predicate,),
+            "discriminator_predicate": non_equivalent_predicate,
+        }
+    )
+    state = _state()
+    for kind, record, parameters in (
+        (ResearchActionKind.INSPECT_COLUMN, schema, ()),
+        (ResearchActionKind.SEARCH_VALUE, empty_search, (("value", old_literal),)),
+        (ResearchActionKind.DISTINCT_VALUES, distinct, ()),
+        (
+            ResearchActionKind.SEARCH_VALUE,
+            recovered_search,
+            (("value", recovered_literal),),
+        ),
+    ):
+        action = ResearchAction(
+            action_id=f"action-{record.evidence_id}",
+            kind=kind,
+            hypothesis_id=None,
+            target=column,
+            parameters=parameters,
+            action_digest=record.action_digest,
+            expected_revision=state.revision,
+        )
+        state = apply_research_transition(state, action, evidence=(record,)).state
+    source = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "status": SemanticItemStatus.RESOLVED,
+            "binding_ids": (old.binding_id, peer.binding_id),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (source,)}
+            ),
+            "bindings": (old, peer),
+            "unresolved_items": (),
+        }
+    )
+    recovery_evidence_ids = (
+        distinct.evidence_id,
+        empty_search.evidence_id,
+        recovered_search.evidence_id,
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": old.binding_id,
+                    },
+                    "certificate": "contradicted",
+                    "citation_evidence_ids": recovery_evidence_ids,
+                },
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:fictional-hue-recovered",
+                    "source_id": old.source_id,
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "catalog",
+                            "column": "hue",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "catalog", "column": "hue"},
+                            "operator": PredicateOperator.IN,
+                            "right": (recovered_literal,),
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (
+                        schema.evidence_id,
+                        recovered_search.evidence_id,
+                    ),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+    batch = TrustedSemanticBatch(
+        schema_namespace_version=SCHEMA,
+        tables=(),
+        columns=(
+            ResolvedColumn(
+                logical_table="catalog",
+                logical_column="hue",
+                physical_column=column,
+            ),
+        ),
+    )
+
+    non_equivalent_source = source.model_copy(
+        update={"binding_ids": (non_equivalent.binding_id, old.binding_id)}
+    )
+    non_equivalent_state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (non_equivalent_source,)}
+            ),
+            "bindings": (old, non_equivalent),
+        }
+    )
+    non_equivalent_first = commit_semantic_turn(
+        admit_semantic_turn(
+            non_equivalent_state,
+            decision,
+            batch=batch,
+            freshness_context=_context(),
+        )
+    ).state
+    assert next(
+        binding
+        for binding in non_equivalent_first.bindings
+        if binding.binding_id == non_equivalent.binding_id
+    ).status is BindingStatus.SUPPORTED
+    assert non_equivalent_first.query_spec.semantic_items[0].status is (
+        SemanticItemStatus.RESOLVED
+    )
+
+    first = commit_semantic_turn(
+        admit_semantic_turn(
+            state,
+            decision,
+            batch=batch,
+            freshness_context=_context(),
+        )
+    ).state
+    recovered = next(
+        binding
+        for binding in first.bindings
+        if binding.binding_id not in {old.binding_id, peer.binding_id}
+    )
+
+    assert all(
+        next(
+            binding
+            for binding in first.bindings
+            if binding.binding_id == binding_id
+        ).status
+        is BindingStatus.STALE
+        for binding_id in (old.binding_id, peer.binding_id)
+    )
+    peer_after = next(
+        binding for binding in first.bindings if binding.binding_id == peer.binding_id
+    )
+    assert peer_after.evidence_ids == (*peer.evidence_ids, *recovery_evidence_ids)
+    assert recovered.status is BindingStatus.CANDIDATE
+    first_source = first.query_spec.semantic_items[0]
+    assert first_source.status is SemanticItemStatus.PARTIALLY_RESOLVED
+    assert first_source.binding_ids == (recovered.binding_id,)
+
+    second = commit_semantic_turn(
+        admit_semantic_turn(
+            first,
+            ResearchDecisionV1.model_validate(
+                {
+                    "decision_version": 1,
+                    "proposals": (
+                        {
+                            "proposal_type": "binding_assessment",
+                            "subject": {
+                                "reference_kind": "existing",
+                                "binding_id": recovered.binding_id,
+                            },
+                            "certificate": "consistent",
+                            "citation_evidence_ids": (
+                                schema.evidence_id,
+                                recovered_search.evidence_id,
+                            ),
+                        },
+                    ),
+                    "next": {"next_kind": "semantic_commit"},
+                }
+            ),
+            batch=batch,
+            freshness_context=_context(),
+        )
+    ).state
+
+    assert [
+        binding.binding_id
+        for binding in second.bindings
+        if binding.source_id == old.source_id
+        and binding.status is BindingStatus.SUPPORTED
+    ] == [recovered.binding_id]
+
+
+@pytest.mark.parametrize(
+    "split_complete_distinct",
+    (False, True),
+    ids=("one_complete_record", "separate_complete_records"),
+)
+def test_certified_categorical_in_recovery_replaces_multi_literal_binding(
+    split_complete_distinct: bool,
+) -> None:
+    column = _column("catalog", "hue")
+    old_literals = ("mist-blue", "storm-grey")
+    recovered_literals = ("Mist Blue", "Storm Grey")
+    schema = _column_evidence(
+        column,
+        "hue-schema",
+        expected_revision=0,
+    ).model_copy(update={"revision": 1})
+    empty_searches = tuple(
+        _evidence(
+            ResearchActionKind.SEARCH_VALUE,
+            column,
+            {"columns": [column.column], "requested_value": literal, "rows": []},
+            evidence_id=f"hue-empty-search-{index}",
+            expected_revision=index + 1,
+            parameters=(("value", literal),),
+        ).model_copy(update={"revision": index + 2})
+        for index, literal in enumerate(old_literals)
+    )
+    distinct_records = (
+        (
+            _evidence(
+                ResearchActionKind.DISTINCT_VALUES,
+                column,
+                {
+                    "columns": [column.column],
+                    "rows": [[recovered_literals[0]]],
+                },
+                evidence_id="hue-distinct-first",
+                expected_revision=3,
+                parameters=(("top_k", 2),),
+            ).model_copy(update={"revision": 4}),
+            _evidence(
+                ResearchActionKind.DISTINCT_VALUES,
+                column,
+                {
+                    "columns": [column.column],
+                    "rows": [[recovered_literals[1]]],
+                },
+                evidence_id="hue-distinct-second",
+                expected_revision=4,
+                parameters=(("top_k", 3),),
+            ).model_copy(update={"revision": 5}),
+        )
+        if split_complete_distinct
+        else (
+            _evidence(
+                ResearchActionKind.DISTINCT_VALUES,
+                column,
+                {
+                    "columns": [column.column],
+                    "rows": [
+                        [recovered_literals[0]],
+                        [recovered_literals[1]],
+                        ["distractor-hue"],
+                    ],
+                },
+                evidence_id="hue-distinct",
+                expected_revision=3,
+            ).model_copy(update={"revision": 4}),
+        )
+    )
+    distinct_parameters = (
+        (("top_k", 2),),
+        (("top_k", 3),),
+    ) if split_complete_distinct else ((),)
+    recovered_searches = tuple(
+        _evidence(
+            ResearchActionKind.SEARCH_VALUE,
+            column,
+            {
+                "columns": [column.column],
+                "requested_value": literal,
+                "rows": [[literal]],
+            },
+            evidence_id=f"hue-recovered-search-{index}",
+            expected_revision=index + 3 + len(distinct_records),
+            parameters=(("value", literal),),
+        ).model_copy(update={"revision": index + 4 + len(distinct_records)})
+        for index, literal in enumerate(recovered_literals)
+    )
+    old = DiscriminatorValueBinding(
+        binding_id="binding:fictional-hue-old",
+        source_id="source-1",
+        tables=(column.table,),
+        columns=(column,),
+        predicates=(
+            PredicateRef(
+                left=column,
+                operator=PredicateOperator.IN,
+                right=old_literals,
+            ),
+        ),
+        join_path=(),
+        evidence_ids=(schema.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:discriminator_value",
+        discriminator_column=column,
+        discriminator_predicate=PredicateRef(
+            left=column,
+            operator=PredicateOperator.IN,
+            right=old_literals,
+        ),
+    )
+    state = _state()
+    for kind, record, parameters in (
+        (ResearchActionKind.INSPECT_COLUMN, schema, ()),
+        *(
+            (ResearchActionKind.SEARCH_VALUE, record, (("value", literal),))
+            for literal, record in zip(old_literals, empty_searches, strict=True)
+        ),
+        *(
+            (ResearchActionKind.DISTINCT_VALUES, record, parameters)
+            for record, parameters in zip(
+                distinct_records, distinct_parameters, strict=True
+            )
+        ),
+        *(
+            (ResearchActionKind.SEARCH_VALUE, record, (("value", literal),))
+            for literal, record in zip(
+                recovered_literals, recovered_searches, strict=True
+            )
+        ),
+    ):
+        action = ResearchAction(
+            action_id=f"action-{record.evidence_id}",
+            kind=kind,
+            hypothesis_id=None,
+            target=column,
+            parameters=parameters,
+            action_digest=record.action_digest,
+            expected_revision=state.revision,
+        )
+        state = apply_research_transition(state, action, evidence=(record,)).state
+    source = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "status": SemanticItemStatus.RESOLVED,
+            "binding_ids": (old.binding_id,),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (source,)}
+            ),
+            "bindings": (old,),
+            "unresolved_items": (),
+        }
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": old.binding_id,
+                    },
+                    "certificate": "contradicted",
+                    "citation_evidence_ids": tuple(
+                        record.evidence_id
+                        for record in (
+                            *empty_searches,
+                            *distinct_records,
+                            *recovered_searches,
+                        )
+                    ),
+                },
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:fictional-hue-recovered",
+                    "source_id": old.source_id,
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "catalog",
+                            "column": "hue",
+                        },
+                        "discriminator_predicate": {
+                            "left": {"table": "catalog", "column": "hue"},
+                            "operator": PredicateOperator.IN,
+                            "right": recovered_literals,
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (
+                        schema.evidence_id,
+                        *(record.evidence_id for record in recovered_searches),
+                    ),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    admission_args = {
+        "batch": TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(
+                ResolvedColumn(
+                    logical_table="catalog",
+                    logical_column="hue",
+                    physical_column=column,
+                ),
+            ),
+        ),
+        "freshness_context": _context(),
+    }
+    if split_complete_distinct:
+        with pytest.raises(SemanticReducerError, match="no permitted certificate"):
+            admit_semantic_turn(state, decision, **admission_args)
+        return
+
+    committed = commit_semantic_turn(
+        admit_semantic_turn(
+            state,
+            decision,
+            **admission_args,
+        )
+    ).state
+
+    assert next(
+        binding for binding in committed.bindings if binding.binding_id == old.binding_id
+    ).status is BindingStatus.STALE
+    recovered = next(
+        binding for binding in committed.bindings if binding.binding_id != old.binding_id
+    )
+    assert recovered.status is BindingStatus.CANDIDATE
+    assert recovered.discriminator_predicate.right == recovered_literals
+
+
 def test_join_certificate_requires_exact_declared_ordered_composite_pairs() -> None:
     left_one = _column("parent", "a")
     left_two = _column("parent", "b")
@@ -2188,6 +2959,7 @@ def test_new_discriminator_binding_preserves_researched_physical_predicate() -> 
     semantic_item = state.query_spec.semantic_items[0].model_copy(
         update={
             "exact_physical_predicate": True,
+            "exact_physical_column_name": "recorded_at",
             "operator": PredicateOperator.EQ,
             "literal_or_reference": "2042-03-04",
         }
@@ -2240,6 +3012,7 @@ def test_new_discriminator_binding_preserves_researched_physical_predicate() -> 
                     physical_column=_column("records", "recorded_at"),
                 ),
             ),
+            exact_physical_column_names=(("source-1", "recorded_at"),),
         ),
         freshness_context=_context(),
         tool_claim=TrustedToolClaim(
@@ -2258,6 +3031,241 @@ def test_new_discriminator_binding_preserves_researched_physical_predicate() -> 
         right="2042-03-04%",
     )
     assert binding.predicates[0] == binding.discriminator_predicate
+
+
+def test_exact_physical_column_constraint_rejects_mismatched_discriminator_binding() -> None:
+    state = _state()
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "exact_physical_predicate": True,
+            "exact_physical_column_name": "body_text",
+            "operator": PredicateOperator.EQ,
+            "literal_or_reference": "Curated Label",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (source_item,)}
+            )
+        }
+    )
+    headline = _column("posts", "headline")
+    schema_evidence = _column_evidence(headline, "r2110-schema")
+    schema_action = ResearchAction(
+        action_id="action-r2110-schema",
+        kind=ResearchActionKind.INSPECT_COLUMN,
+        hypothesis_id=None,
+        target=headline,
+        parameters=(),
+        action_digest=canonical_action_digest(
+            kind=ResearchActionKind.INSPECT_COLUMN,
+            hypothesis_id=None,
+            target=headline,
+            parameters=(),
+            expected_revision=state.revision,
+        ),
+        expected_revision=state.revision,
+    )
+    state = apply_research_transition(
+        state, schema_action, evidence=(schema_evidence,)
+    ).state
+    value_evidence = _evidence(
+        ResearchActionKind.SEARCH_VALUE,
+        headline,
+        {"columns": ["headline"], "rows": [["Curated Label"]]},
+        evidence_id="r2110-value",
+        expected_revision=state.revision,
+    )
+    value_action = ResearchAction(
+        action_id="action-r2110-value",
+        kind=ResearchActionKind.SEARCH_VALUE,
+        hypothesis_id=None,
+        target=headline,
+        parameters=(),
+        action_digest=canonical_action_digest(
+            kind=ResearchActionKind.SEARCH_VALUE,
+            hypothesis_id=None,
+            target=headline,
+            parameters=(),
+            expected_revision=state.revision,
+        ),
+        expected_revision=state.revision,
+    )
+    state = apply_research_transition(
+        state, value_action, evidence=(value_evidence,)
+    ).state
+    batch = TrustedSemanticBatch(
+        schema_namespace_version=SCHEMA,
+        tables=(),
+        columns=(
+            ResolvedColumn(
+                logical_table="posts",
+                logical_column="headline",
+                physical_column=headline,
+            ),
+            ResolvedColumn(
+                logical_table="audit_log",
+                logical_column="body_text",
+                physical_column=_column("audit_log", "body_text"),
+            ),
+            ResolvedColumn(
+                logical_table="archived_audit_log",
+                logical_column="body_text",
+                physical_column=_column("archived_audit_log", "body_text"),
+            ),
+        ),
+        exact_physical_column_names=(("source-1", "body_text"),),
+    )
+    wrong_new_binding = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:r2110-headline",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {"table": "posts", "column": "headline"},
+                        "discriminator_predicate": {
+                            "left": {"table": "posts", "column": "headline"},
+                            "operator": PredicateOperator.EQ,
+                            "right": "Curated Label",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": ("r2110-schema", "r2110-value"),
+                },
+            ),
+            "next": _tool_decision().next.model_dump(mode="python"),
+        }
+    )
+
+    with pytest.raises(SemanticReducerError, match="exact physical column"):
+        admit_semantic_turn(
+            state,
+            wrong_new_binding,
+            batch=batch,
+            freshness_context=_context(),
+            tool_claim=TrustedToolClaim(
+                action_id="r2110-next", tool_name="inspect_table", target=_table("posts"), parameters=()
+            ),
+        )
+
+    wrong_candidate = DiscriminatorValueBinding(
+        binding_id="binding-r2110-headline",
+        source_id="source-1",
+        tables=(headline.table,),
+        columns=(headline,),
+        predicates=(
+            PredicateRef(
+                left=headline,
+                operator=PredicateOperator.EQ,
+                right="Curated Label",
+            ),
+        ),
+        join_path=(),
+        evidence_ids=("r2110-schema", "r2110-value"),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=headline,
+        discriminator_predicate=PredicateRef(
+            left=headline,
+            operator=PredicateOperator.EQ,
+            right="Curated Label",
+        ),
+    )
+    candidate_state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (
+                        source_item.model_copy(
+                            update={
+                                "status": SemanticItemStatus.PARTIALLY_RESOLVED,
+                                "binding_ids": (wrong_candidate.binding_id,),
+                            }
+                        ),
+                    )
+                }
+            ),
+            "bindings": (wrong_candidate,),
+        }
+    )
+    assessment = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": wrong_candidate.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": ("r2110-schema", "r2110-value"),
+                },
+            ),
+            "next": _tool_decision().next.model_dump(mode="python"),
+        }
+    )
+
+    with pytest.raises(SemanticReducerError, match="exact physical column"):
+        admit_semantic_turn(
+            candidate_state,
+            assessment,
+            batch=batch,
+            freshness_context=_context(),
+            tool_claim=TrustedToolClaim(
+                action_id="r2110-assessment-next",
+                tool_name="inspect_table",
+                target=_table("posts"),
+                parameters=(),
+            ),
+        )
+
+    accepted = admit_semantic_turn(
+        state,
+        ResearchDecisionV1.model_validate(
+            {
+                "decision_version": 1,
+                "proposals": (
+                    {
+                        "proposal_type": "new_binding",
+                        "proposal_key": "proposal:r2110-body-text",
+                        "source_id": "source-1",
+                        "candidate": {
+                            "kind": "discriminator_value",
+                            "discriminator_column": {
+                                "table": "audit_log",
+                                "column": "body_text",
+                            },
+                            "discriminator_predicate": {
+                                "left": {"table": "audit_log", "column": "body_text"},
+                                "operator": PredicateOperator.EQ,
+                                "right": "Curated Label",
+                            },
+                        },
+                        "join_references": (),
+                        "citation_evidence_ids": ("r2110-schema",),
+                    },
+                ),
+                "next": _tool_decision().next.model_dump(mode="python"),
+            }
+        ),
+        batch=batch,
+        freshness_context=_context(),
+        tool_claim=TrustedToolClaim(
+            action_id="r2110-accepted-next",
+            tool_name="inspect_table",
+            target=_table("audit_log"),
+            parameters=(),
+        ),
+    )
+
+    assert accepted.bindings[0].discriminator_column == _column("audit_log", "body_text")
 
 
 def test_resolved_physical_id_collision_is_rejected_deterministically() -> None:
@@ -2365,3 +3373,264 @@ def test_semantic_commit_prepares_one_action_without_a_probe() -> None:
     assert admission.action.target is None
     assert committed.state.revision == predecessor.revision + 1
     assert committed.transition is not None
+
+
+def _selected_formula_candidates_state(
+    *,
+    detached: bool = False,
+    valid_history: bool = False,
+) -> ResearchState:
+    first = _column("ledger", "first")
+    second = _column("ledger", "second")
+    evidence = (
+        _column_evidence(first, "first-evidence"),
+        _column_evidence(
+            second,
+            "second-evidence",
+            expected_revision=1 if valid_history else 0,
+        ),
+    )
+
+    def binding(column: ColumnRef, binding_id: str, status: BindingStatus) -> PhysicalColumnBinding:
+        return PhysicalColumnBinding(
+            binding_id=binding_id,
+            source_id="formula-1",
+            tables=(column.table,),
+            columns=(column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=(f"{column.column}-evidence",),
+            confidence=1.0 if status is BindingStatus.SUPPORTED else 0.0,
+            status=status,
+            validator_rule=(
+                "semantic-certificate:v1:physical_column"
+                if status is BindingStatus.SUPPORTED
+                else None
+            ),
+            physical_column=column,
+        )
+
+    first_status = BindingStatus.SUPPORTED if detached else BindingStatus.CANDIDATE
+    first_binding = binding(first, "binding-formula-first", first_status)
+    second_binding = binding(second, "binding-formula-second", BindingStatus.CANDIDATE)
+    selected_ids = (first_binding.binding_id,) if detached else (
+        first_binding.binding_id,
+        second_binding.binding_id,
+    )
+    revision = 2 if valid_history else 0
+    query = QuerySpec(
+        run_id=RUN,
+        run_incarnation=INCARNATION,
+        revision=revision,
+        schema_namespace_version=SCHEMA,
+        query_id="query-formula-candidates",
+        original_text="formula",
+        semantic_items=(
+            SemanticItem(
+                source_id="formula-1",
+                kind=SemanticItemKind.FORMULA,
+                source_text="formula",
+                normalized_meaning="first + second",
+                required=True,
+                operator=None,
+                literal_or_reference=None,
+                status=(
+                    SemanticItemStatus.RESOLVED
+                    if detached
+                    else SemanticItemStatus.PARTIALLY_RESOLVED
+                ),
+                binding_ids=selected_ids,
+            ),
+        ),
+        requested_output_source_ids=(),
+        expected_result_shape=ExpectedResultShape.SCALAR,
+        global_constraints=(),
+    )
+    action_history = ()
+    if valid_history:
+        action_history = tuple(
+            ResearchAction(
+                action_id=f"action-{evidence_id}",
+                kind=ResearchActionKind.INSPECT_COLUMN,
+                hypothesis_id=None,
+                target=column,
+                parameters=(),
+                action_digest=canonical_action_digest(
+                    kind=ResearchActionKind.INSPECT_COLUMN,
+                    hypothesis_id=None,
+                    target=column,
+                    parameters=(),
+                    expected_revision=index,
+                ),
+                expected_revision=index,
+            )
+            for index, (column, evidence_id) in enumerate(
+                ((first, "first-evidence"), (second, "second-evidence"))
+            )
+        )
+    return ResearchState(
+        run_id=RUN,
+        run_incarnation=INCARNATION,
+        revision=revision,
+        schema_namespace_version=SCHEMA,
+        query_spec=query,
+        hypotheses=(),
+        evidence=evidence,
+        bindings=(first_binding, second_binding),
+        join_candidates=(),
+        unresolved_items=() if detached else ("formula-1",),
+        action_history=action_history,
+        budget_state=_budget(),
+        stop_reason=None,
+        **(
+            {"result_expectations": ()}
+            if "result_expectations" in ResearchState.model_fields
+            else {}
+        ),
+    )
+
+
+def _assess_formula_candidates_decision(
+    *,
+    semantic_commit: bool,
+    binding_ids: tuple[str, ...] = ("binding-formula-first",),
+) -> ResearchDecisionV1:
+    return ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": tuple(
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (
+                        f"{binding_id.removeprefix('binding-formula-')}-evidence",
+                    ),
+                }
+                for binding_id in binding_ids
+            ),
+            "next": (
+                {"next_kind": "semantic_commit"}
+                if semantic_commit
+                else _tool_decision().next.model_dump(mode="python")
+            ),
+        }
+    )
+
+
+def test_semantic_commit_rejects_partial_selected_candidate_assessment() -> None:
+    with pytest.raises(SemanticReducerError, match="selected candidate.*unassessed"):
+        admit_semantic_turn(
+            _selected_formula_candidates_state(),
+            _assess_formula_candidates_decision(semantic_commit=True),
+            batch=TrustedSemanticBatch(
+                schema_namespace_version=SCHEMA,
+                tables=(),
+                columns=(),
+            ),
+            freshness_context=_context(),
+        )
+
+
+def test_semantic_commit_allows_equivalent_requested_entity_candidates() -> None:
+    state = _selected_formula_candidates_state()
+    column = state.bindings[0].physical_column
+    first = state.bindings[0].model_copy(
+        update={"source_id": "entity-1", "physical_column": column, "columns": (column,)}
+    )
+    second = state.bindings[1].model_copy(
+        update={"source_id": "entity-1", "physical_column": column, "columns": (column,)}
+    )
+    item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "source_id": "entity-1",
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "devices",
+            "normalized_meaning": "device",
+            "binding_ids": (first.binding_id, second.binding_id),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "bindings": (first, second),
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (item,),
+                    "requested_output_source_ids": (item.source_id,),
+                }
+            ),
+        }
+    )
+    decision = _assess_formula_candidates_decision(
+        semantic_commit=True,
+        binding_ids=(second.binding_id,),
+    )
+
+    _reject_partial_selected_candidate_commit(
+        state,
+        decision,
+        {binding.binding_id: binding for binding in state.bindings},
+    )
+
+
+def test_tool_turn_allows_partial_selected_candidate_assessment() -> None:
+    admission = admit_semantic_turn(
+        _selected_formula_candidates_state(),
+        _assess_formula_candidates_decision(semantic_commit=False),
+        batch=TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(),
+        ),
+        freshness_context=_context(),
+        tool_claim=TrustedToolClaim(
+            action_id="formula-candidate-action",
+            tool_name="inspect_table",
+            target=_table("ledger"),
+            parameters=(),
+        ),
+    )
+
+    assert admission.action is not None
+    assert admission.action.kind is ResearchActionKind.INSPECT_TABLE
+
+
+def test_semantic_commit_allows_detached_same_source_candidate() -> None:
+    admission = admit_semantic_turn(
+        _selected_formula_candidates_state(detached=True),
+        _assess_formula_candidates_decision(semantic_commit=True),
+        batch=TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(),
+        ),
+        freshness_context=_context(),
+    )
+
+    assert admission.action is not None
+    assert admission.action.kind is ResearchActionKind.SEMANTIC_COMMIT
+
+
+def test_semantic_commit_promotes_all_selected_candidate_assessments() -> None:
+    admission = admit_semantic_turn(
+        _selected_formula_candidates_state(valid_history=True),
+        _assess_formula_candidates_decision(
+            semantic_commit=True,
+            binding_ids=("binding-formula-first", "binding-formula-second"),
+        ),
+        batch=TrustedSemanticBatch(
+            schema_namespace_version=SCHEMA,
+            tables=(),
+            columns=(),
+        ),
+        freshness_context=_context(),
+    )
+    committed = commit_semantic_turn(admission).state
+
+    assert all(binding.status is BindingStatus.SUPPORTED for binding in committed.bindings)
+    item = committed.query_spec.semantic_items[0]
+    assert item.status is SemanticItemStatus.RESOLVED
+    assert item.binding_ids == ("binding-formula-first", "binding-formula-second")

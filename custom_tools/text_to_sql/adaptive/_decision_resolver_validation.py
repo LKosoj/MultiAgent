@@ -19,6 +19,7 @@ from .research_decision import (
     NewHypothesisProposal,
     ResearchDecisionV1,
     SemanticCommitRequest,
+    StopRequest,
     ToolIntent,
     MAX_RESEARCH_DECISION_BYTES,
 )
@@ -43,11 +44,110 @@ def validate_resolution_inputs(
     registry: AdaptiveResearchToolRegistry,
 ) -> tuple[ResearchState, ResearchDecisionV1]:
     current = _revalidate_state(state)
-    parsed = _revalidate_decision(decision)
+    if not isinstance(decision, ResearchDecisionV1):
+        raise ResolutionInputError("decision must be parsed ResearchDecisionV1")
+    parsed = _revalidate_decision(expand_model_identifier_handles(current, decision))
     _validate_freshness_context(current, freshness_context)
     _validate_registry_schema(current, loaded_schema, registry)
     _validate_state_references(current, parsed, freshness_context)
     return current, parsed
+
+
+def expand_model_identifier_handles(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+) -> ResearchDecisionV1:
+    """Restore short model-facing identifier handles to trusted raw IDs."""
+
+    source_ids = tuple(sorted(item.source_id for item in state.query_spec.semantic_items))
+    evidence_ids = tuple(sorted(record.evidence_id for record in state.evidence))
+    if len(source_ids) != len(set(source_ids)) or len(evidence_ids) != len(set(evidence_ids)):
+        raise ModelDecisionReferenceError("identifier handles are ambiguous")
+    source_handles = {f"s{index}": value for index, value in enumerate(source_ids, 1)}
+    evidence_handles = {
+        f"e{index}": value for index, value in enumerate(evidence_ids, 1)
+    }
+
+    def resolve(
+        handles: tuple[str, ...] | None,
+        mapping: dict[str, str],
+        label: str,
+    ) -> tuple[str, ...] | None:
+        if handles is None:
+            return None
+        if len(handles) != len(set(handles)):
+            raise ModelDecisionReferenceError(f"duplicate {label} handle")
+        try:
+            return tuple(mapping[handle] for handle in handles)
+        except KeyError:
+            raise ModelDecisionReferenceError(f"{label} handle does not exist") from None
+
+    proposals = []
+    changed = False
+    for proposal in decision.proposals:
+        updates: dict[str, object] = {}
+        citation_handles = getattr(proposal, "citation_evidence_handles", None)
+        citation_ids = getattr(proposal, "citation_evidence_ids", None)
+        if citation_handles is not None:
+            if citation_ids is not None:
+                raise ModelDecisionReferenceError("mixed citation handle and raw ID")
+            updates["citation_evidence_ids"] = resolve(
+                citation_handles, evidence_handles, "evidence"
+            )
+            updates["citation_evidence_handles"] = None
+        if isinstance(proposal, NewBindingProposal) and proposal.source_handle is not None:
+            if proposal.source_id is not None:
+                raise ModelDecisionReferenceError("mixed source handle and raw ID")
+            updates["source_id"] = resolve(
+                (proposal.source_handle,), source_handles, "source"
+            )[0]
+            updates["source_handle"] = None
+        if isinstance(proposal, NewHypothesisProposal) and proposal.source_handles is not None:
+            if proposal.source_ids is not None:
+                raise ModelDecisionReferenceError("mixed source handle and raw ID")
+            updates["source_ids"] = resolve(
+                proposal.source_handles, source_handles, "source"
+            )
+            updates["source_handles"] = None
+        if updates:
+            proposal = proposal.model_copy(update=updates)
+            changed = True
+        proposals.append(proposal)
+
+    next_request = decision.next
+    if isinstance(next_request, StopRequest):
+        updates = {}
+        if next_request.source_handles is not None:
+            if next_request.source_ids is not None:
+                raise ModelDecisionReferenceError("mixed source handle and raw ID")
+            updates["source_ids"] = resolve(
+                next_request.source_handles, source_handles, "source"
+            )
+            updates["source_handles"] = None
+        if next_request.citation_evidence_handles is not None:
+            if next_request.citation_evidence_ids is not None:
+                raise ModelDecisionReferenceError("mixed citation handle and raw ID")
+            updates["citation_evidence_ids"] = resolve(
+                next_request.citation_evidence_handles, evidence_handles, "evidence"
+            )
+            updates["citation_evidence_handles"] = None
+            if next_request.ambiguity is not None:
+                updates["ambiguity"] = next_request.ambiguity.model_copy(
+                    update={
+                        "citation_evidence_ids": updates["citation_evidence_ids"],
+                        "citation_evidence_handles": None,
+                    }
+                )
+        elif next_request.ambiguity is not None:
+            updates["ambiguity"] = next_request.ambiguity.model_copy(
+                update={"citation_evidence_handles": None}
+            )
+        if updates:
+            next_request = next_request.model_copy(update=updates)
+            changed = True
+    if not changed:
+        return decision
+    return decision.model_copy(update={"proposals": tuple(proposals), "next": next_request})
 
 
 def _revalidate_state(state: ResearchState) -> ResearchState:

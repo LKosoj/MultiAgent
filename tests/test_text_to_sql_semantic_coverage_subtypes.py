@@ -462,3 +462,25 @@ def test_multi_hop_join_requires_connected_chain_and_outer_endpoints() -> None:
         ("source-a",),
         lambda: _validate(_join_state(disconnected_path, disconnected)),
     )
+
+
+def test_connected_multi_hop_join_uses_its_terminal_join_type() -> None:
+    first = JoinEdge(
+        left=_column("shipments", "order_id"),
+        right=_column("orders", "id"),
+        join_type=JoinType.INNER,
+    )
+    second = JoinEdge(
+        left=_column("orders", "carrier_id"),
+        right=_column("carriers", "id"),
+        join_type=JoinType.LEFT,
+    )
+    path = (first, second)
+    valid = _validated_join(
+        "join-mixed-multi-hop",
+        path,
+        left=first.left,
+        right=second.right,
+    ).model_copy(update={"join_type": JoinType.LEFT})
+
+    assert _validate(_join_state(path, valid)).eligible_validated_joins == (valid,)

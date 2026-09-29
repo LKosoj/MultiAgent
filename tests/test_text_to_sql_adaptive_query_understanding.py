@@ -68,12 +68,79 @@ def test_command_verbs_are_not_requested_output_fields() -> None:
     assert "не считай артикль достаточным признаком" in completeness
 
 
+def test_concrete_category_selection_narrows_the_requested_entities() -> None:
+    expected_rule = (
+        "конкретное значение категории сужает уже явно запрошенные сущности "
+        "и является обязательным невыходным FILTER"
+    )
+    question = "List the devices with the lowest reading and choose amber service tier."
+    document = "amber service tier means service_code = 'AMBER'"
+    initial = build_adaptive_query_understanding_prompt(
+        question,
+        context_documents=(document,),
+    )
+    completeness = build_adaptive_query_completeness_prompt(
+        question,
+        {
+            "expected_result_shape": "rows",
+            "semantic_items": [
+                _model_item(
+                    "dimension",
+                    "devices",
+                    normalized_meaning="devices",
+                    requested_output=True,
+                ),
+                _model_item(
+                    "limit",
+                    "choose",
+                    normalized_meaning="return one device",
+                    literal_or_reference=1,
+                ),
+                _model_item(
+                    "dimension",
+                    "amber service tier",
+                    normalized_meaning="amber service tier",
+                    requested_output=True,
+                ),
+            ],
+        },
+        context_documents=(document,),
+    )
+
+    for prompt in (initial, completeness):
+        assert expected_rule in prompt
+        assert "отдельно просит вернуть атрибут категории или его значение" in prompt
+        assert "не создавай LIMIT из choose/select/pick" in prompt
+        assert "явно просит одну сущность, top N или отдельный tie-break" in prompt
+
+    assert "удали такой LIMIT" in completeness
+    assert "замени category requested output" in completeness
+    assert '"normalized_meaning": "return one device"' in completeness
+
+
 def test_adaptive_query_understanding_prompt_defines_owner_ordinal_indexing() -> None:
     prompt = build_adaptive_query_understanding_prompt("What is the entity's code?")
 
     assert "zero-based" in prompt
     assert "first item=0" in prompt
     assert "must not reference itself" in prompt
+
+
+def test_requested_output_prompt_requires_the_item() -> None:
+    expected_rule = (
+        "Если requested_output=true, для того же semantic item всегда ставь "
+        "required=true"
+    )
+    initial = build_adaptive_query_understanding_prompt(
+        "Show the relic label and its ceremonial location."
+    )
+    completeness = build_adaptive_query_completeness_prompt(
+        "Show the relic label and its ceremonial location.",
+        {"expected_result_shape": "rows", "semantic_items": []},
+    )
+
+    assert expected_rule in initial
+    assert expected_rule in completeness
 
 
 def _item(
@@ -90,6 +157,7 @@ def _item(
     requested_output: bool = False,
     owner_item_ordinal: int | None = None,
     exact_physical_predicate: bool = False,
+    exact_physical_column_name: str | None = None,
 ) -> dict[str, object]:
     return {
         "kind": kind,
@@ -99,6 +167,7 @@ def _item(
         "requested_output": requested_output,
         "owner_item_ordinal": owner_item_ordinal,
         "exact_physical_predicate": exact_physical_predicate,
+        "exact_physical_column_name": exact_physical_column_name,
         "operator": operator,
         "literal_or_reference": literal_or_reference,
         "status": status,
@@ -121,6 +190,7 @@ def _model_item(
     requested_output: bool = False,
     owner_item_ordinal: int | None = None,
     exact_physical_predicate: bool = False,
+    exact_physical_column_name: str | None = None,
 ) -> dict[str, object]:
     item: dict[str, object] = {
         "kind": kind,
@@ -130,6 +200,7 @@ def _model_item(
         "requested_output": requested_output,
         "owner_item_ordinal": owner_item_ordinal,
         "exact_physical_predicate": exact_physical_predicate,
+        "exact_physical_column_name": exact_physical_column_name,
         "operator": operator,
         "literal_or_reference": literal_or_reference,
         "status": status,
@@ -236,6 +307,176 @@ def test_query_understanding_persists_exact_physical_predicate() -> None:
 
     assert spec.semantic_items[0].exact_physical_predicate is True
     assert spec.semantic_items[0].model_dump()["exact_physical_predicate"] is True
+    assert spec.semantic_items[0].exact_physical_column_name is None
+
+
+def test_query_understanding_persists_explicit_exact_physical_column_name() -> None:
+    response = _response(
+        _item(
+            "filter",
+            0,
+            0,
+            "curated label",
+            normalized_meaning="curated label",
+            operator="eq",
+            literal_or_reference="Curated Label",
+            exact_physical_predicate=True,
+        )
+    )
+    response["semantic_items"][0]["exact_physical_column_name"] = "body_text"
+
+    spec = understand_query(
+        "List entries with the curated label.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=response,
+    )
+
+    assert spec.semantic_items[0].exact_physical_column_name == "body_text"
+
+
+@pytest.mark.parametrize("column_name", ('"body text"', "Имя поля", "body text"))
+def test_query_understanding_preserves_non_ascii_exact_physical_column_name(
+    column_name: str,
+) -> None:
+    response = _response(
+        _item(
+            "filter",
+            0,
+            0,
+            "curated label",
+            normalized_meaning="curated label",
+            operator="eq",
+            literal_or_reference="Curated Label",
+            exact_physical_predicate=True,
+            exact_physical_column_name=column_name,
+        )
+    )
+
+    spec = understand_query(
+        "List entries with the curated label.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=response,
+    )
+
+    assert spec.semantic_items[0].exact_physical_column_name == column_name
+
+
+def test_query_understanding_rejects_empty_exact_physical_column_name() -> None:
+    response = _response(
+        _item(
+            "filter",
+            0,
+            0,
+            "curated label",
+            normalized_meaning="curated label",
+            operator="eq",
+            literal_or_reference="Curated Label",
+            exact_physical_predicate=True,
+        )
+    )
+    response["semantic_items"][0]["exact_physical_column_name"] = ""
+
+    with pytest.raises(QueryUnderstandingDecodeError, match="non-empty"):
+        understand_query(
+            "List entries with the curated label.",
+            run_id=RUN_ID,
+            run_incarnation=INCARNATION,
+            response=response,
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "exact_physical_predicate", "operator"),
+    (
+        ("filter", False, "eq"),
+        ("time", True, None),
+    ),
+)
+def test_query_understanding_rejects_exact_physical_column_name_without_valid_exact_predicate(
+    kind: str,
+    exact_physical_predicate: bool,
+    operator: str | None,
+) -> None:
+    response = _response(
+        _item(
+            kind,
+            0,
+            0,
+            "curated label",
+            normalized_meaning="curated label",
+            operator=operator,
+            literal_or_reference="Curated Label" if operator is not None else None,
+            exact_physical_predicate=exact_physical_predicate,
+            exact_physical_column_name="body_text",
+        )
+    )
+
+    with pytest.raises(QueryUnderstandingSemanticError, match="exact_physical_column_name"):
+        understand_query(
+            "List entries with the curated label.",
+            run_id=RUN_ID,
+            run_incarnation=INCARNATION,
+            response=response,
+        )
+
+
+def test_query_understanding_ignores_exact_predicate_metadata_for_dimension() -> None:
+    response = _response(
+        _item(
+            "dimension",
+            0,
+            0,
+            "promotional status",
+            normalized_meaning="is_promotional = 1; whether the item is promotional",
+            operator="eq",
+            literal_or_reference=1,
+            exact_physical_predicate=True,
+            exact_physical_column_name="is_promotional",
+        )
+    )
+
+    spec = understand_query(
+        "State whether the item is promotional.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=response,
+    )
+
+    assert spec.semantic_items[0].kind is SemanticItemKind.DIMENSION
+    assert spec.semantic_items[0].exact_physical_predicate is False
+    assert spec.semantic_items[0].exact_physical_column_name is None
+    assert spec.semantic_items[0].operator is None
+    assert spec.semantic_items[0].literal_or_reference is None
+    assert spec.semantic_items[0].normalized_meaning == "promotional status"
+
+
+def test_query_understanding_ignores_inconsistent_exact_predicate_metadata_for_dimension() -> None:
+    response = _response(
+        _item(
+            "dimension",
+            0,
+            0,
+            "display status",
+            normalized_meaning="synthetic display status",
+            exact_physical_column_name="physical_status_code",
+        )
+    )
+
+    spec = understand_query(
+        "Show the display status.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=response,
+    )
+
+    assert spec.semantic_items[0].kind is SemanticItemKind.DIMENSION
+    assert spec.semantic_items[0].exact_physical_predicate is False
+    assert spec.semantic_items[0].exact_physical_column_name is None
+    assert spec.semantic_items[0].operator is None
+    assert spec.semantic_items[0].literal_or_reference is None
+    assert spec.semantic_items[0].normalized_meaning == "display status"
 
 
 def test_query_understanding_maps_owner_ordinal_to_stable_source_id() -> None:
@@ -331,6 +572,39 @@ def test_query_understanding_normalizes_owner_ordinal_for_non_output() -> None:
     items = {item.source_text: item for item in spec.semantic_items}
     assert items["activity total"].owner_source_id is None
     assert items["activity ratio"].owner_source_id == items["account"].source_id
+
+
+def test_query_understanding_ignores_owner_ordinal_to_non_dimension() -> None:
+    total = _item(
+        "metric",
+        0,
+        0,
+        "total active notices",
+        normalized_meaning="total active notices",
+        requested_output=True,
+    )
+    region = _item("dimension", 0, 0, "region", normalized_meaning="region")
+    grouped_total = _item(
+        "metric",
+        0,
+        0,
+        "active notices per region",
+        normalized_meaning="active notice count for each region",
+        requested_output=True,
+        owner_item_ordinal=0,
+    )
+
+    spec = understand_query(
+        "How many active notices are there, and how many are there for each region?",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=_response(total, region, grouped_total, shape="grouped_rows"),
+    )
+
+    items = {item.source_text: item for item in spec.semantic_items}
+    assert items["total active notices"].owner_source_id is None
+    assert items["active notices per region"].owner_source_id is None
+    assert items["region"].required is True
 
 
 @pytest.mark.parametrize("owner_item_ordinal", (True, "0", -1))
@@ -580,6 +854,33 @@ def test_query_understanding_persists_only_requested_output_source_ids() -> None
     assert spec.requested_output_source_ids == expected
 
 
+def test_query_understanding_preserves_nlu_requested_output_order() -> None:
+    spec = understand_query(
+        "Show both labels.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        response=_response(
+            _output_item(
+                "dimension",
+                "north",
+                requested_output=True,
+                normalized_meaning="north label",
+            ),
+            _output_item(
+                "dimension",
+                "south",
+                requested_output=True,
+                normalized_meaning="south label",
+            ),
+        ),
+    )
+
+    source_text_by_id = {item.source_id: item.source_text for item in spec.semantic_items}
+    assert tuple(
+        source_text_by_id[source_id] for source_id in spec.requested_output_source_ids
+    ) == ("north", "south")
+
+
 def test_adaptive_query_understanding_prompt_keeps_entity_nouns_and_formula_restrictions_out_of_filters() -> None:
     from custom_tools.text_to_sql.prompts import build_adaptive_query_understanding_prompt
 
@@ -606,6 +907,43 @@ def test_adaptive_query_understanding_prompt_decodes_sql_escaped_string_literals
         "В строковом SQL-литерале декодируй удвоенный апостроф один раз: "
         "'O''Brien' означает O'Brien; не сохраняй два апострофа."
     ) in prompt
+
+
+def test_adaptive_query_prompts_preserve_punctuation_inside_paired_user_quotes() -> None:
+    question = 'Show notifications with status "Verified!"?'
+    initial = {"expected_result_shape": "rows", "semantic_items": []}
+    rule = (
+        "Строковое значение внутри парных пользовательских кавычек копируй в "
+        "literal_or_reference посимвольно: конечная пунктуация внутри кавычек "
+        "остаётся частью значения, а пунктуация после закрывающей кавычки — нет."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert json.dumps(question, ensure_ascii=False) in prompt
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_preserve_universal_root_qualification_for_per_child_count() -> None:
+    question = "Which account has only one audit entry per invoice?"
+    child_pairs_question = "List each invoice and audit entry pair with only one entry."
+    initial = {"expected_result_shape": "rows", "semantic_items": []}
+    rule = (
+        "Когда вопрос запрашивает корневую сущность и условие «только один/only one» задано "
+        "per/for each child, сохрани обязательную FORMULA: корневая сущность проходит только "
+        "если count выполняется для каждой наблюдаемой группы (root, child); child остаётся "
+        "обязательным невыходным DIMENSION уровня расчёта. Если вопрос явно просит child pairs, "
+        "не создавай такую root qualification."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+        build_adaptive_query_understanding_prompt(child_pairs_question),
+    ):
+        assert rule in prompt
 
 
 def test_adaptive_query_understanding_prompt_preserves_container_pronoun_scope() -> None:
@@ -690,6 +1028,53 @@ def test_adaptive_query_prompts_keep_directly_requested_attributes_as_rows() -> 
         assert rule in prompt
 
 
+def test_adaptive_query_prompts_keep_filter_attributes_out_of_output() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = (
+        "List the account category for entries with a premium status and zero balance."
+    )
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "account category",
+            normalized_meaning="account category",
+            requested_output=True,
+        ),
+        _model_item(
+            "dimension",
+            "premium status",
+            normalized_meaning="premium status",
+            requested_output=True,
+        ),
+        _model_item(
+            "filter",
+            "premium status",
+            normalized_meaning="status is premium",
+            requested_output=False,
+            operator="eq",
+            literal_or_reference="premium",
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Атрибут с конкретным значением, который в вопросе только ограничивает "
+        "отбираемые строки, сохраняй как required FILTER и не добавляй как "
+        "requested_output DIMENSION. Упоминание имени атрибута внутри условия "
+        "само по себе не означает просьбу вывести его; requested_output=true "
+        "требует отдельного явного запроса этого атрибута."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
 def test_adaptive_query_prompts_preserve_explicit_attribute_counts_as_metrics() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -719,11 +1104,57 @@ def test_adaptive_query_prompts_preserve_explicit_attribute_counts_as_metrics() 
         assert exception in prompt
 
 
+def test_adaptive_query_prompts_preserve_explicit_entity_once_counting() -> None:
+    question = "How many accounts have a qualifying event?"
+    document = "Don't compute repetitive accounts from repeated event rows."
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "how many accounts",
+            normalized_meaning="count of accounts with a qualifying event",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "сохрани требование entity-once в normalized_meaning соответствующего "
+        "requested_output METRIC"
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=(document,),
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
+    ):
+        assert rule in prompt
+
+    completeness = build_adaptive_query_completeness_prompt(
+        question,
+        initial,
+        context_documents=(document,),
+    )
+    assert (
+        "Если первоначальный JSON пропустил прямое требование unique, distinct, "
+        "entity-once или равнозначное явное указание считать каждую именованную "
+        "сущность один раз и не учитывать её повторные строки"
+    ) in completeness
+
+
 def test_adaptive_query_prompts_preserve_exact_documented_join_row_count_formula() -> None:
     question = "What percentage of distinct accounts have qualifying events?"
     document = (
         "Exact formula: DIVIDE(COUNT(record_id WHERE qualifying), COUNT(record_id))*100; "
         "both counts use the same qualifying event-row scope."
+    )
+    quoted_semicolon_document = (
+        "Exact formula: SUBTRACT(SUM(CASE WHEN marker = 'A;B' THEN accepted_amount "
+        "ELSE 0 END), SUM(reversed_amount)); explanation follows the formula."
     )
     initial = _model_response(
         _model_item(
@@ -743,18 +1174,405 @@ def test_adaptive_query_prompts_preserve_exact_documented_join_row_count_formula
         "прямо требует его; unique, distinct или entity-once применяй только когда "
         "пользовательский вопрос или document прямо требует это."
     )
+    verbatim_rule = (
+        "Когда доверенный context document содержит exact FORMULA, normalized_meaning "
+        "required FORMULA должен начинаться с этой exact FORMULA дословно, кроме "
+        "узко разрешённых ниже нормализаций однозначно понимаемого неизвестного "
+            "имени операции, literal, конфликтующего с единственным прямым mapping, "
+            "или арифметического expansion, противоречащего однозначной процентной "
+            "фразе вопроса, или оператора сравнения, противоречащего однозначной "
+            "числовой границе вопроса, или якоря текущей даты в формуле возраста, "
+            "противоречащего однозначному историческому контексту события из вопроса, "
+            "когда вопрос прямо не просит текущий возраст; "
+        "пояснение "
+        "допустимо только после верхнеуровневого `;`; `;` внутри строкового literal "
+        "остаётся частью FORMULA, а тире, двоеточие или свободный текст не начинают "
+        "пояснение. Если exact FORMULA нет, сохраняй понятийное описание запрошенного "
+        "вычисления."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question, context_documents=(document, quoted_semicolon_document)
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document, quoted_semicolon_document),
+        ),
+    ):
+        assert question in prompt
+        assert document in prompt
+        assert quoted_semicolon_document in prompt
+        assert rule in prompt
+        assert verbatim_rule in prompt
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question, context_documents=("The records use a standard storage format.",)
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=("The records use a standard storage format.",),
+        ),
+    ):
+        assert verbatim_rule in prompt
+
+
+def test_adaptive_query_prompts_resolve_percent_label_scale_before_verbatim_exact_formula() -> None:
+    question = "What percentage of tickets have status amber?"
+    document = (
+        "Exact formula: DIVIDE(COUNT(ticket_id WHERE status = 'amber'), "
+        "COUNT(ticket_id)) as percent"
+    )
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "percentage of amber tickets",
+            normalized_meaning="DIVIDE(COUNT(ticket_id WHERE status = 'amber'), COUNT(ticket_id))*100",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Для trusted exact FORMULA, арифметически задающей только отношение и "
+        "называющей output percent, percentage или %, явный запрос этого процента "
+        "как required requested_output FORMULA "
+        "разрешает единственное добавление *100 или эквивалентной операции масштаба "
+        "после сохранённых operands и predicates и до alias или пояснения; остальное "
+        "сохраняй дословно. Для fraction или ratio без percent не добавляй *100 или "
+        "эквивалентную операцию масштаба."
+    )
 
     for prompt in (
         build_adaptive_query_understanding_prompt(
             question, context_documents=(document,)
         ),
         build_adaptive_query_completeness_prompt(
-            question, initial, context_documents=(document,)
+            question,
+            initial,
+            context_documents=(document,),
         ),
     ):
         assert question in prompt
         assert document in prompt
         assert rule in prompt
+
+
+def test_adaptive_query_prompts_preserve_exact_ratio_scale_for_non_output_filter() -> None:
+    question = "List the beacon names whose marked-share measure exceeds the cutoff."
+    document = (
+        "The marked-share percentage is exactly marked_token_count / total_token_count, "
+        "and the cutoff is expressed on that same ratio scale."
+    )
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "beacon names",
+            normalized_meaning="beacon names",
+            requested_output=True,
+        ),
+        _model_item(
+            "formula",
+            "marked-share measure exceeds the cutoff",
+            normalized_meaning=(
+                "marked_token_count / total_token_count exceeds the cutoff"
+            ),
+        ),
+    )
+    rule = (
+        "Если trusted exact FORMULA отношения используется как required non-output "
+        "условие или predicate, сохраняй её scale, operator и literal сравнения, "
+        "кроме описанного ниже конфликта только включения числовой границы; "
+        "слово percent, percentage или % в имени показателя само по себе не "
+        "разрешает добавлять *100."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question, context_documents=(document,)
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_do_not_invent_join_row_counting_unit_from_shorthand_formula() -> None:
+    question = "What percentage of shipments in orders have a delayed item?"
+    document = (
+        "Orders contain shipments and shipments contain items. Exact formula: "
+        "DIVIDE(COUNT(shipment_id WHERE item is delayed), COUNT(shipment_id))*100"
+    )
+    explicit_row_document = (
+        "Exact formula: DIVIDE(COUNT(shipment_id WHERE item is delayed), "
+        "COUNT(shipment_id))*100; both counts use joined shipment-item rows."
+    )
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "percentage of shipments with delayed items",
+            normalized_meaning=(
+                "DIVIDE(COUNT(shipment_id WHERE item is delayed), "
+                "COUNT(shipment_id))*100"
+            ),
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Краткая trusted exact FORMULA сохраняет порядок операций, аргументы и явно "
+        "заданные predicates, но не создаёт не названные counting unit, JOIN "
+        "multiplicity или запрет entity-once; related predicate сам по себе не "
+        "превращает population в relationship/detail rows. Сохраняй такую единицу "
+        "подсчёта, multiplicity или entity-once только когда их прямо называет вопрос "
+        "или document."
+    )
+
+    for context_document, absent_document in (
+        (document, explicit_row_document),
+        (explicit_row_document, document),
+    ):
+        for prompt in (
+            build_adaptive_query_understanding_prompt(
+                question,
+                context_documents=(context_document,),
+            ),
+            build_adaptive_query_completeness_prompt(
+                question,
+                initial,
+                context_documents=(context_document,),
+            ),
+        ):
+            assert context_document in prompt
+            assert absent_document not in prompt
+            assert rule in prompt
+
+
+def test_adaptive_query_prompts_normalize_unknown_formula_operation_only_when_unambiguous() -> None:
+    question = "What calculation is requested?"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "documented calculation",
+            normalized_meaning="documented calculation",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Неизвестное имя операции в trusted exact FORMULA можно нормализовать "
+        "только когда полный пользовательский вопрос и вся trusted FORMULA задают "
+        "ровно одно стандартное толкование. Сохраняй аргументы, порядок операций, "
+        "row scope, predicates и наличие или отсутствие DISTINCT. При нескольких "
+        "разумных трактовках или отдельном определении имени оставляй FORMULA "
+        "AMBIGUOUS."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_reconcile_unique_conflicting_formula_literal() -> None:
+    question = "What lantern total is requested for moon-signed parcels?"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "lantern total for moon-signed parcels",
+            normalized_meaning="SUM(lantern_glow WHERE seal = 'copper')",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    unique_mapping_document = (
+        "The question phrase moon-signed maps directly to physical predicate "
+        "seal = 'ivory'. Exact formula: SUM(lantern_glow WHERE seal = 'copper')."
+    )
+    equal_mapping_document = (
+        "The question phrase moon-signed maps independently to physical predicate "
+        "seal = 'ivory' and seal = 'copper'. Exact formula: "
+        "SUM(lantern_glow WHERE seal = 'copper')."
+    )
+    rule = (
+        "Если фраза из вопроса имеет ровно одно прямое trusted mapping к физическому "
+        "predicate/literal, а фрагмент exact FORMULA в том же context использует "
+        "другой literal для той же semantic role без отдельного значения, нормализуй "
+        "этот literal FORMULA согласно единственному mapping. Если два значения "
+        "одинаково прямо и независимо подтверждены, оставляй FORMULA AMBIGUOUS и "
+        "не выбирай ни один literal. Обычная exact FORMULA без такого доказанного "
+        "внутреннего конфликта остаётся дословной."
+    )
+
+    for context_document in (unique_mapping_document, equal_mapping_document):
+        for prompt in (
+            build_adaptive_query_understanding_prompt(
+                question,
+                context_documents=(context_document,),
+            ),
+            build_adaptive_query_completeness_prompt(
+                question,
+                initial,
+                context_documents=(context_document,),
+            ),
+        ):
+            assert question in prompt
+            assert context_document in prompt
+            assert rule in prompt
+
+
+def test_adaptive_query_prompts_preserve_unambiguous_percentage_relation_over_conflicting_expansion() -> None:
+    question = "How many samples have a reading 25% above the average?"
+    document = "calculation = MULTIPLY(AVG + AVG, 0.25)"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "reading 25% above the average",
+            normalized_meaning="MULTIPLY(AVG + AVG, 0.25)",
+            requested_output=False,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Если обычная фраза вопроса «на N% выше/ниже» имеет единственное "
+        "стандартное арифметическое значение, а expansion trusted exact FORMULA "
+        "алгебраически ему противоречит, сохраняй отношение из вопроса и не "
+        "заменяй его противоречащим expansion. Это узкое исключение из требования "
+        "дословно сохранять trusted exact FORMULA; совместимую формулу по-прежнему "
+        "сохраняй дословно."
+    )
+    exception_boundary = (
+        "или арифметического expansion, противоречащего однозначной процентной "
+        "фразе вопроса"
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question, context_documents=(document,)
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
+    ):
+        assert rule in prompt
+        assert exception_boundary in prompt
+
+
+def test_adaptive_query_prompts_preserve_unambiguous_inclusive_count_boundary() -> None:
+    question = "Which depots have four or more completed inspections?"
+    document = "qualifying depot = COUNT(inspection_id) > 4"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "four or more completed inspections",
+            normalized_meaning="COUNT(inspection_id) > 4",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    compatible_question = "Which depots have more than four completed inspections?"
+    compatible_initial = _model_response(
+        _model_item(
+            "formula",
+            "more than four completed inspections",
+            normalized_meaning="COUNT(inspection_id) > 4",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    ratio_question = "Which depots have a completion ratio of 0.4 or more?"
+    ratio_document = (
+        "qualifying depot = DIVIDE(completed_count, total_count) > 0.4"
+    )
+    ratio_initial = _model_response(
+        _model_item(
+            "formula",
+            "completion ratio of 0.4 or more",
+            normalized_meaning="DIVIDE(completed_count, total_count) > 0.4",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Если вопрос однозначно задаёт включающую или исключающую числовую "
+        "границу, например «N или больше/меньше» или «больше/меньше N», а "
+        "trusted exact FORMULA отличается только включением самой границы N, "
+        "сохраняй оператор сравнения из вопроса. Не меняй колонку или literal; "
+        "совместимую FORMULA и неоднозначную обычную фразу сохраняй по общим правилам."
+    )
+    exception_boundary = (
+        "или оператора сравнения, противоречащего однозначной числовой границе вопроса"
+    )
+
+    ratio_boundary_rule = (
+        "сохраняй её scale, operator и literal сравнения, кроме описанного ниже "
+        "конфликта только включения числовой границы"
+    )
+
+    for current_question, current_document, current_initial in (
+        (question, document, initial),
+        (compatible_question, document, compatible_initial),
+        (ratio_question, ratio_document, ratio_initial),
+    ):
+        for prompt in (
+            build_adaptive_query_understanding_prompt(
+                current_question, context_documents=(current_document,)
+            ),
+            build_adaptive_query_completeness_prompt(
+                current_question,
+                current_initial,
+                context_documents=(current_document,),
+            ),
+        ):
+            assert current_question in prompt
+            assert current_document in prompt
+            assert rule in prompt
+            assert exception_boundary in prompt
+            assert ratio_boundary_rule in prompt
+
+
+def test_adaptive_query_prompts_preserve_explicit_per_entity_aggregate_grain() -> None:
+    question = "What is the average number of late items in each shipment?"
+    document = "late item count = AVG(item.is_late = 1)"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "average number of late items",
+            normalized_meaning="AVG(item.is_late = 1)",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Когда вопрос явно просит агрегат величины, которую сначала надо вычислить "
+        "отдельно для каждой сущности"
+    )
+    boundary = (
+        "документная формула, которая называет только выражение строки, но не задаёт "
+        "уровень сущности или единицу подсчёта, не отменяет этот явно заданный вопросом уровень"
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question, context_documents=(document,)
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
+    ):
+        normalized_prompt = " ".join(prompt.split())
+        assert rule in normalized_prompt
+        assert boundary in normalized_prompt
 
 
 def test_adaptive_query_prompts_distinguish_configured_cadence_from_event_rate() -> None:
@@ -853,6 +1671,37 @@ def test_adaptive_query_prompts_do_not_invent_conversion_from_display_format() -
         assert rule in prompt
 
 
+def test_adaptive_query_completeness_does_not_invent_formula_from_schema_columns() -> None:
+    prompt = build_adaptive_query_completeness_prompt(
+        "Return the total charge and the charge for the requested period.",
+        _model_response(
+            _model_item(
+                "metric",
+                "total charge",
+                normalized_meaning="total charge",
+                requested_output=True,
+            ),
+            _model_item(
+                "metric",
+                "charge for the requested period",
+                normalized_meaning="charge for the requested period",
+                requested_output=True,
+            ),
+            shape="rows",
+        ),
+        schema_context="events.quantity; events.unit_rate; periods.recorded_charge",
+    )
+
+    assert (
+        "не заменяй понятийный METRIC физической FORMULA, составленной из колонок "
+        "schema context" in prompt
+    )
+    assert (
+        "Точную арифметику можно добавить только из вопроса или trusted context document"
+        in prompt
+    )
+
+
 def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -884,9 +1733,20 @@ def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions()
             "обязательным FILTER с выраженными operator и literal_or_reference."
         ) not in prompt
         assert (
-            "exact_physical_predicate: true, если контекстный документ явно задаёт "
-            "operator и literal_or_reference как физическое представление предиката; "
-            "такое явное представление обязательно и не заменяется. Иначе false"
+            "`exact_physical_predicate: true`, если контекстный документ явно задаёт "
+            "`operator` и `literal_or_reference` как физическое представление предиката; "
+            "такое явное представление обязательно и не заменяется, кроме полного набора "
+            "явных `means`/`refers to` пар для literals этого же documented predicate. "
+            "Пример: `grade_code IN ('A', 'B'); grade_code='clear' means 'A'; "
+            "grade_code='blocked' refers to 'B'; grade_code='other' means 'C'`. Первые две "
+            "adjacent semicolon-separated same-column пары относятся к непосредственно "
+            "предшествующему predicate: используй `['clear', 'blocked']`, сохрани "
+            "`grade_code` и `IN`; третья пара не относится к predicate и игнорируется. В "
+            "общем случае используй противоположную сторону каждой complete same-column пары "
+            "независимо от порядка вокруг `means` или `refers to`. Если такие пары не "
+            "покрывают каждый literal predicate, FILTER остаётся conceptual: "
+            "`exact_physical_predicate=false`, а `exact_physical_column_name`, `operator` и "
+            "`literal_or_reference` — `null`. Иначе `false`."
         ) in prompt
         assert (
             "Если operator равен null, exact_physical_predicate всегда false, даже "
@@ -902,8 +1762,8 @@ def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions()
             "exact_physical_predicate true."
         ) in prompt
         assert (
-            "Запись логического условия в документе в виде «поле = значение» сама "
-            "по себе не описывает физическое хранение и оставляет "
+            "Запись логического условия в документе в виде «поле = значение» без "
+            "такого сопоставления или утверждения о хранении оставляет "
             "exact_physical_predicate false."
         ) in prompt
         assert (
@@ -917,6 +1777,65 @@ def test_adaptive_query_prompts_distinguish_entity_nouns_from_row_restrictions()
             "остаются отдельными и false, пока документ не описал их физическое "
             "представление."
         ) in prompt
+
+
+def test_adaptive_query_prompts_default_unqualified_age_to_current_date() -> None:
+    rule = (
+        "Если вопрос просит возраст без явно названной исторической даты, "
+        "даты события или другого момента расчёта, это полные годы на текущую дату"
+    )
+    question = "Provide the IDs and age of eligible clients."
+    initial = build_adaptive_query_understanding_prompt(question)
+    completeness = build_adaptive_query_completeness_prompt(
+        question,
+        {"expected_result_shape": "rows", "semantic_items": []},
+    )
+
+    for prompt in (initial, completeness):
+        assert rule in prompt
+        assert "не объявляй такой возраст неоднозначным" in prompt
+        assert "считай возраст на дату соответствующего события" in prompt
+
+
+def test_adaptive_query_prompts_distinguish_document_predicate_mapping_from_condition() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "List entries with the featured label."
+    initial = _model_response(
+        _model_item(
+            "filter",
+            "featured label",
+            normalized_meaning="featured label",
+        )
+    )
+    explicit_mapping = (
+        "Явное сопоставление доверенным документом названной в вопросе фразы или "
+        "роли с конкретным физическим полем, operator и literal_or_reference "
+        "является exact_physical_predicate true, даже если записано как "
+        "«поле = значение»."
+    )
+    bare_condition = (
+        "Запись логического условия в документе в виде «поле = значение» без "
+        "такого сопоставления или утверждения о хранении оставляет "
+        "exact_physical_predicate false."
+    )
+    exact_column_name = (
+        "- exact_physical_column_name: имя этого конкретного физического поля без "
+        "имени таблицы только при таком явном сопоставлении доверенным документом "
+        "названной в вопросе фразы или роли; иначе null. Не выводи его из одного "
+        "логического условия или похожего имени поля."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert explicit_mapping in prompt
+        assert bare_condition in prompt
+        assert exact_column_name in prompt
 
 
 def test_adaptive_query_prompts_classify_explicit_temporal_conditions_as_time() -> None:
@@ -1102,7 +2021,6 @@ def test_adaptive_query_prompts_keep_counted_item_filter_at_item_scope() -> None
         "Если METRIC считает вложенные элементы, свойство самих считаемых "
         "элементов и отдельное условие их контейнера являются разными FILTER"
     )
-
     for prompt in (
         build_adaptive_query_understanding_prompt(question),
         build_adaptive_query_completeness_prompt(question, initial),
@@ -1263,6 +2181,36 @@ def test_adaptive_query_prompts_do_not_mark_composite_formula_as_exact_predicate
         ) in prompt
 
 
+def test_adaptive_query_prompts_model_finite_named_alternatives_as_in_filter() -> None:
+    question = "Among Alpha and Beta membership tiers, show the tier with the highest account count."
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "highest account count",
+            normalized_meaning="highest account count by membership tier",
+            requested_output=True,
+        )
+    )
+    rule = (
+        "Один логический атрибут, ограниченный конечным набором явно названных "
+        "значений, сохраняй отдельным обязательным невыходным FILTER: operator=in, "
+        "literal_or_reference — JSON-массив этих значений в исходном порядке, "
+        "exact_physical_predicate=false. DIMENSION группировки или выхода и FORMULA "
+        "выбора победителя остаются обязательными."
+    )
+    boundary = (
+        "Разные левые атрибуты или условия, составная булева логика и вычисляемые "
+        "альтернативы сохраняют существующее представление FORMULA."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+        assert boundary in prompt
+
+
 def test_adaptive_query_prompts_keep_computed_comparisons_in_formula() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -1347,13 +2295,78 @@ def test_adaptive_query_prompts_preserve_exact_document_formula_scope() -> None:
         assert "истинности для всех строк одной сущности" in prompt
 
 
-def test_adaptive_query_prompts_keep_period_in_percentage_denominator() -> None:
+def test_adaptive_query_prompts_keep_reference_population_inside_comparative_aggregate() -> None:
+    question = "Which devices have a reading above the average reading for calibrated devices?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "devices",
+            normalized_meaning="device identity",
+            requested_output=True,
+        ),
+        _model_item(
+            "formula",
+            "reading above the average reading for calibrated devices",
+            normalized_meaning="reading > AVG(reading for calibrated devices)",
+        ),
+    )
+    rule = (
+        "Когда условие задаёт reference population для aggregate, с которым "
+        "сравниваются возвращаемые сущности, сохраняй это условие только внутри "
+        "aggregate FORMULA. Не делай его FILTER возвращаемых сущностей, пока вопрос "
+        "отдельно не ограничивает их тем же условием."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_remove_inherited_reference_only_outer_scope() -> None:
+    question = "Which devices have a reading above the average reading for calibrated devices?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "devices",
+            normalized_meaning="device identity",
+            requested_output=True,
+        ),
+        _model_item(
+            "filter",
+            "calibrated devices",
+            normalized_meaning="returned device is calibrated",
+            operator="eq",
+            literal_or_reference="true",
+        ),
+        _model_item(
+            "formula",
+            "reading above the average reading for calibrated devices",
+            normalized_meaning="reading > AVG(reading for calibrated devices)",
+        ),
+    )
+    initial_rule = (
+        "не представляй такой FILTER как самостоятельный категориальный FILTER или root qualification "
+        "возвращаемых сущностей"
+    )
+    completeness_rule = (
+        "не сохраняется лишь потому, что уже был в initial response; условие остаётся "
+        "только внутри required FORMULA"
+    )
+
+    assert initial_rule in build_adaptive_query_understanding_prompt(question)
+    assert completeness_rule in build_adaptive_query_completeness_prompt(question, initial)
+
+
+def test_adaptive_query_prompts_apply_percentage_period_to_both_terms() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
         build_adaptive_query_understanding_prompt,
     )
 
     question = "What percentage of accounts had status A during April?"
+    document = "Formula notation writes the denominator as COUNT(account_id)."
     initial = _model_response(
         _model_item(
             "metric",
@@ -1365,15 +2378,65 @@ def test_adaptive_query_prompts_keep_period_in_percentage_denominator() -> None:
     )
 
     for prompt in (
-        build_adaptive_query_understanding_prompt(question),
-        build_adaptive_query_completeness_prompt(question, initial),
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=(document,),
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
     ):
         assert (
-            "Для доли или процента объектов с признаком в явно заданном периоде "
-            "знаменатель сохраняет этот период. Используй все объекты независимо "
-            "от периода только когда вопрос или контекстный документ явно задаёт "
-            "такую глобальную базовую группу."
+            "При отсутствии более сильной доверенной exact FORMULA явный период, "
+            "грамматически ограничивающий запрошенную долю или процент в исходном "
+            "пользовательском вопросе, задаёт общую population/row scope числителя и "
+            "знаменателя; контекстный document может уточнять формулу или физическое "
+            "представление, но не сужает этот явный scope до одного термина. "
+            "Раздельную scope используй только когда сам пользовательский вопрос прямо "
+            "назначает её конкретному термину или явно называет глобальную базовую группу."
         ) in prompt
+
+
+def test_adaptive_query_prompts_keep_exact_formula_period_operand_local() -> None:
+    question = "What percentage of records had a score above the threshold in 2011?"
+    document = (
+        "Exact formula: DIVIDE(COUNT(record_id WHERE YEAR(event_time)=Y AND score>T), "
+        "COUNT(record_id))*100"
+    )
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "percentage of qualifying records",
+            normalized_meaning=(
+                "DIVIDE(COUNT(record_id WHERE YEAR(event_time)=Y AND score>T), "
+                "COUNT(record_id))*100"
+            ),
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Когда доверенная exact FORMULA помещает периодическое условие только "
+        "внутри одного aggregate operand, а другой operand его не содержит, сохрани "
+        "это operand-local condition в одной exact FORMULA и не создавай отдельный "
+        "required TIME или FILTER, дублирующий его как общий scope."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=(document,),
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=(document,),
+        ),
+    ):
+        assert document in prompt
+        assert rule in prompt
 
 
 def test_adaptive_query_prompts_keep_percentage_units() -> None:
@@ -1398,10 +2461,37 @@ def test_adaptive_query_prompts_keep_percentage_units() -> None:
         build_adaptive_query_completeness_prompt(question, initial),
     ):
         assert (
-            "Если запрошен процент, результат отношения должен быть выражен "
+            "Если процентное отношение является required requested_output FORMULA, "
+            "его результат должен быть выражен "
             "в процентах: умножь долю на 100. Не умножай на 100, когда "
             "запрошена доля или отношение."
         ) in prompt
+
+
+def test_adaptive_query_prompts_preserve_percentage_scale_in_normalized_meaning() -> None:
+    question = "What percentage of ember tokens have a lunar mark?"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "percentage of marked ember tokens",
+            normalized_meaning="count of marked ember tokens / count of all ember tokens",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Для required requested_output FORMULA процента отношения normalized_meaning "
+        "явно сохраняет "
+        "умножение на 100 или эквивалентную арифметическую операцию масштаба. "
+        "Слово, alias или единица «percent/процент/%» не заменяют эту операцию. "
+        "Для доли или отношения без процента умножение на 100 не добавляй."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
 
 
 def test_adaptive_query_prompts_treat_filtered_identifier_sum_as_count() -> None:
@@ -1473,6 +2563,333 @@ def test_adaptive_query_prompts_keep_separate_requested_results() -> None:
             "сохрани отдельный requested_output semantic item для результата "
             "каждого вопроса, даже если показатели похожи."
         ) in prompt
+
+
+def test_adaptive_query_prompts_keep_current_explicit_role_after_anaphora() -> None:
+    question = (
+        "How many districts offer a standard permit? For each district, how many "
+        "offices process such permit?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "district count",
+            normalized_meaning="count of districts offering a standard permit",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+    offered_permit = "permit offered by a district"
+    processed_permit = "permit processed by an office"
+    rule = (
+        "В нескольких самостоятельных requested_output каждый явно названный "
+        "глагол, действие или роль сохраняй в normalized_meaning именно этого "
+        "результата. Ссылка «such», «same», «that», «такой» или «тот же» "
+        "переносит названный атрибут или значение, но не заменяет явно названное "
+        "действие или роль текущего результата."
+    )
+
+    assert offered_permit != processed_permit
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_separate_filters_for_distinct_roles() -> None:
+    question = (
+        "How many markets publish a certified label? For each market, how many "
+        "stalls display the same certified label?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "market count",
+            normalized_meaning="count of markets publishing a certified label",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    published_label = "certified label published by a market"
+    displayed_label = "certified label displayed by a stall"
+    rule = (
+        "Когда самостоятельные requested_output или calculations явно требуют "
+        "один и тот же атрибут или значение для разных действий или ролей, "
+        "сохраняй отдельный обязательный FILTER для каждого действия или роли. "
+        "Не объединяй их в общий FILTER только из-за совпадения атрибута или значения."
+    )
+
+    assert published_label != displayed_label
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_filter_role_local_to_its_clause() -> None:
+    question = (
+        "How many markets publish a certified label? For each market, how many "
+        "stalls display the same certified label?"
+    )
+    initial = _model_response(
+        _model_item(
+            "filter",
+            "certified label",
+            normalized_meaning="certified label published by a market",
+            requested_output=False,
+        ),
+        shape="grouped_rows",
+    )
+    published_label = "certified label published by a market"
+    displayed_label = "certified label displayed by a stall"
+    rule = (
+        "Для отдельного FILTER, требуемого самостоятельным requested_output или "
+        "calculation, сохраняй в source_text и normalized_meaning явно названное "
+        "в его части вопроса действие или роль. Не заменяй его действием или ролью "
+        "другой части, даже когда атрибут или значение совпадает."
+    )
+
+    assert published_label != displayed_label
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_prioritize_explicit_source_role_in_normalized_meaning() -> None:
+    question = (
+        "How many depots authorize a safety pass? For each depot, how many "
+        "inspectors verify the same safety pass?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "depots authorize a safety pass",
+            normalized_meaning="number of depots verifying a safety pass",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    authorized_pass = "safety pass authorized by a depot"
+    verified_pass = "safety pass verified by an inspector"
+    rule = (
+        "Если source_text semantic item явно называет действие или роль, "
+        "normalized_meaning обязан сохранять это действие или роль. При "
+        "противоречии source_text имеет приоритет; не заменяй его действием или "
+        "ролью другого semantic item только из-за общего атрибута или значения."
+    )
+
+    assert authorized_pass != verified_pass
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_do_not_drop_qualified_predicate_meaning_for_shorter_mapping() -> None:
+    question = "Count records whose signal category is amber."
+    document = "signal category is amber refers to signal = 'amber'"
+    initial = _model_response(
+        _model_item(
+            "filter",
+            "signal category is amber",
+            normalized_meaning="signal = 'amber'",
+            operator="eq",
+            literal_or_reference="amber",
+            exact_physical_predicate=True,
+            exact_physical_column_name="signal",
+        ),
+        shape="scalar",
+    )
+    rule = (
+        "Если вопрос явно называет квалификатор, подтип, компонент или роль "
+        "атрибута, не отбрасывай его из source_text или normalized_meaning и не "
+        "принимай более короткое имя физического поля как exact mapping, пока "
+        "доверенный документ явно не установил эквивалентность всей "
+        "квалифицированной фразы этому полю."
+    )
+    schema_conflict_rule = (
+        "Если trusted schema context прямо показывает, что объявленное exact "
+        "physical field имеет несовместимый тип или описывает другую смысловую "
+        "роль, сними exact_physical_predicate и exact_physical_column_name, но "
+        "сохрани полную квалифицированную фразу для обычного исследования схемы. "
+        "Не выбирай здесь заменяющую колонку."
+    )
+
+    initial_prompt = build_adaptive_query_understanding_prompt(
+        question, context_documents=(document,)
+    )
+    completeness_prompt = build_adaptive_query_completeness_prompt(
+        question,
+        initial,
+        context_documents=(document,),
+        schema_context=(
+            "records.signal: INTEGER magnitude; "
+            "records.signal_category: TEXT category label"
+        ),
+    )
+
+    for prompt in (initial_prompt, completeness_prompt):
+        assert rule in prompt
+    assert schema_conflict_rule not in initial_prompt
+    assert schema_conflict_rule in completeness_prompt
+
+
+def test_adaptive_query_prompts_do_not_weaken_explicit_source_role_to_an_alternative() -> None:
+    question = (
+        "How many depots authorize a safety pass? For each depot, how many "
+        "inspectors verify the same safety pass?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "depots authorize a safety pass",
+            normalized_meaning="number of depots that authorize or verify a safety pass",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    authorized_pass = "safety pass authorized by a depot"
+    verified_pass = "safety pass verified by an inspector"
+    rule = (
+        "Если source_text semantic item явно называет действие или роль, "
+        "normalized_meaning обязан сохранять его как однозначно обязательное; не "
+        "ослабляй его добавлением другого действия или роли как альтернативы. Такое "
+        "объединение допустимо, только если исходный текст или доверенный документ "
+        "прямо задаёт для того же semantic item оба действия или роли как альтернативы."
+    )
+
+    assert authorized_pass != verified_pass
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_explicit_role_in_source_text_when_adding_scope() -> None:
+    question = (
+        "How many districts certify a permit? For each district, how many offices "
+        "verify the same permit?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "offices verifying a permit for the district count",
+            normalized_meaning="count of districts certifying a permit",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    certified_permit = "permit certified by a district"
+    verified_permit = "permit verified by an office"
+    rule = (
+        "source_text must faithfully retain the wording of the question or trusted "
+        "document. It may shorten the wording or add neutral scope/grain clarification, "
+        "but must not replace, add, or borrow an explicitly named action or role from "
+        "another clause. When a clause explicitly names an action or role, retain that "
+        "same action or role in source_text while annotating that result's scope."
+    )
+
+    assert certified_permit != verified_permit
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_reject_same_item_action_role_conflict() -> None:
+    question = (
+        "How many districts certify a permit? For each district, how many offices "
+        "verify the same permit?"
+    )
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "districts certify a permit",
+            normalized_meaning="count of districts whose offices verify a permit",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    certified_permit = "permit certified by a district"
+    verified_permit = "permit verified by an office"
+    rule = (
+        "Before returning either JSON, check every semantic item's source_text and "
+        "normalized_meaning for an explicit action or role conflict. An item that names "
+        "different actions or roles in those two fields is invalid: preserve the "
+        "source-local action or role in normalized_meaning, or use separate required "
+        "items when the question explicitly requires both. Scope or grain clarification "
+        "does not permit a conflicting action or role in the same item."
+    )
+
+    assert certified_permit != verified_permit
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_align_entity_total_with_defined_groups() -> None:
+    question = "How many regions have active notices, and how many notices are there for each region?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "region total",
+            normalized_meaning="number of regions with active notices",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    defined_region = "region identity with a value"
+    missing_region = "region identity without a value"
+    rule = (
+        "Когда один и тот же scope явно просит число именованных сущностей и результат "
+        "по каждой из них, сохрани общую область идентичности: считай distinct "
+        "определённые (не NULL) значения сущности и выводи только группы с определённым "
+        "её значением, так что total равен числу возвращённых групп. Не применяй это "
+        "к явно запрошенному nullable атрибуту или когда вопрос явно просит missing/unknown "
+        "сущности."
+    )
+
+    assert defined_region != missing_region
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_grouping_dimension_out_of_metric_owner() -> None:
+    question = "How many regions have active notices, and how many notices are there for each region?"
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "notice count per region",
+            normalized_meaning="number of active notices for each region",
+            requested_output=True,
+        ),
+        shape="grouped_rows",
+    )
+    grouping_dimension = "region grouping dimension"
+    grouped_metric = "notice metric"
+    rule = (
+        "Эта DIMENSION задаёт только группировку/гранулярность (grain), а не владельца "
+        "METRIC или FORMULA; для такого группового результата owner_item_ordinal=null."
+    )
+
+    assert grouping_dimension != grouped_metric
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
 
 
 def test_adaptive_query_prompts_keep_separate_conditional_aggregates() -> None:
@@ -1559,6 +2976,31 @@ def test_adaptive_query_prompts_do_not_turn_requested_boolean_output_into_filter
             "Если пользователь просит указать, является ли признак истинным для "
             "каждой возвращаемой строки, сохрани этот признак как requested_output "
             "и не создавай FILTER истинности без отдельного требования отбора."
+        ) in prompt
+
+
+def test_adaptive_query_prompts_preserve_single_existential_boolean_output() -> None:
+    question = "Did the collection include any enabled related record?"
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "whether the collection included an enabled related record",
+            normalized_meaning="enabled = true for a related record",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert (
+            "Одиночный вопрос да/нет о существовании хотя бы одной подходящей "
+            "связанной или содержащейся строки сохраняй как один requested_output "
+            "FORMULA с явным existential-смыслом и expected_result_shape=scalar. "
+            "Не применяй это правило, когда вопрос явно просит отдельный ответ "
+            "для каждой строки или сущности."
         ) in prompt
 
 
@@ -1671,6 +3113,128 @@ def test_adaptive_query_prompts_preserve_separately_named_output_fields() -> Non
         ) in prompt
 
 
+def test_adaptive_query_prompts_do_not_collapse_numbered_output_slots() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Show the responsible contacts' names."
+    documents = (
+        "A contact name consists of given name and family name; "
+        "there are up to three numbered contact slots.",
+    )
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "contacts' given names",
+            normalized_meaning="given_name_1, given_name_2, or given_name_3",
+            requested_output=True,
+        ),
+        _model_item(
+            "dimension",
+            "contacts' family names",
+            normalized_meaning="family_name_1, family_name_2, or family_name_3",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Не представляй несколько отдельно названных или пронумерованных "
+        "output-полей одним semantic item с несколькими bindings, даже через "
+        "and/или/or: создай отдельный requested_output item для каждого поля."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=documents,
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=documents,
+        ),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_completeness_enumerates_every_numbered_schema_member() -> None:
+    from custom_tools.text_to_sql.prompts import build_adaptive_query_completeness_prompt
+
+    question = "Show the assigned contacts."
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "assigned contacts",
+            normalized_meaning="assigned contacts",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+    schema_context = (
+        '{"assignments": {"contact_given_1": "nullable", '
+        '"contact_family_1": "nullable", "contact_given_2": "nullable", '
+        '"contact_family_2": "nullable", "contact_given_3": "nullable", '
+        '"contact_family_3": "nullable"}}'
+    )
+    rule = (
+        "Если trusted schema context для одного requested term явно показывает "
+        "пронумерованное семейство физических полей, completeness должна создать "
+        "отдельный requested_output semantic item для каждого явно присутствующего "
+        "члена семейства, включая последний nullable slot; не останавливайся на "
+        "произвольном префиксе."
+    )
+
+    prompt = build_adaptive_query_completeness_prompt(
+        question,
+        initial,
+        schema_context=schema_context,
+    )
+
+    assert json.dumps(schema_context, ensure_ascii=False) in prompt
+    assert rule in prompt
+
+
+def test_adaptive_query_prompts_allow_explicit_combined_output() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Show each responsible contact as one full name."
+    documents = (
+        "A contact name is stored as separate given_name and family_name fields.",
+    )
+    initial = _model_response(
+        _model_item(
+            "formula",
+            "one full name per contact",
+            normalized_meaning="combine given_name and family_name",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Объединённый output допустим, если вопрос прямо просит именно объединённую "
+        "форму. Иное преобразование допустимо только если доверенный документ прямо "
+        "требует преобразование или формат результата и вопрос прямо просит эту форму."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=documents,
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=documents,
+        ),
+    ):
+        assert rule in prompt
+
+
 def test_adaptive_query_prompts_preserve_documented_physical_output_mapping() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -1707,6 +3271,65 @@ def test_adaptive_query_prompts_preserve_documented_physical_output_mapping() ->
         ) in prompt
         assert "Не придумывай таблицы, колонки или schema bindings" in prompt
         assert "Не называй таблицы, колонки или schema bindings" not in prompt
+
+
+def test_adaptive_query_prompts_honor_documented_output_only_scope() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Who won the event? Indicate the recorded duration."
+    documents = ("Only the recorded duration is shown in the result.",)
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "winner",
+            normalized_meaning="winner name",
+            requested_output=False,
+        ),
+        _model_item(
+            "dimension",
+            "recorded duration",
+            normalized_meaning="recorded duration",
+            requested_output=True,
+        ),
+        shape="rows",
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            question,
+            context_documents=documents,
+        ),
+        build_adaptive_query_completeness_prompt(
+            question,
+            initial,
+            context_documents=documents,
+        ),
+    ):
+        assert (
+            "Если доверенный context document прямо говорит, что в результате "
+            "показывается только конкретный атрибут"
+        ) in prompt
+        assert (
+            "Сохрани сущность, найденную вопросом «кто/что», как required для "
+            "области поиска, но не как requested_output"
+        ) in prompt
+
+    completeness_prompt = build_adaptive_query_completeness_prompt(
+        question,
+        initial,
+        context_documents=documents,
+    )
+    assert json.dumps(initial, ensure_ascii=False) in completeness_prompt
+    assert (
+        "Если первоначальный JSON уже оставил найденную через «кто/что» сущность "
+        "как required с requested_output=false"
+    ) in completeness_prompt
+    assert (
+        "Проверка полноты не должна возвращать исключённую сущность в состав ответа"
+    ) in completeness_prompt
 
 
 def test_adaptive_query_prompts_do_not_turn_last_actor_role_into_row_ordering() -> None:
@@ -1891,9 +3514,10 @@ def test_adaptive_query_prompts_keep_compound_attribute_components_separate() ->
         "перечислены или пронумерованы, каждый компонент — отдельный "
         "requested_output DIMENSION, включая все пронумерованные slots. "
         "Описание, что составной атрибут состоит из A+B, описывает хранение и "
-        "не разрешает создавать derived output. Объединённый output допустим "
-        "только если доверенный документ прямо требует преобразование или формат "
-        "результата и вопрос прямо просит именно эту преобразованную форму."
+        "не разрешает создавать derived output. Объединённый output допустим, "
+        "если вопрос прямо просит именно объединённую форму. Иное преобразование "
+        "допустимо только если доверенный документ прямо требует преобразование "
+        "или формат результата и вопрос прямо просит эту форму."
     )
 
     initial_prompt = build_adaptive_query_understanding_prompt(
@@ -2001,7 +3625,7 @@ def test_adaptive_query_prompts_do_not_invent_per_entity_aggregation_for_row_ext
         ) in prompt
 
 
-def test_adaptive_query_prompts_require_limit_for_plural_raw_row_superlative() -> None:
+def test_adaptive_query_prompts_preserve_ties_for_plural_raw_row_superlative() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
         build_adaptive_query_understanding_prompt,
@@ -2022,9 +3646,125 @@ def test_adaptive_query_prompts_require_limit_for_plural_raw_row_superlative() -
         ),
     )
     rule = (
-        "Прямой экстремум исходного показателя по строкам, выбирающий одну "
-        "наивысшую или наинизшую позицию, требует ORDERING и обязательный LIMIT 1 "
-        "даже при грамматически множественном классе выбираемых сущностей."
+        "Если вопрос явно просит множество сущностей или строк, имеющих экстремальное "
+        "значение, не добавляй LIMIT 1 и сохрани все строки с одинаковым экстремальным "
+        "значением."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_require_limit_for_singular_raw_row_superlative() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Which school has the highest number of students?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "school",
+            normalized_meaning="school identity",
+            requested_output=True,
+        ),
+        _model_item(
+            "metric",
+            "number of students",
+            normalized_meaning="student count on each raw row",
+        ),
+    )
+    rule = (
+        "Если вопрос явно просит одну сущность или позицию, добавь обязательный LIMIT 1."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_limit_plural_output_for_multiple_direct_row_superlatives() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "What are the labels and codes of records with the earliest start and lowest rank?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "labels",
+            normalized_meaning="record labels",
+            requested_output=True,
+        ),
+        _model_item(
+            "dimension",
+            "codes",
+            normalized_meaning="record codes",
+            requested_output=True,
+        ),
+        _model_item(
+            "metric",
+            "earliest start",
+            normalized_meaning="start stored on each raw row",
+        ),
+        _model_item(
+            "metric",
+            "lowest rank",
+            normalized_meaning="rank stored on each raw row",
+        ),
+    )
+    rule = (
+        "Когда два или более прямых экстремума исходных показателей по строкам "
+        "задают один отобранный объект или позицию, они образуют последовательные "
+        "критерии ORDERING и требуют обязательный LIMIT 1, даже если выходные "
+        "атрибуты или сущности сформулированы во множественном числе. Это не "
+        "относится к явному top N, явному запросу всех ничьих или экстремуму "
+        "агрегата между группами."
+    )
+    precedence_rule = (
+        "Правило сохранения всех ничьих для множества относится к одному прямому "
+        "экстремуму и не отменяет обязательный LIMIT 1 для двух или более прямых "
+        "экстремумов."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+        assert precedence_rule in prompt
+
+
+def test_adaptive_query_prompts_define_singular_direct_extremum_explicitly() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Who supports the station with the lowest measured load?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "station",
+            normalized_meaning="selected station",
+        ),
+        _model_item(
+            "metric",
+            "measured load",
+            normalized_meaning="load stored on each station row",
+        ),
+        shape="rows",
+    )
+    rule = (
+        "Форма «the/эта одна сущность with the highest/lowest исходный показатель» "
+        "явно просит одну сущность и требует LIMIT 1."
     )
 
     for prompt in (
@@ -2141,6 +3881,41 @@ def test_adaptive_query_prompts_preserve_ties_for_grouped_extremum() -> None:
         ) in prompt
 
 
+def test_adaptive_query_prompts_keep_winner_attribute_separate_from_aggregate() -> None:
+    question = "What is the banner name of the guild with the highest total crystal count?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "guild",
+            normalized_meaning="winning guild",
+        ),
+        _model_item(
+            "dimension",
+            "banner name",
+            normalized_meaning="guild banner name",
+            requested_output=True,
+        ),
+        _model_item(
+            "metric",
+            "highest total crystal count",
+            normalized_meaning="total crystal count per guild",
+        ),
+    )
+    rule = (
+        "Если вопрос прямо просит имя, метку или иной атрибут сущности-победителя, "
+        "выбранной по агрегатному METRIC или FORMULA, этот атрибут — requested_output "
+        "DIMENSION. Сам METRIC или FORMULA остаётся required с requested_output=false, "
+        "пока вопрос отдельно не просит вывести его значение. Явно запрошенный вывод "
+        "METRIC или FORMULA остаётся requested_output."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
 def test_adaptive_query_prompts_keep_top_n_extremum_as_ranking() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -2223,6 +3998,58 @@ def test_adaptive_query_prompts_preserve_explicit_rank_output() -> None:
         assert "ORDERING также остаётся обязательным" in prompt
 
 
+def test_adaptive_query_prompts_distinguish_ranked_group_population_from_outputs() -> None:
+    grouped_question = (
+        "Rank customers by popularity of membership tier, showing tier, count and rank."
+    )
+    grouped_initial = _model_response(
+        _model_item(
+            "dimension",
+            "customers",
+            normalized_meaning="counted customer population at the membership-tier grain",
+        ),
+        _model_item(
+            "dimension",
+            "membership tier",
+            normalized_meaning="membership-tier grouping attribute",
+            requested_output=True,
+        ),
+        _model_item(
+            "metric",
+            "count",
+            normalized_meaning="customer count per membership tier",
+            requested_output=True,
+        ),
+        _model_item(
+            "formula",
+            "rank",
+            normalized_meaning="rank membership tiers by customer count",
+            requested_output=True,
+        ),
+        shape="ranked_rows",
+    )
+    rule = (
+        "Если ранжируются значения группирующего атрибута по popularity или count "
+        "сущностей, названные сущности являются обязательной counted population/grain, "
+        "а не requested_output, если вопрос прямо не просит перечислить, назвать или "
+        "показать каждую сущность. Группирующий атрибут, count и rank являются "
+        "requested_output."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(grouped_question),
+        build_adaptive_query_completeness_prompt(grouped_question, grouped_initial),
+    ):
+        assert rule in prompt
+        assert "Если вопрос явно просит ранжировать сущности по показателю" in prompt
+
+    for question in (
+        "Rank products by score.",
+        "Rank membership tiers by popularity and show each customer.",
+    ):
+        assert rule in build_adaptive_query_understanding_prompt(question)
+
+
 def test_adaptive_query_prompts_keep_top_n_entity_as_metric_grain_only() -> None:
     from custom_tools.text_to_sql.prompts import (
         build_adaptive_query_completeness_prompt,
@@ -2262,6 +4089,90 @@ def test_adaptive_query_prompts_keep_top_n_entity_as_metric_grain_only() -> None
         build_adaptive_query_completeness_prompt(question, initial),
     ):
         assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_aggregate_threshold_as_one_formula() -> None:
+    from custom_tools.text_to_sql.prompts import (
+        build_adaptive_query_completeness_prompt,
+        build_adaptive_query_understanding_prompt,
+    )
+
+    question = "Which account has more than 4 submitted requests?"
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "account",
+            normalized_meaning="account identity",
+            requested_output=True,
+        ),
+        _model_item(
+            "formula",
+            "more than 4 submitted requests",
+            normalized_meaning="COUNT(submitted requests) > 4",
+        ),
+    )
+    rule = (
+        "Порог группы или сущности, вычисляемый через COUNT, SUM, AVG, MIN или MAX "
+        "и сравниваемый с literal, является одной обязательной FORMULA, а не отдельным "
+        "FILTER: operator и literal_or_reference=null, exact_physical_predicate=false. "
+        "Прямое physical column > literal остаётся обязательным FILTER."
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt(question),
+        build_adaptive_query_completeness_prompt(question, initial),
+    ):
+        assert rule in prompt
+
+
+def test_adaptive_query_prompts_keep_member_threshold_inside_existence_formula() -> None:
+    questions_and_initial = (
+        (
+            "List stations with readings whose level is at least 70.",
+            _model_response(
+                _model_item(
+                    "dimension",
+                    "stations",
+                    normalized_meaning="station identity",
+                    requested_output=True,
+                ),
+                _model_item(
+                    "formula",
+                    "readings whose level is at least 70",
+                    normalized_meaning="exists a related reading with level >= 70",
+                ),
+            ),
+        ),
+        (
+            "List stations with at least 3 qualifying readings.",
+            _model_response(
+                _model_item(
+                    "dimension",
+                    "stations",
+                    normalized_meaning="station identity",
+                    requested_output=True,
+                ),
+                _model_item(
+                    "formula",
+                    "at least 3 qualifying readings",
+                    normalized_meaning="count of qualifying readings >= 3",
+                ),
+            ),
+        ),
+    )
+    rule = (
+        "Когда корневые сущности отбираются по наличию связанных members/rows, чей "
+        "числовой атрибут сравнивается с literal, сохраняй одно required non-output "
+        "FORMULA существования: сравнение атрибута остаётся внутри FORMULA, а её "
+        "operator и literal_or_reference равны null. Не переноси этот literal на "
+        "физическую агрегированную колонку, которая уже считает подходящие "
+        "members/rows. Только явный порог count/number of qualifying members >= N "
+        "сравнивает агрегированный count с N."
+    )
+
+    for question, initial in questions_and_initial:
+        assert rule in build_adaptive_query_understanding_prompt(question)
+        assert rule in build_adaptive_query_completeness_prompt(question, initial)
 
 
 def test_adaptive_query_prompts_keep_qualifying_entity_out_of_explicit_output() -> None:
@@ -2453,8 +4364,31 @@ def test_adaptive_query_prompts_preserve_conditional_entity_output() -> None:
         assert "Не заменяй такую формулу колонкой состояния или истинности" in prompt
         assert "Фраза «если есть»" in prompt
         assert "не превращай это условие в FILTER всего результата" in prompt
-        assert "человекочитаемое имя или метку сущности" in prompt
-        assert "не технический идентификатор" in prompt
+        assert "сохраняй в normalized_meaning саму сущность" in prompt
+        assert "не подставляй заранее её имя, метку, ID, код или номер" in prompt
+
+
+def test_adaptive_query_prompts_do_not_invent_entity_output_attribute() -> None:
+    initial = _model_response(
+        _model_item(
+            "dimension",
+            "devices",
+            normalized_meaning="device name",
+            requested_output=True,
+        )
+    )
+    prompts = (
+        build_adaptive_query_understanding_prompt("Which devices are active?"),
+        build_adaptive_query_completeness_prompt(
+            "Which devices are active?",
+            initial,
+        ),
+    )
+
+    for prompt in prompts:
+        assert "сохраняй в normalized_meaning саму сущность" in prompt
+        assert "не подставляй заранее её имя, метку, ID, код или номер" in prompt
+        assert "Физическое представление выберет исследование схемы" in prompt
 
 
 def test_adaptive_query_prompts_keep_available_attribute_as_nullable_dimension() -> None:
@@ -2519,6 +4453,331 @@ def test_nlu_system_prompt_requires_unquoted_json_null_for_absent_predicates(
     assert all(rule in call["system_prompt"] for call in calls)
 
 
+def test_nlu_system_prompt_preserves_explicit_entity_once_counting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    response = _model_response(
+        _model_item("metric", "how many accounts", normalized_meaning="count accounts"),
+        shape="scalar",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_openai_api(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+    monkeypatch.setattr(nlu_module, "_nlu_max_tokens", lambda _key: 321)
+
+    nlu_module.NLUProcessor()._understand_query(
+        "How many accounts have qualifying events?",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        context_documents=("Don't compute repetitive accounts.",),
+    )
+
+    rule = (
+        "Если вопрос или trusted context document прямо требует считать каждую "
+        "именованную сущность один раз и не учитывать её повторные строки, сохрани "
+        "entity-once в normalized_meaning соответствующего requested_output METRIC."
+    )
+    assert len(calls) == 2
+    assert all(rule in call["system_prompt"] for call in calls)
+
+
+def test_nlu_system_prompt_prioritizes_unambiguous_numeric_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    response = _model_response(
+        _model_item(
+            "formula",
+            "six or more verified visits",
+            normalized_meaning="COUNT(visit_id) > 6",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_openai_api(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+
+    nlu_module.NLUProcessor()._understand_query(
+        "Which stations have six or more verified visits?",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        context_documents=("qualifying station = COUNT(visit_id) > 6",),
+    )
+
+    rule = (
+        "Если однозначная числовая граница из вопроса и trusted exact FORMULA "
+        "отличаются только включением или исключением того же значения границы, "
+        "сохраняй оператор из вопроса"
+    )
+    assert len(calls) == 2
+    assert all(rule in call["system_prompt"] for call in calls)
+
+
+def test_nlu_system_prompt_prioritizes_explicit_event_time_for_age(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    response = _model_response(
+        _model_item(
+            "formula",
+            "under 30 years old",
+            normalized_meaning="year(current_timestamp) - year(birth_date) < 30",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_openai_api(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+
+    nlu_module.NLUProcessor()._understand_query(
+        "For inspections performed in 2012, list devices under 30 years old.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        context_documents=(
+            "under 30 years old = year(current_timestamp) - year(birth_date) < 30",
+        ),
+    )
+
+    rule = (
+        "Если вопрос отбирает сущности по участию в событиях за явно названную "
+        "историческую дату или период и одновременно задаёт возраст этих сущностей, "
+        "считай возраст на дату соответствующего события, если вопрос прямо не "
+        "говорит о текущем возрасте"
+    )
+    exception = (
+        "или якоря текущей даты в формуле возраста, противоречащего однозначному "
+        "историческому контексту события из вопроса, когда вопрос прямо не просит "
+        "текущий возраст"
+    )
+    assert len(calls) == 2
+    assert all(rule in call["system_prompt"] for call in calls)
+    for prompt in (
+        build_adaptive_query_understanding_prompt(
+            "For inspections performed in 2012, list devices under 30 years old.",
+            context_documents=(
+                "under 30 years old = year(current_timestamp) - year(birth_date) < 30",
+            ),
+        ),
+        build_adaptive_query_completeness_prompt(
+            "For inspections performed in 2012, list devices under 30 years old.",
+            response,
+            context_documents=(
+                "under 30 years old = year(current_timestamp) - year(birth_date) < 30",
+            ),
+        ),
+    ):
+        assert exception in prompt
+
+
+def test_explicit_current_age_remains_current_in_historical_event_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    response = _model_response(
+        _model_item(
+            "formula",
+            "current age under 30",
+            normalized_meaning="year(current_timestamp) - year(birth_date) < 30",
+            requested_output=False,
+        ),
+        shape="rows",
+    )
+    monkeypatch.setattr(
+        nlu_module,
+        "call_openai_api",
+        lambda **_kwargs: json.dumps(response, ensure_ascii=False),
+    )
+
+    spec = nlu_module.NLUProcessor()._understand_query(
+        "For inspections performed in 2012, list devices whose current age is under 30.",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        context_documents=(
+            "current age under 30 = year(current_timestamp) - year(birth_date) < 30",
+        ),
+    )
+
+    age = next(
+        item for item in spec.semantic_items if item.kind is SemanticItemKind.FORMULA
+    )
+    assert age.normalized_meaning == "year(current_timestamp) - year(birth_date) < 30"
+
+
+def test_ranked_prompt_preserves_separately_listed_aggregate_output() -> None:
+    rule = (
+        "Когда ранжированный запрос грамматически перечисляет и сущность, и агрегат "
+        "как возвращаемые поля, сохраняй оба как requested_output"
+    )
+    boundary = (
+        "агрегат, упомянутый только внутри оборота `by ...` без отдельного запроса "
+        "его вывести, остаётся requested_output=false"
+    )
+
+    for prompt in (
+        build_adaptive_query_understanding_prompt("List regions and their order count."),
+        build_adaptive_query_completeness_prompt(
+            "List regions and their order count.",
+            _model_response(
+                _model_item(
+                    "dimension",
+                    "regions",
+                    normalized_meaning="regions",
+                    requested_output=True,
+                ),
+                _model_item(
+                    "metric",
+                    "order count",
+                    normalized_meaning="number of orders",
+                    requested_output=False,
+                ),
+                shape="ranked_rows",
+            ),
+        ),
+    ):
+        assert rule in prompt
+        assert boundary in prompt
+
+
+def test_nlu_processor_normalizes_complete_same_column_pair_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    text = "List records with the selected profile."
+    response = _model_response(
+        _model_item(
+            "filter",
+            "selected profile",
+            normalized_meaning="selected profile",
+            operator="in",
+            literal_or_reference=["P", "Q"],
+            exact_physical_predicate=True,
+            exact_physical_column_name="profile_code",
+        )
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_call_openai_api(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(response, ensure_ascii=False)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+    monkeypatch.setattr(nlu_module, "_nlu_max_tokens", lambda _key: 321)
+
+    spec = nlu_module.NLUProcessor()._understand_query(
+        text,
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+        context_documents=(
+            "The selected profile refers to profile_code IN ('P', 'Q'); "
+            "profile_code='compact' means 'P'; "
+            "profile_code='expanded' refers to 'Q'; "
+            "profile_code='archived' means 'R'.",
+        ),
+    )
+
+    selected_profile = next(
+        item for item in spec.semantic_items if item.source_text == "selected profile"
+    )
+    assert selected_profile.exact_physical_predicate is True
+    assert selected_profile.exact_physical_column_name == "profile_code"
+    assert selected_profile.operator == "in"
+    assert selected_profile.literal_or_reference == ("compact", "expanded")
+    assert len(calls) == 2
+    assert '"literal_or_reference": ["compact", "expanded"]' in calls[1]["prompt"]
+
+
+@pytest.mark.parametrize(
+    ("document", "exact_physical_predicate", "literal_or_reference"),
+    [
+        (
+            "profile_code IN ('P', 'Q'); profile_code='compact' means 'P'.",
+            True,
+            ["P", "Q"],
+        ),
+        (
+            "profile_code IN ('P', 'Q'); other_code='compact' means 'P'; "
+            "other_code='expanded' refers to 'Q'.",
+            True,
+            ["P", "Q"],
+        ),
+        (
+            "profile_code IN ('P', 'Q'); profile_code='compact' means 'P'; "
+            "profile_code='narrow' refers to 'P'; profile_code='expanded' means 'Q'.",
+            True,
+            ["P", "Q"],
+        ),
+        (
+            "profile_code IN ('P', 'Q'); profile_code='compact' means 'P'; "
+            "profile_code='expanded' refers to 'Q'.",
+            False,
+            ["P", "Q"],
+        ),
+        (
+            "profile_code IN ('P', 'Q'); profile_code='compact' means 'P'; "
+            "profile_code='expanded' refers to 'Q'.",
+            True,
+            ["P", "R"],
+        ),
+        (
+            "profile_code IN ('P', 'Q'); unrelated prose means no mapping.",
+            True,
+            ["P", "Q"],
+        ),
+    ],
+    ids=(
+        "incomplete",
+        "other-column",
+        "ambiguous-duplicate",
+        "non-exact",
+        "model-mismatch",
+        "unrelated-prose",
+    ),
+)
+def test_complete_same_column_pair_mapping_keeps_boundaries_unchanged(
+    document: str,
+    exact_physical_predicate: bool,
+    literal_or_reference: list[str],
+) -> None:
+    from custom_tools.text_to_sql.nlu import _normalize_complete_same_column_pair_mapping
+
+    response = _model_response(
+        _model_item(
+            "filter",
+            "selected profile",
+            normalized_meaning="selected profile",
+            operator="in",
+            literal_or_reference=literal_or_reference,
+            exact_physical_predicate=exact_physical_predicate,
+            exact_physical_column_name="profile_code",
+        )
+    )
+
+    normalized = _normalize_complete_same_column_pair_mapping(response, (document,))
+
+    assert normalized == response
+    assert normalized is not response
+
+
 def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2569,7 +4828,21 @@ def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
                 "всегда должен быть непустой JSON-строкой или null; числа, "
                 "boolean, массивы и объекты запрещены. Если operator или "
                 "literal_or_reference отсутствует, указывай JSON null без кавычек; "
-                'строка "null" не означает отсутствующее значение.'
+                'строка "null" не означает отсутствующее значение. '
+                "Если exact_physical_predicate=false или operator=null, "
+                "exact_physical_column_name также должен быть JSON null. "
+                "Если вопрос или trusted context document прямо требует считать каждую "
+                "именованную сущность один раз и не учитывать её повторные строки, сохрани "
+                "entity-once в normalized_meaning соответствующего requested_output METRIC. "
+                "Не добавляй entity-once только из-за JOIN, идентификатора или нескольких "
+                "строк без такого явного требования. "
+                "Если однозначная числовая граница из вопроса и trusted exact FORMULA "
+                "отличаются только включением или исключением того же значения границы, "
+                "сохраняй оператор из вопроса. "
+                "Если вопрос отбирает сущности по участию в событиях за явно названную "
+                "историческую дату или период и одновременно задаёт возраст этих сущностей, "
+                "считай возраст на дату соответствующего события, если вопрос прямо не "
+                "говорит о текущем возрасте."
             ),
             "max_tokens": 321,
             "model": agent_command.model_mapping[
@@ -2585,7 +4858,21 @@ def test_nlu_processor_calls_separate_strict_adaptive_model_boundary(
                 "всегда должен быть непустой JSON-строкой или null; числа, "
                 "boolean, массивы и объекты запрещены. Если operator или "
                 "literal_or_reference отсутствует, указывай JSON null без кавычек; "
-                'строка "null" не означает отсутствующее значение.'
+                'строка "null" не означает отсутствующее значение. '
+                "Если exact_physical_predicate=false или operator=null, "
+                "exact_physical_column_name также должен быть JSON null. "
+                "Если вопрос или trusted context document прямо требует считать каждую "
+                "именованную сущность один раз и не учитывать её повторные строки, сохрани "
+                "entity-once в normalized_meaning соответствующего requested_output METRIC. "
+                "Не добавляй entity-once только из-за JOIN, идентификатора или нескольких "
+                "строк без такого явного требования. "
+                "Если однозначная числовая граница из вопроса и trusted exact FORMULA "
+                "отличаются только включением или исключением того же значения границы, "
+                "сохраняй оператор из вопроса. "
+                "Если вопрос отбирает сущности по участию в событиях за явно названную "
+                "историческую дату или период и одновременно задаёт возраст этих сущностей, "
+                "считай возраст на дату соответствующего события, если вопрос прямо не "
+                "говорит о текущем возрасте."
             ),
             "max_tokens": 321,
             "model": agent_command.model_mapping[step_model_name("nlu_completeness")],
@@ -2710,6 +4997,33 @@ def test_completeness_prompt_preserves_requested_attribute_owner() -> None:
     assert "не меняет владельца выходного атрибута" in prompt
 
 
+def test_completeness_prompt_preserves_explicit_action_from_initial_item() -> None:
+    from custom_tools.text_to_sql.prompts import build_adaptive_query_completeness_prompt
+
+    initial = _model_response(
+        _model_item(
+            "metric",
+            "district count",
+            normalized_meaning="count of districts offering a standard permit",
+            requested_output=True,
+        ),
+        shape="scalar",
+    )
+    prompt = build_adaptive_query_completeness_prompt(
+        "How many districts offer a standard permit?",
+        initial,
+    )
+
+    assert "count of districts offering a standard permit" in prompt
+    assert (
+        "Если semantic item первоначального JSON уже сохраняет явно названное "
+        "в исходном тексте действие или роль, не заменяй это действие или роль "
+        "в normalized_meaning. Такая замена допустима только когда исходный текст "
+        "или доверенный контекстный документ прямо задаёт для того же результата "
+        "другое действие или роль."
+    ) in prompt
+
+
 def test_completeness_prompt_preserves_explicit_conditions_and_formulas() -> None:
     from custom_tools.text_to_sql.prompts import build_adaptive_query_completeness_prompt
 
@@ -2741,6 +5055,11 @@ def test_completeness_prompt_preserves_explicit_conditions_and_formulas() -> Non
 
     assert "не удаляй его при исправлении" in prompt
     assert "не объединяй явные условия и формулы внутри описания METRIC" in prompt
+    assert (
+        "Если первоначальный JSON уже содержит exact FILTER, применивший общее правило "
+        "полного same-column pair mapping, сохрани его mapped "
+        "`literal_or_reference` и не возвращай aliases documented predicate."
+    ) in prompt
 
 
 def test_completeness_prompt_preserves_distinctive_representation_as_filter() -> None:
@@ -2970,10 +5289,11 @@ def test_nlu_processor_derives_unique_unicode_span_from_source_text_with_mandato
             "source_text": "sales",
             "normalized_meaning": "sales",
                 "required": True,
-                "requested_output": True,
-                "owner_item_ordinal": None,
-                "exact_physical_predicate": False,
-            "operator": None,
+                    "requested_output": True,
+                    "owner_item_ordinal": None,
+                    "exact_physical_predicate": False,
+                    "exact_physical_column_name": None,
+                "operator": None,
             "literal_or_reference": None,
             "status": "unresolved",
         },
@@ -3009,10 +5329,11 @@ def test_nlu_processor_uses_completeness_call_for_repeated_source_text(
             "source_text": "sales",
             "normalized_meaning": "sales",
                 "required": True,
-                "requested_output": True,
-                "owner_item_ordinal": None,
-                "exact_physical_predicate": False,
-            "operator": None,
+                    "requested_output": True,
+                    "owner_item_ordinal": None,
+                    "exact_physical_predicate": False,
+                    "exact_physical_column_name": None,
+                "operator": None,
             "literal_or_reference": None,
             "status": "unresolved",
         }
@@ -3190,6 +5511,37 @@ def test_nlu_processor_fails_closed_when_completeness_response_is_malformed(
         )
 
     assert calls == 2
+
+
+def test_nlu_processor_unwraps_exact_answer_object_from_completeness_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import custom_tools.text_to_sql.nlu as nlu_module
+
+    response = _model_response(
+        _model_item("metric", "total sales", normalized_meaning="total sales"),
+        shape="scalar",
+    )
+    calls = 0
+
+    def fake_call_openai_api(**_kwargs):
+        nonlocal calls
+        calls += 1
+        payload = response if calls == 1 else {"answer": response}
+        return json.dumps(payload)
+
+    monkeypatch.setattr(nlu_module, "call_openai_api", fake_call_openai_api)
+    monkeypatch.setattr(nlu_module, "_nlu_max_tokens", lambda _key: 321)
+
+    spec = nlu_module.NLUProcessor()._understand_query(
+        "What are total sales?",
+        run_id=RUN_ID,
+        run_incarnation=INCARNATION,
+    )
+
+    assert calls == 2
+    assert spec.expected_result_shape is ExpectedResultShape.SCALAR
+    assert spec.semantic_items[0].source_text == "total sales"
 
 
 def test_adaptive_query_understanding_has_its_own_bounded_token_config(

@@ -12,6 +12,7 @@ import inspect
 import json
 import logging
 import re
+import sqlite3
 import uuid
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, List, Any, Optional, Set, Union
@@ -142,11 +143,26 @@ class WorkflowEngine(DynamicAgentSystem):
         write: Callable[[], Awaitable[Any]],
     ) -> Any:
         deadline = self._context_deadline(context)
-        if deadline is None:
-            return await write()
 
         async def run_write(_context: object) -> Any:
-            return await write()
+            try:
+                return await write()
+            except sqlite3.OperationalError as exc:
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                if (
+                    not isinstance(error_code, int)
+                    or error_code & 0xFF != sqlite3.SQLITE_IOERR
+                ):
+                    raise
+                logger.warning(
+                    "Transient SQLite I/O error during %s; retrying once",
+                    boundary,
+                )
+                await asyncio.sleep(0.1)
+                return await write()
+
+        if deadline is None:
+            return await run_write(None)
 
         return await execute_step_attempt(
             boundary,
@@ -1674,7 +1690,7 @@ class WorkflowEngine(DynamicAgentSystem):
                 logger.debug(f"🔧 Стандартная подстановка не сработала: {e}")
                 pass
         else:
-            logger.debug(f"🔧 Обнаружены переменные с точками, пропускаем стандартную подстановку")
+            logger.debug("🔧 Обнаружены переменные с точками, пропускаем стандартную подстановку")
         
         # Если стандартная подстановка не сработала, используем кастомную
         result = template

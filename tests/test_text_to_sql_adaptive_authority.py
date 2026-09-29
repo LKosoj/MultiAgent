@@ -331,6 +331,36 @@ def test_discriminator_value_filter_with_exact_current_evidence_is_allowed() -> 
     assert decision.requirements.allowed_predicates == (predicate,)
 
 
+@pytest.mark.parametrize(
+    ("operator", "right"),
+    (
+        (PredicateOperator.EQ, "premium"),
+        (PredicateOperator.IN, ("premium", "standard")),
+    ),
+)
+def test_discriminator_value_filter_requires_exact_value_evidence(
+    operator: PredicateOperator,
+    right: object,
+) -> None:
+    column = _column("orders", "tier")
+    predicate = PredicateRef(left=column, operator=operator, right=right)
+    schema_evidence = _schema_evidence("tier-schema", column)
+    binding = _discriminator_binding(
+        column,
+        predicate,
+        (schema_evidence.evidence_id,),
+    )
+    state = _required_filter_state(binding, (schema_evidence,), right, operator)
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is False
+    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+    assert decision.affected_source_ids == ("source-a",)
+
+
 def test_discriminator_null_filter_requires_schema_and_exact_null_value() -> None:
     column = _column("orders", "cancelled_at")
     predicate = PredicateRef(
@@ -359,6 +389,35 @@ def test_discriminator_null_filter_requires_schema_and_exact_null_value() -> Non
     assert decision.allowed is True
     assert decision.requirements is not None
     assert decision.requirements.allowed_predicates == (predicate,)
+
+
+def test_discriminator_null_filter_with_schema_only_evidence_is_deferred() -> None:
+    column = _column("orders", "cancelled_at")
+    predicate = PredicateRef(
+        left=column,
+        operator=PredicateOperator.IS_NULL,
+        right=None,
+    )
+    schema_evidence = _schema_evidence("cancelled-schema", column)
+    binding = _discriminator_binding(
+        column,
+        predicate,
+        (schema_evidence.evidence_id,),
+    )
+    state = _required_filter_state(
+        binding,
+        (schema_evidence,),
+        None,
+        PredicateOperator.IS_NULL,
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is False
+    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+    assert decision.affected_source_ids == ("source-a",)
 
 
 def test_filter_allows_supporting_physical_column_alongside_predicate_binding() -> None:
@@ -678,7 +737,7 @@ def test_filter_operator_does_not_require_an_observed_matching_row(
 @pytest.mark.parametrize(
     "case", ("wrong-value", "wrong-column", "wrong-type", "missing")
 )
-def test_value_filter_ignores_unrelated_observed_values(case: str) -> None:
+def test_value_filter_requires_matching_observed_value(case: str) -> None:
     column = _column("orders", "tier")
     literal: str | int = 1 if case == "wrong-type" else "premium"
     predicate = PredicateRef(
@@ -711,9 +770,9 @@ def test_value_filter_ignores_unrelated_observed_values(case: str) -> None:
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is True
-    assert decision.requirements is not None
-    assert decision.requirements.allowed_predicates == (predicate,)
+    assert decision.allowed is False
+    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
+    assert decision.affected_source_ids == ("source-a",)
 
 
 def test_value_filter_with_stale_value_evidence_is_deferred() -> None:

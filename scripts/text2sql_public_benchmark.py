@@ -92,7 +92,7 @@ CANONICAL_CASE_COUNTS = {"bird": 500, "spider": 135}
 CANONICAL_RELEASE_DATASET_ORDER = release_support.CANONICAL_RELEASE_DATASET_ORDER
 RELEASE_POLICY_PATH = REPO_ROOT / "config/text_to_sql/public_benchmark_release_policy.json"
 EARLY_STOP_AWAITING_DECISION = 2
-STALE_TRACE_SECONDS = 300.0
+STALE_TRACE_SECONDS = 600.0
 _SCHEMA_ABSTENTION_REASONS = frozenset(
     {
         "SCHEMA_CLARIFICATION_REQUIRED",
@@ -927,7 +927,7 @@ def _client(base_url: str, token: str) -> TextToSqlApiClient:
         auth_headers=lambda: {"Authorization": f"Bearer {token}"},
         poll_interval_seconds=1.0,
         max_poll_attempts=1200,
-        request_timeout_seconds=600,
+        request_timeout_seconds=1200,
     )
 
 

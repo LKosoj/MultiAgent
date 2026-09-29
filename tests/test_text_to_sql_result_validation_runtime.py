@@ -468,19 +468,21 @@ def test_result_review_runtime_forwards_remaining_deadline_and_skips_expired_cal
     assert response_format["json_schema"]["schema"]["required"] == [
         "status",
         "reason",
-        "source_id",
+        "source_handle",
         "repair_kind",
         "repair_binding_id",
         "predicate_authority",
+        "row_grain_requirement",
     ]
-    assert response_format["json_schema"]["schema"]["properties"]["source_id"] == {
+    assert response_format["json_schema"]["schema"]["properties"]["source_handle"] == {
         "anyOf": [
-            {"enum": ["status"], "type": "string"},
+            {"enum": ["r1"], "type": "string"},
             {"type": "null"},
         ],
         "default": None,
-        "title": "Source Id",
+        "title": "Source Handle",
     }
+    assert "source_id" not in response_format["json_schema"]["schema"]["properties"]
 
     expired_runtime, _ = _runtime_with_persisted_candidate(
         tmp_path / "expired",

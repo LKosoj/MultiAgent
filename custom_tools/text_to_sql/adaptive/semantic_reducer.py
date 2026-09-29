@@ -50,6 +50,7 @@ from .models import (
     ResearchAction,
     ResearchActionKind,
     ResearchState,
+    SemanticItemKind,
     TableRef,
     TargetRef,
     VerticalAttributeBinding,
@@ -89,8 +90,30 @@ from .research_decision import (
 from .state import ResearchNovelty, ResearchTransitionResult, apply_research_transition
 
 
+@dataclass(frozen=True)
+class _PartialSelectedCandidateCommitGap:
+    """One selected semantic item whose candidate assessments are incomplete."""
+
+    source_id: str
+    required_binding_assessment_ids: tuple[str, ...]
+    unassessed_binding_ids: tuple[str, ...]
+
+
 class SemanticReducerError(ValueError):
     """A semantic proposal is not admissible from the supplied trusted facts."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_selected_candidate_commit_gaps: tuple[
+            _PartialSelectedCandidateCommitGap, ...
+        ] = (),
+    ) -> None:
+        super().__init__(message)
+        self.partial_selected_candidate_commit_gaps = (
+            partial_selected_candidate_commit_gaps
+        )
 
 
 def derive_result_expectations(
@@ -130,6 +153,7 @@ class TrustedSemanticBatch(StrictModel):
     documents: tuple[DocumentRef, ...] = ()
     schema_columns: tuple[ColumnRef, ...] = ()
     declared_join_ids: tuple[Id, ...] = ()
+    exact_physical_column_names: tuple[tuple[Id, NonEmptyText], ...] = ()
 
     def model_post_init(self, __context: object) -> None:
         table_keys = [item.logical_table for item in self.tables]
@@ -137,12 +161,17 @@ class TrustedSemanticBatch(StrictModel):
             (item.logical_table, item.logical_column) for item in self.columns
         ]
         document_ids = [item.document_id for item in self.documents]
+        exact_column_source_ids = [
+            source_id for source_id, _ in self.exact_physical_column_names
+        ]
         if len(table_keys) != len(set(table_keys)):
             raise ValueError("resolved logical tables must be unique")
         if len(column_keys) != len(set(column_keys)):
             raise ValueError("resolved logical columns must be unique")
         if len(document_ids) != len(set(document_ids)):
             raise ValueError("resolved documents must be unique")
+        if len(exact_column_source_ids) != len(set(exact_column_source_ids)):
+            raise ValueError("exact physical column source IDs must be unique")
 
 
 class TrustedToolClaim(StrictModel):
@@ -286,12 +315,13 @@ def admit_semantic_turn(
                 proposal_ids,
                 current.schema_namespace_version,
             )
+            _require_exact_physical_column_name(item, batch)
             proposal_ids[proposal.proposal_key] = item.binding_id
             new_bindings.append(item)
     _require_unique_ids((item.binding_id for item in new_bindings), "binding")
 
     updates_hypotheses: list[Hypothesis] = []
-    updates_bindings: list[BindingBase] = []
+    updates_bindings: dict[str, BindingBase] = {}
     updates_joins: list[JoinCandidate] = []
     for proposal in decision.proposals:
         if isinstance(proposal, HypothesisAssessment):
@@ -311,15 +341,39 @@ def admit_semantic_turn(
             if old is None:
                 raise SemanticReducerError("binding assessment subject does not exist")
             cited = _cited_records(proposal.citation_evidence_ids, evidence, fresh)
-            updates_bindings.append(
-                _assess_binding(
-                    old,
-                    proposal.certificate,
-                    cited,
-                    joins_by_id,
-                    schema_columns=batch.schema_columns,
-                )
+            if proposal.certificate == "consistent" and old.status is BindingStatus.CANDIDATE:
+                _require_exact_physical_column_name(old, batch)
+            assessed = _assess_binding(
+                old,
+                proposal.certificate,
+                cited,
+                joins_by_id,
+                schema_columns=batch.schema_columns,
+                recovery_replacements=tuple(new_bindings),
             )
+            if old.binding_id not in updates_bindings:
+                updates_bindings[old.binding_id] = assessed
+            if (
+                isinstance(old, DiscriminatorValueBinding)
+                and assessed.status is BindingStatus.STALE
+            ):
+                for peer in bindings_by_id.values():
+                    if (
+                        peer.binding_id != old.binding_id
+                        and isinstance(peer, DiscriminatorValueBinding)
+                        and peer.status is BindingStatus.SUPPORTED
+                        and peer.source_id == old.source_id
+                        and peer.discriminator_column == old.discriminator_column
+                        and peer.discriminator_predicate == old.discriminator_predicate
+                    ):
+                        updates_bindings[peer.binding_id] = peer.model_copy(
+                            update={
+                                "status": BindingStatus.STALE,
+                                "evidence_ids": _append_evidence(
+                                    peer.evidence_ids, cited
+                                ),
+                            }
+                        )
         elif isinstance(proposal, JoinAssessment):
             subject = _existing_id(proposal.subject, "join")
             old = joins_by_id.get(subject)
@@ -337,6 +391,7 @@ def admit_semantic_turn(
             )
 
     if isinstance(decision.next, SemanticCommitRequest):
+        _reject_partial_selected_candidate_commit(current, decision, bindings_by_id)
         action = _action_for_semantic_commit(decision, current)
     else:
         if tool_claim is None:
@@ -352,7 +407,10 @@ def admit_semantic_turn(
             )
         ),
         tuple(
-            sorted((*new_bindings, *updates_bindings), key=lambda item: item.binding_id)
+            sorted(
+                (*new_bindings, *updates_bindings.values()),
+                key=lambda item: item.binding_id,
+            )
         ),
         tuple(sorted((*new_joins, *updates_joins), key=lambda item: item.join_id)),
         budget_state,
@@ -360,11 +418,105 @@ def admit_semantic_turn(
     )
 
 
+def _reject_partial_selected_candidate_commit(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+    bindings_by_id: Mapping[str, BindingBase],
+) -> None:
+    gaps = _partial_selected_candidate_commit_gaps(
+        state, decision, bindings_by_id
+    )
+    if gaps:
+        raise SemanticReducerError(
+            "semantic commit leaves selected candidate bindings unassessed",
+            partial_selected_candidate_commit_gaps=gaps,
+        )
+
+
+def _partial_selected_candidate_commit_gaps(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+    bindings_by_id: Mapping[str, BindingBase],
+) -> tuple[_PartialSelectedCandidateCommitGap, ...]:
+    """Return deterministic assessment gaps for selected candidate bindings."""
+
+    gaps: list[_PartialSelectedCandidateCommitGap] = []
+    assessed_ids = {
+        _existing_id(proposal.subject, "binding")
+        for proposal in decision.proposals
+        if isinstance(proposal, BindingAssessment)
+    }
+    promoted_ids = {
+        _existing_id(proposal.subject, "binding")
+        for proposal in decision.proposals
+        if isinstance(proposal, BindingAssessment)
+        and proposal.certificate == "consistent"
+        and bindings_by_id[_existing_id(proposal.subject, "binding")].status
+        is BindingStatus.CANDIDATE
+    }
+    for item in state.query_spec.semantic_items:
+        selected_candidate_ids = {
+            binding_id
+            for binding_id in item.binding_ids
+            if bindings_by_id[binding_id].status is BindingStatus.CANDIDATE
+        }
+        unassessed_ids = selected_candidate_ids - assessed_ids
+        if (
+            item.kind is SemanticItemKind.DIMENSION
+            and item.source_id in state.query_spec.requested_output_source_ids
+        ):
+            promoted_columns = {
+                binding.physical_column
+                for binding_id in selected_candidate_ids & promoted_ids
+                if isinstance(
+                    binding := bindings_by_id[binding_id], PhysicalColumnBinding
+                )
+            }
+            unassessed_ids = {
+                binding_id
+                for binding_id in unassessed_ids
+                if not isinstance(
+                    binding := bindings_by_id[binding_id], PhysicalColumnBinding
+                )
+                or binding.physical_column not in promoted_columns
+            }
+        if (
+            selected_candidate_ids & promoted_ids
+            and unassessed_ids
+        ):
+            gaps.append(
+                _PartialSelectedCandidateCommitGap(
+                    source_id=item.source_id,
+                    required_binding_assessment_ids=tuple(
+                        sorted(selected_candidate_ids)
+                    ),
+                    unassessed_binding_ids=tuple(sorted(unassessed_ids)),
+                )
+            )
+    return tuple(sorted(gaps, key=lambda gap: gap.source_id))
+
+
 def _require_unique_ids(identifiers, label: str) -> None:
     values = tuple(identifiers)
     if len(values) != len(set(values)):
         raise SemanticReducerError(
             f"resolved proposals produce duplicate {label} identifiers"
+        )
+
+
+def _require_exact_physical_column_name(
+    binding: BindingBase,
+    batch: TrustedSemanticBatch,
+) -> None:
+    expected_column_names = dict(batch.exact_physical_column_names)
+    expected = expected_column_names.get(binding.source_id)
+    if (
+        expected is not None
+        and isinstance(binding, DiscriminatorValueBinding)
+        and binding.discriminator_column.column != expected
+    ):
+        raise SemanticReducerError(
+            "discriminator binding differs from the exact physical column"
         )
 
 
@@ -974,10 +1126,22 @@ def _assess_binding(
     joins: Mapping[str, JoinCandidate],
     *,
     schema_columns: tuple[ColumnRef, ...] = (),
+    recovery_replacements: tuple[BindingBase, ...] = (),
 ) -> BindingBase:
     if certificate == "insufficient":
         return item
     if certificate == "contradicted":
+        if _categorical_in_recovery_replacement_certificate(
+            item,
+            cited,
+            recovery_replacements,
+        ):
+            return item.model_copy(
+                update={
+                    "status": BindingStatus.STALE,
+                    "evidence_ids": _append_evidence(item.evidence_ids, cited),
+                }
+            )
         # No sampled/top-k absence is ever a rejection certificate.
         raise SemanticReducerError("binding rejection has no permitted certificate")
     kind = item.kind
@@ -1030,6 +1194,141 @@ def _assess_binding(
     )
 
 
+def _categorical_in_recovery_replacement_certificate(
+    item: BindingBase,
+    cited: tuple[EvidenceRecord, ...],
+    replacements: tuple[BindingBase, ...],
+) -> bool:
+    if not (
+        isinstance(item, DiscriminatorValueBinding)
+        and item.status in (BindingStatus.SUPPORTED, BindingStatus.CANDIDATE)
+        and item.discriminator_predicate.operator is PredicateOperator.IN
+        and isinstance(item.discriminator_column, ColumnRef)
+        and type(item.discriminator_predicate.right) is tuple
+        and item.discriminator_predicate.right
+        and all(type(value) is str for value in item.discriminator_predicate.right)
+    ):
+        return False
+    old_literals = item.discriminator_predicate.right
+    candidates = tuple(
+        replacement
+        for replacement in replacements
+        if isinstance(replacement, DiscriminatorValueBinding)
+        and replacement.source_id == item.source_id
+        and replacement.status is BindingStatus.CANDIDATE
+        and replacement.discriminator_column == item.discriminator_column
+        and replacement.discriminator_predicate.operator is PredicateOperator.IN
+        and type(replacement.discriminator_predicate.right) is tuple
+        and replacement.discriminator_predicate.right
+        and all(
+            type(value) is str for value in replacement.discriminator_predicate.right
+        )
+        and len(set(replacement.discriminator_predicate.right))
+        == len(replacement.discriminator_predicate.right)
+    )
+    if len(candidates) != 1:
+        return False
+    recovered_literals = candidates[0].discriminator_predicate.right
+    return (
+        all(literal not in old_literals for literal in recovered_literals)
+        and all(
+            _exact_zero_search_value(item.discriminator_column, literal, cited)
+            for literal in old_literals
+        )
+        and _untruncated_distinct_contains_values(
+            item.discriminator_column,
+            recovered_literals,
+            cited,
+        )
+        and all(
+            _exact_positive_search_value(
+                item.discriminator_column,
+                literal,
+                tuple(
+                    record
+                    for record in cited
+                    if record.evidence_id in candidates[0].evidence_ids
+                ),
+            )
+            for literal in recovered_literals
+        )
+    )
+
+
+def _exact_zero_search_value(
+    column: ColumnRef,
+    literal: str,
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    return any(
+        _search_value_payload_matches(record, column, literal, rows_empty=True)
+        for record in cited
+    )
+
+
+def _exact_positive_search_value(
+    column: ColumnRef,
+    literal: str,
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    return any(
+        _search_value_payload_matches(record, column, literal, rows_empty=False)
+        and _evidence_observes_exact_value(record, column, literal)
+        for record in cited
+    )
+
+
+def _search_value_payload_matches(
+    record: EvidenceRecord,
+    column: ColumnRef,
+    literal: str,
+    *,
+    rows_empty: bool,
+) -> bool:
+    provenance, payload = _payload(record)
+    return (
+        provenance.probe_kind is ResearchActionKind.SEARCH_VALUE
+        and not _observation_truncated(record)
+        and record.target == column
+        and isinstance(payload, dict)
+        and payload.get("columns") == [column.column]
+        and type(payload.get("requested_value")) is str
+        and payload["requested_value"] == literal
+        and isinstance(payload.get("rows"), list)
+        and bool(payload["rows"]) is not rows_empty
+    )
+
+
+def _untruncated_distinct_contains_values(
+    column: ColumnRef,
+    literals: tuple[str, ...],
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    for record in cited:
+        provenance, payload = _payload(record)
+        if not (
+            provenance.probe_kind is ResearchActionKind.DISTINCT_VALUES
+            and not _observation_truncated(record)
+            and record.target == column
+            and isinstance(payload, dict)
+            and payload.get("columns") == [column.column]
+            and isinstance(payload.get("rows"), list)
+            and all(
+                any(
+                    type(row) is list
+                    and len(row) == 1
+                    and type(row[0]) is str
+                    and row[0] == literal
+                    for row in payload["rows"]
+                )
+                for literal in literals
+            )
+        ):
+            continue
+        return True
+    return False
+
+
 def _exact_column(record: EvidenceRecord, column: ColumnRef) -> bool:
     try:
         return evidence_observes_exact_column(record, column)
@@ -1063,12 +1362,48 @@ def _discriminator_certificate(
             schema_columns,
         )
         and predicate_has_valid_literal(predicate)
+        and not _conflicting_exact_search_value(predicate, cited)
         and (
             not _temporal_numeric_bound(predicate, cited)
             or _cited_numeric_representation(predicate.left, cited)
         )
         for predicate in item.predicates
     )
+
+
+def _conflicting_exact_search_value(
+    predicate: PredicateRef,
+    cited: tuple[EvidenceRecord, ...],
+) -> bool:
+    if predicate.operator is not PredicateOperator.EQ or not isinstance(
+        predicate.left, ColumnRef
+    ):
+        return False
+    expected = (
+        predicate.right.value
+        if type(predicate.right) is LiteralValue
+        else predicate.right
+    )
+    if expected is None or type(expected) is tuple:
+        return False
+    for record in cited:
+        provenance, payload = _payload(record)
+        if not (
+            provenance.probe_kind is ResearchActionKind.SEARCH_VALUE
+            and record.target == predicate.left
+            and isinstance(payload, dict)
+            and payload.get("columns") == [predicate.left.column]
+            and "requested_value" in payload
+        ):
+            continue
+        requested = payload.get("requested_value")
+        rows = payload.get("rows")
+        same_literal = type(requested) is type(expected) and requested == expected
+        if same_literal and rows == []:
+            return True
+        if not same_literal and isinstance(rows, list) and rows:
+            return True
+    return False
 
 
 def _temporal_numeric_bound(

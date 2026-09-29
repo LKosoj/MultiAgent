@@ -15,6 +15,7 @@ from .result_review import (
     RESULT_REVIEW_RUNTIME_KEY,
     _ArbitrationResponse,
     _ModelReviewResponse,
+    _source_handle_mapping,
     create_result_review_arbitration_capability,
     create_result_review_capability,
 )
@@ -247,11 +248,10 @@ def build_result_review_runtime(runtime: object, *, sql_query: object) -> object
             runtime.query,
         )
         review_schema = _ModelReviewResponse.model_json_schema()
+        review_schema["properties"].pop("source_id")
         review_schema["required"] = list(review_schema["properties"])
-        review_schema["properties"]["source_id"]["anyOf"][0] = {
-            "enum": sorted(
-                {binding.source_id for binding in requirements.selected_bindings}
-            ),
+        review_schema["properties"]["source_handle"]["anyOf"][0] = {
+            "enum": list(_source_handle_mapping(requirements)),
             "type": "string",
         }
         response_format = {

@@ -41,7 +41,11 @@ from custom_tools.text_to_sql.llm_models_config import (
 from llm_call_context import llm_call_context
 from custom_tools.text_to_sql.nlu import NLUProcessor
 from custom_tools.text_to_sql.schema_enricher import SchemaEnricher
-from custom_tools.text_to_sql.schema_loader import LoadedSchema, SchemaLoader
+from custom_tools.text_to_sql.schema_loader import (
+    LoadedSchema,
+    SchemaLoader,
+    compute_editable_schema_digest,
+)
 from custom_tools.text_to_sql.schema_memory import SchemaMemoryManager
 from custom_tools.text_to_sql.schema_namespace import SchemaScope
 from custom_tools.text_to_sql.validators.schema_limiter import SchemaLimiter
@@ -104,10 +108,18 @@ async def run_typed_schema_research(
         dsn=runtime.dsn,
     )
     if loaded_schema.schema != schema_before_enrichment and not scope.transient:
+        raw_document = await asyncio.to_thread(
+            schema_loader.merge_enriched_schema_metadata,
+            runtime.dsn,
+            loaded_schema.schema,
+        )
         snapshot = schema_loader.file_manager.load_scoped_snapshot(scope)
         if snapshot is None:
             raise RuntimeError("Scoped schema snapshot is missing after live load")
         snapshot["schema_info"] = loaded_schema.schema
+        snapshot["editable_schema_digest"] = compute_editable_schema_digest(
+            raw_document.get("schema_info")
+        )
         schema_loader.file_manager.save_scoped_snapshot(scope, snapshot)
     # Glossary synonyms are merged after the snapshot is saved so the
     # "Синонимы: ..." notes never persist into sqlrag/ and re-accumulate.

@@ -1,6 +1,7 @@
 """Контракты typed-состояния Text-to-SQL должны отвергать неполные факты."""
 
 from datetime import UTC, datetime
+import json
 
 import pytest
 from pydantic import ValidationError
@@ -459,6 +460,34 @@ def test_query_spec_checks_resolved_binding() -> None:
         item(status=SemanticItemStatus.RESOLVED)
 
 
+@pytest.mark.parametrize(
+    ("kind", "exact_physical_predicate", "operator"),
+    (
+        ("filter", False, "eq"),
+        ("metric", True, "eq"),
+        ("time", True, None),
+    ),
+)
+def test_query_spec_replay_rejects_invalid_exact_physical_column_constraint(
+    kind: str,
+    exact_physical_predicate: bool,
+    operator: str | None,
+) -> None:
+    payload = query_spec().model_dump(mode="json")
+    item_payload = payload["semantic_items"][0]
+    item_payload.update(
+        {
+            "kind": kind,
+            "exact_physical_predicate": exact_physical_predicate,
+            "exact_physical_column_name": "body_text",
+            "operator": operator,
+        }
+    )
+
+    with pytest.raises(ValidationError, match="exact_physical_column_name"):
+        QuerySpec.model_validate_json(json.dumps(payload))
+
+
 def test_resolved_binding_free_formula_does_not_open_unbound_limit() -> None:
     formula = SemanticItem(
         source_id="formula",
@@ -487,7 +516,7 @@ def test_resolved_binding_free_formula_does_not_open_unbound_limit() -> None:
         )
 
 
-def test_query_spec_requires_canonical_requested_output_source_ids() -> None:
+def test_query_spec_requires_unique_requested_output_source_ids() -> None:
     first = item(source_id="source-1")
     second = item(source_id="source-2")
     values = query_spec(semantic_items=(first, second)).model_dump()
@@ -507,8 +536,12 @@ def test_query_spec_requires_canonical_requested_output_source_ids() -> None:
 
     unordered = dict(values)
     unordered["requested_output_source_ids"] = ("source-2", "source-1")
-    with pytest.raises(ValidationError, match="sorted"):
-        QuerySpec(**unordered)
+    assert QuerySpec(**unordered).requested_output_source_ids == ("source-2", "source-1")
+
+    duplicate = dict(values)
+    duplicate["requested_output_source_ids"] = ("source-1", "source-1")
+    with pytest.raises(ValidationError, match="unique"):
+        QuerySpec(**duplicate)
 
 
 def test_semantic_item_does_not_require_source_span() -> None:

@@ -1655,6 +1655,46 @@ def test_schema_validator_flags_ambiguous_unqualified_columns():
     assert any(issue["issue_type"] == "AMBIGUOUS_COLUMN" for issue in result["issues"])
 
 
+def test_schema_validator_resolves_unqualified_columns_from_cte_row_source():
+    validator = SQLSchemaValidator()
+    schema = {
+        "items": {
+            "columns": {
+                "label": {"type": "TEXT"},
+                "score": {"type": "INTEGER"},
+            }
+        }
+    }
+
+    result = validator.validate_sql_against_schema(
+        "WITH scoped_items AS ("
+        "SELECT i.label AS output_label, i.score FROM items AS i"
+        ") "
+        "SELECT output_label FROM scoped_items "
+        "WHERE score = (SELECT MAX(score) FROM scoped_items)",
+        schema,
+    )
+
+    assert result["is_valid"] is True
+
+
+def test_schema_validator_rejects_column_outside_cte_row_source():
+    validator = SQLSchemaValidator()
+    schema = {
+        "items": {"columns": {"score": {"type": "INTEGER"}}},
+        "other": {"columns": {"outside_only": {"type": "TEXT"}}},
+    }
+
+    result = validator.validate_sql_against_schema(
+        "WITH scoped_items AS (SELECT score FROM items) "
+        "SELECT outside_only FROM scoped_items",
+        schema,
+    )
+
+    assert result["is_valid"] is False
+    assert any(issue["issue_type"] == "UNKNOWN_COLUMN" for issue in result["issues"])
+
+
 def test_schema_validator_accepts_short_names_for_qualified_schema():
     validator = SQLSchemaValidator()
     schema = {"public.orders": {"columns": {"amount": {"type": "DECIMAL"}}}}

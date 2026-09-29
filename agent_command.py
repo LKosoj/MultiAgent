@@ -1,10 +1,13 @@
 import functools
+import math
 import os
 import yaml
 
 from retry_openai_model import RetryOpenAIServerModel
 
 custom_role_conversions = {"tool-call": "assistant", "tool-response": "user"}
+
+_TEXT_TO_SQL_MODEL_TIMEOUT_SECONDS = 600.0
 
 _MODEL_CONFIGS: dict[str, dict] = {
     "model_search": {
@@ -110,13 +113,26 @@ def create_text_to_sql_model(
 ) -> RetryOpenAIServerModel:
     """Create the isolated Typed provider with its per-call contract."""
 
+    if timeout_seconds is None:
+        effective_timeout = _TEXT_TO_SQL_MODEL_TIMEOUT_SECONDS
+    elif (
+        not isinstance(timeout_seconds, bool)
+        and isinstance(timeout_seconds, (int, float))
+        and math.isfinite(float(timeout_seconds))
+    ):
+        effective_timeout = min(
+            float(timeout_seconds), _TEXT_TO_SQL_MODEL_TIMEOUT_SECONDS
+        )
+    else:
+        effective_timeout = timeout_seconds
+
     return _create_model(
         name,
         max_tokens=max_tokens,
         temperature=temperature,
         max_retries=0,
         client_kwargs={"max_retries": client_max_retries},
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=effective_timeout,
     )
 
 
