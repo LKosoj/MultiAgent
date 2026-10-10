@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pydantic import ValidationError
+from sqlglot import exp, parse_one
+from sqlglot.optimizer.scope import Scope, build_scope
 
 from ..dialects import get_sqlglot_dialect
-from ._semantic_matching import predicate_matches
-from ._semantic_value_certificate import predicate_has_exact_value_certificate
 from ._semantic_coverage_footprint import (
     canonical_binding,
     canonical_join,
@@ -24,20 +24,15 @@ from .models import (
     CheckResult,
     CheckStatus,
     ColumnRef,
-    DerivedExpressionBinding,
-    EvidenceSourceKind,
+    ExpectedResultShape,
     JoinCandidateStatus,
-    PhysicalColumnBinding,
-    PredicateOperator,
-    PredicateRef,
-    QuerySpec,
     RepairKind,
     ResearchState,
     SemanticItem,
     SemanticItemKind,
-    SemanticItemStatus,
     TableRef,
     is_binding_free_semantic_item,
+    is_structurally_resolved_limit,
 )
 from .semantic_coverage import (
     CoverageRequirements,
@@ -49,42 +44,23 @@ from .semantic_plan import (
     _relation_tables,
     _resolve_column_ref,
     collect_ast_columns,
-    predicate_from_expression,
 )
 
 
 _AUTHORITY_FAILURE_ORDER = (
     CheckFailureCode.UNAUTHORIZED_TABLE,
     CheckFailureCode.UNAUTHORIZED_COLUMN,
-    CheckFailureCode.UNAUTHORIZED_LITERAL,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class _PredicateOccurrence:
-    node_id: str
-    scope_id: str
-    relation_scope_ids: tuple[str, ...]
-    expression_field: str
-    expression_index: int
-    expression_path: tuple[tuple[str, int], ...]
-    unordered_between: bool
-    predicate: PredicateRef
 
 
 @dataclass(frozen=True, slots=True)
 class _SemanticContext:
     check_input: SemanticCheckInput
-    query_spec: QuerySpec
-    state: ResearchState
     requirements: CoverageRequirements
-    bindings_by_source: dict[str, tuple[object, ...]]
     items_by_kind: dict[SemanticItemKind, tuple[SemanticItem, ...]]
     tables: tuple[tuple[str, TableRef], ...]
     columns: tuple[AstColumnOccurrence, ...]
-    relation_tables: dict[str, TableRef]
     root_scope_ids: frozenset[str]
-    authority_predicates: tuple[_PredicateOccurrence, ...]
     expression_relation_node_ids: frozenset[str]
 
 
@@ -94,31 +70,148 @@ class _SemanticInputError(ValueError):
         self.ast_node_ids = tuple(sorted(set(ast_node_ids)))
 
 
-def _deferred_limit_mismatch(context: _SemanticContext) -> CheckResult | None:
-    deferred_limits = tuple(
+def _required_limit_mismatch(context: _SemanticContext) -> CheckResult | None:
+    required_limits = tuple(
         item
         for item in context.items_by_kind.get(SemanticItemKind.LIMIT, ())
-        if item.required and item.literal_or_reference is None
+        if item.required
+        and (
+            item.literal_or_reference is None
+            or is_structurally_resolved_limit(item)
+        )
     )
-    if not deferred_limits:
+    if not required_limits:
         return None
+    if _partitioned_rank_limit_satisfied(context, required_limits):
+        return None
+    if any(
+        fact.scope_id in context.root_scope_ids
+        for fact in context.check_input.parsed_ast.expression_relations
+    ):
+        required_limits = tuple(
+            item for item in required_limits if item.literal_or_reference is None
+        )
+        if not required_limits:
+            return None
     root_limits = tuple(
         limit
         for limit in context.check_input.parsed_ast.limits
         if limit.scope_id in context.root_scope_ids
     )
+    required_count = (
+        required_limits[0].literal_or_reference
+        if len(required_limits) == 1
+        else None
+    )
+    candidate_limits = root_limits
+    if type(required_count) is int:
+        reachable_scope_ids = _reachable_scope_ids(context.check_input.parsed_ast)
+        candidate_limits = tuple(
+            limit
+            for limit in context.check_input.parsed_ast.limits
+            if limit.scope_id in reachable_scope_ids
+        )
     if (
-        len(deferred_limits) == 1
-        and len(root_limits) == 1
-        and type(root_limits[0].count) is int
-        and root_limits[0].count > 0
+        len(required_limits) == 1
+        and len(candidate_limits) == 1
+        and type(candidate_limits[0].count) is int
+        and candidate_limits[0].count > 0
+        and (required_count is None or candidate_limits[0].count == required_count)
     ):
         return None
     return _failure(
         context,
         CheckFailureCode.LIMIT_MISMATCH,
-        sources=tuple(item.source_id for item in deferred_limits),
+        sources=tuple(item.source_id for item in required_limits),
     )
+
+
+def _partitioned_rank_limit_satisfied(
+    context: _SemanticContext,
+    required_limits: tuple[SemanticItem, ...],
+) -> bool:
+    if (
+        context.check_input.query_spec.expected_result_shape
+        is not ExpectedResultShape.RANKED_ROWS
+        or len(required_limits) != 1
+        or type(required_limits[0].literal_or_reference) is not int
+    ):
+        return False
+    required_count = required_limits[0].literal_or_reference
+    root = build_scope(
+        parse_one(
+            context.check_input.candidate.sql,
+            read=context.check_input.parsed_ast.dialect,
+        )
+    )
+    if root is None:
+        return False
+    for relation_name, source in root.sources.items():
+        if not isinstance(source, Scope):
+            continue
+        rank_aliases = {
+            projection.alias_or_name
+            for projection in source.expression.selects
+            if projection.alias_or_name
+            and _is_partitioned_rank_expression(
+                projection.this if isinstance(projection, exp.Alias) else projection
+            )
+        }
+        if rank_aliases and _has_rank_threshold(
+            root, relation_name, rank_aliases, required_count
+        ):
+            return True
+    return False
+
+
+def _is_partitioned_rank_expression(expression: exp.Expression) -> bool:
+    return (
+        isinstance(expression, exp.Window)
+        and bool(expression.args.get("partition_by"))
+        and (
+            isinstance(expression.this, exp.RowNumber)
+            or (
+                isinstance(expression.this, exp.Anonymous)
+                and expression.this.name.lower() in {"rank", "dense_rank"}
+            )
+        )
+    )
+
+
+def _has_rank_threshold(
+    scope: Scope,
+    relation_name: str,
+    rank_aliases: set[str],
+    required_count: int,
+) -> bool:
+    where = scope.expression.args.get("where")
+    if not isinstance(where, exp.Where):
+        return False
+    pending = [where.this]
+    while pending:
+        comparison = pending.pop()
+        while isinstance(comparison, exp.Paren):
+            comparison = comparison.this
+        if isinstance(comparison, exp.And):
+            pending.extend((comparison.this, comparison.expression))
+            continue
+        if not isinstance(comparison, (exp.LTE, exp.LT)):
+            continue
+        column = comparison.this
+        literal = comparison.expression
+        if not isinstance(column, exp.Column) or not isinstance(literal, exp.Literal):
+            continue
+        if column.name not in rank_aliases or (
+            column.table
+            and column.table != relation_name
+            or not column.table
+            and len(scope.sources) != 1
+        ):
+            continue
+        expected = required_count + isinstance(comparison, exp.LT)
+        if not literal.is_string and literal.this == str(expected):
+            return True
+    return False
 
 
 def _binary_null_comparison(context: _SemanticContext) -> CheckResult | None:
@@ -159,16 +252,13 @@ def evaluate_semantic_authority_checks(
         checks = {
             CheckFailureCode.UNAUTHORIZED_TABLE: _unauthorized_table,
             CheckFailureCode.UNAUTHORIZED_COLUMN: _unauthorized_column,
-            CheckFailureCode.UNAUTHORIZED_LITERAL: _unauthorized_authority_literal,
         }
-        for code in _AUTHORITY_FAILURE_ORDER[:2]:
+        for code in _AUTHORITY_FAILURE_ORDER:
             if (result := checks[code](context)) is not None:
                 return result
         if (result := _binary_null_comparison(context)) is not None:
             return result
-        if (result := checks[CheckFailureCode.UNAUTHORIZED_LITERAL](context)) is not None:
-            return result
-        if (result := _deferred_limit_mismatch(context)) is not None:
+        if (result := _required_limit_mismatch(context)) is not None:
             return result
         return _passed(candidate_id)
     except _SemanticInputError as exc:
@@ -215,21 +305,6 @@ def _validated_context(
     ):
         raise _SemanticInputError()
     _validate_requirements_state_membership(required_items, requirements, state)
-    binding_required_source_ids = {
-        item.source_id
-        for item in required_items
-        if not is_binding_free_semantic_item(item)
-    }
-    bindings = {
-        source_id: tuple(
-            binding
-            for binding in requirements.selected_bindings
-            if binding.source_id == source_id
-        )
-        for source_id in binding_required_source_ids
-    }
-    if set(bindings) != binding_required_source_ids:
-        raise _SemanticInputError()
     reachable_scope_ids = _reachable_scope_ids(ast.parsed_ast)
     authority_tables = tuple(
         dict.fromkeys(
@@ -269,24 +344,6 @@ def _validated_context(
             )
         )
     )
-    authority_predicates = tuple(
-        occurrence
-        for node_id, scope_id, field, index, expression in _all_active_expressions(active_ast)
-        for occurrence in _comparison_occurrences(
-            node_id,
-            scope_id,
-            field,
-            index,
-            expression,
-            relation_tables,
-            authority_columns,
-            ast.parsed_ast.dialect,
-            {
-                scan.relation_id: scan.scope_id
-                for scan in active_ast.table_scans
-            },
-        )
-    )
     columns = collect_ast_columns(
         active_ast,
         relation_tables,
@@ -295,10 +352,7 @@ def _validated_context(
     )
     return _SemanticContext(
         check_input=check_input,
-        query_spec=query_spec,
-        state=state,
         requirements=requirements,
-        bindings_by_source=bindings,
         items_by_kind={
             kind: tuple(item for item in required_items if item.kind is kind)
             for kind in SemanticItemKind
@@ -308,13 +362,11 @@ def _validated_context(
             for fact in active_ast.table_scans
         ),
         columns=columns.occurrences,
-        relation_tables=relation_tables,
         root_scope_ids=frozenset(
             scope.scope_id
             for scope in active_ast.scopes
             if scope.parent_scope_id is None and scope.query_role.value == "root"
         ),
-        authority_predicates=authority_predicates,
         expression_relation_node_ids=frozenset(
             fact.node_id for fact in active_ast.expression_relations
         ),
@@ -442,222 +494,6 @@ def _all_active_expressions(parsed_ast: object):
         yield fact.node_id, fact.scope_id, "expression", 0, fact.expression
     for fact in getattr(parsed_ast, "orderings", ()):
         yield fact.node_id, fact.scope_id, "expression", 0, fact.expression
-
-
-def _comparison_occurrences(
-    node_id: str,
-    scope_id: str,
-    expression_field: str,
-    expression_index: int,
-    expression: object,
-    relations: dict[str, TableRef],
-    allowed_columns: tuple[ColumnRef, ...],
-    dialect: str,
-    relation_scopes: dict[str, str],
-) -> tuple[_PredicateOccurrence, ...]:
-    result: list[_PredicateOccurrence] = []
-    pending = [((), expression)]
-    while pending:
-        path, current = pending.pop()
-        predicate = predicate_from_expression(
-            current,
-            relations,
-            scope_id=scope_id,
-            allowed_columns=allowed_columns,
-            dialect=dialect,
-        )
-        if predicate is not None:
-            result.append(
-                _PredicateOccurrence(
-                    node_id=node_id,
-                    scope_id=scope_id,
-                    relation_scope_ids=_predicate_relation_scope_ids(
-                        current,
-                        relation_scopes,
-                    ),
-                    expression_field=expression_field,
-                    expression_index=expression_index,
-                    expression_path=path,
-                    unordered_between=(
-                        getattr(current, "kind", None) == "between"
-                        and getattr(current, "attributes", ()) == (("symmetric", True),)
-                    ),
-                    predicate=predicate,
-                )
-            )
-        pending.extend(
-            ((path + ((argument, ordinal),)), child)
-            for argument, ordinal, child in getattr(current, "children", ())
-        )
-    return tuple(result)
-
-
-def _predicate_relation_scope_ids(
-    expression: object,
-    relation_scopes: dict[str, str],
-) -> tuple[str, ...]:
-    children = {
-        argument: child
-        for argument, ordinal, child in getattr(expression, "children", ())
-        if ordinal == 0
-    }
-    if len(children) != len(getattr(expression, "children", ())) or set(children) != {
-        "this",
-        "expression",
-    }:
-        return ()
-    relation_ids = tuple(
-        dict(getattr(child, "attributes", ())).get("relation_id")
-        for child in (children["this"], children["expression"])
-    )
-    if not all(type(relation_id) is str for relation_id in relation_ids):
-        return ()
-    scopes = tuple(relation_scopes.get(relation_id) for relation_id in relation_ids)
-    return scopes if all(type(scope) is str for scope in scopes) else ()
-
-
-def _required_predicates(context: _SemanticContext) -> tuple[tuple[str, PredicateRef], ...]:
-    result: list[tuple[str, PredicateRef]] = []
-    for item in (
-        *context.items_by_kind[SemanticItemKind.FILTER],
-        *context.items_by_kind[SemanticItemKind.TIME],
-    ):
-        for binding in context.bindings_by_source[item.source_id]:
-            result.extend((item.source_id, predicate) for predicate in binding.predicates)
-    return tuple(result)
-
-
-def _unauthorized_authority_literal(context: _SemanticContext) -> CheckResult | None:
-    allowed = tuple(predicate for _, predicate in _required_predicates(context)) + tuple(context.requirements.allowed_predicates)
-    eligible_evidence_ids = set(context.requirements.eligible_evidence_ids)
-    exact_value_evidence = tuple(
-        record
-        for record in context.state.evidence
-        if record.evidence_id in eligible_evidence_ids
-        and record.source_kind is EvidenceSourceKind.VALUE_SEARCH
-    )
-    nodes = tuple(
-        item.node_id
-        for item in context.authority_predicates
-        if _predicate_has_literal(item.predicate)
-        and item.predicate.operator is not PredicateOperator.LIKE
-        and not _binding_free_formula_authorizes_literal(context, item)
-        and not _derived_formula_annotation_authorizes_literal(context, item)
-        and not _requested_output_authorizes_literal(context, item)
-        and not (
-            item.predicate.left in context.requirements.allowed_columns
-            and item.predicate.operator is PredicateOperator.EQ
-            and predicate_has_exact_value_certificate(
-                item.predicate,
-                exact_value_evidence,
-            )
-        )
-        and not any(
-            _predicate_is_authorized(expected, item)
-            for expected in allowed
-        )
-    )
-    return _failure(context, CheckFailureCode.UNAUTHORIZED_LITERAL, nodes=nodes) if nodes else None
-
-
-def _requested_output_authorizes_literal(
-    context: _SemanticContext,
-    occurrence: _PredicateOccurrence,
-) -> bool:
-    if occurrence.node_id not in {
-        projection.node_id
-        for projection in context.check_input.parsed_ast.projections
-    }:
-        return False
-    requested_source_ids = set(context.query_spec.requested_output_source_ids)
-    for item in context.query_spec.semantic_items:
-        if (
-            item.source_id not in requested_source_ids
-            or item.operator is None
-            or item.literal_or_reference is None
-        ):
-            continue
-        for binding in context.bindings_by_source.get(item.source_id, ()):
-            if type(binding) is not PhysicalColumnBinding:
-                continue
-            try:
-                expected = PredicateRef(
-                    left=binding.physical_column,
-                    operator=item.operator,
-                    right=item.literal_or_reference,
-                )
-            except (ValidationError, TypeError, ValueError):
-                continue
-            if _predicate_is_authorized(expected, occurrence):
-                return True
-    return False
-
-
-def _predicate_has_literal(predicate: PredicateRef) -> bool:
-    return type(predicate.right) is not ColumnRef
-
-
-def _predicate_is_authorized(
-    expected: PredicateRef,
-    occurrence: _PredicateOccurrence,
-) -> bool:
-    return predicate_matches(
-        expected,
-        occurrence.predicate,
-        unordered_between=occurrence.unordered_between,
-    )
-
-
-def _binding_free_formula_authorizes_literal(
-    context: _SemanticContext,
-    occurrence: _PredicateOccurrence,
-) -> bool:
-    if not any(
-        item.required
-        and item.status
-        in {SemanticItemStatus.UNRESOLVED, SemanticItemStatus.RESOLVED}
-        for item in context.items_by_kind[SemanticItemKind.FORMULA]
-    ):
-        return False
-    formula_node_ids = {
-        item.node_id
-        for item in (
-            *context.check_input.parsed_ast.projections,
-            *context.check_input.parsed_ast.aggregates,
-        )
-    }
-    return occurrence.node_id in formula_node_ids
-
-
-def _derived_formula_annotation_authorizes_literal(
-    context: _SemanticContext,
-    occurrence: _PredicateOccurrence,
-) -> bool:
-    physical_formula_sources = {
-        item.source_id
-        for item in context.items_by_kind[SemanticItemKind.FORMULA]
-    }
-    formula_sources = {
-        source_id
-        for source_id, bindings in context.bindings_by_source.items()
-        if any(type(binding) is DerivedExpressionBinding for binding in bindings)
-        or (
-            source_id in physical_formula_sources
-            and any(type(binding) is PhysicalColumnBinding for binding in bindings)
-        )
-    }
-    return any(
-        formula_sources.intersection(annotation.source_ids)
-        and annotation.node_id == occurrence.node_id
-        and annotation.expression_field == occurrence.expression_field
-        and annotation.expression_index == occurrence.expression_index
-        and tuple(
-            (segment.argument, segment.ordinal)
-            for segment in annotation.expression_path
-        )
-        == occurrence.expression_path[: len(annotation.expression_path)]
-        for annotation in context.check_input.semantic_ast.coverage.annotations
-    )
 
 
 def _failure(

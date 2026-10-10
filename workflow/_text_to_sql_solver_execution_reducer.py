@@ -167,6 +167,8 @@ def state_after_known_finalizer(
             )
             if terminal.status is TextToSqlTerminalStatus.SUCCEEDED:
                 return transition.state
+            if terminal.reason_code == TextToSqlTerminalReasonCode.EXECUTION_FAILED.value:
+                return transition.state
             return SolverState.model_validate(
                 {
                     **transition.state.model_dump(mode="python"),

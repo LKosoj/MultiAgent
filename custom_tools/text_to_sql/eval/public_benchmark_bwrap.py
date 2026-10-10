@@ -80,7 +80,7 @@ def _sandbox_runtime_env(args: argparse.Namespace) -> dict[str, str]:
         return {
             str(name): str(value) for name, value in canonical_environment.items()
         }
-    values: dict[str, str] = {"WORKFLOW_PROCESS_LEASE_SECONDS": "1200"}
+    values: dict[str, str] = {"WORKFLOW_PROCESS_LEASE_SECONDS": "2400"}
     for raw in getattr(args, "sandbox_env", []):
         name, separator, value = raw.partition("=")
         if not separator or not name:

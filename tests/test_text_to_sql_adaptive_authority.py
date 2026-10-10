@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from custom_tools.text_to_sql.adaptive.freshness import (
+    DocumentSourceAvailability,
+    DocumentSourceState,
+)
 from custom_tools.text_to_sql.adaptive.policy import (
     ResearchGenerationAuthority,
     ResearchGenerationAuthorityStatus,
@@ -12,7 +16,10 @@ from custom_tools.text_to_sql.adaptive.policy import (
 from custom_tools.text_to_sql.adaptive.semantic_coverage import CoverageInputErrorCode
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
+    DerivedExpressionBinding,
     DiscriminatorValueBinding,
+    DocumentRef,
+    ExpressionRef,
     JoinEdge,
     JoinType,
     LiteralValue,
@@ -32,6 +39,7 @@ from tests.text_to_sql_semantic_coverage_helpers import (
     RUN_ID,
     _context,
     _column,
+    _document_evidence,
     _join_candidate,
     _physical_binding,
     _schema_evidence,
@@ -252,12 +260,11 @@ def test_value_filter_with_only_physical_column_evidence_is_deferred() -> None:
 @pytest.mark.parametrize(
     ("operator", "literal"),
     (
-        (None, "premium"),
         (PredicateOperator.EQ, None),
         (PredicateOperator.IS_NULL, None),
     ),
 )
-def test_physical_column_binding_never_authorizes_a_required_filter(
+def test_physical_column_binding_does_not_authorize_an_explicit_predicate(
     operator: PredicateOperator | None,
     literal: object,
 ) -> None:
@@ -275,6 +282,22 @@ def test_physical_column_binding_never_authorizes_a_required_filter(
     assert decision.allowed is False
     assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
     assert decision.affected_source_ids == ("source-a",)
+
+
+def test_operatorless_filter_uses_supported_physical_column() -> None:
+    binding = _physical_binding("source-a", "binding-a", "evidence-a")
+    state = _with_required_filter(
+        _state(bindings=(binding,)),
+        "premium",
+        None,
+    )
+
+    decision = evaluate_research_generation_authority(
+        state, _context(), RUN_ID, INCARNATION
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
 
 
 def test_physical_column_with_exact_value_evidence_is_deferred() -> None:
@@ -338,7 +361,7 @@ def test_discriminator_value_filter_with_exact_current_evidence_is_allowed() -> 
         (PredicateOperator.IN, ("premium", "standard")),
     ),
 )
-def test_discriminator_value_filter_requires_exact_value_evidence(
+def test_supported_discriminator_does_not_require_exact_value_evidence(
     operator: PredicateOperator,
     right: object,
 ) -> None:
@@ -356,9 +379,9 @@ def test_discriminator_value_filter_requires_exact_value_evidence(
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_discriminator_null_filter_requires_schema_and_exact_null_value() -> None:
@@ -391,7 +414,7 @@ def test_discriminator_null_filter_requires_schema_and_exact_null_value() -> Non
     assert decision.requirements.allowed_predicates == (predicate,)
 
 
-def test_discriminator_null_filter_with_schema_only_evidence_is_deferred() -> None:
+def test_supported_null_discriminator_with_schema_evidence_is_allowed() -> None:
     column = _column("orders", "cancelled_at")
     predicate = PredicateRef(
         left=column,
@@ -415,9 +438,9 @@ def test_discriminator_null_filter_with_schema_only_evidence_is_deferred() -> No
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_filter_allows_supporting_physical_column_alongside_predicate_binding() -> None:
@@ -737,7 +760,9 @@ def test_filter_operator_does_not_require_an_observed_matching_row(
 @pytest.mark.parametrize(
     "case", ("wrong-value", "wrong-column", "wrong-type", "missing")
 )
-def test_value_filter_requires_matching_observed_value(case: str) -> None:
+def test_supported_value_filter_does_not_require_matching_observed_value(
+    case: str,
+) -> None:
     column = _column("orders", "tier")
     literal: str | int = 1 if case == "wrong-type" else "premium"
     predicate = PredicateRef(
@@ -770,9 +795,9 @@ def test_value_filter_requires_matching_observed_value(case: str) -> None:
         state, _context(), RUN_ID, INCARNATION
     )
 
-    assert decision.allowed is False
-    assert decision.reason is CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE
-    assert decision.affected_source_ids == ("source-a",)
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_value_filter_with_stale_value_evidence_is_deferred() -> None:
@@ -1125,6 +1150,169 @@ def test_multiple_supported_required_bindings_are_authorized_as_one_union() -> N
         "binding-a",
         "binding-b",
     )
+
+
+def test_exact_formula_keeps_its_supported_discriminator_in_generation_scope() -> None:
+    value_column = _column("measurements", "score")
+    category_column = _column("measurements", "category")
+    predicate = PredicateRef(
+        left=category_column,
+        operator=PredicateOperator.EQ,
+        right="priority",
+    )
+    evidence = _document_evidence(
+        "formula-evidence",
+        content="Use MIN(score) where category = 'priority'.",
+    )
+    formula = DerivedExpressionBinding(
+        binding_id="formula-binding",
+        source_id="formula-source",
+        tables=(value_column.table,),
+        columns=(value_column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:derived_expression",
+        document=DocumentRef(document_id="coverage-document", namespace="main"),
+        expression=ExpressionRef(
+            expression_id="formula-expression",
+            expression="MIN(score)",
+        ),
+        rule_excerpt="MIN(score)",
+        input_columns=(value_column,),
+    )
+    discriminator = DiscriminatorValueBinding(
+        binding_id="formula-discriminator",
+        source_id="formula-source",
+        tables=(category_column.table,),
+        columns=(category_column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:discriminator_value",
+        discriminator_column=category_column,
+        discriminator_predicate=predicate,
+    )
+    state = _state(
+        item_specs=(
+            (
+                "formula-source",
+                True,
+                SemanticItemStatus.RESOLVED,
+                (formula.binding_id, discriminator.binding_id),
+            ),
+        ),
+        bindings=(formula, discriminator),
+        evidence=(evidence,),
+    )
+    formula_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "normalized_meaning": "MIN(score) where category = 'priority'",
+            "exact_formula_binding_id": formula.binding_id,
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula_item,)}
+            )
+        }
+    )
+
+    decision = evaluate_research_generation_authority(
+        state,
+        _context(
+            documents=(
+                DocumentSourceState(
+                    document_id="coverage-document",
+                    availability=DocumentSourceAvailability.AVAILABLE,
+                    source_version="v1",
+                ),
+            )
+        ),
+        RUN_ID,
+        INCARNATION,
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
+
+
+def test_resolved_formula_without_selected_derived_binding_is_generation_ready() -> None:
+    category_column = _column("measurements", "category")
+    predicate = PredicateRef(
+        left=category_column,
+        operator=PredicateOperator.EQ,
+        right="priority",
+    )
+    evidence = _document_evidence(
+        "formula-evidence",
+        content="Priority measurements use category = 'priority'.",
+    )
+    discriminator = DiscriminatorValueBinding(
+        binding_id="formula-discriminator",
+        source_id="formula-source",
+        tables=(category_column.table,),
+        columns=(category_column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=(evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="semantic-certificate:v1:discriminator_value",
+        discriminator_column=category_column,
+        discriminator_predicate=predicate,
+    )
+    state = _state(
+        item_specs=(
+            (
+                "formula-source",
+                True,
+                SemanticItemStatus.RESOLVED,
+                (discriminator.binding_id,),
+            ),
+        ),
+        bindings=(discriminator,),
+        evidence=(evidence,),
+    )
+    formula_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "normalized_meaning": "COUNT(rows WHERE category = 'priority')",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (formula_item,)}
+            )
+        }
+    )
+
+    decision = evaluate_research_generation_authority(
+        state,
+        _context(
+            documents=(
+                DocumentSourceState(
+                    document_id="coverage-document",
+                    availability=DocumentSourceAvailability.AVAILABLE,
+                    source_version="v1",
+                ),
+            )
+        ),
+        RUN_ID,
+        INCARNATION,
+    )
+
+    assert decision.allowed is True
+    assert decision.requirements is not None
+    assert decision.requirements.allowed_predicates == (predicate,)
 
 
 def test_namespace_mismatch_fails_closed_with_exact_required_sources() -> None:

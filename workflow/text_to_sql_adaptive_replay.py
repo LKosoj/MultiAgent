@@ -60,7 +60,7 @@ from custom_tools.text_to_sql.adaptive.serialization import (
     verify_artifact_reference,
 )
 from custom_tools.text_to_sql.adaptive.replay_contract import (
-    _result_contradiction_receipt,
+    _known_open_execution,
     dedupe_artifact_references,
     sha256_digest,
 )
@@ -752,7 +752,7 @@ def _legacy_reasons(
     typed = solver_terminal is not None or bool(
         solver_steps
         and type(solver_steps[-1]) is SolverExecutionReplayStep
-        and _result_contradiction_receipt(solver_steps[-1]) is not None
+        and _known_open_execution(solver_steps[-1])
     )
     if research_abort_journal is not None:
         reasons.add(LegacyReplayReason.RESEARCH_ABORT_INPUT)

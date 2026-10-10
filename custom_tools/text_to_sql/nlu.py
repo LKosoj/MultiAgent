@@ -47,13 +47,21 @@ def _nlu_max_tokens(key: str) -> int:
     return int(load_llm_models_config().get("nlu", key))
 
 
-def _nlu_model(step: str):
+def _nlu_model(step: str, *, max_tokens: int):
     """Модель для NLU LLM-вызова ``step`` из реестра ``llm_models.yaml::step_models`` (W1-1.1)."""
-    from agent_command import model_mapping
+    from agent_command import create_text_to_sql_model
 
     from .llm_models_config import step_model_name
 
-    return model_mapping[step_model_name(step)]
+    return create_text_to_sql_model(
+        step_model_name(step),
+        max_tokens=max_tokens,
+        temperature=(
+            0.0
+            if step in {"nlu_query_understanding", "nlu_completeness"}
+            else 0.7
+        ),
+    )
 
 
 _TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}|\d+[.,]?\d*|[\w\-]+", re.IGNORECASE | re.UNICODE)
@@ -237,6 +245,8 @@ class NLUProcessor:
             "boolean, массивы и объекты запрещены. Если operator или "
             "literal_or_reference отсутствует, указывай JSON null без кавычек; "
             'строка "null" не означает отсутствующее значение. '
+            "required, requested_output и exact_physical_predicate всегда должны "
+            "быть JSON boolean true или false, никогда null. "
             "Если exact_physical_predicate=false или operator=null, "
             "exact_physical_column_name также должен быть JSON null. "
             "Если вопрос или trusted context document прямо требует считать каждую "
@@ -244,31 +254,45 @@ class NLUProcessor:
             "entity-once в normalized_meaning соответствующего requested_output METRIC. "
             "Не добавляй entity-once только из-за JOIN, идентификатора или нескольких "
             "строк без такого явного требования. "
+            "Если вопрос выбирает одну сущность или позицию превосходной формой по "
+            "прямому исходному значению, всегда добавляй ORDERING и LIMIT 1, даже когда "
+            "trusted context описывает критерий через MIN или MAX. Не применяй это правило "
+            "к экстремуму агрегата между группами: без явного требования одной группы или "
+            "правила разрешения ничьей LIMIT 1 не добавляй. "
+            "Если trusted context прямо определяет превосходную фразу как проверку "
+            "наличия значения поля, это FILTER присутствия, а не экстремум: не добавляй "
+            "ORDERING или LIMIT только из-за превосходной формы. "
             "Если однозначная числовая граница из вопроса и trusted exact FORMULA "
             "отличаются только включением или исключением того же значения границы, "
-            "сохраняй оператор из вопроса. "
+            "сохраняй оператор из вопроса. «N или больше» означает >= N, а "
+            "«больше N» означает > N; «N или меньше» означает <= N, а "
+            "«меньше N» означает < N. "
             "Если вопрос отбирает сущности по участию в событиях за явно названную "
             "историческую дату или период и одновременно задаёт возраст этих сущностей, "
             "считай возраст на дату соответствующего события, если вопрос прямо не "
-            "говорит о текущем возрасте."
+            "говорит о текущем возрасте. В таком случае normalized_meaning возраста "
+            "не должен содержать current_timestamp, current_date или now; он должен "
+            "ссылаться на время соответствующего события. "
+            "Если вопрос просит отобрать или посчитать сущности, чьё числовое "
+            "значение на N% выше или ниже опорного значения, сохраняй строгое "
+            "пороговое сравнение > или < в normalized_meaning FORMULA, а не "
+            "равенство вычисленному порогу. Не применяй это к вопросу о самой "
+            "величине изменения или о явно заданном точном целевом значении. "
+            "В конструкции «укажи X; как X сравнивается с Y» сохраняй X и результат "
+            "сравнения как requested_output, а Y только как required input с "
+            "requested_output=false, если вопрос отдельно не просит вернуть Y."
         )
         max_tokens = _nlu_max_tokens("query_understanding_max_tokens")
         response = call_openai_api(
             prompt=prompt,
             system_prompt=system_prompt,
             max_tokens=max_tokens,
-            model=_nlu_model("nlu_query_understanding"),
+            model=_nlu_model("nlu_query_understanding", max_tokens=max_tokens),
             response_format={"type": "json_object"},
         )
         decoded = _unwrap_exact_answer_object(parse_llm_json_response(response))
         decoded = _normalize_complete_same_column_pair_mapping(
             decoded, context_documents
-        )
-        understand_query(
-            text,
-            run_id=run_id,
-            run_incarnation=run_incarnation,
-            response=decoded,
         )
         completeness_response = call_openai_api(
             prompt=build_adaptive_query_completeness_prompt(
@@ -277,9 +301,31 @@ class NLUProcessor:
                 context_documents=context_documents,
                 schema_context=schema_context,
             ),
-            system_prompt=system_prompt,
+            system_prompt=(
+                system_prompt
+                + " В completeness-ответе trusted maximum N и подтверждённые "
+                "schema slots 1..N требуют отдельный requested_output для каждого "
+                "физического поля всех слотов 1..N; не пропускай nullable или "
+                "помеченные как не полезные поля, если они входят в это семейство. "
+                "Не восстанавливай arithmetic expansion trusted FORMULA, если она "
+                "противоречит однозначной процентной фразе вопроса; сохрани "
+                "нормализованную арифметику этой фразы. Bare `refers to` или `means` "
+                "перед одним логическим условием не доказывает exact physical column: "
+                "сохрани operator и literal, но поставь exact_physical_predicate=false "
+                "и exact_physical_column_name=null. Сопоставление фразы из вопроса с "
+                "одним field_name без operator и literal, напротив, является direct "
+                "physical field mapping: сохрани exact_physical_predicate=true, "
+                "exact_physical_column_name и operator/literal из вопроса. Если вопрос просит отобрать или "
+                "посчитать сущности, чьё числовое значение на N% выше или ниже "
+                "опорного значения, сохраняй строгое пороговое сравнение > или < "
+                "в normalized_meaning FORMULA, а не равенство вычисленному порогу. "
+                "В конструкции «укажи X; как X сравнивается с Y» сохраняй X и "
+                "результат сравнения как requested_output, а Y только как required "
+                "input с requested_output=false, если вопрос отдельно не просит "
+                "вернуть Y."
+            ),
             max_tokens=max_tokens,
-            model=_nlu_model("nlu_completeness"),
+            model=_nlu_model("nlu_completeness", max_tokens=max_tokens),
             response_format={"type": "json_object"},
         )
         corrected = _unwrap_exact_answer_object(
@@ -336,11 +382,12 @@ class NLUProcessor:
         if call_openai_api:
             try:
                 prompt = build_nlu_prompt(text)
+                max_tokens = _nlu_max_tokens("intent_max_tokens")
                 resp = call_openai_api(
                     prompt=prompt,
                     system_prompt="Ты находишь intent и сущности для Text-to-SQL. Верни только JSON.",
-                    max_tokens=_nlu_max_tokens("intent_max_tokens"),
-                    model=_nlu_model("nlu_intent"),
+                    max_tokens=max_tokens,
+                    model=_nlu_model("nlu_intent", max_tokens=max_tokens),
                     response_format={"type": "json_object"}
                 )
                 from .utils import parse_llm_json_response

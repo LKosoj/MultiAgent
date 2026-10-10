@@ -1576,10 +1576,16 @@ class EnhancedWorkflowEngine(WorkflowEngine):
 
     @staticmethod
     def _open_result_contradiction_checkpoint(runtime):
+        from custom_tools.text_to_sql.adaptive.models import CheckKind, CheckStatus
         from custom_tools.text_to_sql.adaptive.result_review import ResultReviewReceipt
         from custom_tools.text_to_sql.adaptive.result_validation import ResultContradictionReceipt
         from custom_tools.text_to_sql.adaptive.serialization import canonical_json_bytes
         from .adaptive_solver_checkpoint import AdaptiveSolverCheckpointStore
+        from .text_to_sql_contract import (
+            TextToSqlTerminalReasonCode,
+            TextToSqlTerminalResult,
+            TextToSqlTerminalStatus,
+        )
 
         store = getattr(runtime, "solver_checkpoint_store", None)
         run_id = getattr(runtime, "run_id", None)
@@ -1634,7 +1640,25 @@ class EnhancedWorkflowEngine(WorkflowEngine):
                     canonical_json_bytes(result)
                 )
             else:
-                return None
+                terminal = TextToSqlTerminalResult.from_mapping(dict(result))
+                if (
+                    terminal.status is not TextToSqlTerminalStatus.FAILED
+                    or terminal.reason_code
+                    != TextToSqlTerminalReasonCode.EXECUTION_FAILED.value
+                    or not checkpoint.state.execution_results
+                    or checkpoint.state.execution_results[-1].candidate_id
+                    != action.candidate_id
+                    or checkpoint.state.execution_results[-1].success
+                    or not checkpoint.state.check_results
+                    or checkpoint.state.check_results[-1].candidate_id
+                    != action.candidate_id
+                    or checkpoint.state.check_results[-1].check_kind
+                    is not CheckKind.EXECUTION
+                    or checkpoint.state.check_results[-1].status
+                    is not CheckStatus.FAILED
+                ):
+                    return None
+                return checkpoint
         except (TypeError, ValueError):
             return None
         if (

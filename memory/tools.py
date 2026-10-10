@@ -965,8 +965,8 @@ def get_memory(
             except Exception as e:
                 print(f"Ошибка rerank фильтрации: {e}")
         
-        # Для schema_table и schema_linking не создаем summary, возвращаем исходные результаты
-        if query and length > 70000 and cache_kind not in ("schema_table", "schema_linking", "schema_probe_fact"):
+        # Для структурированной памяти схемы не создаем summary, возвращаем исходные результаты
+        if query and length > 70000 and cache_kind not in ("schema_table", "schema_linking", "schema_probe_fact", "schema_semantic_fact"):
             cleaned = ""
             for record in records:
                 cleaned += f"Агент {record['agent_name']} шаг {record['step']}:\n"
@@ -1021,8 +1021,8 @@ def _apply_memory_filtering(records: List[Dict], query: str = None, total_length
     if not records:
         return records
     
-    # Для schema_table и schema_linking не применяем фильтрацию - возвращаем как есть
-    if cache_kind in ("schema_table", "schema_linking", "schema_probe_fact"):
+    # Для структурированной памяти схемы не применяем фильтрацию - возвращаем как есть
+    if cache_kind in ("schema_table", "schema_linking", "schema_probe_fact", "schema_semantic_fact"):
         return records
     
     # Лимиты для фильтрации

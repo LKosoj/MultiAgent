@@ -210,8 +210,8 @@ def test_profile_requires_existing_join_references_as_objects() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
     required_rule = (
         'Each new_binding.join_references existing element: {"reference_kind":"existing",'
-        '"join_id":"JOIN_ID_FROM_CURRENT_STATE"}; copy join_id verbatim from durable '
-        'join_candidates; bare join-ID strings are invalid.'
+        '"join_handle":"JOIN_HANDLE_FROM_CURRENT_STATE"}; copy join_handle verbatim '
+        'from durable join_candidates; bare join-handle strings are invalid.'
     )
     decision_payload = json.loads(_decision_payload())
     decision_payload["proposals"] = [
@@ -224,7 +224,7 @@ def test_profile_requires_existing_join_references_as_objects() -> None:
                 "physical_column": {"table": "related", "column": "label"},
             },
             "join_references": [
-                {"reference_kind": "existing", "join_id": "join-related"}
+                {"reference_kind": "existing", "join_handle": "j1"}
             ],
             "citation_evidence_ids": ["evidence-related"],
         }
@@ -232,7 +232,7 @@ def test_profile_requires_existing_join_references_as_objects() -> None:
 
     assert required_rule in instructions
     decision = parse_research_decision(json.dumps(decision_payload))
-    assert decision.proposals[0].join_references[0].join_id == "join-related"
+    assert decision.proposals[0].join_references[0].join_handle == "j1"
 
     decision_payload["proposals"][0]["join_references"] = ["join-related"]
     with pytest.raises(ContractValidationError):
@@ -385,6 +385,49 @@ def test_formula_continuation_keeps_target_formula_in_bounded_context() -> None:
     assert semantic_items[0]["source_handle"] == "s1"
     assert formula.source_id not in json.dumps(context)
     assert semantic_items[0]["kind"] == SemanticItemKind.FORMULA.value
+
+
+def test_bounded_context_hides_requested_output_source_ids() -> None:
+    policy = _minimal_research_context_policy()
+    state = _minimal_research_state(policy)
+    output = SemanticItem(
+        source_id="semantic:fictional:long:opaque:output:identifier",
+        kind=SemanticItemKind.DIMENSION,
+        source_text="requested output",
+        normalized_meaning="requested output",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (output,),
+                    "requested_output_source_ids": (output.source_id,),
+                }
+            ),
+            "unresolved_items": (output.source_id,),
+        }
+    )
+
+    context = json.loads(
+        _bounded_research_context(
+            SimpleNamespace(schema={}),
+            state,
+            policy,
+            profile=load_schema_research_agent_profile(),
+            task="Return the requested output",
+            validation_feedback=(),
+        )
+    )
+
+    assert context["state"]["query_spec"]["requested_output_source_handles"] == [
+        "s1"
+    ]
+    assert output.source_id not in json.dumps(context)
 
 
 def test_bounded_context_keeps_exact_physical_fields() -> None:
@@ -1267,6 +1310,11 @@ def test_profile_distinguishes_entity_attribute_from_event_snapshot() -> None:
     )
     assert "Do not guess the owner of an ambiguous pronoun" in instructions
     assert (
+        "When one named entity and its qualifying event share an attribute, inspect both; "
+        "prefer the entity unless the output is explicitly event-local."
+        in instructions
+    )
+    assert (
         "inspect the named entity table before committing the binding"
         in instructions
     )
@@ -1330,6 +1378,16 @@ def test_profile_uses_named_entity_attribute_for_categorical_filter_owner() -> N
     )
 
     assert entity_attribute != related_measure
+    assert rule in instructions
+
+
+def test_profile_does_not_bind_named_entity_to_qualifying_event_foreign_key() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    entity_key = "patient.id"
+    event_foreign_key = "examination.patient_id"
+    rule = "an event foreign key proves participation, not ownership of entity attributes"
+
+    assert entity_key != event_foreign_key
     assert rule in instructions
 
 
@@ -2043,6 +2101,17 @@ def test_profile_requires_following_stop_review_hint_before_semantic_commit() ->
     )
 
 
+def test_profile_rejects_cosmetic_duplicate_action_corrections() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "After DUPLICATE_ACTION, the next tool must address a different unresolved "
+        "fact. Namespace/schema qualification, aliases, projection, LIMIT, or "
+        "formatting do not make the rejected action new"
+        in instructions
+    )
+
+
 def test_profile_limits_targeted_stop_review_recovery_to_named_sources() -> None:
     prompt = build_schema_research_prompt(
         load_schema_research_agent_profile(),
@@ -2055,16 +2124,61 @@ def test_profile_limits_targeted_stop_review_recovery_to_named_sources() -> None
     instructions = " ".join(json.loads(prompt)["instructions"].split())
 
     assert (
-        "When an Independent stop review hint names one or more exact unresolved "
-        "source_ids, the next decision may propose bindings only for those named "
-        "source_ids"
+        "Every proposal kind must address only its named source_ids or correction"
         in instructions
     )
     assert (
-        "Do not include proposals for other unresolved sources in that decision; "
-        "handle them in later decisions"
+        "handle other sources later"
         in instructions
     )
+
+
+def test_profile_scopes_all_proposals_to_targeted_stop_review_recovery() -> None:
+    research_context = (
+        '{"rejected_preflight_assessments":['
+        '{"source_handle":"s5"},{"source_handle":"s2"}]}'
+        "\n\nIndependent stop review allows at most two normal research decisions. "
+        "Its non-authoritative hint is: Correct only s5 using "
+        "binding:formula-input."
+    )
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="Preserve the documented calculation from its confirmed input.",
+        research_context=research_context,
+    )
+    prompt_payload = json.loads(prompt)
+    instructions = " ".join(prompt_payload["instructions"].split())
+
+    assert prompt_payload["input"]["research_context"] == research_context
+    assert (
+        "A stop-review scope overrides rejected_preflight_assessments"
+        in instructions
+    )
+    assert (
+        "Every proposal kind must address only its named source_ids or correction"
+        in instructions
+    )
+    assert (
+        "Do not resubmit, reassess, contradict, or recreate unmentioned durable items"
+        in instructions
+    )
+    assert (
+        "under a targeted stop-review hint, only entries within its scope"
+        in instructions
+    )
+
+
+def test_stop_review_hint_must_fit_bounded_follow_up_window() -> None:
+    prompt = build_research_stop_review_prompt(
+        task="Resolve the remaining semantic sources.",
+        research_context='{"durable_evidence":["schema","values"]}',
+        stop_reason="stagnated",
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert "fit within at most two normal research decisions" in instructions
+    assert "reuse relevant durable facts already present" in instructions
+    assert "broad checklist of separate confirmations" in instructions
 
 
 def test_profile_commits_durable_duplicate_hint_facts_without_repeating_probe() -> None:
@@ -2082,10 +2196,33 @@ def test_profile_commits_durable_duplicate_hint_facts_without_repeating_probe() 
     )
     instructions = " ".join(json.loads(prompt)["instructions"].split())
 
-    assert "After DUPLICATE_ACTION, if a completed durable probe already contains the facts named by the Independent stop review hint" in instructions
-    assert "and no other required schema, document, or value fact remains absent" in instructions
-    assert "return nonempty proposals citing that durable evidence and semantic_commit" in instructions
-    assert "do not repeat or modify the probe's LIMIT, ordering, aliases, or SQL" in instructions
+    assert "After DUPLICATE_ACTION" in instructions
+    assert "no fact is missing" in instructions
+    assert "cite it in proposals with semantic_commit, not a tool" in instructions
+    assert "the next tool must address a different unresolved fact" in instructions
+
+
+def test_profile_commits_facts_when_stop_review_requests_persistence() -> None:
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="Use the confirmed record relationship.",
+        research_context=(
+            '{"previous_stop_review_hint":"Persist the required typed bindings '
+            'from the durable observations.",'
+            '"completed_action_index":[{"kind":"execute_research_probe",'
+            '"target":"probe:record-relationship"}],'
+            '"durable_evidence":[{"evidence_id":"evidence:record-relationship",'
+            '"facts":["record relationship"]}]}'
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "When a stop-review hint requests persistence from durable evidence and no fact "
+        "is missing, cite it in proposals with semantic_commit, not a tool"
+        in instructions
+    )
+    assert "not a tool" in instructions
 
 
 def test_profile_keeps_duplicate_hint_open_for_other_required_missing_fact() -> None:
@@ -2102,8 +2239,8 @@ def test_profile_keeps_duplicate_hint_open_for_other_required_missing_fact() -> 
     )
     instructions = " ".join(json.loads(prompt)["instructions"].split())
 
-    assert "If any other required fact is absent, do not make unsupported proposals" in instructions
-    assert "one different typed tool remains allowed only for that exact fact" in instructions
+    assert "use one different typed tool only for the missing fact" in instructions
+    assert "do not make unsupported proposals" in instructions
 
 
 def test_profile_changes_hypothesis_after_successful_zero_row_probe() -> None:
@@ -2115,6 +2252,18 @@ def test_profile_changes_hypothesis_after_successful_zero_row_probe() -> None:
         in instructions
     )
     assert "Change the tested hypothesis or choose a different typed action" in instructions
+
+
+def test_profile_prefers_complete_direct_probe_over_partial_competing_probe() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "if the earlier probe leaves a required output NULL and the later probe fills every "
+        "requested output from directly described schema columns, the earlier interpretation "
+        "is contradicted"
+        in instructions
+    )
+    assert "commit only the later probe's bindings" in instructions
 
 
 def test_profile_requires_exact_document_excerpt_for_derived_expression() -> None:
@@ -2284,6 +2433,24 @@ def test_bounded_context_keeps_compact_candidate_join_when_evidence_does_not_fit
     state = state.model_copy(
         update={"evidence": (evidence,), "join_candidates": (join,)}
     )
+    source = SemanticItem(
+        source_id="source:join",
+        kind=SemanticItemKind.DIMENSION,
+        source_text="orders with customers",
+        normalized_meaning="orders joined to customers",
+        required=True,
+        operator=None,
+        literal_or_reference=None,
+        status=SemanticItemStatus.UNRESOLVED,
+        binding_ids=(),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (source,)}
+            )
+        }
+    )
 
     context = json.loads(
         _bounded_research_context(
@@ -2296,7 +2463,10 @@ def test_bounded_context_keeps_compact_candidate_join_when_evidence_does_not_fit
             rejected_preflight_assessments=(
                 {
                     "proposal": {
+                        "source_id": source.source_id,
+                        "source_handle": None,
                         "citation_evidence_ids": [evidence.evidence_id],
+                        "citation_evidence_handles": None,
                     }
                 },
             ),
@@ -2304,10 +2474,14 @@ def test_bounded_context_keeps_compact_candidate_join_when_evidence_does_not_fit
     )
 
     assert context["state"]["join_candidates"][0]["evidence_handles"] == ["e1"]
+    assert context["state"]["join_candidates"][0]["join_handle"] == "j1"
+    assert "join_id" not in context["state"]["join_candidates"][0]
     assert context["rejected_preflight_assessments"][0]["proposal"] == {
-        "citation_evidence_handles": ["e1"]
+        "source_handle": "s1",
+        "citation_evidence_handles": ["e1"],
     }
     assert evidence.evidence_id not in json.dumps(context)
+    assert join.join_id not in json.dumps(context)
     assert context["state"]["evidence"] == []
 
 
@@ -2509,11 +2683,11 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
     assert (
-        "Resolve every requested output from its source_text and normalized_meaning."
+        "Resolve each requested output from source_text and normalized_meaning."
         in instructions
     )
     assert (
-        "Use physical_column only when the requested output itself is stored in that column."
+        "Use physical_column only for the stored requested output."
         in instructions
     )
     assert (
@@ -2525,9 +2699,9 @@ def test_profile_preserves_requested_output_semantics_when_selecting_a_binding()
         in instructions
     )
     assert (
-        "Same name, type, or unit is insufficient: for any requested summary, standing, or cumulative measure, "
-        "prefer a schema-described summary, standing, or cumulative measure over an event or detail measure. "
-        "An explicit event or operation request may use the detail measure."
+        "Choose same-named measures by trusted schema role. A requested summary, standing, "
+        "or cumulative measure uses that role; an explicit event or operation may use its "
+        "detail measure."
         in instructions
     )
 
@@ -2536,24 +2710,19 @@ def test_profile_binds_positive_direct_period_measure_before_commit() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
     assert (
-        "When a separately requested period metric has a direct schema-described measure at "
-        "that period grain, and a positive probe confirms it under the exact entity and period "
-        "conditions, bind that direct measure under the period metric's source_id before "
-        "semantic_commit. Do not replace it with event or detail inputs used for a separate "
-        "overall metric."
+        "For a separately requested period metric, probe its direct schema-described measure "
+        "once under the exact entity and period. Before the result, do not propose or assess "
+        "event/detail bindings."
         in instructions
     )
     assert (
-        "For that period metric, check the direct period-grain measure before binding "
-        "event or detail inputs. Bind event or detail inputs only when no direct measure "
-        "exists or the targeted probe does not confirm it."
+        "On a positive result, bind it under that metric's source_id and do not replace it "
+        "with detail inputs for another metric."
         in instructions
     )
     assert (
-        "Once an inspected relation contains both the matching period key and a "
-        "schema-described direct numeric measure, the next action is one targeted probe "
-        "of that measure under the exact entity and period conditions. Until that probe "
-        "returns, do not propose or assess event or detail bindings for the period metric."
+        "Use event/detail inputs only when no direct measure exists or that probe does not "
+        "confirm it."
         in instructions
     )
 
@@ -2563,13 +2732,7 @@ def test_profile_binds_threshold_to_named_qualifying_record_measure() -> None:
     output_entity = "accounts"
     entity_measure = "account_standings.amount"
     qualifying_record_measure = "ledger_entries.amount"
-    rule = (
-        "A threshold on a quantitative attribute follows the record, event, or object named "
-        "in its own qualifying clause. When similar entity-level and record-level columns exist, "
-        "compare schema role and description and bind the direct qualifying-record measure; use "
-        "an entity cumulative measure only when question or trusted context explicitly assigns "
-        "the threshold to the entity."
-    )
+    rule = "When a quantitative predicate follows a named record, event, or object, keep that owner."
 
     assert output_entity != qualifying_record_measure
     assert entity_measure != qualifying_record_measure
@@ -2582,12 +2745,10 @@ def test_profile_preserves_candidate_owner_for_owner_neutral_predicate_document(
     competing_entity_measure = "account.amount"
     document_predicate = "Amount >= threshold"
     rule = (
-        "An owner-neutral document that states only an unqualified measure, operator, and literal, "
-        "including a bare physical-looking or capitalized field name, confirms predicate meaning, "
-        "not relation or owner. For the same source preserve the "
-        "schema/grain-selected CANDIDATE physical column and owner and use the document to support "
-        "it. Reconsider only when the document explicitly names a different relation, table, or "
-        "entity owner, not a field name alone, or directly contradicts the column, operator, or literal."
+        "An owner-neutral document with only an unqualified measure, operator, and literal, including "
+        "a physical-looking or capitalized field name, confirms predicate meaning, not owner. Preserve "
+        "the schema/grain-selected CANDIDATE column unless the document names a different relation, "
+        "table, or entity owner or contradicts the column, operator, or literal."
     )
 
     assert selected_child_measure != competing_entity_measure
@@ -2598,13 +2759,26 @@ def test_profile_preserves_candidate_owner_for_owner_neutral_predicate_document(
 def test_profile_binds_unowned_threshold_to_explicit_child_grain() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
     rule = (
-        "If a quantitative threshold is not explicitly assigned to the root but the same "
-        "semantic fragment explicitly states per/for each child-record grain, bind it to the "
-        "child; do not move it to a root or cumulative metric. A root metric remains allowed "
-        "only with an explicit root owner, possessive, or relation/table/entity-qualified "
-        "trusted assignment."
+        "For a per/for each child DIMENSION plus an owner-neutral quantitative FILTER in the same "
+        "calculation, inspect the child's direct measure before root, standing, cumulative, or "
+        "running-total measures and bind the threshold to the child. A root measure requires an "
+        "explicit root owner, possessive, or trusted relation/table/entity assignment."
     )
 
+    assert rule in instructions
+
+
+def test_profile_binds_event_count_predicate_to_per_event_result() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    per_event_measure = "event_results.points"
+    cumulative_measure = "event_standings.points"
+    rule = (
+        "When a quantitative predicate and exact count qualify the same named events/details, "
+        "use that event/detail grain, not a standing, snapshot, cumulative, or running total "
+        "unless the question or trusted context explicitly requests it."
+    )
+
+    assert per_event_measure != cumulative_measure
     assert rule in instructions
 
 
@@ -2615,28 +2789,33 @@ def test_profile_binds_split_child_dimension_and_owner_neutral_filter_to_child()
     child_measure = "invoice.amount"
     competing_root_measure = "account.amount"
     rule = (
-        "If a quantitative threshold is not explicitly assigned to the root but the same semantic "
-        "fragment explicitly states per/for each child-record grain, bind it to the child; do not move "
-        "it to a root or cumulative metric. A root metric remains allowed only with an explicit root "
-        "owner, possessive, or relation/table/entity-qualified trusted assignment. When a required "
-        "per/for each child DIMENSION and owner-neutral quantitative FILTER are "
-        "separate semantic items that jointly qualify one calculation, treat them as the same "
-        "semantic fragment and bind the threshold to the child. Do not move a standalone FILTER "
-        "from an unrelated clause."
+        "For a per/for each child DIMENSION plus an owner-neutral quantitative FILTER in the same "
+        "calculation, inspect the child's direct measure before root, standing, cumulative, or "
+        "running-total measures and bind the threshold to the child. A root measure requires an "
+        "explicit root owner, possessive, or trusted relation/table/entity assignment. Do not move "
+        "an unrelated standalone FILTER."
     )
 
     assert child_dimension == "per invoice"
     assert owner_neutral_filter == "Amount >= threshold"
     assert child_measure != competing_root_measure
     assert rule in instructions
+    first_candidate_rule = (
+        "Before the first table choice or quantitative proposal or assessment, resolve owner from "
+        "the named record and grain."
+    )
+    tool_signatures = "Tool argument signatures:"
+
+    assert first_candidate_rule in instructions
+    assert instructions.index(first_candidate_rule) < instructions.index(tool_signatures)
 
 
 def test_profile_prefers_event_actor_fk_over_related_object_owner() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
     rule = (
         "When selecting or counting an entity by an event, history, or activity on a related "
-        "object, a direct event-to-entity FK is event participation and outranks a path from the "
-        "entity through an owner-related object. Use that owner path only when the question or "
+        "object, an event foreign key proves participation, not ownership of entity attributes; "
+        "it outranks an owner path. Use that owner path only when the question or "
         "trusted context explicitly requests owner, author, creator, owned-by, or equivalent."
     )
 
@@ -2702,9 +2881,9 @@ def test_profile_uses_left_only_for_evidence_backed_dependent_extension() -> Non
         "with the same endpoints for this proven extension; propose the exact LEFT join. For "
         "a parent lookup from A's foreign key to B's key, or a non-unique child relation, keep "
         "the default INNER join unless the question or QuerySpec independently requires "
-        "unmatched A rows or marks B optional. Use INNER when B participates in row "
-        "qualification or the question requires a matching or nonempty B value. Distinguish "
-        "NULL in a matched B row from absence of a B row, and reject a reversed LEFT join."
+        "unmatched A rows or marks B optional. Absent that exception, a requested "
+        "non-unique child record or attribute requires a match; output-only is not a reason for LEFT. "
+        "Use INNER when B qualifies rows or must match. Reject a reversed LEFT join."
         in instructions
     )
 
@@ -2737,6 +2916,24 @@ def test_profile_keeps_parent_lookup_and_nonunique_child_output_inner() -> None:
         "or marks B optional"
         in instructions
     )
+
+
+def test_profile_requires_match_for_requested_nonunique_child_rows() -> None:
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="List each order ID and the text of its audit entries.",
+        research_context=(
+            "Eligible evidence proves audit_entries.order_id references orders.id "
+            "and is not unique in audit_entries."
+        ),
+    )
+    instructions = " ".join(json.loads(prompt)["instructions"].split())
+
+    assert (
+        "Absent that exception, a requested non-unique child record or attribute requires a match"
+        in instructions
+    )
+    assert "output-only is not a reason for LEFT" in instructions
 
 
 def test_profile_keeps_named_entity_as_percentage_population() -> None:
@@ -2919,6 +3116,16 @@ def test_profile_allows_only_existing_identifiers_from_durable_state() -> None:
     )
 
 
+def test_profile_keeps_local_proposal_keys_out_of_existing_assessments() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Only new_hypothesis, new_binding, and new_join have proposal_key; "
+        "hypothesis_assessment, binding_assessment, and join_assessment never do."
+        in instructions
+    )
+
+
 def test_profile_reacquires_omitted_facts_without_guessing_identifiers() -> None:
     instructions = load_schema_research_agent_profile().instructions
 
@@ -2946,10 +3153,8 @@ def test_profile_distinguishes_requested_action_or_role_from_similar_column() ->
     offered_service = "service_catalog.service: service offered by each city"
     consumed_service = "service_usage.service: service consumed by each city"
     rule = (
-        "When requested actions or roles differ, bind only a column whose trusted "
-        "description matches the requested action or role. A different action or role "
-        "is invalid even when name, type, or values match, unless trusted evidence "
-        "directly confirms equivalence."
+        "A differently described action or role is invalid even when name, type, "
+        "literal, values, or structural evidence match"
     )
 
     assert offered_service != consumed_service
@@ -2961,18 +3166,28 @@ def test_profile_rejects_cross_role_candidate_assessment_despite_structural_evid
     issued_license = "registry.issued_license: license issued by a registry"
     reviewed_license = "audit.reviewed_license: license reviewed by an auditor"
     rule = (
-        "When loaded schema descriptions distinguish candidates for separately required "
-        "actions or roles, compare each source's explicit source_text and "
-        "normalized_meaning with the candidate description before proposing, assessing, "
-        "or committing its binding. Inspect the matching candidate for that source. A "
-        "candidate for a different action or role must not be proposed, assessed as "
-        "consistent, or committed for the source unless trusted evidence directly "
-        "confirms equivalence, even when literal, type, values, or structural evidence "
-        "match; its evidence is not evidence for the other role. Continue targeted "
-        "research when the matching candidate lacks evidence."
+        "Match each required source's explicit action or role in source_text and "
+        "normalized_meaning to trusted candidate descriptions before proposing, "
+        "assessing, or committing a binding."
     )
 
     assert issued_license != reviewed_license
+    assert rule in instructions
+
+
+def test_profile_inspects_matching_role_before_same_table_literal_candidate() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    offered_service = "service_catalog.service_offered: service offered by each city"
+    consumed_service = "service_catalog.service_consumed: service consumed by each city"
+    rule = (
+        "This includes one required FILTER with operator eq and one literal, including "
+        "candidates on the same table. Inspect the matching candidate first. A differently "
+        "described action or role is invalid even when name, type, literal, values, or "
+        "structural evidence match; a successful value search on that candidate is not "
+        "evidence of role equivalence."
+    )
+
+    assert offered_service != consumed_service
     assert rule in instructions
 
 
@@ -2982,12 +3197,39 @@ def test_profile_preserves_requested_action_or_role_across_dependent_outputs() -
     consumed_service = "service_usage.service: service consumed by each city"
     rule = (
         "After confirming an action or role binding, use it consistently for every "
-        "dependent output or calculation about that same action or role. Do not mix in "
-        "a column for a different action or role unless trusted evidence directly "
-        "confirms equivalence."
+        "dependent output or calculation about that same action or role. Do not mix a "
+        "differently described action or role without trusted evidence of equivalence."
     )
 
     assert offered_service != consumed_service
+    assert rule in instructions
+
+
+def test_profile_checks_action_or_role_immediately_before_response_contract() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    role_check = (
+        "Match each required source's explicit action or role in source_text and "
+        "normalized_meaning to trusted candidate descriptions before proposing, "
+        "assessing, or committing a binding."
+    )
+    response_contract = "Your input is one JSON envelope."
+
+    assert instructions.rindex(role_check) < instructions.rindex(response_contract)
+    assert instructions.rindex(role_check) > instructions.rindex(
+        "A literal in execute_research_probe WHERE is not literal authority."
+    )
+
+
+def test_profile_distinguishes_whole_range_measure_from_endpoint_measure() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    whole_range = "population.total_period: count across the full requested period"
+    endpoint = "population.final_period: count for only the final period"
+    rule = (
+        "For a requested range, bind its whole-range measure; an endpoint measure "
+        "is not equivalent."
+    )
+
+    assert whole_range != endpoint
     assert rule in instructions
 
 
@@ -3479,10 +3721,57 @@ def test_stop_review_routes_certified_categorical_replacement_without_literal() 
         "continue and direct ordinary research only to submit the existing contradicted "
         "binding_assessment and one corrected new_binding in one proposals batch, then assess "
         "the new binding normally. Do not submit a corrected CANDIDATE separately while the "
-        "old binding remains SUPPORTED. Do not name a physical target, SQL, or recovered literal."
+        "old binding remains SUPPORTED. Do not name a physical target or SQL."
     )
 
     assert required_rule in prompt["instructions"]
+
+
+def test_stop_review_may_name_already_certified_full_categorical_tuple() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the fictional hue summary.",
+            research_context=json.dumps(
+                {
+                    "source": "source:fictional-hue",
+                    "certified_recovered_values": ["mist", "sun"],
+                }
+            ),
+            stop_reason="RESEARCH_STAGNATED",
+        )
+    )
+
+    assert (
+        "When durable exact-value evidence already certifies the complete recovered "
+        "categorical tuple, a continuation hint may name that tuple so ordinary research "
+        "can correct an omitted certified member."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_batches_multiple_certified_categorical_replacements() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return rows matching two fictional categorical conditions.",
+            research_context=json.dumps(
+                {
+                    "sources": ["source:first-hue", "source:second-hue"],
+                    "certified_recovered_values": {
+                        "source:first-hue": ["mist", "sun"],
+                        "source:second-hue": ["dawn", "night"],
+                    },
+                }
+            ),
+            stop_reason="RESEARCH_STAGNATED",
+        )
+    )
+
+    assert (
+        "When several stale categorical bindings have complete replacement certificates, "
+        "the same proposals batch must contain the contradicted assessment and corrected "
+        "new_binding for every affected source."
+        in prompt["instructions"]
+    )
 
 
 def test_stop_review_routes_truncated_and_recovered_categorical_recovery_separately() -> None:
@@ -4073,6 +4362,99 @@ def test_stop_review_compares_ambiguous_physical_candidates_without_selecting_on
     )
 
 
+def test_stop_review_does_not_reassess_negative_candidate_when_alternative_is_supported() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return the metric difference for two named contributors.",
+            research_context=json.dumps(
+                {
+                    "state": {
+                        "unresolved_items": [{"source_id": "source:named-contributor"}],
+                        "bindings": [
+                            {
+                                "binding_id": "binding:unconfirmed-label",
+                                "source_id": "source:named-contributor",
+                                "status": "CANDIDATE",
+                            }
+                        ],
+                        "join_candidates": [
+                            {
+                                "join_id": "join:record-contributor",
+                                "status": "VALIDATED",
+                            }
+                        ],
+                        "evidence": [
+                            {
+                                "probe_kind": "search_value",
+                                "binding_id": "binding:unconfirmed-label",
+                                "rows": [],
+                            },
+                            {
+                                "probe_kind": "execute_probe",
+                                "binding_id": "binding:unconfirmed-label",
+                                "rows": [],
+                            },
+                            {
+                                "probe_kind": "inspect_column",
+                                "source_id": "source:named-contributor",
+                                "target": "main.contributors.display_label",
+                                "description": "the contributor's display name",
+                            },
+                        ],
+                    },
+                    "schema": {
+                        "main.records": {"columns": {"display_label": {}}},
+                        "main.contributors": {"columns": {"display_label": {}}},
+                    },
+                }
+            ),
+            stop_reason="RESEARCH_STAGNATED",
+        )
+    )
+
+    assert (
+        "Empty exact and case-insensitive value checks alone do not close the ordinary "
+        "bounded recovery for a candidate. But when those checks are empty and positive "
+        "durable schema and relationship evidence supports a different already loaded "
+        "candidate for the same unresolved source, do not direct another assessment or "
+        "recovery step for the negative candidate. Return continue only to compare that "
+        "source's candidates and existing relationships under the ordinary research "
+        "rules, without naming or selecting a physical target."
+        in prompt["instructions"]
+    )
+
+
+def test_stop_review_preserves_bounded_recovery_for_zero_rows_alone() -> None:
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return records for the named contributor.",
+            research_context=json.dumps(
+                {
+                    "state": {
+                        "unresolved_items": [{"source_id": "source:named-contributor"}],
+                        "evidence": [
+                            {"probe_kind": "search_value", "rows": []},
+                            {"probe_kind": "execute_probe", "rows": []},
+                        ],
+                    }
+                }
+            ),
+            stop_reason="RESEARCH_STAGNATED",
+        )
+    )
+
+    assert (
+        "Empty exact and case-insensitive value checks alone do not close the ordinary "
+        "bounded recovery for a candidate."
+        in prompt["instructions"]
+    )
+    assert (
+        "Without its exact-value certificate, return continue to the existing "
+        "value-confirmation/recovery flow"
+        in prompt["instructions"]
+    )
+
+
 def test_stop_review_requires_prior_hint_to_be_closed_by_completed_evidence() -> None:
     prompt = json.loads(
         build_research_stop_review_prompt(
@@ -4088,9 +4470,11 @@ def test_stop_review_requires_prior_hint_to_be_closed_by_completed_evidence() ->
 
     assert (
         "When previous_stop_review_hint is present, compare it with "
-        "completed_action_index and durable evidence. Return stop_confirmed only "
-        "when they actually close that hint; another successful tool action does not "
-        "close it. If uncertain, return continue with the same limited direction"
+        "completed_action_index and durable evidence. Another successful tool action "
+        "closes that hint only when it satisfies that hint. When the ordinary turn "
+        "followed that hint but the same stop recurs, do not repeat or paraphrase the "
+        "same general direction. Return continue only when durable context shows a "
+        "different untried ordinary typed step"
         in prompt["instructions"]
     )
 
@@ -4454,6 +4838,57 @@ def test_stop_review_continues_unsupported_after_confirmed_empty_composition() -
     )
 
 
+def test_stop_review_confirms_unsupported_when_only_different_scope_exists() -> None:
+    research_context = {
+        "state": {
+            "unresolved_items": [
+                {
+                    "source_id": "quarterly-total",
+                    "normalized_meaning": "quarterly revenue",
+                }
+            ],
+            "bindings": [
+                {
+                    "source_handle": "quarterly-total",
+                    "column": "annual_revenue",
+                    "status": "candidate",
+                }
+            ],
+        },
+        "schema_catalog_search": {
+            "query": "quarterly revenue",
+            "results": [],
+            "status": "missing",
+        },
+        "inspected_column": {
+            "column": "annual_revenue",
+            "description": "Revenue for the full calendar year.",
+        },
+    }
+    prompt = json.loads(
+        build_research_stop_review_prompt(
+            task="Return branches whose quarterly revenue exceeds the threshold.",
+            research_context=json.dumps(research_context),
+            stop_reason="unsupported",
+        )
+    )
+
+    assert prompt["input"]["research_context"] == json.dumps(research_context)
+    assert (
+        "When exhaustive schema and catalog evidence shows only a candidate with "
+        "an explicitly different semantic scope from a required source, and no "
+        "evidence-backed derivation can produce the requested scope, confirm an "
+        "unsupported stop. Do not treat the different scope as a proxy or continue "
+        "only to assess or bind it."
+        in prompt["instructions"]
+    )
+    assert (
+        "This rule takes priority over earlier guidance to compare candidates with "
+        "different actions or roles."
+        in prompt["instructions"]
+    )
+
+
 def test_stop_review_requires_exact_certificate_for_schema_only_categorical_predicate() -> None:
     research_context = {
         "state": {
@@ -4619,18 +5054,21 @@ def test_positive_probe_closes_earlier_zero_row_hypothesis_without_special_label
         )
     )
     profile = " ".join(load_schema_research_agent_profile().instructions.split())
-    expected = (
+    stop_review_expected = (
         "A later positive probe for the same unresolved semantic item, literal, and "
         "confirmed conditions on a different schema-supported column or expression "
-        "establishes the positive "
-        "alternative even when it has no special alternative label. Treat the earlier "
-        "zero-row hypothesis as closed: do not inspect, search, or probe it again. "
-        "Continue only with proposals, assessments, or semantic_commit for the positive "
-        "interpretation and its unresolved dependent outputs."
+        "establishes the positive alternative even when it has no special alternative "
+        "label. Treat the earlier zero-row hypothesis as closed: do not inspect, search, "
+        "or probe it again. Continue only with proposals, assessments, or semantic_commit "
+        "for the positive interpretation and its unresolved dependent outputs."
+    )
+    profile_expected = (
+        "A later positive probe on a different schema-supported column or expression "
+        "closes an earlier zero-row hypothesis for the same literal and conditions."
     )
 
-    assert expected in prompt["instructions"]
-    assert expected in profile
+    assert stop_review_expected in prompt["instructions"]
+    assert profile_expected in profile
 
 
 def test_stop_review_does_not_stop_before_best_available_entity_proxy_is_bound() -> None:
@@ -5220,7 +5658,7 @@ def test_profile_states_stop_invariants_before_any_correction() -> None:
     assert re.search(
         r"\bQUERY_REQUIREMENT_INCOMPLETE\b.*\bsupported bindings\b.*"
         r"\bjoin_path\b.*\bnew_binding\b.*\bjoin_references\b.*"
-        r"\bvalidated join IDs\b",
+        r"\bvalidated join handles\b",
         instructions,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -5287,6 +5725,45 @@ def test_profile_assesses_existing_candidate_join_binding_after_incomplete_stop(
     assert "Do not ask the user at this stage." in instructions
 
 
+def test_profile_does_not_postpone_a_supported_partial_binding_for_a_later_join() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "After a successful typed action adds fresh durable evidence that already "
+        "supports a binding for a required unresolved source, include that smallest "
+        "supported new_binding in the next non-stop decision before requesting "
+        "another tool. Do not postpone the binding until every other source or join "
+        "route is confirmed; use join_references: [] when no required route is yet "
+        "durable, then attach the validated route under the existing join rules."
+        in instructions
+    )
+
+
+def test_profile_commits_bindings_after_a_complete_nonempty_probe() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When a successful non-empty execute_research_probe uses already confirmed "
+        "columns, predicates, and joins over a complete route, treat it only as evidence "
+        "that those facts compose. Next, commit the smallest supported bindings."
+        in instructions
+    )
+
+
+def test_profile_assesses_remaining_candidates_after_complete_nonempty_probe() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "If affected unresolved FILTER or TIME sources have existing CANDIDATE "
+        "bindings and no relationship, column, or predicate evidence is missing, assess "
+        "every applicable candidate in one proposals batch with semantic_commit. Do not "
+        "issue another probe, inspect_column, or other tool that only changes projection, "
+        "aliases, ordering tie-breakers, LIMIT, or rechecks an input already evidenced "
+        "outside that probe."
+        in instructions
+    )
+
+
 def test_profile_parameterizes_context_values_in_raw_research_queries() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
@@ -5336,8 +5813,8 @@ def test_profile_creates_join_when_relationship_is_not_yet_durable() -> None:
         in instructions
     )
     assert (
-        "Never use an evidence ID or digest as an existing join_id; existing join_id "
-        "values come only from durable join_candidates"
+        "Never use an evidence handle or digest as an existing join_handle; existing "
+        "join_handle values come only from durable join_candidates"
         in instructions
     )
     assert (
@@ -5560,7 +6037,7 @@ def test_profile_documents_proposal_shapes_with_one_parseable_example() -> None:
         "join_assessment(subject: join reference, certificate, citation_evidence_handles)",
         "target: table(table) | column(table, column) | document(document_id)",
         "predicate: left(table, column), operator, right",
-        "reference: existing(hypothesis_id | binding_id | join_id) | proposed(proposal_key)",
+        "reference: existing(hypothesis_id | binding_id | join_handle) | proposed(proposal_key)",
         "physical_column(physical_column: table, column)",
         "vertical_attribute(entity_table, entity_key, attribute_catalog_table, attribute_catalog_key, attribute_name_predicate, value_table, value_entity_key, value_attribute_key, value_predicate)",
         "discriminator_value(discriminator_column, discriminator_predicate[, additional_predicates])",
@@ -5785,12 +6262,25 @@ def test_validation_feedback_changes_only_trusted_instructions(feedback: str) ->
         (
             "INVALID_STOP",
             "Previous decision rejected: INVALID_STOP. Correct the decision using "
-            "the profile rules and return a replacement typed decision.",
+            "the profile rules and return a replacement typed decision. When "
+            "research_context has invalid_stop_generation_authority, do not return "
+            "stop or complete again; correct only its "
+            "affected_source_handles using the smallest typed non-stop decision; for "
+            "proposals copy fresh citation_evidence_handles from research_context; "
+            "when an affected source is in exact_formula_documents, every required "
+            "physical input is supported, and no required predicate or join continuation "
+            "remains, return one document-backed derived_expression proposal with those "
+            "fresh citations and semantic_commit; do not request or execute another probe. "
+            "Otherwise, do not repeat a previously successful non-empty probe.",
         ),
         (
             "INVALID_DECISION",
             "Previous decision rejected: INVALID_DECISION. Correct the decision "
-            "using the profile rules and return a replacement typed decision.",
+            "using the profile rules and return a replacement typed decision. Before "
+            "returning, check every proposal and copy non-empty "
+            "citation_evidence_handles from research_context; do not omit them or "
+            "replace them with raw IDs. Recheck every predicate: eq, neq, gt, gte, "
+            "lt, lte, and like require a non-null right value.",
         ),
         (
             "DUPLICATE_ACTION",
@@ -5803,8 +6293,11 @@ def test_validation_feedback_changes_only_trusted_instructions(feedback: str) ->
         (
             "UNRESOLVABLE_PREFLIGHT",
             "Previous decision rejected: UNRESOLVABLE_PREFLIGHT. Correct the decision "
-            "using the profile rules and return a replacement typed decision. Use the "
-            "rejected preflight proposal details in the research context.",
+            "using the profile rules and return a replacement typed decision. If the "
+            "rejected preflight details contain unassessed_binding_ids, return a "
+            "binding_assessment for every listed ID before any new proposal or tool "
+            "request. Use the rejected preflight proposal details in the research "
+            "context.",
         ),
         (
             "REPEATED_PREFLIGHT_DECISION",
@@ -5868,13 +6361,66 @@ def test_invalid_decision_feedback_handles_missing_fresh_evidence() -> None:
 
     instructions = json.loads(prompt)["instructions"]
 
-    assert instructions.endswith(
-        "Previous decision rejected: INVALID_DECISION. Correct the decision using "
-        "the profile rules and return a replacement typed decision."
+    suffix = instructions[len(load_schema_research_agent_profile().instructions) :]
+
+    assert "check every proposal" in suffix
+    assert "non-empty citation_evidence_handles" in suffix
+    assert "research_context" in suffix
+
+
+def test_invalid_stop_feedback_preserves_ready_exact_formula_without_another_probe() -> None:
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="Return the smallest invented measurement.",
+        research_context=(
+            '{"invalid_stop_generation_authority":'
+            '{"reason_code":"QUERY_REQUIREMENT_INCOMPLETE",'
+            '"affected_source_handles":["s1"]},'
+            '"exact_formula_documents":[{"source_handle":"s1"}]}'
+        ),
+        validation_feedback="INVALID_STOP",
+    )
+
+    instructions = json.loads(prompt)["instructions"]
+    suffix = instructions[len(load_schema_research_agent_profile().instructions) :]
+
+    assert "exact_formula_documents" in suffix
+    assert "every required physical input is supported" in suffix
+    assert "no required predicate or join continuation remains" in suffix
+    assert "document-backed derived_expression" in suffix
+    assert "do not request or execute another probe" in suffix
+
+
+def test_invalid_decision_feedback_rechecks_non_null_predicate_values() -> None:
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="Research an invented measurement schema.",
+        research_context='{"state":"unchanged"}',
+        validation_feedback="INVALID_DECISION",
+    )
+
+    instructions = json.loads(prompt)["instructions"]
+    suffix = instructions[len(load_schema_research_agent_profile().instructions) :]
+
+    assert (
+        "Recheck every predicate: eq, neq, gt, gte, lt, lte, and like require a "
+        "non-null right value."
+        in suffix
     )
 
 
-def test_unresolvable_preflight_feedback_requests_discovery_without_json_repair() -> None:
+def test_invalid_decision_profile_requires_citations_on_every_replacement_proposal() -> None:
+    instructions = load_schema_research_agent_profile().instructions
+
+    assert re.search(
+        r"This applies to every proposal, including new_hypothesis\. After\s+"
+        r"INVALID_DECISION,\s+audit every replacement proposal and do not return\s+"
+        r"one without\s+citation_evidence_handles\.",
+        instructions,
+    )
+
+
+def test_unresolvable_preflight_feedback_finishes_named_assessments_first() -> None:
     prompt = build_schema_research_prompt(
         load_schema_research_agent_profile(),
         task="Research the schema.",
@@ -5886,8 +6432,11 @@ def test_unresolvable_preflight_feedback_requests_discovery_without_json_repair(
 
     assert instructions.endswith(
         "Previous decision rejected: UNRESOLVABLE_PREFLIGHT. Correct the decision "
-        "using the profile rules and return a replacement typed decision. Use the "
-        "rejected preflight proposal details in the research context."
+        "using the profile rules and return a replacement typed decision. If the "
+        "rejected preflight details contain unassessed_binding_ids, return a "
+        "binding_assessment for every listed ID before any new proposal or tool "
+        "request. Use the rejected preflight proposal details in the research "
+        "context."
     )
 
 
@@ -5896,26 +6445,53 @@ def test_profile_explains_rejected_preflight_assessment_batch() -> None:
 
     assert "complete rejected assessment batch" in instructions
     assert "none of its assessments was saved" in instructions
-    assert "Correct every rejected assessment" in instructions
+    assert "Correct only entries still applicable to current durable state" in instructions
     assert "use its existing_evidence_handle exactly for that matching assessment" in instructions
     assert "do not repeat a probe for that fact" in instructions
     assert "exactly that existing tool request next with proposals: []" in instructions
     assert (
         "remove the bad optional reference or replace it by copying an existing "
-        "durable join_id verbatim"
+        "durable join_handle verbatim"
         in instructions
     )
+    assert "referenced join_id does not exist" in instructions
     assert "referenced binding_id does not exist" in instructions
     assert "source_id does not exist" in instructions
     assert "copy an existing durable source_handle" in instructions
+
+
     assert "Use source and evidence handles exactly as supplied" in instructions
     assert "cited evidence_id does not exist" in instructions
     assert "copy a durable citation_evidence_handle" in instructions
     assert "binding already exists" in instructions
     assert "omit that new_binding" in instructions
-    assert "logical column differs by case" in instructions
-    assert "replace every affected column reference by exact_column verbatim" in instructions
-    assert "execute only missing_probe before repeating the binding" in instructions
+    assert "For logical-column-case rejection" in instructions
+    assert "use exact_column and execute only missing_probe" in instructions
+
+
+def test_profile_repairs_formula_binding_that_omits_exact_predicate() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When rejection_reason says resolved formula omits trusted exact predicate, "
+        "replace that new_binding, preserving its document-backed expression and "
+        "confirmed predicates and adding every confirmed missing exact predicate; "
+        "do not reassess the incomplete binding"
+        in instructions
+    )
+
+
+def test_profile_requires_local_proposed_references_and_bounded_join_repairs() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "Every proposed reference must point to exactly one proposal in the same "
+        "proposals array"
+    ) in instructions
+    assert "A proposed join reference must point to a new_join proposal" in instructions
+    assert (
+        "repair only the smallest join path needed to connect the unresolved semantic sources"
+    ) in instructions
 
 
 def test_profile_keeps_corrected_binding_with_required_assessments_in_one_batch() -> None:
@@ -5926,11 +6502,34 @@ def test_profile_keeps_corrected_binding_with_required_assessments_in_one_batch(
 
     assert relation != column != corrected_literal
     assert (
-        "When rejected preflight feedback requires assessments of selected candidate "
-        "bindings and a corrected replacement binding for that same source is still "
-        "needed, return every required binding_assessment and the corrected new_binding "
-        "together in one proposals batch before semantic_commit; do not split them "
-        "across decisions."
+        "When required_binding_assessment_ids names competing candidates for one "
+        "source, return every required binding_assessment and any still-needed "
+        "corrected new_binding in one proposals batch before semantic_commit."
+        in instructions
+    )
+
+
+def test_profile_marks_uncertified_competing_binding_insufficient() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When required_binding_assessment_ids names competing candidates for one "
+        "source, return every required binding_assessment and any still-needed "
+        "corrected new_binding in one proposals batch before semantic_commit. Assess "
+        "every named binding: use consistent only with its required semantic "
+        "certificate and insufficient otherwise."
+        in instructions
+    )
+
+
+def test_profile_applies_competing_binding_rule_to_stop_review_candidates() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "When a stop-review hint names multiple candidate bindings for one source, "
+        "return every named binding_assessment in one proposals batch before "
+        "semantic_commit. Use consistent only for a candidate with its required "
+        "semantic certificate and insufficient for every other named candidate."
         in instructions
     )
 
@@ -6102,23 +6701,18 @@ def test_profile_preserves_explicit_physical_mapping_from_document() -> None:
 
     assert "Use normalized_meaning mappings; no substitutes" in instructions
     assert (
-        "For a requested output explicitly named/mapped in normalized_meaning, bind its "
-        "loaded physical column, not a similar column or related lookup label"
+        "For output explicitly mapped in normalized_meaning, bind/project its loaded physical "
+        "column, never a similar column or lookup label, including when it is a foreign key"
         in instructions
     )
     assert (
-        "When exact_physical_predicate is true, discriminator_predicate must use "
-        "the QuerySpec operator on that explicitly named column; preserve its meaning "
-        "and do not translate the literal to a code in another column. The bounded "
-        "stored spelling recovery below is the only exception to retaining its written "
-        "literal"
+        "With exact_physical_predicate, keep operator. Change literal only via "
+        "stored-spelling recovery and column only via absent-name "
+        "recovery below"
         in instructions
     )
     assert (
-        "When a trusted document explicitly names a formula input and the loaded "
-        "schema contains a same-named column whose description matches that measure, "
-        "inspect and bind that column before replacing it with an indirect computed "
-        "proxy"
+        "Bind formula inputs by measure and row grain, not names"
         in instructions
     )
 
@@ -6130,16 +6724,31 @@ def test_profile_does_not_treat_exact_physical_name_as_relation_equivalence() ->
         "review_records.text: official review explanation",
     )
     required_rule = (
-        "An exact physical column name identifies only a column name, not its relation. "
-        "Among several already relevant/reachable same-named candidates, before any "
-        "candidate-specific probe, selection, binding_assessment, or semantic_commit, compare "
-        "each candidate's trusted schema description with source_text and normalized_meaning; "
-        "discovery order does not select a candidate. Bind only a single semantic match. A foreign "
-        "key or reachability alone does not prove equivalence. If there is no single match, leave "
-        "unresolved and request targeted research; do not scan unrelated database tables."
+        "An exact physical name identifies a column, not its relation. For same-named "
+        "candidates, before any probing or binding, compare "
+        "already relevant/reachable candidates' trusted descriptions with source_text and "
+        "normalized_meaning. Bind a semantic match only; discovery order and reachability "
+        "are insufficient. An explicit entity/relation role must match the "
+        "trusted description. With no single match, leave unresolved and request targeted "
+        "research; never scan unrelated tables."
     )
 
     assert same_named_columns[0] != same_named_columns[1]
+    assert required_rule in instructions
+
+
+def test_profile_recovers_when_documented_exact_name_is_absent_from_captured_schema() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    required_rule = (
+        "When exact_physical_column_candidates includes a source with an empty candidates "
+        "list and preflight reports that its target column is absent from captured schema, "
+        "do not inspect or propose that absent name again. Preserve the source operator, "
+        "literal, and semantic role, then compare only already relevant/reachable loaded "
+        "columns by trusted description and relationship role. Bind one semantic match; "
+        "spelling similarity alone is insufficient. With zero or multiple semantic matches, "
+        "leave the source unresolved."
+    )
+
     assert required_rule in instructions
 
 
@@ -6150,11 +6759,9 @@ def test_profile_compares_same_named_candidates_before_candidate_specific_action
         "membership_snapshots.status: membership renewal state",
     )
     required_rule = (
-        "Among several already relevant/reachable same-named candidates, before any "
-        "candidate-specific probe, selection, binding_assessment, or semantic_commit, "
-        "compare each candidate's trusted schema description with source_text and "
-        "normalized_meaning; discovery order does not select a candidate. Bind only a "
-        "single semantic match."
+        "For same-named candidates, before any probing or binding, compare already "
+        "relevant/reachable candidates' trusted descriptions with "
+        "source_text and normalized_meaning. Bind a semantic match only"
     )
 
     assert same_named_candidates[0] != same_named_candidates[1]
@@ -6175,6 +6782,45 @@ def test_profile_prefers_entity_identity_over_same_named_relationship_endpoint()
 
     assert entity_identity != relationship_endpoint
     assert required_rule in instructions
+
+
+def test_profile_prefers_entity_identifier_over_storage_row_identifier() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    entity_identifier = "players.player_api_id: identifier of the player"
+    row_identifier = "players.id: primary key of the stored player row"
+    required_rule = (
+        "When a question requests an entity ID and schema describes a stable identifier reused "
+        "across related or historical rows, prefer it to any storage-row ID, including a base "
+        "or snapshot primary key. Use a storage-row ID only for row, record, or snapshot requests "
+        "or when no stable entity ID exists."
+    )
+
+    assert entity_identifier != row_identifier
+    assert required_rule in instructions
+
+
+def test_profile_prefers_identifier_when_entity_has_no_named_output_attribute() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a non-person entity without a named output attribute, use a schema-described "
+        "identifier, not a display name."
+        in instructions
+    )
+    assert (
+        "Use a display name only if requested or no identifier exists."
+        in instructions
+    )
+
+
+def test_profile_prefers_name_components_for_requested_person() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "For a requested person without a named output attribute, prefer a "
+        "schema-described personal name or name components instead."
+        in instructions
+    )
 
 
 def test_profile_keeps_formula_operand_populations_separate_through_parent_filter() -> None:
@@ -6309,9 +6955,9 @@ def test_profile_keeps_explicit_mapped_outputs_over_lookup_labels() -> None:
     mapped_outputs = ("records.primary_code", "records.secondary_code")
     lookup_label = "lookup.display_label"
     required_rule = (
-        "For a requested output explicitly named/mapped in normalized_meaning, bind its "
-        "loaded physical column, not a similar column or related lookup label. Use "
-        "relationships only for other outputs; lookup labels only if directly requested/mapped."
+        "For output explicitly mapped in normalized_meaning, bind/project its loaded physical "
+        "column, never a similar column or lookup label, including when it is a foreign "
+        "key. Use relationships only for other outputs; lookup labels only when directly mapped."
     )
 
     assert mapped_outputs != (lookup_label,)
@@ -6351,8 +6997,8 @@ def test_profile_does_not_use_a_filter_only_value_as_a_bare_entity_output() -> N
         in instructions
     )
     assert (
-        "Choose an evidence-backed identity or descriptive representation that "
-        "distinguishes the requested rows"
+        "If neither identifier nor person-name rule selects an output, leave it unresolved "
+        "and continue targeted research."
         in instructions
     )
 
@@ -6361,26 +7007,52 @@ def test_profile_uses_described_relationship_when_multiple_foreign_keys_exist() 
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
 
     assert (
-        "When multiple declared foreign keys connect the same required tables and "
-        "trusted descriptions distinguish their roles, use the relationship whose "
-        "described role matches the requested entity relationship. A column named "
-        "as a formula input does not by itself select the join key"
+        "When trusted descriptions distinguish roles, match the question"
         in instructions
     )
+    assert "A formula-input column name alone does not select a join key" in instructions
 
 
 def test_profile_does_not_substitute_owner_fk_for_temporal_role() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
-    temporal_role_rule = (
-        "When multiple declared foreign keys connect the same required tables, a temporal "
-        "role such as last, latest, or most recent actor, editor, or updater is not owner "
-        "or creator merely because an owner or creator foreign key exists. Select only the "
-        "relationship whose trusted schema description matches that temporal role; if trusted "
-        "descriptions do not distinguish the roles, leave it unresolved."
-    )
+    temporal_role_rule = "An owner/creator is not a last/latest editor, updater, or actor."
 
     assert "last_actor_id" != "owner_id"
     assert temporal_role_rule in instructions
+
+
+def test_profile_prefers_direct_temporal_role_over_history_actor() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "when a trusted direct last/latest editor, updater, or actor relationship exists, "
+        "use it"
+        in instructions
+    )
+
+
+def test_profile_inspects_entity_before_committing_history_actor() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "A history, detail, audit, or log row used only to identify a parent does not "
+        "make its row actor the requested last/latest person"
+        in instructions
+    )
+    assert (
+        "Treat ordinary ambiguous role wording as insufficient to request that row actor"
+        in instructions
+    )
+
+
+def test_profile_does_not_compare_history_actor_after_direct_role_is_evidenced() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+
+    assert (
+        "when a trusted direct last/latest editor, updater, or actor relationship exists, "
+        "use it"
+        in instructions
+    )
 
 
 def test_profile_distinguishes_direct_participation_from_shared_parent_membership() -> None:
@@ -6659,6 +7331,40 @@ def test_multiple_validation_feedback_requires_an_ordered_tuple(
 
 
 def test_invalid_stop_feedback_requires_an_admissible_non_stop_request() -> None:
+    research_context = json.dumps(
+        {
+            "invalid_stop_generation_authority": {
+                "reason_code": "QUERY_REQUIREMENT_INCOMPLETE",
+                "affected_source_handles": ["s1"],
+            },
+            "state": {"evidence": [{"evidence_handle": "e1", "fresh": True}]},
+        }
+    )
+    prompt = build_schema_research_prompt(
+        load_schema_research_agent_profile(),
+        task="Research the schema.",
+        research_context=research_context,
+        validation_feedback="INVALID_STOP",
+    )
+
+    instructions = json.loads(prompt)["instructions"]
+
+    assert instructions.endswith(
+        "Previous decision rejected: INVALID_STOP. Correct the decision using the "
+        "profile rules and return a replacement typed decision. When research_context "
+        "has invalid_stop_generation_authority, do not return stop or complete again; "
+            "correct only its affected_source_handles using the smallest typed non-stop "
+            "decision; for proposals copy fresh citation_evidence_handles from "
+            "research_context; when an affected source is in exact_formula_documents, "
+            "every required physical input is supported, and no required predicate or "
+            "join continuation remains, return one document-backed derived_expression "
+            "proposal with those fresh citations and semantic_commit; do not request or "
+            "execute another probe. Otherwise, do not repeat a previously successful "
+            "non-empty probe."
+        )
+
+
+def test_invalid_stop_feedback_without_authority_keeps_terminal_stop_available() -> None:
     prompt = build_schema_research_prompt(
         load_schema_research_agent_profile(),
         task="Research the schema.",
@@ -6667,11 +7373,15 @@ def test_invalid_stop_feedback_requires_an_admissible_non_stop_request() -> None
     )
 
     instructions = json.loads(prompt)["instructions"]
+    suffix = instructions[len(load_schema_research_agent_profile().instructions) :]
 
-    assert instructions.endswith(
-        "Previous decision rejected: INVALID_STOP. Correct the decision using the "
-        "profile rules and return a replacement typed decision."
+    assert "Do not return stop or complete again." not in suffix
+    assert (
+        "When research_context has invalid_stop_generation_authority, do not return "
+        "stop or complete again;"
+        in suffix
     )
+    assert "Every stop request must use proposals: [] and include source_handles" in instructions
 
 
 def test_research_query_feedback_is_generic_and_preserves_input(
@@ -7172,6 +7882,19 @@ def test_runtime_model_enforces_exact_typed_decision_schema(
                 assert_discriminator_fields_are_required(value)
 
     assert_discriminator_fields_are_required(schema)
+    cited_proposal_definitions = {
+        "BindingAssessment",
+        "HypothesisAssessment",
+        "JoinAssessment",
+        "NewBindingProposal",
+        "NewHypothesisProposal",
+        "NewJoinProposal",
+    }
+    for definition_name in cited_proposal_definitions:
+        definition = definitions[definition_name]
+        assert "citation_evidence_handles" in definition.get("required", [])
+        assert definition["properties"]["citation_evidence_handles"]["type"] == "array"
+        assert "citation_evidence_ids" not in definition["properties"]
     assert parse_research_decision(response.raw_response).next.next_kind == "tool"
 
 
@@ -7325,7 +8048,7 @@ def test_model_code_defaults_do_not_override_typed_research_parameters(
         temperature=0.3,
     )
     assert provider.max_retries == 0
-    assert provider.model.client.max_retries == 1
+    assert provider.model.client.max_retries == 0
     completion = provider.model._prepare_completion_kwargs(
         [ChatMessage(role=MessageRole.USER, content="research prompt")],
         max_tokens=1_024,
@@ -7353,7 +8076,7 @@ def test_text_to_sql_model_applies_explicit_http_timeout(
     assert provider.model.client._client.timeout == httpx.Timeout(5.0)
 
 
-def test_text_to_sql_model_caps_http_timeout_at_ten_minutes(
+def test_text_to_sql_model_caps_http_timeout_at_twenty_minutes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import agent_command
@@ -7367,7 +8090,7 @@ def test_text_to_sql_model_caps_http_timeout_at_ten_minutes(
         timeout_seconds=14_400.0,
     )
 
-    assert provider.model.client._client.timeout == httpx.Timeout(600.0)
+    assert provider.model.client._client.timeout == httpx.Timeout(1200.0)
 
 
 @pytest.mark.parametrize("timeout_seconds", (float("nan"), float("inf")))
@@ -7478,19 +8201,24 @@ def test_profile_keeps_trusted_exact_formula_predicate_column_over_proxies() -> 
     assert required_rule in instructions
 
 
-def test_profile_keeps_exact_formula_aggregate_operand_over_id_proxy() -> None:
+def test_profile_maps_formula_operand_by_semantics_not_physical_name() -> None:
     instructions = " ".join(load_schema_research_agent_profile().instructions.split())
-    exact_operand = "event_history.event_id"
-    id_proxy = "events.id"
     required_rule = (
-        "For an explicitly named physical aggregate operand in a trusted exact FORMULA, bind "
-        "the same-named loaded column; never substitute a different-named Id, key, or proxy. "
-        "Before semantic_commit, prove relationship paths connecting that operand to each "
-        "formula predicate population; otherwise leave the FORMULA unresolved. A pure aggregate "
-        "operand does not require a value probe; retain search_value for literal predicates."
+        "Exact FORMULA inputs are semantic roles, not physical names. Bind by question "
+        "meaning/population."
+    )
+    assert required_rule in instructions
+
+
+def test_profile_uses_numeric_measure_instead_of_formatted_text_for_ordering() -> None:
+    instructions = " ".join(load_schema_research_agent_profile().instructions.split())
+    required_rule = (
+        "Bind formula inputs by measure and row grain, not names. When the same row has "
+        "numeric and formatted-text candidates for a measure, use numeric for MIN, MAX, "
+        "ordering, or arithmetic. Use text only for explicitly requested content or "
+        "format; a matching operand name is not such a request."
     )
 
-    assert exact_operand != id_proxy
     assert required_rule in instructions
 
 

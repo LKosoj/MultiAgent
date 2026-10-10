@@ -199,11 +199,14 @@ async def run_targeted_research_reentry(
             raise ResearchReentryError(
                 "requirements must be exact current W4 authority"
             )
-        if _needs_research_continuation(
-            request.source_id,
-            admitted.state,
-            current_research,
-            request.required_evidence_kind,
+        if (
+            request.repair_kind != "semantic_binding_mismatch"
+            and _needs_research_continuation(
+                request.source_id,
+                admitted.state,
+                current_research,
+                request.required_evidence_kind,
+            )
         ):
             return await _complete_research_continuation(
                 admitted,
@@ -511,7 +514,18 @@ def _needs_research_continuation(
             or required_evidence_kind is EvidenceSourceKind.SCHEMA
         )
     )
-    return formula_needs_continuation or (
+    completed_request_ids = {
+        reentry.missing_evidence_request_id
+        for reentry in state.research_reentries
+        if reentry.status is ResearchReentryStatus.COMPLETED
+    }
+    repeated_after_completed_reentry = any(
+        request.source_id == source_id
+        and request.required_evidence_kind is required_evidence_kind
+        and request.missing_evidence_request_id in completed_request_ids
+        for request in state.missing_evidence_requests[:-1]
+    )
+    return formula_needs_continuation or repeated_after_completed_reentry or (
         required_evidence_kind is EvidenceSourceKind.SCHEMA
         and any(
             binding.source_id == source_id

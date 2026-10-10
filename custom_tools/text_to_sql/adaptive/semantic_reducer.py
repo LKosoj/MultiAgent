@@ -460,6 +460,14 @@ def _partial_selected_candidate_commit_gaps(
             for binding_id in item.binding_ids
             if bindings_by_id[binding_id].status is BindingStatus.CANDIDATE
         }
+        discriminator_candidate_ids = {
+            binding.binding_id
+            for binding in bindings_by_id.values()
+            if binding.source_id == item.source_id
+            and isinstance(binding, DiscriminatorValueBinding)
+            and binding.status is BindingStatus.CANDIDATE
+        }
+        selected_candidate_ids.update(discriminator_candidate_ids)
         unassessed_ids = selected_candidate_ids - assessed_ids
         if (
             item.kind is SemanticItemKind.DIMENSION
@@ -481,7 +489,7 @@ def _partial_selected_candidate_commit_gaps(
                 or binding.physical_column not in promoted_columns
             }
         if (
-            selected_candidate_ids & promoted_ids
+            (selected_candidate_ids & promoted_ids or discriminator_candidate_ids)
             and unassessed_ids
         ):
             gaps.append(
@@ -713,6 +721,19 @@ def _new_join(
                 join_type=edge.join_type,
             )
             for edge in oriented_path
+        )
+    if (
+        proposal.join_type is JoinType.INNER
+        and len(path) == 1
+        and _target_key(path[0].right) < _target_key(path[0].left)
+    ):
+        edge = path[0]
+        path = (
+            JoinEdge(
+                left=edge.right,
+                right=edge.left,
+                join_type=edge.join_type,
+            ),
         )
     connected_path = all(
         previous.right.table == following.left.table
@@ -1375,16 +1396,18 @@ def _conflicting_exact_search_value(
     predicate: PredicateRef,
     cited: tuple[EvidenceRecord, ...],
 ) -> bool:
-    if predicate.operator is not PredicateOperator.EQ or not isinstance(
-        predicate.left, ColumnRef
-    ):
+    if not isinstance(predicate.left, ColumnRef):
         return False
     expected = (
         predicate.right.value
         if type(predicate.right) is LiteralValue
         else predicate.right
     )
-    if expected is None or type(expected) is tuple:
+    if predicate.operator is PredicateOperator.EQ and expected is not None:
+        expected_values = (expected,)
+    elif predicate.operator is PredicateOperator.IN and type(expected) is tuple:
+        expected_values = expected
+    else:
         return False
     for record in cited:
         provenance, payload = _payload(record)
@@ -1398,10 +1421,18 @@ def _conflicting_exact_search_value(
             continue
         requested = payload.get("requested_value")
         rows = payload.get("rows")
-        same_literal = type(requested) is type(expected) and requested == expected
+        same_literal = any(
+            type(requested) is type(value) and requested == value
+            for value in expected_values
+        )
         if same_literal and rows == []:
             return True
-        if not same_literal and isinstance(rows, list) and rows:
+        if (
+            predicate.operator is PredicateOperator.EQ
+            and not same_literal
+            and isinstance(rows, list)
+            and rows
+        ):
             return True
     return False
 

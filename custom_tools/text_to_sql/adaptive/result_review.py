@@ -17,6 +17,7 @@ from ._sql_ast_models import (
     QueryRole,
 )
 from .models import (
+    BindingStatus,
     CheckFailureCode,
     Digest,
     DiscriminatorValueBinding,
@@ -39,8 +40,10 @@ from .result_validation import (
 from .freshness import FreshnessContext
 from .semantic_coverage import CoverageRequirements
 from .semantic_plan import (
+    _relation_tables,
     build_semantic_ast,
     direct_physical_projection_column,
+    predicate_from_expression,
 )
 from .serialization import canonical_json_bytes
 
@@ -248,7 +251,9 @@ def evaluate_result_review_arbitration_capability(value: object) -> ResultReview
             "instruction": (
                 "Resolve only this proven conflict between two executed SQL candidates. Use trusted "
                 "context to choose one supplied candidate_id or unresolved. Do not generate, rewrite, "
-                "execute SQL, create bindings, or change any formula."
+                "execute SQL, create bindings, or change any formula. "
+                'Return exactly {"status":"resolve","candidate_id":"<supplied candidate_id>"} '
+                'or {"status":"unresolved","candidate_id":null}.'
             ),
             "question": value.state.query_spec.original_text,
             "query_spec": value.state.query_spec.model_dump(mode="json"),
@@ -402,6 +407,31 @@ def evaluate_result_review_capability(
             repair_kind="semantic_binding_mismatch",
             repair_binding_id=repair_binding_id,
         )
+    if source_id := _root_projection_order_mismatch_source_id(
+        state, requirements, candidate, parsed_ast
+    ):
+        reason = "candidate projects requested values in a different order"
+        source_id, evidence_id, repair_binding_id = _response_target(
+            state,
+            requirements,
+            _ModelReviewResponse(
+                status="contradicted",
+                reason=reason,
+                source_handle=_source_handle_for_source_id(requirements, source_id),
+            ),
+        )
+        return _receipt(
+            state,
+            requirements,
+            candidate,
+            "contradicted",
+            reason,
+            canonical_execution,
+            source_id,
+            evidence_id,
+            deterministic_failure_code=CheckFailureCode.RESULT_SHAPE_MISMATCH,
+            repair_binding_id=repair_binding_id,
+        )
     try:
         response = _parse_response(value.model(_prompt(value, canonical_execution)))
     except Exception as exc:
@@ -416,6 +446,9 @@ def evaluate_result_review_capability(
         response = response.model_copy(update={"predicate_authority": None})
     response = _normalize_unsupported_discriminator_contradiction(
         state, requirements, candidate, parsed_ast, response
+    )
+    response = _normalize_zero_row_discriminator_consistency(
+        state, requirements, parsed_ast, response
     )
     source_id, evidence_id, repair_binding_id = _response_target(
         state, requirements, response
@@ -473,8 +506,33 @@ def _root_projection_shape_mismatch_source_id(
         projection.node_id: annotations_by_node.get(projection.node_id, set())
         for projection in root_projections
     }
+    root_grouping_expressions = tuple(
+        grouping.expression
+        for grouping in parsed_ast.groupings
+        if grouping.scope_id in root_scope_ids
+    )
+
+    def contains_expression(expression, target) -> bool:
+        return expression == target or any(
+            contains_expression(child, target) for _, _, child in expression.children
+        )
     semantic_items_by_source_id = {
         item.source_id: item for item in state.query_spec.semantic_items
+    }
+    requested_bindings_by_source_id = {
+        source_id: tuple(
+            binding
+            for binding in requirements.selected_bindings
+            if binding.source_id == source_id
+        )
+        for source_id in requested_source_ids
+    }
+    deferred_candidate_columns = {
+        binding.physical_column
+        for binding in state.bindings
+        if isinstance(binding, PhysicalColumnBinding)
+        and binding.source_id in requested
+        and binding.status is BindingStatus.CANDIDATE
     }
     if (
         len(requested_source_ids) == 1
@@ -491,18 +549,56 @@ def _root_projection_shape_mismatch_source_id(
                 return min(unexpected_source_ids)
         return requested_source_ids[0]
     if not requested.issubset(set().union(*root_projection_annotations.values())):
-        return None
-    for source_ids in root_projection_annotations.values():
-        if source_ids and source_ids.isdisjoint(requested):
-            return min(source_ids)
-    requested_bindings_by_source_id = {
-        source_id: tuple(
-            binding
-            for binding in requirements.selected_bindings
-            if binding.source_id == source_id
+        requested_column_names = tuple(
+            bindings[0].physical_column.column.casefold()
+            for bindings in requested_bindings_by_source_id.values()
+            if len(bindings) == 1
+            and isinstance(bindings[0], PhysicalColumnBinding)
         )
-        for source_id in requested_source_ids
-    }
+        root_column_names = tuple(
+            dict(projection.expression.attributes).get("name", "").casefold()
+            for projection in root_projections
+            if projection.expression.kind == "column"
+        )
+        if (
+            len(requested_column_names) == len(requested_source_ids)
+            and all(name in root_column_names for name in requested_column_names)
+            and len(root_projections) > len(requested_column_names)
+        ):
+            return requested_source_ids[0]
+        return None
+    for projection in root_projections:
+        source_ids = root_projection_annotations[projection.node_id]
+        if requested_source_ids and source_ids.isdisjoint(requested):
+            if (
+                source_ids
+                and any(
+                    contains_expression(grouping, projection.expression)
+                    for grouping in root_grouping_expressions
+                )
+                and all(
+                    semantic_items_by_source_id[source_id].required
+                    and semantic_items_by_source_id[source_id].kind
+                    is SemanticItemKind.DIMENSION
+                    for source_id in source_ids
+                )
+            ):
+                continue
+            direct_column = direct_physical_projection_column(
+                parsed_ast,
+                projection.expression,
+                next(iter(namespaces)),
+                requirements.allowed_tables,
+                requirements.allowed_columns,
+            )
+            if (
+                len(requested_source_ids) == 1
+                and semantic_items_by_source_id[requested_source_ids[0]].kind
+                is SemanticItemKind.DIMENSION
+                and direct_column in deferred_candidate_columns
+            ):
+                continue
+            return min(source_ids) if source_ids else requested_source_ids[0]
     if (
         len(requested_source_ids) > 1
         and all(
@@ -526,11 +622,6 @@ def _root_projection_shape_mismatch_source_id(
         )
     ):
         return requested_source_ids[0]
-
-    def contains_expression(expression, target) -> bool:
-        return expression == target or any(
-            contains_expression(child, target) for _, _, child in expression.children
-        )
 
     if (
         requested_source_ids
@@ -556,6 +647,72 @@ def _root_projection_shape_mismatch_source_id(
     ):
         return requested_source_ids[0]
     return None
+
+
+def _root_projection_order_mismatch_source_id(
+    state: ResearchState,
+    requirements: CoverageRequirements,
+    candidate: SqlCandidate,
+    parsed_ast: ParsedSqlCandidate,
+) -> str | None:
+    requested_source_ids = state.query_spec.requested_output_source_ids
+    if len(requested_source_ids) < 2:
+        return None
+    items = {item.source_id: item for item in state.query_spec.semantic_items}
+    bindings_by_source = {
+        source_id: tuple(
+            binding
+            for binding in requirements.selected_bindings
+            if binding.source_id == source_id
+        )
+        for source_id in requested_source_ids
+    }
+    if not (
+        all(items[source_id].kind is SemanticItemKind.DIMENSION for source_id in requested_source_ids)
+        and all(
+            len(bindings) == 1 and isinstance(bindings[0], PhysicalColumnBinding)
+            for bindings in bindings_by_source.values()
+        )
+        and len({bindings[0].physical_column for bindings in bindings_by_source.values()})
+        == len(requested_source_ids)
+    ):
+        return None
+    namespaces = {table.namespace for table in requirements.allowed_tables}
+    if len(namespaces) != 1:
+        return None
+    semantic_ast = build_semantic_ast(
+        candidate,
+        parsed_ast,
+        state.query_spec,
+        requirements,
+        next(iter(namespaces)),
+    )
+    root_scope_ids = {
+        scope.scope_id
+        for scope in parsed_ast.scopes
+        if scope.parent_scope_id is None and scope.query_role is QueryRole.ROOT
+    }
+    annotations = {
+        annotation.node_id: set(annotation.source_ids) & set(requested_source_ids)
+        for annotation in semantic_ast.coverage.annotations
+    }
+    projection_source_ids = tuple(
+        annotations.get(projection.node_id, set())
+        for projection in parsed_ast.projections
+        if projection.scope_id in root_scope_ids
+    )
+    if len(projection_source_ids) != len(requested_source_ids) or not all(
+        len(source_ids) == 1 for source_ids in projection_source_ids
+    ):
+        return None
+    projected = tuple(next(iter(source_ids)) for source_ids in projection_source_ids)
+    if projected == requested_source_ids:
+        return None
+    return next(
+        expected
+        for expected, actual in zip(requested_source_ids, projected, strict=True)
+        if expected != actual
+    )
 
 
 def _direct_formula_projection_mismatch_source_id(
@@ -752,11 +909,21 @@ def _response_target(
         if response.repair_binding_id is not None:
             raise ValueError("review binding requires semantic repair")
     else:
-        if len(bindings) != 1:
-            raise ValueError("semantic repair must name one selected binding")
+        if len(bindings) == 1:
+            repair_binding = bindings[0]
+        else:
+            matching_bindings = tuple(
+                binding
+                for binding in bindings
+                if binding.binding_id == response.repair_binding_id
+            )
+            if len(matching_bindings) != 1:
+                raise ValueError("semantic repair must name one selected binding")
+            repair_binding = matching_bindings[0]
         response = response.model_copy(
-            update={"repair_binding_id": bindings[0].binding_id}
+            update={"repair_binding_id": repair_binding.binding_id}
         )
+        bindings = (repair_binding,)
     for binding in bindings:
         for evidence_id in binding.evidence_ids:
             evidence = next(
@@ -777,7 +944,7 @@ def _normalize_unsupported_discriminator_contradiction(
     """Keep a certified discriminator when only its zero-row alternative differs."""
 
     if (
-        response.status != "contradicted"
+        response.status not in {"contradicted", "ambiguous"}
         or response.repair_kind is not None
         or response.repair_binding_id is not None
         or response.predicate_authority is not None
@@ -878,6 +1045,106 @@ def _candidate_covers_selected_binding(
     return any(source_id in annotation.source_ids for annotation in semantic_ast.coverage.annotations)
 
 
+def _normalize_zero_row_discriminator_consistency(
+    state: ResearchState,
+    requirements: CoverageRequirements,
+    parsed_ast: ParsedSqlCandidate,
+    response: _ModelReviewResponse,
+) -> _ModelReviewResponse:
+    """Reject an exact zero-row alternative to a positively observed discriminator."""
+
+    if response.status != "consistent":
+        return response
+    namespaces = {table.namespace for table in requirements.allowed_tables}
+    if len(namespaces) != 1:
+        return response
+    relation_tables = _relation_tables(
+        parsed_ast,
+        next(iter(namespaces)),
+        requirements.allowed_tables,
+        parsed_ast.dialect,
+    )
+    candidate_predicates = tuple(
+        decoded
+        for predicate in parsed_ast.predicates
+        for atom in predicate.atoms
+        if (
+            decoded := predicate_from_expression(
+                atom.expression,
+                relation_tables,
+                scope_id=predicate.scope_id,
+                allowed_columns=requirements.allowed_columns,
+                dialect=parsed_ast.dialect,
+            )
+        )
+        is not None
+    )
+    items = {item.source_id: item for item in state.query_spec.semantic_items}
+    for binding in requirements.selected_bindings:
+        if not isinstance(binding, DiscriminatorValueBinding):
+            continue
+        item = items.get(binding.source_id)
+        if item is None or item.operator is not binding.discriminator_predicate.operator:
+            continue
+        selected_values = _discriminator_members(
+            binding.discriminator_predicate.operator,
+            binding.discriminator_predicate.right,
+        )
+        alternative_values = _discriminator_members(item.operator, item.literal_or_reference)
+        if (
+            selected_values is None
+            or alternative_values is None
+            or alternative_values == selected_values
+            or binding.discriminator_predicate in candidate_predicates
+            or PredicateRef(
+                left=binding.discriminator_column,
+                operator=item.operator,
+                right=item.literal_or_reference,
+            )
+            not in candidate_predicates
+        ):
+            continue
+        if not all(
+            any(
+                _exact_search_rows(evidence, binding.discriminator_column, value)
+                for evidence in state.evidence
+                if evidence.evidence_id in binding.evidence_ids
+                and evidence_has_state_authority(evidence, state)
+            )
+            for value in selected_values
+        ):
+            continue
+        if not all(
+            any(
+                rows == ()
+                for evidence in state.evidence
+                if evidence_has_state_authority(evidence, state)
+                and (
+                    rows := _exact_search_rows(
+                        evidence, binding.discriminator_column, value
+                    )
+                )
+                is not None
+            )
+            for value in alternative_values
+        ):
+            continue
+        return response.model_copy(
+            update={
+                "status": "contradicted",
+                "reason": (
+                    "candidate uses a zero-row discriminator alternative instead of "
+                    "the positively observed selected literal"
+                ),
+                "source_handle": _source_handle_for_source_id(
+                    requirements, binding.source_id
+                ),
+                "source_id": None,
+            }
+        )
+    return response
+
+
 def _discriminator_members(
     operator: PredicateOperator | None, right: object
 ) -> tuple[object, ...] | None:
@@ -945,6 +1212,33 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
     selected_source_ids = {
         binding.source_id for binding in value.requirements.selected_bindings
     }
+    semantic_items_by_source_id = {
+        item.source_id: item for item in value.state.query_spec.semantic_items
+    }
+    requested_output_source_ids = set(
+        value.state.query_spec.requested_output_source_ids
+    )
+    binding_role_checklist = [
+        {
+            "source_handle": _source_handle_for_source_id(
+                value.requirements, binding.source_id
+            ),
+            "source_id": binding.source_id,
+            "required_role": semantic_items_by_source_id[binding.source_id].kind,
+            "source_text": semantic_items_by_source_id[binding.source_id].source_text,
+            "normalized_meaning": semantic_items_by_source_id[
+                binding.source_id
+            ].normalized_meaning,
+            "requested_output": binding.source_id in requested_output_source_ids,
+            "binding_id": binding.binding_id,
+            "binding_kind": binding.kind,
+            "columns": [column.model_dump(mode="json") for column in binding.columns],
+            "predicates": [
+                predicate.model_dump(mode="json") for predicate in binding.predicates
+            ],
+        }
+        for binding in value.requirements.selected_bindings
+    ]
     selected_ids = {
         evidence_id
         for binding in value.requirements.selected_bindings
@@ -970,7 +1264,11 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
     return canonical_json_bytes(
         {
             "instruction": (
-                "First determine the requested result grain. When the question requires an "
+                "First check every required binding in its requested semantic role, not merely "
+                "whether its columns appear somewhere in the SQL. A required grouping dimension "
+                "must participate in the computation at that grouping grain; its column appearing "
+                "only in a filter or another role does not satisfy it. Then determine the requested "
+                "result grain. When the question requires an "
                 "entity-level computation over a period, a candidate that selects an extremal "
                 "raw observation without computing that requested grain cannot be consistent: "
                 "return contradicted when trusted evidence resolves the mismatch, otherwise "
@@ -1040,6 +1338,18 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "expected_result_shape is only an answer-format hint; singular grammar does not "
                 "require a tie-break, LIMIT or one-row result. Preserve all matches unless "
                 "the question or trusted context explicitly requires another result grain or aggregation. "
+                "When QuerySpec keeps a qualifier as a separate required FILTER and trusted "
+                "context independently maps the base measure or attribute to a physical field, "
+                "review that composition as the separate qualifier plus the mapped base measure. "
+                "Do not require one physical field for the whole qualified phrase or reinterpret "
+                "the mapped measure as belonging only to the qualifying rows unless trusted context "
+                "explicitly defines that different meaning. "
+                "If trusted context directly maps the whole qualified phrase to one physical field, "
+                "that direct whole-phrase mapping takes precedence over this composition rule. "
+                "QuerySpec is the authoritative list of required semantic items. The raw question may "
+                "clarify how those items combine, but review must not introduce a new entity, relationship, "
+                "filter, or population requirement unless it is represented by a required semantic item or "
+                "trusted document or evidence. "
                 "An entity or relationship role name alone does not authorize an exact discriminator predicate. "
                 "Do not contradict its omission unless the question, a trusted document, or an already selected binding explicitly requires "
                 "that exact column, operator, and value. "
@@ -1049,7 +1359,7 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "override the selected observed physical spelling. "
                 "Punctuation or formatting alone does not override the selected observed physical spelling when both "
                 "forms denote the same value; use the selected binding's observed literal in that case. "
-                "An alternative literal may contradict the selected exact discriminator only when separate durable exact DB evidence "
+                "An alternative literal may contradict or make ambiguous the selected exact discriminator only when separate durable exact DB evidence "
                 "positively contains that alternative for the same physical column and operator. QuerySpec/document wording and an "
                 "untruncated exact search with rows=[] do not prove the stored literal. "
                 "Use only this trusted context. Inspect the question, SQL, AST, "
@@ -1063,6 +1373,8 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "row_grain_requirement must be null unless contradicted solely because the candidate must "
                 "preserve qualifying rows or deduplicate an entity; then use preserve_qualifying_rows or "
                 "deduplicate_entity respectively. "
+                "For a binary AST expression, the child named this is the left operand and the child "
+                "named expression is the right operand; do not infer operand order from JSON field order. "
                 "Where a required FORMULA and trusted document explicitly specify aggregate operations "
                 "and arguments, you may return contradicted for an incorrect scope or operation order, "
                 "but row_grain_requirement must remain null unless the question, QuerySpec, or exact "
@@ -1074,6 +1386,13 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "formula, AST, and returned data rather than ignoring it because it is advisory. "
                 "Return contradicted when that independent comparison confirms the required "
                 "computation is not preserved; the audit finding alone is not trusted authority. "
+                "When a required numeric measure or numeric extremum is stored in a textual physical column, "
+                "bare ORDER BY, MIN, or MAX compares text instead of numeric values. When the semantic role "
+                "and trusted schema description or evidence confirm that numeric meaning, require an explicit "
+                "numeric conversion before comparison and return contradicted targeting the supplied measure, "
+                "ordering, or formula binding. Do not infer numeric meaning from a column name alone, and do "
+                "not apply this rule to codes, identifiers, labels, or values whose numeric representation is "
+                "not confirmed. "
                 "For a required fractional division or ratio, when the SQL dialect and trusted "
                 "schema establish integer operands, bare division without real coercion computes "
                 "a different result. Return contradicted targeting a supplied formula or input "
@@ -1089,6 +1408,9 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "Every other required item must still be used in its required semantic role, "
                 "such as filtering, joining, grouping, aggregation or ordering, but is not "
                 "required to be projected solely because it is required. "
+                "A required non-output DIMENSION that is already the exact root GROUP BY key "
+                "may also be projected to identify its grouped result row; do not treat that "
+                "group label as an unrelated extra output, and do not require it either. "
                 "When a required DIMENSION is an entity label or identifier that is not a "
                 "requested output, and a trusted document defines the selected entity row "
                 "through another confirmed predicate that the SQL applies, do not require its "
@@ -1106,19 +1428,12 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "requested output unless QuerySpec or trusted context explicitly requires that aggregate "
                 "projection or GROUP BY; return contradicted. A FORMULA used only as a filter or condition "
                 "does not authorize root aggregation or grouping. Use root DISTINCT only when the "
-                "question or QuerySpec explicitly requests unique or distinct, or trusted evidence "
-                "proves the entire root projection is one-to-one at the required result grain, for "
-                "example because the projected entity identity is unique; otherwise preserve all "
-                "qualifying rows. "
-                "When the question requests the values of an attribute themselves as a set, "
-                "whether bounded or unbounded, and repeated source rows carry the same value, "
-                "return each value once before applying a bound. When the question requests rows "
-                "or entities and merely displays that attribute, preserve separate rows. This "
-                "distinction does not apply to counts, metrics, formulas, or ordinary detail output. "
-                "When the requested output is a proven unique identity of a root entity and a "
-                "joined child relation is used only to qualify that entity, with no child output "
-                "requested, return each qualifying root identity once. This does not apply to "
-                "counts, metrics, formulas, or requested child rows. "
+                "question or QuerySpec explicitly requests unique or distinct, trusted evidence "
+                "proves the entire root projection is one-to-one at the required result grain; "
+                "otherwise preserve all qualifying rows. Words such as list, values, categories, "
+                "labels, what, or which do not imply uniqueness. Repeated qualifying rows must "
+                "remain repeated unless the question, QuerySpec, or trusted context explicitly "
+                "requires unique or distinct output. "
                 "A requested conditional entity output that preserves surrounding rows "
                 "must be implemented in the SELECT projection with CASE or IIF; its condition "
                 "must use a textual absence marker rather than SQL NULL, must not be moved to "
@@ -1130,7 +1445,15 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "the AST must retain that operator and those inputs. Do not replace it with a "
                 "domain calculation, duration conversion, date-difference helper, unit normalization, "
                 "or rounding unless the trusted formula explicitly requires that operation; return "
-                "contradicted with repair_kind null. "
+                "contradicted with repair_kind null. In a ratio or percentage, "
+                "SUM(identifier WHERE predicate) is count shorthand when the identifier names "
+                "the counted entity rather than a numeric measure. Require a conditional count "
+                "instead of summing identifier values, even when a trusted document uses SUM "
+                "notation. This does not apply to a confirmed numeric measure or an explicitly "
+                "requested sum of identifier values. This exact-formula rule does not override an "
+                "explicit inclusion, exclusion, or absence condition in the question. When a formula "
+                "describes the opposite population, use it only to confirm operands and do not contradict "
+                "a candidate solely for not reproducing the opposite formula. "
                 "When a numeric metric is requested with a fixed number of decimal places, keep "
                 "the SQL result numeric and use numeric rounding. Do not use text formatting or "
                 "append a display suffix unless the question explicitly requests textual output "
@@ -1144,6 +1467,10 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "an exact formula whose AST does not follow it, an explicit raw-row or single "
                 "entity-time grain, or an explicitly incompatible aggregate. This does not authorize "
                 "adding aggregation absent a required FORMULA, question, or trusted context that requires it. "
+                "When a required FORMULA operand can match multiple rows according to trusted evidence, "
+                "an unbounded scalar subquery that silently selects one matching row is contradicted unless "
+                "the question or trusted context explicitly selects one row. This checks formula row scope "
+                "and does not prescribe which aggregate to use. "
                 "When the question requests a ranked top N by the lowest or highest aggregated metric, "
                 "a trusted MIN or MAX description of that extremum defines the ranking direction; "
                 "do not require an additional outer MIN or MAX that collapses the N result rows. "
@@ -1160,8 +1487,17 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "An expression.expression in a derived binding is a model hypothesis copied "
                 "from expression_claim, not evidence that the SQL performs that computation; "
                 "never use it to resolve a conflict with the question, "
-                "required semantic roles, documents, AST or returned rows. When the "
-                "selected supported derived binding may complete a documented shorthand by adding a required reference input; "
+                "required semantic roles, documents, AST or returned rows. "
+                "A derived binding's input_columns are the resolved physical inputs for its "
+                "document formula; a supported physical binding selected for an operand role is "
+                "likewise a resolved physical input. Once "
+                "resolved, an operand name repeated in the document, rule_excerpt, or expression is "
+                "a logical semantic role, not an exact physical-column requirement, unless the trusted "
+                "document explicitly establishes that physical mapping. When the AST uses the resolved "
+                "inputs in their required roles, do not remap them merely because the logical operand "
+                "name matches another schema column; require independent positive trusted evidence "
+                "that the resolved physical input does not carry the requested role. "
+                "A selected supported derived binding may complete a documented shorthand by adding a required reference input; "
                 "the added input alone is not a contradiction; require trusted context that positively contradicts it. "
                 "For a required age or duration semantic role, a candidate AST using confirmed birth and "
                 "event/reference inputs or a confirmed full-date computation may complete a narrower one-input "
@@ -1208,6 +1544,9 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "An auxiliary probe over a different physical column or predicate cannot "
                 "contradict an exact physical predicate confirmed by a selected binding or "
                 "document. Judge the candidate against the confirmed predicate itself. "
+                "The owner checklist governs requested output attributes; it must not replace a "
+                "selected exact FILTER predicate that the AST follows unless independent trusted "
+                "context positively proves that predicate wrong. "
                 "When a selected binding supplies the confirmed relationship used to combine "
                 "a metric and a condition, row multiplication or surprising result magnitude "
                 "alone does not prove that relationship wrong. Still mark the candidate "
@@ -1244,7 +1583,10 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "For one required formula, each required FILTER or TIME predicate that defines its population "
                 "must apply to every numerator and denominator term; if only one term applies it, return "
                 "contradicted. Use separate populations only when the question or trusted formula explicitly "
-                "requires separate populations. "
+                "requires separate populations. When the user asks for a percentage in, within, or among a "
+                "named group, that group is the common population of numerator and denominator. A supporting "
+                "formula that mentions the group only in the denominator does not narrow this user scope unless "
+                "the user explicitly requests a global numerator or a separate baseline population. "
                 "When trusted schema or evidence confirms that alternative endpoint rows are "
                 "directional representations of the same relationship for one entity, count each "
                 "entity-relationship pair once. If the AST counts both directional rows as separate "
@@ -1255,6 +1597,12 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "one requested shared attribute; do not require the other endpoint to be joined or "
                 "projected unless the question or documents explicitly request endpoint-specific or "
                 "both-role output. "
+                "Conversely, when trusted schema or evidence confirms that one relationship row "
+                "contains two endpoint columns and the question requests all entities participating "
+                "in those relationships without restricting an endpoint role, the SQL must cover "
+                "both endpoint columns. Using only one endpoint is contradicted, not ambiguous; "
+                "target the supplied output binding and leave repair_kind null because the SQL "
+                "composition, not the binding, is wrong. "
                 "For counts as well as ratios, do not infer DISTINCT, a unique subquery, or EXISTS unless "
                 "the question, QuerySpec, or trusted context explicitly requires unique, distinct, or "
                 "entity-once counting. A named entity, identifier, or one-to-many join alone does not prove deduplication. "
@@ -1285,9 +1633,22 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "is valid only when the question or trusted document explicitly names those rows as "
                 "its counting unit. Within an already established population, COUNT(identifier) "
                 "remains non-DISTINCT unless unique, distinct, or entity-once counting is explicit. "
+                "Determine the measured population from the aggregate arguments, not from whether "
+                "a qualifying predicate is stored in the same FORMULA item. If every aggregate "
+                "argument comes from one relation and another one-to-many relation contributes only "
+                "a population predicate, that other relation is a qualifier: do not join its detail "
+                "rows into the aggregate. Use EXISTS or one qualifying key per parent. This preserves "
+                "plain non-DISTINCT COUNT(input) over the measured rows; it does not add DISTINCT. "
                 "A scalar or yes/no answer form alone does not prove a single-row result and "
                 "does not authorize aggregation; preserve the formula's row scope unless the "
                 "question or trusted context explicitly requires another grain or aggregate. "
+                "When a required requested METRIC asks for one aggregate measure over the complete "
+                "qualifying population, selecting the stored measure separately for each qualifying "
+                "row does not compute that metric. Return contradicted unless the SQL combines those "
+                "measures at the requested population grain or the question or trusted context "
+                "explicitly requests the separate row values. This rule follows the metric meaning, "
+                "not expected_result_shape or singular grammar; do not apply it to a DIMENSION, a "
+                "boolean or existence answer, or an explicitly requested per-row breakdown. "
                 "Multiple returned rows do not by themselves make the answer ambiguous. When "
                 "the SQL follows all required bindings and the question and documents specify "
                 "no tie-break or limit, preserve all matches and do not return ambiguous solely "
@@ -1299,13 +1660,12 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "For other requested entity or time semantics, "
                 "compare them with the table/data grain and aggregation and grouping in the AST. "
                 "For an aggregate per entity, a display attribute is not proof of the entity grain. "
-                "If the AST groups by that attribute, return consistent only when trusted context "
+                "When the question or an exact trusted formula explicitly defines the compared groups "
+                "by that attribute, preserve that attribute-defined grain and do not require proof that "
+                "each value uniquely maps to a different internal entity identifier. "
+                "Outside that exception, if the AST groups by that attribute, return consistent only when trusted context "
                 "proves that attribute is unique per entity; return contradicted when trusted context "
                 "or the result proves that distinct entities were merged, otherwise return ambiguous. "
-                "Check every required binding in its requested semantic role, not merely whether "
-                "its columns appear somewhere in the SQL. A required grouping dimension must "
-                "participate in the computation at that grouping grain; its column appearing only "
-                "in a filter or another role does not satisfy it. "
                 "When trusted schema or a document explicitly maps a required semantic item to "
                 "one physical column but the selected binding and SQL use a different physical "
                 "column, return contradicted targeting that supplied binding and set repair_kind "
@@ -1334,6 +1694,9 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "selected supported parent/entity-role relationship that the SQL follows. Do not apply "
                 "this preservation when the question or a trusted document explicitly requests the "
                 "filter-row actor, author, owner, or updater role. "
+                "Ordinary ambiguous role wording alone does not explicitly request the filter-row role; "
+                "that requires a trusted mapping to it or an explicit reference to the event, history, "
+                "audit, or log row actor. "
                 "A selected binding's supported status proves authority, not that its "
                 "business meaning matches the question, and must not override a "
                 "conflicting trusted schema description. "
@@ -1349,7 +1712,10 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "show that the direct requested attribute is absent, the selected column belongs to "
                 "the requested entity, its described role is a plausible answer proxy, and no second "
                 "plausible entity-owned proxy remains. Do not reopen the literal-label mismatch in "
-                "that case. A merely related or correlated attribute still fails this rule. "
+                "that case. Once those conditions are satisfied, preserve research's consistent "
+                "assessment and must not independently re-assess whether that proxy is plausible "
+                "solely from the same literal-label mismatch. A merely related or correlated "
+                "attribute still fails this rule. "
                 "When an event or detail measure is selected for a requested summary, standing, or cumulative "
                 "measure, return contradicted with semantic_binding_mismatch targeting that selected binding; "
                 "supported status does not override this role conflict. Do not apply this when the question or "
@@ -1368,19 +1734,40 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "aggregates, extrema, filters and groupings with the exact computation requested "
                 "by the question and documents instead of treating the presence of the same "
                 "operations as proof of equivalence. Return contradicted only when trusted context "
-                "proves the mismatch, otherwise ambiguous. When the "
-                "question or QuerySpec requests an aggregate of a quantity computed separately "
+                "proves the mismatch, otherwise ambiguous. "
+                "An explicit comparator in the question or QuerySpec takes precedence over "
+                "a conflicting comparator inferred only from descriptive evidence. Only a "
+                "trusted document that explicitly defines the exact formula may override that "
+                "comparator. When QuerySpec has already normalized an exact trusted formula solely "
+                "to preserve the question's explicit inclusive or exclusive boundary, review against "
+                "the normalized QuerySpec comparator and do not restore the document comparator. "
+                "When QuerySpec has already normalized an exact trusted formula solely because its "
+                "arithmetic expansion contradicts an unambiguous percentage phrase in the question, "
+                "review against the normalized QuerySpec arithmetic and do not restore the document "
+                "expansion. "
+                "When QuerySpec explicitly leaves an aggregate reference population unresolved, and "
+                "the question, trusted documents, selected bindings, and evidence do not positively "
+                "require one scope, do not return ambiguous solely because the candidate chooses one "
+                "reasonable reference population. Review that candidate against the resolved requirements; "
+                "this does not authorize changing or inventing a scope that trusted context specifies. "
+                "When the question or QuerySpec requests an aggregate of a quantity computed separately "
                 "for each entity, require the inner value once per entity and the outer aggregate "
                 "over those entity rows. For a matching-child count, include zero matching children "
                 "for every entity in the qualifying parent set. A trusted exact formula that names "
                 "only a row expression but omits the entity grain or counting unit does not erase "
                 "that explicit entity grain. This does not override a trusted formula that explicitly "
                 "states another row scope or counting unit. "
-                "When the "
-                "trusted document explicitly specifies the exact computation, return contradicted "
-                "when the AST adds, removes or reorders an aggregation so that it computes a "
-                "different formula; do not request more schema or data evidence merely to justify "
-                "an undocumented alternative computation. repair_kind must be null when the selected "
+                "After applying that grain rule, preserve every operation explicitly stated by a "
+                "trusted exact formula. The formula remains authoritative for those stated "
+                "operations even when unconventional; do not replace them with a conventional "
+                "domain interpretation. An outer aggregation required by an explicit question or "
+                "QuerySpec grain is not an added or reordered operation within a shorthand row "
+                "expression when the document omits its grain or counting unit. A trusted document "
+                "explicitly specifies the exact computation. When the document explicitly states "
+                "its row scope or counting unit, return contradicted when the AST "
+                "adds, removes or reorders an aggregation so that it computes a different formula; "
+                "do not request more schema or data evidence merely to justify an undocumented "
+                "alternative computation. repair_kind must be null when the selected "
                 "physical bindings are correct and only the computation differs. When an unbound required FORMULA is "
                 "computed incorrectly, target one supplied input binding used by that formula as source_handle. "
                 "When the SQL exactly follows a computation "
@@ -1398,11 +1785,25 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "question or documents explicitly request that identity or attribute. "
                 "When alternatives are defined by MIN(...) and MAX(...), use Min and Max "
                 "respectively as their exact result labels. "
+                "When trusted context names a status phrase and its negated form while "
+                "defining a condition and its opposite, treat both phrases as exact text "
+                "labels. Generic true/false values contradict that requested answer form, "
+                "even for a yes/no question. "
                 "Mark a wrong answer form or projection contradicted. "
                 "Final mandatory cardinality rule: expected_result_shape never constrains "
                 "the number of returned rows. Never return contradicted or ambiguous merely "
                 "because execution returned multiple rows; when no independent trusted conflict "
                 "exists, return consistent. "
+                "Final mandatory extremum-scope check: before returning consistent for a lowest "
+                "or highest row, compare the AST scope that computes MIN, MAX, or ranking with the "
+                "root candidate-row scope. Every join and filter that the question, trusted document, "
+                "or selected bindings require for a row to qualify must also constrain the extremum. "
+                "If an independent scalar subquery computes a global extremum while omitting any such "
+                "required relation or predicate, return contradicted even when the SQL executed "
+                "successfully or returned zero rows: that global row may be absent from the qualifying "
+                "candidate set. An empty result alone remains valid only when the SQL preserves the "
+                "required extremum scope. Do not reject a global extremum when trusted meaning truly "
+                "defines the global base-table population. "
                 "Final mandatory owner checklist, which takes precedence over earlier row-local and "
                 "full-label rules: (1) Determine the owner of every requested output "
                 "from the question and normalized meaning. (2) Determine the owner table from table "
@@ -1410,6 +1811,10 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "same-named event or record column is selected instead of the direct column of the named "
                 "entity, return contradicted with semantic_binding_mismatch. (4) Conversely, do not reject "
                 "a direct named-entity column because an event or record has a same-named column. "
+                "When a requested output has a confirmed direct physical binding, compare the projected "
+                "AST column with that binding: a different related or proxy column does not satisfy that requested output "
+                "without trusted proof of equivalence. Return contradicted targeting the confirmed binding with "
+                "repair_kind null because the SQL projection, not the binding, is wrong. "
                 "A qualifying relation that trusted schema describes as another representation of the same "
                 "named entity at the same identity key is not an event or record for this checklist: prefer "
                 "its direct qualifying-row label over adding a separate master or entity join solely for "
@@ -1418,13 +1823,34 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
                 "consistent, compare every direct matching label already visible on same-identity "
                 "representations that supply a required condition or formula. Do not stop at the first "
                 "plausible master label. "
+                "Final mandatory exact-discriminator authority check: when one trusted "
+                "document directly and unambiguously maps the same required filter source "
+                "to an exact physical column, operator and literal, and a selected SUPPORTED "
+                "discriminator_value and the AST follow that mapping, do not reopen it as "
+                "ambiguous only because the question or QuerySpec contains a malformed or "
+                "ambiguous surface label for that source. This does not authorize guessing "
+                "between mappings or accepting another column, operator or literal; positive "
+                "durable exact DB evidence of such a literal conflict still controls, but "
+                "QuerySpec or document wording alone does not. "
                 "Final mandatory population and time check: an ordinary requested count of named "
                 "base entities must preserve the base-entity population when no trusted exact "
                 "formula explicitly establishes another counting unit. A related table may qualify "
                 "those entities through EXISTS or a deduplicated qualifying-key set without creating "
-                "DISTINCT or entity-once semantics. Explicit relationship/detail-row counting units "
+                "DISTINCT or entity-once semantics. Uniqueness of a related row or its composite key "
+                "does not prove that each counted base-entity key appears only once after the join. "
+                "Explicit relationship/detail-row counting units "
                 "and exact formula counting units, including their existing plain COUNT behavior, "
-                "remain exceptions. Return contradicted for a base-population violation or when a "
+                "remain exceptions. For an exact formula whose COUNT inputs share a relational "
+                "row scope, EXISTS, IN, or a deduplicated key set does not preserve qualifying "
+                "row occurrences unless unique, distinct, or entity-once counting is explicitly "
+                "required; return contradicted when the AST makes that substitution. "
+                "When a requested root entity identity is qualified only by "
+                "joined child rows, repeated root identities contradict the requested entity grain; "
+                "return each qualifying root identity once. This does not apply to counts, metrics, "
+                "formulas, or requested child rows. When the question asks for entity age in an "
+                "explicitly dated historical event, current_timestamp, current_date, or now "
+                "contradicts that event-time age unless current age is explicitly requested. "
+                "Return contradicted for a base-population violation or when a "
                 "full date/time value is directly compared with a bare calendar-year literal. A full "
                 "date/time value directly compared with a bare calendar-year literal cannot be "
                 "consistent. Calendar-year extraction or a trusted full-date boundary remains valid. "
@@ -1432,6 +1858,18 @@ def _prompt(value: _ResultReviewCapability, execution: dict[str, object]) -> str
             ),
             "question": value.state.query_spec.original_text,
             "query_spec": value.state.query_spec.model_dump(mode="json"),
+            "review_binding_role_checklist": {
+                "instruction": (
+                    "Before returning consistent, compare every item below with the SQL in its "
+                    "required semantic role. Do not independently relitigate a SUPPORTED "
+                    "binding that the SQL follows solely because the requested phrase and "
+                    "column description differ. Return semantic_binding_mismatch only when "
+                    "a positive trusted fact identifies a different physical attribute for "
+                    "the requested role, or the SQL AST or returned data contradicts the "
+                    "selected binding."
+                ),
+                "items": binding_role_checklist,
+            },
             "sql": value.candidate.sql,
             "ast": asdict(value.parsed_ast),
             "bindings": [

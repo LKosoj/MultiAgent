@@ -462,6 +462,7 @@ _TEXT_TO_SQL_EXECUTION_OPTIONAL_FIELDS = frozenset({
     "policy_version",
     "capability_error",
     "pre_execution_error_code",
+    "timed_out",
     # `llm_audit`/`advisory_issues` are deliberately part of the executor's
     # own contract, not a separate reviewer-only channel: the owner of a run
     # is meant to see the verdict of the advisory audit that ran over their
@@ -485,6 +486,7 @@ _TEXT_TO_SQL_EXECUTOR_BOUNDARY_OPTIONAL_FIELDS = frozenset({
     "policy_version",
     "capability_error",
     "pre_execution_error_code",
+    "timed_out",
     # See _TEXT_TO_SQL_EXECUTION_OPTIONAL_FIELDS above: same fields, same
     # rationale — advisory audit results cross the executor boundary as-is.
     "llm_audit",
@@ -795,6 +797,8 @@ def text_to_sql_executor_contract_error(
         for field_name in ("success", "dry_run_only", "skipped_execution"):
             if type(result[field_name]) is not bool:
                 return f"executor field {field_name!r} must be a boolean"
+        if "timed_out" in result and type(result["timed_out"]) is not bool:
+            return "executor field 'timed_out' must be a boolean"
         if result["dry_run_only"] and not result["skipped_execution"]:
             return "executor dry-run result must skip execution"
         if (
@@ -1334,6 +1338,8 @@ class TextToSqlTerminalResult:
                 for marker in ("dry_run_only", "skipped_execution"):
                     if type(execution[marker]) is not bool:
                         raise TypeError(f"execution.{marker} must be a boolean")
+                if "timed_out" in execution and type(execution["timed_out"]) is not bool:
+                    raise TypeError("execution.timed_out must be a boolean")
                 if execution["dry_run_only"] is not self.dry_run:
                     raise ValueError(
                         "execution.dry_run_only must match top-level dry_run"

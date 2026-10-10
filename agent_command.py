@@ -7,7 +7,7 @@ from retry_openai_model import RetryOpenAIServerModel
 
 custom_role_conversions = {"tool-call": "assistant", "tool-response": "user"}
 
-_TEXT_TO_SQL_MODEL_TIMEOUT_SECONDS = 600.0
+_TEXT_TO_SQL_MODEL_TIMEOUT_SECONDS = 1200.0
 
 _MODEL_CONFIGS: dict[str, dict] = {
     "model_search": {
@@ -109,7 +109,7 @@ def create_text_to_sql_model(
     max_tokens: int,
     temperature: float,
     timeout_seconds: float | None = None,
-    client_max_retries: int = 1,
+    client_max_retries: int = 0,
 ) -> RetryOpenAIServerModel:
     """Create the isolated Typed provider with its per-call contract."""
 

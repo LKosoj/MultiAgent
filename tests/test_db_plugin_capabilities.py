@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -77,7 +78,12 @@ def test_matrix_timeout_modes_and_t11_grouping_facts_are_truthful() -> None:
         base.EnforcementMode.DATABASE,
         "POSTGRES_STATEMENT_TIMEOUT",
     )
-    for dialect in {"mysql", "sqlite", "duckdb", "sapiq", "impala"}:
+    assert matrix["sqlite"].statement_timeout == base.Capability(
+        base.CapabilityState.SUPPORTED,
+        base.EnforcementMode.DRIVER,
+        "SQLITE_PROGRESS_HANDLER_TIMEOUT",
+    )
+    for dialect in {"mysql", "duckdb", "sapiq", "impala"}:
         timeout = matrix[dialect].statement_timeout
         assert timeout.state is base.CapabilityState.SUPPORTED
         assert timeout.mode is base.EnforcementMode.SUPERVISOR
@@ -90,6 +96,23 @@ def test_matrix_timeout_modes_and_t11_grouping_facts_are_truthful() -> None:
         assert matrix[dialect].composite_fk_introspection.state is (
             base.CapabilityState.UNSUPPORTED
         )
+
+
+def test_sqlite_statement_timeout_interrupts_the_running_query() -> None:
+    plugin = SQLitePlugin()
+    conn = sqlite3.connect(":memory:")
+    try:
+        plugin.set_statement_timeout(conn, 1)
+        with pytest.raises(TimeoutError, match="SQLite statement timed out"):
+            plugin.execute_select(
+                conn,
+                "WITH RECURSIVE counter(value) AS ("
+                "SELECT 1 UNION ALL SELECT value + 1 FROM counter"
+                ") SELECT SUM(value) FROM counter LIMIT 1",
+                row_limit=1,
+            )
+    finally:
+        conn.close()
 
 
 def test_inherited_timeout_is_unsupported_and_never_applied() -> None:
@@ -356,13 +379,18 @@ def test_custom_plugin_missing_probe_closes_without_query_submission(
     assert calls == ["connect", "close"]
 
 
-def test_supervisor_timeout_is_labeled_without_calling_base_setter(monkeypatch) -> None:
+def test_sqlite_driver_timeout_is_labeled_after_calling_setter(monkeypatch) -> None:
+    timeout_calls: list[int] = []
+
     class SQLiteExecutorDouble(SQLitePlugin):
         def connect(self, _dsn):
             return object()
 
         def close(self, _conn):
             pass
+
+        def set_statement_timeout(self, _conn, timeout_ms):
+            timeout_calls.append(timeout_ms)
 
         def execute_select(self, _conn, _sql, row_limit=500):
             return {
@@ -397,8 +425,10 @@ def test_supervisor_timeout_is_labeled_without_calling_base_setter(monkeypatch) 
         reset_tool_runtime_context(token)
 
     assert result.success is True
-    assert result.outcome["timeout_enforcement_mode"] == "supervisor"
+    assert result.outcome["timeout_enforcement_mode"] == "driver"
     assert result.outcome["cancellation_enforcement_mode"] == "supervisor"
+    assert len(timeout_calls) == 1
+    assert 0 < timeout_calls[0] <= 5000
 
 
 def test_deadline_without_supervisor_evidence_rejects_before_connect(monkeypatch) -> None:
@@ -426,7 +456,7 @@ def test_deadline_without_supervisor_evidence_rejects_before_connect(monkeypatch
 
     assert result.success is False
     assert result.outcome["capability_error"] == {
-        "capability": "statement_timeout",
+        "capability": "cancellation",
         "reason_code": "SUPERVISOR_ENFORCEMENT_DISALLOWED",
     }
     assert calls == []

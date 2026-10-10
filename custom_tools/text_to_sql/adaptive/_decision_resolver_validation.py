@@ -61,12 +61,18 @@ def expand_model_identifier_handles(
 
     source_ids = tuple(sorted(item.source_id for item in state.query_spec.semantic_items))
     evidence_ids = tuple(sorted(record.evidence_id for record in state.evidence))
-    if len(source_ids) != len(set(source_ids)) or len(evidence_ids) != len(set(evidence_ids)):
+    join_ids = tuple(sorted(join.join_id for join in state.join_candidates))
+    if (
+        len(source_ids) != len(set(source_ids))
+        or len(evidence_ids) != len(set(evidence_ids))
+        or len(join_ids) != len(set(join_ids))
+    ):
         raise ModelDecisionReferenceError("identifier handles are ambiguous")
     source_handles = {f"s{index}": value for index, value in enumerate(source_ids, 1)}
     evidence_handles = {
         f"e{index}": value for index, value in enumerate(evidence_ids, 1)
     }
+    join_handles = {f"j{index}": value for index, value in enumerate(join_ids, 1)}
 
     def resolve(
         handles: tuple[str, ...] | None,
@@ -102,6 +108,41 @@ def expand_model_identifier_handles(
                 (proposal.source_handle,), source_handles, "source"
             )[0]
             updates["source_handle"] = None
+        if isinstance(proposal, NewBindingProposal):
+            join_references = []
+            for reference in proposal.join_references:
+                if (
+                    isinstance(reference, ExistingJoinRef)
+                    and reference.join_handle is not None
+                ):
+                    if reference.join_id is not None:
+                        raise ModelDecisionReferenceError("mixed join handle and raw ID")
+                    reference = reference.model_copy(
+                        update={
+                            "join_id": resolve(
+                                (reference.join_handle,), join_handles, "join"
+                            )[0],
+                            "join_handle": None,
+                        }
+                    )
+                join_references.append(reference)
+            if tuple(join_references) != proposal.join_references:
+                updates["join_references"] = tuple(join_references)
+        if (
+            isinstance(proposal, JoinAssessment)
+            and isinstance(proposal.subject, ExistingJoinRef)
+            and proposal.subject.join_handle is not None
+        ):
+            if proposal.subject.join_id is not None:
+                raise ModelDecisionReferenceError("mixed join handle and raw ID")
+            updates["subject"] = proposal.subject.model_copy(
+                update={
+                    "join_id": resolve(
+                        (proposal.subject.join_handle,), join_handles, "join"
+                    )[0],
+                    "join_handle": None,
+                }
+            )
         if isinstance(proposal, NewHypothesisProposal) and proposal.source_handles is not None:
             if proposal.source_ids is not None:
                 raise ModelDecisionReferenceError("mixed source handle and raw ID")

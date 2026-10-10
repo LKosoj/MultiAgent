@@ -1610,6 +1610,14 @@ def _secure_db_executor(
                             )
                     except WorkflowDeadlineExceeded:
                         raise
+                    except TimeoutError as exc:
+                        execution_result = _attempted_execution_failure(
+                            start_time=start,
+                            sql_query=sql_query,
+                            row_limit=row_limit,
+                            error=mask_dsn(bound_text_to_sql_error(exc)),
+                        )
+                        execution_result["timed_out"] = True
                     except Exception as exc:
                         execution_result = _attempted_execution_failure(
                             start_time=start,

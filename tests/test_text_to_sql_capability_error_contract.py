@@ -163,6 +163,26 @@ def test_boundary_accepts_capability_error_alongside_valid_row_limit():
     assert error is None
 
 
+def test_boundary_accepts_executor_timeout_marker():
+    result = _executor_result(
+        success=False,
+        data=[],
+        columns=[],
+        rows_affected=0,
+        error_message="query timed out",
+        timed_out=True,
+    )
+
+    error = text_to_sql_executor_contract_error(
+        result,
+        expected_dry_run_only=False,
+        expected_sql_query="SELECT 1",
+        expected_row_limit=10,
+    )
+
+    assert error is None
+
+
 @pytest.mark.parametrize(
     "capability_error",
     [

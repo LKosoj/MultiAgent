@@ -152,6 +152,13 @@ def evidence_observes_exact_value(
             "semantic certificate requires v1 probe observation"
         )
     payload = observation.payload
+    expected = value.value if type(value) is LiteralValue else value
+    if observation.provenance.probe_kind is ResearchActionKind.EXECUTE_PROBE:
+        return _execute_probe_observes_exact_equality(
+            payload,
+            column,
+            expected,
+        )
     if (
         observation.provenance.probe_kind
         not in {ResearchActionKind.SEARCH_VALUE, ResearchActionKind.DISTINCT_VALUES}
@@ -161,7 +168,6 @@ def evidence_observes_exact_value(
         or not isinstance(payload.get("rows"), list)
     ):
         return False
-    expected = value.value if type(value) is LiteralValue else value
     returned_value_matches = any(
         isinstance(row, list)
         and len(row) == 1
@@ -177,6 +183,30 @@ def evidence_observes_exact_value(
             and payload["requested_value"] == expected
         )
     return returned_value_matches
+
+
+def _execute_probe_observes_exact_equality(
+    payload: object,
+    column: ColumnRef,
+    expected: object,
+) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return False
+    exact_equalities = payload.get("exact_equalities")
+    if not isinstance(exact_equalities, list):
+        return False
+    serialized_column = column.model_dump(mode="json", by_alias=True)
+    return any(
+        isinstance(candidate, dict)
+        and set(candidate) == {"column", "value"}
+        and candidate["column"] == serialized_column
+        and type(candidate["value"]) is type(expected)
+        and candidate["value"] == expected
+        for candidate in exact_equalities
+    )
 
 
 __all__ = [

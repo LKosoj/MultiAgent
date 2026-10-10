@@ -73,6 +73,9 @@ instructions: |-
   When no output order is stated, project requested DIMENSION identifiers or labels
   first, then METRIC values, then derived FORMULA values such as ranks. This fallback
   does not override an output order explicitly stated in the question.
+  Project only semantic items with requested_output=true. An item with
+  requested_output=false may still be used internally for filtering, joining,
+  grouping, ordering, or limiting, but must not appear as a separate root SELECT expression.
   A technical physical key used only for JOIN, GROUP BY, ORDER BY, window partition,
   or dedup may be used internally but must not be root SELECT unless QuerySpec or
   trusted context explicitly requests that identifier or label output.
@@ -103,6 +106,9 @@ instructions: |-
   predicate, an output-only relation, or a research-authored LEFT path.
   For grouped aggregate output, project grouping dimensions before aggregate metrics
   unless the question explicitly states a different output order.
+  When the question asks which entities are among the top N or have rank at most N,
+  use RANK so equal ordering values share the same rank. Use ROW_NUMBER only when
+  exactly N rows or an explicit tie-break is required.
 
   When the requested result is the label of one of several named alternatives,
   use their exact labels from trusted context; do not replace them with descriptive
@@ -113,6 +119,11 @@ instructions: |-
 
   When the required result is an average or explicit division, preserve a
   fractional result even when its inputs are integer-valued.
+  When arithmetic combines SUM aggregate operands representing requested
+  totals, treat a SUM over no matching rows as numeric zero so that the
+  requested arithmetic remains numeric. Use COALESCE(SUM(...), 0) or an
+  equivalent SUM expression; do not change the requested operands, operator,
+  or their order.
   For SQLite, CAST the numerator AS REAL before dividing integer-valued inputs.
   This real coercion remains mandatory for a trusted exact formula and does not
   change its operands, division operator, order, or scale.
@@ -145,10 +156,27 @@ instructions: |-
   only when the question or trusted document explicitly names those rows as its
   counting unit. Within an already established population, COUNT(identifier) remains
   non-DISTINCT unless unique, distinct, or entity-once counting is explicit.
+  Determine the measured population from the aggregate arguments, not from whether
+  a qualifying predicate is stored in the same FORMULA item. If every aggregate
+  argument comes from one relation and another one-to-many relation contributes only
+  a population predicate, that other relation is a qualifier: do not join its detail
+  rows into the aggregate. Use EXISTS or one qualifying key per parent. This preserves
+  plain non-DISTINCT COUNT(input) over the measured rows; it does not add DISTINCT.
   Within one required formula, apply each required FILTER or TIME predicate that
   defines a formula's population to every numerator and denominator term; do not
   apply it only to one term. Use separate populations only when the question or
   trusted formula explicitly requires separate populations.
+  When QuerySpec contains a separate required TIME item with owner_item_ordinal
+  null, it defines the global row population for every requested aggregate or
+  formula. Prefer to apply it once as an outer WHERE predicate; applying it to
+  every operand is equivalent. A supporting exact formula that repeats the period
+  in only one operand does not make that global TIME operand-local. Use an
+  operand-local period only when the question explicitly assigns it to that term.
+  When the user asks for a percentage in, within, or among a named group,
+  that group is the common population of numerator and denominator. A supporting
+  formula that mentions the group only in the denominator does not narrow this
+  user scope unless the user explicitly requests a global numerator or a separate
+  baseline population.
   When the denominator is all base entities, compute it from the base table
   without joins that can discard them.
   In an exact trusted FORMULA, COUNT(all <entity words>) denotes all rows of
@@ -188,6 +216,11 @@ instructions: |-
   that input. A condition attached to that term filters that term. Do not return
   missing_evidence merely because the question names an entity while the trusted
   formula names its confirmed numeric input.
+  A trusted formula may clarify operands but must not reverse an explicit condition
+  or polarity in the question. Preserve the question's requested inclusion, exclusion,
+  or absence at its stated entity grain, using confirmed formula operands and predicates.
+  Do not return missing_evidence solely because that conflicting formula describes the
+  opposite population.
   Implement every required FORMULA in QuerySpec as written. Do not replace it
   with a different physical column or precomputed value merely because it
   appears to have the same unit or meaning.
@@ -198,12 +231,25 @@ instructions: |-
   or predicate instead.
   In that formula, keep each column on its confirmed physical table; do not move
   a column to another joined table merely because that table has the same column name.
+  Preserve the logical grouping of every confirmed compound predicate when
+  combining it with an independent condition. When an AND condition is combined
+  with a confirmed OR group, enclose the OR group in parentheses.
   Preserve the stated order of arithmetic operations and operands; do not
   algebraically rearrange the formula even when the rewrite seems equivalent.
   Priority: for an exact trusted formula, preserve its exact operators, operands,
   and stated order. When it is DIVIDE(numerator, denominator) followed by a stated
   scale, divide first and apply the scale only afterwards. SQL COUNT(CASE WHEN
   predicate THEN 1 END) may implement a predicate count.
+  In a ratio or percentage, SUM(identifier WHERE predicate) is count shorthand
+  when the identifier names the counted entity rather than a numeric measure.
+  Implement that term as a conditional count; preserve count semantics rather
+  than summing identifier values, even when a trusted document uses SUM notation.
+  This does not apply to a confirmed numeric measure or an explicitly requested
+  sum of identifier values.
+  In a percentage or rate formula,
+  MULTIPLY(DIVIDE(numerator), denominator, scale) is the legacy spelling of
+  MULTIPLY(DIVIDE(numerator, denominator), scale). Do not return missing_evidence
+  solely because the legacy spelling closes DIVIDE before its denominator.
   When an exact trusted formula applies arithmetic to its confirmed inputs,
   retain that operator and those inputs. Do not replace it with a domain
   calculation, duration conversion, date-difference helper, unit normalization,
@@ -235,19 +281,20 @@ instructions: |-
   one row unless QuerySpec or trusted context explicitly requires that aggregate
   projection or GROUP BY. A FORMULA used only as a filter or condition does not
   authorize root aggregation or grouping. Use root DISTINCT only when the question
-  or QuerySpec explicitly requests unique or distinct, or trusted evidence proves
-  the entire root projection is one-to-one at the required result grain, for example
+  or QuerySpec explicitly requests unique or distinct, trusted evidence proves the
+  entire root projection is one-to-one at the required result grain, for example
   because the projected entity identity is unique; otherwise preserve all qualifying
-  rows.
-  When the question requests the values of an attribute themselves as a set,
-  whether bounded or unbounded, and repeated source rows carry the same value,
-  return each value once before applying a bound. When the question requests rows
-  or entities and merely displays that attribute, preserve separate rows. This
-  distinction does not apply to counts, metrics, formulas, or ordinary detail output.
+  rows. Words such as list, values, categories, labels, what, or which do not imply
+  uniqueness. Repeated qualifying rows must remain repeated unless the question,
+  QuerySpec, or trusted context explicitly requires unique or distinct output.
   When the requested output is a proven unique identity of a root entity and a
   joined child relation is used only to qualify that entity, with no child output
   requested, return each qualifying root identity once. This does not apply to
   counts, metrics, formulas, or requested child rows.
+  When a top-N request returns entity identities from multiple historical or
+  snapshot rows per entity, compute the requested MIN or MAX once per entity
+  before ordering and applying the final LIMIT. A top-N entity result must not
+  spend multiple result positions on snapshots of the same entity.
   For an explicit every/each/all observed-child condition, qualify the requested root.
   If a required FILTER or TIME binds that same child relation, form the universe after
   that filter and evaluate the universal condition in the same scope; do not include other
@@ -269,12 +316,17 @@ instructions: |-
   concatenation or other derived expression unless QuerySpec contains a requested
   FORMULA or trusted context explicitly requires the transformed output that the
   question explicitly requests.
-  One requested semantic item remains one root output column, even when it has
-  multiple bindings or relationship roles. Combine the role values as rows of that
-  column, for example through a normalized row source or UNION; do not turn each
-  binding or role into a separate output column. This does not combine separately
-  requested semantic items or decide whether requested entity or detail rows should
-  be deduplicated.
+  When one requested root entity name is supported by separate schema-described
+  name components, project the name components as separate root columns; do not
+  concatenate them unless the question requests a combined name. If a joined child
+  relation only qualifies that entity and contributes no requested output, return
+  each qualifying root entity once.
+  Separately stored name components are the exception. When peer relationship roles
+  are stored together in one source row and the question requests those roles for
+  each relationship, project each role as a separate output column. Combine role
+  values into one output column only when the question explicitly asks for one
+  homogeneous list or set across roles. This does not decide whether requested
+  entity or detail rows should be deduplicated.
   When an exact formula applies arithmetic to a filtered metric term and the
   confirmed row scope can contain multiple matching rows, preserve all matching
   metric rows with SUM; do not use an unbounded scalar subquery that silently
@@ -283,9 +335,16 @@ instructions: |-
 
   Do not add LIMIT unless QuerySpec contains a required LIMIT item. A scalar
   result shape does not prove that only one row matches.
+  Do not add ORDER BY unless QuerySpec contains a required ORDERING item.
   When QuerySpec requires a final row LIMIT, preserve it on the final row set.
   A LIMIT inside a subquery does not satisfy that final row limit when a later
   one-to-many join can expand the selected rows.
+  When MIN or MAX selects rows from a population constrained by QuerySpec,
+  compute that extreme over the same qualifying population. If the extreme is
+  implemented in a subquery, CTE, or derived relation, carry every required
+  FILTER or TIME predicate that defines the selected population into that
+  extremum relation; applying it only outside can select a non-qualifying row
+  and then remove the result.
   For a question asking which entities attain a minimum or maximum aggregate,
   preserve every tied extreme when QuerySpec has no required LIMIT or explicit
   tie-break. Do not use ORDER BY aggregate with LIMIT 1; constrain grouped
@@ -347,6 +406,10 @@ instructions: |-
   through EXISTS or a deduplicated qualifying-key set without adding DISTINCT or
   entity-once semantics. Explicit relationship/detail-row counting units and trusted
   exact formula counting units, including their existing plain COUNT behavior, remain
-  exceptions. For a calendar-year condition on a full date/time value, use calendar-year
+  exceptions. For an exact formula whose COUNT inputs share a relational row scope,
+  preserve each qualifying row occurrence: EXISTS, IN, or a deduplicated key set does
+  not preserve that scope unless the question or trusted formula explicitly requires
+  unique, distinct, or entity-once counting. Keep the required relation in the aggregate
+  row scope instead. For a calendar-year condition on a full date/time value, use calendar-year
   extraction or a trusted full-date boundary. Never compare a full date/time value
   directly with a bare calendar-year literal.

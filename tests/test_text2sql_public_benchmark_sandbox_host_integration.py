@@ -124,20 +124,20 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
         raise AssertionError("typed research prompt has no state")
 
     @staticmethod
-    def _required_source_id(state: dict[str, object]) -> str:
-        unresolved_items = state.get("unresolved_items")
+    def _required_source_handle(state: dict[str, object]) -> str:
+        unresolved_items = state.get("unresolved_source_handles")
         assert isinstance(unresolved_items, list)
         source_id = next(iter(unresolved_items))
         assert isinstance(source_id, str)
         return source_id
 
     @staticmethod
-    def _evidence_id_for_action(state: dict[str, object], kind: str) -> str:
+    def _evidence_handle_for_action(state: dict[str, object], kind: str) -> str:
         evidence = state.get("evidence")
         assert isinstance(evidence, list)
         del kind
         evidence_id = next(
-            item.get("evidence_id")
+            item.get("evidence_handle")
             for item in evidence
             if isinstance(item, dict)
         )
@@ -162,7 +162,7 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                 },
             }
 
-        source_id = cls._required_source_id(state)
+        source_handle = cls._required_source_handle(state)
         if revision == 1:
             return {
                 "decision_version": 1,
@@ -170,14 +170,14 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                     {
                         "proposal_type": "new_binding",
                         "proposal_key": "proposal:items-name",
-                        "source_id": source_id,
+                        "source_handle": source_handle,
                         "candidate": {
                             "kind": "physical_column",
                             "physical_column": {"table": "items", "column": "name"},
                         },
                         "join_references": [],
-                        "citation_evidence_ids": [
-                            cls._evidence_id_for_action(state, "inspect_column")
+                        "citation_evidence_handles": [
+                            cls._evidence_handle_for_action(state, "inspect_column")
                         ],
                     }
                 ],
@@ -198,11 +198,11 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                 item
                 for item in bindings
                 if isinstance(item, dict)
-                and item.get("source_id") == source_id
+                and item.get("source_handle") == source_handle
                 and item.get("kind") == "physical_column"
             )
             binding_id = binding.get("binding_id")
-            evidence_ids = binding.get("evidence_ids")
+            evidence_ids = binding.get("evidence_handles")
             assert isinstance(binding_id, str)
             assert isinstance(evidence_ids, list)
             assert isinstance(evidence_ids[0], str)
@@ -216,7 +216,7 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                             "binding_id": binding_id,
                         },
                         "certificate": "consistent",
-                        "citation_evidence_ids": [
+                        "citation_evidence_handles": [
                             evidence_ids[0]
                         ],
                     }
@@ -240,12 +240,12 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                 "next": {
                     "next_kind": "stop",
                     "reason": "complete",
-                    "source_ids": [],
-                    "citation_evidence_ids": sorted(
-                        item["evidence_id"]
+                    "source_handles": [],
+                    "citation_evidence_handles": sorted(
+                        item["evidence_handle"]
                         for item in evidence
                         if isinstance(item, dict)
-                        and isinstance(item.get("evidence_id"), str)
+                        and isinstance(item.get("evidence_handle"), str)
                     ),
                 },
             }
@@ -277,6 +277,13 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                 },
                 "recommendations": [],
             }
+        elif "ПРИМЕРЫ РЕАЛЬНЫХ ДАННЫХ" in prompt:
+            response = {
+                "table_description": {"main.items": "Тестовые элементы."},
+                "descriptions": {
+                    "main.items": {"name": "Название тестового элемента."}
+                },
+            }
         elif "Разбери пользовательский Text-to-SQL запрос" in prompt:
             response = {
                 "expected_result_shape": "rows",
@@ -286,6 +293,10 @@ class _FakeModelHandler(BaseHTTPRequestHandler):
                         "source_text": "item names",
                         "normalized_meaning": "item names",
                         "required": True,
+                        "requested_output": True,
+                        "owner_item_ordinal": None,
+                        "exact_physical_predicate": False,
+                        "exact_physical_column_name": None,
                         "operator": None,
                         "literal_or_reference": None,
                         "status": "unresolved",

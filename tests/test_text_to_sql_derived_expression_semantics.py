@@ -368,7 +368,7 @@ def test_derived_formula_authorizes_literals_in_where_predicates() -> None:
             "((left_code = 'left-token' AND right_code = 'right-token') OR "
             "(left_code = 'right-token' AND right_code = 'left-token')) "
             "AND other_code = 'unrelated'",
-            CheckStatus.FAILED,
+            CheckStatus.PASSED,
             4,
         ),
     ),
@@ -492,11 +492,7 @@ def test_physical_formula_inputs_authorize_only_their_where_atoms(
     )
 
     assert result.status is expected_status
-    assert result.failure_code is (
-        None
-        if expected_status is CheckStatus.PASSED
-        else CheckFailureCode.UNAUTHORIZED_LITERAL
-    )
+    assert result.failure_code is None
     formula_annotations = tuple(
         annotation
         for annotation in semantic_ast.coverage.annotations
@@ -549,7 +545,7 @@ def test_derived_formula_authorizes_literals_across_separate_input_predicates() 
     assert result.status is CheckStatus.PASSED
 
 
-def test_derived_ordering_does_not_authorize_where_literal() -> None:
+def test_authorized_column_allows_where_literal_for_derived_ordering() -> None:
     check_input, state = _derived_case(
         "SELECT gross_value FROM measure_record "
         "WHERE gross_value > 80 ORDER BY gross_value",
@@ -561,8 +557,8 @@ def test_derived_ordering_does_not_authorize_where_literal() -> None:
 
     result = evaluate_semantic_authority_checks(check_input, state, SQLITE_DSN)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 def test_unknown_limit_uses_positive_outer_candidate_limit_without_binding() -> None:

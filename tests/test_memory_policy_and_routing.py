@@ -186,6 +186,82 @@ def test_schema_probe_fact_never_uses_model_summary_or_filtering(monkeypatch):
     ) == records
 
 
+def test_schema_semantic_fact_never_uses_model_summary_or_filtering(monkeypatch, tmp_path):
+    from memory import tools as mt
+
+    db_path = tmp_path / "memory.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE agent_memory (
+                session_id TEXT,
+                agent_name TEXT,
+                step INTEGER,
+                instance_step INTEGER,
+                run_id TEXT,
+                data TEXT,
+                valid_from TEXT,
+                valid_to TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_memory
+            (session_id, agent_name, step, instance_step, run_id, data, valid_from, valid_to)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "s1",
+                "Schema-RAG-Agent",
+                1,
+                None,
+                None,
+                '{"cache_kind":"schema_semantic_fact","payload":"' + "x" * 70_001 + '"}',
+                "2026-10-07",
+                None,
+            ),
+        )
+
+    class DbHandler:
+        tactical_collection = SimpleNamespace(metadata={"hnsw:space": "cosine"})
+
+        def _get_connection(self):
+            return sqlite3.connect(db_path)
+
+    manager = SimpleNamespace(
+        db_handler=DbHandler(),
+        _search_semantic_with_scores=lambda *_args, **_kwargs: {
+            "ids": ["s1-Schema-RAG-Agent-1"],
+            "distances": [[0.0]],
+            "metadatas": [[]],
+        },
+    )
+    monkeypatch.setattr(mt, "memory_manager", manager)
+    monkeypatch.setenv("RAG_RERANK_ENABLED", "0")
+    monkeypatch.setattr(
+        mt,
+        "call_openai_api",
+        lambda *_args, **_kwargs: pytest.fail("structured semantic facts must not be summarized"),
+    )
+    monkeypatch.setattr(
+        mt,
+        "_create_memory_summary",
+        lambda *_args: pytest.fail("structured semantic facts must not be summarized"),
+    )
+
+    with mt.memory_requester_context("Schema-RAG-Agent"):
+        records = mt.get_memory(
+            session_id="s1",
+            query="driver participation",
+            cache_kind="schema_semantic_fact",
+            requesting_agent="Schema-RAG-Agent",
+        )
+
+    assert len(records) == 1
+    assert records[0]["data"]["cache_kind"] == "schema_semantic_fact"
+
+
 def test_streamlit_memory_search_requires_session_for_user(monkeypatch):
     from backend.fastapi_app.agui.auth import Principal
     from memory.streamlit_api import MemoryRAGManager

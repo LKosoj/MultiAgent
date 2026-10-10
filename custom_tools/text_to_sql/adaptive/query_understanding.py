@@ -200,6 +200,12 @@ def _decode_item(
             "semantic item operator",
         )
     )
+    if not exact_physical_predicate and kind in {
+        SemanticItemKind.FILTER,
+        SemanticItemKind.TIME,
+        SemanticItemKind.FORMULA,
+    }:
+        exact_physical_column_name = None
     discard_exact_predicate_metadata = kind not in {
         SemanticItemKind.FILTER,
         SemanticItemKind.TIME,

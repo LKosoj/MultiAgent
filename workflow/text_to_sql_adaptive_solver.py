@@ -107,7 +107,10 @@ from ._text_to_sql_solver_reentry import (
     settle_incomplete_solver_model_call,
 )
 from ._text_to_sql_reentry_recovery import recover_prepared_targeted_reentry
-from .text_to_sql_contract import TextToSqlTerminalResult
+from .text_to_sql_contract import (
+    TextToSqlTerminalReasonCode,
+    TextToSqlTerminalResult,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -2414,6 +2417,11 @@ def _result_contradiction_requirements(
     )
     if len(reconciliations) != 1:
         raise ValueError("result-contradiction known reconciliation is invalid")
+    if reconciliations[0].result.get("record_kind") not in {
+        "text2sql_result_contradiction",
+        "text2sql_result_review",
+    }:
+        return None
     receipt = _result_reentry_receipt(reconciliations[0].result)
     if (
         receipt.run_id != research.run_id
@@ -2757,6 +2765,12 @@ def reconcile_known_finalizer(
         )
     terminal = TextToSqlTerminalResult.from_mapping(terminal_mapping)
     after_state = _state_after_known_finalizer(state, reservation, terminal)
+    if terminal.reason_code == TextToSqlTerminalReasonCode.EXECUTION_FAILED.value:
+        return store.reconcile_execution(
+            reservation,
+            after_state,
+            result=terminal.to_mapping(),
+        )
     authority = _reservation_authority(reservation)
     evidence = build_verified_solver_terminal_evidence(
         state,

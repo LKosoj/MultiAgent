@@ -15,7 +15,7 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 from sqlglot.tokens import TokenType
 
 from ..utils import get_table_columns
-from .models import QueryProbeRef, StrictModel
+from .models import ColumnRef, QueryProbeRef, StrictModel, TableRef
 from .serialization import canonical_digest
 
 
@@ -99,6 +99,7 @@ class ResearchQueryAdmission:
     output_columns: tuple[str, ...]
     row_limit: int
     action_parameters: tuple[tuple[str, JsonScalar], ...]
+    exact_equalities: tuple[tuple[ColumnRef, JsonScalar], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -150,6 +151,153 @@ def admit_research_query(
         output_columns=output_columns,
         row_limit=row_limit,
         action_parameters=derived.identity.action_parameters,
+        exact_equalities=_exact_conjunctive_equalities(
+            tree,
+            derived.checked.sql,
+            derived.checked.parameters,
+            schema,
+            dialect.casefold(),
+            namespace,
+        ),
+    )
+
+
+def _exact_conjunctive_equalities(
+    tree: exp.Select,
+    sql: str,
+    parameters: tuple[JsonScalar, ...],
+    schema: Mapping[str, object],
+    dialect: str,
+    namespace: str,
+) -> tuple[tuple[ColumnRef, JsonScalar], ...]:
+    """Return exact bound equalities that every result row must satisfy."""
+
+    where = tree.args.get("where")
+    if not isinstance(where, exp.Where) or any(
+        nested is not tree for nested in tree.find_all(exp.Select)
+    ) or tree.find(exp.AggFunc) is not None:
+        return ()
+    condition = where.this
+    if condition.find(exp.Or, exp.Not) is not None:
+        return ()
+    placeholder_positions = tuple(
+        token.start
+        for token in Dialect.get_or_raise(dialect).tokenize(sql)
+        if token.token_type is TokenType.PLACEHOLDER
+    )
+    if len(placeholder_positions) != len(parameters):
+        return ()
+    sources: dict[str, _Source] = {}
+    for table in tree.find_all(exp.Table):
+        source = _physical_source(table, schema)
+        alias = table.args.get("alias")
+        identifier = (
+            alias.this
+            if isinstance(alias, exp.TableAlias)
+            and isinstance(alias.this, exp.Identifier)
+            else table.this
+        )
+        if not isinstance(identifier, exp.Identifier):
+            return ()
+        sources[_canonical_identifier(identifier)] = source
+
+    result: list[tuple[ColumnRef, JsonScalar]] = []
+    leaves = tuple(_conjunctive_leaves(condition))
+    for leaf in leaves:
+        if not isinstance(leaf, exp.EQ):
+            continue
+        column, placeholder = (
+            (leaf.this, leaf.expression)
+            if isinstance(leaf.this, exp.Column)
+            and isinstance(leaf.expression, exp.Placeholder)
+            else (leaf.expression, leaf.this)
+            if isinstance(leaf.expression, exp.Column)
+            and isinstance(leaf.this, exp.Placeholder)
+            else (None, None)
+        )
+        if not isinstance(column, exp.Column) or not isinstance(
+            placeholder, exp.Placeholder
+        ):
+            continue
+        resolved = _exact_physical_column(column, sources, namespace)
+        parameter_index = _equality_parameter_index(
+            column,
+            placeholder_on_left=placeholder is leaf.this,
+            placeholder_positions=placeholder_positions,
+        )
+        if resolved is None or parameter_index is None:
+            continue
+        pair = (resolved, parameters[parameter_index])
+        if pair not in result:
+            result.append(pair)
+    return tuple(result)
+
+
+def _conjunctive_leaves(condition: exp.Expression):
+    if isinstance(condition, exp.Paren):
+        yield from _conjunctive_leaves(condition.this)
+        return
+    if isinstance(condition, exp.And):
+        yield from _conjunctive_leaves(condition.this)
+        yield from _conjunctive_leaves(condition.expression)
+        return
+    yield condition
+
+
+def _equality_parameter_index(
+    column: exp.Column,
+    *,
+    placeholder_on_left: bool,
+    placeholder_positions: tuple[int, ...],
+) -> int | None:
+    identifier = column.this
+    if not isinstance(identifier, exp.Identifier):
+        return None
+    start = identifier.meta.get("start")
+    end = identifier.meta.get("end")
+    if type(start) is not int or type(end) is not int:
+        return None
+    candidates = (
+        tuple(position for position in placeholder_positions if position < start)
+        if placeholder_on_left
+        else tuple(position for position in placeholder_positions if position > end)
+    )
+    if not candidates:
+        return None
+    position = max(candidates) if placeholder_on_left else min(candidates)
+    return placeholder_positions.index(position)
+
+
+def _exact_physical_column(
+    column: exp.Column,
+    sources: Mapping[str, _Source],
+    namespace: str,
+) -> ColumnRef | None:
+    column_key = column.name.casefold()
+    if column.table:
+        source = sources.get(column.table.casefold())
+        candidates = () if source is None else (source,)
+    else:
+        candidates = tuple(
+            source
+            for source in sources.values()
+            if any(candidate.casefold() == column_key for candidate in source.columns)
+        )
+    if len(candidates) != 1:
+        return None
+    source = candidates[0]
+    matches = tuple(
+        candidate for candidate in source.columns if candidate.casefold() == column_key
+    )
+    if len(matches) != 1 or source.table is None:
+        return None
+    return ColumnRef(
+        table=TableRef(
+            namespace=namespace,
+            schema=source.database,
+            table=source.table,
+        ),
+        column=matches[0],
     )
 
 

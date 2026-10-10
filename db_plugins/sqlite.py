@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 import time
@@ -26,7 +25,7 @@ class SQLitePlugin(BaseDBPlugin):
             dialect=self.dialect,
             read_only=read_only,
             statement_timeout=Capability.supported(
-                EnforcementMode.SUPERVISOR, "SUPERVISOR_DEADLINE_ENFORCED"
+                EnforcementMode.DRIVER, "SQLITE_PROGRESS_HANDLER_TIMEOUT"
             ),
             cancellation=Capability.supported(
                 EnforcementMode.SUPERVISOR, "SUPERVISOR_PROCESS_CANCELLATION"
@@ -87,6 +86,16 @@ class SQLitePlugin(BaseDBPlugin):
         except Exception:
             pass
 
+    def set_statement_timeout(self, conn, timeout_ms: int) -> None:
+        timeout = int(timeout_ms)
+        if timeout <= 0:
+            raise ValueError("timeout_ms must be a positive integer")
+        deadline = time.monotonic() + timeout / 1000
+        conn.set_progress_handler(
+            lambda: int(time.monotonic() >= deadline),
+            1000,
+        )
+
     def explain(self, conn, sql: str) -> Dict[str, Any]:
         # sql уже прошёл верификацию; EXPLAIN QUERY PLAN не поддерживает параметризацию команды.
         with self._cursor(conn) as cur:
@@ -104,15 +113,25 @@ class SQLitePlugin(BaseDBPlugin):
     def execute_select(self, conn, sql: str, row_limit: int = 500) -> Dict[str, Any]:
         start = time.time()
         q = self.limit_select_sql(sql, row_limit)
-        with self._cursor(conn) as cur:
-            cur.execute(q)
-            rows = self.fetch_rows_with_limit(cur, row_limit)
-            columns = [d[0] for d in cur.description] if cur.description else []
+        try:
+            with self._cursor(conn) as cur:
+                cur.execute(q)
+                rows = self.fetch_rows_with_limit(cur, row_limit)
+                columns = [d[0] for d in cur.description] if cur.description else []
+        except sqlite3.OperationalError as exc:
+            if str(exc).casefold() == "interrupted":
+                raise TimeoutError("SQLite statement timed out") from exc
+            raise
         elapsed = int((time.time() - start) * 1000)
         return {"success": True, "data": rows, "columns": columns, "rows_affected": len(rows), "execution_time_ms": elapsed, "error_message": None}
 
     def execute_select_bound(self, conn, sql, parameters, row_limit=500):
-        return self._execute_select_bound_driver(conn, sql, parameters, row_limit)
+        try:
+            return self._execute_select_bound_driver(conn, sql, parameters, row_limit)
+        except sqlite3.OperationalError as exc:
+            if str(exc).casefold() == "interrupted":
+                raise TimeoutError("SQLite statement timed out") from exc
+            raise
 
     def introspect_schema(self, conn, schema: str | None = None, table_name: str | None = None) -> Dict[str, Dict[str, Any]]:
         schema_result: Dict[str, Dict[str, Any]] = {}

@@ -847,11 +847,11 @@ def test_execution_evidence_rejects_nested_execution_result_forgery():
 
 def test_semantic_authority_adapter_rejects_recursive_model_copy_forgery():
     case = _semantic_case(
-        "SELECT o.status FROM orders o WHERE o.status = 'forged'",
-        filter_required=True,
+        "SELECT u.value FROM orders o CROSS JOIN "
+        "UNNEST(ARRAY[o.secret]) AS u(value)"
     )
     native = evaluate_semantic_authority_checks(case.check_input, case.state, POSTGRES_DSN)
-    assert native.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert native.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
     assert native.repair is not None
     forged = native.model_copy(
         update={"repair": native.repair.model_copy(update={"kind": "forged"})}
@@ -867,27 +867,27 @@ def test_semantic_authority_adapter_rejects_recursive_model_copy_forgery():
 
 def test_semantic_authority_adapter_rejects_forged_authenticated_input():
     case = _semantic_case(
-        "SELECT o.status FROM orders o WHERE o.status = 'active' AND o.status = 'forged'",
-        filter_required=True,
+        "SELECT u.value FROM orders o CROSS JOIN "
+        "UNNEST(ARRAY[o.secret]) AS u(value)"
     )
     native = evaluate_semantic_authority_checks(case.check_input, case.state, POSTGRES_DSN)
     assert native.status is CheckStatus.FAILED
-    assert native.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert native.failure_code is CheckFailureCode.UNAUTHORIZED_COLUMN
     assert adapt_semantic_authority_check_result(case.check_input, native) == native
-    semantic_ast = case.check_input.semantic_ast
-    annotation = semantic_ast.coverage.annotations[0]
-    forged_coverage = semantic_ast.coverage.model_copy(
+    binding = case.requirements.selected_bindings[0]
+    forged_requirements = case.requirements.model_copy(
         update={
-            "annotations": (
-                annotation.model_copy(update={"source_ids": ()}),
-                *semantic_ast.coverage.annotations[1:],
+            "selected_bindings": (
+                binding.model_copy(
+                    update={"source_id": _SneakyStr(binding.source_id)}
+                ),
             )
         }
     )
     forged_input = SemanticCheckInput(
-        semantic_ast=replace(semantic_ast, coverage=forged_coverage),
+        semantic_ast=case.check_input.semantic_ast,
         query_spec=case.query_spec,
-        requirements=case.requirements,
+        requirements=forged_requirements,
     )
 
     result = adapt_semantic_authority_check_result(forged_input, native)

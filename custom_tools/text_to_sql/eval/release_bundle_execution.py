@@ -202,33 +202,44 @@ class ReleaseBundleExecution:
         """Copy the previous release's schema memory once into this release."""
 
         source_identity = self._schema_memory_source_identity()
-        source_root = Path(source_identity["root"])
-        if self._schema_memory_digest(source_root) != source_identity["digest"]:
-            raise SandboxError("schema-memory source changed after lock creation")
         destination = self.state_root / "schema-memory"
         if destination.exists() or destination.is_symlink():
             raise SandboxError("release schema-memory root already exists")
-        shutil.copytree(source_root, destination)
-        support.release_inputs.filter_schema_memory_copy(destination)
-        copied_digest = self._schema_memory_digest(destination)
-        if copied_digest != source_identity["digest"]:
-            raise SandboxError("copied schema-memory does not match release lock")
+        source_root = source_identity["root"]
+        if source_root is None:
+            destination.mkdir()
+            copied_digest = source_identity["digest"]
+        else:
+            source_path = Path(source_root)
+            if self._schema_memory_digest(source_path) != source_identity["digest"]:
+                raise SandboxError("schema-memory source changed after lock creation")
+            shutil.copytree(source_path, destination)
+            support.release_inputs.filter_schema_memory_copy(destination)
+            copied_digest = self._schema_memory_digest(destination)
+            if copied_digest != source_identity["digest"]:
+                raise SandboxError("copied schema-memory does not match release lock")
         self.schema_memory_seed = {
-            "source_root": source_identity["root"],
+            "source_root": source_root,
             "source_digest": source_identity["digest"],
             "copied_digest": copied_digest,
         }
 
-    def _schema_memory_source_identity(self) -> dict[str, str]:
+    def _schema_memory_source_identity(self) -> dict[str, object]:
         value = self.lock.get("schema_memory_source")
+        source_root = value.get("root") if isinstance(value, Mapping) else None
+        source_digest = value.get("digest") if isinstance(value, Mapping) else None
+        fresh_source = (
+            source_root is None
+            and source_digest == support.release_inputs.json_digest([])
+        )
+        copied_source = isinstance(source_root, str) and isinstance(source_digest, str)
         if (
             not isinstance(value, Mapping)
             or set(value) != {"root", "digest"}
-            or not isinstance(value.get("root"), str)
-            or not isinstance(value.get("digest"), str)
+            or not (fresh_source or copied_source)
         ):
             raise SandboxError("release schema-memory source identity is invalid")
-        return {"root": value["root"], "digest": value["digest"]}
+        return {"root": source_root, "digest": source_digest}
 
     def _verify_resumed_schema_memory(
         self, bundle_manifest: Mapping[str, object]

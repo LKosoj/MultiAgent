@@ -281,7 +281,13 @@ BindingReference: TypeAlias = Annotated[
 
 class ExistingJoinRef(StrictModel):
     reference_kind: Literal["existing"] = "existing"
-    join_id: Id
+    join_id: Id | None = None
+    join_handle: Annotated[str, Field(pattern=r"^j[1-9][0-9]*$")] | None = None
+
+    @model_validator(mode="after")
+    def require_join_form(self) -> ExistingJoinRef:
+        _exactly_one_identifier_form(self.join_id, self.join_handle, "join")
+        return self
 
 
 class ProposedJoinRef(StrictModel):

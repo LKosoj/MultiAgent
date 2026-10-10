@@ -106,12 +106,12 @@ def test_benchmark_client_allows_long_running_status_requests(monkeypatch) -> No
 def test_diagnostic_bwrap_runtime_environment_defaults_to_benchmark_lease() -> None:
     assert public_benchmark_bwrap._sandbox_runtime_env(
         SimpleNamespace(canonical_runtime_env=None, sandbox_env=[])
-    ) == {"WORKFLOW_PROCESS_LEASE_SECONDS": "1200"}
+    ) == {"WORKFLOW_PROCESS_LEASE_SECONDS": "2400"}
     assert public_benchmark_bwrap._sandbox_runtime_env(
         SimpleNamespace(canonical_runtime_env=None, sandbox_env=["EXTRA_SETTING=value"])
     ) == {
         "EXTRA_SETTING": "value",
-        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "2400",
     }
     with pytest.raises(ValueError, match="WORKFLOW_PROCESS_LEASE_SECONDS is fixed"):
         public_benchmark_bwrap._sandbox_runtime_env(
@@ -2356,11 +2356,12 @@ def test_canonical_environment_is_closed_typed_and_forces_empty_memory() -> None
         "OPENAI_API_BASE_DB": "http://127.0.0.1:9999/v1",
         "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
         "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
+        "PII_MASKING_ENABLED": "0",
         "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0",
         "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
         "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
         "TEXT_TO_SQL_LLM_MODELS_PROFILE": "default",
-        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "2400",
     }
     policy_path = (
         Path(__file__).resolve().parents[1]
@@ -4512,15 +4513,39 @@ def test_release_resume_never_recopies_schema_memory_seed() -> None:
     assert execution.run() == 0
 
 
-def test_schema_memory_source_identity_rejects_missing_or_empty_root(
-    tmp_path: Path,
-) -> None:
-    with pytest.raises(sandbox_module.SandboxError, match="required"):
-        release_inputs.schema_memory_source_identity(None)
+def test_schema_memory_source_identity_allows_fresh_release_seed() -> None:
+    assert release_inputs.schema_memory_source_identity(None) == {
+        "root": None,
+        "digest": release_inputs.json_digest([]),
+    }
+
+
+def test_schema_memory_source_identity_rejects_empty_root(tmp_path: Path) -> None:
     empty = tmp_path / "empty-schema-memory"
     empty.mkdir()
     with pytest.raises(sandbox_module.SandboxError, match="empty"):
         release_inputs.schema_memory_source_identity(empty)
+
+
+def test_release_schema_memory_seed_starts_fresh_without_source(
+    tmp_path: Path,
+) -> None:
+    execution = object.__new__(ReleaseBundleExecution)
+    execution.lock = {
+        "schema_memory_source": release_inputs.schema_memory_source_identity(None)
+    }
+    execution.state_root = tmp_path / "new-state"
+    execution.state_root.mkdir()
+
+    execution._prepare_schema_memory_seed()
+
+    assert (execution.state_root / "schema-memory").is_dir()
+    assert not any((execution.state_root / "schema-memory").iterdir())
+    assert execution.schema_memory_seed == {
+        "source_root": None,
+        "source_digest": release_inputs.json_digest([]),
+        "copied_digest": release_inputs.json_digest([]),
+    }
 
 
 def test_release_schema_memory_seed_rejects_lock_digest_mismatch(tmp_path: Path) -> None:

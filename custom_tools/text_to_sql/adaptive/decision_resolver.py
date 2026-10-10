@@ -785,6 +785,11 @@ def resolve_research_decision(
             budget_state=current.budget_state,
         )
     except SemanticReducerError as exc:
+        if exc.partial_selected_candidate_commit_gaps:
+            raise UnresolvableModelDecisionError(
+                "model semantic decision is not admissible",
+                normalized_decision=parsed,
+            ) from exc
         baseline_next = parsed.next
         if isinstance(baseline_next, ToolIntent):
             baseline_next = baseline_next.model_copy(
@@ -802,6 +807,15 @@ def resolve_research_decision(
                 tool_claim=tool_claim,
                 budget_state=current.budget_state,
             )
+        except SemanticReducerError as baseline_exc:
+            if baseline_exc.partial_selected_candidate_commit_gaps:
+                raise UnresolvableModelDecisionError(
+                    "model semantic decision is not admissible",
+                    normalized_decision=parsed,
+                ) from exc
+            raise DecisionResolverError(
+                "semantic decision admission failed"
+            ) from exc
         except (TypeError, ValueError, ValidationError):
             raise DecisionResolverError(
                 "semantic decision admission failed"

@@ -177,10 +177,11 @@ async def run_typed_schema_research(
         )
     )
     approved_semantic_fact_hints = tuple(
-        memory_manager.find_approved_semantic_facts(
-            _query_spec_terms(query_spec),
-            loaded_schema.namespace,
+        fact
+        for fact in memory_manager.find_approved_semantic_facts(
+            _query_spec_terms(query_spec), loaded_schema.namespace
         )
+        if fact.table_fqn in loaded_schema.schema
     )
 
     policy = load_adaptive_policy_config()
@@ -314,6 +315,26 @@ def _typed_response_format(model_type: type, name: str) -> dict[str, object]:
     while pending:
         node = pending.pop()
         if isinstance(node, dict):
+            properties = node.get("properties")
+            if (
+                isinstance(properties, dict)
+                and "proposal_type" in properties
+                and "citation_evidence_handles" in properties
+            ):
+                required = node.setdefault("required", [])
+                if "citation_evidence_handles" not in required:
+                    required.append("citation_evidence_handles")
+                properties.pop("citation_evidence_ids", None)
+                citation_schema = properties["citation_evidence_handles"]
+                if isinstance(citation_schema, dict):
+                    variants = citation_schema.get("anyOf")
+                    if isinstance(variants, list):
+                        properties["citation_evidence_handles"] = next(
+                            variant
+                            for variant in variants
+                            if isinstance(variant, dict)
+                            and variant.get("type") == "array"
+                        )
             discriminator = node.get("discriminator")
             if isinstance(discriminator, dict):
                 property_name = discriminator.get("propertyName")

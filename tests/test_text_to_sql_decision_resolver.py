@@ -21,7 +21,9 @@ from custom_tools.text_to_sql.adaptive.models import (
     ColumnRef,
     DiscriminatorValueBinding,
     EvidenceCost,
+    JoinCandidate,
     JoinCandidateStatus,
+    JoinEdge,
     JoinType,
     PredicateOperator,
     ResearchAction,
@@ -150,6 +152,81 @@ def test_identifier_handles_expand_to_canonical_durable_ids_before_resolution() 
         registry=_registry(namespace),
         state=state,
     ).admission.action is not None
+
+
+def test_join_handle_expands_to_canonical_durable_id_before_resolution() -> None:
+    loaded, namespace = _schema()
+    state = _state(namespace, with_evidence=True)
+    orders = TableRef(namespace="main", schema="public", table="orders")
+    customers = TableRef(namespace="main", schema="public", table="customers")
+    left = ColumnRef(table=orders, column="customer_id")
+    right = ColumnRef(table=customers, column="id")
+    join = JoinCandidate(
+        join_id="join:" + "a" * 64,
+        left=left,
+        right=right,
+        join_type=JoinType.INNER,
+        path=(JoinEdge(left=left, right=right),),
+        status=JoinCandidateStatus.VALIDATED,
+        evidence_ids=(state.evidence[0].evidence_id,),
+    )
+    state = state.model_copy(update={"join_candidates": (join,)})
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:handled-join",
+                    "source_handle": "s1",
+                    "candidate": {
+                        "kind": "physical_column",
+                        "physical_column": {"table": "orders", "column": "id"},
+                    },
+                    "join_references": (
+                        {"reference_kind": "existing", "join_handle": "j1"},
+                    ),
+                    "citation_evidence_handles": ("e1",),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    expanded = expand_model_identifier_handles(state, decision)
+
+    reference = expanded.proposals[0].join_references[0]
+    assert reference.join_id == join.join_id
+    assert reference.join_handle is None
+
+
+def test_join_handle_rejects_unknown_handle() -> None:
+    _loaded, namespace = _schema()
+    state = _state(namespace, with_evidence=True)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:unknown-join-handle",
+                    "source_handle": "s1",
+                    "candidate": {
+                        "kind": "physical_column",
+                        "physical_column": {"table": "orders", "column": "id"},
+                    },
+                    "join_references": (
+                        {"reference_kind": "existing", "join_handle": "j99"},
+                    ),
+                    "citation_evidence_handles": ("e1",),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    with pytest.raises(ModelDecisionReferenceError, match="join handle"):
+        expand_model_identifier_handles(state, decision)
 
 
 def test_identifier_handles_reject_unknown_handles() -> None:
@@ -837,7 +914,7 @@ def test_new_binding_precheck_preserves_retryable_semantic_errors() -> None:
         )
 
 
-def test_bare_entity_output_allows_existing_descriptive_column() -> None:
+def test_requested_output_allows_schema_evidenced_physical_column() -> None:
     loaded, namespace = _schema(
         {
             "public.orders": {
@@ -894,6 +971,65 @@ def test_bare_entity_output_allows_existing_descriptive_column() -> None:
     )
 
     assert resolved.admission.bindings[0].physical_column.column == "name"
+
+
+def test_named_entity_output_allows_entity_suffix_name_column() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.subcategory": {
+                "columns": {
+                    "id": {"type": "INTEGER", "is_primary_key": True},
+                    "category_name": {"type": "TEXT"},
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "subcategories",
+            "normalized_meaning": "subcategories",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:subcategory-name",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.subcategory",
+                        "column": "category_name",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "category_name"
 
 
 def test_explicit_entity_name_output_allows_name_column() -> None:
@@ -953,6 +1089,307 @@ def test_explicit_entity_name_output_allows_name_column() -> None:
     )
 
     assert resolved.admission.bindings[0].physical_column.column == "name"
+
+
+def test_explicit_property_output_allows_column_named_by_schema_description() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.samples": {
+                "columns": {
+                    "id": {"type": "INTEGER", "is_primary_key": True},
+                    "flag": {
+                        "type": "TEXT",
+                        "description": "whether this sample is recyclable",
+                    },
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "Is the sample recyclable?",
+            "normalized_meaning": "Whether the selected sample is recyclable.",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:sample-recyclable",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.samples",
+                        "column": "flag",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "flag"
+
+
+def test_plural_output_allows_singular_physical_column() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.atoms": {
+                "columns": {
+                    "atom_id": {"type": "TEXT", "is_primary_key": True},
+                    "element": {
+                        "type": "TEXT",
+                        "description": "chemical element of the atom",
+                    },
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "elements",
+            "normalized_meaning": "the elements associated with the selected atoms",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:element",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.atoms",
+                        "column": "element",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "element"
+
+
+def test_explicit_multiword_output_allows_camel_case_column() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.users": {
+                "columns": {
+                    "Id": {"type": "INTEGER", "is_primary_key": True},
+                    "DisplayName": {"type": "TEXT"},
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "display name of the user",
+            "normalized_meaning": "Display name of the user.",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:user-display-name",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.users",
+                        "column": "DisplayName",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "DisplayName"
+
+
+def test_explicit_output_allows_named_suffix_after_column_acronym() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.items": {
+                "columns": {
+                    "id": {"type": "INTEGER", "is_primary_key": True},
+                    "QZcategory": {"type": "TEXT"},
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "item category",
+            "normalized_meaning": "category assigned to the item",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:item-category",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.items",
+                        "column": "QZcategory",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "QZcategory"
+
+
+def test_explicit_normalized_output_allows_snake_case_column() -> None:
+    loaded, namespace = _schema(
+        {
+            "public.teams": {
+                "columns": {
+                    "id": {"type": "INTEGER", "is_primary_key": True},
+                    "team_long_name": {"type": "TEXT"},
+                }
+            }
+        }
+    )
+    state = _state(namespace, with_evidence=True)
+    source_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "long name of teams",
+            "normalized_meaning": "long name of teams; team_long_name",
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (source_item,),
+                    "requested_output_source_ids": (source_item.source_id,),
+                }
+            )
+        }
+    )
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:team-long-name",
+                "source_id": source_item.source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.teams",
+                        "column": "team_long_name",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+
+    resolved = resolve_research_decision(
+        state,
+        decision,
+        loaded_schema=loaded,
+        freshness_context=_freshness(state),
+        registry=_registry(namespace),
+    )
+
+    assert resolved.admission.bindings[0].physical_column.column == "team_long_name"
 
 
 def _semantic_commit(proposals: tuple[dict[str, object], ...]) -> ResearchDecisionV1:
@@ -1953,19 +2390,28 @@ def test_loaded_schema_certifies_valid_discriminator_literal() -> None:
 
 
 @pytest.mark.parametrize(
-    ("requested_value", "rows", "predicate_value", "accepted"),
+    ("requested_value", "rows", "operator", "predicate_value", "accepted"),
     (
-        (31, [["31"]], 31, True),
-        ("31", [["31"]], "31", True),
-        (31, [], 31, False),
-        ("stored-label-a", [["stored-label-a"]], "stored-label-b", False),
-        ("31", [["31"]], 31, False),
+        (31, [["31"]], PredicateOperator.EQ, 31, True),
+        ("31", [["31"]], PredicateOperator.EQ, "31", True),
+        (31, [], PredicateOperator.EQ, 31, False),
+        (
+            "stored-label-a",
+            [["stored-label-a"]],
+            PredicateOperator.EQ,
+            "stored-label-b",
+            False,
+        ),
+        ("31", [["31"]], PredicateOperator.EQ, 31, False),
+        ("-", [], PredicateOperator.IN, ("-", "+-"), False),
+        ("-", [["-"]], PredicateOperator.IN, ("-", "+-"), True),
     ),
 )
 def test_empty_exact_search_value_rejects_discriminator_literal(
     requested_value: str | int,
     rows: list[list[str]],
-    predicate_value: str | int,
+    operator: PredicateOperator,
+    predicate_value: str | int | tuple[str, ...],
     accepted: bool,
 ) -> None:
     loaded, namespace = _schema()
@@ -2047,7 +2493,7 @@ def test_empty_exact_search_value_rejects_discriminator_literal(
                         },
                         "discriminator_predicate": {
                             "left": {"table": "public.orders", "column": "status"},
-                            "operator": PredicateOperator.EQ,
+                            "operator": operator,
                             "right": predicate_value,
                         },
                     },
@@ -2183,6 +2629,115 @@ def test_trusted_semantic_admission_error_remains_terminal(monkeypatch) -> None:
         )
 
     assert type(error.value) is DecisionResolverError
+    assert calls == 2
+
+
+def test_partial_candidate_commit_error_remains_model_correctable(monkeypatch) -> None:
+    loaded, namespace = _schema()
+    state = _state(namespace, with_evidence=True)
+    source_id = state.query_spec.semantic_items[0].source_id
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:partial-candidate",
+                "source_id": source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.orders",
+                        "column": "status",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+    calls = 0
+
+    def reject_partial_commit(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise SemanticReducerError(
+            "semantic commit leaves selected candidate bindings unassessed",
+            partial_selected_candidate_commit_gaps=(object(),),
+        )
+
+    monkeypatch.setattr(
+        _resolver_module,
+        "admit_semantic_turn",
+        reject_partial_commit,
+    )
+
+    with pytest.raises(UnresolvableModelDecisionError) as error:
+        resolve_research_decision(
+            state,
+            decision,
+            loaded_schema=loaded,
+            freshness_context=_freshness(state),
+            registry=_registry(namespace),
+        )
+
+    assert error.value.normalized_decision == decision
+    assert isinstance(error.value.__cause__, SemanticReducerError)
+    assert calls == 1
+
+
+def test_invalid_commit_with_partial_baseline_remains_model_correctable(
+    monkeypatch,
+) -> None:
+    loaded, namespace = _schema()
+    state = _state(namespace, with_evidence=True)
+    decision = _semantic_commit(
+        (
+            {
+                "proposal_type": "new_binding",
+                "proposal_key": "proposal:invalid-certificate",
+                "source_id": state.query_spec.semantic_items[0].source_id,
+                "candidate": {
+                    "kind": "physical_column",
+                    "physical_column": {
+                        "table": "public.orders",
+                        "column": "status",
+                    },
+                },
+                "join_references": (),
+                "citation_evidence_ids": ("evidence-1",),
+            },
+        )
+    )
+    calls = 0
+
+    def reject_invalid_then_partial(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise SemanticReducerError(
+                "binding assessment lacks the required semantic certificate"
+            )
+        raise SemanticReducerError(
+            "semantic commit leaves selected candidate bindings unassessed",
+            partial_selected_candidate_commit_gaps=(object(),),
+        )
+
+    monkeypatch.setattr(
+        _resolver_module,
+        "admit_semantic_turn",
+        reject_invalid_then_partial,
+    )
+
+    with pytest.raises(UnresolvableModelDecisionError) as error:
+        resolve_research_decision(
+            state,
+            decision,
+            loaded_schema=loaded,
+            freshness_context=_freshness(state),
+            registry=_registry(namespace),
+        )
+
+    assert error.value.normalized_decision == decision
+    assert isinstance(error.value.__cause__, SemanticReducerError)
     assert calls == 2
 
 

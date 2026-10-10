@@ -657,7 +657,7 @@ def validate_solver_chain(payload: AdaptiveReplayPayload) -> None:
         snapshots and snapshots[-1].state.stop_reason is not None
     ) or (
         final_execution is not None
-        and _result_contradiction_receipt(final_execution) is None
+        and not _known_open_execution(final_execution)
     )
     if terminal_required and terminal is None:
         raise ValueError("final solver state requires terminal authority")
@@ -696,6 +696,24 @@ def _result_contradiction_receipt(
         return receipt
     except (CanonicalJsonError, ValidationError):
         return None
+
+
+def _known_open_execution(step: SolverExecutionReplayStep) -> bool:
+    if _result_contradiction_receipt(step) is not None:
+        return True
+    if step.reconciliation.outcome != "KNOWN":
+        return False
+    try:
+        value = json.loads(step.reconciliation.result.content())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    return (
+        type(value) is dict
+        and value.get("status") == "failed"
+        and value.get("reason_code") == "EXECUTION_FAILED"
+        and type(value.get("execution")) is dict
+        and value["execution"].get("success") is False
+    )
 
 
 def validate_budget_chains(payload: AdaptiveReplayPayload) -> None:
@@ -918,7 +936,7 @@ def legacy_reasons(
     typed = payload.solver_terminal is not None or bool(
         payload.solver_steps
         and type(payload.solver_steps[-1]) is SolverExecutionReplayStep
-        and _result_contradiction_receipt(payload.solver_steps[-1]) is not None
+        and _known_open_execution(payload.solver_steps[-1])
     )
     if payload.research_abort_journal is not None:
         reasons.add(LegacyReplayReason.RESEARCH_ABORT_INPUT)

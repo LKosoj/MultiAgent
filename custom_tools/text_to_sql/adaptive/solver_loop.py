@@ -648,7 +648,10 @@ def finalize_targeted_reentry(
     formula_continuation = (
         request.repair_kind is None
         and request_item.kind is SemanticItemKind.FORMULA
-        and not request_item.binding_ids
+        and (
+            not request_item.binding_ids
+            or request.required_evidence_kind is EvidenceSourceKind.SCHEMA
+        )
     )
     research_continuation = (
         semantic_repair

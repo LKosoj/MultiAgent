@@ -76,9 +76,15 @@ def _evaluate(case):
     )
 
 
-def _deferred_limit_case(sql: str) -> tuple[ResearchState, SemanticCheckInput]:
+def _deferred_limit_case(
+    sql: str,
+    *,
+    literal: int | None = None,
+    shape: ExpectedResultShape = ExpectedResultShape.ROWS,
+) -> tuple[ResearchState, SemanticCheckInput]:
     state = build_state(
-        (_item("minimum", SemanticItemKind.METRIC, "amount"),)
+        (_item("minimum", SemanticItemKind.METRIC, "amount"),),
+        shape=shape,
     )
     deferred_limit = state.query_spec.semantic_items[0].model_copy(
         update={
@@ -86,8 +92,12 @@ def _deferred_limit_case(sql: str) -> tuple[ResearchState, SemanticCheckInput]:
             "kind": SemanticItemKind.LIMIT,
             "source_text": "one result",
             "normalized_meaning": "one result",
-            "literal_or_reference": None,
-            "status": SemanticItemStatus.UNRESOLVED,
+            "literal_or_reference": literal,
+            "status": (
+                SemanticItemStatus.UNRESOLVED
+                if literal is None
+                else SemanticItemStatus.RESOLVED
+            ),
             "binding_ids": (),
         }
     )
@@ -113,6 +123,10 @@ def _deferred_limit_case(sql: str) -> tuple[ResearchState, SemanticCheckInput]:
         query_spec=state.query_spec,
         requirements=requirements,
     )
+
+
+def _literal_limit_case(sql: str) -> tuple[ResearchState, SemanticCheckInput]:
+    return _deferred_limit_case(sql, literal=1)
 
 
 @pytest.mark.parametrize(
@@ -141,6 +155,144 @@ def test_deferred_limit_requires_one_positive_root_literal_limit(
         assert result.affected_source_ids == ("take-one",)
         assert result.repair is not None
         assert result.repair.kind is RepairKind.REVISE_SQL
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_status"),
+    (
+        (
+            "SELECT (SELECT MIN(o.amount) FROM orders o) AS minimum",
+            CheckStatus.FAILED,
+        ),
+        (
+            "SELECT (SELECT MIN(o.amount) FROM orders o) AS minimum LIMIT 2",
+            CheckStatus.FAILED,
+        ),
+        (
+            "SELECT (SELECT MIN(o.amount) FROM orders o) AS minimum LIMIT 1",
+            CheckStatus.PASSED,
+        ),
+    ),
+)
+def test_literal_limit_requires_matching_root_limit(
+    sql: str, expected_status: CheckStatus
+) -> None:
+    state, check_input = _literal_limit_case(sql)
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is expected_status
+    if expected_status is CheckStatus.FAILED:
+        assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+        assert result.affected_source_ids == ("take-one",)
+        assert result.repair is not None
+        assert result.repair.kind is RepairKind.REVISE_SQL
+
+
+def test_literal_limit_accepts_one_selected_entity_before_outer_detail_rows() -> None:
+    state, check_input = _literal_limit_case(
+        "WITH selected AS ("
+        "SELECT o.amount FROM orders o ORDER BY o.amount DESC LIMIT 1"
+        ") "
+        "SELECT o.amount FROM orders o "
+        "JOIN selected s ON o.amount = s.amount"
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_literal_limit_ignores_unused_limited_cte() -> None:
+    state, check_input = _literal_limit_case(
+        "WITH unused AS (SELECT o.amount FROM orders o LIMIT 1) "
+        "SELECT o.amount FROM orders o"
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+
+
+def test_ranked_rows_accepts_per_partition_rank_threshold_without_global_limit() -> None:
+    state, check_input = _deferred_limit_case(
+        "WITH ranked AS ("
+        "SELECT o.amount, "
+        "RANK() OVER (PARTITION BY o.status ORDER BY o.amount DESC) AS place "
+        "FROM orders o"
+        ") "
+        "SELECT amount FROM ranked WHERE place <= 5",
+        literal=5,
+        shape=ExpectedResultShape.RANKED_ROWS,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.PASSED
+
+
+def test_ranked_rows_without_rank_threshold_still_requires_limit() -> None:
+    state, check_input = _deferred_limit_case(
+        "WITH ranked AS ("
+        "SELECT o.amount, "
+        "RANK() OVER (PARTITION BY o.status ORDER BY o.amount DESC) AS place "
+        "FROM orders o"
+        ") "
+        "SELECT amount FROM ranked",
+        literal=5,
+        shape=ExpectedResultShape.RANKED_ROWS,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+
+
+def test_ranked_rows_threshold_on_non_rank_alias_still_requires_limit() -> None:
+    state, check_input = _deferred_limit_case(
+        "WITH ranked AS ("
+        "SELECT o.amount AS place, "
+        "RANK() OVER (PARTITION BY o.status ORDER BY o.amount DESC) AS actual_rank "
+        "FROM orders o"
+        ") "
+        "SELECT place FROM ranked WHERE place <= 5",
+        literal=5,
+        shape=ExpectedResultShape.RANKED_ROWS,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
+
+
+@pytest.mark.parametrize(
+    "condition",
+    (
+        "place <= 5 OR amount > 0",
+        "NOT place <= 5",
+        "EXISTS (SELECT 1 FROM orders x WHERE place <= 5)",
+    ),
+    ids=("optional_or", "negated", "nested_subquery"),
+)
+def test_ranked_rows_requires_positive_outer_rank_threshold(condition: str) -> None:
+    state, check_input = _deferred_limit_case(
+        "WITH ranked AS ("
+        "SELECT o.amount, "
+        "RANK() OVER (PARTITION BY o.status ORDER BY o.amount DESC) AS place "
+        "FROM orders o"
+        ") "
+        f"SELECT amount FROM ranked WHERE {condition}",
+        literal=5,
+        shape=ExpectedResultShape.RANKED_ROWS,
+    )
+
+    result = evaluate_semantic_authority_checks(check_input, state, POSTGRES_DSN)
+
+    assert result.status is CheckStatus.FAILED
+    assert result.failure_code is CheckFailureCode.LIMIT_MISMATCH
 
 
 @pytest.mark.parametrize(
@@ -336,7 +488,7 @@ def test_relation_column_aliases_preserve_underlying_physical_authority(sql: str
     assert _evaluate(case).status is CheckStatus.PASSED
 
 
-def test_qualify_generic_option_keeps_literal_authority():
+def test_qualify_generic_option_does_not_validate_literal_value():
     case = build_case(
         "SELECT o.status, ROW_NUMBER() OVER (ORDER BY o.status) AS rn FROM orders o "
         "QUALIFY o.status = 'forged'",
@@ -353,11 +505,11 @@ def test_qualify_generic_option_keeps_literal_authority():
 
     result = _evaluate(case)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
-def test_generic_join_option_keeps_literal_authority():
+def test_generic_join_option_does_not_validate_literal_value():
     case = build_case(
         "SELECT o.status FROM orders AS o CROSS JOIN orders AS b",
         (_item("status", SemanticItemKind.DIMENSION, "status"),),
@@ -398,9 +550,8 @@ def test_generic_join_option_keeps_literal_authority():
         POSTGRES_DSN,
     )
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
-    assert result.affected_ast_node_ids == (parsed_ast.joins[0].node_id,)
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 def test_pivot_input_columns_remain_in_physical_authority_collection() -> None:
@@ -1693,7 +1844,7 @@ def test_authority_checks_literals_in_conditional_aggregate() -> None:
     assert result.failure_code is None
 
 
-def test_authority_gate_allows_incomplete_filter_but_rejects_unknown_literal() -> None:
+def test_authority_gate_does_not_validate_filter_literal_value() -> None:
     missing_filter = build_case(
         "SELECT o.status FROM orders AS o",
         (
@@ -1720,13 +1871,28 @@ def test_authority_gate_allows_incomplete_filter_but_rejects_unknown_literal() -
     )
 
     assert _evaluate(missing_filter).status is CheckStatus.PASSED
-    assert (
-        _evaluate(unknown_literal).failure_code
-        is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert _evaluate(unknown_literal).status is CheckStatus.PASSED
+
+
+def test_authority_gate_accepts_literal_on_authorized_physical_column() -> None:
+    case = build_case(
+        "SELECT o.status FROM orders AS o WHERE o.status = 'pending_review'",
+        (
+            _item(
+                "status",
+                SemanticItemKind.DIMENSION,
+                "status",
+            ),
+        ),
     )
 
+    result = _evaluate(case)
 
-def test_authority_gate_checks_literals_inside_any_expression() -> None:
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
+
+
+def test_authority_gate_does_not_validate_literals_inside_expressions() -> None:
     items = (
         _item(
             "eur",
@@ -1756,10 +1922,7 @@ def test_authority_gate_checks_literals_inside_any_expression() -> None:
     )
 
     assert _evaluate(allowed).status is CheckStatus.PASSED
-    assert (
-        _evaluate(unknown).failure_code
-        is CheckFailureCode.UNAUTHORIZED_LITERAL
-    )
+    assert _evaluate(unknown).status is CheckStatus.PASSED
 
 
 def test_requested_output_condition_authorizes_its_literal_in_projection() -> None:
@@ -1828,8 +1991,8 @@ def test_requested_output_condition_authorizes_its_literal_in_projection() -> No
 
     assert allowed.status is CheckStatus.PASSED
     assert allowed.failure_code is None
-    assert wrong_column.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
-    assert filter_use.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert wrong_column.status is CheckStatus.PASSED
+    assert filter_use.status is CheckStatus.PASSED
 
     vertical_state = build_vertical_state()
     vertical_query_spec = vertical_state.query_spec.model_copy(
@@ -1880,7 +2043,7 @@ def test_requested_output_condition_authorizes_its_literal_in_projection() -> No
         "sqlite://",
     )
 
-    assert composite_binding.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert composite_binding.status is CheckStatus.PASSED
 
 
 def test_explicit_formula_allows_its_conditional_literal() -> None:
@@ -1956,21 +2119,9 @@ def test_explicit_formula_with_bound_input_allows_its_conditional_literal() -> N
     assert result.failure_code is None
 
 
-@pytest.mark.parametrize(
-    ("literal", "expected_status", "expected_failure"),
-    (
-        ("small_business", CheckStatus.PASSED, None),
-        (
-            "enterprise",
-            CheckStatus.FAILED,
-            CheckFailureCode.UNAUTHORIZED_LITERAL,
-        ),
-    ),
-)
+@pytest.mark.parametrize("literal", ("small_business", "enterprise"))
 def test_eligible_exact_value_evidence_authorizes_equality_literal(
     literal: str,
-    expected_status: CheckStatus,
-    expected_failure: CheckFailureCode | None,
 ) -> None:
     state = build_state(
         (
@@ -2030,11 +2181,11 @@ def test_eligible_exact_value_evidence_authorizes_equality_literal(
     )
 
     assert evidence_id in requirements.eligible_evidence_ids
-    assert result.status is expected_status
-    assert result.failure_code is expected_failure
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
-def test_exact_value_evidence_does_not_authorize_join_only_column() -> None:
+def test_literal_gate_does_not_restrict_join_only_column_value() -> None:
     join = inner_join("accounts", "AccountID", "events", "AccountID")
     state = build_state(
         (
@@ -2094,8 +2245,8 @@ def test_exact_value_evidence_does_not_authorize_join_only_column() -> None:
 
     assert account_id not in requirements.allowed_columns
     assert evidence_id in requirements.eligible_evidence_ids
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 @pytest.mark.parametrize(
@@ -2107,21 +2258,6 @@ def test_exact_value_evidence_does_not_authorize_join_only_column() -> None:
             ExpectedResultShape.ROWS,
             CheckFailureCode.UNAUTHORIZED_TABLE,
             id="unauthorized-table",
-        ),
-        pytest.param(
-            "SELECT o.status FROM orders o WHERE o.status = 'inactive'",
-            (
-                _item(
-                    "status",
-                    SemanticItemKind.FILTER,
-                    "status",
-                    operator=PredicateOperator.EQ,
-                    literal="active",
-                ),
-            ),
-            ExpectedResultShape.ROWS,
-            CheckFailureCode.UNAUTHORIZED_LITERAL,
-            id="unauthorized-literal",
         ),
     ),
 )

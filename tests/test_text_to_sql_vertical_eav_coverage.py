@@ -33,29 +33,23 @@ def _evaluate(sql: str):
 
 
 @pytest.mark.parametrize(
-    ("sql", "code"),
+    "sql",
     (
-        (
-            "SELECT c.id FROM customers c "
-            "JOIN attribute_values v ON c.id = v.customer_id "
-            "JOIN attributes a ON a.id = v.attribute_id "
-            "WHERE a.name = 'wrong_attribute' AND v.value = 'premium'",
-            CheckFailureCode.UNAUTHORIZED_LITERAL,
-        ),
-        (
-            "SELECT c.id FROM customers c "
-            "JOIN attribute_values v ON c.id = v.customer_id "
-            "JOIN attributes a ON a.id = v.attribute_id "
-            "WHERE a.name = 'membership_level' AND v.value = 'basic'",
-            CheckFailureCode.UNAUTHORIZED_LITERAL,
-        ),
+        "SELECT c.id FROM customers c "
+        "JOIN attribute_values v ON c.id = v.customer_id "
+        "JOIN attributes a ON a.id = v.attribute_id "
+        "WHERE a.name = 'wrong_attribute' AND v.value = 'premium'",
+        "SELECT c.id FROM customers c "
+        "JOIN attribute_values v ON c.id = v.customer_id "
+        "JOIN attributes a ON a.id = v.attribute_id "
+        "WHERE a.name = 'membership_level' AND v.value = 'basic'",
     ),
 )
-def test_vertical_failures_are_specific(sql: str, code: CheckFailureCode) -> None:
+def test_vertical_literal_values_are_left_to_result_review(sql: str) -> None:
     _, result = _evaluate(sql)
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is code
+    assert result.status is CheckStatus.PASSED
+    assert result.failure_code is None
 
 
 @pytest.mark.parametrize(

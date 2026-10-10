@@ -12,7 +12,6 @@ from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
 from custom_tools.text_to_sql.adaptive.checks import SemanticCheckInput
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
-    CheckFailureCode,
     CheckStatus,
     DiscriminatorValueBinding,
     ExpectedResultShape,
@@ -241,7 +240,7 @@ def test_document_only_binding_has_no_semantic_ast_targets() -> None:
     assert "physical-output" in annotation_source_ids
 
 
-def test_physical_filter_value_may_differ_from_query_literal() -> None:
+def test_literal_gate_does_not_compare_physical_and_query_values() -> None:
     accepted = _in_case(
         "SELECT o.tier FROM orders o WHERE o.tier = 'Discount'",
         operator=PredicateOperator.EQ,
@@ -258,10 +257,10 @@ def test_physical_filter_value_may_differ_from_query_literal() -> None:
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert query_spelling.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert query_spelling.status is CheckStatus.PASSED
 
 
-def test_in_list_reordering_and_duplicates_preserve_authority() -> None:
+def test_in_list_values_are_left_to_result_review() -> None:
     accepted = _in_case(
         "SELECT o.tier FROM orders o WHERE o.tier IN ('silver', 'gold', 'silver')"
     )
@@ -270,8 +269,7 @@ def test_in_list_reordering_and_duplicates_preserve_authority() -> None:
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert rejected.status is CheckStatus.FAILED
-    assert rejected.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert rejected.status is CheckStatus.PASSED
 
 
 def test_generic_transform_expression_keeps_in_literal_authority() -> None:
@@ -312,8 +310,7 @@ def test_between_symmetric_literal_bounds_are_authorized_in_either_order() -> No
         literal=(1, 2),
         evidence_values=(1, 2),
     )
-    assert ordinary_reversed.status is CheckStatus.FAILED
-    assert ordinary_reversed.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert ordinary_reversed.status is CheckStatus.PASSED
 
 
 def test_reversed_symmetric_between_keeps_exact_coverage_annotation_and_evidence() -> None:
@@ -368,7 +365,7 @@ def test_reversed_symmetric_between_keeps_exact_coverage_annotation_and_evidence
     )
 
 
-def test_symmetric_between_rejects_a_literal_without_exact_evidence() -> None:
+def test_symmetric_between_literal_is_left_to_result_review() -> None:
     result = _in_case(
         "SELECT o.tier FROM orders o WHERE o.tier BETWEEN SYMMETRIC 1 AND 3",
         operator=PredicateOperator.BETWEEN,
@@ -376,11 +373,10 @@ def test_symmetric_between_rejects_a_literal_without_exact_evidence() -> None:
         evidence_values=(1, 2),
     )
 
-    assert result.status is CheckStatus.FAILED
-    assert result.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert result.status is CheckStatus.PASSED
 
 
-def test_time_between_requires_exact_discriminator_predicate_match() -> None:
+def test_time_between_literal_is_left_to_result_review() -> None:
     accepted = _in_case(
         "SELECT o.tier FROM orders o "
         "WHERE o.tier BETWEEN '2024-01-01' AND '2024-01-31'",
@@ -399,7 +395,7 @@ def test_time_between_requires_exact_discriminator_predicate_match() -> None:
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert wrong_endpoint.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert wrong_endpoint.status is CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(
@@ -467,7 +463,7 @@ def test_ordered_predicates_do_not_require_observed_values(
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert wrong_literal.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert wrong_literal.status is CheckStatus.PASSED
 
 
 def test_time_between_does_not_require_bounds_as_observed_values() -> None:
@@ -489,7 +485,7 @@ def test_time_between_does_not_require_bounds_as_observed_values() -> None:
     )
 
     assert accepted.status is CheckStatus.PASSED
-    assert wrong_endpoint.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert wrong_endpoint.status is CheckStatus.PASSED
 
 
 @pytest.mark.parametrize(
@@ -548,10 +544,7 @@ def test_filter_predicates_do_not_require_an_observed_matching_row(
     )
 
     assert accepted.status is CheckStatus.PASSED
-    if operator is PredicateOperator.LIKE:
-        assert wrong_literal.status is CheckStatus.PASSED
-    else:
-        assert wrong_literal.failure_code is CheckFailureCode.UNAUTHORIZED_LITERAL
+    assert wrong_literal.status is CheckStatus.PASSED
 
 
 def test_like_pattern_is_not_rejected_by_literal_authority_check() -> None:

@@ -3081,6 +3081,51 @@ def test_execute_research_probe_uses_only_trusted_template_and_typed_cells(
         ledger.close()
 
 
+def test_sqlite_research_query_timeout_remains_typed_through_executor(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = _sqlite_data_runtime(tmp_path, "F01_CONVENTIONAL_STAR")
+    template = ResearchQueryTemplate(
+        probe_id="timeout-probe",
+        namespace="main",
+        schema_namespace_version=f"sha256:{runtime.namespace.version_key}",
+        sql=(
+            "WITH RECURSIVE counter(value) AS ("
+            "SELECT 1 UNION ALL SELECT value + 1 FROM counter"
+            ") SELECT SUM(value) AS total FROM counter LIMIT 1"
+        ),
+        output_columns=("total",),
+        row_limit=1,
+        deterministic=True,
+    )
+    runtime = replace(runtime, query_templates=(template,))
+    target = QueryProbeRef(probe_id="timeout-probe", namespace="main")
+    budget, ledger = _data_budget_runtime(
+        tmp_path,
+        runtime.namespace,
+        ResearchActionKind.EXECUTE_PROBE,
+        target,
+        suffix="sqlite-timeout",
+        rows=1,
+    )
+    monkeypatch.setenv("DB_EXECUTOR_STATEMENT_TIMEOUT_MS", "1")
+    try:
+        result = _run_supervised(
+            lambda: execute_research_probe(
+                target,
+                (),
+                runtime=runtime,
+                budget=budget,
+            )
+        )
+
+        assert result.status is ProbeStatus.FAILED
+        assert result.failure_code == "data_probe_timed_out"
+    finally:
+        ledger.close()
+
+
 def test_data_probe_parameter_capability_fails_before_connect(tmp_path: Path) -> None:
     capabilities = _capabilities().downgrade(
         parameter_binding=Capability.unverified(

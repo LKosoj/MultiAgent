@@ -90,11 +90,11 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def schema_memory_source_identity(source: Path | None) -> dict[str, str]:
-    """Bind the previous release's non-empty schema-memory tree."""
+def schema_memory_source_identity(source: Path | None) -> dict[str, object]:
+    """Bind a prior schema-memory tree or a fresh release seed."""
 
     if source is None:
-        raise SandboxError("canonical release schema-memory source is required")
+        return {"root": None, "digest": json_digest([])}
     root = Path(source).resolve()
     if root.is_symlink() or not root.is_dir():
         raise SandboxError("schema-memory source is missing or unsafe")
@@ -488,13 +488,14 @@ def canonical_runtime_environment(
         raise ValueError("llm_models_profile must be non-empty text or None")
     environment = {
         "OPENAI_API_BASE_DB": model_api_base,
+        "PII_MASKING_ENABLED": "0",
         "TEXT_TO_SQL_ALLOWED_DB_FILE_ROOTS": "/benchmark-input",
         "TEXT_TO_SQL_ALLOWED_DB_SCHEMES": "sqlite",
         "TEXT_TO_SQL_SUCCESSFUL_SQL_MEMORY_ENABLED": "0",
         "TEXT_TO_SQL_CODE_LABEL_CASCADE_HINT": "shadow",
         "TEXT_TO_SQL_CLARIFYING_QUESTIONS": "0",
         "TEXT_TO_SQL_LLM_MODELS_PROFILE": resolved_llm_models_profile,
-        "WORKFLOW_PROCESS_LEASE_SECONDS": "1200",
+        "WORKFLOW_PROCESS_LEASE_SECONDS": "2400",
     }
     return environment
 
@@ -871,7 +872,7 @@ def _build_release_lock_and_binding(
     bird_cases: tuple[ReleaseCase, ...],
     spider_cases: tuple[ReleaseCase, ...],
     digest_cache: FileDigestCache,
-    schema_memory_source: Mapping[str, str],
+    schema_memory_source: Mapping[str, object],
 ) -> tuple[dict[str, object], FrozenReleaseInputs]:
     canonical_environment = canonical_runtime_environment(
         {"model_api_base": args.model_api_base},
@@ -1114,20 +1115,27 @@ def validate_release_input_lock(
         ) != raw_record.get("sha256"):
             raise SandboxError("release input changed after lock creation")
     source_identity = lock.get("schema_memory_source")
+    source_root = source_identity.get("root") if isinstance(source_identity, Mapping) else None
+    source_digest = (
+        source_identity.get("digest") if isinstance(source_identity, Mapping) else None
+    )
+    fresh_source = source_root is None and source_digest == json_digest([])
+    copied_source = isinstance(source_root, str) and isinstance(source_digest, str)
     if (
         not isinstance(source_identity, Mapping)
         or set(source_identity) != {"root", "digest"}
-        or not isinstance(source_identity.get("root"), str)
-        or not isinstance(source_identity.get("digest"), str)
+        or not (fresh_source or copied_source)
     ):
         raise SandboxError("release schema-memory source identity is invalid")
+    if fresh_source and getattr(args, "schema_memory_source", None) is not None:
+        raise SandboxError("fresh release cannot override schema-memory source")
     expected, binding = inspect_release_inputs(
         args,
         policy=policy,
         load_bird_cases=load_bird_cases,
         load_spider_cases=load_spider_cases,
         prove_git=prove_git,
-        schema_memory_source=Path(source_identity["root"]),
+        schema_memory_source=Path(source_root) if isinstance(source_root, str) else None,
     )
     comparable_fields = (
         "policy_digest",

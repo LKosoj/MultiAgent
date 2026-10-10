@@ -565,6 +565,63 @@ def test_exported_result_contradiction_execution_replays_open_s1(
     assert result.solver_state_digest == canonical_digest(checkpoint.state)
 
 
+def test_exported_failed_execution_replays_as_open_solver_repair(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from test_text_to_sql_adaptive_solver import _ready_state
+    from test_text_to_sql_semantic_coverage import _failed_execution_terminal
+
+    from custom_tools.text_to_sql.adaptive.replay import HistoricalReplayStatus
+    from workflow.text_to_sql_adaptive_replay import build_adaptive_replay_artifact
+    from workflow.text_to_sql_adaptive_solver import reconcile_known_finalizer
+
+    _use_synchronous_sql_parser(monkeypatch)
+    db_path = tmp_path / "failed-execution-replay.db"
+    checkpoint_store = AdaptiveStateStore(db_path)
+    research_store = AdaptiveResearchStateStore(db_path)
+    solver_store = AdaptiveSolverCheckpointStore(db_path)
+    budget_ledger = AdaptiveBudgetLedger(db_path)
+    state = _ready_state()
+    candidate = state.sql_candidates[-1]
+    research_store.save_query_spec(state.query_spec)
+    solver_store.initialize(state)
+    reservation = solver_store.reserve_execution(
+        state,
+        action_revision=0,
+        candidate_id=candidate.candidate_id,
+        execution_id="failed-execution-replay-1",
+        request={
+            "operation": "finalize_text_to_sql_run",
+            "sql_query": candidate.sql,
+            "row_limit": 10,
+            "dry_run_only": False,
+        },
+    )
+    checkpoint = reconcile_known_finalizer(
+        solver_store,
+        reservation,
+        state,
+        _failed_execution_terminal(state.run_id, candidate.sql),
+    )
+    assert checkpoint.terminal is None
+
+    raw = build_adaptive_replay_artifact(
+        state.run_id,
+        state.run_incarnation,
+        checkpoint_store=checkpoint_store,
+        research_store=research_store,
+        solver_store=solver_store,
+        budget_ledger=budget_ledger,
+    )
+    _forbid_external_replay(monkeypatch)
+    _decode_trusted(raw)
+    result = _replay_trusted(raw)
+
+    assert result.status is HistoricalReplayStatus.VERIFIED
+    assert result.solver_state_digest == canonical_digest(checkpoint.state)
+
+
 def test_exported_unknown_execution_replays_as_tool_failure(
     tmp_path,
     monkeypatch,

@@ -170,6 +170,7 @@ class _PreparedQuery:
     output_columns: tuple[str, ...]
     can_truncate: bool
     profile_sample_limit: int | None = None
+    exact_equalities: tuple[tuple[ColumnRef, object], ...] = ()
 
 
 class _DataProbeFailure(RuntimeError):
@@ -476,6 +477,7 @@ def execute_raw_research_query(
             row_limit=admitted.row_limit,
             output_columns=admitted.output_columns,
             can_truncate=True,
+            exact_equalities=admitted.exact_equalities,
         )
 
     return _run_data_probe(
@@ -526,6 +528,8 @@ def _run_data_probe(
                 )
             )
             if not result.success:
+                if result.outcome.get("timed_out") is True:
+                    raise TimeoutError("research query timed out")
                 capability = result.outcome.get("capability_error")
                 failure_code = (
                     "data_probe_capability_unavailable"
@@ -558,6 +562,14 @@ def _run_data_probe(
                 )
             if kind is ResearchActionKind.SEARCH_VALUE:
                 payload["requested_value"] = action_parameters[1][1]
+            if query.exact_equalities:
+                payload["exact_equalities"] = [
+                    {
+                        "column": column.model_dump(mode="json", by_alias=True),
+                        "value": value,
+                    }
+                    for column, value in query.exact_equalities
+                ]
             payload_bytes = canonical_json_bytes(payload)
             cost = _cost(
                 started_ns,
@@ -614,7 +626,7 @@ def _run_data_probe(
             ) from exc
         except TimeoutError as exc:
             raise ProbeExecutionFailure(
-                status=ProbeStatus.TIMED_OUT,
+                status=ProbeStatus.FAILED,
                 actual_cost=_cost(started_ns, runtime.monotonic_ns),
                 failure_code="data_probe_timed_out",
                 summary="data probe timed out",

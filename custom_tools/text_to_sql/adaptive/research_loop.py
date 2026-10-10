@@ -66,6 +66,7 @@ from .models import (
     PhysicalColumnBinding,
     PredicateRef,
     PredicateOperator,
+    QueryProbeRef,
     ResearchAction,
     ResearchActionKind,
     ResearchState,
@@ -171,6 +172,9 @@ _MAX_INVALID_STOP_REJECTIONS_WITHOUT_PROGRESS = 2
 _MAX_REPEATED_MODEL_REJECTIONS_WITHOUT_PROGRESS = 2
 _BINDING_ID_IN_HINT = re.compile(r"\bbinding:[A-Za-z0-9][A-Za-z0-9._:-]*")
 _SOURCE_ID_IN_HINT = re.compile(r"\bsemantic:[A-Za-z0-9][A-Za-z0-9._:-]*")
+_SOURCE_HANDLE_IN_HINT = re.compile(
+    r"(?<![A-Za-z0-9._:-])s[1-9][0-9]*(?![A-Za-z0-9_:-]|\.[A-Za-z0-9_])"
+)
 _QUALIFIED_PHYSICAL_COLUMN_IN_HINT = re.compile(
     r"\b(?:[A-Za-z_][A-Za-z0-9_]*\.){1,2}[A-Za-z_][A-Za-z0-9_]*\b"
 )
@@ -179,6 +183,44 @@ _MISSING_EXACT_PREDICATE_HINT_MARKER = (
     "predicate before semantic_commit or SQL; this is an addition, not a "
     "replacement for an existing CANDIDATE: "
 )
+
+
+def _same_predicate_literal(left: object, right: object) -> bool:
+    if isinstance(left, str) and isinstance(right, str):
+        return left.casefold() == right.casefold()
+    return type(left) is type(right) and left == right
+
+
+def _rejected_preflight_repetition_digest(
+    rejected_assessments: tuple[dict[str, object], ...],
+) -> str | None:
+    """Identify the rejected semantic conflict, not its model JSON spelling."""
+
+    identities = tuple(
+        {
+            key: rejected[key]
+            for key in (
+                "source_id",
+                "source_handle",
+                "rejection_reason",
+                "existing_evidence_id",
+                "existing_evidence_handle",
+                "missing_probe",
+                "missing_exact_predicate_columns",
+            )
+            if key in rejected
+        }
+        for rejected in rejected_assessments
+    )
+    identities = tuple(identity for identity in identities if identity)
+    if not identities:
+        return None
+    unique_identities = {
+        canonical_digest(identity): identity for identity in identities
+    }
+    return canonical_digest(
+        sorted(unique_identities.values(), key=canonical_digest)
+    )
 
 
 def _rejected_preflight_missing_exact_predicates(
@@ -212,7 +254,9 @@ def _rejected_preflight_missing_exact_predicates(
                 and binding.discriminator_column.column.casefold()
                 == column.casefold()
                 and binding.discriminator_predicate.operator is PredicateOperator.EQ
-                and binding.discriminator_predicate.right == literal
+                and _same_predicate_literal(
+                    binding.discriminator_predicate.right, literal
+                )
                 for binding in state.bindings
             ):
                 continue
@@ -232,10 +276,54 @@ def _validated_stop_review_hint(
 ) -> str:
     """Do not let an advisory hint override durable identifiers."""
 
-    durable_binding_ids = {binding.binding_id for binding in state.bindings}
-    durable_source_ids = {
-        item.source_id for item in state.query_spec.semantic_items
+    semantic_items = tuple(
+        sorted(state.query_spec.semantic_items, key=lambda item: item.source_id)
+    )
+    source_ids_by_handle = {
+        f"s{index}": item.source_id
+        for index, item in enumerate(semantic_items, 1)
     }
+    source_handle_matches = tuple(_SOURCE_HANDLE_IN_HINT.finditer(hint))
+    has_unknown_source_handle = any(
+        match.group(0) not in source_ids_by_handle
+        for match in source_handle_matches
+    )
+    hint = _SOURCE_HANDLE_IN_HINT.sub(
+        lambda match: source_ids_by_handle.get(
+            match.group(0),
+            "the exact durable source_id for the affected semantic item",
+        ),
+        hint,
+    )
+    durable_binding_ids = {binding.binding_id for binding in state.bindings}
+    durable_source_ids = {item.source_id for item in semantic_items}
+    unresolved_required_source_ids = {
+        item.source_id
+        for item in semantic_items
+        if item.required and item.status is not SemanticItemStatus.RESOLVED
+    }
+    referenced_source_ids = {
+        match.group(0)
+        for match in _SOURCE_ID_IN_HINT.finditer(hint)
+        if match.group(0) in durable_source_ids
+    }
+    if (
+        unresolved_required_source_ids
+        and (
+            (
+                referenced_source_ids
+                and referenced_source_ids.isdisjoint(
+                    unresolved_required_source_ids
+                )
+            )
+            or (has_unknown_source_handle and not referenced_source_ids)
+        )
+    ):
+        hint = (
+            "Continue ordinary research for unresolved required semantic source_ids: "
+            + ", ".join(sorted(unresolved_required_source_ids))
+            + "."
+        )
 
     def replace_unknown_binding(match: re.Match[str]) -> str:
         candidate = match.group(0)
@@ -374,11 +462,49 @@ def _validated_stop_review_hint(
         "for these existing CANDIDATE bindings, citing only their listed durable "
         f"evidence_ids: {json.dumps(candidate_bindings, ensure_ascii=False, separators=(',', ':'))}. "
         "Then semantic_commit with those assessments; never use an empty semantic_commit. "
-        "do not create a replacement binding."
+        "Do not create a duplicate binding; create a replacement only when fresh "
+        "trusted evidence contradicts the candidate's requested meaning or join role."
     )
     if auto_assessment_block in validated_hint:
         return validated_hint
     return f"{validated_hint}{auto_assessment_block}"
+
+
+def _model_facing_stop_review_hint(hint: str, state: ResearchState) -> str:
+    """Replace durable source, evidence, and join IDs with model-facing handles."""
+
+    replacements = {
+        **{
+            item.source_id: f"s{index}"
+            for index, item in enumerate(
+                sorted(state.query_spec.semantic_items, key=lambda item: item.source_id),
+                1,
+            )
+        },
+        **{
+            record.evidence_id: f"e{index}"
+            for index, record in enumerate(
+                sorted(state.evidence, key=lambda record: record.evidence_id),
+                1,
+            )
+        },
+        **{
+            join.join_id: f"j{index}"
+            for index, join in enumerate(
+                sorted(state.join_candidates, key=lambda join: join.join_id),
+                1,
+            )
+        },
+    }
+    if not replacements:
+        return hint
+    identifier_pattern = re.compile(
+        "|".join(re.escape(identifier) for identifier in sorted(replacements, key=len, reverse=True))
+    )
+    return identifier_pattern.sub(
+        lambda match: replacements[match.group(0)],
+        hint,
+    )
 
 
 def _auto_binding_assessment_hint_is_closed(
@@ -394,7 +520,9 @@ def _auto_binding_assessment_hint_is_closed(
     )
     suffix = (
         ". Then semantic_commit with those assessments; never use an empty "
-        "semantic_commit. do not create a replacement binding."
+        "semantic_commit. Do not create a duplicate binding; create a replacement "
+        "only when fresh trusted evidence contradicts the candidate's requested "
+        "meaning or join role."
     )
     prefix, separator, serialized_candidates = hint.partition(marker)
     if not prefix or not separator or not serialized_candidates.endswith(suffix):
@@ -549,7 +677,7 @@ class _ResearchLoopCoordinator:
             try:
                 key = self._action_checkpoint_key(state)
                 snapshot = self._checkpoint_store.get_snapshot(key)
-            except AdaptiveCheckpointError:
+            except (AdaptiveCheckpointError, AdaptiveResearchStateStoreError):
                 return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
             recover_planned = snapshot.planned is not None
             if snapshot.terminal is not None:
@@ -557,15 +685,16 @@ class _ResearchLoopCoordinator:
                     terminal = _terminal_envelope(snapshot.terminal.action, state)
                 except (TypeError, ValidationError, ValueError):
                     return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
-                continue_unbound_formula = (
-                    self._semantic_repair_continuation
-                    and terminal["reason"] == ResearchStopReason.COMPLETE.value
-                    and _has_pending_required_formula_continuation(
-                        state,
-                        self._freshness_context,
-                        self._exact_formula_documents,
+                try:
+                    continue_unbound_formula = (
+                        self._semantic_repair_continuation
+                        and terminal["reason"] == ResearchStopReason.COMPLETE.value
+                        and self._has_pending_required_formula_continuation(state)
                     )
-                )
+                except AdaptiveResearchStateStoreError:
+                    return self._outcome(
+                        state, ResearchStopReason.PROTOCOL_FAILURE
+                    )
                 if continue_unbound_formula:
                     snapshot = replace(snapshot, terminal=None)
                 else:
@@ -695,23 +824,36 @@ class _ResearchLoopCoordinator:
                     affected_source_ids=terminal_authority.affected_source_ids,
                 )
             if terminal_reason is ResearchStopReason.COMPLETE:
-                pending_formula_continuation = (
-                    self._semantic_repair_continuation
-                    and (
-                        _has_pending_required_formula_continuation(
-                            state,
-                            self._freshness_context,
-                            self._exact_formula_documents,
+                try:
+                    pending_formula_continuation = (
+                        _has_unbound_latest_probe_evidence(state)
+                        or (
+                            self._semantic_repair_continuation
+                            and self._has_pending_required_formula_continuation(state)
                         )
-                        or _has_unbound_latest_probe_evidence(state)
                     )
-                )
+                except AdaptiveResearchStateStoreError:
+                    return self._stop(
+                        state, ResearchStopReason.PROTOCOL_FAILURE
+                    )
                 selected_binding_ids = {
                     binding_id
                     for item in state.query_spec.semantic_items
                     if item.required
                     for binding_id in item.binding_ids
                 }
+                required_source_ids = {
+                    item.source_id
+                    for item in state.query_spec.semantic_items
+                    if item.required
+                }
+                selected_binding_ids.update(
+                    binding.binding_id
+                    for binding in state.bindings
+                    if isinstance(binding, DiscriminatorValueBinding)
+                    and binding.source_id in required_source_ids
+                    and binding.status is BindingStatus.CANDIDATE
+                )
                 if not pending_formula_continuation and not any(
                     binding.status is BindingStatus.CANDIDATE
                     and binding.binding_id in selected_binding_ids
@@ -723,12 +865,14 @@ class _ResearchLoopCoordinator:
                         freshness_context=terminal_freshness_context,
                     )
             if _consecutive_non_novel(self._checkpoint_store, state) >= 2:
-                if self._stop_review_used_for_non_novel_streak(state):
-                    if not self._stop_review_follow_up_decision_allowed(state):
-                        return self._stop(state, ResearchStopReason.STAGNATED)
-                    self._pending_stop_review_hint = None
-                    self._last_stop_review_hint = None
-                elif self._pending_stop_review_hint is None:
+                review_used = self._stop_review_used_for_non_novel_streak(state)
+                follow_up_allowed = (
+                    review_used
+                    and self._stop_review_follow_up_decision_allowed(state)
+                )
+                if review_used and not follow_up_allowed:
+                    return self._stop(state, ResearchStopReason.STAGNATED)
+                if not review_used and self._pending_stop_review_hint is None:
                     generation_authority = None
                     if (
                         not terminal_authority.allowed
@@ -813,7 +957,11 @@ class _ResearchLoopCoordinator:
                     state,
                     resolved,
                     None,
-                    _is_semantically_novel_turn(state, committed),
+                    _is_semantically_novel_turn(
+                        state,
+                        committed,
+                        self._exact_formula_predicate_constraints,
+                    ),
                 )
                 if reason is not None:
                     return self._stop(state, reason)
@@ -858,7 +1006,11 @@ class _ResearchLoopCoordinator:
                 state,
                 resolved,
                 probe_result,
-                _is_semantically_novel_turn(state, committed),
+                _is_semantically_novel_turn(
+                    state,
+                    committed,
+                    self._exact_formula_predicate_constraints,
+                ),
             )
             if reason is not None:
                 return self._stop(state, reason)
@@ -939,6 +1091,8 @@ class _ResearchLoopCoordinator:
                     exact_source_ids.intersection(authority.affected_source_ids),
                 )
             )
+            if not authority.affected_source_ids:
+                rejected_preflight_assessments = ()
         last_unresolvable_decision_digest: str | None = None
         invalid_stop_generation_authority: (
             tuple[CoverageInputErrorCode, tuple[str, ...]] | None
@@ -980,6 +1134,7 @@ class _ResearchLoopCoordinator:
         ) -> bool:
             nonlocal consecutive_rejections, last_rejection_identity
             nonlocal rejected_without_progress, validation_feedbacks
+            previous_rejection_identity = last_rejection_identity
             logger.warning(
                 "typed_schema_research_decision retry=true "
                 "code=%s rejection_path=%s",
@@ -1014,10 +1169,17 @@ class _ResearchLoopCoordinator:
                 consecutive_rejections
                 >= _MAX_REPEATED_MODEL_REJECTIONS_WITHOUT_PROGRESS
             )
+            mixed_corrective_rejection = bool(
+                previous_rejection_identity is not None
+                and previous_rejection_identity[0] == "duplicate_action"
+                and rejection_path == "unresolvable_preflight"
+                and rejected_preflight_assessments
+            )
             if (
                 rejected_without_progress < _MAX_MODEL_REJECTIONS_WITHOUT_PROGRESS
                 and not repeated_invalid_stop
                 and not repeated_rejection
+                and not mixed_corrective_rejection
             ):
                 return False
             self._model_stagnation_signatures = tuple(sorted(rejection_signatures))
@@ -1065,9 +1227,16 @@ class _ResearchLoopCoordinator:
             if not isinstance(context, str):
                 return None, ResearchStopReason.PROTOCOL_FAILURE, None
             if stop_review_hint is not None:
+                model_facing_hint = _model_facing_stop_review_hint(
+                    stop_review_hint,
+                    state,
+                )
                 context += (
-                    "\n\nIndependent stop review allows one normal research turn. "
-                    f"Its non-authoritative hint is: {stop_review_hint}"
+                    "\n\nIndependent stop review allows at most two normal research "
+                    "decisions. Reuse relevant durable facts already in the context, avoid "
+                    "reinspecting loaded schema unless a required detail is absent, and reach "
+                    "proposals or a justified stop within this window. "
+                    f"Its non-authoritative hint is: {model_facing_hint}"
                 )
             if (
                 exact_physical_predicate_continuation_hint is not None
@@ -1181,6 +1350,10 @@ class _ResearchLoopCoordinator:
                         attempt,
                     )
                     if stop_review_hint is not None:
+                        rejected_without_progress = 0
+                        rejection_counts.clear()
+                        last_rejection_identity = None
+                        consecutive_rejections = 0
                         continue
                     return None, ResearchStopReason.STAGNATED, None
                 continue
@@ -1400,8 +1573,13 @@ class _ResearchLoopCoordinator:
                         if rejected_action is not None:
                             rejected_duplicate_actions += (rejected_action,)
                         if preflight_feedback == "UNRESOLVABLE_PREFLIGHT":
-                            decision_digest = canonical_digest(
-                                captured.model_dump(mode="json", by_alias=True)
+                            decision_digest = (
+                                _rejected_preflight_repetition_digest(
+                                    rejected_assessments
+                                )
+                                or canonical_digest(
+                                    captured.model_dump(mode="json", by_alias=True)
+                                )
                             )
                             if decision_digest == last_unresolvable_decision_digest:
                                 repeated_feedback = (
@@ -1480,6 +1658,7 @@ class _ResearchLoopCoordinator:
                                 ResearchStopReason.STAGNATED,
                                 context,
                                 attempt,
+                                allow_same_revision_recheck=True,
                             )
                             if stop_review_hint is not None:
                                 continue
@@ -1528,10 +1707,21 @@ class _ResearchLoopCoordinator:
         reason: ResearchStopReason,
         context: str,
         attempt: int,
+        *,
+        allow_same_revision_recheck: bool = False,
     ) -> tuple[str | None, int]:
-        if self._stop_review_used_for_revision(
-            state
-        ) or not self._model_budget_supports(2):
+        review_prefix = f"research-stop-review-{state.revision}-"
+        same_revision_review_count = sum(
+            record.reservation.call_id.startswith(review_prefix)
+            for record in self._budget_ledger.load_model_records(
+                state.run_id, state.run_incarnation
+            )
+        )
+        allowed_review_count = 2 if allow_same_revision_recheck else 1
+        if (
+            same_revision_review_count >= allowed_review_count
+            or not self._model_budget_supports(2)
+        ):
             return None, attempt
         captured = None
         limits = self._policy.model_budget
@@ -1595,6 +1785,23 @@ class _ResearchLoopCoordinator:
             if isinstance(context_payload, dict)
             else None
         )
+        rejected_evidence_hint = (
+            "Correct every rejected proposal using its supplied "
+            "existing_evidence_handle and rejection_reason. Keep the correction "
+            "limited to the rejected proposal; do not select a different physical "
+            "candidate or repeat a probe."
+            if isinstance(rejected_preflight_items, list)
+            and any(
+                isinstance(item, dict)
+                and isinstance(
+                    item.get("existing_evidence_handle")
+                    or item.get("existing_evidence_id"),
+                    str,
+                )
+                for item in rejected_preflight_items
+            )
+            else None
+        )
         missing_exact_predicates = _rejected_preflight_missing_exact_predicates(
             tuple(
                 item
@@ -1629,14 +1836,26 @@ class _ResearchLoopCoordinator:
                         not in exact_formula_mismatching_candidate_ids
                     )
                 )
-        additional_assessment_binding_ids = (
-            ()
-            if relationship_continuation_priority
-            else tuple(
-                sorted(
-                    set(exact_formula_candidate_binding_ids)
-                    | set(authority_candidate_binding_ids)
+        relationship_assessment_binding_ids = tuple(
+            binding.binding_id
+            for binding in state.bindings
+            if binding.binding_id in authority_candidate_binding_ids
+            and binding.join_path
+            and all(
+                any(
+                    join.status is JoinCandidateStatus.VALIDATED
+                    and edge in join.path
+                    for join in state.join_candidates
                 )
+                for edge in binding.join_path
+            )
+        )
+        additional_assessment_binding_ids = tuple(
+            sorted(
+                set(relationship_assessment_binding_ids)
+                if relationship_continuation_priority
+                else set(exact_formula_candidate_binding_ids)
+                | set(authority_candidate_binding_ids)
             )
         )
         if self._last_stop_review_hint is not None and _auto_binding_assessment_hint_is_closed(
@@ -1726,6 +1945,17 @@ class _ResearchLoopCoordinator:
         if captured is None:
             return None, attempt + 1
         if captured.decision == "stop_confirmed":
+            if rejected_evidence_hint is not None:
+                return (
+                    _validated_stop_review_hint(
+                        rejected_evidence_hint,
+                        state,
+                        additional_assessment_binding_ids,
+                        self._loaded_schema,
+                        missing_exact_predicates,
+                    ),
+                    attempt + 1,
+                )
             prior_hint = self._last_stop_review_hint
             unresolved_source_ids = {
                 item.source_id
@@ -1791,11 +2021,38 @@ class _ResearchLoopCoordinator:
                         ),
                         attempt + 1,
                     )
+            if authority_affected_source_ids:
+                return (
+                    _validated_stop_review_hint(
+                        "Continue ordinary research for generation-authority "
+                        "affected semantic source_ids: "
+                        + ", ".join(authority_affected_source_ids)
+                        + ". Make one valid typed corrective decision from current "
+                        "durable state; do not stop while these source_ids remain "
+                        "affected.",
+                        state,
+                        additional_assessment_binding_ids,
+                        self._loaded_schema,
+                        missing_exact_predicates,
+                    ),
+                    attempt + 1,
+                )
             return None, attempt + 1
         mismatch_source_ids = _mismatching_external_exact_formula_candidate_source_ids(
             state,
             self._exact_formula_documents,
             self._loaded_schema,
+        )
+        relationship_override = (
+            "Complete only the required relationship continuation from current "
+            "durable state. If the required join is already VALIDATED, submit only a "
+            "replacement new_binding for the affected source that references that "
+            "join. Otherwise, if durable evidence for the missing relationship exists, "
+            "submit exactly one new_join and a replacement new_binding that references "
+            "it in the same semantic_commit. Otherwise inspect that relationship. Do "
+            "not reassess unrelated bindings."
+            if relationship_continuation_priority
+            else None
         )
         exact_formula_override = None
         exact_physical_predicate_override = None
@@ -1854,8 +2111,10 @@ class _ResearchLoopCoordinator:
                         )
                     )
         hint = _validated_stop_review_hint(
-            exact_formula_override
+            rejected_evidence_hint
+            or exact_formula_override
             or exact_physical_predicate_override
+            or relationship_override
             or captured.hint,
             state,
             additional_assessment_binding_ids,
@@ -1907,15 +2166,25 @@ class _ResearchLoopCoordinator:
         return bool(review_revisions)
 
     def _stop_review_follow_up_decision_allowed(self, state: ResearchState) -> bool:
-        if state.revision == 0:
-            return False
-        review_revision = state.revision - 1
-        if not any(
-            _stop_review_call_revision(record.reservation.call_id) == review_revision
+        review_revisions = {
+            revision
             for record in self._budget_ledger.load_model_records(
                 state.run_id, state.run_incarnation
             )
-        ):
+            if record.result is not None and record.reconciliation is not None
+            if (
+                revision := _stop_review_call_revision(
+                    record.reservation.call_id
+                )
+            )
+            is not None
+        }
+        if state.revision in review_revisions:
+            return True
+        if state.revision == 0:
+            return False
+        review_revision = state.revision - 1
+        if review_revision not in review_revisions:
             return False
         try:
             observed = self._checkpoint_store.get_snapshot(
@@ -1946,6 +2215,29 @@ class _ResearchLoopCoordinator:
         if replay_input is None or not _replay_input_has_failed_probe(replay_input):
             return None
         return "PROBE_UNAVAILABLE"
+
+    def _has_pending_required_formula_continuation(
+        self, state: ResearchState
+    ) -> bool:
+        if _has_pending_required_formula_continuation(
+            state,
+            self._freshness_context,
+            self._exact_formula_documents,
+        ):
+            return True
+        if state.revision == 0:
+            return False
+        replay_input = self._state_store.load_research_replay_input(
+            state.run_id,
+            state.run_incarnation,
+            state.revision,
+        )
+        return bool(
+            replay_input is not None
+            and _latest_formula_candidate_source_ids(
+                state, replay_input.decision
+            )
+        )
 
     async def _wait_for_model_follower(self, seconds: float) -> None:
         reason = self._boundary_reason()
@@ -2013,45 +2305,7 @@ class _ResearchLoopCoordinator:
         )
         if type(table_namespace) is not str:
             table_namespace = None
-        aggregate_operand_mismatch = _has_exact_aggregate_operand_mismatch(
-            state, decision, self._exact_formula_documents, self._loaded_schema
-        )
         resolved: ResolvedResearchDecision | None = None
-        if aggregate_operand_mismatch:
-            try:
-                resolved = self._resolve_current_decision(state, decision)
-            except (
-                ResearchTransitionConflictError,
-                ResearchTransitionProtocolError,
-                UnresolvableModelDecisionError,
-                DuplicateResearchActionError,
-                DecisionResolverError,
-                ValidationError,
-                ValueError,
-                TypeError,
-            ):
-                resolved = None
-            if resolved is None or not _has_same_batch_confirmed_differently_named_aggregate_input(
-                state,
-                decision,
-                resolved,
-                self._exact_formula_documents,
-                self._loaded_schema,
-            ):
-                return (
-                    "UNRESOLVABLE_PREFLIGHT",
-                    None,
-                    None,
-                    _rejected_preflight_assessment_context(
-                        state,
-                        decision,
-                        self._freshness_context,
-                        self._preflight_requested_action(state, decision),
-                        loaded_schema=self._loaded_schema,
-                        exact_formula_documents=self._exact_formula_documents,
-                        table_namespace=table_namespace,
-                    ),
-                )
         if _has_exact_formula_predicate_mismatch(
             state, decision, self._exact_formula_predicate_constraints
         ):
@@ -2081,7 +2335,11 @@ class _ResearchLoopCoordinator:
                     if isinstance(decision.next, SemanticCommitRequest)
                     else {}
                 )
-                if missing_predicates:
+                if missing_predicates and not _decision_advances_missing_exact_formula_predicate(
+                    state,
+                    decision,
+                    self._exact_formula_predicate_constraints,
+                ):
                     return (
                         "UNRESOLVABLE_PREFLIGHT",
                         None,
@@ -2097,7 +2355,10 @@ class _ResearchLoopCoordinator:
                             table_namespace=table_namespace,
                         ),
                     )
-        except (ResearchTransitionConflictError, ResearchTransitionProtocolError):
+        except (
+            ResearchTransitionConflictError,
+            ResearchTransitionProtocolError,
+        ) as error:
             return (
                 "UNRESOLVABLE_PREFLIGHT",
                 None,
@@ -2110,6 +2371,7 @@ class _ResearchLoopCoordinator:
                     loaded_schema=self._loaded_schema,
                     exact_formula_documents=self._exact_formula_documents,
                     table_namespace=table_namespace,
+                    fallback_rejection_reason=str(error),
                 ),
             )
         except UnresolvableModelDecisionError as error:
@@ -2132,6 +2394,12 @@ class _ResearchLoopCoordinator:
                 loaded_schema=self._loaded_schema,
                 exact_formula_documents=self._exact_formula_documents,
                 table_namespace=table_namespace,
+                fallback_rejection_reason=(
+                    str(error.__cause__)
+                    if isinstance(error.__cause__, SemanticReducerError)
+                    and not partial_selected_candidate_commit_gaps
+                    else None
+                ),
             )
             if partial_selected_candidate_commit_gaps:
                 rejected = _with_partial_selected_candidate_commit_feedback(
@@ -2253,7 +2521,12 @@ class _ResearchLoopCoordinator:
                 action=_planned_action(resolved),
                 semantic_repair_continuation=self._semantic_repair_continuation,
             )
-        except (AdaptiveCheckpointError, TypeError, ValueError) as error:
+        except (
+            AdaptiveCheckpointError,
+            AdaptiveResearchStateStoreError,
+            TypeError,
+            ValueError,
+        ) as error:
             logger.warning(
                 "typed_schema_research_decision retry=false "
                 "code=CHECKPOINT_PLAN_WRITE error_class=%s",
@@ -2366,7 +2639,12 @@ class _ResearchLoopCoordinator:
             self._checkpoint_store.record_observed(
                 key, expected_revision=key.revision, action=action
             )
-        except (AdaptiveCheckpointError, TypeError, ValueError):
+        except (
+            AdaptiveCheckpointError,
+            AdaptiveResearchStateStoreError,
+            TypeError,
+            ValueError,
+        ):
             return ResearchStopReason.PROTOCOL_FAILURE
         return None
 
@@ -2444,22 +2722,30 @@ class _ResearchLoopCoordinator:
             )
         except (BudgetAdmissionError, TypeError, ValueError):
             return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
-        affected = (
-            _affected_source_ids(state)
-            if affected_source_ids is None
-            else affected_source_ids
+        affected = tuple(
+            sorted(
+                _affected_source_ids(state)
+                if affected_source_ids is None
+                else affected_source_ids
+            )
         )
-        citations = (
-            tuple(sorted(item.evidence_id for item in state.evidence))
-            if citation_evidence_ids is None
-            else citation_evidence_ids
+        citations = tuple(
+            sorted(
+                (item.evidence_id for item in state.evidence)
+                if citation_evidence_ids is None
+                else citation_evidence_ids
+            )
         )
+        if ambiguity is not None:
+            ambiguity = ambiguity.model_copy(
+                update={"citation_evidence_ids": citations}
+            )
         if (reason is ResearchStopReason.AMBIGUOUS) != (ambiguity is not None):
             reason = ResearchStopReason.PROTOCOL_FAILURE
             ambiguity = None
         try:
             key = self._terminal_checkpoint_key(state)
-        except AdaptiveCheckpointError:
+        except (AdaptiveCheckpointError, AdaptiveResearchStateStoreError):
             return self._outcome(state, ResearchStopReason.PROTOCOL_FAILURE)
         terminal = {
             "affected_source_ids": list(affected),
@@ -2490,11 +2776,7 @@ class _ResearchLoopCoordinator:
                     self._semantic_repair_continuation
                     and stored_terminal["reason"]
                     == ResearchStopReason.COMPLETE.value
-                    and _has_pending_required_formula_continuation(
-                        state,
-                        self._freshness_context,
-                        self._exact_formula_documents,
-                    )
+                    and self._has_pending_required_formula_continuation(state)
                 )
                 if not continue_unbound_formula:
                     stored_freshness_context = (
@@ -2542,6 +2824,7 @@ class _ResearchLoopCoordinator:
         except (
             AdaptiveCheckpointCasError,
             AdaptiveCheckpointError,
+            AdaptiveResearchStateStoreError,
             TypeError,
             ValueError,
         ):
@@ -2569,11 +2852,7 @@ class _ResearchLoopCoordinator:
             terminal = _terminal_envelope(snapshot.terminal.action, state)
             if not (
                 terminal["reason"] == ResearchStopReason.COMPLETE.value
-                and _has_pending_required_formula_continuation(
-                    state,
-                    self._freshness_context,
-                    self._exact_formula_documents,
-                )
+                and self._has_pending_required_formula_continuation(state)
             ):
                 return key
             return replace(key, revision=key.revision + 1)
@@ -2592,11 +2871,7 @@ class _ResearchLoopCoordinator:
             return key
         terminal = _terminal_envelope(snapshot.terminal.action, state)
         if terminal["reason"] != ResearchStopReason.COMPLETE.value or not (
-            _has_pending_required_formula_continuation(
-                state,
-                self._freshness_context,
-                self._exact_formula_documents,
-            )
+            self._has_pending_required_formula_continuation(state)
         ):
             return key
         return replace(key, revision=key.revision + 1)
@@ -2724,6 +2999,30 @@ async def run_research_loop(
         return coordinator._stop(  # noqa: SLF001 - closed cancellation result
             coordinator._latest_state, ResearchStopReason.CANCELLED
         )
+
+
+def _latest_formula_candidate_source_ids(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+) -> tuple[str, ...]:
+    required_formula_sources = {
+        item.source_id
+        for item in state.query_spec.semantic_items
+        if item.required and item.kind is SemanticItemKind.FORMULA
+    }
+    candidate_sources = {
+        binding.source_id
+        for binding in state.bindings
+        if binding.status is BindingStatus.CANDIDATE
+    }
+    proposed_sources = {
+        proposal.source_id
+        for proposal in decision.proposals
+        if isinstance(proposal, NewBindingProposal)
+    }
+    return tuple(
+        sorted(required_formula_sources & candidate_sources & proposed_sources)
+    )
 
 
 def _has_pending_required_formula_continuation(
@@ -2945,7 +3244,10 @@ def _rejected_external_exact_formula_missing_operands(
                 for column, literal in predicate_constraints.get(
                     proposal.source_id, ()
                 )
-                if literal == proposal.candidate.discriminator_predicate.right
+                if _same_predicate_literal(
+                    literal,
+                    proposal.candidate.discriminator_predicate.right,
+                )
             ]
             if (
                 constraint
@@ -2975,7 +3277,9 @@ def _rejected_external_exact_formula_missing_operands(
             constraint = [
                 column
                 for column, literal in predicate_constraints.get(binding.source_id, ())
-                if literal == binding.discriminator_predicate.right
+                if _same_predicate_literal(
+                    literal, binding.discriminator_predicate.right
+                )
             ]
             if (
                 binding.status is BindingStatus.CANDIDATE
@@ -3104,6 +3408,13 @@ def _unresolved_exact_physical_predicate_stop_review_hint(
         "same physical column and operator and obtain its exact search_value "
         "certificate. An unbound semantic phrase does not select a physical "
         "table or column; physical candidates must come from schema or evidence. "
+        "Once the existing profile rules select one physical candidate and only "
+        "the exact literal certificate remains missing, first check the completed "
+        "actions. If no completed exact search_value exists for that candidate and "
+        "literal, return exactly one search_value tool request for them and do not "
+        "repeat a composed execute_research_probe. If a completed exact "
+        "search_value already exists, do not repeat it; follow the existing "
+        "stored-spelling recovery rules when its result was empty. "
         "If durable evidence already confirms the physical column from schema or "
         "evidence, operator, literal, and any required relationship path, create "
         "the corresponding typed binding citing only that evidence, then "
@@ -3201,10 +3512,6 @@ def _external_exact_formula_stop_review_hint(
     missing_predicates = {
         column for columns in predicate_names_by_source.values() for column in columns
     }
-    missing_operands_by_source = {
-        source_id: columns - predicate_names_by_source.get(source_id, set())
-        for source_id, columns in missing_by_source.items()
-    }
     if not formulas:
         predicates = tuple(
             (column, literal)
@@ -3219,46 +3526,7 @@ def _external_exact_formula_stop_review_hint(
             + ". Missing exact predicate column: " + names
             + ". Verify ordinary schema evidence only; do not semantic_commit or generate SQL."
         )
-    if isinstance(loaded_schema, LoadedSchema):
-        documents_by_source = dict(exact_formula_documents)
-        items_by_source = {item.source_id: item for item in state.query_spec.semantic_items}
-        schema_names = tuple(
-            column
-            for table in loaded_schema.schema.values()
-            if isinstance(table, Mapping)
-            for column in get_table_columns(table)
-        )
-        for binding in state.bindings:
-            item = items_by_source.get(binding.source_id)
-            if (
-                isinstance(binding, DerivedExpressionBinding)
-                and binding.status is BindingStatus.CANDIDATE
-                and binding.source_id in pending_source_ids
-                and item is not None
-                and binding.document == documents_by_source.get(binding.source_id)
-                and (formula := _formula_part(item.normalized_meaning)) is not None
-                and _formula_part(binding.expression.expression) == formula
-            ):
-                missing_operands_by_source.setdefault(binding.source_id, set()).update(
-                    _missing_exact_aggregate_operand_names(
-                        formula,
-                        schema_names,
-                        tuple(column.column for column in binding.input_columns),
-                    )
-                )
-    missing_operands = {
-        column
-        for source_id, columns in missing_operands_by_source.items()
-        for column in columns - predicate_names_by_source.get(source_id, set())
-    }
     quoted_formulas = "; ".join(f'"{formula}"' for formula in formulas)
-    missing_operand_text = (
-        " Missing same-name aggregate operand: "
-        + ", ".join(sorted(missing_operands))
-        + "."
-        if missing_operands
-        else ""
-    )
     missing_predicate_text = (
         " Missing exact predicate column: "
         + ", ".join(sorted(missing_predicates))
@@ -3269,13 +3537,13 @@ def _external_exact_formula_stop_review_hint(
         else ""
     )
     return (
-        f"Trusted exact formula: {quoted_formulas}.{missing_operand_text}"
+        f"Trusted exact formula: {quoted_formulas}."
         f"{missing_predicate_text} "
         "Direct ordinary research to "
-        "verify and map every explicitly named aggregate operand and predicate "
-        "column with durable schema and relationship evidence. Do not substitute a "
-        "proxy or ID-lookalike, do not semantic_commit the formula before that proof, "
-        "and do not generate SQL. When all required inputs and predicates already "
+        "map formula inputs by their schema meaning and verify exact predicate columns "
+        "with durable schema and relationship evidence. Formula operand labels alone "
+        "do not require same-named physical columns. Do not semantic_commit the formula "
+        "before that proof, and do not generate SQL. When all required inputs and predicates already "
         "have durable evidence, create the document-backed derived_expression "
         "binding for the exact formula and semantic_commit it instead of repeating "
         "the probes."
@@ -4076,7 +4344,9 @@ def _has_exact_formula_predicate_mismatch(
         matching = [
             name
             for name, literal in by_source.get(source_id, ())
-            if literal == getattr(predicate, "right", None)
+            if _same_predicate_literal(
+                literal, getattr(predicate, "right", None)
+            )
         ]
         return bool(
             getattr(predicate, "operator", None) is PredicateOperator.EQ
@@ -4143,7 +4413,9 @@ def _missing_resolved_exact_formula_predicates(
             binding.source_id == source_id
             and binding.discriminator_column.column.casefold() == column.casefold()
             and binding.discriminator_predicate.operator is PredicateOperator.EQ
-            and binding.discriminator_predicate.right == literal
+            and _same_predicate_literal(
+                binding.discriminator_predicate.right, literal
+            )
             for binding in supported
         ):
             continue
@@ -4152,6 +4424,55 @@ def _missing_resolved_exact_formula_predicates(
         source_id: tuple(sorted(columns))
         for source_id, columns in sorted(missing.items())
     }
+
+
+def _decision_advances_missing_exact_formula_predicate(
+    state: ResearchState,
+    decision: ResearchDecisionV1,
+    constraints: tuple[tuple[str, DocumentRef, str, str], ...],
+) -> bool:
+    """Return whether this commit directly advances one missing exact predicate."""
+
+    missing = _missing_resolved_exact_formula_predicates(state, constraints)
+    expected = {
+        (source_id, column.casefold(), literal)
+        for source_id, _document, column, literal in constraints
+        if column in missing.get(source_id, ())
+    }
+    bindings = {binding.binding_id: binding for binding in state.bindings}
+
+    def matches(
+        source_id: str,
+        candidate: DiscriminatorValueCandidate | DiscriminatorValueBinding,
+    ) -> bool:
+        predicate = candidate.discriminator_predicate
+        return predicate.operator is PredicateOperator.EQ and any(
+            expected_source_id == source_id
+            and expected_column == candidate.discriminator_column.column.casefold()
+            and _same_predicate_literal(expected_literal, predicate.right)
+            for expected_source_id, expected_column, expected_literal in expected
+        )
+
+    for proposal in decision.proposals:
+        if (
+            isinstance(proposal, NewBindingProposal)
+            and isinstance(proposal.candidate, DiscriminatorValueCandidate)
+            and matches(proposal.source_id, proposal.candidate)
+        ):
+            return True
+        if (
+            isinstance(proposal, BindingAssessment)
+            and proposal.certificate == "consistent"
+            and isinstance(proposal.subject, ExistingBindingRef)
+            and isinstance(
+                binding := bindings.get(proposal.subject.binding_id),
+                DiscriminatorValueBinding,
+            )
+            and binding.status is BindingStatus.CANDIDATE
+            and matches(binding.source_id, binding)
+        ):
+            return True
+    return False
 
 
 def _normalize_new_join_citation(
@@ -4661,6 +4982,7 @@ def _normalize_existing_binding_assessment_citation(
         proposal.certificate == "consistent"
         and binding.status is BindingStatus.CANDIDATE
         and freshness_context is not None
+        and not set(proposal.citation_evidence_ids) <= durable_evidence_ids
     ):
         if (
             binding.evidence_ids
@@ -4731,6 +5053,9 @@ def _normalize_existing_hypothesis_assessment_citation(
     ):
         return proposal
     durable_evidence_ids = {evidence.evidence_id for evidence in state.evidence}
+    cited_evidence_ids = set(proposal.citation_evidence_ids)
+    if cited_evidence_ids and cited_evidence_ids <= durable_evidence_ids:
+        return proposal
     if not set(hypothesis.evidence_ids) <= durable_evidence_ids:
         return proposal
     if not all(
@@ -4805,6 +5130,7 @@ def _rejected_preflight_assessment_context(
     missing_exact_predicates: Mapping[str, tuple[str, ...]] | None = None,
     exact_formula_documents: tuple[tuple[str, DocumentRef], ...] = (),
     table_namespace: str | None = None,
+    fallback_rejection_reason: str | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Describe rejected proposals and one deterministic missing probe."""
 
@@ -5048,6 +5374,19 @@ def _rejected_preflight_assessment_context(
                 if missing_probe is not None:
                     column, probe = missing_probe
                     candidates.append((column, item, probe))
+            if "rejection_reason" not in item:
+                missing_probe = _missing_new_physical_column_probe(
+                    proposal,
+                    state,
+                    loaded_schema=loaded_schema,
+                    table_namespace=table_namespace,
+                )
+                if missing_probe is not None:
+                    column, probe = missing_probe
+                    item["rejection_reason"] = (
+                        "cited evidence does not observe exact physical column"
+                    )
+                    candidates.append((column, item, probe))
             rejected.append(item)
             continue
         if "rejection_reason" in item:
@@ -5217,6 +5556,10 @@ def _rejected_preflight_assessment_context(
     proposal_feedback = tuple(
         sorted(rejected, key=lambda item: canonical_digest(item["proposal"]))
     )
+    if fallback_rejection_reason is not None:
+        proposal_feedback += (
+            {"batch_rejection_reason": fallback_rejection_reason},
+        )
     return (
         proposal_feedback
         if rejected_tool is None
@@ -5292,6 +5635,7 @@ def _with_partial_selected_candidate_commit_feedback(
             gap_by_binding_id[binding_id] = gap
 
     feedback: list[dict[str, object]] = []
+    reported_binding_ids: set[str] = set()
     for item in rejected:
         proposal = item.get("proposal")
         subject = proposal.get("subject") if isinstance(proposal, dict) else None
@@ -5317,6 +5661,25 @@ def _with_partial_selected_candidate_commit_feedback(
                 "required_binding_assessment_ids": list(
                     getattr(gap, "required_binding_assessment_ids")
                 ),
+                "unassessed_binding_ids": list(
+                    getattr(gap, "unassessed_binding_ids")
+                ),
+            }
+        )
+        reported_binding_ids.update(
+            getattr(gap, "required_binding_assessment_ids")
+        )
+    for gap in gaps:
+        required_ids = getattr(gap, "required_binding_assessment_ids", ())
+        if not isinstance(required_ids, tuple) or set(required_ids) & reported_binding_ids:
+            continue
+        feedback.append(
+            {
+                "rejection_reason": (
+                    "semantic commit leaves selected candidate bindings unassessed"
+                ),
+                "source_id": getattr(gap, "source_id"),
+                "required_binding_assessment_ids": list(required_ids),
                 "unassessed_binding_ids": list(
                     getattr(gap, "unassessed_binding_ids")
                 ),
@@ -6103,7 +6466,11 @@ def _consecutive_non_novel(store: AdaptiveStateStore, state: ResearchState) -> i
 
 
 def _is_semantically_novel_turn(
-    state: ResearchState, committed: SemanticCommitResult
+    state: ResearchState,
+    committed: SemanticCommitResult,
+    exact_formula_predicate_constraints: tuple[
+        tuple[str, DocumentRef, str, str], ...
+    ] = (),
 ) -> bool:
     """Ignore append-only evidence IDs when judging whether research progressed."""
 
@@ -6150,11 +6517,22 @@ def _is_semantically_novel_turn(
             or novelty.stop_reason != state.stop_reason
         ):
             return True
-    return _has_novel_relevant_value_evidence(state, next_state)
+    return (
+        _has_novel_relevant_value_evidence(
+            state,
+            next_state,
+            exact_formula_predicate_constraints,
+        )
+        or _has_novel_execute_probe_evidence(state, next_state)
+    )
 
 
 def _has_novel_relevant_value_evidence(
-    state: ResearchState, next_state: ResearchState
+    state: ResearchState,
+    next_state: ResearchState,
+    exact_formula_predicate_constraints: tuple[
+        tuple[str, DocumentRef, str, str], ...
+    ] = (),
 ) -> bool:
     existing_ids = {record.evidence_id for record in state.evidence}
     added = tuple(
@@ -6214,12 +6592,21 @@ def _has_novel_relevant_value_evidence(
             )
         )
     }
+    trusted_formula_predicate_values = {
+        (column, literal)
+        for source_id, _document, column, literal in exact_formula_predicate_constraints
+        if source_id in state.unresolved_items
+    }
     relevant_columns |= {
         record.target
         for record in added
         if (
             isinstance(record.target, ColumnRef)
-            and record.target.column in unbound_exact_column_names
+            and record.target.column
+            in (
+                unbound_exact_column_names
+                | {column for column, _literal in trusted_formula_predicate_values}
+            )
         )
     }
     for column in relevant_columns:
@@ -6272,7 +6659,10 @@ def _has_novel_relevant_value_evidence(
                         exact_column_name == column.column
                         and type(exact_value) is type(value)
                         and exact_value == value
-                        for exact_column_name, exact_value in unbound_exact_predicate_values
+                        for exact_column_name, exact_value in (
+                            unbound_exact_predicate_values
+                            | trusted_formula_predicate_values
+                        )
                     )
                     and not _has_prior_qualifying_exact_search(
                         state,
@@ -6286,6 +6676,79 @@ def _has_novel_relevant_value_evidence(
             ):
                 return True
     return False
+
+
+def _has_novel_execute_probe_evidence(
+    state: ResearchState, next_state: ResearchState
+) -> bool:
+    if not state.unresolved_items:
+        return False
+    existing_ids = {record.evidence_id for record in state.evidence}
+    existing_results = {
+        result
+        for record in state.evidence
+        if (
+            result := _qualifying_execute_probe_result(
+                state, record, state.action_history
+            )
+        )
+        is not None
+    }
+    return any(
+        result not in existing_results
+        for record in next_state.evidence
+        if record.evidence_id not in existing_ids
+        and (
+            result := _qualifying_execute_probe_result(
+                next_state, record, next_state.action_history
+            )
+        )
+        is not None
+    )
+
+
+def _qualifying_execute_probe_result(
+    state: ResearchState,
+    evidence: EvidenceRecord,
+    action_history: tuple[ResearchAction, ...],
+) -> str | None:
+    if (
+        not isinstance(evidence.target, QueryProbeRef)
+        or not evidence_has_state_authority(evidence, state)
+    ):
+        return None
+    try:
+        observation = parse_probe_observation(evidence.observation)
+    except MalformedProvenanceError:
+        return None
+    if (
+        observation is None
+        or observation.storage != "inline"
+        or observation.provenance.probe_kind is not ResearchActionKind.EXECUTE_PROBE
+        or observation.provenance.action_digest != evidence.action_digest
+        or observation.provenance.target != evidence.target
+        or not isinstance(observation.payload, dict)
+    ):
+        return None
+    columns = observation.payload.get("columns")
+    rows = observation.payload.get("rows")
+    if (
+        not isinstance(columns, list)
+        or not columns
+        or not all(isinstance(column, str) and column for column in columns)
+        or not isinstance(rows, list)
+        or not rows
+        or observation.row_count != len(rows)
+        or not all(isinstance(row, list) and len(row) == len(columns) for row in rows)
+        or not any(
+            action.action_digest == evidence.action_digest
+            and action.kind is ResearchActionKind.EXECUTE_PROBE
+            and action.target == evidence.target
+            for action in action_history
+        )
+    ):
+        return None
+    return canonical_digest({"columns": columns, "rows": rows})
 
 
 def _has_prior_qualifying_exact_search(

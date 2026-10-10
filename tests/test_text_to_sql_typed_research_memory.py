@@ -217,6 +217,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     monkeypatch,
 ) -> None:
     import workflow.text_to_sql_typed_research as typed_research
+    from custom_tools.text_to_sql.schema_memory import SemanticFact
 
     loaded = _loaded_schema()
     monkeypatch.setenv("SCHEMA_MAX_COLUMNS", "1")
@@ -247,6 +248,18 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     captured: dict[str, object] = {}
     final_state = SimpleNamespace(
         schema_namespace_version="sha256:" + loaded.namespace.version_key
+    )
+    valid_semantic_fact = SemanticFact(
+        subject="column",
+        table_fqn="public.revenue",
+        column="amount",
+        fact_kind="example",
+        value="monthly",
+        source="typed_probe",
+        status="approved",
+    )
+    stale_semantic_fact = valid_semantic_fact.model_copy(
+        update={"table_fqn": "public.public.revenue"}
     )
 
     class MemoryManager:
@@ -279,7 +292,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
 
         def find_approved_semantic_facts(self, terms, namespace):
             calls.append(("find_semantic_facts", tuple(terms), namespace))
-            return []
+            return [valid_semantic_fact, stale_semantic_fact]
 
         def save_verified_probe_facts(self, namespace, state):
             calls.append(("save_facts", namespace, state))
@@ -404,7 +417,7 @@ def test_typed_research_indexes_and_searches_loaded_schema_memory_by_namespace(
     assert captured["verified_probe_fact_hints"] == (
         {"probe_kind": "sample_rows", "summary": "recent revenue rows"},
     )
-    assert captured["approved_semantic_fact_hints"] == ()
+    assert captured["approved_semantic_fact_hints"] == (valid_semantic_fact,)
     assert captured["stop_review_model"] is not None
     assert calls[3][2]["schema_info"]["public.revenue"]["columns"]["amount"][
         "examples"
@@ -564,6 +577,29 @@ def test_probe_promotion_rejects_payload_with_non_finite_example_value() -> None
     )
 
     assert facts == ()
+
+
+def test_probe_promotion_does_not_duplicate_equal_namespace_and_schema() -> None:
+    from custom_tools.text_to_sql.schema_memory_sqlite import (
+        _approved_semantic_facts_from_probe_fact,
+    )
+
+    facts = _approved_semantic_facts_from_probe_fact(
+        {
+            "probe_kind": "distinct_values",
+            "target": {
+                "table": {
+                    "namespace": "main",
+                    "schema": "main",
+                    "table": "customers",
+                },
+                "column": "country",
+            },
+            "payload": {"columns": ["country"], "rows": [["CZ"]]},
+        }
+    )
+
+    assert [fact.table_fqn for fact in facts] == ["main.customers"]
 
 
 def test_probe_promotion_rejects_multi_column_payload() -> None:

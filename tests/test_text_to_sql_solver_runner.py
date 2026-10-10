@@ -533,7 +533,9 @@ def test_pre_execution_runner_stops_on_limit_semantic_failure_before_explain(
     assert result.check_results[-1].failure_code is CheckFailureCode.LIMIT_MISMATCH
 
 
-def test_pre_execution_runner_allows_review_repair_to_rebind_literals(monkeypatch):
+def test_pre_execution_runner_does_not_bypass_semantic_failure_for_review_repair(
+    monkeypatch,
+):
     state, research_state, requirements, loaded_schema = _runtime()
     calls: list[str] = []
 
@@ -555,11 +557,11 @@ def test_pre_execution_runner_allows_review_repair_to_rebind_literals(monkeypatc
     def semantic(check_input, *_args):
         calls.append("semantic")
         return CheckResult(
-            check_id=f"semantic:{check_input.candidate.candidate_id}:unauthorized_literal",
+            check_id=f"semantic:{check_input.candidate.candidate_id}:unauthorized_column",
             candidate_id=check_input.candidate.candidate_id,
             check_kind=CheckKind.SEMANTIC,
             status=CheckStatus.FAILED,
-            failure_code=CheckFailureCode.UNAUTHORIZED_LITERAL,
+            failure_code=CheckFailureCode.UNAUTHORIZED_COLUMN,
             affected_source_ids=("status",),
             affected_ast_node_ids=(),
             observed_error=None,
@@ -599,10 +601,9 @@ def test_pre_execution_runner_allows_review_repair_to_rebind_literals(monkeypatc
         result_review_repair=True,
     )
 
-    assert calls == ["semantic", "explain"]
-    assert result.check_results[-2].check_kind is CheckKind.SEMANTIC
-    assert result.check_results[-2].status is CheckStatus.PASSED
-    assert result.check_results[-1].check_kind is CheckKind.EXPLAIN
+    assert calls == ["semantic"]
+    assert result.check_results[-1].check_kind is CheckKind.SEMANTIC
+    assert result.check_results[-1].status is CheckStatus.FAILED
 
 
 def test_pre_execution_runner_rejects_non_boolean_review_repair_flag():
@@ -774,6 +775,7 @@ def test_pre_execution_runner_accepts_generation_authorized_binding_subset(monke
 
     assert tuple(binding.binding_id for binding in requirements.selected_bindings) == (
         physical_binding.binding_id,
+        alias_binding.binding_id,
     )
     assert calls == ["safety", "schema", "explain"]
     assert tuple(item.status for item in result.check_results) == (

@@ -287,12 +287,25 @@ def _exact_formula_predicate_constraints(
         ):
             continue
         formula = _formula_prefix(item.normalized_meaning)
+        matches: list[tuple[re.Match[str], str]] = []
         for fragment in _balanced_aggregate_fragments(formula):
-            match = re.search(
+            aggregate_match = re.search(
                 r"WHERE\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'((?:''|[^'])*)'\s*\)$",
                 fragment,
                 re.I,
             )
+            if aggregate_match is not None:
+                matches.append((aggregate_match, fragment))
+        matches.extend(
+            (match, match.group(0))
+            for match in re.finditer(
+                r"\b[A-Za-z_][A-Za-z0-9_]*\s+WHERE\s*"
+                r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*'((?:''|[^'])*)'(?=\s*[,)])",
+                formula,
+                re.I,
+            )
+        )
+        for match, fragment in matches:
             if match is None or match.group(1).casefold() not in known_columns:
                 continue
             normalized_fragment = _normalize_formula_whitespace(fragment)
@@ -317,7 +330,9 @@ def _exact_formula_predicate_constraints(
                         match.group(2).replace("''", "'"),
                     )
                 )
-    return tuple(sorted(constraints, key=lambda item: (item[0], item[2], item[3])))
+    return tuple(
+        sorted(set(constraints), key=lambda item: (item[0], item[2], item[3]))
+    )
 
 
 def _has_one_root_formula(formula: str) -> bool:
@@ -1219,12 +1234,14 @@ def _with_model_identifier_handles(
     context: dict[str, object],
     state: ResearchState,
 ) -> dict[str, object]:
-    """Replace model-facing source and evidence IDs with deterministic handles."""
+    """Replace model-facing source, evidence, and join IDs with deterministic handles."""
 
     source_ids = tuple(sorted(item.source_id for item in state.query_spec.semantic_items))
     evidence_ids = tuple(sorted(record.evidence_id for record in state.evidence))
+    join_ids = tuple(sorted(join.join_id for join in state.join_candidates))
     source_handles = {value: f"s{index}" for index, value in enumerate(source_ids, 1)}
     evidence_handles = {value: f"e{index}" for index, value in enumerate(evidence_ids, 1)}
+    join_handles = {value: f"j{index}" for index, value in enumerate(join_ids, 1)}
 
     def source_handle(value: object) -> object:
         return source_handles.get(value, "unknown_source_handle")
@@ -1232,9 +1249,16 @@ def _with_model_identifier_handles(
     def evidence_handle(value: object) -> object:
         return evidence_handles.get(value, "unknown_evidence_handle")
 
+    def join_handle(value: object) -> object:
+        return join_handles.get(value, "unknown_join_handle")
+
     replacements = {
         "source_id": ("source_handle", source_handle),
         "source_ids": ("source_handles", source_handle),
+        "requested_output_source_ids": (
+            "requested_output_source_handles",
+            source_handle,
+        ),
         "affected_source_ids": ("affected_source_handles", source_handle),
         "citation_evidence_ids": ("citation_evidence_handles", evidence_handle),
         "evidence_ids": ("evidence_handles", evidence_handle),
@@ -1242,6 +1266,7 @@ def _with_model_identifier_handles(
         "existing_evidence_id": ("existing_evidence_handle", evidence_handle),
         "available_evidence_ids": ("available_evidence_handles", evidence_handle),
         "unresolved_items": ("unresolved_source_handles", source_handle),
+        "join_id": ("join_handle", join_handle),
     }
 
     def replace(value: object) -> object:
@@ -1253,6 +1278,8 @@ def _with_model_identifier_handles(
         for key, item in value.items():
             replacement = replacements.get(key)
             if replacement is None:
+                if key in replaced:
+                    continue
                 replaced[key] = replace(item)
                 continue
             output_key, handler = replacement

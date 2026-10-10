@@ -252,7 +252,6 @@ def test_closed_enums_have_only_the_normative_values() -> None:
         "RESULT_SHAPE_MISMATCH",
         "UNAUTHORIZED_TABLE",
         "UNAUTHORIZED_COLUMN",
-        "UNAUTHORIZED_LITERAL",
         "UNAUTHORIZED_JOIN",
         "EAV_CATALOG_PREDICATE_MISSING",
         "EAV_VALUE_PREDICATE_MISSING",

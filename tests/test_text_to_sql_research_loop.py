@@ -46,6 +46,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     JoinType,
     PhysicalColumnBinding,
     PredicateRef,
+    QueryProbeRef,
     ResearchAction,
     ResearchActionKind,
     QuerySpec,
@@ -57,7 +58,11 @@ from custom_tools.text_to_sql.adaptive.models import (
     TableRef,
     PredicateOperator,
 )
-from custom_tools.text_to_sql.adaptive.replay_inputs import ResearchTerminalReplayInput
+from custom_tools.text_to_sql.adaptive.replay_inputs import (
+    ResearchSemanticReplayInput,
+    ResearchTerminalReplayInput,
+    serialize_replay_input,
+)
 from custom_tools.text_to_sql.adaptive.controller import NormalizedToolResult
 from custom_tools.text_to_sql.adaptive.decision_resolver import DecisionResolverError
 from custom_tools.text_to_sql.adaptive.probes import ProbeStatus, build_probe_result
@@ -97,6 +102,7 @@ from custom_tools.text_to_sql.adaptive.research_loop import (
     _state_with_reconciled_model_budget,
     _stable_planned_identity,
     _terminal_envelope,
+    _with_partial_selected_candidate_commit_feedback,
     run_research_loop,
 )
 from custom_tools.text_to_sql.adaptive.production_research import (
@@ -109,7 +115,10 @@ from custom_tools.text_to_sql.adaptive.schema_research_agent import (
     build_schema_research_prompt,
     load_schema_research_agent_profile,
 )
-from custom_tools.text_to_sql.adaptive.semantic_reducer import commit_semantic_turn
+from custom_tools.text_to_sql.adaptive.semantic_reducer import (
+    TrustedSemanticBatch,
+    commit_semantic_turn,
+)
 from custom_tools.text_to_sql.adaptive.serialization import (
     canonical_digest,
     canonical_json_bytes,
@@ -118,7 +127,10 @@ from custom_tools.text_to_sql.adaptive.serialization import (
 from custom_tools.text_to_sql.adaptive.terminal import research_stop_terminal_result
 from workflow.adaptive_budget_ledger import AdaptiveBudgetLedger
 from workflow.adaptive_budget_ledger import EXECUTION_CLAIM_LEASE_NS
-from workflow.adaptive_research_state_store import AdaptiveResearchStateStore
+from workflow.adaptive_research_state_store import (
+    AdaptiveResearchStateStore,
+    AdaptiveResearchStateStoreError,
+)
 from workflow.adaptive_state_store import (
     AdaptiveCheckpointCasError,
     AdaptiveCheckpointKey,
@@ -1330,6 +1342,212 @@ def test_unselected_formula_candidate_does_not_defer_automatic_complete(tmp_path
         ledger.close()
 
 
+def test_latest_formula_binding_proposal_defers_automatic_complete(tmp_path) -> None:
+    _, namespace = _fixture_schema()
+    initial = _policy_state(namespace)
+    state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
+    supported = state.bindings[0]
+    candidate_column = supported.physical_column.model_copy(
+        update={"column": "pending_value"}
+    )
+    candidate = PhysicalColumnBinding(
+        binding_id="binding-pending",
+        source_id=supported.source_id,
+        tables=(candidate_column.table,),
+        columns=(candidate_column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(state.evidence[0].evidence_id,),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        physical_column=candidate_column,
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (
+                        state.query_spec.semantic_items[0].model_copy(
+                            update={"kind": SemanticItemKind.FORMULA}
+                        ),
+                    )
+                }
+            ),
+            "bindings": (*state.bindings, candidate),
+        }
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:formula-input",
+                    "source_id": supported.source_id,
+                    "candidate": {
+                        "kind": "physical_column",
+                        "physical_column": {
+                            "table": "events",
+                            "column": "pending_value",
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    assert _research_loop_module._latest_formula_candidate_source_ids(
+        state, decision
+    ) == (supported.source_id,)
+
+    replay_input = ResearchSemanticReplayInput(
+        decision=decision,
+        semantic_batch=TrustedSemanticBatch(
+            schema_namespace_version=state.schema_namespace_version,
+            tables=(),
+            columns=(),
+        ),
+        freshness_context=_fixture_freshness(state),
+        tool_claim=None,
+        budget_state=state.budget_state,
+        planned_action_digest="sha256:" + "1" * 64,
+        observed_action_digest="sha256:" + "2" * 64,
+        probe_result=None,
+    )
+    state_store, checkpoint_store, ledger = _open_existing_research_state(
+        tmp_path, initial, state
+    )
+    replay_bytes = serialize_replay_input(replay_input)
+    with sqlite3.connect(tmp_path / "adaptive.sqlite") as connection:
+        connection.execute(
+            """
+            INSERT INTO adaptive_research_replay_inputs (
+                run_id, run_incarnation, successor_contract_name,
+                successor_revision, input_kind, input_version, input_bytes,
+                input_digest, created_at_ns
+            ) VALUES (?, ?, 'research_state', ?, 'research_semantic', 1, ?, ?, ?)
+            """,
+            (
+                state.run_id,
+                state.run_incarnation,
+                state.revision,
+                replay_bytes,
+                "sha256:" + hashlib.sha256(replay_bytes).hexdigest(),
+                1,
+            ),
+        )
+    assert (
+        state_store.load_research_replay_input(
+            state.run_id, state.run_incarnation, state.revision
+        )
+        == replay_input
+    )
+    calls = 0
+
+    async def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps(
+            {
+                "decision_version": 1,
+                "proposals": (),
+                "next": {
+                    "next_kind": "stop",
+                    "reason": "complete",
+                    "source_ids": (),
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            }
+        )
+
+    _seed_prior_model_budget(initial, ledger)
+    outcome = asyncio.run(
+        run_research_loop(
+            initial_state=state,
+            task="research schema",
+            research_context=lambda current, _feedbacks: canonical_digest(current),
+            model=model,
+            model_identity="test/model",
+            adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+            loaded_schema=object(),
+            freshness_context=_fixture_freshness(state),
+            registry=object(),
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=_policy(),
+            semantic_repair_continuation=True,
+        )
+    )
+    try:
+        assert calls == 1, outcome
+        assert outcome.stop_reason is ResearchStopReason.COMPLETE
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_formula_replay_read_failure_stops_as_protocol_failure(
+    tmp_path, monkeypatch
+) -> None:
+    _, namespace = _fixture_schema()
+    initial = _policy_state(namespace)
+    state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
+    state_store, checkpoint_store, ledger = _open_existing_research_state(
+        tmp_path, initial, state
+    )
+
+    original_replay_read = state_store.load_research_replay_input
+    replay_reads = 0
+
+    def fail_replay_read(*args, **kwargs):
+        nonlocal replay_reads
+        replay_reads += 1
+        if replay_reads == 1:
+            return original_replay_read(*args, **kwargs)
+        raise AdaptiveResearchStateStoreError("unreadable replay")
+
+    monkeypatch.setattr(
+        state_store,
+        "load_research_replay_input",
+        fail_replay_read,
+    )
+
+    async def model(_prompt: str) -> str:
+        raise AssertionError("a replay read failure must stop before a model call")
+
+    outcome = asyncio.run(
+        run_research_loop(
+            initial_state=state,
+            task="research schema",
+            research_context=lambda current, _feedbacks: canonical_digest(current),
+            model=model,
+            model_identity="test/model",
+            adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+            loaded_schema=object(),
+            freshness_context=_fixture_freshness(state),
+            registry=object(),
+            state_store=state_store,
+            checkpoint_store=checkpoint_store,
+            budget_ledger=ledger,
+            policy=_policy(),
+            semantic_repair_continuation=True,
+        )
+    )
+    try:
+        assert replay_reads == 2
+        assert outcome.stop_reason is ResearchStopReason.PROTOCOL_FAILURE
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 def test_exact_document_formula_requires_selected_derived_binding_before_complete() -> None:
     _, namespace = _fixture_schema()
     physical_state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
@@ -1772,6 +1990,100 @@ def test_exact_formula_document_matching_preserves_literal_whitespace() -> None:
     assert not _exact_formula_documents(state, (compacted_literal_document,))
 
 
+def test_unassessed_binding_feedback_is_added_without_matching_proposal() -> None:
+    gap = SimpleNamespace(
+        source_id="school-source",
+        required_binding_assessment_ids=("binding-row-role",),
+        unassessed_binding_ids=("binding-row-role",),
+    )
+
+    feedback = _with_partial_selected_candidate_commit_feedback(
+        (
+            {
+                "proposal": {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": "binding-address",
+                    },
+                    "certificate": "consistent",
+                }
+            },
+        ),
+        (gap,),
+    )
+
+    assert feedback[-1]["source_id"] == "school-source"
+    assert feedback[-1]["unassessed_binding_ids"] == ["binding-row-role"]
+
+
+def test_candidate_discriminator_prevents_automatic_complete(tmp_path) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    initial = _policy_state(namespace)
+    state = _supported_state_after_probe(namespace, observed_at=_NOW)
+    physical = state.bindings[0]
+    discriminator_column = ColumnRef(
+        table=physical.physical_column.table,
+        column="rtype",
+    )
+    predicate = PredicateRef(
+        left=discriminator_column,
+        operator=PredicateOperator.EQ,
+        right="school",
+    )
+    discriminator = DiscriminatorValueBinding(
+        binding_id="binding-row-role",
+        source_id=physical.source_id,
+        tables=(discriminator_column.table,),
+        columns=(discriminator_column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=(state.evidence[0].evidence_id,),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=discriminator_column,
+        discriminator_predicate=predicate,
+    )
+    state = state.model_copy(update={"bindings": (*state.bindings, discriminator)})
+    calls = 0
+
+    async def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("stop after proving the model was called")
+
+    state_store, checkpoint_store, ledger = _open_existing_research_state(
+        tmp_path, initial, state
+    )
+    try:
+        outcome = asyncio.run(
+            run_research_loop(
+                initial_state=state,
+                task="research schema",
+                research_context=lambda current, _feedbacks: canonical_digest(current),
+                model=model,
+                model_identity="test/model",
+                adapter=SchemaResearchDecisionAdapter(
+                    load_schema_research_agent_profile()
+                ),
+                loaded_schema=loaded_schema,
+                freshness_context=_freshness(state),
+                registry=_make_registry(namespace),
+                state_store=state_store,
+                checkpoint_store=checkpoint_store,
+                budget_ledger=ledger,
+                policy=_policy(),
+            )
+        )
+        assert calls == 1, outcome
+        assert outcome.stop_reason is ResearchStopReason.PROTOCOL_FAILURE
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 @pytest.mark.parametrize(
     ("formula", "is_exact"),
     (
@@ -1895,13 +2207,18 @@ def test_document_formula_predicate_constraint_skips_logical_formula_predicates(
     )
 
 
-def test_document_exact_formula_constrains_predicate_without_nlu_physical_flag() -> None:
+@pytest.mark.parametrize(
+    "formula",
+    (
+        "SUBTRACT(COUNT(record_id WHERE canonical_label = 'target'), COUNT(record_id))",
+        "SUBTRACT(amount WHERE canonical_label = 'target', amount)",
+    ),
+)
+def test_document_exact_formula_constrains_predicate_without_nlu_physical_flag(
+    formula: str,
+) -> None:
     loaded_schema, namespace = _fixture_schema()
     state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
-    formula = (
-        "SUBTRACT(COUNT(record_id WHERE canonical_label = 'target'), "
-        "COUNT(record_id))"
-    )
     item = state.query_spec.semantic_items[0].model_copy(
         update={
             "kind": SemanticItemKind.FORMULA,
@@ -2581,7 +2898,10 @@ def test_formula_candidate_continuation_assesses_detached_input(tmp_path) -> Non
         ledger.close()
 
 
-def test_formula_continuation_consumes_latest_unbound_probe_evidence(tmp_path) -> None:
+@pytest.mark.parametrize("semantic_repair_continuation", (False, True))
+def test_formula_continuation_consumes_latest_unbound_probe_evidence(
+    tmp_path, semantic_repair_continuation
+) -> None:
     loaded_schema, namespace = _fixture_schema()
     initial = _policy_state(namespace)
     supported_state = _supported_state_after_probe(
@@ -2704,7 +3024,7 @@ def test_formula_continuation_consumes_latest_unbound_probe_evidence(tmp_path) -
             checkpoint_store=checkpoint_store,
             budget_ledger=ledger,
             policy=_policy(),
-            semantic_repair_continuation=True,
+            semantic_repair_continuation=semantic_repair_continuation,
         )
     )
     try:
@@ -2731,7 +3051,7 @@ def test_formula_continuation_consumes_latest_unbound_probe_evidence(tmp_path) -
                 checkpoint_store=checkpoint_store,
                 budget_ledger=ledger,
                 policy=_policy(),
-                semantic_repair_continuation=True,
+                semantic_repair_continuation=semantic_repair_continuation,
             )
         )
         assert replay == outcome
@@ -2996,9 +3316,6 @@ def test_model_semantic_stop_accepts_blocking_affected_source_subset(
             f"{ambiguity}}}}}"
         )
 
-    async def review_model(_prompt: str) -> str:
-        return '{"decision":"stop_confirmed","hint":null}'
-
     try:
         _seed_prior_model_budget(state, ledger)
         outcome = asyncio.run(
@@ -3015,11 +3332,10 @@ def test_model_semantic_stop_accepts_blocking_affected_source_subset(
                 freshness_context=_fixture_freshness(state),
                 registry=_make_registry(namespace),
                 state_store=state_store,
-                checkpoint_store=checkpoint_store,
-                budget_ledger=ledger,
-                policy=_policy(),
-                stop_review_model=review_model,
-            )
+                    checkpoint_store=checkpoint_store,
+                    budget_ledger=ledger,
+                    policy=_policy(),
+                )
         )
         assert outcome.stop_reason is ResearchStopReason(reason.upper())
         assert outcome.affected_source_ids == ("source-1",)
@@ -3117,6 +3433,61 @@ def test_model_semantic_stop_and_replay_preserve_exact_affected_sources(
         assert first.stop_reason is expected_reason
         assert first.affected_source_ids == ("source-1", "source-2")
         assert first.citation_evidence_ids == ("evidence-1",)
+        assert replay == first
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_model_semantic_stop_canonicalizes_citation_order_before_replay(
+    tmp_path,
+) -> None:
+    initial, state, loaded_schema, namespace = _two_unresolved_states()
+    second_evidence = state.evidence[0].model_copy(
+        update={"evidence_id": "evidence-0"}
+    )
+    state = state.model_copy(
+        update={"evidence": (state.evidence[0], second_evidence)}
+    )
+    state_store, checkpoint_store, ledger = _open_existing_research_state(
+        tmp_path, initial, state
+    )
+
+    async def no_model(_prompt: str) -> str:
+        raise AssertionError("terminal creation and replay must not call the model")
+
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=lambda current, _feedbacks: canonical_digest(current),
+        model=no_model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=_policy(),
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "terminal-citation-order-owner",
+        model_wait=None,
+    )
+    try:
+        first = coordinator._stop(
+            state,
+            ResearchStopReason.UNSUPPORTED,
+            affected_source_ids=("source-1",),
+            citation_evidence_ids=("evidence-1", "evidence-0"),
+        )
+        replay = asyncio.run(coordinator.run())
+
+        assert first.stop_reason is ResearchStopReason.UNSUPPORTED
+        assert first.citation_evidence_ids == ("evidence-0", "evidence-1")
         assert replay == first
     finally:
         state_store.close()
@@ -3717,8 +4088,8 @@ def test_five_mixed_model_rejections_stop_without_state_progress(
         assert outcome.stop_reason is ResearchStopReason.STAGNATED
         assert outcome.final_state.revision == state.revision
         assert outcome.final_state.action_history == ()
-        assert calls == 5
-        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 5
+        assert calls == 6
+        assert len(ledger.load_model_records(state.run_id, state.run_incarnation)) == 6
         diagnostics = [
             record.message
             for record in caplog.records
@@ -3732,6 +4103,8 @@ def test_five_mixed_model_rejections_stop_without_state_progress(
             "code=INVALID_STOP rejection_path=invalid_stop",
             "typed_schema_research_decision retry=true "
             "code=STOP_WITH_PROPOSALS rejection_path=stop_with_proposals",
+            "typed_schema_research_decision retry=true "
+            "code=INVALID_STOP rejection_path=invalid_stop",
             "typed_schema_research_decision retry=true "
             "code=INVALID_STOP rejection_path=invalid_stop",
         ]
@@ -3804,6 +4177,69 @@ def test_two_identical_contract_decode_rejections_trigger_stop_review(
         ledger.close()
 
 
+def test_stop_review_continuation_starts_fresh_contract_decode_window(
+    tmp_path,
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    policy = _policy(8)
+    state = _policy_state(namespace).model_copy(
+        update={"budget_state": initial_budget_state(policy)}
+    )
+    prompts: list[str] = []
+    regular_calls = 0
+
+    async def model(prompt: str) -> str:
+        nonlocal regular_calls
+        prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"continue","hint":"Retry the ordinary decision."}'
+        regular_calls += 1
+        if regular_calls < 4:
+            return "{}"
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    state_store = AdaptiveResearchStateStore(tmp_path / "state.sqlite")
+    checkpoint_store = AdaptiveStateStore(tmp_path / "checkpoint.sqlite")
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=lambda current, _feedbacks, *_args: canonical_digest(current),
+        model=model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=policy,
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "fresh-rejection-window-owner",
+        model_wait=None,
+    )
+    try:
+        decision, reason, _freshness = asyncio.run(coordinator._model_decision(state))
+        assert decision is not None
+        assert reason is None
+        assert regular_calls == 4
+        assert sum(
+            '"review_kind":"research_stop_review"' in prompt for prompt in prompts
+        ) == 1
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 def test_repeated_unresolvable_preflight_records_its_terminal_signature(tmp_path) -> None:
     loaded_schema, namespace = _fixture_schema()
     policy = _policy(6)
@@ -3852,6 +4288,188 @@ def test_repeated_unresolvable_preflight_records_its_terminal_signature(tmp_path
         assert terminal.action["rejection_signatures"] == [
             ["unresolvable_preflight", "UNRESOLVABLE_PREFLIGHT"]
         ]
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_equivalent_unresolvable_preflights_trigger_stop_review(
+    tmp_path, monkeypatch
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    policy = _policy(8)
+    state = _policy_state(namespace).model_copy(
+        update={"budget_state": initial_budget_state(policy)}
+    )
+    prompts: list[str] = []
+    regular_calls = 0
+
+    async def model(prompt: str) -> str:
+        nonlocal regular_calls
+        prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
+        regular_calls += 1
+        return json.dumps(
+            {
+                "decision_version": 1,
+                "proposals": [],
+                "next": {
+                    "next_kind": "tool",
+                    "hypothesis_ref": None,
+                    "intent": {
+                        "tool_name": "inspect_table",
+                        "arguments": {"table": f"syntactic_variant_{regular_calls}"},
+                    },
+                },
+            }
+        )
+
+    rejected_assessments = (
+        {
+            "source_handle": "s1",
+            "rejection_reason": "the same unresolved semantic conflict",
+            "proposal": {"proposal_type": "new_binding"},
+        },
+    )
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: (
+            "UNRESOLVABLE_PREFLIGHT",
+            None,
+            None,
+            rejected_assessments,
+        ),
+    )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            policy=policy,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert regular_calls == 2
+        assert len(prompts) == 3
+        assert '"review_kind":"research_stop_review"' in prompts[2]
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_repeated_preflight_digest_ignores_duplicate_feedback_rows() -> None:
+    common = {
+        "source_id": "semantic:comparison",
+        "rejection_reason": (
+            "semantic commit leaves selected candidate bindings unassessed"
+        ),
+    }
+    first = (
+        {**common, "unassessed_binding_ids": ["binding:first"]},
+        {**common, "unassessed_binding_ids": ["binding:second"]},
+    )
+    second = (
+        {**common, "unassessed_binding_ids": ["binding:replacement"]},
+    )
+
+    assert _research_loop_module._rejected_preflight_repetition_digest(
+        first
+    ) == _research_loop_module._rejected_preflight_repetition_digest(second)
+
+
+def test_repeated_preflight_can_recheck_after_earlier_same_revision_review(
+    tmp_path, monkeypatch
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    policy = _policy(20)
+    state = _policy_state(namespace).model_copy(
+        update={"budget_state": initial_budget_state(policy)}
+    )
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+
+    async def recorded_review(_reservation) -> ModelTokenUsage:
+        return ModelTokenUsage(input_tokens=None, output_tokens=None)
+
+    asyncio.run(
+        execute_model_call_with_budget_async(
+            state.run_id,
+            state.run_incarnation,
+            f"research-stop-review-{state.revision}-0",
+            canonical_digest({"review": "earlier non-novel continuation"}),
+            "test/model",
+            10,
+            10,
+            recorded_review,
+            config=policy,
+            ledger=ledger,
+            claim_now_ns=lambda: 1,
+            owner_token_factory=lambda: "earlier-review-owner",
+        )
+    )
+    prompts: list[str] = []
+
+    async def model(prompt: str) -> str:
+        prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    rejected_assessments = (
+        {
+            "source_handle": "s1",
+            "rejection_reason": "the same unresolved semantic conflict",
+            "proposal": {"proposal_type": "new_binding"},
+        },
+    )
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: (
+            "UNRESOLVABLE_PREFLIGHT",
+            None,
+            None,
+            rejected_assessments,
+        ),
+    )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            policy=policy,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+            budget_ledger=ledger,
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert len(prompts) == 3
+        assert '"review_kind":"research_stop_review"' in prompts[2]
+        review_calls = [
+            record
+            for record in ledger.load_model_records(
+                state.run_id, state.run_incarnation
+            )
+            if record.reservation.call_id.startswith(
+                f"research-stop-review-{state.revision}-"
+            )
+        ]
+        assert len(review_calls) == 2
     finally:
         state_store.close()
         checkpoint_store.close()
@@ -6185,6 +6803,66 @@ def test_preflight_allows_operatorless_filter_discriminator() -> None:
     assert "rejection_reason" not in feedback[0]
 
 
+def test_rejected_preflight_feedback_keeps_reducer_reason() -> None:
+    """A retry must receive the closed reducer reason when no narrower reason exists."""
+
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    citation = state.evidence[0].evidence_id
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "new_binding",
+                    "proposal_key": "proposal:typed-range",
+                    "source_id": "source-1",
+                    "candidate": {
+                        "kind": "discriminator_value",
+                        "discriminator_column": {
+                            "table": "public.orders",
+                            "column": "status",
+                        },
+                        "discriminator_predicate": {
+                            "left": {
+                                "table": "public.orders",
+                                "column": "status",
+                            },
+                            "operator": PredicateOperator.BETWEEN,
+                            "right": (201201, 201212),
+                        },
+                    },
+                    "join_references": (),
+                    "citation_evidence_ids": (citation,),
+                },
+            ),
+            "next": {
+                "next_kind": "tool",
+                "hypothesis_ref": None,
+                "intent": {
+                    "tool_name": "inspect_table",
+                    "arguments": {"table": "public.orders"},
+                },
+            },
+        }
+    )
+
+    feedback = _research_loop_module._rejected_preflight_assessment_context(
+        state,
+        decision,
+        _freshness(state),
+        requested_action=None,
+        fallback_rejection_reason=(
+            "binding assessment lacks the required semantic certificate"
+        ),
+    )
+
+    assert "rejection_reason" not in feedback[0]
+    assert feedback[1]["batch_rejection_reason"] == (
+        "binding assessment lacks the required semantic certificate"
+    )
+
+
 def test_rejected_new_binding_feedback_names_unknown_evidence() -> None:
     _loaded_schema, namespace = _fixture_schema()
     state = _policy_state(namespace, with_evidence=True)
@@ -7690,8 +8368,45 @@ def test_rejected_new_physical_column_without_durable_evidence_gets_inspect_prob
         "tool_name": "inspect_column",
         "arguments": {"table": "public.orders", "column": "status"},
     }
+    table = TableRef(namespace="main", schema="public", table="orders")
+    table_action, table_evidence = _observed_table_evidence(
+        state,
+        table,
+        invocation_id="orders-table-evidence",
+        columns=[{"name": "status", "type": "TEXT"}],
+    )
+    table_evidenced = state.model_copy(
+        update={
+            "evidence": (*state.evidence, table_evidence),
+            "action_history": (*state.action_history, table_action),
+        }
+    )
+    table_evidenced_decision = decision.model_copy(
+        update={
+            "proposals": (
+                decision.proposals[0].model_copy(
+                    update={"citation_evidence_ids": (table_evidence.evidence_id,)}
+                ),
+            )
+        }
+    )
+    table_feedback = _research_loop_module._rejected_preflight_assessment_context(
+        table_evidenced,
+        table_evidenced_decision,
+        _freshness(table_evidenced),
+        requested_action=None,
+        loaded_schema=loaded_schema,
+    )
+
+    assert table_feedback[0]["rejection_reason"] == (
+        "cited evidence does not observe exact physical column"
+    )
+    assert table_feedback[0]["missing_probe"] == {
+        "tool_name": "inspect_column",
+        "arguments": {"table": "public.orders", "column": "status"},
+    }
     column = ColumnRef(
-        table=TableRef(namespace="main", schema="public", table="orders"),
+        table=table,
         column="status",
     )
     inspected_action, inspected_evidence = _observed_column_evidence(
@@ -8119,6 +8834,76 @@ def test_candidate_existing_binding_assessment_uses_its_durable_evidence_batch()
     ) is non_consistent
 
 
+def test_candidate_existing_binding_assessment_preserves_known_new_evidence() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    base = _policy_state(namespace, with_evidence=True)
+    table = base.evidence[0].target
+    assert isinstance(table, TableRef)
+    column = ColumnRef(table=table, column="status")
+    action, new_evidence = _observed_column_evidence(
+        base,
+        column,
+        invocation_id="new-exact-evidence",
+    )
+    binding = PhysicalColumnBinding(
+        binding_id="binding-with-new-evidence",
+        source_id="source-1",
+        tables=(table,),
+        columns=(column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(base.evidence[0].evidence_id,),
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        physical_column=column,
+    )
+    item = base.query_spec.semantic_items[0].model_copy(
+        update={
+            "status": SemanticItemStatus.PARTIALLY_RESOLVED,
+            "binding_ids": (binding.binding_id,),
+        }
+    )
+    state = ResearchState.model_validate(
+        {
+            **base.model_dump(mode="python", round_trip=True),
+            "revision": base.revision + 1,
+            "query_spec": base.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "evidence": (*base.evidence, new_evidence),
+            "bindings": (binding,),
+            "action_history": (*base.action_history, action),
+        }
+    )
+    citations = (base.evidence[0].evidence_id, new_evidence.evidence_id)
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": binding.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": citations,
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    normalized = _research_loop_module._normalize_model_source_ids(
+        state,
+        decision,
+        freshness_context=_fixture_freshness(state),
+    )
+
+    assert normalized.proposals[0].citation_evidence_ids == citations
+
+
 def test_existing_proposed_hypothesis_assessment_uses_its_durable_evidence_batch() -> None:
     _loaded_schema, namespace = _fixture_schema()
     state = _policy_state(namespace, with_evidence=True, hypothesis=True)
@@ -8186,6 +8971,7 @@ def test_existing_proposed_hypothesis_assessment_uses_its_durable_evidence_batch
         tuple(sorted(first_hypothesis.evidence_ids)),
         tuple(sorted(second_hypothesis.evidence_ids)),
     )
+
     first_decision = decision.model_copy(update={"proposals": (decision.proposals[0],)})
 
     assert _research_loop_module._normalize_model_source_ids(
@@ -8272,6 +9058,55 @@ def test_existing_proposed_hypothesis_assessment_uses_its_durable_evidence_batch
         proposed_reference,
         freshness_context=_freshness(state),
     ) is proposed_reference
+
+
+def test_existing_hypothesis_assessment_preserves_exact_durable_citation() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True, hypothesis=True)
+    column = ColumnRef(
+        table=TableRef(namespace="main", schema="public", table="orders"),
+        column="status",
+    )
+    action, evidence = _observed_column_evidence(
+        state,
+        column,
+        invocation_id="hypothesis-exact-column-evidence",
+    )
+    hypothesis = state.hypotheses[0].model_copy(
+        update={"candidate_targets": (column,)}
+    )
+    state = state.model_copy(
+        update={
+            "evidence": (*state.evidence, evidence),
+            "hypotheses": (hypothesis,),
+            "action_history": (*state.action_history, action),
+        }
+    )
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "hypothesis_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "hypothesis_id": hypothesis.hypothesis_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": (evidence.evidence_id,),
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+
+    normalized = _research_loop_module._normalize_model_source_ids(
+        state,
+        decision,
+        freshness_context=_freshness(state),
+    )
+
+    assert normalized.proposals[0].citation_evidence_ids == (evidence.evidence_id,)
 
 
 def test_existing_binding_assessment_citation_stays_fail_closed_without_one_replacement() -> None:
@@ -9661,6 +10496,199 @@ def test_repeated_preflight_rejection_triggers_stop_review(tmp_path, monkeypatch
         ledger.close()
 
 
+def test_two_mixed_rejections_trigger_stop_review(tmp_path, monkeypatch) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    rejected_assessments = ({"proposal": {"proposal_key": "proposal:second"}},)
+    preflights = iter(
+        (
+            ("DUPLICATE_ACTION", None, {"kind": "inspect_table"}, ()),
+            ("UNRESOLVABLE_PREFLIGHT", None, None, rejected_assessments),
+        )
+    )
+
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: next(preflights),
+    )
+    prompts: list[str] = []
+
+    def research_context(
+        current: ResearchState,
+        _feedbacks: tuple[str, ...],
+        rejected_duplicates: tuple[dict[str, object], ...] = (),
+        rejected_preflight_assessments: tuple[dict[str, object], ...] = (),
+    ) -> str:
+        return json.dumps(
+            {
+                "rejected_duplicate_actions": list(rejected_duplicates),
+                "rejected_preflight_assessments": list(
+                    rejected_preflight_assessments
+                ),
+                "state": canonical_digest(current),
+            }
+        )
+
+    async def model(prompt: str) -> str:
+        prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+            research_context=research_context,
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert len(prompts) == 3
+        assert '"review_kind":"research_stop_review"' in prompts[2]
+        review = json.loads(prompts[2])
+        review_context = json.loads(review["input"]["research_context"])
+        assert review_context["rejected_duplicate_actions"] == [
+            {"kind": "inspect_table"}
+        ]
+        assert review_context["rejected_preflight_assessments"] == list(
+            rejected_assessments
+        )
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_nonadjacent_mixed_rejections_do_not_trigger_stop_review(
+    tmp_path, monkeypatch
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    preflights = iter(
+        (
+            ("DUPLICATE_ACTION", None, {"kind": "inspect_table"}, ()),
+            (
+                "UNRESOLVABLE_PREFLIGHT",
+                None,
+                None,
+                ({"proposal": {"proposal_key": "proposal:third"}},),
+            ),
+            (None, ResearchStopReason.STAGNATED, None, ()),
+        )
+    )
+
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: next(preflights),
+    )
+    prompts: list[str] = []
+
+    async def model(prompt: str) -> str:
+        prompts.append(prompt)
+        if '"review_kind":"research_stop_review"' in prompt:
+            return '{"decision":"stop_confirmed","hint":null}'
+        if len(prompts) == 2:
+            return "{}"
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert len(prompts) == 4
+        assert all('"review_kind":"research_stop_review"' not in item for item in prompts)
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
+def test_duplicate_then_reference_error_keeps_general_rejection_limit(
+    tmp_path, monkeypatch
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    preflights = iter(
+        (
+            ("DUPLICATE_ACTION", None, {"kind": "inspect_table"}, ()),
+            (None, ResearchStopReason.STAGNATED, None, ()),
+        )
+    )
+    expansions = 0
+    expand = _research_loop_module.expand_model_identifier_handles
+
+    def expand_with_reference_error(current, decision):
+        nonlocal expansions
+        expansions += 1
+        if expansions == 2:
+            raise _research_loop_module.ModelDecisionReferenceError(
+                "unknown model reference"
+            )
+        return expand(current, decision)
+
+    monkeypatch.setattr(
+        _research_loop_module,
+        "expand_model_identifier_handles",
+        expand_with_reference_error,
+    )
+    monkeypatch.setattr(
+        _research_loop_module._ResearchLoopCoordinator,
+        "_preflight_model_decision",
+        lambda _self, _state, _decision: next(preflights),
+    )
+    prompts: list[str] = []
+
+    async def model(prompt: str) -> str:
+        prompts.append(prompt)
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"tool","hypothesis_ref":null,"intent":'
+            '{"tool_name":"inspect_table","arguments":'
+            '{"table":"public.orders"}}}}'
+        )
+
+    outcome, state_store, checkpoint_store, ledger = asyncio.run(
+        _run(
+            tmp_path,
+            state,
+            model,
+            loaded_schema=loaded_schema,
+            registry=_make_registry(namespace),
+        )
+    )
+    try:
+        assert outcome.stop_reason is ResearchStopReason.STAGNATED
+        assert len(prompts) == 3
+        assert all('"review_kind":"research_stop_review"' not in item for item in prompts)
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+
 @pytest.mark.parametrize(
     (
         "rejection_kind",
@@ -10405,7 +11433,11 @@ def test_strict_schema_invalid_model_decision_is_retried_with_feedback(
         assert outcome.stop_reason is ResearchStopReason.AMBIGUOUS
         assert len(prompts) == 2
         assert context_feedbacks == [(), ("INVALID_DECISION",)]
-        assert "INVALID_DECISION" not in json.loads(prompts[0])["instructions"]
+        assert (
+            "Correct the decision using the profile rules and return a replacement typed "
+            "decision."
+            not in json.loads(prompts[0])["instructions"]
+        )
         assert "INVALID_DECISION" in json.loads(prompts[1])["instructions"]
         assert (
             "Correct the decision using the profile rules and return a replacement typed "
@@ -11018,7 +12050,11 @@ def test_trusted_runtime_failure_is_not_retried_as_model_feedback(
     try:
         assert outcome.stop_reason is ResearchStopReason.PROTOCOL_FAILURE
         assert len(prompts) == 1
-        assert "INVALID_DECISION" not in prompts[0]
+        assert (
+            "Correct the decision using the profile rules and return a replacement typed "
+            "decision."
+            not in prompts[0]
+        )
         records = ledger.load_model_records(state.run_id, state.run_incarnation)
         assert len(records) == 1
         assert records[0].result is not None
@@ -11305,7 +12341,11 @@ def test_model_budget_integrity_failure_is_not_retried_as_model_feedback(
     try:
         assert outcome.stop_reason is ResearchStopReason.PROTOCOL_FAILURE
         assert len(prompts) == 1
-        assert "INVALID_DECISION" not in prompts[0]
+        assert (
+            "Correct the decision using the profile rules and return a replacement typed "
+            "decision."
+            not in prompts[0]
+        )
         records = ledger.load_model_records(state.run_id, state.run_incarnation)
         assert len(records) == 1
         assert records[0].result is not None
@@ -11689,7 +12729,16 @@ def test_stop_review_continue_passes_hint_to_one_normal_research_turn(tmp_path) 
     state = _policy_state(namespace).model_copy(
         update={"budget_state": initial_budget_state(policy)}
     )
+    _action, evidence = _observed_table_evidence(
+        state,
+        TableRef(namespace="main", schema="public", table="orders"),
+        invocation_id="invocation:durable-evidence",
+        columns=["id", "status"],
+    )
+    state = state.model_copy(update={"evidence": (evidence,)})
+    evidence_id = state.evidence[0].evidence_id
     calls: list[str] = []
+    forwarded_hints: list[str] = []
     invalid_stop = (
         '{"decision_version":1,"proposals":[],"next":'
         '{"next_kind":"stop","reason":"ambiguous",'
@@ -11705,12 +12754,12 @@ def test_stop_review_continue_passes_hint_to_one_normal_research_turn(tmp_path) 
             assert '"review_kind":"research_stop_review"' in prompt
             return (
                 '{"decision":"continue","hint":'
-                '"Inspect the visible relationship from the supported facts."}'
+                f'"Use evidence {evidence_id} for the binding assessment."}}'
             )
         if len(calls) == 4:
-            assert (
-                "Inspect the visible relationship from the supported facts."
-            ) in prompt
+            forwarded_hints.append(
+                prompt.rsplit("Its non-authoritative hint is: ", 1)[1]
+            )
         return invalid_stop
 
     outcome, state_store, checkpoint_store, ledger = asyncio.run(
@@ -11728,10 +12777,35 @@ def test_stop_review_continue_passes_hint_to_one_normal_research_turn(tmp_path) 
         assert outcome.stop_reason is ResearchStopReason.STAGNATED
         assert outcome.final_state.revision == 0
         assert len(calls) == 4
+        assert len(forwarded_hints) == 1
+        assert "Use evidence e1 for the binding assessment." in forwarded_hints[0]
+        assert f"Use evidence {evidence_id}" not in forwarded_hints[0]
     finally:
         state_store.close()
         checkpoint_store.close()
         ledger.close()
+
+
+def test_model_facing_stop_review_hint_does_not_cascade_handles() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace, with_evidence=True)
+    item = state.query_spec.semantic_items[0].model_copy(update={"source_id": "e1"})
+    evidence = state.evidence[0].model_copy(update={"evidence_id": "s1"})
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "evidence": (evidence,),
+        }
+    )
+
+    hint = _research_loop_module._model_facing_stop_review_hint(
+        "Use source e1 with evidence s1.",
+        state,
+    )
+
+    assert hint == "Use source s1 with evidence e1."
 
 
 @pytest.mark.parametrize(
@@ -12153,6 +13227,11 @@ def test_exact_predicate_stop_review_hint_allows_evidence_backed_stored_spelling
     assert "same physical column and operator" in hint
     assert "exact search_value certificate" in hint
     assert "profile permits" in hint
+    assert "If no completed exact search_value exists" in hint
+    assert "return exactly one search_value tool request" in hint
+    assert "do not repeat a composed execute_research_probe" in hint
+    assert "If a completed exact search_value already exists, do not repeat it" in hint
+    assert "stored-spelling recovery rules when its result was empty" in hint
 
 
 def _r2101_exact_filter_state(
@@ -12534,7 +13613,11 @@ def test_stop_review_hint_names_existing_physical_candidates_and_evidence() -> N
     assert binding.binding_id in hint
     assert second_binding.binding_id in hint
     assert evidence_id in hint
-    assert "do not create a replacement binding" in hint
+    assert (
+        "create a replacement only when fresh trusted evidence contradicts the "
+        "candidate's requested meaning or join role"
+        in hint
+    )
 
 
 def test_stop_review_hint_preserves_uncertified_categorical_in_recovery() -> None:
@@ -13256,6 +14339,69 @@ def test_stop_review_current_generation_authority_omits_stale_prior_hint(
     assert open_hint_context["previous_stop_review_hint"] == prior_hint
 
 
+def test_stop_confirmed_cannot_close_current_generation_authority_gap(
+    tmp_path,
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    source_id = state.query_spec.semantic_items[0].source_id
+    state_store = AdaptiveResearchStateStore(tmp_path / "state.sqlite")
+    checkpoint_store = AdaptiveStateStore(tmp_path / "checkpoint.sqlite")
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+
+    async def no_decision_model(_prompt: str) -> str:
+        raise AssertionError("_review_stop must not call the decision model")
+
+    async def stop_confirmed(_prompt: str) -> str:
+        return '{"decision":"stop_confirmed","hint":null}'
+
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=lambda current, _feedbacks: canonical_digest(current),
+        model=no_decision_model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=_policy(),
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "authority-gap-owner",
+        model_wait=None,
+        stop_review_model=stop_confirmed,
+    )
+    context = json.dumps(
+        {
+            "invalid_stop_generation_authority": {
+                "reason_code": "QUERY_REQUIREMENT_INCOMPLETE",
+                "affected_source_ids": [source_id],
+            }
+        }
+    )
+    try:
+        hint, _attempt = asyncio.run(
+            coordinator._review_stop(
+                state,
+                ResearchStopReason.STAGNATED,
+                context,
+                0,
+            )
+        )
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+    assert hint is not None
+    assert source_id in hint
+
+
 def test_stop_review_assesses_pending_exact_formula_candidate_not_selected_by_item(
     tmp_path,
 ) -> None:
@@ -13584,6 +14730,79 @@ def test_pending_rejected_preflight_filter_resolves_existing_binding_source() ->
     assert _research_loop_module._filter_pending_rejected_preflight_assessments(
         (item,), state, {binding.source_id}
     ) == (item,)
+
+
+def test_model_decision_drops_resolved_ordinary_preflight_feedback(
+    tmp_path,
+) -> None:
+    loaded_schema, namespace = _fixture_schema()
+    state = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
+    binding = state.bindings[0]
+    rejected = {
+        "proposal": {
+            "proposal_type": "binding_assessment",
+            "subject": {
+                "reference_kind": "existing",
+                "binding_id": binding.binding_id,
+            },
+            "certificate": "insufficient",
+            "citation_evidence_ids": [state.evidence[0].evidence_id],
+        }
+    }
+    contexts: list[tuple[dict[str, object], ...]] = []
+
+    def research_context(
+        _state: ResearchState,
+        _feedbacks: tuple[str, ...],
+        _duplicates: tuple[dict[str, object], ...] = (),
+        rejected_preflight_assessments: tuple[dict[str, object], ...] = (),
+        *_args: object,
+    ) -> str:
+        contexts.append(rejected_preflight_assessments)
+        return "{}"
+
+    async def model(_prompt: str) -> str:
+        return (
+            '{"decision_version":1,"proposals":[],"next":'
+            '{"next_kind":"stop","reason":"complete","source_handles":[],'
+            '"citation_evidence_handles":[]}}'
+        )
+
+    state_store = AdaptiveResearchStateStore(tmp_path / "state.sqlite")
+    checkpoint_store = AdaptiveStateStore(tmp_path / "checkpoint.sqlite")
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=research_context,
+        model=model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=_policy(),
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "ordinary-feedback-owner",
+        model_wait=None,
+    )
+    coordinator._pending_rejected_preflight_assessments = (rejected,)
+    try:
+        decision, reason, _freshness = asyncio.run(coordinator._model_decision(state))
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+    assert decision is not None
+    assert reason is None
+    assert contexts == [()]
+    assert coordinator._pending_rejected_preflight_assessments == ()
 
 
 @pytest.mark.parametrize(
@@ -14190,6 +15409,63 @@ def test_exact_aggregate_preflight_accepts_same_batch_confirmed_input(tmp_path) 
     assert reason is None
 
 
+def test_transition_conflict_preflight_keeps_rejection_reason(
+    tmp_path, monkeypatch
+) -> None:
+    """A rejected transition must tell the next model call why it failed."""
+
+    loaded_schema, state, document, decision = (
+        _same_batch_differently_named_exact_aggregate_input()
+    )
+
+    def reject_transition(_admission):
+        raise _state_module.ResearchTransitionConflictError(
+            "neutral transition conflict"
+        )
+
+    monkeypatch.setattr(
+        _research_loop_module,
+        "commit_semantic_turn",
+        reject_transition,
+    )
+
+    feedback, reason, _action, rejected = _same_batch_aggregate_preflight(
+        tmp_path, loaded_schema, state, document, decision
+    )
+
+    assert feedback == "UNRESOLVABLE_PREFLIGHT"
+    assert reason is None
+    assert rejected[-1] == {
+        "batch_rejection_reason": "neutral transition conflict"
+    }
+
+
+def test_exact_aggregate_preflight_accepts_schema_resolved_semantic_alias(
+    tmp_path,
+) -> None:
+    """A document operand name is semantic, not a required physical column name."""
+
+    loaded_schema, state, document, decision = (
+        _same_batch_differently_named_exact_aggregate_input()
+    )
+    decision = decision.model_copy(
+        update={
+            "proposals": tuple(
+                proposal
+                for proposal in decision.proposals
+                if isinstance(proposal.candidate, DerivedExpressionCandidate)
+            )
+        }
+    )
+
+    feedback, reason, _action, _rejected = _same_batch_aggregate_preflight(
+        tmp_path, loaded_schema, state, document, decision
+    )
+
+    assert feedback is None
+    assert reason is None
+
+
 def test_exact_aggregate_preflight_detects_compact_connector_input(tmp_path) -> None:
     """A compact connector cannot hide another exact formula input."""
 
@@ -14638,18 +15914,56 @@ def test_exact_formula_predicate_preflight_rejects_existing_proxy_candidate() ->
     )
 
 
+def test_exact_formula_predicate_accepts_observed_case_only_spelling() -> None:
+    _loaded_schema, state, document, candidate = _exact_aggregate_candidate_state(
+        "status"
+    )
+    observed = _formula_predicate_candidate(
+        state,
+        candidate.source_id,
+        binding_id="binding:observed-case",
+        column_name="canonical_label",
+        literal="target",
+    ).model_copy(
+        update={
+            "status": BindingStatus.SUPPORTED,
+            "validator_rule": "semantic-certificate:v1:discriminator_value",
+        }
+    )
+    state = state.model_copy(update={"bindings": (*state.bindings, observed)})
+    constraints = (
+        (candidate.source_id, document, "canonical_label", "Target"),
+    )
+
+    assert not _research_loop_module._missing_resolved_exact_formula_predicates(
+        state, constraints
+    )
+
+
+@pytest.mark.parametrize(
+    ("left", "right", "matches"),
+    ((1, True, False), (1, 1.0, False), (1, 1, True), ("Target", "target", True)),
+)
+def test_predicate_literal_comparison_preserves_non_string_types(
+    left: object, right: object, matches: bool
+) -> None:
+    assert _research_loop_module._same_predicate_literal(left, right) is matches
+
+
 def test_predicate_feedback_names_missing_column_for_new_and_existing() -> None:
     loaded_schema, state, document, candidate = _exact_aggregate_candidate_state("status")
     proxy = _formula_predicate_candidate(
         state,
         candidate.source_id,
         binding_id="binding:proxy-feedback",
+        literal="TARGET",
     )
     state = state.model_copy(update={"bindings": (state.bindings[0], proxy)})
     new = _formula_predicate_decision(
         candidate.source_id,
         candidate.evidence_ids,
         column="proxy_label",
+        literal="TARGET",
     )
     existing = ResearchDecisionV1.model_validate(
         {
@@ -15169,6 +16483,92 @@ def test_exact_predicate_commit_preflight_reports_omitted_constraint(tmp_path) -
         loaded_schema,
         constraints,
     ) == {candidate.source_id: ("canonical_label",)}
+
+
+def test_exact_predicate_commit_preflight_allows_one_pending_constraint_progress(
+    tmp_path,
+) -> None:
+    loaded_schema, state, document, candidate = _exact_aggregate_candidate_state(
+        "status",
+        tables={
+            "public.orders": {
+                "columns": {
+                    "id": {"type": "INTEGER"},
+                    "status": {"type": "TEXT"},
+                    "canonical_label": {"type": "TEXT"},
+                    "second_label": {"type": "TEXT"},
+                }
+            }
+        },
+    )
+    canonical = _formula_predicate_candidate(
+        state,
+        candidate.source_id,
+        binding_id="binding:canonical-predicate",
+        column_name="canonical_label",
+    )
+    state = state.model_copy(update={"bindings": (*state.bindings, canonical)})
+    decision = ResearchDecisionV1.model_validate(
+        {
+            "decision_version": 1,
+            "proposals": (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": canonical.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": canonical.evidence_ids,
+                },
+            ),
+            "next": {"next_kind": "semantic_commit"},
+        }
+    )
+    constraints = (
+        (candidate.source_id, document, "canonical_label", "target"),
+        (candidate.source_id, document, "second_label", "other"),
+    )
+    state_store = AdaptiveResearchStateStore(tmp_path / "state.sqlite")
+    checkpoint_store = AdaptiveStateStore(tmp_path / "checkpoint.sqlite")
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+
+    async def no_model(_prompt: str) -> str:
+        raise AssertionError("preflight must not call the model")
+
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=lambda current, _feedbacks: canonical_digest(current),
+        model=no_model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(loaded_schema.namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=_policy(),
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "predicate-progress-owner",
+        model_wait=None,
+        exact_formula_documents=((candidate.source_id, document),),
+        exact_formula_predicate_constraints=constraints,
+    )
+    try:
+        feedback, reason, _action, _rejected = coordinator._preflight_model_decision(
+            state, decision
+        )
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+    assert feedback is None
+    assert reason is None
 
 
 def test_rejected_preflight_feedback_explains_calendar_year_equality() -> None:
@@ -15910,6 +17310,68 @@ def test_stop_review_authority_excludes_mismatching_exact_formula_candidate(tmp_
     assert candidate.binding_id not in hint
 
 
+def test_stop_review_cannot_override_rejected_proposal_evidence(tmp_path) -> None:
+    loaded_schema, state, document, candidate = _exact_aggregate_candidate_state("id")
+    state_store = AdaptiveResearchStateStore(tmp_path / "state.sqlite")
+    checkpoint_store = AdaptiveStateStore(tmp_path / "checkpoint.sqlite")
+    ledger = AdaptiveBudgetLedger(tmp_path / "budget.sqlite")
+    judge_hint = "Use the other physical time column instead."
+
+    async def no_decision_model(_prompt: str) -> str:
+        raise AssertionError("_review_stop must not call the decision model")
+
+    async def review_model(_prompt: str) -> str:
+        return json.dumps({"decision": "continue", "hint": judge_hint})
+
+    coordinator = _research_loop_module._ResearchLoopCoordinator(
+        initial_state=state,
+        task="research schema",
+        research_context=lambda current, _feedbacks: canonical_digest(current),
+        model=no_decision_model,
+        model_identity="test/model",
+        adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
+        loaded_schema=loaded_schema,
+        freshness_context=_fixture_freshness(state),
+        registry=_make_registry(loaded_schema.namespace),
+        state_store=state_store,
+        checkpoint_store=checkpoint_store,
+        budget_ledger=ledger,
+        policy=_policy(),
+        deadline=None,
+        is_cancelled=lambda: False,
+        model_claim_now_ns=lambda: 0,
+        model_owner_token_factory=lambda: "rejected-evidence-owner",
+        model_wait=None,
+        exact_formula_documents=((candidate.source_id, document),),
+        stop_review_model=review_model,
+    )
+    context = json.dumps(
+        {
+            "rejected_preflight_assessments": [
+                {
+                    "proposal": {"proposal_type": "new_binding"},
+                    "source_id": candidate.source_id,
+                    "rejection_reason": "use the inspected same-row time",
+                    "existing_evidence_handle": "e1",
+                }
+            ]
+        }
+    )
+    try:
+        hint, _attempt = asyncio.run(
+            coordinator._review_stop(state, ResearchStopReason.STAGNATED, context, 0)
+        )
+    finally:
+        state_store.close()
+        checkpoint_store.close()
+        ledger.close()
+
+    assert hint is not None
+    assert "existing_evidence_handle" in hint
+    assert "rejection_reason" in hint
+    assert judge_hint not in hint
+
+
 @pytest.mark.parametrize(
     ("formula", "input_column", "overrides_judge_hint"),
     (
@@ -16212,6 +17674,7 @@ def test_stop_review_assesses_authority_affected_resolved_filter_candidate(
         response: str,
         prior_hint: str | None = None,
         context: str = authority_context,
+        review_state: ResearchState = state,
     ) -> str | None:
         state_store = AdaptiveResearchStateStore(tmp_path / f"{name}-state.sqlite")
         checkpoint_store = AdaptiveStateStore(tmp_path / f"{name}-checkpoint.sqlite")
@@ -16224,14 +17687,14 @@ def test_stop_review_assesses_authority_affected_resolved_filter_candidate(
             return response
 
         coordinator = _research_loop_module._ResearchLoopCoordinator(
-            initial_state=state,
+            initial_state=review_state,
             task="research schema",
             research_context=lambda current, _feedbacks: canonical_digest(current),
             model=no_decision_model,
             model_identity="test/model",
             adapter=SchemaResearchDecisionAdapter(load_schema_research_agent_profile()),
             loaded_schema=loaded_schema,
-            freshness_context=_fixture_freshness(state),
+            freshness_context=_fixture_freshness(review_state),
             registry=_make_registry(namespace),
             state_store=state_store,
             checkpoint_store=checkpoint_store,
@@ -16248,7 +17711,7 @@ def test_stop_review_assesses_authority_affected_resolved_filter_candidate(
         try:
             hint, _attempt = asyncio.run(
                 coordinator._review_stop(
-                    state,
+                    review_state,
                     ResearchStopReason.STAGNATED,
                     context,
                     0,
@@ -16282,14 +17745,52 @@ def test_stop_review_assesses_authority_affected_resolved_filter_candidate(
     )
     relationship_hint = review_hint(
         "relationship",
-        '{"decision":"continue","hint":"Preserve exactly one new_join for the missing relationship."}',
+        '{"decision":"continue","hint":"Submit the existing validated join as exactly one new_join using j1 and e9."}',
         context=relationship_context,
     )
     assert relationship_hint is not None
-    assert "Preserve exactly one new_join" in relationship_hint
+    assert "Complete only the required relationship continuation" in relationship_hint
+    assert "If the required join is already VALIDATED" in relationship_hint
+    assert "replacement new_binding" in relationship_hint
+    assert "exactly one new_join" in relationship_hint
+    assert "j1" not in relationship_hint
+    assert "e9" not in relationship_hint
     assert "binding_assessment" not in relationship_hint
-    assert "semantic_commit" not in relationship_hint
+    assert "semantic_commit" in relationship_hint
     assert "do not create a replacement binding" not in relationship_hint
+
+    related_table = TableRef(namespace="main", schema="public", table="customers")
+    related_column = ColumnRef(table=related_table, column="category")
+    relationship_edge = JoinEdge(left=category, right=related_column)
+    joined_affected = affected.model_copy(
+        update={"join_path": (relationship_edge,)}
+    )
+    joined_state = state.model_copy(
+        update={
+            "bindings": (physical_binding, joined_affected, unrelated),
+            "join_candidates": (
+                JoinCandidate(
+                    join_id="join:orders-customers",
+                    left=category,
+                    right=related_column,
+                    join_type=JoinType.INNER,
+                    path=(relationship_edge,),
+                    status=JoinCandidateStatus.VALIDATED,
+                    evidence_ids=physical_binding.evidence_ids,
+                ),
+            ),
+        }
+    )
+    joined_hint = review_hint(
+        "relationship-confirmed-after-join",
+        '{"decision":"stop_confirmed","hint":null}',
+        relationship_hint,
+        relationship_context,
+        joined_state,
+    )
+    assert joined_hint is not None
+    assert joined_affected.binding_id in joined_hint
+    assert "Use nonempty binding_assessment proposals" in joined_hint
 
     assert review_hint(
         "confirmed",
@@ -16331,7 +17832,8 @@ def test_stop_review_assesses_authority_affected_resolved_filter_candidate(
             separators=(",", ":"),
         )
         + ". Then semantic_commit with those assessments; never use an empty semantic_commit. "
-        "do not create a replacement binding."
+        "Do not create a duplicate binding; create a replacement only when fresh "
+        "trusted evidence contradicts the candidate's requested meaning or join role."
     )
     corrected_full_hint = review_hint(
         "confirmed-model-full",
@@ -16366,6 +17868,109 @@ def test_stop_review_hint_does_not_forward_unknown_semantic_source_id() -> None:
     assert "semantic:mistyped.alpha:1-" not in hint
     assert "the exact durable source_id for the affected semantic item" in hint
     assert "semantic:durable.alpha:1-." in hint
+
+
+def test_stop_review_hint_replaces_closed_handles_with_open_required_source() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    template = state.query_spec.semantic_items[0]
+    resolved = template.model_copy(
+        update={
+            "source_id": "semantic:resolved",
+            "status": SemanticItemStatus.RESOLVED,
+        }
+    )
+    unresolved = template.model_copy(
+        update={"source_id": "semantic:unresolved"}
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (resolved, unresolved)}
+            ),
+            "unresolved_items": (unresolved.source_id,),
+        }
+    )
+
+    hint = _research_loop_module._validated_stop_review_hint(
+        "Unresolved source s1 remains.", state
+    )
+
+    assert resolved.source_id not in hint
+    assert unresolved.source_id in hint
+
+
+def test_stop_review_hint_does_not_expand_handle_inside_identifier() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    item = state.query_spec.semantic_items[0].model_copy(
+        update={"source_id": "semantic:s1"}
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "unresolved_items": (item.source_id,),
+        }
+    )
+
+    hint = _research_loop_module._validated_stop_review_hint(
+        "Keep semantic:s1 and s1.column.", state
+    )
+
+    assert hint == "Keep semantic:s1 and s1.column."
+
+
+def test_stop_review_hint_replaces_unknown_handle_with_open_required_source() -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    source_id = state.query_spec.semantic_items[0].source_id
+
+    hint = _research_loop_module._validated_stop_review_hint(
+        "Inspect unknown source s999.", state
+    )
+
+    assert "s999" not in hint
+    assert source_id in hint
+
+
+@pytest.mark.parametrize(
+    "review_hint",
+    (
+        "Inspect open source s2 using durable evidence.",
+        "Compare closed source s1 with open source s2 using durable evidence.",
+    ),
+)
+def test_stop_review_hint_preserves_text_that_names_open_source(
+    review_hint: str,
+) -> None:
+    _loaded_schema, namespace = _fixture_schema()
+    state = _policy_state(namespace)
+    template = state.query_spec.semantic_items[0]
+    resolved = template.model_copy(
+        update={
+            "source_id": "semantic:resolved",
+            "status": SemanticItemStatus.RESOLVED,
+        }
+    )
+    unresolved = template.model_copy(
+        update={"source_id": "semantic:unresolved"}
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (resolved, unresolved)}
+            ),
+            "unresolved_items": (unresolved.source_id,),
+        }
+    )
+
+    hint = _research_loop_module._validated_stop_review_hint(review_hint, state)
+
+    assert hint.startswith(review_hint.split(" s", 1)[0])
+    assert unresolved.source_id in hint
+    assert "Continue ordinary research" not in hint
 
 
 def test_stop_review_uses_separate_model_and_forwards_hint(tmp_path) -> None:
@@ -16615,24 +18220,34 @@ def test_stop_review_can_run_again_after_research_progress(
 
 
 @pytest.mark.parametrize(
-    ("revision", "restart", "review_call_id", "expected_model_calls", "expected_review_calls"),
     (
-        (4, False, "research-stop-review-3-0", 1, 0),
-        (4, True, "research-stop-review-3-0", 1, 0),
-        (5, False, "research-stop-review-3-0", 0, 0),
-        (4, False, "research-stop-review-3-0-extra", 0, 1),
+        "revision",
+        "restart",
+        "review_call_id",
+        "completed_review",
+        "expected_model_calls",
+        "expected_review_calls",
+    ),
+    (
+        (4, False, "research-stop-review-3-0", True, 1, 0),
+        (4, True, "research-stop-review-3-0", True, 1, 0),
+        (4, True, "research-stop-review-4-0", True, 1, 0),
+        (4, True, "research-stop-review-4-0", False, 0, 0),
+        (5, False, "research-stop-review-3-0", True, 0, 0),
+        (4, False, "research-stop-review-3-0-extra", True, 0, 1),
     ),
 )
-def test_stop_review_follow_up_decision_is_single_use_and_durable(
+def test_stop_review_follow_up_window_is_durable_and_rechecks(
     tmp_path,
     monkeypatch,
     revision,
     restart,
     review_call_id,
+    completed_review,
     expected_model_calls,
     expected_review_calls,
 ) -> None:
-    """A reviewed non-novel turn allows one durable follow-up decision."""
+    """A reviewed non-novel turn is rechecked after its follow-up window."""
 
     policy = _policy(8)
     initial = _state(required=True)
@@ -16715,8 +18330,25 @@ def test_stop_review_follow_up_decision_is_single_use_and_durable(
     async def reviewed(_reservation) -> ModelTokenUsage:
         return ModelTokenUsage(input_tokens=None, output_tokens=None)
 
-    asyncio.run(
-        execute_model_call_with_budget_async(
+    if completed_review:
+        asyncio.run(
+            execute_model_call_with_budget_async(
+                state.run_id,
+                state.run_incarnation,
+                review_call_id,
+                canonical_digest({"review": "continued"}),
+                "test/model",
+                10,
+                10,
+                reviewed,
+                config=policy,
+                ledger=ledger,
+                claim_now_ns=lambda: 1,
+                owner_token_factory=lambda: "non-novel-streak-review-owner",
+            )
+        )
+    else:
+        reserve_model_call_budget(
             state.run_id,
             state.run_incarnation,
             review_call_id,
@@ -16724,13 +18356,9 @@ def test_stop_review_follow_up_decision_is_single_use_and_durable(
             "test/model",
             10,
             10,
-            reviewed,
             config=policy,
             ledger=ledger,
-            claim_now_ns=lambda: 1,
-            owner_token_factory=lambda: "non-novel-streak-review-owner",
         )
-    )
     model_calls = 0
     review_calls = 0
 
@@ -16787,6 +18415,7 @@ def test_stop_review_follow_up_decision_is_single_use_and_durable(
             else ResearchStopReason.STAGNATED
         )
         assert review_calls == expected_review_calls
+        valid_seed_review_calls = 0 if review_call_id.endswith("-extra") else 1
         assert sum(
             _research_loop_module._stop_review_call_revision(
                 record.reservation.call_id
@@ -16795,7 +18424,7 @@ def test_stop_review_follow_up_decision_is_single_use_and_durable(
             for record in ledger.load_model_records(
                 state.run_id, state.run_incarnation
             )
-        ) == 1
+        ) == valid_seed_review_calls + expected_review_calls
     finally:
         state_store.close()
         checkpoint_store.close()
@@ -16806,11 +18435,11 @@ def test_stop_review_follow_up_consumes_persisted_non_novel_result(
     tmp_path, monkeypatch
 ) -> None:
     loaded_schema, namespace = _fixture_schema()
-    policy = _policy(8).model_copy(
+    policy = _policy(10).model_copy(
         update={
             "operation_counts": OperationCountBudget(
                 actions=6,
-                model_decisions=8,
+                model_decisions=10,
                 db_probes=6,
             )
         }
@@ -16963,7 +18592,7 @@ def test_stop_review_follow_up_consumes_persisted_non_novel_result(
                 ("Use the persisted observation." not in prompt, len(actions))
             )
         else:
-            raise AssertionError("a second follow-up decision is not allowed")
+            raise AssertionError("two failed post-review turns must stop this run")
         return json.dumps(
             {
                 "decision_version": 1,
@@ -16983,7 +18612,9 @@ def test_stop_review_follow_up_consumes_persisted_non_novel_result(
 
     async def review_model(prompt: str) -> str:
         review_prompts.append(prompt)
-        return '{"decision":"continue","hint":"Use the persisted observation."}'
+        if len(review_prompts) == 1:
+            return '{"decision":"continue","hint":"Use the persisted observation."}'
+        return '{"decision":"stop_confirmed","hint":null}'
 
     try:
         outcome = asyncio.run(
@@ -19402,6 +21033,143 @@ def test_semantic_novelty_requires_semantic_change_not_only_new_evidence() -> No
     )
 
 
+def test_semantic_novelty_counts_first_nonempty_execute_probe_result() -> None:
+    _, namespace = _fixture_schema()
+    current = _state(required=True).model_copy(
+        update={"schema_namespace_version": f"sha256:{namespace.version_key}"}
+    )
+    target = QueryProbeRef(
+        probe_id="research:" + "1" * 64,
+        namespace="main",
+    )
+    action = ResearchAction(
+        action_id="execute-probe-action",
+        kind=ResearchActionKind.EXECUTE_PROBE,
+        hypothesis_id=None,
+        target=target,
+        parameters=(),
+        action_digest=canonical_action_digest(
+            kind=ResearchActionKind.EXECUTE_PROBE,
+            hypothesis_id=None,
+            target=target,
+            parameters=(),
+            expected_revision=current.revision,
+        ),
+        expected_revision=current.revision,
+    )
+
+    def record(evidence_id: str, rows: list[list[object]]):
+        payload = {"columns": ["label"], "rows": rows}
+        result = build_probe_result(
+            run_id=current.run_id,
+            run_incarnation=current.run_incarnation,
+            revision=current.revision,
+            schema_namespace_version=current.schema_namespace_version,
+            invocation_id=evidence_id,
+            action_digest=action.action_digest,
+            probe_kind=action.kind,
+            status=ProbeStatus.SUCCESS,
+            target=target,
+            started_at=_FIXTURE_NOW,
+            completed_at=_FIXTURE_NOW,
+            summary="targeted query result",
+            cost=EvidenceCost(
+                wall_clock_ms=0,
+                model_calls=0,
+                model_tokens=0,
+                db_probe_ms=0,
+                rows=len(rows),
+                bytes=len(canonical_json_bytes(payload)),
+            ),
+            row_count=len(rows),
+            truncated=True,
+            payload=payload,
+        )
+        evidence = probe_result_to_evidence(result, action)
+        assert evidence is not None
+        return evidence
+
+    first = record("execute-probe-first", [["confirmed-result"]])
+    committed = SimpleNamespace(
+        state=current.model_copy(
+            update={
+                "evidence": (*current.evidence, first),
+                "action_history": (*current.action_history, action),
+                "revision": current.revision + 1,
+                "query_spec": current.query_spec.model_copy(
+                    update={"revision": current.revision + 1}
+                ),
+            }
+        ),
+        novelty=SimpleNamespace(
+            added_hypothesis_ids=(),
+            updated_hypothesis_ids=(),
+            added_binding_ids=(),
+            updated_binding_ids=(),
+            added_join_ids=(),
+            updated_join_ids=(),
+            unresolved_items=current.unresolved_items,
+            stop_reason=current.stop_reason,
+        ),
+    )
+
+    assert _research_loop_module._is_semantically_novel_turn(current, committed)
+
+    duplicate = record("execute-probe-duplicate", [["confirmed-result"]])
+    duplicate_commit = SimpleNamespace(
+        state=committed.state.model_copy(
+            update={"evidence": (*committed.state.evidence, duplicate)}
+        ),
+        novelty=committed.novelty,
+    )
+    assert not _research_loop_module._is_semantically_novel_turn(
+        committed.state, duplicate_commit
+    )
+
+    empty = record("execute-probe-empty", [])
+    empty_commit = SimpleNamespace(
+        state=current.model_copy(
+            update={
+                "evidence": (*current.evidence, empty),
+                "action_history": (*current.action_history, action),
+                "revision": current.revision + 1,
+                "query_spec": current.query_spec.model_copy(
+                    update={"revision": current.revision + 1}
+                ),
+            }
+        ),
+        novelty=committed.novelty,
+    )
+    assert not _research_loop_module._is_semantically_novel_turn(
+        current, empty_commit
+    )
+
+    malformed = first.model_copy(
+        update={
+            "evidence_id": "execute-probe-malformed",
+            "observation": "{not-json",
+        }
+    )
+    malformed_commit = SimpleNamespace(
+        state=committed.state.model_copy(update={"evidence": (malformed,) }),
+        novelty=committed.novelty,
+    )
+    assert not _research_loop_module._is_semantically_novel_turn(
+        current, malformed_commit
+    )
+
+    foreign = record("execute-probe-foreign", [["other-result"]]).model_copy(
+        update={"run_id": "foreign-run"}
+    )
+    foreign_commit = SimpleNamespace(
+        state=committed.state.model_copy(update={"evidence": (foreign,)}),
+        novelty=committed.novelty,
+    )
+    assert not _research_loop_module._is_semantically_novel_turn(
+        current, foreign_commit
+    )
+
+
 @pytest.mark.parametrize(
     "exact_kind", (SemanticItemKind.FILTER, SemanticItemKind.TIME)
 )
@@ -19480,6 +21248,9 @@ def test_semantic_novelty_counts_first_qualifying_value_evidence(
         record,
         *,
         action_history: tuple[ResearchAction, ...] | None = None,
+        exact_formula_predicate_constraints: tuple[
+            tuple[str, DocumentRef, str, str], ...
+        ] = (),
     ) -> bool:
         committed = SimpleNamespace(
             state=current.model_copy(
@@ -19503,6 +21274,12 @@ def test_semantic_novelty_counts_first_qualifying_value_evidence(
                 stop_reason=current.stop_reason,
             ),
         )
+        if exact_formula_predicate_constraints:
+            return _research_loop_module._is_semantically_novel_turn(
+                current,
+                committed,
+                exact_formula_predicate_constraints,
+            )
         return _research_loop_module._is_semantically_novel_turn(current, committed)
 
     full_distinct = evidence(
@@ -19975,6 +21752,53 @@ def test_semantic_novelty_counts_first_qualifying_value_evidence(
             )
         }
     )
+    trusted_formula_predicates = (
+        (
+            non_exact.source_id,
+            DocumentRef(document_id="neutral-formula-rule", namespace="main"),
+            exact_column.column,
+            "neutral-marker",
+        ),
+    )
+    trusted_formula_novelty = is_novel(
+        non_exact_state,
+        exact_search_without_distinct,
+        action_history=(actions[exact_search_without_distinct.evidence_id],),
+        exact_formula_predicate_constraints=trusted_formula_predicates,
+    )
+    assert trusted_formula_novelty
+    assert not is_novel(
+        non_exact_state.model_copy(update={"unresolved_items": ()}),
+        exact_search_without_distinct,
+        action_history=(actions[exact_search_without_distinct.evidence_id],),
+        exact_formula_predicate_constraints=trusted_formula_predicates,
+    )
+    assert not is_novel(
+        non_exact_state,
+        exact_search_without_distinct,
+        action_history=(actions[exact_search_without_distinct.evidence_id],),
+        exact_formula_predicate_constraints=(
+            (
+                non_exact.source_id,
+                trusted_formula_predicates[0][1],
+                "other_category_marker",
+                "neutral-marker",
+            ),
+        ),
+    )
+    assert not is_novel(
+        non_exact_state,
+        exact_search_without_distinct,
+        action_history=(actions[exact_search_without_distinct.evidence_id],),
+        exact_formula_predicate_constraints=(
+            (
+                non_exact.source_id,
+                trusted_formula_predicates[0][1],
+                exact_column.column,
+                "other-neutral-marker",
+            ),
+        ),
+    )
     typed_literal_item = exact_item.model_copy(update={"literal_or_reference": 1})
     typed_literal_state = exact_unbound.model_copy(
         update={
@@ -20090,6 +21914,38 @@ def test_semantic_novelty_counts_first_qualifying_value_evidence(
             ),
         }
     )
+    non_exact_with_search = non_exact_state.model_copy(
+        update={
+            "evidence": (*non_exact_state.evidence, exact_search_without_distinct),
+            "action_history": (actions[exact_search_without_distinct.evidence_id],),
+            "revision": non_exact_state.revision + 1,
+            "query_spec": non_exact_state.query_spec.model_copy(
+                update={"revision": non_exact_state.revision + 1}
+            ),
+        }
+    )
+    assert not is_novel(
+        non_exact_with_search,
+        duplicate_exact_search,
+        action_history=(
+            *non_exact_with_search.action_history,
+            actions[duplicate_exact_search.evidence_id],
+        ),
+        exact_formula_predicate_constraints=trusted_formula_predicates,
+    )
+    assert not is_novel(
+        non_exact_state,
+        typed_mismatch_search,
+        action_history=(actions[typed_mismatch_search.evidence_id],),
+        exact_formula_predicate_constraints=(
+            (
+                non_exact.source_id,
+                trusted_formula_predicates[0][1],
+                exact_column.column,
+                "True",
+            ),
+        ),
+    )
     assert not is_novel(
         optional_exact_state,
         exact_distinct,
@@ -20194,6 +22050,46 @@ def test_semantic_novelty_counts_first_qualifying_value_evidence(
         ) == 0
     finally:
         exact_checkpoint_store.close()
+
+    trusted_replay_state = non_exact_state.model_copy(
+        update={
+            "revision": 4,
+            "query_spec": non_exact_state.query_spec.model_copy(update={"revision": 4}),
+        }
+    )
+    trusted_database = tmp_path / "trusted-formula-value-evidence-novelty.sqlite"
+    trusted_events = tuple(
+        (
+            AdaptiveCheckpointKey(
+                trusted_replay_state.run_id,
+                trusted_replay_state.run_incarnation,
+                AdaptiveLoopKind.RESEARCH,
+                revision,
+            ),
+            "observed",
+            {
+                "contract_version": 1,
+                "kind": "research_observed",
+                "novel": trusted_formula_novelty if revision == 3 else False,
+                "result": None,
+                "resolution_digest": "sha256:" + "3" * 64,
+            },
+        )
+        for revision in range(4)
+    )
+    _seed_honest_v2_history(
+        trusted_database,
+        states=(trusted_replay_state,),
+        events=trusted_events,
+    )
+    trusted_checkpoint_store = AdaptiveStateStore(trusted_database)
+    try:
+        assert _research_loop_module._consecutive_non_novel(
+            trusted_checkpoint_store,
+            trusted_replay_state,
+        ) == 0
+    finally:
+        trusted_checkpoint_store.close()
 
 
 def test_semantic_novelty_ignores_binding_addition_after_all_items_resolved() -> None:

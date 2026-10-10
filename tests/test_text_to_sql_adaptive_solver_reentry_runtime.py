@@ -169,7 +169,7 @@ def test_solver_and_targeted_reentry_preserve_typed_model_parameters(
     finally:
         agent_command._get_model.cache_clear()
 
-    assert observed == [(32_000, 0.3, 0, 1), (32_000, 0.3, 0, 1)]
+    assert observed == [(32_000, 0.3, 0, 0), (32_000, 0.3, 0, 0)]
 
 
 def test_solver_and_targeted_reentry_pass_yaml_profile_as_system_prompt(
@@ -1399,7 +1399,7 @@ async def test_reentry_continuation_stop_review_model_comes_from_step_models_reg
 
         assert captured_names == ["model_lite"]
         assert captured_assembly["model_identity"] == stable_schema_research_model_identity(
-            "model_code"
+            profile.model
         )
 
         runtime.research_state_store.close()

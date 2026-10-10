@@ -17,6 +17,9 @@ import pytest
 from custom_tools.text_to_sql.adaptive._semantic_coverage_footprint import (
     canonical_binding,
 )
+from custom_tools.text_to_sql.adaptive._semantic_value_certificate import (
+    evidence_observes_exact_value,
+)
 from custom_tools.text_to_sql.adaptive.freshness import FreshnessContext
 from custom_tools.text_to_sql.adaptive.models import (
     BindingStatus,
@@ -35,6 +38,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
+    QueryProbeRef,
     QuerySpec,
     ResearchAction,
     ResearchActionKind,
@@ -378,6 +382,101 @@ def _research_state(
     )
 
 
+def _exact_equality_probe_evidence(
+    schema_version: str,
+    *,
+    rows: list[list[object]] | None = None,
+    exact_equalities: object = None,
+) -> tuple[ResearchAction, EvidenceRecord]:
+    target = QueryProbeRef(namespace="main", probe_id="research:exact-equality")
+    parameters = (("parameter_000", "active"),)
+    action = ResearchAction(
+        action_id="research-action-exact-equality",
+        kind=ResearchActionKind.EXECUTE_PROBE,
+        hypothesis_id=None,
+        target=target,
+        parameters=parameters,
+        action_digest=canonical_action_digest(
+            kind=ResearchActionKind.EXECUTE_PROBE,
+            hypothesis_id=None,
+            target=target,
+            parameters=parameters,
+            expected_revision=1,
+        ),
+        expected_revision=1,
+    )
+    selected_rows = [[7]] if rows is None else rows
+    selected_equalities = (
+        [
+            {
+                "column": _column().model_dump(mode="json", by_alias=True),
+                "value": "active",
+            }
+        ]
+        if exact_equalities is None
+        else exact_equalities
+    )
+    payload = {
+        "columns": ["id"],
+        "rows": selected_rows,
+        "exact_equalities": selected_equalities,
+    }
+    payload_bytes = canonical_json_bytes(payload)
+    provenance = ProbeProvenance(
+        provenance_version=1,
+        run_id=_RUN_ID,
+        run_incarnation=_INCARNATION,
+        invocation_id="evidence-exact-equality-probe",
+        action_digest=action.action_digest,
+        probe_kind=ResearchActionKind.EXECUTE_PROBE,
+        target=target,
+        schema_namespace_version=schema_version,
+        payload_digest=canonical_digest(payload),
+        started_at=_OBSERVED_AT,
+        completed_at=_OBSERVED_AT,
+    )
+    observation = canonical_json_bytes(
+        {
+            "artifact_reference": None,
+            "byte_count": len(payload_bytes),
+            "invocation_id": provenance.invocation_id,
+            "observation_version": 1,
+            "payload": payload,
+            "payload_digest": provenance.payload_digest,
+            "probe_kind": ResearchActionKind.EXECUTE_PROBE,
+            "provenance": provenance,
+            "row_count": len(selected_rows),
+            "storage": "inline",
+            "summary": "exact equality probe",
+            "truncated": False,
+        }
+    ).decode("utf-8")
+    return action, EvidenceRecord(
+        run_id=_RUN_ID,
+        run_incarnation=_INCARNATION,
+        revision=2,
+        schema_namespace_version=schema_version,
+        evidence_id=provenance.invocation_id,
+        source_kind=EvidenceSourceKind.PROBE,
+        target=target,
+        action_digest=action.action_digest,
+        observation=observation,
+        validity_scope=EvidenceValidityScope.RUN_ONLY,
+        data_snapshot_token=None,
+        observed_at=_OBSERVED_AT,
+        strength=1.0,
+        created_at=_OBSERVED_AT,
+        cost=EvidenceCost(
+            wall_clock_ms=1,
+            model_calls=0,
+            model_tokens=0,
+            db_probe_ms=1,
+            rows=len(selected_rows),
+            bytes=len(payload_bytes),
+        ),
+    )
+
+
 def test_exact_fresh_search_value_suffices_without_inspect_column() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (binding,) = state.bindings
@@ -406,6 +505,93 @@ def test_exact_fresh_search_value_suffices_without_inspect_column() -> None:
     )
 
     assert requirements.selected_bindings == (binding,)
+
+
+def test_nonempty_exact_parameterized_probe_suffices_for_discriminator() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    action, probe_evidence = _exact_equality_probe_evidence(
+        state.schema_namespace_version
+    )
+    schema_evidence = state.evidence[0]
+    binding = canonical_binding(
+        state.bindings[0].model_copy(
+            update={
+                "evidence_ids": (
+                    schema_evidence.evidence_id,
+                    probe_evidence.evidence_id,
+                )
+            }
+        )
+    )
+    state = state.model_copy(
+        update={
+            "revision": 2,
+            "bindings": (binding,),
+            "evidence": (schema_evidence, probe_evidence),
+            "action_history": (state.action_history[0], action),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (binding,)
+
+
+@pytest.mark.parametrize(
+    ("rows", "exact_equalities", "expected"),
+    [
+        (
+            [],
+            [{"column": _column().model_dump(mode="json", by_alias=True), "value": "active"}],
+            "active",
+        ),
+        ([[7]], "malformed", "active"),
+        (
+            [[7]],
+            [
+                {
+                    "column": ColumnRef(
+                        table=_table(), column="id"
+                    ).model_dump(mode="json", by_alias=True),
+                    "value": "active",
+                }
+            ],
+            "active",
+        ),
+        (
+            [[7]],
+            [{"column": _column().model_dump(mode="json", by_alias=True), "value": "inactive"}],
+            "active",
+        ),
+        (
+            [[7]],
+            [{"column": _column().model_dump(mode="json", by_alias=True), "value": True}],
+            1,
+        ),
+    ],
+)
+def test_execute_probe_exact_equality_certificate_fails_closed(
+    rows: list[list[object]],
+    exact_equalities: object,
+    expected: object,
+) -> None:
+    _action, evidence = _exact_equality_probe_evidence(
+        "sha256:" + "a" * 64,
+        rows=rows,
+        exact_equalities=exact_equalities,
+    )
+
+    assert not evidence_observes_exact_value(evidence, _column(), expected)
 
 
 def test_researched_time_physical_predicate_is_accepted_at_coverage() -> None:
@@ -504,6 +690,58 @@ def test_researched_time_predicate_without_query_operator_is_accepted() -> None:
     )
 
     assert requirements.selected_bindings == (binding,)
+
+
+def test_time_label_without_operator_does_not_require_physical_predicate() -> None:
+    state = _research_state("sha256:" + "a" * 64)
+    (item,) = state.query_spec.semantic_items
+    (binding,) = state.bindings
+    physical_binding = canonical_binding(
+        PhysicalColumnBinding(
+            binding_id="binding-reporting-period",
+            source_id=item.source_id,
+            tables=binding.tables,
+            columns=(binding.discriminator_column,),
+            predicates=(),
+            join_path=(),
+            evidence_ids=binding.evidence_ids,
+            confidence=1.0,
+            status=BindingStatus.SUPPORTED,
+            validator_rule="w6-07",
+            physical_column=binding.discriminator_column,
+        )
+    )
+    item = item.model_copy(
+        update={
+            "kind": SemanticItemKind.TIME,
+            "operator": None,
+            "literal_or_reference": 2024,
+            "exact_physical_predicate": False,
+            "binding_ids": (physical_binding.binding_id,),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+            "bindings": (physical_binding,),
+        }
+    )
+
+    requirements = validate_coverage_inputs(
+        state,
+        FreshnessContext(
+            evaluated_at=_OBSERVED_AT,
+            run_id=_RUN_ID,
+            run_incarnation=_INCARNATION,
+            schema_namespace_version=state.schema_namespace_version,
+        ),
+        _RUN_ID,
+        _INCARNATION,
+    )
+
+    assert requirements.selected_bindings == (physical_binding,)
 
 
 def test_researched_filter_predicate_without_query_operator_is_accepted() -> None:
@@ -864,7 +1102,7 @@ def test_exact_composite_filter_uses_confirmed_physical_predicates() -> None:
     assert requirements.selected_bindings == (binding,)
 
 
-def test_generation_authority_excludes_uncertified_discriminator_aliases() -> None:
+def test_generation_authority_keeps_supported_discriminator_aliases() -> None:
     state = _research_state("sha256:" + "a" * 64)
     (item,) = state.query_spec.semantic_items
     (physical_binding,) = state.bindings
@@ -972,8 +1210,8 @@ def test_generation_authority_excludes_uncertified_discriminator_aliases() -> No
         _INCARNATION,
     )
 
-    assert requirements.selected_bindings == (physical_binding,)
-    assert requirements.allowed_predicates == (physical_predicate,)
+    assert requirements.selected_bindings == (alias_binding, physical_binding)
+    assert requirements.allowed_predicates == (alias_predicate, physical_predicate)
 
 
 def _create_fixture(
@@ -1181,8 +1419,9 @@ def _run_generation(
     ledger,
     *,
     reenter=None,
+    identifiers=None,
 ) -> dict[str, object]:
-    identifiers = _ids()
+    identifiers = _ids() if identifiers is None else identifiers
     return asyncio.run(
         run_adaptive_sql_generation(
             runtime,
@@ -1369,7 +1608,7 @@ def test_explain_failure_is_repaired_without_finalizing_failed_candidate(
     assert checkpoint.pending_execution is None
 
 
-def test_execution_failure_is_sealed_and_replayed_exactly(
+def test_execution_failure_keeps_solver_open_for_a_second_candidate(
     monkeypatch, tmp_path
 ) -> None:
     runtime, store = _runtime(tmp_path)
@@ -1389,7 +1628,7 @@ def test_execution_failure_is_sealed_and_replayed_exactly(
         preparation.state,
         _failed_execution_terminal(_RUN_ID, output["sql"]),
     )
-    expected_bytes = reconciled.terminal.terminal_bytes
+    assert reconciled.terminal is None
     durable = store.load(_RUN_ID, _INCARNATION)
     assert durable is not None
     candidate_id = durable.state.sql_candidates[0].candidate_id
@@ -1408,22 +1647,22 @@ def test_execution_failure_is_sealed_and_replayed_exactly(
     assert execution_result.candidate_id == candidate_id
     assert execution_result.success is False
     assert durable.state.selected_candidate_id is None
-    assert durable.state.stop_reason is SolverStopReason.TOOL_FAILURE
+    assert durable.state.stop_reason is None
 
-    restarted, reopened = _runtime(tmp_path)
-    replay = prepare_finalizer_execution(
-        restarted,
-        _finalizer_request(output["sql"]),
-        id_factory=lambda: (_ for _ in ()).throw(
-            AssertionError("terminal replay allocated a second execution ID")
-        ),
+    repaired_sql = "SELECT status FROM orders WHERE status = 'active'"
+    repaired = _run_generation(
+        runtime,
+        (_sql(repaired_sql),),
+        ledger,
+        identifiers=(f"w6-07-repair-{index}" for index in range(1, 100)),
     )
-
-    assert replay.reservation is None and replay.terminal is not None
-    assert canonical_json_bytes(replay.terminal.to_mapping()) == expected_bytes
-    assert apply_finalizer_checkpoint(
-        restarted, reopened.load(_RUN_ID, _INCARNATION)
-    ) == (replay.terminal.to_mapping())
+    repaired_state = store.load(_RUN_ID, _INCARNATION).state
+    assert repaired["sql"] == repaired_sql, (
+        repaired,
+        repaired_state.stop_reason,
+        repaired_state.sql_candidates,
+        repaired_state.check_results,
+    )
     assert ledger.counts()["finalizer"] == 1
 
 
@@ -1742,6 +1981,8 @@ def _spawn_reentry_worker(root_text: str, crash_on_admission: bool) -> None:
 
 
 def _spawn_finalizer_worker(root_text: str, crash_window: str | None) -> None:
+    from test_text_to_sql_adaptive_solver import _successful_terminal
+
     root = Path(root_text)
     ledger = _SqliteCallLedger(root / "calls.sqlite")
     runtime, store = _runtime(root)
@@ -1770,10 +2011,21 @@ def _spawn_finalizer_worker(root_text: str, crash_window: str | None) -> None:
 
     runner.core.sql_safety_check = safety
     runner.core.sql_explain = explain
-    proposals = (
-        () if store.load(_RUN_ID, _INCARNATION) is not None else (_sql(_GOOD_SQL),)
-    )
-    identifiers = _ids()
+    checkpoint = store.load(_RUN_ID, _INCARNATION)
+    repair_sql = "SELECT status FROM orders WHERE status = 'active'"
+    if checkpoint is None:
+        proposals = (_sql(_GOOD_SQL),)
+        identifiers = _ids()
+    elif (
+        checkpoint.terminal is None
+        and checkpoint.state.execution_results
+        and not checkpoint.state.execution_results[-1].success
+    ):
+        proposals = (_sql(repair_sql),)
+        identifiers = (f"w6-07-repair-{index}" for index in range(1, 100))
+    else:
+        proposals = ()
+        identifiers = _ids()
     try:
         output = asyncio.run(
             run_adaptive_sql_generation(
@@ -1791,18 +2043,25 @@ def _spawn_finalizer_worker(root_text: str, crash_window: str | None) -> None:
         preparation = prepare_finalizer_execution(
             runtime,
             _finalizer_request(output["sql"]),
-            id_factory=lambda: "spawn-execution-1",
+            id_factory=lambda: (
+                f"spawn-execution-{runtime.verified_solver_candidate_id}"
+            ),
         )
         if preparation.reservation is None:
             raise AssertionError("fresh finalizer preparation lacked a reservation")
         ledger.add("finalizer")
         if crash_window == "reservation":
             os._exit(86)
+        terminal = (
+            _successful_terminal(preparation.state)
+            if output["sql"] == repair_sql
+            else _failed_execution_terminal(_RUN_ID, output["sql"])
+        )
         reconciled = reconcile_known_finalizer(
             store,
             preparation.reservation,
             preparation.state,
-            _failed_execution_terminal(_RUN_ID, output["sql"]),
+            terminal,
         )
         if crash_window == "known_reconciliation":
             os._exit(86)
@@ -1920,14 +2179,22 @@ def test_spawn_resume_terminalizes_durable_reentry_admission_once(tmp_path) -> N
 
 
 @pytest.mark.parametrize(
-    ("crash_window", "reason_code"),
+    ("crash_window", "reason_code", "expected_counts"),
     (
-        ("reservation", "EXECUTION_UNKNOWN"),
-        ("known_reconciliation", "EXECUTION_FAILED"),
+        (
+            "reservation",
+            "EXECUTION_UNKNOWN",
+            Counter({"proposal": 1, "safety": 1, "explain": 1, "finalizer": 1}),
+        ),
+        (
+            "known_reconciliation",
+            "",
+            Counter({"proposal": 2, "safety": 2, "explain": 2, "finalizer": 2}),
+        ),
     ),
 )
 def test_spawn_resume_never_repeats_finalizer(
-    tmp_path, crash_window, reason_code
+    tmp_path, crash_window, reason_code, expected_counts
 ) -> None:
     context = multiprocessing.get_context("spawn")
     first = context.Process(
@@ -1950,7 +2217,7 @@ def test_spawn_resume_never_repeats_finalizer(
     _join_process(second, 0)
 
     counts = ledger.counts()
-    assert counts == Counter({"proposal": 1, "safety": 1, "explain": 1, "finalizer": 1})
+    assert counts == expected_counts
     _, store = _runtime(tmp_path)
     checkpoint = store.load(_RUN_ID, _INCARNATION)
     assert checkpoint is not None and checkpoint.terminal is not None

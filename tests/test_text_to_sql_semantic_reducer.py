@@ -35,6 +35,7 @@ from custom_tools.text_to_sql.adaptive.models import (
     PhysicalColumnBinding,
     PredicateOperator,
     PredicateRef,
+    QueryProbeRef,
     QuerySpec,
     ResearchAction,
     SemanticItem,
@@ -75,6 +76,7 @@ from custom_tools.text_to_sql.adaptive.semantic_reducer import (
     admit_semantic_turn,
     commit_semantic_turn,
     _derived_expression_certificate,
+    _assess_hypothesis,
     _assess_binding,
     _cited_records,
     _declared_join_certificate,
@@ -202,7 +204,7 @@ def _column(table: str, column: str) -> ColumnRef:
 
 def _evidence(
     kind: ResearchActionKind,
-    target: TableRef | ColumnRef | DocumentRef,
+    target: TableRef | ColumnRef | DocumentRef | QueryProbeRef,
     payload: object,
     *,
     evidence_id: str,
@@ -1297,6 +1299,25 @@ def test_inner_join_id_is_symmetric_but_left_join_is_directed() -> None:
     assert left_forward.join_id != left_reverse.join_id
 
 
+def test_inner_single_edge_path_is_canonical_when_declared_endpoints_are_reversed() -> None:
+    forward = _join_candidate(
+        ("opaque_a", "x1"),
+        ("opaque_b", "y1"),
+        "inner",
+        ((("opaque_a", "x1"), ("opaque_b", "y1")),),
+    )
+    reversed_path = _join_candidate(
+        ("opaque_a", "x1"),
+        ("opaque_b", "y1"),
+        "inner",
+        ((("opaque_b", "y1"), ("opaque_a", "x1")),),
+    )
+
+    assert reversed_path.status is JoinCandidateStatus.VALIDATED
+    assert reversed_path.join_id == forward.join_id
+    assert reversed_path.path == forward.path
+
+
 def test_inner_composite_reversal_preserves_pair_order() -> None:
     forward_path = (
         (("opaque_a", "x1"), ("opaque_b", "y1")),
@@ -2009,6 +2030,33 @@ def test_truncated_structural_absence_is_not_negative_evidence() -> None:
     )
 
     assert _negative_hypothesis_certificate(hypothesis, (evidence,)) is False
+
+
+def test_matching_table_inspection_supports_exact_hypothesis() -> None:
+    target = _table("neutral_records")
+    evidence = _evidence(
+        ResearchActionKind.INSPECT_TABLE,
+        target,
+        {
+            "status": "matched",
+            "table": target.model_dump(mode="json", by_alias=True),
+            "columns": [],
+        },
+        evidence_id="matching-table-inspection",
+    )
+    hypothesis = Hypothesis(
+        hypothesis_id="hypothesis-neutral-records",
+        source_ids=("source-1",),
+        claim="The neutral records are represented by this table.",
+        candidate_targets=(target,),
+        status=HypothesisStatus.PROPOSED,
+        evidence_ids=(),
+    )
+
+    assessed = _assess_hypothesis(hypothesis, "consistent", (evidence,))
+
+    assert assessed.status is HypothesisStatus.SUPPORTED
+    assert assessed.evidence_ids == (evidence.evidence_id,)
 
 
 def test_sample_absence_cannot_reject_a_binding() -> None:
@@ -3612,6 +3660,58 @@ def test_semantic_commit_allows_detached_same_source_candidate() -> None:
 
     assert admission.action is not None
     assert admission.action.kind is ResearchActionKind.SEMANTIC_COMMIT
+
+
+def test_semantic_commit_rejects_unassessed_discriminator_on_resolved_source() -> None:
+    state = _selected_formula_candidates_state(detached=True)
+    supported = state.bindings[0]
+    discriminator_column = state.bindings[1].physical_column
+    predicate = PredicateRef(
+        left=discriminator_column,
+        operator=PredicateOperator.EQ,
+        right="school",
+    )
+    discriminator = DiscriminatorValueBinding(
+        binding_id="binding-row-role",
+        source_id=supported.source_id,
+        tables=(discriminator_column.table,),
+        columns=(discriminator_column,),
+        predicates=(predicate,),
+        join_path=(),
+        evidence_ids=state.bindings[1].evidence_ids,
+        confidence=0.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        discriminator_column=discriminator_column,
+        discriminator_predicate=predicate,
+    )
+    item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.DIMENSION,
+            "source_text": "school",
+            "normalized_meaning": "school row",
+            "binding_ids": (supported.binding_id,),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "bindings": (*state.bindings, discriminator),
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (item,)}
+            ),
+        }
+    )
+    decision = _assess_formula_candidates_decision(
+        semantic_commit=True,
+        binding_ids=(state.bindings[1].binding_id,),
+    )
+
+    with pytest.raises(SemanticReducerError, match="selected candidate.*unassessed"):
+        _reject_partial_selected_candidate_commit(
+            state,
+            decision,
+            {binding.binding_id: binding for binding in state.bindings},
+        )
 
 
 def test_semantic_commit_promotes_all_selected_candidate_assessments() -> None:

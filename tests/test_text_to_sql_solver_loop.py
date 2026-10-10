@@ -429,7 +429,7 @@ def test_formula_reentry_refreshes_query_spec_before_sql_proposal() -> None:
         update={
             "query_spec": stale_query_spec,
             "bindings": (),
-            "unresolved_items": (),
+            "unresolved_items": ("formula",),
         }
     )
     requested = requested.model_copy(update={"query_spec": stale_query_spec})
@@ -937,11 +937,11 @@ def test_failed_candidate_allows_exact_retry_after_completed_research_reentry() 
         candidate_id="candidate-1",
         check_kind=CheckKind.SEMANTIC,
         status=CheckStatus.FAILED,
-        failure_code=CheckFailureCode.UNAUTHORIZED_LITERAL,
+        failure_code=CheckFailureCode.UNAUTHORIZED_COLUMN,
         affected_source_ids=(),
         affected_ast_node_ids=("ast:projection:literal",),
-        observed_error="The literal lacks evidence.",
-        required_change="Research the literal value.",
+        observed_error="The column lacks authority.",
+        required_change="Research the column.",
     )
     checked = SolverState.model_validate(
         {

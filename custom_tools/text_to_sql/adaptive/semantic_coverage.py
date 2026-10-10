@@ -453,10 +453,7 @@ def _validate_coverage_inputs(
         for item in required_items
         if (
             item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
-            and (
-                item.operator is not None
-                or item.literal_or_reference is not None
-            )
+            and item.operator is not None
         )
         and not any(
             _binding_proves_required_predicate(
@@ -544,6 +541,18 @@ def _validate_coverage_inputs(
             key=lambda binding: (binding.source_id, binding.binding_id),
         )
     )
+    selected_source_ids = {binding.source_id for binding in selected_bindings}
+    missing_generation_sources = tuple(
+        item.source_id
+        for item in required_items
+        if not is_binding_free_semantic_item(item, current.bindings)
+        and item.source_id not in selected_source_ids
+    )
+    if missing_generation_sources:
+        _fail(
+            CoverageInputErrorCode.QUERY_REQUIREMENT_INCOMPLETE,
+            missing_generation_sources,
+        )
     protected_join_ids = {
         candidate.join_id
         for item in selected_bindings
@@ -803,20 +812,9 @@ def _binding_proves_required_predicate(
             return False
         requirement_matches = predicate_matches(required_predicate, source_predicate)
     if isinstance(binding, DiscriminatorValueBinding):
-        try:
-            return requirement_matches and all(
-                predicate_has_exact_value_certificate(predicate, citations)
-                if predicate.operator
-                in {
-                    PredicateOperator.EQ,
-                    PredicateOperator.IN,
-                    PredicateOperator.IS_NULL,
-                }
-                else predicate_has_valid_literal(predicate)
-                for predicate in predicates
-            )
-        except ExactValueCertificateError:
-            return False
+        return requirement_matches and all(
+            predicate_has_valid_literal(predicate) for predicate in predicates
+        )
     try:
         return requirement_matches and all(
             predicate_has_exact_value_certificate(predicate, citations)
@@ -841,10 +839,18 @@ def _binding_has_generation_authority(
         }
     ):
         return True
-    return any(
-        _binding_proves_required_predicate(item, binding, citations)
+    predicate_items = tuple(
+        item
         for item in required_items
         if binding.binding_id in item.binding_ids
+        and item.kind in {SemanticItemKind.FILTER, SemanticItemKind.TIME}
+        and item.operator is not None
+    )
+    if not predicate_items:
+        return True
+    return any(
+        _binding_proves_required_predicate(item, binding, citations)
+        for item in predicate_items
     )
 
 

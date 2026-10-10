@@ -270,10 +270,11 @@ def _approved_semantic_facts_from_probe_fact(
     rows = payload.get("rows")
     if not isinstance(table_ref, dict) or not isinstance(column, str):
         return ()
+    qualifier = table_ref.get("schema") or table_ref.get("namespace")
     table_parts = [
-        table_ref.get(name)
-        for name in ("namespace", "schema", "table")
-        if isinstance(table_ref.get(name), str) and table_ref[name]
+        value
+        for value in (qualifier, table_ref.get("table"))
+        if isinstance(value, str) and value
     ]
     if (
         not table_parts
@@ -1653,6 +1654,28 @@ class SchemaMemoryManager:
             try:
                 from memory.manager import EmbeddingUnavailableError, EmbeddingFailedError
                 if isinstance(e, (EmbeddingUnavailableError, EmbeddingFailedError)):
+                    if namespace is not None:
+                        handler = getattr(memory_manager, "db_handler", None)
+                        setter = getattr(handler, "set_vector_readiness", None)
+                        if callable(setter):
+                            setter("unavailable", "embedding_query_failed")
+                        self.last_vector_readiness = "unavailable"
+                        self.last_vector_reason = "embedding_query_failed"
+                        relevant_tables = self._sqlite_lexical_schema_tables(
+                            entities, namespace
+                        )
+                        self._set_search_status(
+                            "sqlite_lexical_ok"
+                            if relevant_tables
+                            else "sqlite_lexical_no_hits",
+                            str(e),
+                        )
+                        logger.warning(
+                            "Embedding search unavailable; used exact-namespace "
+                            "SQLite schema search: %s",
+                            _redact_schema_memory_value(e),
+                        )
+                        return relevant_tables
                     logger.error(
                         "Embedding model unavailable in find_semantic_relevant_tables"
                         " — check OPENAI_API_KEY_DB / embedding config: %s",

@@ -734,6 +734,68 @@ def test_result_contradiction_dispatches_open_checkpoint_without_terminal_apply(
     assert captured == [(step, context, "finalize")]
 
 
+def test_execution_failure_dispatches_solver_repair_without_terminal_apply(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    engine = object.__new__(EnhancedWorkflowEngine)
+    runtime, state, _ = _finalizer_runtime(tmp_path)
+    context = _context(runtime)
+    step = _finalizer_step(state)
+    failed = _successful_terminal(state)
+    failed_execution = {
+        **failed["execution"],
+        "success": False,
+        "data": [],
+        "columns": [],
+        "rows_affected": 0,
+        "error_message": "no such column: missing_alias",
+    }
+    failed.update(
+        {
+            "status": "failed",
+            "reason_code": "EXECUTION_FAILED",
+            "data": [],
+            "columns": [],
+            "rows_affected": 0,
+            "error": failed_execution["error_message"],
+            "execution": failed_execution,
+            "persistence": {"status": "not_attempted"},
+            "result_review": {},
+        }
+    )
+    repaired = _successful_terminal(state)
+    captured = []
+
+    async def finalizer(*_args):
+        return failed
+
+    async def continuation(
+        continuation_step,
+        continuation_context,
+        continuation_task,
+    ):
+        captured.append(
+            (continuation_step, continuation_context, continuation_task)
+        )
+        return repaired
+
+    monkeypatch.setattr(engine, "_execute_on_db_audit_tool_once", finalizer)
+    monkeypatch.setattr(
+        engine,
+        "_continue_result_contradiction_finalizer",
+        continuation,
+        raising=False,
+    )
+
+    result = asyncio.run(
+        engine._execute_reserved_text_to_sql_finalizer(step, context, "finalize")
+    )
+
+    assert result == repaired
+    assert captured == [(step, context, "finalize")]
+
+
 @pytest.mark.parametrize(
     ("verdict", "deterministic_failure_code", "open_repair"),
     (

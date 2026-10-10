@@ -1561,7 +1561,9 @@ class _VerticalFixtureModel:
         self.prompts.append(envelope)
         raw_context = envelope["input"]["research_context"]
         assert isinstance(raw_context, str)
-        hint_marker = "\n\nIndependent stop review allows one normal research turn."
+        hint_marker = (
+            "\n\nIndependent stop review allows at most two normal research decisions."
+        )
         if hint_marker in raw_context:
             # A granted stop-review hint is appended as a plain-text suffix to
             # the (otherwise JSON) research_context string; see

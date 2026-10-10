@@ -176,6 +176,49 @@ def test_formatting_equivalent_sql_has_one_identity_and_parameters_stay_separate
     )
 
 
+def test_admission_records_exact_conjunctive_parameter_equality() -> None:
+    admission = _admit(
+        "SELECT o.id FROM main.orders AS o "
+        "WHERE o.status = ? AND o.customer_id > ? ORDER BY o.id LIMIT 5",
+        ("open", 10),
+    )
+
+    assert len(admission.exact_equalities) == 1
+    column, value = admission.exact_equalities[0]
+    assert column.table.namespace == "main"
+    assert column.table.schema_name == "main"
+    assert column.table.table == "orders"
+    assert column.column == "status"
+    assert value == "open"
+
+
+def test_admission_does_not_certify_parameter_equality_below_or() -> None:
+    admission = _admit(
+        "SELECT o.id FROM main.orders AS o "
+        "WHERE o.status = ? OR o.customer_id > ? ORDER BY o.id LIMIT 5",
+        ("open", 10),
+    )
+
+    assert admission.exact_equalities == ()
+
+
+def test_admission_keeps_lexical_parameter_order_for_nested_and() -> None:
+    admission = _admit(
+        "SELECT o.id FROM main.orders AS o "
+        "WHERE (o.status = ? AND o.customer_id = ?) AND o.id = ? "
+        "ORDER BY o.id LIMIT 5",
+        ("open", "customer-17", "order-29"),
+    )
+
+    assert tuple(
+        (column.column, value) for column, value in admission.exact_equalities
+    ) == (
+        ("status", "open"),
+        ("customer_id", "customer-17"),
+        ("id", "order-29"),
+    )
+
+
 def test_preclaim_identity_needs_no_schema_and_matches_live_admission() -> None:
     query = RawResearchQuery(
         sql="SELECT ID AS ORDER_ID FROM MAIN.ORDERS ORDER BY ID LIMIT 2"
@@ -1119,6 +1162,86 @@ def test_raw_query_reuses_one_schema_load_claim_and_real_sqlite_execution(tmp_pa
         assert len(records) == 1
         assert records[0].result == result
         assert records[0].reconciliation is not None
+    finally:
+        ledger.close()
+
+
+def test_raw_query_persists_nonempty_exact_equality_certificate(tmp_path) -> None:
+    loaded, _loader, _plugin, runtime = _sqlite_execution_fixture(tmp_path)
+    query = RawResearchQuery(
+        sql=(
+            "SELECT f.sale_id FROM sales_fact AS f "
+            "WHERE f.sale_id = ? ORDER BY f.sale_id LIMIT 2"
+        ),
+        parameters=(1,),
+    )
+    identity = derive_research_query_identity(
+        query,
+        dialect="sqlite",
+        namespace="main",
+        schema_namespace_version=f"sha256:{loaded.namespace.version_key}",
+    )
+    budget, ledger = _budget(
+        tmp_path,
+        loaded.namespace,
+        identity,
+        suffix="exact-equality",
+    )
+    try:
+        result = _supervised(
+            lambda: execute_raw_research_query(query, runtime=runtime, budget=budget)
+        )
+        payload = read_probe_payload(result)
+
+        assert result.status is ProbeStatus.SUCCESS
+        assert payload["rows"] == [[1]]
+        assert payload["exact_equalities"] == [
+            {
+                "column": {
+                    "table": {
+                        "namespace": "main",
+                        "schema": "main",
+                        "table": "sales_fact",
+                    },
+                    "column": "sale_id",
+                },
+                "value": 1,
+            }
+        ]
+    finally:
+        ledger.close()
+
+
+def test_unmatched_aggregate_probe_does_not_persist_value_certificate(tmp_path) -> None:
+    loaded, _loader, _plugin, runtime = _sqlite_execution_fixture(tmp_path)
+    query = RawResearchQuery(
+        sql=(
+            "SELECT COUNT(*) AS n FROM sales_fact AS f "
+            "WHERE f.sale_id = ? ORDER BY n LIMIT 1"
+        ),
+        parameters=(999,),
+    )
+    identity = derive_research_query_identity(
+        query,
+        dialect="sqlite",
+        namespace="main",
+        schema_namespace_version=f"sha256:{loaded.namespace.version_key}",
+    )
+    budget, ledger = _budget(
+        tmp_path,
+        loaded.namespace,
+        identity,
+        suffix="unmatched-aggregate",
+    )
+    try:
+        result = _supervised(
+            lambda: execute_raw_research_query(query, runtime=runtime, budget=budget)
+        )
+        payload = read_probe_payload(result)
+
+        assert result.status is ProbeStatus.SUCCESS
+        assert payload["rows"] == [[0]]
+        assert "exact_equalities" not in payload
     finally:
         ledger.close()
 

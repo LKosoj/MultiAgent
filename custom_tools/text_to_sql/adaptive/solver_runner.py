@@ -316,21 +316,6 @@ def _run_pre_execution_stages(
         deterministic_result = evaluate_semantic_authority_checks(
             semantic_input, research_state, dsn
         )
-        if (
-            result_review_repair
-            and deterministic_result.failure_code
-            is CheckFailureCode.UNAUTHORIZED_LITERAL
-        ):
-            return CheckResult(
-                check_id=f"semantic:{candidate.candidate_id}:passed",
-                candidate_id=candidate.candidate_id,
-                check_kind=CheckKind.SEMANTIC,
-                status=CheckStatus.PASSED,
-                failure_code=None,
-                affected_source_ids=(),
-                affected_ast_node_ids=(),
-                observed_error=None,
-            )
         return adapt_semantic_authority_check_result(semantic_input, deterministic_result)
 
     stages = (

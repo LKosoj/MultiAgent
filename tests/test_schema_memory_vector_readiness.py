@@ -273,6 +273,85 @@ def test_non_ready_vector_uses_sqlite_lexical_schema_search(monkeypatch, tmp_pat
     assert manager.last_search_status == "sqlite_lexical_ok"
 
 
+def test_embedding_query_failure_uses_sqlite_lexical_schema_search(
+    monkeypatch, tmp_path
+):
+    import memory.index_consistency as consistency_module
+    import memory.manager as manager_module
+    from memory.manager import EmbeddingFailedError
+
+    handler = _disabled_handler(monkeypatch, tmp_path)
+    handler.set_vector_readiness(VectorReadiness.READY, "test")
+    namespace = _namespace()
+    semantic_id = canonical_schema_table_id(namespace.version_key, "sales.orders")
+    _save_schema_row(
+        handler,
+        session_id=namespace.version_key,
+        agent_name="Schema-RAG-Agent",
+        data={
+            "cache_kind": "schema_table",
+            "semantic_id": semantic_id,
+            "table_fqn": "sales.orders",
+            "table_name": "orders",
+            "description": "Customer purchase orders",
+            "table_info": {
+                "table_name": "sales.orders",
+                "description": "Customer purchase orders",
+                "columns": [],
+            },
+        },
+    )
+    collection = SimpleNamespace(metadata={"hnsw:space": "l2"}, configuration=None)
+    fake_memory_manager = SimpleNamespace(
+        db_handler=handler,
+        get_sqlite_connection=handler.get_connection,
+        get_tactical_collection=lambda: collection,
+        search_semantic_with_scores=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            EmbeddingFailedError("embedding gateway timed out")
+        ),
+    )
+    monkeypatch.setattr(manager_module, "memory_manager", fake_memory_manager)
+    monkeypatch.setattr(consistency_module, "memory_manager", fake_memory_manager)
+    monkeypatch.setattr(
+        consistency_module,
+        "reconcile_tactical_namespace",
+        lambda **_kwargs: SimpleNamespace(exact=True, expected_ids=(semantic_id,)),
+    )
+
+    def get_memory(*, session_id, **_kwargs):
+        assert session_id == namespace.version_key
+        conn = handler.get_connection()
+        try:
+            rows = conn.execute(
+                "SELECT agent_name, step, data FROM agent_memory "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [
+            {"agent_name": agent_name, "step": step, "data": json.loads(data)}
+            for agent_name, step, data in rows
+        ]
+
+    monkeypatch.setitem(
+        sys.modules,
+        "memory.tools",
+        SimpleNamespace(
+            get_memory=get_memory,
+            memory_requester_context=lambda _name: contextlib.nullcontext(),
+        ),
+    )
+
+    manager = SchemaMemoryManager(tmp_path)
+
+    assert manager.find_semantic_relevant_tables(
+        ["orders"], namespace=namespace
+    ) == ["sales.orders"]
+    assert handler.vector_readiness is VectorReadiness.UNAVAILABLE
+    assert manager.last_search_status == "sqlite_lexical_ok"
+
+
 def test_vector_readiness_probe_errors_fall_back_to_sqlite(monkeypatch, tmp_path):
     import memory.index_consistency as consistency_module
     import memory.manager as manager_module

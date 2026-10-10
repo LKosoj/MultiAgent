@@ -37,6 +37,7 @@ from custom_tools.text_to_sql.adaptive.result_validation import (
     RESULT_VALIDATION_RUNTIME_KEY,
     create_result_validation_capability,
 )
+from custom_tools.text_to_sql.adaptive import result_review as result_review_module
 from custom_tools.text_to_sql.adaptive.result_review import (
     RESULT_REVIEW_REQUIRED_RUNTIME_KEY,
     RESULT_REVIEW_RUNTIME_KEY,
@@ -284,6 +285,11 @@ def test_terminal_returns_model_review_receipt_without_persistence(monkeypatch) 
     assert "use min and max respectively as their exact result labels" in prompt[
         "instruction"
     ].lower()
+    assert "names a status phrase and its negated form" in prompt[
+        "instruction"
+    ].lower()
+    assert "treat both phrases as exact text labels" in prompt["instruction"].lower()
+    assert "generic true/false values" in prompt["instruction"].lower()
     assert "row multiplication or surprising result magnitude alone" in prompt[
         "instruction"
     ].lower()
@@ -386,12 +392,15 @@ def test_result_review_prompts_for_grain_and_allows_single_observation() -> None
         assert payload["columns"] == ["entity", "period", "metric"]
         assert payload["data"] == [["entity-a", "period-1", 4]]
         instruction = payload["instruction"]
-        grain_rule = "First determine the requested result grain."
+        binding_rule = "First check every required binding in its requested semantic role"
+        grain_rule = "Then determine the requested result grain."
         general_rule = "do not add an aggregation solely"
         if (
             "cannot be consistent" not in instruction
             or "multiple subperiod rows for each entity" not in instruction
+            or binding_rule not in instruction
             or grain_rule not in instruction
+            or instruction.index(binding_rule) > instruction.index(grain_rule)
             or instruction.index(grain_rule) > instruction.index(general_rule)
         ):
             return json.dumps({"status": "consistent", "reason": "raw row accepted"})
@@ -430,12 +439,57 @@ def test_result_review_prompts_for_grain_and_allows_single_observation() -> None
     assert "entity-level computation over a period" in prompts[0]["instruction"]
     assert "extremal raw observation" in prompts[0]["instruction"]
     assert "cannot be consistent" in prompts[0]["instruction"]
-    assert prompts[0]["instruction"].startswith("First determine the requested result grain.")
+    assert prompts[0]["instruction"].startswith(
+        "First check every required binding in its requested semantic role"
+    )
+    checklist = prompts[0]["review_binding_role_checklist"]
+    assert checklist["instruction"] == (
+        "Before returning consistent, compare every item below with the SQL in its "
+        "required semantic role. If the requested meaning and selected physical "
+        "column conflict with trusted schema descriptions, return "
+        "semantic_binding_mismatch for this binding."
+    )
+    assert checklist["items"] == [
+        {
+            "binding_id": binding.binding_id,
+            "binding_kind": binding.kind,
+            "columns": [column.model_dump(mode="json") for column in binding.columns],
+            "normalized_meaning": item.normalized_meaning,
+            "predicates": [
+                predicate.model_dump(mode="json") for predicate in binding.predicates
+            ],
+            "requested_output": item.source_id
+            in period_state.query_spec.requested_output_source_ids,
+            "required_role": item.kind,
+            "source_handle": f"r{index}",
+            "source_id": item.source_id,
+            "source_text": item.source_text,
+        }
+        for index, (item, binding) in enumerate(
+            zip(
+                period_state.query_spec.semantic_items,
+                period_requirements.selected_bindings,
+                strict=True,
+            ),
+            1,
+        )
+    ]
+    encoded_prompt = json.dumps(prompts[0], sort_keys=True)
+    assert encoded_prompt.index('"review_binding_role_checklist"') > encoded_prompt.index(
+        '"query_spec"'
+    )
+    assert prompts[0]["instruction"].index(
+        "Then determine the requested result grain."
+    ) < prompts[0]["instruction"].index("do not add an aggregation solely")
     assert (
         "each required FILTER or TIME predicate that defines its population must apply "
         "to every numerator and denominator term" in prompts[0]["instruction"]
     )
     assert "explicitly requires separate populations" in prompts[0]["instruction"]
+    assert (
+        "percentage in, within, or among a named group" in prompts[0]["instruction"]
+    )
+    assert "global numerator or a separate baseline population" in prompts[0]["instruction"]
 
     single_state = state.model_copy(
         update={
@@ -1632,6 +1686,10 @@ def test_result_review_rejects_count_identifier_sibling_fanout_without_detail_un
             "only when the question or trusted document explicitly names those rows as its "
             "counting unit"
         )
+        measured_population_rule = (
+            "determine the measured population from the aggregate arguments, not from whether "
+            "a qualifying predicate is stored in the same formula item"
+        )
         has_assets = any(
             binding["source_id"] == "measured-assets"
             and binding["physical_column"]["table"]["table"] == "assets"
@@ -1644,7 +1702,13 @@ def test_result_review_rejects_count_identifier_sibling_fanout_without_detail_un
             and binding["discriminator_predicate"]["right"] == "passed"
             for binding in payload["bindings"]
         )
-        if not (required_rule in instruction and explicit_boundary in instruction and has_assets and has_inspections):
+        if not (
+            required_rule in instruction
+            and explicit_boundary in instruction
+            and measured_population_rule in instruction
+            and has_assets
+            and has_inspections
+        ):
             return json.dumps({"status": "consistent", "reason": "the percentage executed"})
         return json.dumps(
             {
@@ -1768,6 +1832,116 @@ def test_result_review_checks_audit_logic_finding_against_formula_and_ast() -> N
     assert receipt.verdict == "contradicted"
     assert receipt.source_id == "source-1"
     assert receipt.row_grain_requirement is None
+
+
+def test_result_review_rejects_text_ordering_for_numeric_extremum() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                "driver-nationality",
+                SemanticItemKind.DIMENSION,
+                "driver_results",
+                "nationality",
+            ),
+            ItemSpec(
+                "fastest-speed",
+                SemanticItemKind.METRIC,
+                "driver_results",
+                "fastest_lap_speed",
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": (
+                        "What is the nationality of the driver with the fastest lap speed?"
+                    ),
+                    "requested_output_source_ids": ("driver-nationality",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    sql = (
+        "SELECT r.nationality FROM driver_results r "
+        "ORDER BY r.fastest_lap_speed DESC LIMIT 1"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-text-numeric-order")
+    candidate = SqlCandidate(
+        candidate_id="terminal-text-numeric-order",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"]
+        required = (
+            "required numeric measure or numeric extremum",
+            "stored in a textual physical column",
+            "require an explicit numeric conversion before comparison",
+            "Do not infer numeric meaning from a column name alone",
+        )
+        if not all(clause in instruction for clause in required):
+            return json.dumps(
+                {"status": "consistent", "reason": "text ordering accepted"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "text ordering does not compute a numeric maximum",
+                "source_id": "fastest-speed",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(),
+        schema={
+            "main.driver_results": {
+                "description": "Driver race results.",
+                "columns": {
+                    "nationality": {"type": "TEXT"},
+                    "fastest_lap_speed": {
+                        "type": "TEXT",
+                        "description": "Fastest lap speed in km/h.",
+                    },
+                },
+            }
+        },
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["Italian"]]),
+            "columns": ["nationality"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id == "fastest-speed"
 
 
 @pytest.mark.parametrize(
@@ -2056,6 +2230,92 @@ def test_result_review_preserves_plain_count_in_exact_ratio_formula() -> None:
     )
 
     assert receipt.verdict == "consistent"
+
+
+def test_result_review_rejects_numeric_sum_of_entity_identifier_in_percentage() -> None:
+    state, _, _, _ = _case()
+    formula = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.FORMULA,
+            "source_text": "eligible account percentage",
+            "normalized_meaning": (
+                "SUM(account_label WHERE status = 'eligible') / "
+                "COUNT(account_label) * 100"
+            ),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Return the percentage of eligible accounts.",
+                    "semantic_items": (formula,),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT CAST(SUM(CASE WHEN a.status = 'eligible' THEN a.account_label END) "
+        "AS REAL) / COUNT(a.account_label) * 100 FROM accounts a"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-identifier-sum-ratio")
+    candidate = SqlCandidate(
+        candidate_id="terminal-identifier-sum-ratio",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = " ".join(json.loads(prompt)["instruction"].split()).lower()
+        required_rule = (
+            "in a ratio or percentage, sum(identifier where predicate) is count "
+            "shorthand when the identifier names the counted entity rather than a "
+            "numeric measure"
+        )
+        if required_rule in instruction:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "entity identifier was summed instead of counted",
+                    "source_id": formula.source_id,
+                }
+            )
+        return json.dumps({"status": "consistent", "reason": "literal SUM retained"})
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(
+            "Percentage = SUM(account_label WHERE status = 'eligible') / "
+            "COUNT(account_label) * 100.",
+        ),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[0.0]]),
+            "columns": ["percentage"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "contradicted"
 
 
 def test_result_review_rejects_text_formatted_numeric_metric() -> None:
@@ -2638,6 +2898,216 @@ def test_result_review_does_not_require_both_alternative_endpoints_for_one_outpu
     assert receipt.verdict == "consistent"
 
 
+def test_result_review_rejects_one_endpoint_when_all_relationship_entities_are_requested() -> None:
+    join_path = (inner_join("items", "id", "relations", "left_id"),)
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="related-category",
+                kind=SemanticItemKind.DIMENSION,
+                table="items",
+                column="category",
+                join_path=join_path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "List the categories of all items in the selected relationships.",
+                    "requested_output_source_ids": ("related-category",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    sql = (
+        "SELECT DISTINCT i.category FROM items i "
+        "INNER JOIN relations r ON i.id = r.left_id"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-all-endpoints")
+    candidate = SqlCandidate(
+        candidate_id="terminal-all-endpoints",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"].lower()
+        if not all(
+            clause in instruction
+            for clause in (
+                "relationship row contains two endpoint columns",
+                "all entities participating in those relationships",
+                "using only one endpoint is contradicted",
+                "not ambiguous",
+                "repair_kind null",
+            )
+        ):
+            return json.dumps(
+                {
+                    "status": "ambiguous",
+                    "reason": "the second endpoint might be required",
+                    "source_id": "related-category",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "the SQL omits entities stored in the second endpoint",
+                "source_id": "related-category",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(
+            "Each relationship row stores its two participating items in left_id and right_id.",
+        ),
+        model=reviewer,
+        schema={
+            "main.items": {"columns": {"id": {}, "category": {}}},
+            "main.relations": {"columns": {"left_id": {}, "right_id": {}}},
+        },
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["retail"]]),
+            "columns": ["category"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.repair_kind is None
+
+
+def test_result_review_defers_discovered_peer_role_projection_to_model() -> None:
+    left = _coverage_column("relations", "left_id")
+    right = _coverage_column("relations", "right_id")
+    left_evidence = _schema_evidence("peer-left-evidence", left)
+    right_evidence = _schema_evidence("peer-right-evidence", right)
+    left_binding = PhysicalColumnBinding(
+        binding_id="peer-left-binding",
+        source_id="relationship-participant",
+        tables=(left.table,),
+        columns=(left,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(left_evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="coverage",
+        physical_column=left,
+    )
+    right_binding = PhysicalColumnBinding(
+        binding_id="peer-right-binding",
+        source_id="relationship-participant",
+        tables=(right.table,),
+        columns=(right,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(right_evidence.evidence_id,),
+        confidence=1.0,
+        status=BindingStatus.CANDIDATE,
+        validator_rule=None,
+        physical_column=right,
+    )
+    state = _coverage_state(
+        item_specs=((
+            "relationship-participant",
+            True,
+            SemanticItemStatus.RESOLVED,
+            (left_binding.binding_id,),
+        ),),
+        bindings=(left_binding, right_binding),
+        evidence=(left_evidence, right_evidence),
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Return both participants of each relationship.",
+                    "requested_output_source_ids": ("relationship-participant",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=left_evidence.observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    sql = "SELECT r.left_id, r.right_id FROM relations r"
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-peer-roles")
+    candidate = SqlCandidate(
+        candidate_id="terminal-peer-roles",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+    model_calls = 0
+
+    def reviewer(_prompt: str) -> str:
+        nonlocal model_calls
+        model_calls += 1
+        return json.dumps(
+            {"status": "consistent", "reason": "both peer roles are requested"}
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(),
+        schema={"main.relations": {"columns": {"left_id": {}, "right_id": {}}}},
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["a", "b"]]),
+            "columns": ["left_id", "right_id"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+    assert receipt.deterministic_failure_code is None
+    assert model_calls == 1
+
+
 def test_result_review_does_not_infer_distinct_for_counted_entity_join() -> None:
     state, requirements, _, _ = _case()
     state = state.model_copy(
@@ -2881,6 +3351,96 @@ def test_result_review_does_not_invent_aggregation_for_scalar_answer() -> None:
     assert len(prompts) == 1
 
 
+def test_result_review_requires_requested_population_metric_across_detail_rows() -> None:
+    state, _, _, _ = _case()
+    metric_item = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "kind": SemanticItemKind.METRIC,
+            "source_text": "total quantity across the qualifying locations",
+            "normalized_meaning": (
+                "sum the stored quantity across all qualifying location rows"
+            ),
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": (
+                        "What is the total quantity across the qualifying locations?"
+                    ),
+                    "semantic_items": (metric_item,),
+                    "requested_output_source_ids": (metric_item.source_id,),
+                    "expected_result_shape": ExpectedResultShape.SCALAR,
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    parsed = parse_sql_candidate(SQL, POSTGRES_DSN, "terminal-population-metric-review")
+    candidate = SqlCandidate(
+        candidate_id="terminal-population-metric-review",
+        sql=SQL,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = " ".join(json.loads(prompt)["instruction"].lower().split())
+        if all(
+            clause in instruction
+            for clause in (
+                "required requested metric asks for one aggregate measure over the complete qualifying population",
+                "selecting the stored measure separately for each qualifying row does not compute that metric",
+                "this rule follows the metric meaning, not expected_result_shape or singular grammar",
+            )
+        ):
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "detail values do not compute the requested population metric",
+                    "source_id": "source-1",
+                    "repair_kind": None,
+                    "repair_binding_id": None,
+                    "predicate_authority": None,
+                    "row_grain_requirement": None,
+                }
+            )
+        return json.dumps(
+            {"status": "consistent", "reason": "detail values were accepted"}
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=SQL,
+        execution=_executor_result([[40], [335]]),
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id == "source-1"
+
+
 def test_result_review_does_not_infer_period_from_historical_storage() -> None:
     state, requirements, candidate, _ = _case()
     state = state.model_copy(
@@ -3032,6 +3592,65 @@ def test_result_review_does_not_treat_aggregate_silence_as_formula_conflict() ->
     assert receipt.verdict == "consistent"
 
 
+def test_result_review_rejects_formula_operand_that_silently_selects_one_row() -> None:
+    state = _projection_review_state(
+        requested_output_source_ids=("projection-total",)
+    )
+    entity_item, total_item = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Compare two filtered measurements.",
+                    "semantic_items": (
+                        entity_item,
+                        total_item.model_copy(
+                            update={
+                                "kind": SemanticItemKind.FORMULA,
+                                "source_text": "filtered measurement comparison",
+                                "normalized_meaning": "compare all matching measurements",
+                            }
+                        ),
+                    ),
+                }
+            )
+        }
+    )
+    sql = (
+        "SELECT (SELECT i.amount FROM items i WHERE i.id > 0) "
+        "- (SELECT i.amount FROM items i WHERE i.id < 0)"
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"]
+        if (
+            "required FORMULA operand can match multiple rows" not in instruction
+            or "unbounded scalar subquery that silently selects one matching row"
+            not in instruction
+        ):
+            return json.dumps(
+                {"status": "consistent", "reason": "the scalar expression executed"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "the formula discards matching measurement rows",
+                "source_id": "projection-total",
+            }
+        )
+
+    receipt = _projection_review(
+        state,
+        sql,
+        reviewer,
+        documents=("Each filter can match multiple measurement rows.",),
+        execution_data=[[-3]],
+        execution_columns=["difference"],
+    )
+
+    assert receipt.verdict == "contradicted"
+
+
 def test_result_review_distinguishes_tied_winners_from_all_ranked_groups() -> None:
     state, requirements, _, _ = _case()
     state = state.model_copy(
@@ -3103,7 +3722,7 @@ def test_result_review_distinguishes_tied_winners_from_all_ranked_groups() -> No
     assert receipt.source_id == "source-1"
 
 
-def test_result_review_rejects_duplicate_bounded_attribute_values() -> None:
+def test_result_review_preserves_duplicate_bounded_values_without_uniqueness() -> None:
     state, requirements, _, _ = _case()
     state = state.model_copy(
         update={
@@ -3135,23 +3754,18 @@ def test_result_review_rejects_duplicate_bounded_attribute_values() -> None:
         payload = json.loads(prompt)
         instruction = payload["instruction"]
         if (
-            "values of an attribute themselves as a set, whether bounded or unbounded"
+            "Words such as list, values, categories, labels, what, or which do not imply uniqueness"
             in instruction
-            and "return each value once" in instruction
-            and "requests rows or entities and merely displays that attribute"
-            in instruction
+            and "Repeated qualifying rows must remain repeated" in instruction
             and payload["data"] == [["new"], ["new"], ["paid"]]
         ):
             return json.dumps(
                 {
-                    "status": "contradicted",
-                    "reason": "duplicate attribute values consume the bounded result",
-                    "source_id": "source-1",
+                    "status": "consistent",
+                    "reason": "the question does not request unique values",
                 }
             )
-        return json.dumps(
-            {"status": "consistent", "reason": "duplicate values accepted"}
-        )
+        return json.dumps({"status": "contradicted", "reason": "duplicates rejected"})
 
     review = create_result_review_capability(
         state=state,
@@ -3172,11 +3786,11 @@ def test_result_review_rejects_duplicate_bounded_attribute_values() -> None:
         },
     )
 
-    assert receipt.verdict == "contradicted"
-    assert receipt.source_id == "source-1"
+    assert receipt.verdict == "consistent"
+    assert receipt.source_id is None
 
 
-def test_result_review_rejects_duplicate_unbounded_attribute_values() -> None:
+def test_result_review_preserves_duplicate_unbounded_values_without_uniqueness() -> None:
     state = build_state(
         (
             ItemSpec(
@@ -3220,19 +3834,18 @@ def test_result_review_rejects_duplicate_unbounded_attribute_values() -> None:
     def reviewer(prompt: str) -> str:
         payload = json.loads(prompt)
         if (
-            "values of an attribute themselves as a set, whether bounded or unbounded"
+            "Words such as list, values, categories, labels, what, or which do not imply uniqueness"
             in payload["instruction"]
-            and "return each value once" in payload["instruction"]
+            and "Repeated qualifying rows must remain repeated" in payload["instruction"]
             and payload["data"] == [["linen"], ["linen"], ["wool"]]
         ):
             return json.dumps(
                 {
-                    "status": "contradicted",
-                    "reason": "duplicate values do not form the requested set",
-                    "source_id": "material-value",
+                    "status": "consistent",
+                    "reason": "the question does not request unique values",
                 }
             )
-        return json.dumps({"status": "consistent", "reason": "duplicates accepted"})
+        return json.dumps({"status": "contradicted", "reason": "duplicates rejected"})
 
     review = create_result_review_capability(
         state=state,
@@ -3254,8 +3867,8 @@ def test_result_review_rejects_duplicate_unbounded_attribute_values() -> None:
         },
     )
 
-    assert receipt.verdict == "contradicted"
-    assert receipt.source_id == "material-value"
+    assert receipt.verdict == "consistent"
+    assert receipt.source_id is None
 
 
 def test_result_review_preserves_entity_rows_with_repeated_attribute_values() -> None:
@@ -3308,9 +3921,7 @@ def test_result_review_preserves_entity_rows_with_repeated_attribute_values() ->
     def reviewer(prompt: str) -> str:
         payload = json.loads(prompt)
         if (
-            "values of an attribute themselves as a set, whether bounded or unbounded"
-            in payload["instruction"]
-            and "requests rows or entities and merely displays that attribute, preserve separate rows"
+            "Repeated qualifying rows must remain repeated"
             in payload["instruction"]
             and payload["data"] == [["desk", "wood"], ["shelf", "wood"]]
         ):
@@ -3356,9 +3967,9 @@ def test_result_review_rejects_aggregate_for_dimension_only_output() -> None:
             and "requested outputs are only DIMENSION items" in instruction
             and "aggregate projection or GROUP BY" in instruction
             and "Use root DISTINCT only when the question or QuerySpec explicitly requests "
-            "unique or distinct, or trusted evidence proves the entire root projection is "
-            "one-to-one at the required result grain, for example because the projected entity "
-            "identity is unique; otherwise preserve all qualifying rows" in instruction
+            in instruction
+            and "Words such as list, values, categories, labels, what, or which do not imply uniqueness"
+            in instruction
             and "When the requested output is a proven unique identity of a root entity and a "
             "joined child relation is used only to qualify that entity, with no child output "
             "requested, return each qualifying root identity once" in instruction
@@ -3576,6 +4187,199 @@ def test_result_review_does_not_invent_discriminator_from_role_name(
 
 
 @pytest.mark.parametrize(
+    ("documents", "expected_verdict"),
+    (
+        ((), "consistent"),
+        (("Only members linked to an archived request belong to the population.",), "contradicted"),
+    ),
+)
+def test_result_review_does_not_invent_population_from_unmodeled_introductory_phrase(
+    documents: tuple[str, ...],
+    expected_verdict: str,
+) -> None:
+    state, requirements, candidate, _ = _case()
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Among archived requests, list verified members."
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"].lower()
+        required_clauses = (
+            "queryspec is the authoritative list of required semantic items",
+            "must not introduce a new entity, relationship, filter, or population requirement",
+            "required semantic item or trusted document or evidence",
+        )
+        if not all(clause in instruction for clause in required_clauses):
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the introductory phrase implies an additional population filter",
+                    "source_id": "source-1",
+                }
+            )
+        if payload["documents"]:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the trusted document explicitly requires the population filter",
+                    "source_id": "source-1",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the SQL implements every required semantic item",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parse_sql_candidate(SQL, POSTGRES_DSN, candidate.candidate_id),
+        documents=documents,
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=SQL,
+        execution=_executor_result([["verified"]]),
+    )
+
+    assert receipt.verdict == expected_verdict
+
+
+def test_result_review_does_not_reassign_owner_of_confirmed_entity_filter() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="named-record",
+                kind=SemanticItemKind.FILTER,
+                table="localized_records",
+                column="record_name",
+                operator=PredicateOperator.EQ,
+                literal="Copper Finch",
+            ),
+            ItemSpec(
+                source_id="record-language",
+                kind=SemanticItemKind.DIMENSION,
+                table="localized_records",
+                column="language_code",
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Which languages list Copper Finch?",
+                    "requested_output_source_ids": ("record-language",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT DISTINCT language_code FROM localized_records "
+        "WHERE record_name = 'Copper Finch'"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-confirmed-name-filter")
+    candidate = SqlCandidate(
+        candidate_id="terminal-confirmed-name-filter",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"]
+        required_rule = (
+            "The owner checklist governs requested output attributes; it must not replace a "
+            "selected exact FILTER predicate that the AST follows"
+        )
+        if required_rule not in instruction:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the named entity should be identified through the catalog table",
+                    "source_id": "named-record",
+                    "repair_kind": "semantic_binding_mismatch",
+                    "repair_binding_id": payload["bindings"][0]["binding_id"],
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the AST follows the confirmed identifying predicate",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(
+            "localized_records.record_name stores the localized record name.",
+            "catalog_records.record_name stores the canonical record name.",
+        ),
+        model=reviewer,
+        schema={
+            "main.localized_records": {
+                "description": "Localized record representations.",
+                "columns": {
+                    "record_name": {"description": "Localized record name."},
+                    "language_code": {"description": "Representation language."},
+                },
+            },
+            "main.catalog_records": {
+                "description": "Canonical records.",
+                "columns": {
+                    "record_name": {"description": "Canonical record name."}
+                },
+            },
+        },
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["xx"]]),
+            "columns": ["language_code"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+
+
+@pytest.mark.parametrize(
     ("document", "sql", "query_literal", "alternative_rows", "expected_verdict"),
     (
         (
@@ -3754,7 +4558,8 @@ def test_result_review_keeps_confirmed_discriminator_representation_despite_alia
             "does not override the selected observed physical spelling"
         )
         positive_evidence_rule = (
-            "an alternative literal may contradict the selected exact discriminator only when "
+            "an alternative literal may contradict or make ambiguous the selected exact "
+            "discriminator only when "
             "separate durable exact db evidence positively contains that alternative for the same "
             "physical column and operator"
         )
@@ -3864,6 +4669,115 @@ def test_result_review_keeps_confirmed_discriminator_representation_despite_alia
     assert receipt.verdict == expected_verdict
 
 
+def test_result_review_does_not_reopen_document_mapped_filter_for_malformed_label() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="fictional-tier",
+                kind=SemanticItemKind.FILTER,
+                table="fictional_records",
+                column="tier_code",
+                operator=PredicateOperator.EQ,
+                literal="stored-blue",
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "List records in the bluergreen tier.",
+                    "semantic_items": (
+                        state.query_spec.semantic_items[0].model_copy(
+                            update={
+                                "source_text": "bluergreen tier",
+                                "normalized_meaning": (
+                                    "The malformed label does not establish the documented tier."
+                                ),
+                                "literal_or_reference": "bluergreen tier",
+                            }
+                        ),
+                    ),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT f.tier_code FROM fictional_records f "
+        "WHERE f.tier_code = 'stored-blue'"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-malformed-label")
+    candidate = SqlCandidate(
+        candidate_id="terminal-malformed-label",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"].lower()
+        required_rule = (
+            "final mandatory exact-discriminator authority check: when one trusted "
+            "document directly and unambiguously maps the same required filter source "
+            "to an exact physical column, operator and literal, and a selected supported "
+            "discriminator_value and the ast follow that mapping, do not reopen it as "
+            "ambiguous only because the question or queryspec contains a malformed or "
+            "ambiguous surface label for that source"
+        )
+        assert payload["documents"] == [
+            "Blue tier refers to tier_code = 'stored-blue'."
+        ]
+        assert payload["bindings"][0]["discriminator_predicate"]["right"] == (
+            "stored-blue"
+        )
+        if required_rule not in instruction:
+            return json.dumps(
+                {
+                    "status": "ambiguous",
+                    "reason": "the malformed surface label does not equal the document term",
+                    "source_id": "fictional-tier",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the exact documented filter is preserved",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=("Blue tier refers to tier_code = 'stored-blue'.",),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["stored-blue"]]),
+            "columns": ["tier_code"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+
+
 @pytest.mark.parametrize(
     (
         "alternative_rows",
@@ -3874,6 +4788,7 @@ def test_result_review_keeps_confirmed_discriminator_representation_despite_alia
     ),
     (
         ((), False, "status_code = 'stored-approved'", "bare", "consistent"),
+        ((), False, "status_code = 'stored-approved'", "ambiguous", "consistent"),
         (("document-alternative",), False, "status_code = 'stored-approved'", "bare", "contradicted"),
         ((), True, "status_code = 'stored-approved'", "bare", "contradicted"),
         ((), False, "status_code != 'stored-approved'", "bare", "contradicted"),
@@ -3881,9 +4796,11 @@ def test_result_review_keeps_confirmed_discriminator_representation_despite_alia
         ((), False, "status_code = 'stored-approved'", "semantic_repair", "contradicted"),
         ((), False, "status_code = 'stored-approved'", "predicate_authority", "contradicted"),
         ((), False, "status_code = 'stored-approved'", "row_grain", "contradicted"),
+        ((), False, "status_code = 'document-alternative'", "consistent", "contradicted"),
     ),
     ids=(
         "untruncated_empty_exact_search",
+        "untruncated_empty_exact_search_ambiguous",
         "positive_exact_search",
         "truncated_empty_exact_search",
         "wrong_operator",
@@ -3891,6 +4808,7 @@ def test_result_review_keeps_confirmed_discriminator_representation_despite_alia
         "semantic_repair",
         "predicate_authority",
         "row_grain",
+        "consistent_zero_row_alternative",
     ),
 )
 def test_result_review_requires_positive_exact_evidence_for_alternative_discriminator(
@@ -3971,6 +4889,7 @@ def test_result_review_requires_positive_exact_evidence_for_alternative_discrimi
             "query_spec": state.query_spec.model_copy(
                 update={
                     "original_text": "List fictional records with the documented status.",
+                    "requested_output_source_ids": ("fictional-status",),
                     "semantic_items": (
                         state.query_spec.semantic_items[0].model_copy(
                             update={"literal_or_reference": "document-alternative"}
@@ -4018,7 +4937,8 @@ def test_result_review_requires_positive_exact_evidence_for_alternative_discrimi
         revision=state.revision,
     )
     rule = (
-        "An alternative literal may contradict the selected exact discriminator only when "
+        "An alternative literal may contradict or make ambiguous the selected exact "
+        "discriminator only when "
         "separate durable exact DB evidence positively contains that alternative for the same "
         "physical column and operator. QuerySpec/document wording and an untruncated exact "
         "search with rows=[] do not prove the stored literal."
@@ -4047,9 +4967,15 @@ def test_result_review_requires_positive_exact_evidence_for_alternative_discrimi
         }
         assert rule in payload["instruction"]
         response = {
-            "status": "contradicted",
+            "status": (
+                "consistent"
+                if response_kind == "consistent"
+                else "ambiguous"
+                if response_kind == "ambiguous"
+                else "contradicted"
+            ),
             "reason": "the document alternative overrides the selected literal",
-            "source_id": "fictional-status",
+            "source_id": None if response_kind == "consistent" else "fictional-status",
         }
         if response_kind == "semantic_repair":
             response["repair_kind"] = "semantic_binding_mismatch"
@@ -4077,7 +5003,11 @@ def test_result_review_requires_positive_exact_evidence_for_alternative_discrimi
         expected_run_id=state.run_id,
         expected_sql=sql,
         execution={
-            **_executor_result([["stored-approved"]]),
+            **_executor_result(
+                [["document-alternative"]]
+                if response_kind == "consistent"
+                else [["stored-approved"]]
+            ),
             "columns": ["status_code"],
             "sql_query": sql,
         },
@@ -4421,6 +5351,69 @@ def test_result_review_does_not_infer_entity_grain_from_display_attribute() -> N
     assert receipt.verdict == "ambiguous"
     assert receipt.source_id == "source-1"
     assert len(prompts) == 1
+
+
+def test_result_review_preserves_explicit_attribute_defined_groups() -> None:
+    state, requirements, _, _ = _case()
+    sql = (
+        "SELECT o.status FROM orders o GROUP BY o.status "
+        "ORDER BY SUM(o.score) DESC LIMIT 1"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-explicit-label-groups")
+    candidate = SqlCandidate(
+        candidate_id="terminal-explicit-label-groups",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"]
+        if (
+            "question or an exact trusted formula explicitly defines the compared groups "
+            "by that attribute" not in instruction
+        ):
+            return json.dumps(
+                {
+                    "status": "ambiguous",
+                    "reason": "the grouping attribute is not proven unique per entity",
+                    "source_id": "source-1",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the SQL preserves the explicitly defined attribute groups",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=("Compare SUM(score) for each named status value.",),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([["open"]]),
+            "columns": ["status"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
 
 
 def test_result_review_rejects_computation_that_differs_from_document() -> None:
@@ -4837,6 +5830,214 @@ def test_result_review_checks_nested_computation_order() -> None:
     )
 
 
+def test_result_review_keeps_explicit_entity_grain_over_row_formula_shorthand() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="matching-child-average",
+                kind=SemanticItemKind.FORMULA,
+                table="children",
+                column="kind",
+                join_path=(inner_join("parents", "id", "children", "parent_id"),),
+            ),
+            ItemSpec(
+                source_id="parent-grain",
+                kind=SemanticItemKind.DIMENSION,
+                table="parents",
+                column="id",
+            ),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+    )
+    formula, grain = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": (
+                        "Calculate the average number of matching children per parent."
+                    ),
+                    "semantic_items": (
+                        formula.model_copy(
+                            update={
+                                "source_text": "average number of matching children",
+                                "normalized_meaning": (
+                                    "count matching children separately for every parent, "
+                                    "including zero, then average those parent counts"
+                                ),
+                            }
+                        ),
+                        grain.model_copy(
+                            update={
+                                "source_text": "per parent",
+                                "normalized_meaning": (
+                                    "parent is the required per-entity calculation grain"
+                                ),
+                            }
+                        ),
+                    ),
+                    "requested_output_source_ids": ("matching-child-average",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT AVG(match_count) FROM ("
+        "SELECT p.id, COUNT(CASE WHEN c.kind = 'target' THEN 1 END) AS match_count "
+        "FROM parents p LEFT JOIN children c ON c.parent_id = p.id GROUP BY p.id"
+        ") parent_counts"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-entity-grain-formula")
+    candidate = SqlCandidate(
+        candidate_id="terminal-entity-grain-formula",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = payload["instruction"]
+        has_priority_rule = (
+            "An outer aggregation required by an explicit question or QuerySpec grain "
+            "is not an added or reordered operation within a shorthand row expression "
+            "when the document omits its grain or counting unit."
+            in instruction
+        )
+        if has_priority_rule:
+            return json.dumps(
+                {"status": "consistent", "reason": "explicit parent grain is preserved"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "row formula was incorrectly treated as atom-row grain",
+                "source_id": "matching-child-average",
+            }
+        )
+
+    receipt = evaluate_result_review_capability(
+        create_result_review_capability(
+            state=state,
+            requirements=requirements,
+            freshness_context=freshness,
+            candidate=candidate,
+            parsed_ast=parsed,
+            documents=("Use AVG(child.kind = 'target').",),
+            model=reviewer,
+        ),
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[2.0]]),
+            "columns": ["average_count"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+
+
+def test_result_review_preserves_formula_with_explicit_detail_row_unit() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="matching-row-average",
+                kind=SemanticItemKind.FORMULA,
+                table="children",
+                column="kind",
+            ),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+    )
+    formula = state.query_spec.semantic_items[0].model_copy(
+        update={
+            "normalized_meaning": (
+                "AVG(child.kind = 'target') over child rows; each child row is one "
+                "counting unit"
+            )
+        }
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "What fraction of child rows match the target?",
+                    "semantic_items": (formula,),
+                    "requested_output_source_ids": ("matching-row-average",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = "SELECT AVG(CASE WHEN c.kind = 'target' THEN 1.0 ELSE 0.0 END) FROM children c"
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-detail-row-formula")
+    candidate = SqlCandidate(
+        candidate_id="terminal-detail-row-formula",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"]
+        if (
+            "When the document explicitly states its row scope or counting unit, return "
+            "contradicted when the AST adds, removes or reorders an aggregation"
+            in instruction
+        ):
+            return json.dumps(
+                {"status": "consistent", "reason": "explicit child-row unit is preserved"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "explicit child-row unit was replaced",
+                "source_id": "matching-row-average",
+            }
+        )
+
+    receipt = evaluate_result_review_capability(
+        create_result_review_capability(
+            state=state,
+            requirements=requirements,
+            freshness_context=freshness,
+            candidate=candidate,
+            parsed_ast=parsed,
+            documents=(
+                "Compute AVG(child.kind = 'target'); each child row is one counting unit.",
+            ),
+            model=reviewer,
+        ),
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[0.25]]),
+            "columns": ["matching_fraction"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+
+
 def test_result_review_preserves_explicit_parent_absence_grain() -> None:
     state, _, _, _ = _case()
     state = state.model_copy(
@@ -4891,6 +6092,14 @@ def test_result_review_preserves_explicit_parent_absence_grain() -> None:
             "do not contain any matching child" not in instruction
             or "do not by themselves state a child-row result grain" not in instruction
             or "counting unit in semantic terms" not in instruction
+            or (
+                "does not override an explicit inclusion, exclusion, or absence condition"
+                not in instruction
+            )
+            or (
+                "do not contradict a candidate solely for not reproducing the opposite formula"
+                not in instruction
+            )
         ):
             return json.dumps(
                 {
@@ -5042,6 +6251,154 @@ def test_result_review_allows_empty_result_for_exact_filter() -> None:
     assert exact.verdict == "consistent"
     assert mismatch.verdict == "contradicted"
     assert mismatch.source_id == "status-filter"
+
+
+def test_result_review_rejects_global_extremum_outside_joined_candidate_set() -> None:
+    join_path = (inner_join("laboratory", "patient_id", "patients", "id"),)
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="hgb-ranking",
+                kind=SemanticItemKind.METRIC,
+                table="laboratory",
+                column="hgb",
+                join_path=join_path,
+            ),
+            ItemSpec(
+                source_id="patient-diagnosis",
+                kind=SemanticItemKind.DIMENSION,
+                table="patients",
+                column="diagnosis",
+                join_path=join_path,
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": (
+                        "Return the diagnosis of the patient with the highest HGB at examination."
+                    ),
+                    "requested_output_source_ids": ("patient-diagnosis",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = " ".join(payload["instruction"].split())
+        has_rule = (
+            "Final mandatory extremum-scope check" in instruction
+            and "compare the AST scope that computes MIN, MAX, or ranking with the root "
+            "candidate-row scope" in instruction
+            and "An empty result alone remains valid only when the SQL preserves the "
+            "required extremum scope" in instruction
+        )
+        ast = payload["ast"]
+        root_scope_ids = {
+            scope["scope_id"]
+            for scope in ast["scopes"]
+            if scope["query_role"] == "root"
+        }
+        extremum_scope_ids = {
+            aggregate["scope_id"]
+            for aggregate in ast["aggregates"]
+            if aggregate["function"].casefold() in {"min", "max"}
+        }
+        root_tables = {
+            scan["table"]["name"].casefold()
+            for scan in ast["table_scans"]
+            if scan["scope_id"] in root_scope_ids
+        }
+        extremum_tables = {
+            scan["table"]["name"].casefold()
+            for scan in ast["table_scans"]
+            if scan["scope_id"] in extremum_scope_ids
+        }
+        global_extremum_omits_root_relation = (
+            bool(extremum_scope_ids)
+            and bool(root_tables - extremum_tables)
+            and any(
+                scope["query_role"] == "scalar_subquery"
+                and scope["scope_id"] in extremum_scope_ids
+                for scope in ast["scopes"]
+            )
+        )
+        if has_rule and global_extremum_omits_root_relation:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the global maximum may not belong to a joined patient row",
+                    "source_id": "hgb-ranking",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the extremum is evaluated over the joined candidate rows",
+            }
+        )
+
+    def evaluate(sql: str, candidate_id: str) -> ResultReviewReceipt:
+        parsed = parse_sql_candidate(sql, POSTGRES_DSN, candidate_id)
+        candidate = SqlCandidate(
+            candidate_id=candidate_id,
+            sql=sql,
+            normalized_ast_digest=parsed.candidate_digest,
+            revision=state.revision,
+        )
+        review = create_result_review_capability(
+            state=state,
+            requirements=requirements,
+            freshness_context=freshness,
+            candidate=candidate,
+            parsed_ast=parsed,
+            documents=(),
+            model=reviewer,
+        )
+        return evaluate_result_review_capability(
+            review,
+            expected_run_id=state.run_id,
+            expected_sql=sql,
+            execution={
+                **_executor_result([]),
+                "columns": ["diagnosis"],
+                "sql_query": sql,
+            },
+        )
+
+    global_extremum = evaluate(
+        "SELECT p.diagnosis FROM laboratory l "
+        "JOIN patients p ON p.id = l.patient_id "
+        "JOIN examination e ON e.patient_id = p.id "
+        "WHERE l.hgb = (SELECT MAX(hgb) FROM laboratory)",
+        "terminal-global-extremum-review",
+    )
+    joined_extremum = evaluate(
+        "SELECT p.diagnosis FROM laboratory l "
+        "JOIN patients p ON p.id = l.patient_id "
+        "JOIN examination e ON e.patient_id = p.id "
+        "ORDER BY l.hgb DESC LIMIT 1",
+        "terminal-joined-extremum-review",
+    )
+
+    assert global_extremum.verdict == "contradicted"
+    assert global_extremum.source_id == "hgb-ranking"
+    assert joined_extremum.verdict == "consistent"
 
 
 def test_result_review_checks_fixed_positions_against_confirmed_input_format() -> None:
@@ -5414,6 +6771,132 @@ def test_result_review_rejects_birth_year_extraction_as_age_at_event() -> None:
     assert multi_input.verdict == "consistent"
 
 
+def test_result_review_preserves_resolved_physical_inputs_of_document_formula() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="age-at-measurement",
+                kind=SemanticItemKind.FORMULA,
+                table="laboratory",
+                column="measured_at",
+            ),
+        )
+    )
+    (measurement_binding,) = state.bindings
+    assert isinstance(measurement_binding, PhysicalColumnBinding)
+    formula_evidence = _document_evidence(
+        "age-at-measurement-formula",
+        content="Age is year(Examination Date) minus year(Birthday).",
+    )
+    formula_binding = DerivedExpressionBinding(
+        binding_id=measurement_binding.binding_id,
+        source_id=measurement_binding.source_id,
+        tables=(measurement_binding.physical_column.table,),
+        columns=(measurement_binding.physical_column,),
+        predicates=(),
+        join_path=(),
+        evidence_ids=(
+            *measurement_binding.evidence_ids,
+            formula_evidence.evidence_id,
+        ),
+        confidence=1.0,
+        status=BindingStatus.SUPPORTED,
+        validator_rule="coverage",
+        document=DocumentRef(document_id="coverage-document", namespace="main"),
+        expression=ExpressionRef(
+            expression_id="age-at-measurement-expression",
+            expression="year(Examination Date) - year(Birthday)",
+        ),
+        rule_excerpt="Age is year(Examination Date) minus year(Birthday).",
+        input_columns=(measurement_binding.physical_column,),
+    )
+    (formula_item,) = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "bindings": (formula_binding,),
+            "evidence": (*state.evidence, formula_evidence),
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "How old was the patient at the measurement?",
+                    "semantic_items": (formula_item,),
+                    "requested_output_source_ids": (formula_item.source_id,),
+                }
+            ),
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+        document_sources=(
+            DocumentSourceState(
+                document_id="coverage-document",
+                availability=DocumentSourceAvailability.AVAILABLE,
+                source_version="v1",
+            ),
+        ),
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT EXTRACT(YEAR FROM l.measured_at) FROM laboratory l"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "resolved-formula-inputs")
+    candidate = SqlCandidate(
+        candidate_id="resolved-formula-inputs",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        required_rule = (
+            "A derived binding's input_columns are the resolved physical inputs for its "
+            "document formula"
+        )
+        if required_rule not in payload["instruction"]:
+            return json.dumps(
+                {
+                    "status": "contradicted",
+                    "reason": "the document label requires an Examination Date column",
+                    "source_id": "age-at-measurement",
+                    "repair_kind": "semantic_binding_mismatch",
+                    "repair_binding_id": formula_binding.binding_id,
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the SQL uses the formula binding's resolved physical inputs",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=("Age is year(Examination Date) minus year(Birthday).",),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[28]]),
+            "columns": ["age"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
+
+
 def test_result_review_temporal_prompt_preserves_valid_boundaries_and_transforms() -> None:
     state, requirements, candidate, _ = _case()
     prompts: list[str] = []
@@ -5489,9 +6972,20 @@ def test_result_review_final_check_preserves_named_base_population_and_calendar_
         "base entities must preserve the base-entity population when no trusted exact "
         "formula explicitly establishes another counting unit. A related table may qualify "
         "those entities through EXISTS or a deduplicated qualifying-key set without creating "
-        "DISTINCT or entity-once semantics. Explicit relationship/detail-row counting units "
+        "DISTINCT or entity-once semantics. Uniqueness of a related row or its composite key "
+        "does not prove that each counted base-entity key appears only once after the join. "
+        "Explicit relationship/detail-row counting units "
         "and exact formula counting units, including their existing plain COUNT behavior, "
-        "remain exceptions. Return contradicted for a base-population violation or when a "
+        "remain exceptions. For an exact formula whose COUNT inputs share a relational row "
+        "scope, EXISTS, IN, or a deduplicated key set does not preserve qualifying row "
+        "occurrences unless unique, distinct, or entity-once counting is explicitly required; "
+        "return contradicted when the AST makes that substitution. When a requested root entity identity is qualified only by "
+        "joined child rows, repeated root identities contradict the requested entity grain; "
+        "return each qualifying root identity once. This does not apply to counts, metrics, "
+        "formulas, or requested child rows. When the question asks for entity age in an "
+        "explicitly dated historical event, current_timestamp, current_date, or now "
+        "contradicts that event-time age unless current age is explicitly requested. "
+        "Return contradicted for a base-population violation or when a "
         "full date/time value is directly compared with a bare calendar-year literal. A full "
         "date/time value directly compared with a bare calendar-year literal cannot be "
         "consistent. Calendar-year extraction or a trusted full-date boundary remains valid. "
@@ -5499,6 +6993,156 @@ def test_result_review_final_check_preserves_named_base_population_and_calendar_
     )
 
     assert instruction.endswith(final_rule)
+    assert (
+        "When a requested root entity identity is qualified only by joined child "
+        "rows, repeated root identities contradict the requested entity grain"
+        in instruction
+    )
+    assert (
+        "When the question asks for entity age in an explicitly dated historical "
+        "event, current_timestamp, current_date, or now contradicts that event-time "
+        "age unless current age is explicitly requested"
+        in instruction
+    )
+
+
+def test_result_review_preserves_separate_qualifier_and_mapped_measure() -> None:
+    join = inner_join("customers", "id", "accounts", "customer_id")
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="vip-customer",
+                kind=SemanticItemKind.FILTER,
+                table="customers",
+                column="tier",
+                operator=PredicateOperator.EQ,
+                literal="VIP",
+                join_path=(join,),
+            ),
+            ItemSpec(
+                source_id="average-balance",
+                kind=SemanticItemKind.METRIC,
+                table="accounts",
+                column="balance",
+                join_path=(join,),
+            ),
+        ),
+        shape=ExpectedResultShape.SCALAR,
+    )
+    filter_item, measure_item = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "What is the average balance for VIP customers?",
+                    "semantic_items": (
+                        filter_item.model_copy(
+                            update={
+                                "source_text": "VIP customers",
+                                "normalized_meaning": "customers whose tier is VIP",
+                            }
+                        ),
+                        measure_item.model_copy(
+                            update={
+                                "source_text": "average balance",
+                                "normalized_meaning": "average account balance",
+                            }
+                        ),
+                    ),
+                    "requested_output_source_ids": ("average-balance",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state, freshness, state.run_id, state.run_incarnation
+    )
+    sql = (
+        "SELECT AVG(a.balance) AS average_balance FROM accounts a "
+        "JOIN customers c ON c.id = a.customer_id WHERE c.tier = 'VIP'"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "qualified-measure-candidate")
+    candidate = SqlCandidate(
+        candidate_id="qualified-measure-candidate",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        payload = json.loads(prompt)
+        instruction = " ".join(payload["instruction"].split())
+        checklist = {
+            item["source_text"]: item
+            for item in payload["review_binding_role_checklist"]["items"]
+        }
+        expected_rule = (
+            "When QuerySpec keeps a qualifier as a separate required FILTER and trusted "
+            "context independently maps the base measure or attribute to a physical field, "
+            "review that composition as the separate qualifier plus the mapped base measure. "
+            "Do not require one physical field for the whole qualified phrase or reinterpret "
+            "the mapped measure as belonging only to the qualifying rows unless trusted context "
+            "explicitly defines that different meaning."
+        )
+        precedence_rule = (
+            "If trusted context directly maps the whole qualified phrase to one physical field, "
+            "that direct whole-phrase mapping takes precedence over this composition rule."
+        )
+        has_composition = (
+            checklist["VIP customers"]["required_role"] == "filter"
+            and checklist["average balance"]["required_role"] == "metric"
+            and checklist["VIP customers"]["columns"][0]["column"] == "tier"
+            and checklist["average balance"]["columns"][0]["column"] == "balance"
+        )
+        if not has_composition or expected_rule not in instruction or precedence_rule not in instruction:
+            measure = checklist["average balance"]
+            return json.dumps(
+                {
+                    "status": "ambiguous",
+                    "reason": "VIP average balance is treated as a missing VIP-only measure",
+                    "source_handle": measure["source_handle"],
+                    "repair_kind": "semantic_binding_mismatch",
+                    "repair_binding_id": measure["binding_id"],
+                    "predicate_authority": None,
+                    "row_grain_requirement": None,
+                }
+            )
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the separate qualifier and mapped measure are preserved",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(
+            "Customer tier is stored in customers.tier; account balance is stored in accounts.balance.",
+        ),
+        model=reviewer,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[125.0]]),
+            "columns": ["average_balance"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "consistent"
 
 
 def test_result_review_keeps_selected_probe_evidence() -> None:
@@ -5651,6 +7295,103 @@ def test_result_review_does_not_treat_related_proxy_as_requested_attribute() -> 
     assert receipt.repair_binding_id == requirements.selected_bindings[0].binding_id
 
 
+def test_result_review_rejects_proxy_projection_for_confirmed_requested_column() -> None:
+    state = build_state(
+        (
+            ItemSpec(
+                source_id="owner-display-name",
+                kind=SemanticItemKind.DIMENSION,
+                table="users",
+                column="DisplayName",
+            ),
+        )
+    )
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Who owns the selected post?",
+                    "requested_output_source_ids": ("owner-display-name",),
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    sql = (
+        "SELECT p.OwnerDisplayName FROM posts p "
+        "INNER JOIN users u ON p.OwnerUserId = u.Id"
+    )
+    parsed = parse_sql_candidate(sql, POSTGRES_DSN, "terminal-proxy-projection-review")
+    candidate = SqlCandidate(
+        candidate_id="terminal-proxy-projection-review",
+        sql=sql,
+        normalized_ast_digest=parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def reviewer(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"]
+        if (
+            "a different related or proxy column does not satisfy that requested output"
+            not in instruction
+        ):
+            return json.dumps(
+                {
+                    "status": "consistent",
+                    "reason": "the post row has an owner display label",
+                }
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "the SQL projects a proxy instead of the confirmed requested column",
+                "source_id": "owner-display-name",
+            }
+        )
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parsed,
+        documents=(
+            "users.DisplayName is the registered user's display name. "
+            "posts.OwnerDisplayName is an optional label stored on the post row.",
+        ),
+        model=reviewer,
+        schema={
+            "main.users": {"columns": {"DisplayName": {}}},
+            "main.posts": {"columns": {"OwnerDisplayName": {}}},
+        },
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=sql,
+        execution={
+            **_executor_result([[None]]),
+            "columns": ["OwnerDisplayName"],
+            "sql_query": sql,
+        },
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id == "owner-display-name"
+    assert receipt.repair_kind is None
+
+
 def test_result_review_preserves_supported_best_available_entity_proxy() -> None:
     state = build_state(
         (
@@ -5695,9 +7436,16 @@ def test_result_review_preserves_supported_best_available_entity_proxy() -> None
 
     def best_proxy_review(prompt: str) -> str:
         payload = json.loads(prompt)
+        checklist_instruction = payload["review_binding_role_checklist"]["instruction"]
         if (
             "A selected SUPPORTED binding may also preserve that best-available proxy conclusion"
             in payload["instruction"]
+            and "must not independently re-assess whether that proxy is plausible"
+            in payload["instruction"]
+            and "positive trusted fact identifies a different physical attribute"
+            in checklist_instruction
+            and "If the requested meaning and selected physical column conflict"
+            not in checklist_instruction
             and payload["bindings"][0]["status"] == "supported"
         ):
             return json.dumps({"status": "consistent", "reason": "research resolved the proxy"})
@@ -5923,6 +7671,10 @@ def test_result_review_keeps_entity_value_when_event_has_same_attribute() -> Non
             "same-named event or record column is selected instead of the direct column of the named "
             "entity, return contradicted with semantic_binding_mismatch. (4) Conversely, do not reject "
             "a direct named-entity column because an event or record has a same-named column. "
+            "When a requested output has a confirmed direct physical binding, compare the projected "
+            "AST column with that binding: a different related or proxy column does not satisfy that requested output "
+            "without trusted proof of equivalence. Return contradicted targeting the confirmed binding with "
+            "repair_kind null because the SQL projection, not the binding, is wrong. "
             "A qualifying relation that trusted schema describes as another representation of the same "
             "named entity at the same identity key is not an event or record for this checklist: prefer "
                 "its direct qualifying-row label over adding a separate master or entity join solely for "
@@ -6427,6 +8179,31 @@ def test_result_review_canonicalizes_semantic_repair_binding() -> None:
     assert receipt.source_id == "source-1"
     assert receipt.repair_kind == "semantic_binding_mismatch"
     assert receipt.repair_binding_id == requirements.selected_bindings[0].binding_id
+
+
+def test_result_review_accepts_named_repair_among_same_source_bindings() -> None:
+    state, requirements, _, _ = _case()
+    first = requirements.selected_bindings[0]
+    selected = first.model_copy(update={"binding_id": "source-1-selected-binding"})
+    requirements = requirements.model_copy(
+        update={"selected_bindings": (first, selected)}
+    )
+
+    source_id, evidence_id, repair_binding_id = result_review_module._response_target(
+        state,
+        requirements,
+        result_review_module._ModelReviewResponse(
+            status="contradicted",
+            reason="one selected binding contradicts the executed SQL",
+            source_id="source-1",
+            repair_kind="semantic_binding_mismatch",
+            repair_binding_id=selected.binding_id,
+        ),
+    )
+
+    assert source_id == "source-1"
+    assert evidence_id == selected.evidence_ids[0]
+    assert repair_binding_id == selected.binding_id
 
 
 @pytest.mark.parametrize(
@@ -7249,6 +9026,8 @@ def test_result_review_prompt_keeps_parent_role_separate_from_history_row_actor(
             not in instruction
             or "explicitly requests the filter-row actor, author, owner, or updater role"
             not in instruction
+            or "Ordinary ambiguous role wording alone does not explicitly request the "
+            "filter-row role" not in instruction
         ):
             return json.dumps(
                 {
@@ -7618,6 +9397,58 @@ def test_result_review_rejects_unrequested_auxiliary_projection() -> None:
     )
 
     assert requested_receipt.verdict == "consistent"
+
+
+def test_result_review_deterministically_rejects_unrequested_cte_projection() -> None:
+    state = _projection_review_state(
+        requested_output_source_ids=("projection-entity",)
+    )
+    entity_item, total_item = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Which item has the greatest total amount?",
+                    "semantic_items": (
+                        entity_item,
+                        total_item.model_copy(
+                            update={
+                                "kind": SemanticItemKind.FORMULA,
+                                "source_text": "total amount used for comparison",
+                                "normalized_meaning": "SUM(amount) per item",
+                            }
+                        ),
+                    ),
+                }
+            )
+        }
+    )
+    sql = (
+        "WITH totals AS ("
+        "SELECT i.id, SUM(i.amount) AS total_amount FROM items i GROUP BY i.id"
+        ") SELECT t.id, t.total_amount FROM totals t "
+        "ORDER BY t.total_amount DESC LIMIT 1"
+    )
+    model_calls = 0
+
+    def reviewer(_prompt: str) -> str:
+        nonlocal model_calls
+        model_calls += 1
+        return json.dumps(
+            {"status": "consistent", "reason": "the requested item is present"}
+        )
+
+    receipt = _projection_review(
+        state,
+        sql,
+        reviewer,
+        execution_data=[[1, 10]],
+        execution_columns=["id", "total_amount"],
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.deterministic_failure_code is CheckFailureCode.RESULT_SHAPE_MISMATCH
+    assert model_calls == 0
 
 
 def _projection_review_state(*, requested_output_source_ids: tuple[str, ...]):
@@ -8057,6 +9888,35 @@ def test_result_review_preserves_explicit_total_input_percentage_formula() -> No
     assert calls == 1
 
 
+def test_result_review_prompt_preserves_binary_operand_roles() -> None:
+    state = _exact_arithmetic_projection_review_state()
+
+    def model(prompt: str) -> str:
+        instruction = " ".join(json.loads(prompt)["instruction"].split()).lower()
+        required_rule = (
+            "for a binary ast expression, the child named this is the left operand "
+            "and the child named expression is the right operand"
+        )
+        if required_rule in instruction:
+            return json.dumps({"status": "consistent", "reason": "operand roles retained"})
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "binary operand roles are unspecified",
+                "source_id": "arithmetic-formula",
+            }
+        )
+
+    receipt = _projection_review(
+        state,
+        "SELECT CURRENT_TIMESTAMP - r.recorded_at AS elapsed FROM records r",
+        model,
+        documents=("The exact formula is CURRENT_TIMESTAMP - recorded_at.",),
+    )
+
+    assert receipt.verdict == "consistent"
+
+
 @pytest.mark.parametrize(
     ("sql", "expected_verdict"),
     (
@@ -8104,7 +9964,25 @@ def test_result_review_preserves_exact_trusted_arithmetic_formula(
             "domain calculation, duration conversion, date-difference helper, unit "
             "normalization, or rounding"
         )
-        if exact_formula and required_rule in instruction and exact_ast:
+        normalized_percentage_rule = (
+            "when queryspec has already normalized an exact trusted formula solely because "
+            "its arithmetic expansion contradicts an unambiguous percentage phrase in the "
+            "question, review against the normalized queryspec arithmetic and do not restore "
+            "the document expansion"
+        )
+        unresolved_reference_scope_rule = (
+            "when queryspec explicitly leaves an aggregate reference population unresolved, "
+            "and the question, trusted documents, selected bindings, and evidence do not "
+            "positively require one scope, do not return ambiguous solely because the candidate "
+            "chooses one reasonable reference population"
+        )
+        if (
+            exact_formula
+            and required_rule in instruction
+            and normalized_percentage_rule in instruction
+            and unresolved_reference_scope_rule in instruction
+            and exact_ast
+        ):
             return json.dumps({"status": "consistent", "reason": "formula retained"})
         return json.dumps(
             {
@@ -8123,6 +10001,67 @@ def test_result_review_preserves_exact_trusted_arithmetic_formula(
 
     assert receipt.verdict == expected_verdict
     assert calls == 1
+
+
+def test_result_review_treats_unconventional_trusted_formula_as_authoritative() -> None:
+    state = _exact_arithmetic_projection_review_state()
+
+    def model(prompt: str) -> str:
+        instruction = " ".join(json.loads(prompt)["instruction"].split()).lower()
+        required_rule = (
+            "the formula remains authoritative for those stated operations even when "
+            "unconventional; do not replace them with a conventional domain interpretation"
+        )
+        if required_rule in instruction:
+            return json.dumps({"status": "consistent", "reason": "formula retained"})
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "formula replaced by conventional domain meaning",
+                "source_id": "arithmetic-formula",
+            }
+        )
+
+    receipt = _projection_review(
+        state,
+        "SELECT CURRENT_TIMESTAMP - r.recorded_at AS elapsed FROM records r",
+        model,
+        documents=("The exact formula is CURRENT_TIMESTAMP - recorded_at.",),
+    )
+
+    assert receipt.verdict == "consistent"
+
+
+def test_result_review_uses_supported_binding_for_logical_formula_operand() -> None:
+    state = _exact_arithmetic_projection_review_state()
+
+    def model(prompt: str) -> str:
+        instruction = " ".join(json.loads(prompt)["instruction"].split()).lower()
+        required_rule = (
+            "an operand name repeated in the document, rule_excerpt, or expression is "
+            "a logical semantic role, not an exact physical-column requirement, unless the trusted "
+            "document explicitly establishes that physical mapping"
+        )
+        if required_rule in instruction:
+            return json.dumps(
+                {"status": "consistent", "reason": "supported physical binding retained"}
+            )
+        return json.dumps(
+            {
+                "status": "contradicted",
+                "reason": "logical operand name was treated as a physical column",
+                "source_id": "arithmetic-formula",
+            }
+        )
+
+    receipt = _projection_review(
+        state,
+        "SELECT CURRENT_TIMESTAMP - r.recorded_at AS elapsed FROM records r",
+        model,
+        documents=("The exact formula is CURRENT_TIMESTAMP - event_time.",),
+    )
+
+    assert receipt.verdict == "consistent"
 
 
 def test_result_review_rejects_unrequested_display_with_requested_formula_without_model() -> None:
@@ -8404,6 +10343,50 @@ def test_result_review_allows_separate_requested_dimension_projections() -> None
     assert calls == 1
 
 
+def test_result_review_rejects_reversed_requested_dimension_projections() -> None:
+    state = _projection_review_state(
+        requested_output_source_ids=("projection-entity", "projection-total")
+    )
+    entity_item, total_item = state.query_spec.semantic_items
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "semantic_items": (
+                        entity_item,
+                        total_item.model_copy(
+                            update={
+                                "kind": SemanticItemKind.DIMENSION,
+                                "source_text": "item amount label",
+                                "normalized_meaning": "item amount label",
+                            }
+                        ),
+                    )
+                }
+            )
+        }
+    )
+    calls = 0
+
+    def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps({"status": "consistent", "reason": "reversed outputs"})
+
+    receipt = _projection_review(
+        state,
+        "SELECT i.amount, i.id FROM items i",
+        model,
+        execution_data=[[10, 1]],
+        execution_columns=["amount", "id"],
+    )
+
+    assert receipt.verdict == "contradicted"
+    assert receipt.source_id == "projection-entity"
+    assert receipt.deterministic_failure_code is CheckFailureCode.RESULT_SHAPE_MISMATCH
+    assert calls == 0
+
+
 def test_result_review_allows_root_aggregate_for_requested_metric() -> None:
     state = _projection_review_state(
         requested_output_source_ids=("projection-entity",)
@@ -8570,6 +10553,34 @@ def test_result_review_does_not_require_non_output_grouping_dimension_projection
 
     assert receipt.verdict == "consistent"
     assert receipt.source_id is None
+
+
+def test_result_review_allows_non_output_grouping_dimension_projection() -> None:
+    state = _projection_review_state(requested_output_source_ids=("projection-total",))
+    sql = "SELECT i.id, SUM(i.amount) AS total FROM items i GROUP BY i.id"
+    calls = 0
+
+    def model(_prompt: str) -> str:
+        nonlocal calls
+        calls += 1
+        return json.dumps(
+            {
+                "status": "consistent",
+                "reason": "the grouping key identifies each grouped result row",
+            }
+        )
+
+    receipt = _projection_review(
+        state,
+        sql,
+        model,
+        execution_data=[[1, 42]],
+        execution_columns=["id", "total"],
+    )
+
+    assert receipt.verdict == "consistent"
+    assert receipt.source_id is None
+    assert calls == 1
 
 
 def test_result_review_does_not_require_non_output_entity_label_when_row_is_selected() -> None:
@@ -8771,6 +10782,69 @@ def test_result_review_prompt_includes_required_unbound_formula() -> None:
     assert "must be implemented in the SELECT projection with CASE or IIF" in instruction
     assert "textual absence marker rather than SQL NULL" in instruction
     assert "must not be moved to WHERE" in instruction
+
+
+def test_result_review_prefers_explicit_comparator_over_descriptive_evidence() -> None:
+    state, requirements, candidate, _ = _case()
+    state = state.model_copy(
+        update={
+            "query_spec": state.query_spec.model_copy(
+                update={
+                    "original_text": "Return records with two or more observations."
+                }
+            )
+        }
+    )
+    freshness = FreshnessContext(
+        evaluated_at=state.evidence[0].observed_at,
+        run_id=state.run_id,
+        run_incarnation=state.run_incarnation,
+        schema_namespace_version=state.schema_namespace_version,
+    )
+    requirements = validate_coverage_inputs(
+        state,
+        freshness,
+        state.run_id,
+        state.run_incarnation,
+    )
+    captured: dict[str, object] = {}
+
+    def model(prompt: str) -> str:
+        captured.update(json.loads(prompt))
+        return json.dumps({"status": "consistent", "reason": "reviewed"})
+
+    review = create_result_review_capability(
+        state=state,
+        requirements=requirements,
+        freshness_context=freshness,
+        candidate=candidate,
+        parsed_ast=parse_sql_candidate(SQL, POSTGRES_DSN, candidate.candidate_id),
+        documents=("The observations are commonly described as exceeding two.",),
+        model=model,
+    )
+    receipt = evaluate_result_review_capability(
+        review,
+        expected_run_id=state.run_id,
+        expected_sql=SQL,
+        execution=_executor_result([["paid"]]),
+    )
+
+    assert receipt.verdict == "consistent"
+    instruction = " ".join(captured["instruction"].split())
+    assert (
+        "An explicit comparator in the question or QuerySpec takes precedence over "
+        "a conflicting comparator inferred only from descriptive evidence"
+    ) in instruction
+    assert (
+        "Only a trusted document that explicitly defines the exact formula may "
+        "override that comparator"
+    ) in instruction
+    assert (
+        "When QuerySpec has already normalized an exact trusted formula solely "
+        "to preserve the question's explicit inclusive or exclusive boundary, "
+        "review against the normalized QuerySpec comparator and do not restore "
+        "the document comparator"
+    ) in instruction
 
 
 @pytest.mark.parametrize(
@@ -9141,6 +11215,67 @@ def test_result_review_arbitration_selects_only_an_executed_grain_candidate() ->
     assert resolution.verdict == "consistent"
     assert resolution.candidate_id == candidate.candidate_id
     assert resolution.execution == preserve.execution
+
+
+def test_result_review_arbitration_prompt_requires_complete_response() -> None:
+    state, requirements, candidate, _ = _case()
+    distinct_sql = "SELECT DISTINCT o.status FROM orders o"
+    distinct_parsed = parse_sql_candidate(
+        distinct_sql, POSTGRES_DSN, "terminal-distinct-prompt-candidate"
+    )
+    distinct_candidate = SqlCandidate(
+        candidate_id="terminal-distinct-prompt-candidate",
+        sql=distinct_sql,
+        normalized_ast_digest=distinct_parsed.candidate_digest,
+        revision=state.revision,
+    )
+
+    def contradicted_receipt(candidate, requirement):
+        return ResultReviewReceipt(
+            run_id=state.run_id,
+            run_incarnation=state.run_incarnation,
+            research_state_revision=state.revision,
+            candidate_id=candidate.candidate_id,
+            normalized_ast_digest=candidate.normalized_ast_digest,
+            requirements_digest=requirements.requirements_digest,
+            source_id="source-1",
+            evidence_id="terminal-result-validation-not-null",
+            verdict="contradicted",
+            reason="the candidates require opposite row grains",
+            execution={**_executor_result([["paid"]]), "sql_query": candidate.sql},
+            deterministic_failure_code=None,
+            row_grain_requirement=requirement,
+        )
+
+    required_instruction = (
+        'Return exactly {"status":"resolve","candidate_id":"<supplied candidate_id>"} '
+        'or {"status":"unresolved","candidate_id":null}.'
+    )
+
+    def arbiter(prompt: str) -> str:
+        instruction = json.loads(prompt)["instruction"]
+        if required_instruction not in instruction:
+            return json.dumps({"candidate_id": candidate.candidate_id})
+        return json.dumps(
+            {"status": "resolve", "candidate_id": candidate.candidate_id}
+        )
+
+    resolution = evaluate_result_review_arbitration_capability(
+        create_result_review_arbitration_capability(
+            state=state,
+            requirements=requirements,
+            candidates=(candidate, distinct_candidate),
+            receipts=(
+                contradicted_receipt(candidate, "preserve_qualifying_rows"),
+                contradicted_receipt(distinct_candidate, "deduplicate_entity"),
+            ),
+            documents=(),
+            model=arbiter,
+        )
+    )
+
+    assert resolution is not None
+    assert resolution.candidate_id == candidate.candidate_id
 
 
 
