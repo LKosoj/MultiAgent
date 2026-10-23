@@ -72,7 +72,9 @@ class TestStorybookPipelineDag(unittest.TestCase):
             ["storybook_audio_subtitle", "music_planner"],
         )
         self.assertEqual(steps["storybook_music_generator"].condition, "{generate_screenplay}")
-        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_music_generator"])
+        self.assertEqual(steps["storybook_sfx_generator"].depends_on, ["storybook_music_generator"])
+        self.assertEqual(steps["storybook_sfx_generator"].condition, "{generate_screenplay}")
+        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_sfx_generator"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
 
     def test_montage_assembler_receives_audio_policy_flags(self):

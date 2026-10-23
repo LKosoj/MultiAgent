@@ -377,6 +377,7 @@ steps:
   # пере-триггерит платную генерацию. См. H-2.
   metadata:
     retryable: false
+#  tool_name: video_generator_routerai_tool
 #  tool_name: video_generator_veo_tool
 #  tool_name: video_generator_mm_tool
   tool_name: video_generator_aitunnel_tool
@@ -461,6 +462,26 @@ steps:
   - storybook_audio_subtitle
   - music_planner
   condition: '{generate_screenplay}'
+- id: storybook_sfx_generator
+  step_type: tool
+  task: Generate scene sound effects and register MP3 files in the audio manifest
+  timeout: 2400
+  metadata:
+    retryable: false
+  tool_name: storybook_sfx_generator_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - sfx_manifest_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - storybook_music_generator
+  condition: '{generate_screenplay}'
 - id: montage_assembler
   step_type: tool
   task: Assemble final video, timeline, subtitles, manifest and final review
@@ -487,7 +508,7 @@ steps:
     allow_missing_audio: '{final_allow_missing_audio}'
     music_enabled: '{generate_music}'
   depends_on:
-  - storybook_music_generator
+  - storybook_sfx_generator
 - id: storybook_video_decision_log
   step_type: tool
   task: Persist storybook video provider/model/runtime decisions and final status

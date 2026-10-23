@@ -21,6 +21,33 @@ _AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/videos"
 _AITUNNEL_MODELS_TIMEOUT_SECONDS = 60
 _AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+_ROUTERAI_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
+_ROUTERAI_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+
+
+def _get_routerai_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    global _ROUTERAI_MODELS_CACHE
+    with _ROUTERAI_MODELS_CACHE_LOCK:
+        if _ROUTERAI_MODELS_CACHE is not None and not force_refresh:
+            return _ROUTERAI_MODELS_CACHE
+        base_url = os.getenv("ROUTERAI_API_BASE", "https://routerai.ru/api/v1").rstrip("/")
+        response = requests.get(f"{base_url}/models", timeout=60)
+        if response.status_code != 200:
+            raise RuntimeError(f"RouterAI models endpoint failed: {response.status_code} - {response.text}")
+        records = response.json().get("data")
+        if not isinstance(records, list):
+            raise RuntimeError("Неверный ответ каталога моделей RouterAI")
+        catalog = {}
+        for record in records:
+            if "video" not in record.get("architecture", {}).get("output_modalities", []):
+                continue
+            catalog[record["id"]] = {
+                **record,
+                "supports_seed": bool(record.get("seed")),
+                "supports_reference_video": "video" in record.get("architecture", {}).get("input_modalities", []),
+            }
+        _ROUTERAI_MODELS_CACHE = catalog
+        return catalog
 
 
 def _get_aitunnel_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -1113,24 +1140,27 @@ def _write_video_model_caps(caps_file_path: str, payload: Dict[str, Any]) -> Non
         logger.error(f"❌ Не удалось записать {caps_file_path}: {e}")
 
 
-def _resolve_aitunnel_capabilities(caps_file_path: str) -> Dict[str, Any]:
-    """Ветка video_generator_aitunnel_tool: каталог по сети, иначе откат на кэш."""
+def _resolve_aitunnel_capabilities(caps_file_path: str, provider_name: str = "aitunnel") -> Dict[str, Any]:
+    """Возможности модели из каталога провайдера или кэша."""
+    provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
+    tool_name = f"video_generator_{provider_name}_tool"
+    model_env = f"{provider_name.upper()}_VIDEO_MODEL"
     warnings: List[Dict[str, Any]] = []
-    configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+    configured_model = (os.getenv(model_env) or "").strip()
     record: Optional[Dict[str, Any]] = None
     # Причина неудачи — три разных сценария, тексты P14 не должны их путать.
-    reason = "переменная окружения AITUNNEL_VIDEO_MODEL не задана"
+    reason = f"переменная окружения {model_env} не задана"
 
     if configured_model:
         try:
-            catalog = _get_aitunnel_video_models()
+            catalog = _get_routerai_video_models() if provider_name == "routerai" else _get_aitunnel_video_models()
         except Exception as e:
-            logger.warning(f"⚠️ Не удалось получить каталог видеомоделей AITUNNEL: {e}")
-            reason = "каталог видеомоделей AITUNNEL недоступен"
+            logger.warning(f"⚠️ Не удалось получить каталог видеомоделей {provider_label}: {e}")
+            reason = f"каталог видеомоделей {provider_label} недоступен"
         else:
             record = _get_active_aitunnel_model_record(catalog, configured_model)
             if record is None:
-                reason = f"модель {configured_model!r} отсутствует в каталоге видеомоделей AITUNNEL"
+                reason = f"модель {configured_model!r} отсутствует в каталоге видеомоделей {provider_label}"
 
     if record is not None:
         return {
@@ -1149,7 +1179,11 @@ def _resolve_aitunnel_capabilities(caps_file_path: str) -> Dict[str, Any]:
     # Откат на кэш допустим только при непустом supported_durations в прежнем файле
     # (раздел 6.1 ТЗ): иначе файл, уже записанный ранее с пустым набором и
     # source=null, самоподдерживал бы себя как "cache" на каждом следующем прогоне.
-    if cached is not None and cached.get("supported_durations"):
+    if (
+        cached is not None and cached.get("supported_durations")
+        and cached.get("tool_name", tool_name) == tool_name
+        and (provider_name == "aitunnel" or cached.get("model") == configured_model)
+    ):
         resolved_at = cached.get("resolved_at")
         if not resolved_at:
             # Запасной вариант: в прежнем файле нет resolved_at — копировать
@@ -1157,9 +1191,9 @@ def _resolve_aitunnel_capabilities(caps_file_path: str) -> Dict[str, Any]:
             resolved_at = _utc_now_iso()
         warnings.append(video_model_caps_warning(
             "P14",
-            f"Не удалось получить возможности видеомодели AITUNNEL из каталога ({reason}), "
+            f"Не удалось получить возможности видеомодели {provider_label} из каталога ({reason}), "
             "использован набор возможностей из video_model_caps.json предыдущего прогона",
-            details={"tool_name": "video_generator_aitunnel_tool", "configured_model": configured_model or None},
+            details={"tool_name": tool_name, "configured_model": configured_model or None},
         ))
         return {
             "model": cached.get("model"),
@@ -1175,9 +1209,9 @@ def _resolve_aitunnel_capabilities(caps_file_path: str) -> Dict[str, Any]:
 
     warnings.append(video_model_caps_warning(
         "P14",
-        f"Не удалось определить возможности видеомодели AITUNNEL ({reason}), а video_model_caps.json "
+        f"Не удалось определить возможности видеомодели {provider_label} ({reason}), а video_model_caps.json "
         "предыдущего прогона отсутствует или содержит пустой набор длительностей",
-        details={"tool_name": "video_generator_aitunnel_tool", "configured_model": configured_model or None},
+        details={"tool_name": tool_name, "configured_model": configured_model or None},
     ))
     return {
         "model": None,
@@ -1289,6 +1323,8 @@ def resolve_video_model_capabilities(
     try:
         if tool_name == "video_generator_aitunnel_tool":
             resolved = _resolve_aitunnel_capabilities(caps_file_path)
+        elif tool_name == "video_generator_routerai_tool":
+            resolved = _resolve_aitunnel_capabilities(caps_file_path, "routerai")
         else:
             registry_entry = _VIDEO_MODEL_CAPABILITIES_REGISTRY.get(tool_name)
             if registry_entry is not None:

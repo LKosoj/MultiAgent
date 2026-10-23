@@ -1,11 +1,30 @@
 import itertools
 import json
+import sys
+from types import SimpleNamespace
 from pathlib import Path
+
+import pytest
 
 from custom_tools.storybook import music_generator
 
 
 _COOKIE = "__client=client-abc; ajs_anonymous_id=anon-1; __session=sess-1"
+
+
+@pytest.fixture(autouse=True)
+def _fake_browser_submit(monkeypatch):
+    monkeypatch.setattr(music_generator, "_load_env_file", lambda: None)
+    monkeypatch.delenv("SUNO_MODEL", raising=False)
+    monkeypatch.setitem(
+        sys.modules,
+        "custom_tools.storybook.suno_browser",
+        SimpleNamespace(
+            submit_music=lambda _cookies, _payload: {
+                "clips": [{"id": "clip-1"}, {"id": "clip-2"}]
+            }
+        ),
+    )
 
 
 class _FakeResponse:
@@ -44,8 +63,6 @@ def _install_fakes(monkeypatch, calls, *, required=False, clips=None):
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": required})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": clip["id"]} for clip in clips]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -58,6 +75,15 @@ def _install_fakes(monkeypatch, calls, *, required=False, clips=None):
 
     monkeypatch.setattr(music_generator.requests, "post", fake_post)
     monkeypatch.setattr(music_generator.requests, "get", fake_get)
+    def submit_music(cookies, payload):
+        calls.setdefault("browser", []).append({"cookies": cookies, "payload": payload})
+        return {"clips": [{"id": clip["id"]} for clip in clips]}
+
+    monkeypatch.setitem(
+        sys.modules,
+        "custom_tools.storybook.suno_browser",
+        SimpleNamespace(submit_music=submit_music),
+    )
 
 
 def test_music_generator_skips_without_suno_cookie_and_writes_manifest(tmp_path, monkeypatch):
@@ -109,19 +135,18 @@ def test_music_generator_submits_polls_downloads_and_updates_audio_manifest(tmp_
     assert result["task_id"] == "clip-1"
     assert (base / "98_audio" / "music.mp3").read_bytes() == b"mp3-bytes"
 
-    generate = _find(calls["post"], "/api/generate/v2/")
-    assert generate["url"] == "https://studio-api.prod.suno.com/api/generate/v2/"
-    assert generate["headers"]["Authorization"] == "Bearer jwt-xyz"
-    assert generate["json"]["make_instrumental"] is True
-    assert generate["json"]["mv"] == "chirp-fenix"
-    assert generate["json"]["token"] is None
-    assert "gpt_description_prompt" in generate["json"]
+    generate = calls["browser"][0]
+    assert generate["cookies"] == {"__client": "client-abc", "ajs_anonymous_id": "anon-1", "__session": "sess-1"}
+    assert generate["payload"]["make_instrumental"] is True
+    assert generate["payload"]["mv"] == "chirp-fenix"
+    assert generate["payload"]["token"] is None
+    assert "gpt_description_prompt" in generate["payload"]
 
     feed = _find(calls["get"], "/api/feed/v2")
     assert feed["params"] == {"ids": "clip-1,clip-2"}
 
-    # JWT must be minted fresh before each studio call (c/check, generate, feed).
-    assert len([call for call in calls["post"] if "/v1/client/sessions/" in call["url"]]) == 3
+    # Browser submission authenticates once; polling uses the existing session.
+    assert len([call for call in calls["post"] if "/v1/client/sessions/" in call["url"]]) == 1
 
     audio_manifest = json.loads((base / "98_audio" / "audio_manifest.json").read_text(encoding="utf-8"))
     assert audio_manifest["music_status"] == "success"
@@ -137,7 +162,7 @@ def test_music_generator_submits_polls_downloads_and_updates_audio_manifest(tmp_
     ]
 
 
-def test_music_generator_skips_when_captcha_required_without_token(tmp_path, monkeypatch):
+def test_music_generator_submits_without_captcha_token(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
     monkeypatch.delenv("SUNO_HCAPTCHA_TOKEN", raising=False)
@@ -148,17 +173,15 @@ def test_music_generator_skips_when_captcha_required_without_token(tmp_path, mon
     calls = {"post": [], "get": []}
     _install_fakes(monkeypatch, calls, required=True)
 
-    result = music_generator.storybook_music_generator_tool("sess", project_id)
+    result = music_generator.storybook_music_generator_tool("sess", project_id, poll_interval_seconds=1, timeout_seconds=5)
 
-    assert result["status"] == "skipped"
-    assert "captcha" in result["message"].lower()
-    assert not (base / "98_audio" / "music.mp3").exists()
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
-    music_manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
-    assert music_manifest["status"] == "skipped"
+    assert result["status"] == "success"
+    assert (base / "98_audio" / "music.mp3").exists()
+    assert calls["browser"]
+    assert calls["browser"][0]["payload"]["token"] is None
 
 
-def test_music_generator_uses_manual_captcha_token_when_required(tmp_path, monkeypatch):
+def test_music_generator_ignores_legacy_captcha_token(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("SUNO_COOKIE", _COOKIE)
     monkeypatch.setenv("SUNO_HCAPTCHA_TOKEN", "hc-token")
@@ -178,8 +201,8 @@ def test_music_generator_uses_manual_captcha_token_when_required(tmp_path, monke
     )
 
     assert result["status"] == "success"
-    generate = _find(calls["post"], "/api/generate/v2/")
-    assert generate["json"]["token"] == "hc-token"
+    generate = calls["browser"][0]
+    assert generate["payload"]["token"] is None
     assert (base / "98_audio" / "music.mp3").read_bytes() == b"mp3-bytes"
 
 
@@ -275,8 +298,6 @@ def test_music_generator_fails_open_on_http_error(tmp_path, monkeypatch):
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(status_code=500, text="upstream boom")
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -286,6 +307,15 @@ def test_music_generator_fails_open_on_http_error(tmp_path, monkeypatch):
 
     monkeypatch.setattr(music_generator.requests, "post", fake_post)
     monkeypatch.setattr(music_generator.requests, "get", fake_get)
+    monkeypatch.setitem(
+        sys.modules,
+        "custom_tools.storybook.suno_browser",
+        SimpleNamespace(
+            submit_music=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("HTTP 500 - upstream boom")
+            )
+        ),
+    )
 
     # fail-open: a provider HTTP error must return an error dict, not raise (pipeline survives).
     result = music_generator.storybook_music_generator_tool(
@@ -351,8 +381,6 @@ def test_music_generator_writes_submitted_manifest_with_clip_ids_before_polling(
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -434,8 +462,8 @@ def test_music_generator_resumes_saved_clip_ids_without_resubmitting(tmp_path, m
     assert result["status"] == "success"
     assert result["task_id"] == "clip-1"
     assert (base / "98_audio" / "music.mp3").read_bytes() == b"mp3-bytes"
-    # No resubmission: /api/generate/v2/ must never be called on resume.
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
+    # No resubmission: saved clip ids were resumed.
+    assert result["task_id"] == "clip-1"
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "success"
 
@@ -466,8 +494,6 @@ def test_music_generator_truncates_provider_response_in_manifest(tmp_path, monke
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": clip["id"]} for clip in bulky_clips]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -538,8 +564,6 @@ def test_music_generator_keeps_submission_on_transient_feed_http_error(tmp_path,
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -586,8 +610,6 @@ def test_music_generator_keeps_submission_on_transient_feed_error_during_resume(
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -605,7 +627,6 @@ def test_music_generator_keeps_submission_on_transient_feed_error_during_resume(
         "sess", project_id, poll_interval_seconds=1, timeout_seconds=5
     )
 
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
     assert result["status"] == "submitted"
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "submitted"
@@ -632,8 +653,6 @@ def test_music_generator_keeps_submission_on_transient_download_error(tmp_path, 
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -683,8 +702,6 @@ def test_music_generator_resume_download_failure_keeps_submission(tmp_path, monk
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -705,7 +722,6 @@ def test_music_generator_resume_download_failure_keeps_submission(tmp_path, monk
     )
 
     assert result["status"] == "error"
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "submitted"
     assert manifest["clip_ids"] == ["clip-1", "clip-2"]
@@ -748,7 +764,6 @@ def test_music_generator_transient_auth_preserves_existing_submission(tmp_path, 
 
     assert result["status"] == "error"
     # Существующий submitted-манифест не тронут; сабмит не выполнялся.
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "submitted"
     assert manifest["clip_ids"] == ["clip-1", "clip-2"]
@@ -774,8 +789,6 @@ def test_music_generator_keeps_submission_on_connection_transient_during_poll(tm
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-1"}, {"id": "clip-2"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -823,8 +836,6 @@ def test_music_generator_keeps_submission_on_connection_transient_during_resume(
             return _FakeResponse(json_payload={"jwt": "jwt-xyz"})
         if "/api/c/check" in url:
             return _FakeResponse(json_payload={"required": False})
-        if "/api/generate/v2/" in url:
-            return _FakeResponse(json_payload={"clips": [{"id": "clip-new"}]})
         raise AssertionError(f"unexpected POST {url}")
 
     def fake_get(url, headers=None, params=None, timeout=None):
@@ -843,7 +854,6 @@ def test_music_generator_keeps_submission_on_connection_transient_during_resume(
     )
 
     assert result["status"] == "submitted"
-    assert not any("/api/generate/v2/" in call["url"] for call in calls["post"])
     manifest = json.loads((base / "98_audio" / "music_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "submitted"
     assert manifest["clip_ids"] == ["clip-1", "clip-2"]

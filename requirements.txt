@@ -40,6 +40,7 @@ plotly>=5.0.0
 # Web и HTTP
 # ============================================================================
 requests
+cloakbrowser==0.6.4
 aiohttp
 httpx
 streamlit>=1.28.0

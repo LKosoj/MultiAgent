@@ -19,7 +19,11 @@ from custom_tools.storybook.video_generator_aitunnel_tool import (
     resumable_aitunnel_job_for_item,
     trusted_aitunnel_output_for_item,
 )
-from custom_tools.storybook.video_generator_common import _get_aitunnel_video_models, parse_duration_seconds_from_timing
+from custom_tools.storybook.video_generator_common import (
+    _get_aitunnel_video_models,
+    _get_routerai_video_models,
+    parse_duration_seconds_from_timing,
+)
 
 
 CONTRACT_VERSION = 1
@@ -34,6 +38,7 @@ _WORKFLOW_YAML_PATH = (
 _VIDEO_GENERATOR_STEP_ID = "video_generator"
 _TOOL_NAME_TO_PROVIDER = {
     "video_generator_aitunnel_tool": "aitunnel",
+    "video_generator_routerai_tool": "routerai",
     "video_generator_mm_tool": "minimax",
     "video_generator_veo_tool": "veo",
     "video_generator_tool": "kling",
@@ -384,19 +389,22 @@ def storybook_video_delivery_promise_tool(
     summary = _provider_summary(session_id, project_id, language, enabled, generate_blockout, use_blockout_reference)
     delivery_items = summary["expected_video_items"]
     required_aitunnel_items = []
-    if summary["provider"] == "aitunnel":
+    if summary["provider"] in {"aitunnel", "routerai"}:
+        provider_name = summary["provider"]
         _, shot_items, _ = _load_shots(project_id)
         required_aitunnel_items = _required_aitunnel_video_items(shot_items)
         delivery_items = _collect_video_items(shot_items, include_existing=True)
         try:
-            job_store = _ProviderJobStore(str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"))
+            job_store = _ProviderJobStore(
+                str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"), provider_name=provider_name,
+            )
         except Exception:
             job_store = None
-        configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+        configured_model = (os.getenv(f"{provider_name.upper()}_VIDEO_MODEL") or "").strip()
         catalog = None
         if _as_bool(generate_blockout) and _as_bool(use_blockout_reference):
             try:
-                catalog = _get_aitunnel_video_models()
+                catalog = _get_routerai_video_models() if provider_name == "routerai" else _get_aitunnel_video_models()
             except Exception:
                 catalog = None
         collected_keys = {_video_shot_key(item) for item in delivery_items}
@@ -433,10 +441,11 @@ def storybook_video_delivery_promise_tool(
             for item in required_aitunnel_items
             if _video_shot_key(item) not in collected_keys
         )
-    if enabled and summary["provider"] == "aitunnel" and not blocking_reasons:
+    if enabled and summary["provider"] in {"aitunnel", "routerai"} and not blocking_reasons:
         blocking_reasons.extend(
             _aitunnel_delivery_input_blockers(
-                project_id, delivery_items, generate_blockout, use_blockout_reference, language
+                project_id, delivery_items, generate_blockout, use_blockout_reference, language,
+                provider_name=summary["provider"],
             )
         )
 
@@ -1023,20 +1032,24 @@ def _required_aitunnel_video_items(items):
     return required
 
 
-def _aitunnel_delivery_input_blockers(project_id, expected_items, generate_blockout, use_blockout_reference, language):
-    """Return per-shot blockers before the AITunnel step can submit a paid job."""
+def _aitunnel_delivery_input_blockers(
+    project_id, expected_items, generate_blockout, use_blockout_reference, language, provider_name="aitunnel",
+):
+    """Return per-shot blockers before submitting a paid video job."""
     pending_items = []
     blockers = []
     try:
-        job_store = _ProviderJobStore(str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"))
+        job_store = _ProviderJobStore(
+            str(_project_dir(project_id) / "97_shots" / "provider_jobs.json"), provider_name=provider_name,
+        )
     except Exception:
         job_store = None
-    configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+    configured_model = (os.getenv(f"{provider_name.upper()}_VIDEO_MODEL") or "").strip()
     catalog = None
     for item in expected_items:
         if use_blockout_reference and generate_blockout:
             try:
-                catalog = catalog or _get_aitunnel_video_models()
+                catalog = catalog or (_get_routerai_video_models() if provider_name == "routerai" else _get_aitunnel_video_models())
             except Exception:
                 catalog = None
         if trusted_aitunnel_output_for_item(
@@ -1073,7 +1086,7 @@ def _aitunnel_delivery_input_blockers(project_id, expected_items, generate_block
     if not pending_items:
         return blockers
     try:
-        catalog = catalog or _get_aitunnel_video_models()
+        catalog = catalog or (_get_routerai_video_models() if provider_name == "routerai" else _get_aitunnel_video_models())
     except Exception:
         return blockers + ["video_model_catalog_unavailable"]
 
@@ -1118,6 +1131,11 @@ def _active_video_provider():
 def _select_provider():
     active = _active_video_provider()
     providers = [
+        {
+            "name": "routerai",
+            "configured": _has_env("ROUTERAI_API_KEY") and _has_env("ROUTERAI_VIDEO_MODEL"),
+            "required_env": ["ROUTERAI_API_KEY", "ROUTERAI_VIDEO_MODEL"],
+        },
         {
             "name": "aitunnel",
             "configured": _has_env("AITUNNEL_API_KEY") and _has_env("AITUNNEL_VIDEO_MODEL"),

@@ -130,8 +130,10 @@ def montage_assembler_tool(
         else:
             warnings.append(message)
 
-    usable_audio_tracks = [track for track in audio_artifacts["audio_tracks"] if track["exists"]]
-    audio_required = _audio_required(audio_artifacts)
+    render_tracks = [track for track in audio_artifacts["audio_tracks"] if track["role"] != "sfx"]
+    sfx_tracks = [track for track in audio_artifacts["audio_tracks"] if track["role"] == "sfx"]
+    usable_audio_tracks = [track for track in render_tracks if track["exists"]]
+    audio_required = _audio_required({**audio_artifacts, "audio_tracks": render_tracks})
     if not usable_audio_tracks and audio_required and not allow_missing_audio:
         errors.append("Audio track missing and allow_missing_audio=False")
     if music_enabled and not usable_audio_tracks:
@@ -139,6 +141,12 @@ def montage_assembler_tool(
             errors.append("music_enabled=True but no usable audio track and allow_missing_audio=False")
         else:
             warnings.append("final_video_has_no_audio")
+
+    if audio_artifacts.get("sfx_status") == "error":
+        message = "SFX generation failed: " + "; ".join(audio_artifacts.get("sfx_errors") or [])
+        (warnings if allow_missing_audio else errors).append(message)
+    if any(not track["exists"] for track in sfx_tracks):
+        errors.append("SFX files missing for Final Cut XML")
 
     ffmpeg_bin = _find_executable("ffmpeg")
     ffprobe_bin = _find_executable("ffprobe")
@@ -148,7 +156,10 @@ def montage_assembler_tool(
         errors.append("ffprobe not available")
 
     timeline_clips = [clip for clip in clips if clip.get("path_allowed", True)]
-    _write_fcpxml(paths["timeline"], str(project_id), timeline_clips)
+    try:
+        _write_fcpxml(paths["timeline"], str(project_id), timeline_clips, [track for track in sfx_tracks if track["exists"]])
+    except Exception as exc:
+        errors.append(f"Final Cut XML export failed: {exc}")
 
     expected_duration = _expected_duration(clips)
     render_result: Optional[Dict[str, Any]] = None
@@ -414,6 +425,8 @@ def _read_audio_artifacts(audio_dir: Path) -> Dict[str, Any]:
         "cue_sheet_path": str(cue_sheet_path),
         "cue_sheet_exists": cue_sheet_path.exists(),
         "tts_status": manifest.get("tts_status") or "unavailable",
+        "sfx_status": manifest.get("sfx_status"),
+        "sfx_errors": manifest.get("sfx_errors", []),
         "audio_tracks": tracks,
     }
 
@@ -442,6 +455,7 @@ def _extract_audio_tracks(manifest: Dict[str, Any], audio_dir: Path) -> List[Dic
             {
                 "index": index,
                 "role": role,
+                "scene_number": track.get("scene_number") if isinstance(track, dict) else None,
                 "path": str(track_path),
                 "source_path": str(path),
                 "path_allowed": path_allowed,
@@ -507,7 +521,12 @@ def _render_timeline_srt(sequence: List[Dict[str, Any]], cue_texts: Dict[Any, st
     return "\n\n".join(blocks) + ("\n" if blocks else "")
 
 
-def _write_fcpxml(path: Path, project_id: str, clips: List[Dict[str, Any]]) -> None:
+def _write_fcpxml(
+    path: Path,
+    project_id: str,
+    clips: List[Dict[str, Any]],
+    sfx_tracks: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     fcpxml = ET.Element("fcpxml", version="1.11")
     resources = ET.SubElement(fcpxml, "resources")
     ET.SubElement(resources, "format", id="r0", name="FFVideoFormat1080p25", frameDuration="1/25s", width="1920", height="1080")
@@ -517,20 +536,40 @@ def _write_fcpxml(path: Path, project_id: str, clips: List[Dict[str, Any]]) -> N
             "asset",
             id=f"r{index}",
             name=Path(clip["path"]).name,
-            src=_path_uri(clip["path"]),
             hasVideo="1",
         )
         duration = max(float(clip.get("planned_duration_seconds") or 0), 1.0)
         asset.set("duration", _fcpx_duration(duration))
+        ET.SubElement(asset, "media-rep", kind="original-media", src=_path_uri(clip["path"]))
+
+    sfx_assets = []
+    for index, track in enumerate(sfx_tracks or []):
+        probe = _probe_media(Path(track["path"]))
+        duration = _probe_duration(probe)
+        stream = next((stream for stream in probe.get("streams", []) if stream.get("codec_type") == "audio"), None)
+        if duration is None or duration <= 0 or stream is None:
+            raise ValueError(f"Invalid SFX audio: {track['path']}")
+        asset_id = f"sfx{index}"
+        asset = ET.SubElement(
+            resources, "asset", id=asset_id, name=Path(track["path"]).name,
+            start="0s", duration=_fcpx_duration(duration), hasAudio="1", audioSources="1",
+        )
+        for field, attribute in (("channels", "audioChannels"), ("sample_rate", "audioRate")):
+            if stream.get(field):
+                asset.set(attribute, str(stream[field]))
+        ET.SubElement(asset, "media-rep", kind="original-media", src=_path_uri(track["path"]))
+        sfx_assets.append((track, asset_id, duration))
 
     library = ET.SubElement(fcpxml, "library")
     event = ET.SubElement(library, "event", name=f"storybook-{project_id}")
     project = ET.SubElement(event, "project", name=f"{project_id}-final")
     sequence = ET.SubElement(project, "sequence", format="r0", duration=_fcpx_duration(_expected_duration(clips)))
     spine = ET.SubElement(sequence, "spine")
+    anchors = {}
+    scene_ends = {}
     for index, clip in enumerate(clips, start=1):
         duration = max(float(clip.get("planned_duration_seconds") or 0), 1.0)
-        ET.SubElement(
+        element = ET.SubElement(
             spine,
             "asset-clip",
             name=Path(clip["path"]).name,
@@ -538,6 +577,20 @@ def _write_fcpxml(path: Path, project_id: str, clips: List[Dict[str, Any]]) -> N
             offset=_fcpx_duration(_clip_start(clip)),
             duration=_fcpx_duration(duration),
             start="0s",
+        )
+        scene_id = str(clip.get("scene_number"))
+        anchors.setdefault(scene_id, (element, _clip_start(clip)))
+        scene_ends[scene_id] = _clip_start(clip) + duration
+
+    for track, asset_id, duration in sfx_assets:
+        scene_id = str(track["scene_number"])
+        if scene_id not in anchors:
+            raise ValueError(f"No video scene for SFX: {scene_id}")
+        anchor, start = anchors[scene_id]
+        ET.SubElement(
+            anchor, "asset-clip", name=f"SFX scene {scene_id}", ref=asset_id,
+            lane="-1", offset="0s", start="0s",
+            duration=_fcpx_duration(min(duration, scene_ends[scene_id] - start)), audioRole="effects",
         )
 
     ET.indent(fcpxml, space="  ")

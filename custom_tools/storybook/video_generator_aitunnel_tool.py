@@ -28,6 +28,7 @@ from custom_tools.storybook.video_generator_aitunnel_media import (
 from custom_tools.storybook.video_generator_common import (
     _PREPARED_ENGLISH_VIDEO_PROMPT_KEY,
     _get_aitunnel_video_models,
+    _get_routerai_video_models,
     parse_duration_seconds_from_timing,
     sync_items_to_memory,
     update_shots_with_descriptions,
@@ -113,6 +114,8 @@ def video_generator_aitunnel_tool(
     sample_shot_key: Optional[str] = None,
     generate_blockout: bool = False,
     use_blockout_reference: bool = False,
+    *,
+    _provider_name: str = "aitunnel",
 ) -> Dict[str, Any]:
     """
     Генерирует видео через AITUNNEL, сохраняя контракт storybook video tools.
@@ -140,6 +143,8 @@ def video_generator_aitunnel_tool(
     Returns:
         Словарь со статусом, сообщением и списком results по шотам.
     """
+    provider_label = "RouterAI" if _provider_name == "routerai" else "AITUNNEL"
+    env_prefix = _provider_name.upper()
     video_step_started_at = time.monotonic()
     enable = _as_bool(enable)
     force_update_prompts = _as_bool(force_update_prompts)
@@ -148,7 +153,7 @@ def video_generator_aitunnel_tool(
     generate_blockout = _as_bool(generate_blockout)
     use_blockout_reference = _as_bool(use_blockout_reference)
     if not enable and not project_id and items is None:
-        logger.info("🎬 Генерация видео AITUNNEL отключена (enable=False).")
+        logger.info("🎬 Генерация видео %s отключена (enable=False).", provider_label)
         return {
             "status": "skipped",
             "message": "Генерация видео отключена",
@@ -178,7 +183,7 @@ def video_generator_aitunnel_tool(
                 return _error_result(f"Ошибка чтения shots.json: {exc}")
         elif items is None:
             if not enable:
-                logger.info("🎬 Генерация видео AITUNNEL отключена (enable=False).")
+                logger.info("🎬 Генерация видео %s отключена (enable=False).", provider_label)
                 return {
                     "status": "skipped",
                     "message": "Генерация видео отключена",
@@ -233,7 +238,7 @@ def video_generator_aitunnel_tool(
                 return _error_result(f"Ошибка перезагрузки shots.json: {exc}")
 
     if not enable:
-        logger.info("🎬 Генерация видео AITUNNEL отключена (enable=False).")
+        logger.info("🎬 Генерация видео %s отключена (enable=False).", provider_label)
         sync_items_to_memory(items, items_list)
         return {
             "status": "skipped",
@@ -241,23 +246,21 @@ def video_generator_aitunnel_tool(
             "results": [],
         }
 
-    api_key = os.getenv("AITUNNEL_API_KEY")
+    api_key = os.getenv(f"{env_prefix}_API_KEY")
     if not api_key:
-        logger.error("❌ AITUNNEL_API_KEY не найден в переменных окружения")
-        return _error_result("AITUNNEL_API_KEY не найден")
-    configured_model = (os.getenv("AITUNNEL_VIDEO_MODEL") or "").strip()
+        return _error_result(f"{env_prefix}_API_KEY не найден")
+    configured_model = (os.getenv(f"{env_prefix}_VIDEO_MODEL") or "").strip()
     if not configured_model:
-        logger.error("❌ AITUNNEL_VIDEO_MODEL не задан в переменных окружения")
-        return _error_result("AITUNNEL_VIDEO_MODEL не задан")
+        return _error_result(f"{env_prefix}_VIDEO_MODEL не задан")
 
     try:
-        model_catalog = _get_aitunnel_video_models()
+        model_catalog = _get_routerai_video_models() if _provider_name == "routerai" else _get_aitunnel_video_models()
     except Exception as exc:
-        logger.error("❌ Не удалось получить capabilities AITUNNEL: %s", exc)
-        return _error_result(f"Не удалось получить список моделей AITUNNEL: {exc}")
+        logger.error("❌ Не удалось получить каталог %s: %s", provider_label, exc)
+        return _error_result(f"Не удалось получить список моделей {provider_label}: {exc}")
 
     try:
-        job_store = _ProviderJobStore(str(project_dir / "97_shots" / "provider_jobs.json")) if project_dir else None
+        job_store = _ProviderJobStore(str(project_dir / "97_shots" / "provider_jobs.json"), provider_name=_provider_name) if project_dir else None
     except Exception as exc:
         logger.error("❌ Ошибка чтения provider_jobs.json: %s", exc)
         return _error_result(f"Ошибка чтения provider_jobs.json: {exc}")
@@ -280,7 +283,7 @@ def video_generator_aitunnel_tool(
             video_items.append(item.copy())
             collected_keys.add(_shot_key(item))
     if not video_items:
-        logger.info("ℹ️ Нет кадров для генерации видео AITUNNEL")
+        logger.info("ℹ️ Нет кадров для генерации видео %s", provider_label)
         return _error_result("Нет кадров для обработки")
 
     remaining = 0
@@ -289,10 +292,10 @@ def video_generator_aitunnel_tool(
         if sample_error:
             return _error_result(sample_error)
         if not video_items:
-            logger.info("ℹ️ Нет ожидающих кадров для sample генерации AITUNNEL")
+            logger.info("ℹ️ Нет ожидающих кадров для sample генерации %s", provider_label)
             return {
                 "status": "success",
-                "message": "Нет ожидающих кадров для sample генерации AITUNNEL",
+                "message": f"Нет ожидающих кадров для sample генерации {provider_label}",
                 "results": [],
                 "stats": {
                     "total": 0,
@@ -323,7 +326,8 @@ def video_generator_aitunnel_tool(
             for candidate in video_items[batch_start:]
         )
         logger.info(
-            "🎬 AITUNNEL: пакет %s, видео %s",
+            "🎬 %s: пакет %s, видео %s",
+            provider_label,
             batch_start // worker_count + 1,
             len(batch_items),
         )
@@ -345,6 +349,7 @@ def video_generator_aitunnel_tool(
                     video_step_started_at,
                     remaining_new_output_items,
                     worker_count,
+                    _provider_name,
                 ): item
                 for item in batch_items
             }
@@ -354,7 +359,7 @@ def video_generator_aitunnel_tool(
                 try:
                     result = future.result()
                 except Exception as exc:
-                    logger.error("❌ Исключение при генерации видео AITUNNEL: %s", exc)
+                    logger.error("❌ Исключение при генерации видео %s: %s", provider_label, exc)
                     result = {
                         "success": False,
                         "error": str(exc),
@@ -382,7 +387,7 @@ def video_generator_aitunnel_tool(
     if sample_before_batch:
         stats["remaining"] = remaining
 
-    message = f"Сгенерировано {successful} из {total} видео AITUNNEL"
+    message = f"Сгенерировано {successful} из {total} видео {provider_label}"
     if successful == total:
         return {
             "status": "success",
@@ -472,6 +477,7 @@ def trusted_aitunnel_output_for_item(
         pass
     should_attach_reference, reference_info = _should_attach_blockout_reference(
         item, generate_blockout, use_blockout_reference, duration, size_params,
+        (model_catalog or {}).get(configured_model),
     )
     reference_hash = _hash_source_image(reference_info) if should_attach_reference else None
     input_hash = _build_input_hash(
@@ -484,6 +490,7 @@ def trusted_aitunnel_output_for_item(
         seed=seed,
         frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
         reference_video_hash=reference_hash,
+        provider_name=job_store.provider_name,
     )
     return trusted_job.get("input_hash" if prompt else "original_input_hash") == input_hash
 
@@ -529,6 +536,7 @@ def resumable_aitunnel_job_for_item(
         pass
     attach_reference, reference = _should_attach_blockout_reference(
         item, generate_blockout, use_blockout_reference, duration, size_params,
+        (model_catalog or {}).get(configured_model),
     )
     input_hash = _build_input_hash(
         model_name=configured_model,
@@ -540,6 +548,7 @@ def resumable_aitunnel_job_for_item(
         seed=seed,
         frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
         reference_video_hash=_hash_source_image(reference) if attach_reference else None,
+        provider_name=job_store.provider_name,
     )
     return job.get("original_input_hash") == input_hash
 
@@ -585,6 +594,7 @@ def confirm_legacy_aitunnel_output_for_item(
         pass
     attached, reference = _should_attach_blockout_reference(
         item, generate_blockout, use_blockout_reference, duration, size_params,
+        (model_catalog or {}).get(configured_model),
     )
     requested_width, requested_height = _requested_frame_dimensions(item)
     original_hash = _build_input_hash(
@@ -593,6 +603,7 @@ def confirm_legacy_aitunnel_output_for_item(
         requested_width=requested_width, requested_height=requested_height, seed=seed,
         frame_types=["first_frame"] + (["last_frame"] if source_hashes["end_image"] else []),
         reference_video_hash=_hash_source_image(reference) if attached else None,
+        provider_name=job_store.provider_name,
     )
     job_store.update_job(job["shot_key"], job["input_hash"], {"original_input_hash": original_hash, "original_prompt_language": language})
     return True
@@ -860,8 +871,10 @@ def _generate_single_video_aitunnel(
     video_step_started_at: Optional[float] = None,
     remaining_new_output_items: int = 1,
     worker_count: int = 1,
+    provider_name: str = "aitunnel",
 ) -> Dict[str, Any]:
     del session_id
+    provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
 
     scene_number = item.get("scene_number", "?")
     shot_number = item.get("shot_number", "?")
@@ -950,7 +963,8 @@ def _generate_single_video_aitunnel(
         # Раздел 11.3: подавать ли ролик болванки видео-референсом. Пять условий
         # проверяются здесь, до формирования хеша и записи журнала задания.
         should_attach_reference, reference_info = _should_attach_blockout_reference(
-            item, generate_blockout, use_blockout_reference, duration, size_params
+            item, generate_blockout, use_blockout_reference, duration, size_params,
+            model_catalog.get(configured_model),
         )
         reference_video_path = reference_info if should_attach_reference else None
         video_reference_rejected_reason = None if should_attach_reference else reference_info
@@ -978,6 +992,7 @@ def _generate_single_video_aitunnel(
                 seed=seed,
                 frame_types=frame_types,
                 reference_video_hash=reference_video_hash,
+                provider_name=provider_name,
             )
             original_input_hash = _build_input_hash(
                 model_name=configured_model,
@@ -989,6 +1004,7 @@ def _generate_single_video_aitunnel(
                 seed=seed,
                 frame_types=frame_types,
                 reference_video_hash=reference_video_hash,
+                provider_name=provider_name,
             )
 
         if job_store:
@@ -1009,6 +1025,7 @@ def _generate_single_video_aitunnel(
                     video_reference_rejected_reason=video_reference_rejected_reason,
                     original_input_hash=original_input_hash,
                     original_prompt_language=language,
+                    provider_name=provider_name,
                 )
             )
         else:
@@ -1057,7 +1074,8 @@ def _generate_single_video_aitunnel(
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        base_url = os.getenv("AITUNNEL_API_BASE", _DEFAULT_BASE_URL).rstrip("/")
+        default_base = "https://routerai.ru/api/v1" if provider_name == "routerai" else _DEFAULT_BASE_URL
+        base_url = os.getenv(f"{provider_name.upper()}_API_BASE", default_base).rstrip("/")
         poll_callback = (
             (lambda payload: _record_poll_update(job_store, shot_key, input_hash, payload))
             if job_store
@@ -1088,10 +1106,13 @@ def _generate_single_video_aitunnel(
                     headers=headers,
                     base_url=base_url,
                     on_poll=poll_callback,
+                    provider_name=provider_name,
                 )
                 unsigned_urls = status_payload.get("unsigned_urls") or []
                 video_url = unsigned_urls[0] if unsigned_urls else f"{base_url}/videos/{task_id}/content?index=0"
-                video_url_requires_auth = not bool(unsigned_urls)
+                video_url_requires_auth = not bool(unsigned_urls) or (
+                    provider_name == "routerai" and str(video_url).startswith(base_url + "/")
+                )
             elif video_url and status in {"completed", "download_failed", "downloaded"}:
                 # download_failed without task_id: reuse the previously stored URL.
                 status_payload = {"usage": {}}
@@ -1101,10 +1122,13 @@ def _generate_single_video_aitunnel(
                     headers=headers,
                     base_url=base_url,
                     on_poll=poll_callback,
+                    provider_name=provider_name,
                 )
                 unsigned_urls = status_payload.get("unsigned_urls") or []
                 video_url = unsigned_urls[0] if unsigned_urls else f"{base_url}/videos/{task_id}/content?index=0"
-                video_url_requires_auth = not bool(unsigned_urls)
+                video_url_requires_auth = not bool(unsigned_urls) or (
+                    provider_name == "routerai" and str(video_url).startswith(base_url + "/")
+                )
             else:
                 raise RuntimeError("В provider_jobs.json нет task_id или video_url для resume")
         else:
@@ -1159,7 +1183,13 @@ def _generate_single_video_aitunnel(
                 if seed is not None:
                     payload["seed"] = seed
                 if reference_video_path:
-                    payload["reference_video"] = _build_reference_video_payload(reference_video_path)
+                    if provider_name == "routerai":
+                        payload["input_references"] = [{
+                            "type": "video_url",
+                            "video_url": {"url": _build_reference_video_payload(reference_video_path)},
+                        }]
+                    else:
+                        payload["reference_video"] = _build_reference_video_payload(reference_video_path)
                 _require_budget_for_new_video_submission(
                     deadline,
                     video_step_started_at,
@@ -1188,13 +1218,13 @@ def _generate_single_video_aitunnel(
                 )
                 if submit_response.status_code not in (200, 202):
                     raise RuntimeError(
-                        f"AITUNNEL submit failed: {submit_response.status_code} - {submit_response.text}"
+                        f"{provider_label} submit failed: {submit_response.status_code} - {submit_response.text}"
                     )
 
                 submit_payload = submit_response.json()
                 task_id = submit_payload.get("id")
                 if not task_id:
-                    raise RuntimeError(f"Не получен id задачи от AITUNNEL: {submit_payload}")
+                    raise RuntimeError(f"Не получен id задачи от {provider_label}: {submit_payload}")
 
                 if job_store:
                     job_store.update_job(
@@ -1217,12 +1247,17 @@ def _generate_single_video_aitunnel(
                     headers=headers,
                     base_url=base_url,
                     on_poll=poll_callback,
+                    provider_name=provider_name,
                 )
             unsigned_urls = status_payload.get("unsigned_urls") or []
             video_url = unsigned_urls[0] if unsigned_urls else f"{base_url}/videos/{task_id}/content?index=0"
-            video_url_requires_auth = not bool(unsigned_urls)
+            video_url_requires_auth = not bool(unsigned_urls) or (
+                provider_name == "routerai" and str(video_url).startswith(base_url + "/")
+            )
 
         cost, currency = _extract_cost_and_currency(status_payload)
+        if provider_name == "routerai" and cost is not None:
+            currency = "RUB"
         if cost is None and resume_job:
             cost = resume_job.get("cost")
             currency = resume_job.get("currency")
@@ -1302,7 +1337,7 @@ def _generate_single_video_aitunnel(
             else:
                 status = "failed"
             job_store.update_job(shot_key, input_hash, {"status": status, "error": str(exc)}, "failed_at")
-        logger.error("❌ AITUNNEL: ошибка генерации %s-%s: %s", scene_number, shot_number, exc)
+        logger.error("❌ %s: ошибка генерации %s-%s: %s", provider_label, scene_number, shot_number, exc)
         return {
             "success": False,
             "error": str(exc),
@@ -1355,7 +1390,9 @@ def _wait_for_video_completion_aitunnel(
     max_wait_time: int = _DEFAULT_MAX_WAIT_SECONDS,
     poll_interval: int = _DEFAULT_POLL_INTERVAL_SECONDS,
     on_poll: Optional[Callable[[Dict[str, Any]], None]] = None,
+    provider_name: str = "aitunnel",
 ) -> Dict[str, Any]:
+    provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
     start_time = time.time()
     transient_errors = 0
 
@@ -1372,7 +1409,7 @@ def _wait_for_video_completion_aitunnel(
             transient_errors += 1
             if transient_errors > _DEFAULT_POLL_MAX_TRANSIENT_ERRORS:
                 raise _PollTransientError(
-                    f"AITUNNEL polling network errors exceeded budget for task {task_id}: {exc}",
+                    f"{provider_label} polling network errors exceeded budget for task {task_id}: {exc}",
                     task_id=task_id,
                 )
             time.sleep(_poll_backoff_seconds(transient_errors, poll_interval))
@@ -1382,7 +1419,7 @@ def _wait_for_video_completion_aitunnel(
             transient_errors += 1
             if transient_errors > _DEFAULT_POLL_MAX_TRANSIENT_ERRORS:
                 raise _PollTransientError(
-                    f"AITUNNEL polling failed for task {task_id}: "
+                    f"{provider_label} polling failed for task {task_id}: "
                     f"{response.status_code} - {response.text}",
                     task_id=task_id,
                 )
@@ -1396,9 +1433,9 @@ def _wait_for_video_completion_aitunnel(
             on_poll(payload)
         if status == "completed":
             return payload
-        if status == "failed":
+        if status == "failed" or (provider_name == "routerai" and status in {"cancelled", "expired"}):
             raise _ProviderGenerationError(
-                f"AITUNNEL generation failed: {payload.get('error')}",
+                f"{provider_label} generation failed ({status}): {payload.get('error')}",
                 task_id=task_id,
             )
         # M-13: any other status (queued/moderation/unknown/pending/in_progress) is
@@ -1406,7 +1443,7 @@ def _wait_for_video_completion_aitunnel(
         time.sleep(poll_interval)
 
     raise _PollTimeoutError(
-        f"Превышено время ожидания AITUNNEL task {task_id}",
+        f"Превышено время ожидания {provider_label} task {task_id}",
         task_id=task_id,
     )
 

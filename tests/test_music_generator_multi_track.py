@@ -7,7 +7,7 @@ Suno track per leitmotif plus a neutral track (_multi_track_path). Otherwise
 it falls back 100% to the legacy single-track behavior (_legacy_single_track_path).
 
 These tests mock the same Suno call-chain functions used by
-tests/test_storybook_music_generator_tool.py (_authenticate, _captcha_required,
+tests/test_storybook_music_generator_tool.py (_authenticate,
 _post_suno_generate, _wait_for_suno_audio_url, _download_audio) so no real
 network calls are made.
 """
@@ -77,7 +77,6 @@ def _fake_download_audio(audio_url, output_path) -> None:
 
 def _install_common_fakes(monkeypatch, post_suno_generate) -> None:
     monkeypatch.setattr(music_generator, "_authenticate", lambda cookie_raw: {"fake": "auth"})
-    monkeypatch.setattr(music_generator, "_captcha_required", lambda auth: False)
     monkeypatch.setattr(music_generator, "_post_suno_generate", post_suno_generate)
     monkeypatch.setattr(
         music_generator,

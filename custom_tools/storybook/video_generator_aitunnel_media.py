@@ -59,7 +59,7 @@ def _resolve_model_and_size(
 ) -> Tuple[str, Dict[str, str], int]:
     config = _get_active_aitunnel_model_record(model_catalog, configured_model)
     if config is None:
-        raise ValueError(f"Модель AITUNNEL не найдена: {configured_model}")
+        raise ValueError(f"Видеомодель не найдена: {configured_model}")
 
     supported_frame_images = set(config.get("supported_frame_images") or [])
     if "first_frame" not in supported_frame_images:
@@ -285,6 +285,7 @@ def _should_attach_blockout_reference(
     use_blockout_reference: bool,
     resolved_duration: int,
     size_params: Optional[Dict[str, str]],
+    model_config: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """Пять условий раздела 11.3 подачи видео-референса болванки.
 
@@ -293,6 +294,12 @@ def _should_attach_blockout_reference(
     """
     if not (generate_blockout and use_blockout_reference):
         return False, "condition_1_reference_disabled"
+
+    if model_config is not None:
+        if model_config.get("supports_reference_video") is False:
+            return False, "model_reference_video_unsupported"
+        if model_config.get("frames_exclusive_with_references"):
+            return False, "model_frames_exclusive_with_references"
 
     blockout_video = str(item.get("blockout_video") or "").strip()
     if not blockout_video or not Path(blockout_video).exists():

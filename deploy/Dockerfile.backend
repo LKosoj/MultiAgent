@@ -42,6 +42,16 @@ RUN test -n "${SOURCE_DATE_EPOCH}" \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
+        xvfb \
+        libnss3 \
+        libatk-bridge2.0-0 \
+        libasound2 \
+        libxcomposite1 \
+        libxdamage1 \
+        libxrandr2 \
+        libgbm1 \
+        libxkbcommon0 \
+        libcups2 \
         libffi8 \
         libgl1 \
         libglib2.0-0 \

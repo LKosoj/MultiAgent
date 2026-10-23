@@ -385,14 +385,8 @@ def _generate_single_track(
             _clear_submitted_state(base_dir, track_id)
             return target_path
 
-    captcha_required = _captcha_required(auth)
-    manual_token = _env("SUNO_HCAPTCHA_TOKEN") or None
-    if captcha_required and not manual_token:
-        raise RuntimeError("Suno requires a captcha for this request; set SUNO_HCAPTCHA_TOKEN to provide one")
-    token = manual_token if captcha_required else None
-
     _write_submitted_state(base_dir, track_id, "submitting", suno_prompt, prompt_hash, [])
-    request_payload = _build_suno_payload(suno_prompt, instrumental, base_dir, token)
+    request_payload = _build_suno_payload(suno_prompt, instrumental, base_dir, None)
     submit_response = _post_suno_generate(auth, request_payload)
     clip_ids = _extract_clip_ids(submit_response)
     if not clip_ids:
@@ -608,26 +602,7 @@ def _legacy_single_track_path(
                     return resumed
                 clip_ids = []
 
-        captcha_required = _captcha_required(auth)
-        manual_token = _env("SUNO_HCAPTCHA_TOKEN") or None
-        if captcha_required and not manual_token:
-            message = "Suno requires a captcha for this request; set SUNO_HCAPTCHA_TOKEN to provide one"
-            payload = _manifest_payload(
-                session_id=session_id,
-                project_id=project_id,
-                language=language,
-                provider=provider,
-                status="skipped",
-                message=message,
-                music_path=music_path,
-                prompt=music_prompt,
-            )
-            _write_json(manifest_path, payload)
-            _merge_music_status(audio_manifest_path, payload, track=None)
-            return _tool_result(payload, manifest_path, music_path)
-        token = manual_token if captcha_required else None
-
-        request_payload = _build_suno_payload(music_prompt, instrumental, base_dir, token)
+        request_payload = _build_suno_payload(music_prompt, instrumental, base_dir, None)
         submit_response = _post_suno_generate(auth, request_payload)
         clip_ids = _extract_clip_ids(submit_response)
         if not clip_ids:
@@ -835,19 +810,10 @@ def _mint_jwt(auth: Dict[str, Any]) -> str:
     return str(jwt)
 
 
-def _captcha_required(auth: Dict[str, Any]) -> bool:
-    url = _url(STUDIO_API_BASE_URL, "/api/c/check")
-    response = requests.post(
-        url, headers=_studio_headers(auth), json={"ctype": "generation"}, timeout=_request_timeout()
-    )
-    data = _json_response(response)
-    return bool(data.get("required"))
-
-
 def _post_suno_generate(auth: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = _url(STUDIO_API_BASE_URL, "/api/generate/v2/")
-    response = requests.post(url, headers=_studio_headers(auth), json=payload, timeout=_request_timeout())
-    return _json_response(response)
+    from custom_tools.storybook.suno_browser import submit_music
+
+    return submit_music(auth["cookies"], payload)
 
 
 def _get_suno_feed(auth: Dict[str, Any], clip_ids: List[str]) -> Dict[str, Any]:
@@ -883,8 +849,11 @@ def _wait_for_suno_audio_url(
         for clip in clips:
             status = str(clip.get("status") or "").strip().lower()
             audio_url = clip.get("audio_url")
-            if status == "complete" and isinstance(audio_url, str) and audio_url.startswith(("http://", "https://")):
-                return last_payload, audio_url, str(clip.get("id") or "") or None
+            clip_id = str(clip.get("id") or "")
+            if status == "complete" and clip_id:
+                if not isinstance(audio_url, str) or not audio_url.startswith(("http://", "https://")) or "/api/forbidden" in audio_url:
+                    audio_url = f"https://suno.com/song/{clip_id}"
+                return last_payload, audio_url, clip_id
             if status != "error":
                 all_failed = False
         if all_failed:
@@ -895,6 +864,11 @@ def _wait_for_suno_audio_url(
 
 
 def _download_audio(audio_url: str, output_path: Path) -> None:
+    if audio_url.startswith("https://suno.com/song/"):
+        from custom_tools.storybook.suno_browser import download_music
+
+        download_music(_parse_cookies(_env("SUNO_COOKIE")), audio_url.rsplit("/", 1)[-1], output_path)
+        return
     response = requests.get(audio_url, timeout=max(30, _request_timeout()))
     if getattr(response, "status_code", 200) >= 400:
         raise RuntimeError(f"Audio download failed with HTTP {response.status_code}")

@@ -201,7 +201,6 @@ def test_pipeline_planner_generator_montage_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(generator_mod.time, "sleep", lambda *_a, **_k: None)
 
     monkeypatch.setattr(generator_mod, "_authenticate", lambda cookie_raw: {"fake": "auth"})
-    monkeypatch.setattr(generator_mod, "_captcha_required", lambda auth: False)
 
     post_calls = {"count": 0}
 
