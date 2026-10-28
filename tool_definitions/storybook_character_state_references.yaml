@@ -1,0 +1,26 @@
+name: storybook_character_state_references_tool
+description: "Готовит устойчивые изменения внешности персонажей и привязывает референсы к кадрам"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.character_state_references.storybook_character_state_references_tool
+parameters:
+  - name: session_id
+    type: str
+    required: true
+    description: "Идентификатор сессии"
+  - name: project_id
+    type: str
+    required: true
+    description: "Идентификатор проекта"
+  - name: shots_data
+    type: dict
+    required: false
+    description: "Проверенные задания кадров; по умолчанию shots.json"
+  - name: language
+    type: str
+    required: false
+    description: "Язык проекта"
+  - name: enable
+    type: bool
+    required: false
+    description: "Включить подготовку референсов"

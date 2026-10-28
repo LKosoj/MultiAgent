@@ -215,6 +215,7 @@ def protagonist_initializer_tool(session_id: str, project_id: str) -> str:
   - prompt: "english_prompt" - строго на английском языке, его нужно сгенерировать на основе {prompt}
   - session_id: "{session_id}"
   - number: 1
+  - seed: {brief.get("seed")}
   - negative_prompt: "усиленный_негативный_промпт" - базовый + противоположная стилистика
   - width: 1920
   - height: 1080

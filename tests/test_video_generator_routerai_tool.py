@@ -1,4 +1,5 @@
 import json
+import threading
 
 import pytest
 from PIL import Image
@@ -33,6 +34,7 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUTERAI_API_KEY", "router-key")
     monkeypatch.setenv("ROUTERAI_VIDEO_MODEL", MODEL)
     monkeypatch.delenv("ROUTERAI_API_BASE", raising=False)
+    monkeypatch.delenv("ROUTERAI_RESOLUTION", raising=False)
     monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
     monkeypatch.setattr(generator, "update_shots_with_descriptions", lambda *a, **kw: False)
     monkeypatch.setattr(generator.time, "sleep", lambda *a: None)
@@ -74,6 +76,7 @@ def test_routerai_submit_poll_download_and_reuse(project, monkeypatch, external_
     def post(url, headers, json, timeout):
         assert url == f"{BASE}/videos"
         assert headers["Authorization"] == "Bearer router-key"
+        assert timeout == 1200
         submits.append(json)
         return Response({"id": "task-1", "status": "pending", "polling_url": f"{BASE}/videos/task-1"}, 202)
 
@@ -241,3 +244,202 @@ def test_routerai_disabled_and_missing_credentials(project, monkeypatch):
     assert video_generator_routerai_tool("test", enable=False)["status"] == "skipped"
     monkeypatch.delenv("ROUTERAI_API_KEY")
     assert "ROUTERAI_API_KEY" in run_video()["message"]
+
+
+def test_routerai_test_resolution_and_sample_preparation_are_scoped(project, monkeypatch):
+    shots, item, record = project
+    monkeypatch.setenv("ROUTERAI_RESOLUTION", "480p")
+    record["supported_resolutions"].append("480p")
+    record["supported_sizes"] = ["1920x1080", "854x480"]
+    item.update(width=1920, height=1088)
+    other = dict(item, scene_number=2, video_path=str(shots / "other.mp4"))
+    (shots / "shots.json").write_text(json.dumps({"items": [item, other]}))
+    prepared, payloads = [], []
+    monkeypatch.setattr(generator, "update_shots_with_descriptions", lambda path, items, **kwargs: prepared.extend(items) or 0)
+
+    def get(url, **kwargs):
+        if url.endswith("/models"):
+            return Response({"data": [record]})
+        return Response({"status": "completed"})
+
+    def post(url, **kwargs):
+        payloads.append(kwargs["json"])
+        return Response({"id": "test-only"}, 202)
+
+    monkeypatch.setattr(generator.requests, "get", get)
+    monkeypatch.setattr(generator.requests, "post", post)
+    result = run_video(sample_before_batch=True, sample_shot_key="1-1")
+    assert result["status"] == "success"
+    assert [(i["scene_number"], i["shot_number"]) for i in prepared] == [(1, 1)]
+    assert len(payloads) == 1
+    assert payloads[0]["resolution"] == "480p"
+    assert payloads[0]["aspect_ratio"] == "16:9"
+    assert "size" not in payloads[0]
+    assert not (shots / "other.mp4").exists()
+
+
+def test_routerai_resolution_is_part_of_requested_input_hash(monkeypatch):
+    args = dict(model_name=MODEL, prompt_hash="prompt", source_image_hashes={},
+                requested_duration=6, requested_width=1920, requested_height=1088,
+                seed=None, frame_types=["first_frame", "last_frame"], provider_name="routerai")
+    monkeypatch.setenv("ROUTERAI_RESOLUTION", "480p")
+    low = generator._build_input_hash(**args)
+    monkeypatch.setenv("ROUTERAI_RESOLUTION", "720p")
+    assert generator._build_input_hash(**args) != low
+
+
+def test_seedance_documented_capabilities_are_stored_in_code(monkeypatch):
+    monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
+    record = {"id": "bytedance/seedance-1-5-pro", "architecture": {"output_modalities": ["video"]},
+              "supports_reference_images": True, "max_image_references": None}
+    monkeypatch.setattr(common.requests, "get", lambda *args, **kwargs: Response({"data": [record]}))
+    config = common._get_routerai_video_models()[record["id"]]
+    assert config["supported_durations"] == list(range(4, 13))
+    assert config["supported_resolutions"] == ["480p", "720p", "1080p"]
+    assert config["supported_frame_images"] == ["first_frame", "last_frame"]
+    assert config["supports_image_references"] is True
+    assert config["max_image_references"] == 2
+
+
+def test_grok_reference_rejection_overrides_advertised_support(monkeypatch):
+    monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
+    record = {"id": "x-ai/grok-imagine-video-1.5-lite",
+              "architecture": {"output_modalities": ["video"]}, "supports_reference_images": True}
+    monkeypatch.setattr(common.requests, "get", lambda *a, **kw: Response({"data": [record]}))
+    assert common._get_routerai_video_models()[record["id"]]["supports_image_references"] is False
+
+
+def test_prepared_video_prompt_skips_image_analysis(project, monkeypatch):
+    shots, item, record = project
+    payloads = []
+    monkeypatch.setattr(generator, "update_shots_with_descriptions", lambda *args, **kwargs: pytest.fail("Prepared prompts must not re-analyze images"))
+    monkeypatch.setattr(generator.requests, "get", lambda url, **kwargs: Response({"data": [record]}) if url.endswith("/models") else Response({"status": "completed"}))
+
+    def post(url, **kwargs):
+        payloads.append(kwargs["json"])
+        return Response({"id": "prepared-prompt"}, 202)
+
+    monkeypatch.setattr(generator.requests, "post", post)
+    result = run_video(skip_prompt_enhancement=True, sample_before_batch=True, sample_shot_key="1-1")
+    assert result["status"] == "success"
+    assert len(payloads) == 1
+    assert payloads[0]["prompt"] == item["video_prompt"]
+
+
+def test_wan_documented_capabilities_are_stored_in_code(monkeypatch):
+    monkeypatch.setattr(common, "_ROUTERAI_MODELS_CACHE", None)
+    record = {"id": "alibaba/wan-3.0", "architecture": {"output_modalities": ["video"]}}
+    monkeypatch.setattr(common.requests, "get", lambda *args, **kwargs: Response({"data": [record]}))
+    config = common._get_routerai_video_models()[record["id"]]
+    assert config["supported_durations"] == list(range(2, 31))
+    assert config["supported_resolutions"] == ["480p", "720p", "1080p"]
+    assert config["supported_frame_images"] == ["first_frame", "last_frame"]
+    assert config["supported_aspect_ratios"] == ["16:9", "4:3", "1:1", "3:4", "9:16"]
+
+
+def test_routerai_default_runs_four_video_jobs_in_parallel(project, monkeypatch):
+    shots, item, record = project
+    items = [dict(item, shot_number=n, video_path=str(shots / f"clip{n}.mp4"), video_prompt=f"Camera movement {n}") for n in range(1, 5)]
+    (shots / "shots.json").write_text(json.dumps({"items": items}))
+    barrier = threading.Barrier(4)
+    submitted = []
+
+    def post(url, **kwargs):
+        task = kwargs["json"]["prompt"].split()[-1]
+        submitted.append(task)
+        barrier.wait(timeout=5)
+        return Response({"id": task}, 202)
+
+    monkeypatch.setattr(generator.requests, "post", post)
+    monkeypatch.setattr(generator.requests, "get", lambda url, **kwargs: Response({"data": [record]}) if url.endswith("/models") else Response({"status": "completed"}))
+    result = run_video(skip_prompt_enhancement=True)
+    assert result["stats"] == {"total": 4, "successful": 4, "failed": 0}
+    assert len(submitted) == 4
+
+
+def test_selected_video_scope_never_touches_other_clips(project, monkeypatch):
+    shots, item, record = project
+    protected = shots / 'user_replaced.mp4'
+    protected.write_bytes(b'user-video')
+    other = dict(item, shot_number=2, video_prompt='Do not submit', video_path=str(protected))
+    (shots / 'shots.json').write_text(json.dumps({'items': [item, other]}))
+    submits = []
+
+    def post(url, **kwargs):
+        submits.append(kwargs['json'])
+        return Response({'id': 'selected-only'}, 202)
+
+    monkeypatch.setattr(generator.requests, 'post', post)
+    monkeypatch.setattr(generator.requests, 'get', lambda url, **kwargs:
+                        Response({'data': [record]}) if url.endswith('/models') else Response({'status': 'completed'}))
+    result = run_video(shot_keys=['1-1'], skip_prompt_enhancement=True)
+    assert result['stats']['total'] == 1
+    assert len(submits) == 1 and submits[0]['prompt'] == item['video_prompt']
+    assert protected.read_bytes() == b'user-video'
+    jobs = json.loads((shots / 'provider_jobs.json').read_text())['jobs']
+    assert {job['shot_key'] for job in jobs} == {'1-1'}
+
+
+def test_fallback_and_cycles_are_loaded_from_environment(project, monkeypatch):
+    shots, item, record = project
+    monkeypatch.setenv("ROUTERAI_VIDEO_FALLBACK_MODEL", "vendor/backup-video")
+    monkeypatch.setenv("ROUTERAI_VIDEO_RETRY_CYCLES", "2")
+    monkeypatch.setattr(generator, "_get_routerai_video_models", lambda: {})
+    calls = []
+
+    def generate(item, **params):
+        calls.append(params["configured_model"])
+        return dict(success=len(calls) == 4, scene_number=1, shot_number=1,
+                    video_path=item["video_path"], model=params["configured_model"])
+
+    monkeypatch.setattr(generator, "_generate_single_video_aitunnel", generate)
+    result = run_video()
+    assert result["status"] == "success"
+    assert calls == [MODEL, "vendor/backup-video"] * 2
+
+
+def test_tool_parameters_override_fallback_environment(project, monkeypatch):
+    monkeypatch.setenv("ROUTERAI_VIDEO_FALLBACK_MODEL", "unused/backup")
+    monkeypatch.setenv("ROUTERAI_VIDEO_RETRY_CYCLES", "9")
+    monkeypatch.setattr(generator, "_get_routerai_video_models", lambda: {})
+    calls = []
+
+    def generate(item, **params):
+        calls.append(params["configured_model"])
+        return dict(success=False, scene_number=1, shot_number=1,
+                    video_path=item["video_path"], model=params["configured_model"])
+
+    monkeypatch.setattr(generator, "_generate_single_video_aitunnel", generate)
+    result = run_video(retry_cycles=1, fallback_model="chosen/backup")
+    assert result["status"] == "error"
+    assert calls == [MODEL, "chosen/backup"]
+
+
+def test_keyframe_generation_falls_back_and_reuses_downloaded_video(project, monkeypatch):
+    shots, item, record = project
+    backup = "vendor/backup-video"
+    monkeypatch.setenv("ROUTERAI_VIDEO_FALLBACK_MODEL", backup)
+    monkeypatch.setenv("ROUTERAI_VIDEO_RETRY_CYCLES", "2")
+    submitted = []
+
+    def post(url, **kwargs):
+        submitted.append(kwargs["json"]["model"])
+        if len(submitted) < 4:
+            return Response(status=504)
+        return Response({"id": "backup-task", "status": "pending"}, 202)
+
+    def get(url, **kwargs):
+        if url.endswith("/models"):
+            return Response({"data": [record, dict(record, id=backup)]})
+        if "/content" in url:
+            return Response(content=b"backup-video")
+        return Response({"status": "completed"})
+
+    monkeypatch.setattr(generator.requests, "post", post)
+    monkeypatch.setattr(generator.requests, "get", get)
+    result = run_video()
+    assert result["status"] == "success"
+    assert submitted == [MODEL, backup] * 2
+    assert (shots / "clip.mp4").read_bytes() == b"backup-video"
+    assert run_video()["status"] == "success"
+    assert len(submitted) == 4

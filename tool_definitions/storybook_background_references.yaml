@@ -1,0 +1,26 @@
+name: storybook_background_references_tool
+description: "Готовит пронумерованные виды окружения по физическим пространствам и привязывает их к кадрам всего сценария"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.background_references.storybook_background_references_tool
+parameters:
+  - name: session_id
+    type: str
+    required: true
+    description: "Идентификатор сессии"
+  - name: project_id
+    type: str
+    required: true
+    description: "Идентификатор проекта"
+  - name: shots_data
+    type: dict
+    required: true
+    description: "Результат шага планирования окружения"
+  - name: language
+    type: str
+    required: false
+    description: "Язык проекта"
+  - name: enable
+    type: bool
+    required: false
+    description: "Включить подготовку фоновых референсов"

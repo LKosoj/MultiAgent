@@ -96,3 +96,23 @@ def test_pp13_baseline_request_omits_language(tmp_path, monkeypatch):
     baseline.bible_builder_tool("session", "project", language="fr")
 
     assert "language" not in json.loads(captured[0]["prompt"])
+
+
+def test_collective_character_is_not_forced_into_one_person():
+    prompt = build_canon_image_prompt('character', {
+        'name': 'Футболисты', 'role': 'Группа мальчишек без индивидуальных лиц',
+    }, [])
+    assert 'Show ONLY this ONE character' not in prompt
+    assert 'multiple characters, group shot' not in prompt
+    assert 'GROUP SHEET' in prompt
+    assert 'not a single representative' in prompt
+
+
+def test_location_reference_does_not_copy_another_locations_weather():
+    prompt = build_canon_image_prompt('location', {
+        'name': 'Париж', 'historical_period': '1920-е годы',
+        'environment_context': 'Осень, дождь, без снега и льда',
+    }, [])
+    assert '1920-е годы' in prompt
+    assert 'дождь, без снега и льда' in prompt
+    assert 'Target location description takes priority' in prompt

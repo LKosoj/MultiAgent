@@ -899,6 +899,19 @@ def test_montage_assembler_container_check_requires_probe_format(tmp_path, monke
     assert review["checks"]["container"]["passed"] is False
 
 
+def test_montage_resolves_repository_relative_clip_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    project = tmp_path / "plots/storybooks/project"
+    clip = project / "97_shots/clip.mp4"
+    clip.parent.mkdir(parents=True)
+    clip.write_bytes(b"video")
+    resolved, allowed = montage_assembler._resolve_project_media_path(
+        str(clip.relative_to(tmp_path)), project,
+    )
+    assert resolved == clip
+    assert allowed is True
+
+
 def test_montage_assembler_resolves_relative_clip_paths_from_project_root(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     project_id = "proj_relative_clip"

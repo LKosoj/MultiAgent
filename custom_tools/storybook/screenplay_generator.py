@@ -2,6 +2,7 @@ import json
 import os
 import logging
 import fcntl
+import re
 from typing import Any, Dict, Optional
 
 from agent_command import model_hard, model_ultimate
@@ -65,6 +66,87 @@ def _llm_json_call(
         return {}
 
 
+def _repair_mixed_script_fields(screenplay_data: Dict[str, Any]) -> None:
+    """Повторно генерирует только поля с посторонней письменностью в русском тексте."""
+    pattern = re.compile(r"[\u3400-\u9fff]|[А-Яа-яЁё][A-Za-z]|[A-Za-z][А-Яа-яЁё]")
+    pending = []
+
+    def collect(node):
+        entries = node.items() if isinstance(node, dict) else enumerate(node) if isinstance(node, list) else []
+        for key, value in entries:
+            if isinstance(value, str) and pattern.search(value):
+                pending.append((node, key, value))
+            elif isinstance(value, (dict, list)):
+                collect(value)
+
+    collect(screenplay_data)
+    if not pending:
+        return
+    repaired = _llm_json_call(
+        system_prompt='Исправь посторонние иероглифы и склеенные языковые фрагменты в русских текстах. Сохрани смысл, факты и технические параметры. Не добавляй события. Верни JSON {"texts": ["исправленный текст"]} в исходном порядке, без пропусков.',
+        payload={"texts": [value for _, _, value in pending]},
+        model=model_hard, temperature=0.0, max_tokens=12000,
+    ).get("texts")
+    if not isinstance(repaired, list) or len(repaired) != len(pending) or any(
+        not isinstance(text, str) or not text.strip() or pattern.search(text) for text in repaired
+    ):
+        raise ValueError("screenplay_generator: языковой брак не исправлен")
+    for (node, key, _), text in zip(pending, repaired):
+        node[key] = text
+
+
+def _refresh_location_bindings(screenplay_data: Dict[str, Any], locations: list) -> bool:
+    """Обновляет устаревшие ссылки на канон, сохраняя постановку и текст."""
+    known = {loc["name"] for loc in locations}
+    scenes = screenplay_data.get("screenplay") or []
+    if not known or not scenes:
+        return False
+    if all(
+        scene.get("location_canon_name") in known
+        and all(not shot.get("location_canon_name") or shot["location_canon_name"] in known
+                for shot in scene.get("storyboard", []))
+        for scene in scenes
+    ):
+        return False
+    result = _llm_json_call(
+        system_prompt=(
+            "Сопоставь существующие сцены и шоты с актуальным каноном локаций. Не переписывай сценарий. "
+            "Выбирай только точные имена из locations. Учитывай реальное и воображаемое пространство. "
+            "Для сцены укажи начальную локацию, для каждого шота — локацию его первого видимого состояния; "
+            "переход внутри шота не означает, что начальный кадр уже находится в конечной локации. "
+            "Верни JSON {\"bindings\":[{\"scene_number\":1,\"location_canon_name\":\"...\","
+            "\"shot_locations\":[{\"shot_number\":1,\"location_canon_name\":\"...\"}]}]} "
+            "для всех переданных сцен и шотов, без других полей."
+        ),
+        payload={"locations": locations, "scenes": [
+            {"scene_number": sc["scene_number"], "location_time": sc.get("location_time"),
+             "action": sc.get("action"), "storyboard": [
+                 {"shot_number": sh["shot_number"], "description": sh.get("description")}
+                 for sh in sc.get("storyboard", [])]}
+            for sc in scenes]},
+        model=model_hard, temperature=0.0, max_tokens=12000,
+    )
+    rows = result.get("bindings") or []
+    by_scene = {row["scene_number"]: row for row in rows}
+    if len(rows) != len(scenes) or set(by_scene) != {sc["scene_number"] for sc in scenes}:
+        raise ValueError("screenplay_generator: incomplete canonical location bindings")
+    updates = []
+    for scene in scenes:
+        row = by_scene[scene["scene_number"]]
+        shots = scene.get("storyboard", [])
+        shot_rows = row.get("shot_locations") or []
+        by_shot = {sh["shot_number"]: sh for sh in shot_rows}
+        if len(shot_rows) != len(shots) or set(by_shot) != {sh["shot_number"] for sh in shots}:
+            raise ValueError("screenplay_generator: incomplete shot location bindings")
+        updates.append((scene, row.get("location_canon_name")))
+        updates.extend((sh, by_shot[sh["shot_number"]].get("location_canon_name")) for sh in shots)
+    if any(name not in known for _, name in updates):
+        raise ValueError("screenplay_generator: unknown canonical location")
+    for target, name in updates:
+        target["location_canon_name"] = name
+    return True
+
+
 def _canonize_names_in_screenplay(screenplay_data: Dict[str, Any], bible_data: Dict[str, Any]) -> None:
     """Нормализует имена персонажей в сценах/диалогах к канону bible (in-place)."""
     try:
@@ -119,6 +201,7 @@ def _generate_storyboard_for_scene_llm(
 - Ты НЕ меняешь concept/characters/world_description/director_notes.
 - Ты НЕ меняешь action/dialogue/camera/sound/transition сцен.
 - Ты меняешь ТОЛЬКО storyboard у target-сцены (по номеру scene_number).
+- Если у сцены есть voiceover, распредели его дословно между кадрами в поле voiceover без повторов и пропусков. Для кадра без речи voiceover="". Описание видимого действия остаётся в description.
 - storyboard.description — детализация action этой сцены:
   - МОЖНО добавлять локальные детали реализации (механика/реквизит/микроблокинг, напр. ремень/верёвка/как удерживается герой),
     если это НЕ меняет причинно-следственный смысл и не вводит новый сюжетный бит.
@@ -137,7 +220,7 @@ def _generate_storyboard_for_scene_llm(
 {
   "scene_number": 1,
   "storyboard": [
-    { "shot_number": 1, "camera_plan": "EXTREME CLOSE-UP", "description": "конкретно что видно в кадре", "timing": "00:02", "location_canon_name": "optional override from BIBLE_LOCATION_NAMES" }
+    { "shot_number": 1, "camera_plan": "EXTREME CLOSE-UP", "description": "конкретно что видно в кадре", "voiceover": "дословный закадровый текст этого кадра или пустая строка", "timing": "00:02", "location_canon_name": "optional override from BIBLE_LOCATION_NAMES" }
   ],
   "added_mechanics": ["если добавил детали реализации (верёвка/ремень/т.п.), перечисли коротко"],
   "notes": ["коротко: почему детали совместимы с action"]
@@ -181,8 +264,14 @@ def _reconcile_scene_action_and_storyboard_llm(
 
 ОГРАНИЧЕНИЯ:
 - Нельзя менять смысл story_anchors.
+- Последняя авторская правка приоритетнее прежних вариантов постановки. Не узаконивай противоречащую ей деталь storyboard правкой action.
 - Нельзя добавлять новые ключевые события/персонажей.
-- Структуру сцены сохраняй (те же ключи).
+- Сохрани исходные поля, номера шотов, хронометраж и закадровый текст. Заполни используемый пайплайном словарь scene_continuity_facts: устойчивые пространственные отношения, стороны физических границ, путь персонажей, а также явно разрешённые изменения состояния по шотам. Не подменяй физическое положение персонажа его местом слева/справа на экране.
+- Положение и перемещение камеры не означают перемещение персонажей. Персонаж пересекает границу пространства только при заданном действии; смена крупности или ракурса сама по себе не меняет взаимного расположения участников.
+- Если автор уточнил сторону физической границы, согласуй с ней прежние указания глубины и перекрытий во всех шотах. Двусмысленное «за» замени точным отношением к выбранной камере и границе; экранное разделение фигур элементом среды само по себе не требует перекрытия их тел этим элементом.
+- Существование предмета не означает его постоянную видимость: смена кадрирования или перекрытие может закрыть его от камеры. Если исходник явно не требует последующего показа, не обязывай снова видеть скрытый предмет через другую часть среды; не перемещай предметы и не добавляй проёмы ради сохранения их в кадре.
+- Разделяй реальный эпизод и воображаемый. При монтажной смене мира новый кадр уже принадлежит новой среде; не добавляй гибрид старой и новой локаций, если совмещение прямо не задано автором. Для каждого эпизода уточни уместное состояние одежды и реквизита; не переноси состояние из другого мира автоматически.
+- Для перемещения задай понятные исходное положение, направление, промежуточное действие и достигнутое положение. Между соседними шотами сохраняй порядок участников относительно пути и цели, пока действие явно его не меняет.
 
 Верни JSON обновлённой сцены (только сцена, не весь сценарий).
 """
@@ -199,7 +288,11 @@ def _reconcile_scene_action_and_storyboard_llm(
         max_tokens=20000,
         max_retries=3,
     )
-    return data if isinstance(data, dict) and data.get("scene_number") else scene
+    if not isinstance(data, dict) or not data.get("scene_number"):
+        raise ValueError("Scene reconciliation returned no scene")
+    if not isinstance(data.get("scene_continuity_facts"), dict) or not data["scene_continuity_facts"]:
+        raise ValueError("Scene reconciliation must return nonempty scene_continuity_facts")
+    return data
 
 def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -254,12 +347,16 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
                 "scene_number": sc.get("scene_number"),
                 "location_time": _clip(sc.get("location_time", ""), 200),
                 "scene_timing": sc.get("scene_timing", ""),
+                "location_canon_name": sc.get("location_canon_name", ""),
+                "sfx": sc.get("sfx"),
                 "action": _clip(sc.get("action", ""), 2200),
                 "characters": sc.get("characters", []),
                 "camera": _clip(sc.get("camera", ""), 800),
                 "sound": _clip(sc.get("sound", ""), 800),
                 "transition": _clip(sc.get("transition", ""), 120),
             }
+            if "voiceover" in sc:
+                compact_sc["voiceover"] = sc["voiceover"]
             # dialogue
             dlg = sc.get("dialogue")
             if isinstance(dlg, list):
@@ -293,6 +390,8 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
                             "timing": sh.get("timing", ""),
                         }
                     )
+                    if "voiceover" in sh:
+                        compact_sb[-1]["voiceover"] = sh["voiceover"]
                 compact_sc["storyboard"] = compact_sb
             else:
                 compact_sc["storyboard"] = []
@@ -311,6 +410,7 @@ def _extract_story_anchors_llm(
     genre: str,
     moral: str,
     screenplay_time: int,
+    source_brief: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Универсально извлекает "семантические якоря" истории:
@@ -329,6 +429,7 @@ def _extract_story_anchors_llm(
 - Не переписывай историю; извлеки структуру смысла.
 - Формулируй коротко и проверяемо: якоря должны быть применимы как чеклист.
 - Сохраняй причинно-следственные связи.
+- Учитывай исходное режиссёрское задание source_brief наряду с текстом истории; сохраняй заданные там события экранизации, даже если они не произносятся за кадром.
 - Если в начале истории есть яркая ЗАВЯЗКА/ЭКСПОЗИЦИЯ (среда, погода, телесные ощущения, базовое состояние героя, сенсорный триггер),
   выдели это как ОТДЕЛЬНЫЙ must_keep_beat: зритель должен понять "где мы", "в каком состоянии герой", "что его толкает" ДО первого сюжетного действия.
 
@@ -371,6 +472,7 @@ def _extract_story_anchors_llm(
         "moral": moral,
         "screenplay_time_seconds": screenplay_time,
         "story_text": story_text,
+        "source_brief": source_brief or {},
     }
 
     resp = call_openai_api(
@@ -407,6 +509,7 @@ def _validate_and_repair_screenplay_llm(
     story_anchors: Dict[str, Any],
     screenplay_json: Dict[str, Any],
     screenplay_time: int,
+    source_brief: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Универсальный self-check: сверяет готовый screenplay с "якорями смысла".
@@ -416,6 +519,7 @@ def _validate_and_repair_screenplay_llm(
 Ты — строгий сценарный редактор. У тебя есть:
 1) STORY_ANCHORS — контракт смысла (события/причинность/темы/ирония/запрещённые изменения).
 2) SCREENPLAY_JSON — режиссёрский сценарий (концепт + сцены + notes).
+3) SOURCE_BRIEF — исходное задание, включая переданный режиссёрский сценарий. Его конкретные события, порядок появления персонажей и финал имеют приоритет над пересказом STORY_ANCHORS и текущим SCREENPLAY_JSON. Сверяй сцены непосредственно с этим источником.
 
 ЗАДАЧА:
 - Проверить, что сценарий НЕ теряет смысл и причинно-следственную цепь исходной истории.
@@ -427,6 +531,7 @@ def _validate_and_repair_screenplay_llm(
   - если storyboard добавляет важную механику, которая нужна для понимания кадра, action должен быть расширен на 1 короткий визуальный бит, чтобы "узаконить" деталь.
 - Не добавляй новых центральных событий, которые меняют смысл. Допускается только уточнение, уплотнение, восстановление пропущенного.
 - Строго соблюдай исходную JSON-схему SCREENPLAY_JSON (не добавляй новые ключи).
+- Сохраняй дословный voiceover с пунктуацией и поля sfx. Не теряй их при исправлении сцен. Если storyboard пока пуст, оставь его пустым.
 - Суммарный хронометраж должен соответствовать screenplay_time (в пределах здравого смысла; не обязательно математически идеально).
 
 Верни JSON по схеме:
@@ -441,6 +546,7 @@ def _validate_and_repair_screenplay_llm(
     payload = {
         "screenplay_time_seconds": screenplay_time,
         "story_anchors": story_anchors,
+        "source_brief": source_brief or {},
         # Важно: отправляем сжатую версию, чтобы избежать таймаутов и переполнения контекста.
         "screenplay_json": _compact_screenplay_for_alignment(screenplay_json),
     }
@@ -583,6 +689,22 @@ def screenplay_generator_tool(
     screenplay_path = f"{screenplay_dir}/screenplay.json"
 
     if os.path.exists(screenplay_path):
+        locations_path = f"{base_dir}/20_bible/locations.json"
+        if os.path.exists(locations_path):
+            with open(screenplay_path, encoding="utf-8") as f:
+                cached_screenplay = json.load(f)
+            with open(locations_path, encoding="utf-8") as f:
+                current_locations = json.load(f)
+            if _refresh_location_bindings(cached_screenplay, current_locations):
+                with open(f"{screenplay_path}.lock", "a+", encoding="utf-8") as lock_f:
+                    fcntl.flock(lock_f, fcntl.LOCK_EX)
+                    try:
+                        tmp = f"{screenplay_path}.{os.getpid()}.tmp"
+                        with open(tmp, "w", encoding="utf-8") as f:
+                            json.dump(cached_screenplay, f, ensure_ascii=False, indent=2)
+                        os.replace(tmp, screenplay_path)
+                    finally:
+                        fcntl.flock(lock_f, fcntl.LOCK_UN)
         logger.info(f"🎬 Режиссерский сценарий уже существует: {screenplay_path}, пропускаем генерацию")
         return {
             "status": "success",
@@ -657,6 +779,7 @@ def screenplay_generator_tool(
         genre=str(brief_data.get("genre", "") or ""),
         moral=str(brief_data.get("moral", "") or ""),
         screenplay_time=screenplay_time,
+        source_brief=brief_data,
     )
 
     # Формируем system prompt для генерации режиссерского сценария
@@ -672,6 +795,7 @@ def screenplay_generator_tool(
 - Не делай "радикального переосмысления", которое меняет тезис/иронию/мораль или мотивацию героя. Избегай смыслового дрейфа.
 - Не выноси смысл только в director_notes. Сценарий должен быть самодостаточен: если убрать director_notes, зритель всё равно должен понять, что происходит и почему это важно.
 - Если исходный текст держит смысл на внутреннем монологе/авторской иронии/формулировках — обязателен КИНЕМАТОГРАФИЧЕСКИЙ эквивалент (минимально и не-экспозиционно): реакция/physical business, контрапункт звука, монтажный приём, on-screen text, или короткая VO-реплика (1 строка), но без длинных объяснений.
+- Если исходное задание требует полного дословного закадрового текста, это требование имеет приоритет: не сокращай его до короткой VO-реплики. Размести весь текст по порядку в полях voiceover сцен, без повторов и пропусков. Персонажи при этом могут молчать; их dialogue остаётся пустым.
 - СЦЕНА 1 ОБЯЗАТЕЛЬНО: начни с establishing/stasis (погода/среда, телесное состояние героя, ключевой сенсорный триггер), и только затем переходи к первому действию.
   Нельзя начинать фильм сразу с "герой делает X" без ощущения места/холода/голода/толчка (если это есть в истории).
 
@@ -821,6 +945,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
       "scene_timing": "ММ:СС",
       "action": "Описание действия",
       "characters": ["Список персонажей"],
+      "voiceover": "Дословный закадровый текст сцены, если он предусмотрен заданием, иначе пустая строка",
       "dialogue": [
         {
           "character": "Имя персонажа",
@@ -833,6 +958,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
           "shot_number": 1,
           "camera_plan": "План камеры",
           "description": "Описание кадра",
+          "voiceover": "Дословный закадровый текст кадра или пустая строка",
           "timing": "ММ:СС",
           "location_canon_name": "ОПЦИОНАЛЬНО: override канонической локации для этого кадра (строго из context_data.locations[].name)"
         }
@@ -857,6 +983,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
     
     # Формируем контекст для запроса
     context_data = {
+        "brief": brief_data,
         "story_text": full_story_text,
         "title": brief_data.get("title", ""),
         "target_age": brief_data.get("target_age", ""),
@@ -891,6 +1018,9 @@ SFX: Отдельно заполни поле sfx для генерации зв
     core_prompt = system_prompt + """
 
 ДОПОЛНИТЕЛЬНОЕ ОГРАНИЧЕНИЕ ДЛЯ ЭТАПА B:
+- Если context_data.brief содержит исходный режиссёрский сценарий, сохраняй его события, порядок появления персонажей и финал. Это подготовка исходного сценария к производству, а не новая адаптация: не придумывай встречи, жесты или биографические обстоятельства.
+- Дословный закадровый текст сохраняй вместе с исходной пунктуацией. Не заменяй точки запятыми и не редактируй стихотворение.
+- Все описания и режиссёрские notes пиши на языке исходного задания. В русском тексте недопустимы случайные иностранные слова, иероглифы и склеенные фрагменты разных языков. Перед выдачей перечитай и исправь их.
 - НЕ генерируй раскадровку. В каждой сцене поле storyboard должно быть ПУСТЫМ массивом [].
 - НЕ пытайся описывать конкретные кадры. Только сцены (action/dialogue/camera/sound/transition) и режиссерские notes.
 - Игнорируй любые требования/примеры из блока "РАСКАДРОВКА"/storyboard.description, даже если они встречаются выше в промпте.
@@ -909,8 +1039,8 @@ SFX: Отдельно заполни поле sfx для генерации зв
         system_prompt=core_prompt,
         payload=core_payload,
         model=model_ultimate,
-        temperature=0.6,
-        max_tokens=160000,
+        temperature=0.2,
+        max_tokens=32768,
         max_retries=3,
     )
 
@@ -919,6 +1049,17 @@ SFX: Отдельно заполни поле sfx для генерации зв
         return {"error": "Screenplay core generation failed", "status": "failed"}
 
     _canonize_names_in_screenplay(screenplay_data, bible_data)
+    if brief_data.get("storybook_prompt"):
+        logger.info("🎬 [B QA] Сверка сцен непосредственно с исходным заданием...")
+        checked = _validate_and_repair_screenplay_llm(
+            story_anchors=story_anchors, screenplay_json=screenplay_data,
+            screenplay_time=screenplay_time, source_brief=brief_data,
+        ).get("screenplay_json")
+        if not isinstance(checked, dict) or not checked.get("screenplay"):
+            raise ValueError("screenplay_generator: проверка исходного сценария не вернула сцены")
+        screenplay_data["screenplay"] = checked["screenplay"]
+    if str(brief_data.get("language") or "ru").lower().startswith("ru"):
+        _repair_mixed_script_fields(screenplay_data)
 
     # Сохраняем core артефакт
     try:
@@ -1038,6 +1179,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
             story_anchors=story_anchors,
             screenplay_json=screenplay_data,
             screenplay_time=screenplay_time,
+            source_brief=brief_data,
         )
         repaired = check.get("screenplay_json")
         if isinstance(repaired, dict) and repaired.get("screenplay"):
@@ -1066,6 +1208,11 @@ SFX: Отдельно заполни поле sfx для генерации зв
     except Exception as e:
         logger.warning(f"⚠️ Screenplay self-check failed (continuing with original): {e}")
     
+    if str(brief_data.get("language") or "ru").lower().startswith("ru"):
+        _repair_mixed_script_fields(screenplay_data)
+
+    _refresh_location_bindings(screenplay_data, bible_data.get("locations", []))
+
     # M-7: атомарная кросс-процессная запись финального сценария (flock + tmp + os.replace).
     # flock на sidecar `{path}.lock` (НЕ подменяется): флок на самом screenplay_path
     # бесполезен — os.replace меняет inode, второй процесс флокнул бы новый inode.

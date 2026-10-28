@@ -40,18 +40,19 @@ logger = logging.getLogger(__name__)
 
 
 _AITUNNEL_MAX_WAIT_SECONDS = 900
-_VIDEO_STEP_TIMEOUT_SECONDS = 9_000
+_VIDEO_STEP_TIMEOUT_SECONDS = 86_400
 # The remaining Storybook tail after video: audio/subtitles (180), music plan
 # (180), at most four sequential 600-second tracks, montage (1200), log (120).
 _STORYBOOK_VIDEO_TAIL_SECONDS = 4_080
 
 _DEFAULT_BASE_URL = "https://api.aitunnel.ru/v1"
 _DEFAULT_TIMEOUT_SECONDS = 60
+_DEFAULT_SUBMIT_TIMEOUT_SECONDS = 1200
 _DEFAULT_MAX_WAIT_SECONDS = 900
 _DEFAULT_POLL_INTERVAL_SECONDS = 15
 _DEFAULT_POLL_MAX_TRANSIENT_ERRORS = 5
 _DEFAULT_POLL_BACKOFF_CAP_SECONDS = 120
-_AITUNNEL_BATCH_RESERVE_SECONDS = _DEFAULT_MAX_WAIT_SECONDS + 3 * _DEFAULT_TIMEOUT_SECONDS
+_AITUNNEL_BATCH_RESERVE_SECONDS = _DEFAULT_MAX_WAIT_SECONDS + _DEFAULT_SUBMIT_TIMEOUT_SECONDS + 2 * _DEFAULT_TIMEOUT_SECONDS
 
 
 class _PollTransientError(Exception):
@@ -114,6 +115,9 @@ def video_generator_aitunnel_tool(
     sample_shot_key: Optional[str] = None,
     generate_blockout: bool = False,
     use_blockout_reference: bool = False,
+    shot_keys: Optional[list] = None,
+    retry_cycles: Optional[int] = None,
+    fallback_model: Optional[str] = None,
     *,
     _provider_name: str = "aitunnel",
 ) -> Dict[str, Any]:
@@ -139,6 +143,10 @@ def video_generator_aitunnel_tool(
         sample_shot_key: Опциональный ключ шота в формате "scene-shot" для sample режима.
         generate_blockout: Включён ли слой болванок проекта (раздел 11.3).
         use_blockout_reference: Подавать ли ролик болванки видео-референсом в запрос (раздел 11.3).
+        shot_keys: Ограничить обработку указанными выходными шотами, не затрагивая остальные.
+        retry_cycles: Число циклов основной и резервной модели; из VIDEO_RETRY_CYCLES.
+        fallback_model: Резервная модель; из VIDEO_FALLBACK_MODEL.
+        _provider_name: Имя провайдера для общего адаптера (aitunnel или routerai).
 
     Returns:
         Словарь со статусом, сообщением и списком results по шотам.
@@ -203,11 +211,22 @@ def video_generator_aitunnel_tool(
         logger.warning("⚠️ Список items пуст")
         return _error_result("Список items пуст")
 
-    if shots_file_path and project_id:
+    if shots_file_path and project_id and (force_update_prompts or not skip_prompt_enhancement):
+        description_items = items_list
+        if shot_keys is not None:
+            description_items = [item for item in description_items if _shot_key(item) in shot_keys]
+        if sample_before_batch:
+            selected, _, sample_error = _select_sample_video_items(
+                _collect_video_items(items_list, include_existing=True), sample_shot_key,
+            )
+            if sample_error:
+                return _error_result(sample_error)
+            selected_keys = {_shot_key(item) for item in selected}
+            description_items = [item for item in items_list if _shot_key(item) in selected_keys]
         logger.info("📝 Этап 1: Анализ и обновление описаний изображений")
         descriptions_updated = update_shots_with_descriptions(
             shots_file_path,
-            items_list,
+            description_items,
             force_update=force_update_prompts,
             skip_prompt_enhancement=skip_prompt_enhancement,
         )
@@ -253,6 +272,16 @@ def video_generator_aitunnel_tool(
     if not configured_model:
         return _error_result(f"{env_prefix}_VIDEO_MODEL не задан")
 
+    fallback_model = (fallback_model if fallback_model is not None else
+                      os.getenv(f"{env_prefix}_VIDEO_FALLBACK_MODEL", "")).strip()
+    try:
+        retry_cycles = int(retry_cycles if retry_cycles is not None else
+                           os.getenv(f"{env_prefix}_VIDEO_RETRY_CYCLES", "1"))
+        if retry_cycles < 0:
+            raise ValueError("negative cycle count")
+    except (TypeError, ValueError):
+        return _error_result(f"{env_prefix}_VIDEO_RETRY_CYCLES должен быть целым числом >= 0")
+
     try:
         model_catalog = _get_routerai_video_models() if _provider_name == "routerai" else _get_aitunnel_video_models()
     except Exception as exc:
@@ -264,6 +293,15 @@ def video_generator_aitunnel_tool(
     except Exception as exc:
         logger.error("❌ Ошибка чтения provider_jobs.json: %s", exc)
         return _error_result(f"Ошибка чтения provider_jobs.json: {exc}")
+    if project_id:
+        from .video_plan import apply_video_plan
+        items_list = apply_video_plan(project_id, items_list)
+    if shot_keys is not None:
+        selected_keys = set(shot_keys)
+        known_keys = {_shot_key(item) for item in items_list}
+        if not selected_keys or not selected_keys.issubset(known_keys):
+            return _error_result("Requested video scope contains missing or no shots")
+        items_list = [item for item in items_list if _shot_key(item) in selected_keys]
     video_items = _collect_video_items(items_list, include_existing=job_store is not None)
     if job_store:
         collected_keys = {_shot_key(item) for item in video_items}
@@ -332,24 +370,21 @@ def video_generator_aitunnel_tool(
             len(batch_items),
         )
         with ThreadPoolExecutor(max_workers=len(batch_items)) as executor:
+            from .video_retry import generate_with_model_fallback
+            generation_params = dict(session_id=session_id, api_key=api_key, model_catalog=model_catalog,
+                configured_model=configured_model, seed=seed, language=language, job_store=job_store,
+                generate_blockout=generate_blockout, use_blockout_reference=use_blockout_reference,
+                deadline=deadline, video_step_started_at=video_step_started_at,
+                remaining_new_output_items=remaining_new_output_items, worker_count=worker_count,
+                provider_name=_provider_name)
             future_to_item = {
                 executor.submit(
+                    generate_with_model_fallback,
                     _generate_single_video_aitunnel,
                     item,
-                    session_id,
-                    api_key,
-                    model_catalog,
-                    configured_model,
-                    seed,
-                    language,
-                    job_store,
-                    generate_blockout,
-                    use_blockout_reference,
-                    deadline,
-                    video_step_started_at,
-                    remaining_new_output_items,
-                    worker_count,
-                    _provider_name,
+                    generation_params,
+                    retry_cycles,
+                    fallback_model,
                 ): item
                 for item in batch_items
             }
@@ -368,6 +403,20 @@ def video_generator_aitunnel_tool(
                         "video_path": item.get("video_path"),
                     }
                 results.append(result)
+
+    if retry_cycles and project_dir:
+        plan_path = project_dir / '97_shots/video_plan.json'
+        if plan_path.is_file():
+            plan = json.loads(plan_path.read_text())
+            winners = {f"{r['scene_number']}-{r['shot_number']}": r for r in results if r.get('success')}
+            changed = False
+            for unit in plan.get('units', []):
+                winner = winners.get(unit['shot_keys'][0])
+                if winner and winner.get('video_path') == unit['video_path'] and unit.get('model') != winner.get('model'):
+                    unit['model'] = winner['model']
+                    changed = True
+            if changed:
+                plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2))
 
     # ТЗ раздел 20.3, код P09: video_generator — единственный, кто знает,
     # какие референсы фактически ушли в запрос; фиксирует результат уже
@@ -433,6 +482,9 @@ def trusted_aitunnel_output_for_item(
     ``prompt`` must already be the provider prompt.  Deliberately do not translate
     here: delivery validation must not make a second LLM/API request.
     """
+    if item.get("video_mode") == "references":
+        from .video_plan import trusted_reference_output
+        return trusted_reference_output(item, job_store, configured_model, seed)
     if not job_store or (not prompt and original_prompt is None):
         return False
     video_path = str(item.get("video_path") or "")
@@ -766,7 +818,7 @@ def _collect_video_items(items_list: List[Dict[str, Any]], include_existing: boo
         if not end_image:
             end_image = _discover_shot_image(video_dir, scene_number, shot_number, "end")
 
-        if not start_image and not output_exists:
+        if not start_image and not output_exists and item.get("video_mode") != "references":
             logger.debug("⏭️ Стартовый кадр не найден для %s-%s", scene_number, shot_number)
             continue
 
@@ -874,6 +926,11 @@ def _generate_single_video_aitunnel(
     provider_name: str = "aitunnel",
 ) -> Dict[str, Any]:
     del session_id
+    if item.get("video_mode") == "references":
+        from .video_plan import generate_reference_video
+        return generate_reference_video(item, api_key, configured_model, seed, job_store, model_catalog,
+                                        deadline, video_step_started_at, remaining_new_output_items, worker_count,
+                                        provider_name=provider_name)
     provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
 
     scene_number = item.get("scene_number", "?")
@@ -1214,7 +1271,7 @@ def _generate_single_video_aitunnel(
                     f"{base_url}/videos",
                     headers=headers,
                     json=payload,
-                    timeout=_DEFAULT_TIMEOUT_SECONDS,
+                    timeout=_DEFAULT_SUBMIT_TIMEOUT_SECONDS,
                 )
                 if submit_response.status_code not in (200, 202):
                     raise RuntimeError(

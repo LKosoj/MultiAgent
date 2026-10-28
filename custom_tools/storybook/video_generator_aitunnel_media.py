@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import os
 from math import gcd
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -88,6 +89,14 @@ def _resolve_size_params(
     resolution = _infer_resolution(width, height)
     aspect_ratio = _infer_aspect_ratio(width, height)
 
+    requested_resolution = os.getenv(model_config.get("_resolution_env", ""), "").strip()
+    if requested_resolution:
+        if requested_resolution not in (model_config.get("supported_resolutions") or []):
+            raise ValueError(f"Модель не поддерживает запрошенное разрешение {requested_resolution}")
+        if aspect_ratio not in (model_config.get("supported_aspect_ratios") or []):
+            return None
+        return {"resolution": requested_resolution, "aspect_ratio": aspect_ratio}
+
     supported_sizes = set(model_config.get("supported_sizes") or [])
     if size in supported_sizes:
         return {"size": size}
@@ -113,7 +122,14 @@ def _infer_resolution(width: int, height: int) -> Optional[str]:
 def _infer_aspect_ratio(width: int, height: int) -> Optional[str]:
     divisor = gcd(width, height)
     reduced = (width // divisor, height // divisor)
-    return _ASPECT_RATIO_BY_REDUCED_PAIR.get(reduced)
+    exact = _ASPECT_RATIO_BY_REDUCED_PAIR.get(reduced)
+    if exact:
+        return exact
+    # Codec-aligned image dimensions can differ slightly from their display ratio.
+    nearest = min(_ASPECT_RATIO_BY_REDUCED_PAIR, key=lambda pair: abs(width / height - pair[0] / pair[1]))
+    if abs(width / height / (nearest[0] / nearest[1]) - 1) <= 0.01:
+        return _ASPECT_RATIO_BY_REDUCED_PAIR[nearest]
+    return None
 
 
 def _select_best_supported_duration(requested_duration: int, supported_durations: List[int]) -> int:

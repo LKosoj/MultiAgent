@@ -166,6 +166,16 @@ def _build_state_to_image_common_core(
 - Генерируй literal image-edit prompt для одного видимого кадра, а не литературный пересказ или интерпретацию сцены.
 - Source of truth для этой фазы: `shot_frame_spec` + `{state_spec_name}` + `world_physics` + текущие structured fields.
 - Описывай только то, что действительно должно быть видно в этой фазе; не смешивай раннее и позднее состояния одного и того же шота.
+- Отделяй сторону камеры от стороны персонажа относительно преграды. Сохраняй масштаб и естественное перекрытие тела: непрозрачные части закрывают тело, целые прозрачные части сохраняются, повреждение относится только к указанной части. Не расширяй проём ради показа всех деталей одежды.
+- Не генерируй и не выбирай художественный стиль: код добавит готовое описание из каталога по сохранённой привязке кадра. Не копируй в `english_prompt` общую библию стиля, палитры других локаций, будущие события, звук, монтажные указания и название модели.
+- `negative_prompt` — визуальные дефекты, несовместимые состояния объектов текущего кадра и явно заданное отсутствие предметов, существенное для этого момента. Не копируй `must_not_show` и сведения о соседних кадрах целиком: не перечисляй имена, локации, предметы и события других моментов. Не перечисляй весь сюжет в виде запретов.
+- Сохраняй область действия запрета: конкретную часть объекта, владельца, фазу и степень изменения. Не сокращай условный запрет до запрета всего объекта или любого его состояния; сверяй его с обязательными видимыми частями в positive prompt.
+- Сохраняй технические параметры текущего кадра: крупность, ракурс, оптику, экспозицию, температуру света, позу и расположение предметов. В `negative_prompt` включай только применимые к изображению ограничения, а не требования к сюжету или производственные метаданные.
+- Крупность выражай видимым масштабом главного субъекта и границами кадра: что занимает основную площадь, что обрезано или остаётся вне кадра. Одних названия плана и фокусного расстояния недостаточно; не раскрывай весь интерьер ради сохранения референса.
+- Сохраняй геометрию мира, а не экранные координаты фона. При следящей камере движущийся герой может оставаться в той же области кадра, но фон должен заметно сместиться согласно направлению, глубине и пройденному пути. При неподвижной камере перемещается герой относительно фона; локальный жест не требует параллакса. В непрерывном движении не возвращай следующий START к исходному виду локации из канонического референса.
+- Для перемещения камеры задай в END новое экранное положение и масштаб уже видимых фоновых ориентиров относительно START; при боковом сопровождении фон проходит в противоположную движению камеры сторону. Фраза «лёгкий параллакс» без такого конечного состояния недостаточна.
+- Заданную анатомическую сторону руки сохраняй относительно тела персонажа. Когда ракурс однозначен, поясняй её экранное положение; не путай сторону персонажа со стороной зрителя и не копируй иной хват из референса.
+- Эпоха уже закреплена опорными изображениями и референсами. Не добавляй в image prompt и negative_prompt датировки исторической эпохи, требования исторической точности и перечни запрещённых эпохой предметов. Описывай текущий кадр и его изменения; внешний вид среды и предметов наследуется от референсов.
 - `{summary_field}`, `{composition_field}`, `{camera_position_field}`, `{orientation_field}` и `english_prompt` должны описывать ОДИН И ТОТ ЖЕ кадр.
 - Предпочитай конкретные видимые факты: положение тела, контакты, зазоры, перекрытия, разрыв поверхности, направление взгляда, читаемое выражение лица.
 - Если в source-of-truth есть `pose_signature`, это и есть главный источник для читаемой позы/жеста: корпус, голова, руки, кисти, реквизит и их взаимное положение.
@@ -177,6 +187,8 @@ def _build_state_to_image_common_core(
 - Не заменяй видимые факты декоративной авторской прозой, метафорами или "красивыми" обобщениями.
 - Описывай внешность персонажа через прямые канонические признаки из референсов и описаний, а не через сравнения, метафоры, зооморфные аналогии или "как у ...".
 - Используй только визуальный канон персонажа: лицо, глаза, пропорции, прическа, одежда, аксессуары, устойчивые видимые признаки. Не вытаскивай в image-prompt профессию, роль в сюжете, биографию, характер или речевые паттерны, если они не выражены визуально.
+- Одежда, аксессуары и причёска в каноне — базовый вид, который уступает текущему состоянию из исходника и phase_state_spec. Не возвращай снятую вещь на персонажа из описания канона: сохраняй отдельно, где она находится сейчас и что персонаж носит в этой фазе.
+- Одежду, реквизит и их положение бери из текущего состояния шота и его исходной преемственности, а не из позы и комплектации персонажа на референсе.
 - Не добавляй абстрактные mood-labels вроде "торжественность", "роковая пауза", "напряжённая тишина", если они не переведены в видимые признаки света, воздуха, материала, позы или лица.
 - Не расширяй style anchors сверх уже заданного проектного стиля. Не добавляй новых художников, школ, эстетик или художественных сравнений, если их нет во входных данных этого шота.
 - Не допускай языкового мусора: prompt должен оставаться на языке генерации, кроме допустимых технических camera/lens терминов и явно авторизованных readable texts.
@@ -186,6 +198,9 @@ def _build_state_to_image_common_core(
 - Если мир кадра физически нестабилен, prompt не должен описывать эмоционально пустое лицо и спокойную постановочную стойку без явного основания в source-of-truth.
 - Если `shot_frame_spec`, `{state_spec_name}` или `prop_continuity` явно называют реквизит/аксессуар, сохраняй его предметную идентичность дословно. Не подменяй трость стулом, книгу коробкой, очки маской и т.п. только из-за формы, материала или ассоциаций.
 - Если в кадре несколько персонажей, держи их визуальные якоря раздельно: не смешивай лицо, одежду, аксессуары и силуэт одного персонажа с другим. Используй `shot_role` и `must_remain_distinct_from` из per-shot cast data как обязательные ограничения различимости.
+- Главный визуальный акцент не обязан быть ближе к камере. Сохраняй заданный порядок персонажей по пути и глубине: выделяй субъекта фокусом и кадрированием, не переставляя его на передний план вопреки геометрии сцены.
+  Передний план означает физическую близость к камере, а не важность персонажа в композиции.
+- Положение цели маршрута и опорных объектов определяется текущей камерой и направлением движения, а не экранной глубиной канонического референса локации.
 - Если per-shot cast data содержит `phase_pose_signature` для персонажа, это authoritative поза именно этого персонажа в текущей фазе. Не позволяй позе primary subject перетекать на secondary characters и наоборот.
 - Не добавляй новые props, зоны, фоны, символы или декоративные объекты только ради "более красивого" кадра.
 - Держи формулировки суше и визуальнее: меньше оценочных фраз, больше буквальных наблюдаемых признаков кадра.
@@ -197,8 +212,8 @@ def _build_state_to_image_phase_rule(phase_name: str) -> str:
     if str(phase_name).upper() == "START":
         return """
 - START = самый ранний читаемый кадр этого же шота, а не отдельный спокойный пролог.
-- Если внутри шота уже начинается физически значимое изменение, START должен сохранять раннюю читаемую напряжённость этого же события, но без подмены на END-результат.
-- Не преувеличивай устойчивость и безопасность кадра, если shot_description/transition/world_physics задают imminent change внутри того же шота.
+- Для t0_mode=early_motion/mid_action сохраняй видимую раннюю фазу этого же события, без подмены на END-результат; для frozen используй заданное состояние до события.
+- Опора и устойчивость берутся из start_state_spec.world_physics, а не из общего предположения о безопасном прологе.
 """
     return """
 - END = финальный стоп-кадр этого же шота, без process prose и без возврата к раннему безопасному состоянию.
@@ -234,7 +249,7 @@ def _build_state_to_image_user_core(
 - Не придумывай новые style references и новые artist names. Используй только те стилевые якоря, которые уже даны во входных данных проекта/шота.
 - Не смешивай языки и скрипты. В image prompt не должно быть случайных инородных фрагментов, кроме стандартных технических camera/lens терминов.
 - Если shot/frame требует эмоциональной или физической реакции, описывай её как видимое состояние лица и тела, а не как нейтральную заглушку.
-- `facing_camera` и прямой взгляд в объектив допустимы только при явном direct-address/frontal-lens кадре.
+- `facing_camera` описывает корпус спереди, а не взгляд в объектив. Прямой взгляд в объектив допустим только при явно заданном обращении к зрителю; в остальных случаях сохраняй цель взгляда из исходника независимо от ракурса корпуса.
 - Держи геометрию кадра непротиворечивой: `camera_position`, `orientation` и текстовое описание ракурса не должны спорить друг с другом.
 - Если реквизит уже назван в `shot_frame_spec`, `{state_spec_name}` или `prop_continuity`, используй то же имя предмета и не заменяй его семантически похожим объектом.
 - Если в per-shot cast присутствуют несколько персонажей, используй их как отдельные визуальные сущности: один `primary_subject`, остальные `secondary_visible_character`, без смешения внешних признаков.
@@ -250,6 +265,7 @@ def screenplay_shots_generator_tool(
     language: str = 'en',
     max_scenes: Optional[int] = None,
     scene_numbers: Optional[List[int]] = None,
+    shot_keys: Optional[List[str]] = None,
     force: bool = False,
     generate_blockout: bool = True,
     allowed_durations: Optional[List[int]] = None,
@@ -266,6 +282,7 @@ def screenplay_shots_generator_tool(
         language: Язык генерации промптов для shots.json (по умолчанию 'en').
         max_scenes: Опционально ограничить количество сцен (после фильтрации по scene_numbers).
         scene_numbers: Опционально явный список номеров сцен для генерации (например: [2, 3]).
+        shot_keys: Только указанные ключи scene-shot; остальные шоты сохраняются.
         force: Если True — игнорирует существующий shots.json и перегенерирует заново (полезно при частичной генерации).
         generate_blockout: Если True (по умолчанию) — отсутствие/пустота набора supported_durations
             видеомодели останавливает генерацию блокирующей ошибкой B15. Если False — генерация
@@ -330,6 +347,9 @@ def screenplay_shots_generator_tool(
         logger.error(f"❌ Ошибка чтения файлов: {e}")
         return {"items": [], "consistency_rules": [], "error": f"File reading error: {e}"}
     
+    from .style_keeper import ensure_image_style_catalog
+    image_style_catalog = ensure_image_style_catalog(base_dir, style_images_data)
+
     # Получаем сцены из screenplay
     screenplay_scenes = screenplay_data.get("screenplay", [])
     if not screenplay_scenes:
@@ -343,6 +363,14 @@ def screenplay_shots_generator_tool(
         except Exception:
             allow = set()
         screenplay_scenes = [sc for sc in (screenplay_scenes or []) if int(sc.get("scene_number", 0)) in allow]
+
+    selected_shot_keys = set(shot_keys) if shot_keys is not None else None
+    if selected_shot_keys is not None:
+        known = {f"{sc['scene_number']}-{sh['shot_number']}" for sc in screenplay_scenes for sh in sc.get('storyboard', [])}
+        if not selected_shot_keys or not selected_shot_keys.issubset(known):
+            raise ValueError('Shot scope contains missing or no shots')
+        screenplay_scenes = [sc for sc in screenplay_scenes if any(
+            f"{sc['scene_number']}-{sh['shot_number']}" in selected_shot_keys for sh in sc.get('storyboard', []))]
 
     # Optional limiting by max_scenes (after filtering)
     if max_scenes is not None:
@@ -371,7 +399,7 @@ def screenplay_shots_generator_tool(
     # как условие «пропустить генерацию».
 
     # If the caller requests a partial scope or force regen, do NOT short-circuit on existing shots.json.
-    requested_partial = (scene_numbers is not None) or (max_scenes is not None)
+    requested_partial = (scene_numbers is not None) or (max_scenes is not None) or (shot_keys is not None)
 
     # Полный набор номеров сцен фильма (до фильтрации по scope) — нужен, чтобы решить,
     # покрывает ли результат весь фильм для маркера generation_completed (C-2).
@@ -417,6 +445,7 @@ def screenplay_shots_generator_tool(
         locations_data=locations_data,
         consistency_rules=consistency_rules,
         style_images_data=style_images_data,
+        image_style_catalog=image_style_catalog,
         seed=seed,
         language=language,
         generate_end_shots=generate_end_shots,
@@ -499,6 +528,7 @@ def screenplay_shots_generator_tool(
             partial=True,
             manual_overrides=manual_overrides,
             effective_durations=effective_durations,
+            shot_keys=selected_shot_keys,
             duration_report=point1_report,
         )
 
@@ -557,15 +587,11 @@ def screenplay_shots_generator_tool(
             else:
                 logger.info("♻️ inputs_hash не совпал или генерация неполна без совпадения — полная перегенерация")
 
-    # R3: под requested_partial блок resume/short-circuit (выше) пропускается,
-    # поэтому inputs_hash on-disk НЕ сверялся. Если стабильные входы всего фильма
-    # изменились, on-disk completed_scenes и его items относятся к ДРУГИМ входам:
-    # нельзя ни засчитывать их завершёнными (иначе ложный generation_completed / C-2),
-    # ни мёржить superset'ом (иначе смешанный shots.json из старых+новых входов).
-    # Наследуем on-disk состояние (seed completed_scenes + superset-merge) только при
-    # совпадении inputs_hash; иначе пишем чисто под текущие входы (перезапись).
+    # R3: сохранение внешних items и признание их свежими — разные решения.
+    # При requested_partial старый payload сохраняем, даже если inputs_hash изменился,
+    # но seed completed_scenes используем только при совпадении hash.
     on_disk_hash_matches = bool(on_disk_meta) and (on_disk_meta.get("inputs_hash") == inputs_hash)
-    partial_write = resume_active or (requested_partial and on_disk_hash_matches)
+    partial_write = resume_active or (requested_partial and bool(on_disk_meta))
 
     # Генерируем shots.json (и FCPXML, если его нет)
     logger.info("🎬 Генерируем shots.json...")
@@ -582,8 +608,9 @@ def screenplay_shots_generator_tool(
     # обычного resume). Для resume_active current_scope не пересекается с completed_scenes_on_disk
     # (screenplay_scenes уже отфильтрован), поэтому вычитание там — no-op.
     current_scope = {int(sc.get("scene_number", 0)) for sc in (screenplay_scenes or [])}
+    freshness_seed = resume_active or (requested_partial and on_disk_hash_matches)
     completed_scene_numbers: set = (
-        (set(completed_scenes_on_disk) - current_scope) if partial_write else set()
+        (set(completed_scenes_on_disk) - current_scope) if freshness_seed else set()
     )
     total_shots = 0
     item_number = 1
@@ -628,7 +655,9 @@ def screenplay_shots_generator_tool(
             )
             _merge_write_shots(
                 shots_path, shots_data=checkpoint_data, partial=partial_write,
+                image_style_catalog=image_style_catalog,
                 manual_overrides=manual_overrides, effective_durations=effective_durations,
+                shot_keys=selected_shot_keys,
             )
             logger.info(
                 "💾 Checkpoint shots.json обновлен после shot %s сцены %s (%s items)",
@@ -672,6 +701,8 @@ def screenplay_shots_generator_tool(
         
         for shot in storyboard:
             shot_number = shot.get("shot_number", 1)
+            if selected_shot_keys is not None and f"{scene_number}-{shot_number}" not in selected_shot_keys:
+                continue
             shot_description = shot.get("description", "")
             camera_plan = shot.get("camera_plan", "")
             timing = shot.get("timing", "")
@@ -726,7 +757,7 @@ def screenplay_shots_generator_tool(
                     )
                     start_shot_item = shot_item
                     start_shot_item["video_prompt"] = ""
-                    start_llm_result = dict(previous_end_llm_result or {})
+                    start_llm_result = start_shot_item.pop("_start_llm_result")
                     start_llm_result["video_prompt"] = ""
                     local_start.append(shot_item)
                     local_item += 1
@@ -769,6 +800,7 @@ def screenplay_shots_generator_tool(
                             seed=seed,
                             visual_style=str(extended_context.get("visual_style") or ""),
                             style_do_not_include=extended_context.get("style_do_not_include"),
+                            image_style_catalog=image_style_catalog,
                         )
                         start_shot_item = shot_item
                         start_shot_item["video_prompt"] = ""
@@ -810,8 +842,8 @@ def screenplay_shots_generator_tool(
                                 start_location_name = str(start_locations[0].get("name") or "").strip()
 
                         requested_end_location_name = (
-                            str(extended_context.get("location_canon_name") or "").strip()
-                            or str(end_llm_result.get("location") or "").strip()
+                            str(end_llm_result.get("location") or "").strip()
+                            or str(extended_context.get("location_canon_name") or "").strip()
                         )
                         end_location_canon_name = requested_end_location_name
                         if start_location_name:
@@ -839,6 +871,7 @@ def screenplay_shots_generator_tool(
                                     start_location_name,
                                     requested_end_location_name,
                                 )
+                        end_llm_result["location"] = end_location_canon_name
                         end_shot_item = _create_shot_item(
                             project_id=project_id,
                             scene_number=scene_number,
@@ -863,6 +896,7 @@ def screenplay_shots_generator_tool(
                             seed=seed,
                             visual_style=str(extended_context.get("visual_style") or ""),
                             style_do_not_include=extended_context.get("style_do_not_include"),
+                            image_style_catalog=image_style_catalog,
                         )
                         end_shot_item["video_prompt"] = ""
                         local_end.append(end_shot_item)
@@ -964,7 +998,9 @@ def screenplay_shots_generator_tool(
                 )
                 _merge_write_shots(
                     shots_path, shots_data=checkpoint_data, partial=partial_write,
+                    image_style_catalog=image_style_catalog,
                     manual_overrides=manual_overrides, effective_durations=effective_durations,
+                    shot_keys=selected_shot_keys,
                 )
                 logger.info(
                     "💾 Checkpoint shots.json синхронизирован после завершения сцены %s (%s items)",
@@ -1003,7 +1039,9 @@ def screenplay_shots_generator_tool(
     final_duration_report: Dict[str, Any] = {}
     shots_data = _merge_write_shots(
         shots_path, shots_data=shots_data, partial=partial_write,
+        image_style_catalog=image_style_catalog,
         manual_overrides=manual_overrides, effective_durations=effective_durations,
+        shot_keys=selected_shot_keys,
         duration_report=final_duration_report,
     )
     shots_items = shots_data["items"]
@@ -1103,6 +1141,7 @@ def _compute_inputs_hash(
     seed: int,
     language: str,
     generate_end_shots: bool,
+    image_style_catalog: Optional[Dict[str, Any]] = None,
 ) -> str:
     """sha256 по стабильным входам всего фильма (M-26).
 
@@ -1120,6 +1159,37 @@ def _compute_inputs_hash(
         "language": language,
         "generate_end_shots": bool(generate_end_shots),
     }
+    if image_style_catalog:
+        default_style = image_style_catalog.get("default_style_id")
+        location_bindings = image_style_catalog.get("location_bindings") or {}
+        expected_styles = {}
+        for scene in screenplay_data.get("screenplay", []) or []:
+            scene_number = scene.get("scene_number")
+            scene_location = scene.get("location_canon_name")
+            for shot in scene.get("storyboard", []) or []:
+                try:
+                    key = (int(scene_number), int(shot.get("shot_number")))
+                except (TypeError, ValueError):
+                    continue
+                location_name = shot.get("location_canon_name") or scene_location
+                expected_styles[key] = location_bindings.get(location_name, default_style)
+
+        def _is_explicit_frame_binding(key, value):
+            try:
+                scene_number, shot_number = (int(part) for part in str(key).split(":", 2)[:2])
+            except (TypeError, ValueError):
+                return value != default_style
+            return value != expected_styles.get((scene_number, shot_number), default_style)
+
+        payload["image_style_catalog"] = {
+            "styles": image_style_catalog.get("styles"),
+            "default_style_id": default_style,
+            "location_bindings": location_bindings,
+            "frame_bindings": {
+                k: v for k, v in image_style_catalog.get("frame_bindings", {}).items()
+                if _is_explicit_frame_binding(k, v)
+            },
+        }
     try:
         blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     except Exception:
@@ -1492,6 +1562,8 @@ def _merge_write_shots(
     manual_overrides: Optional[Dict[tuple, Dict[str, Any]]] = None,
     effective_durations: Optional[List[int]] = None,
     duration_report: Optional[Dict[str, Any]] = None,
+    image_style_catalog: Optional[Dict[str, Any]] = None,
+    shot_keys: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Атомарная кросс-процессная запись shots.json (M-7/H-4).
 
@@ -1533,14 +1605,37 @@ def _merge_write_shots(
                     shots_data = _merge_shots_payload(on_disk, shots_data)
 
                 items = shots_data.get("items") or []
+                duration_items = items if shot_keys is None else [
+                    i for i in items if f"{i['scene_number']}-{i['shot_number']}" in shot_keys]
                 if manual_overrides:
-                    _apply_manual_duration_overrides(items, manual_overrides)
+                    _apply_manual_duration_overrides(duration_items, manual_overrides)
                 if effective_durations is not None:
-                    changed, norm_warnings, affected = _normalize_shot_durations(items, effective_durations)
+                    changed, norm_warnings, affected = _normalize_shot_durations(duration_items, effective_durations)
                     if duration_report is not None:
                         duration_report["changed"] = changed
                         duration_report["warnings"] = norm_warnings
                         duration_report["affected"] = affected
+
+                if image_style_catalog:
+                    style_path = os.path.join(os.path.dirname(directory), "30_style", "image_styles.json")
+                    os.makedirs(os.path.dirname(style_path), exist_ok=True)
+                    # The existing shots lock also protects the frame bindings.
+                    if os.path.exists(style_path):
+                        with open(style_path, encoding="utf-8") as sf:
+                            saved_catalog = json.load(sf)
+                    else:
+                        saved_catalog = dict(image_style_catalog)
+                    bindings = saved_catalog.setdefault("frame_bindings", {})
+                    for item in items:
+                        if item.get("style_id"):
+                            if shot_keys is not None and f"{item['scene_number']}-{item['shot_number']}" not in shot_keys:
+                                continue
+                            key = f"{item['scene_number']}:{item['shot_number']}:{item['shot_type']}"
+                            bindings[key] = item["style_id"]
+                    style_tmp = f"{style_path}.{os.getpid()}.tmp"
+                    with open(style_tmp, "w", encoding="utf-8") as sf:
+                        json.dump(saved_catalog, sf, ensure_ascii=False, indent=2)
+                    os.replace(style_tmp, style_path)
 
                 tmp = f"{shots_path}.{os.getpid()}.tmp"
                 try:
@@ -1691,11 +1786,11 @@ def _generate_shot_artistic(
 
 Ты — креативный директор. Создай команды редактирования для START кадра (T=0) на основе технических параметров.
 
-**LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):**
-- `english_prompt`: ALWAYS in English regardless of source language.
+**LANGUAGE CONTRACT (image prompts follow the requested project language):**
+- `english_prompt`: in {prompt_language_label}; the legacy field name does not select English.
 - `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary`,
   `spatial_composition`: in {prompt_language_label} (source language) — these feed downstream QA.
-- `video_prompt`: English-only (unchanged).
+- `video_prompt`: English instructions; preserve source-visible text verbatim in its original script.
 - Continuity-редактирование: префикс `{edit_prefix}`. Создание с нуля: префикс `{create_prefix}`.
 
 **TEXT-IN-IMAGE RULE (critical):**
@@ -1752,9 +1847,10 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 
 **ШАГ 5 — ENGLISH_PROMPT (собери по шаблону):**
 [Editing instruction] [Shot Size]: [Subject + pose] [Position left/center/right + fore/mid/back] [Location context as unified objects] [Lighting + direction] [Camera angle] [Lens specs]
+- Начинай с имени субъекта и требуемой видимой позы/состояния. Не ставь перед ними повтор канонической внешности из референсов; сохраняй текущую одежду и её изменения, освещение, камеру и технические параметры.
 - location_context.key_features → описывай КАК ЕДИНОЕ ЦЕЛОЕ ("wall with embedded neon symbol", не два отдельных объекта)
 - Close-up: освещение БЕЗ температуры K. Medium/Wide: с температурой K.
-- Lens: Close-up → 85mm f/1.8. Medium → 50mm f/2.0. Wide → 24mm f/8.0.
+- Lens: explicit optics and focal-length requirements in camera_plan, storyboard and shot_frame_spec take priority. Shot size alone does not determine focal length. Only when no optics are specified, use these defaults: Close-up → 85mm f/1.8; Medium → 50mm f/2.0; Wide → 24mm f/8.0.
 - Ratio ≈1.0 (0.98–1.02) → НЕ генерируй команду масштабирования.
 - scene_continuity_facts: добавляй гардероб/предметы только если видимы при данной крупности. Close-up → минимальные подсказки.
 
@@ -1763,19 +1859,17 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 - Не общие фразы "image 1 as character". Укажи конкретный аспект.
 
 **ШАГ 7 — VIDEO_PROMPT (English-only, одна строка):**
-Формат: Camera (с позицией) → Subject (quality keyword + action, до 2 шагов) → Environment (микродинамика) → Tempo
-- video_prompt = tight English paraphrase shot_description + camera clause. Ничего лишнего.
+Формат: Camera (с позицией) → Subject (quality keyword + полная причинная последовательность действий) → Environment (микродинамика) → Tempo
+- video_prompt = tight English paraphrase of the complete shot_description + camera clause; required end results must be explicitly achieved by END. Preserve source-visible text verbatim in its original script. Ничего лишнего.
 - Направление движения: "спускается" → "descends" (НЕ "ascends"). "Касается" → "makes contact" (НЕ "approaching").
 - Если взаимодействие объект-персонаж → включи видимые части персонажа ("nape/upper back visible in frame").
 - Close-up: обязателен токен "close-up". Фон = blur-hint, без room-establishing.
 - Split screen: обязателен токен "split-screen".
 - Quality keywords: natural/energetic/slow and deliberate/graceful/confident/fluid movement.
 
-**ШАГ 8 — NEGATIVE_PROMPT (КОМПАКТНО, максимум 30 слов):**
-- Базовый: blurry, motion blur, text, watermark
-- Close-up: + "no extra/double/missing [body parts], no deformed anatomy"
-- Wide: + "no cropping, no truncation, no cut-off subjects"
-- POV: + "no third-person view, no external camera angle"
+**ШАГ 8 — NEGATIVE_PROMPT (КОМПАКТНО, максимум 30 слов, на языке проекта):**
+- Называй нежелательные состояния без дополнительного отрицания: размытие, водяной знак, лишние или отсутствующие части тела.
+- Не запрещай разрешённый исходником текст, заданное кадрирование или обрезку частей вне кадра. Для POV исключай противоречащий ему внешний ракурс.
 - НЕ РАЗДУВАЙ negative повторами одного запрета в разных формулировках. Одна идея = одна фраза.
 
 **ШАГ 9 — SELF-CHECK (обязательно перед возвратом JSON):**
@@ -1813,7 +1907,7 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
   "character_orientation": "из technical params",
   "spatial_composition": "непустая композиция",
   "point_of_view": "objective / pov / etc",
-  "initial_state_summary": "статичное T=0 summary",
+  "initial_state_summary": "видимое T=0 согласно start_state_spec.t0_mode, без последовательности событий",
   "english_prompt": "команда редактирования START T=0",
   "negative_prompt": "запреты по типу кадра",
   "reference_image_paths": ["путь1", "путь2"],
@@ -1857,6 +1951,8 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
         "lighting_context": extended_context.get("lighting_context", ""),
         "scene_sound": extended_context.get("scene_sound", ""),
         "visual_style": extended_context.get("visual_style", ""),
+        "style_images": extended_context.get("style_images", {}),
+        "style_do_not_include": extended_context.get("style_do_not_include", []),
         "previous_shot": extended_context.get("previous_shot", {}),
         "next_shot": extended_context.get("next_shot", {}),
     }
@@ -1891,7 +1987,7 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 - `shot_frame_spec` и `must_show` / `must_not_show` сильнее общего описания локации: не добавляй объекты, запрещённые спецификацией шота.
 """
         start_key_objects_rule = (
-            "ОБЯЗАТЕЛЬНО опирайся на key_objects из location_context (в согласовании с shot_frame_spec), референс локации и must_show."
+            "key_objects из location_context используй только для объектов, заданных исходником и видимых при текущем кадрировании; не добавляй предметы ради заполнения кадра."
         )
 
     _bs_art = black_screen_storyboard_shot(
@@ -1911,11 +2007,11 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 
     user_prompt = f"""Создай художественные промпты на основе технических параметров с учетом полного контекста.
 {black_screen_mode_block}
-LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):
-- `english_prompt`: ALWAYS in English regardless of source language.
+LANGUAGE CONTRACT (image prompts follow the requested project language):
+- `english_prompt`: in {prompt_language_label}; the legacy field name does not select English.
 - `negative_prompt`, `reference_roles_instruction`, `main_subject`, `initial_state_summary`,
   `spatial_composition`: in {prompt_language_label} (source language) — these feed downstream QA.
-- `video_prompt`: English-only (unchanged).
+- `video_prompt`: English instructions; preserve source-visible text verbatim in its original script.
 - Для continuity-редактирования используй `{edit_prefix}`.
 - Для создания кадра с нуля используй `{create_prefix}`.
 
@@ -1949,7 +2045,7 @@ SHOT FRAME SPEC (авторитетный source of truth для шота):
 КРУПНОСТЬ КАДРА (ОБЯЗАТЕЛЬНО НАЧНИ ПРОМПТ С НЕЁ):
 {shot_size}
 
-ПАСПОРТ ЛОКАЦИИ (КРИТИЧНО ДЛЯ ФОНА):
+ПРОИЗВОДНЫЙ КОНТЕКСТ ЛОКАЦИИ (не заменяет исходник и shot_frame_spec):
 <location_context>
 {json.dumps(location_ctx, ensure_ascii=False, indent=2)}
 </location_context>
@@ -1969,7 +2065,7 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
     ОБЯЗАТЕЛЬНО:
     - `shot_frame_spec` — это source of truth. Включи все факты из `must_show`, не добавляй того, чего нет в spec, и не делай главным субъектом никого, кроме `primary_subject`.
     - Если в `shot_frame_spec` или `start_state_spec` есть `world_physics`, переведи его в визуально читаемое состояние мира: опора, поверхность, устойчивость, контакты, зазоры, перекрытия. Не замещай это локальными edge-case описаниями.
-    - **ВИЗУАЛИЗАЦИЯ**: Всегда добавляй к имени персонажа его прямые видимые черты из PER-SHOT CAST VISUAL CANON. Используй только лицо, глаза, пропорции, прическу, одежду, аксессуары и устойчивые видимые признаки. Не тащи в prompt роль, профессию, биографию, характер или речевые паттерны.
+    - **ВИЗУАЛИЗАЦИЯ**: Для персонажа с референсом укажи каноническое имя и видимые факты текущего шота: позу, мимику, взгляд и текущую одежду; не перечисляй повторно неизменную внешность из PER-SHOT CAST VISUAL CANON. Если референса нет, добавь только необходимые отличительные признаки. Базовая одежда и аксессуары не отменяют заданную смену или снятие. Не тащи в prompt роль, профессию, биографию, характер или речевые паттерны.
     - **MULTI-CHARACTER LOCK**: если в PER-SHOT CAST VISUAL CANON несколько персонажей, сохраняй их как отдельные визуальные сущности по `shot_role`; не смешивай одежду, лицо, аксессуары и силуэт между ними.
     - Если у персонажа в PER-SHOT CAST VISUAL CANON есть `phase_pose_signature`, используй её как authoritative позу именно этого персонажа в START.
     - **ЛИНЗЫ И КАМЕРА**: Включи технические параметры (85mm f/1.8 и т.д.) в english_prompt.
@@ -1979,7 +2075,7 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
   * Если continuity reference содержит четкий фон → "Keep {location_ctx.get('name', '')} from image 1"
   * Если continuity reference = крупный план → "Use {location_ctx.get('name', '')} from image [N] (location), position characters as in image 1"
 - **BACKGROUND & EXTRAS LOCK (ОБЯЗАТЕЛЬНО при continuity reference)**:
-  * Если ты редактируешь continuity reference (image 1) — фон и массовка должны оставаться теми же: НЕ меняй одежду/прически/лица background extras, НЕ добавляй/удаляй новые источники света и декор (люстры, лампы, бра, флаги, плакаты, растения), НЕ меняй архитектурные элементы, если этого нет в сценарии.
+  * При редактировании continuity reference сохраняй те же объекты мира, архитектуру и идентичность массовки; их экранные положения, масштаб и видимость определяются текущей камерой. Изменения одежды, света и предметов должны следовать исходнику.
   * Референс локации используй только для согласования палитры/материалов/архитектуры, но НЕ как источник новых объектов, если они не присутствуют в image 1 и не требуются явно.
 - Соблюдай ПРАВИЛО START-ФРЕЙМА — фиксируй T=0 (исходное состояние ПЕРЕД действием или МОМЕНТ процесса).
 - Если действие подразумевает ВХОД персонажа в кадр — в T=0 этого персонажа в кадре НЕТ.
@@ -1994,22 +2090,14 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
   * Используй 1–2 anchor objects из `location_context.key_objects` только как подтверждение уже заданного физического состояния мира, а не как замену `world_physics`.
   * Если `world_physics` не задан, опирайся на минимально необходимую физическую заземлённость по смыслу shot_description, без локальных специальных случаев.
 - **КРИТИЧНО - ПРЕДМЕТЫ ИНТЕРЬЕРА ИЗ РЕФЕРЕНСА ЛОКАЦИИ:**
-  * Предметы интерьера из `location_context.key_objects` (стол, стул, комод, лампа, зеркало, окно и т.д.) ДОЛЖНЫ БРАТЬСЯ С РЕФЕРЕНСНОГО ИЗОБРАЖЕНИЯ ЛОКАЦИИ (location reference)!
-  * НЕ описывай позиции предметов интерьера в промпте явно — вместо этого используй location reference для сохранения их точного расположения
-  * Если предмет упоминается в shot_description — используй его ТОЛЬКО для описания взаимодействия персонажа с ним, НЕ меняя его позицию (если это не указано явно)
-  * ПРАВИЛО: "Use location reference image for exact positioning of furniture and interior objects; keep all objects in their original positions from the location reference unless explicitly changed in shot_description"
-  * Если shot_description ЯВНО указывает изменение позиции предмета ("стол передвинули", "стул убрали") → тогда можно изменить
-  * Если shot_description ЯВНО указывает новый предмет, которого нет в location reference → можно добавить
-  * ЦЕЛЬ: обеспечить стабильность расположения предметов между кадрами, используя location reference как источник истины для геометрии интерьера
-  * ПРИМЕРЫ:
-    - ❌ ПЛОХО: "стол справа от окна" → это переопределяет позицию из reference
-    - ✅ ПРАВИЛЬНО: "Use location reference for table position" или просто не упоминать позицию, полагаясь на reference
-    - ✅ ПРАВИЛЬНО: Если shot_description говорит "передвинули стол" → тогда указать новую позицию
+  * Референс сохраняет геометрию локации, но не задаёт крупность, границы кадра или обязательную видимость всего инвентаря.
+  * Описывай положение видимых предметов, если это нужно для композиции текущего шота. Смена точки камеры и кадрирования не означает перемещение самих предметов.
+  * Показывай только требуемую исходником и текущим кадрированием часть интерьера; поза, состояния и явно заданные изменения из shot_description имеют приоритет над референсом.
 - **ZONE DISAMBIGUATION (ОБЯЗАТЕЛЬНО)**:
   * Если anchor object потенциально может находиться в разных зонах локации, ты ОБЯЗАН явно указать ЗОНУ через топологию пространства, а не через абстрактное "в центре кадра".
   * "В центре кадра" НЕ считается зоной. Нужна именно топология сцены/пространства.
   * Определи зону по `shot_description` и `location_context.key_objects` (и их смыслу), не выдумывая новых объектов.
-  * **ДОКАЗАТЕЛЬСТВА ЗОНЫ (ОБЯЗАТЕЛЬНО)**: добавь 1–2 визуальных маркера, которые подтверждают выбранную зону именно для этой локации и этого шота.
+  * Если зона требует пояснения, используй уже заданные и видимые ориентиры; не добавляй новые маркеры ради доказательства зоны.
 
 **[P1 CRITICAL] SUBJECT ZONE LOCK:**
 - Зона главного субъекта должна следовать текущему `shot_description` и `shot_frame_spec`, а не типовым шаблонам сцены.
@@ -2017,15 +2105,15 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 - Проверяй, что зона субъекта, опора, дистанция и фон согласованы между собой физически.
 - **ORIENTATION / ATTENTION TARGET (ОБЯЗАТЕЛЬНО)**:
   * Всегда явно фиксируй **куда повернут корпус и взгляд** персонажа: facing_camera / profile / facing_away / three_quarter.
-  * Всегда укажи **attention target** (на что смотрит/к чему обращён): выбери из `shot_description` или 1–2 `location_context.key_objects`.
+  * Цель взгляда бери из `shot_description` и `gaze_direction`; не выбирай её из случайных предметов location_context.
   * Всегда укажи **attention_target_relation** относительно персонажа: in_front_of_subject / behind_subject / left_of_subject / right_of_subject / above_subject / below_subject.
   * Ориентация должна быть **логически совместима** с `camera_position` и attention target:
   * **КРИТИЧНО - ПЕРСОНАЖИ СМОТРЯТ ДРУГ НА ДРУГА, НЕ В КАМЕРУ (START):**
-    * Если в shot_description описано взаимодействие между персонажами → персонажи ОБЯЗАНЫ смотреть друг на друга!
+    * Если shot_description явно задаёт взаимный взгляд → персонажи смотрят друг на друга; само взаимодействие не требует разворота корпуса или взгляда к партнёру.
     * Явно укажи в промпте: "[Персонаж A] смотрит на [Персонаж B]", "их лица обращены друг к другу", "facing each other"
     * НЕ используй формулировки "смотрят в камеру", "looking at camera", "facing camera" если shot_description подразумевает, что они смотрят друг на друга
     * Если `character_orientation` = "facing_each_other" (из technical params) → обязательно используй это в промпте!
-    - camera_position=in_front → по умолчанию three_quarter; `facing_camera` только если shot_description явно требует прямого фронтального взгляда в объектив/зрителя
+    - camera_position=in_front → facing_camera/three_quarter в зависимости от направления корпуса; взгляд может проходить мимо объектива к заданной цели
     - camera_position=side → profile/three_quarter
     - camera_position=behind → facing_away
   * **ДЕТЕРМИНИРОВАННЫЕ СООТВЕТСТВИЯ:**
@@ -2038,17 +2126,14 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 - **ЕСЛИ ЕСТЬ CONTINUITY REFERENCE**: 
   * ОБЯЗАТЕЛЬНО включи ТОЧНЫЙ путь "{continuity_ref_path}" КАК ПЕРВЫЙ элемент в reference_image_paths
   * Начни english_prompt с "{edit_prefix}" (continuity reference)
-  * В поле reference_roles_instruction (отдельно от english_prompt): "image 1 as continuity reference (pose+composition+lighting, одежда, прическа, предметы); image 2 as character — [имя]; image 3 as background — [локация]"
+  * В поле reference_roles_instruction (отдельно от english_prompt): "image 1 as continuity reference (same world layout and identity; current camera determines screen positions and scale); image 2 as character — [имя]; image 3 as background — [локация]"
   * Добавь остальные character/location референсы как дополнительные (начиная с image 2)
 - **ЕСЛИ НЕТ CONTINUITY REFERENCE**: Начни с "{create_prefix}" и создай изображение с нуля, используя character/location references
-- СТРУКТУРИРОВАННЫЙ ШАБЛОН: обязательно включи все 6 компонентов (Действие + Объект + Позиция + Стиль + Освещение + Перспектива)
+- СТРУКТУРИРОВАННЫЙ ШАБЛОН: обязательно включи все 6 компонентов (Действие + Объект + Позиция + Освещение + Перспектива; художественный стиль добавит код)
 - Учитывай время суток и освещение из контекста с конкретными параметрами (тип света, температура K, направление)
-- Отражай эмоциональную атмосферу из настроения сцены
-- Соблюдай визуальный стиль проекта
 - Обеспечивай преемственность с предыдущими кадрами
-- Подготавливай композицию для следующего кадра
 - Соблюдай ПРАВИЛО ИМЁН И КОЛИЧЕСТВА (имена строго как в start_summary.characters)
-- **STATE ENFORCEMENT (START T=0)**: If action is transformative (e.g. "tongue shoots out"), explicitly describe the *BEFORE* state (e.g. "mouth slightly open, tongue hidden inside"). Do NOT describe the action itself, only the potential.
+- **STATE ENFORCEMENT (START T=0)**: Follow start_state_spec.t0_mode. For frozen, describe the specified pre-action state; for early_motion/mid_action, describe the visible ongoing pose. Do not substitute the completed END result or a sequence of events.
 
 **EDGE-CASE ПРАВИЛА ДЛЯ ЭТОГО ШОТА (определены автоматически, следуй строго):**
 {json.dumps(shot_type_info, ensure_ascii=False, indent=2)}
@@ -2058,8 +2143,8 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 ПРАВИЛА ДЛЯ VIDEO_PROMPT (черновой, будет перегенерирован позже с учётом END):
 - English-only, одна строка. Формат: Camera (с позицией) → Subject (quality keyword + action) → Environment (микродинамика) → Tempo
 - Camera: словарь Static/Pan/Tilt/Dolly/Tracking/Zoom/Crane + позиция ("at eye level"/"from behind"). Движение камеры: укажи тип + направление. Статика: "Camera locks off at [position]"
-- Subject: quality keyword (natural/energetic/slow and deliberate/graceful/confident/fluid movement) + действие (до 2 шагов через "then")
-- Environment: ЗАПРЕЩЕНО "static background". Используй: mist drifts / reflections shimmer / leaves sway / fabric billows
+- Subject: quality keyword (natural/energetic/slow and deliberate/graceful/confident/fluid movement) + полная причинная последовательность действий через "then"
+- Environment: только процессы из shot_description и shot_frame_spec; неподвижный фон допустим, не добавляй туман, отражения или колыхание ткани ради микродинамики.
 - Tempo: slowly/quickly/gently/steadily/handheld/locks off
 - Structure: "Scene begins with [START], then [transition], finally ending with [END]"
 - Subject = из start_summary.characters. Не подменяй субъектом из continuity reference.
@@ -2072,17 +2157,13 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
 - ВСЕГДА используй ТОЧНЫЕ имена из start_summary.characters (не изменяй регистр, не добавляй/убирай символы)
 
 ЗАДАЧА ДЛЯ ENGLISH_PROMPT:
-- Пиши `english_prompt` строго на английском. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
-- **ОБЯЗАТЕЛЬНО ИСПОЛЬЗУЙ ВСЕ ДЕТАЛИ**: initial_state_summary + spatial_composition + camera_position + character_orientation + point_of_view + prop_continuity
+- Пиши `english_prompt` на {prompt_language_label}. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
+- Сохрани подтверждённые исходником позу, композицию, камеру, взгляд и реквизит из технического анализа; не переносись в чужую фазу и не копируй необязательный инвентарь.
 - **DIALOGUE IS AUDIO-ONLY**: реплики/междометия/крики персонажей передавай через мимику и артикуляцию рта/позу,
   но НЕ рендери буквенный текст в кадре (no speech bubbles, no subtitle/caption text, no on-image dialogue words).
-- **КРИТИЧНО - ИСПОЛЬЗУЙ ОПИСАНИЕ ЛОКАЦИИ ИЗ location_context**:
-  * ОБЯЗАТЕЛЬНО используй lighting из location_context (тип света, температуру, направление)
-  * ОБЯЗАТЕЛЬНО используй color_palette из location_context (цветовую палитру)
-  * ОБЯЗАТЕЛЬНО используй atmosphere из location_context (атмосферу)
+- **КОНТЕКСТ ЛОКАЦИИ**:
+  * lighting, color_palette и atmosphere из location_context — подсказки, если они согласованы с исходником, текущей фазой и референсом.
   * {start_key_objects_rule}
-  * НЕ придумывай свои характеристики освещения или цветов - используй ТОЛЬКО из location_context!
-  * ПРИМЕР: если location_context.lighting = "яркий белый свет", НЕ пиши "слабое освещение" или "тёмный зал"
 - **КРИТИЧНО - LOCATION REFERENCE - MULTI-VIEW SHEET**:
   * Если location reference — multi-view, НЕ описывай "4 панели/лист/разбивку" в основном тексте промпта (это триггерит коллаж).
   * Вместо этого: опиши кадр как ЕДИНЫЙ непрерывный фрейм и добавь короткую фразу: "Use the location reference to ground geometry/palette; select ONE view that matches this shot; do not output a split-screen unless storyboard explicitly requires it."
@@ -2093,9 +2174,9 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
      * Убирай избыточные слова: вместо "находится на расстоянии миллиметра над" → "в миллиметре над"
      * Не повторяй информацию об освещении/палитре - укажи один раз
   2. **[ТЕХНИЧЕСКИЕ ПАРАМЕТРЫ]** - компактно, без лишних слов:
-     * Формат: "Ракурс: [camera_position]. [focal_length] [aperture], [camera_model]. Стиль: [стиль], [детали стиля]."
+     * Формат: "Ракурс: [camera_position]. [focal_length] [aperture], [camera_model]."
      * Убирай слова "Кинематографический стиль", "Съёмка с" - это избыточно
-     * Пример: "Низкий ракурс снизу вверх. 24 мм f/8.0, Arri Alexa Mini LF. Стиль: [название из visual_style], мягкие края, зернистость плёнки."
+     * Пример: "Низкий ракурс снизу вверх. 24 мм f/8.0, Arri Alexa Mini LF."
 - **НЕ РАЗБИВАЙ НА МНОЖЕСТВЕННЫЕ КОМАНДЫ**: Create, Position, Show, Apply, Add — используй ОДНУ команду для всего
 - **ЦЕЛЬ**: промпт должен сохранять всю необходимую информацию. Убирай избыточные слова и повторы.
 
@@ -2209,6 +2290,11 @@ def _generate_shot_prompt(
             if not stripped or " " in stripped:
                 return False
             return bool(re.match(r"^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)+$", stripped))
+
+        # The artistic schema does not repeat technical location fields.
+        for field in ("location", "location_context"):
+            if not _is_empty(source_params.get(field)):
+                merged[field] = source_params[field]
 
         if _is_empty(merged.get("characters")) and not _is_empty(source_params.get("characters")):
             merged["characters"] = source_params.get("characters", [])
@@ -2614,15 +2700,17 @@ SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовы
 - Движение: "Camera [type] [direction] at [position]" (пример: "Camera sharp zoom in at eye level")
 
 СЕГМЕНТ 2 — SUBJECT:
-- [quality keyword] + действие через "then" (до 2 шагов)
+- [quality keyword] + все причинно значимые действия через "then", без искусственного ограничения их числа
 - Quality keywords (выбери ОДИН): natural / energetic / slow and deliberate / graceful / confident / fluid movement
 - Направление: "спускается"→"descends" (НИКОГДА "ascends"). "Касается"→"makes contact" (НЕ "approaching")
-- Формат: "subject with [quality] movement [action], then [action2]"
+- Формат: "subject with [quality] movement [all source actions in their causal order]"
 - MUST — geometric clarity: direction OR destination OR body part MUST be named.
   Weak: "makes contact", "reaches out", "approaches"
   Strong: "hand descends toward ceramic bowl", "head turns 30° right toward window",
           "foot steps forward onto stone platform"
 - If shot_description names an object/target — subject action MUST reference that object by noun.
+- When character visibility changes, distinguish a physical entrance/exit from a camera reveal or occlusion. Describe an entrance only when this shot requires it; otherwise preserve the actor's established location. Preserve identities and source order, never interpolating one person into another.
+- For quiet observation by a living subject, preserve the staged position with subtle breathing and source-consistent gaze/facial response; a wardrobe inventory and moving particles alone are insufficient. Do not invent a new narrative action.
 
 СЕГМЕНТ 3 — ENVIRONMENT:
 - ОБЯЗАТЕЛЬНА микродинамика: dust swirls / torch flames flicker / mist drifts / reflections shimmer
@@ -2632,7 +2720,7 @@ SOURCE OF TRUTH: shot_description + camera_plan + transition_spec + готовы
 - Выбери ОДИН: slowly / quickly / sharply / gently / steadily / abruptly
 
 ПРАВИЛА:
-- video_prompt = ОДНА строка, English-only, NO Cyrillic. Никакого markdown и prose.
+- video_prompt = ОДНА строка с английскими инструкциями; preserve source-visible text verbatim in its original script. Required end results must be explicitly achieved by END. Никакого markdown и пояснений вне JSON.
 - НЕ выдумывай объекты/одежду/текст, которых нет в shot_description.
 - Close-up (shot_size includes "close-up" OR "extreme close-up"):
   MUST — foreground blur only. Include exactly one blur cue in ENVIRONMENT ("shallow depth of field", "soft bokeh", "blurred background").
@@ -2653,13 +2741,11 @@ EVENT CHOREOGRAPHY (обязательно если есть event/action в tra
   Cause      = initiating action (thrown, released, contacted, opened, entered)
   Effect     = immediate physical consequence (deforms, shatters, ripples, illuminates, recoils)
   Follow-through = short residual motion (settles, dissipates, echoes, drifts, stills)
-  Example (impact/ball→window): "ball strikes glass then shards splay outward, dust settling in slow arcs"
-  Example (emergence/door→figure): "figure steps through doorway then hem catches on threshold, coat trailing"
 Если transition_spec пустой — этот блок игнорируется.
 
 CONTINUITY WINDOW (top-level `continuity_window` in INPUT — {prev, curr, next}):
 - `prev.final_action` = last action of previous shot. Current SUBJECT MUST NOT contradict its direction (no teleports, no orientation flips without cause).
-- `next.opening_action` = first action of next shot. If your effect/follow-through can seed it (smoke drifts → next opens on lingering smoke), let it — do not resolve everything back to rest.
+- `next.opening_action` is read-only context for the next shot. Finish this shot at its own END; do not perform or anticipate the next shot's actions.
 - `continuity_window` is optional context, NOT a mandate — use it to keep motion physically continuous, do not narrate it.
 
 SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) все 4 сегмента присутствуют? 3) quality keyword есть? 4) motion не противоречит prev.final_action?
@@ -2668,6 +2754,10 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
         "camera_plan": extended_context.get("camera_plan", ""),
         "shot_description": extended_context.get("shot_description", ""),
         "transition_spec": transition_spec,
+        "start_visible_characters": shot_frame_spec.get("start_state_spec", {}).get("visible_characters", []),
+        "end_visible_characters": shot_frame_spec.get("end_state_spec", {}).get("visible_characters", []),
+        "start_world_physics": shot_frame_spec.get("start_state_spec", {}).get("world_physics", {}),
+        "end_world_physics": shot_frame_spec.get("end_state_spec", {}).get("world_physics", {}),
         "start_english_prompt": start_llm_result.get("english_prompt", ""),
         "end_english_prompt": end_llm_result.get("english_prompt", ""),
         "start_main_subject": start_llm_result.get("main_subject", shot_frame_spec.get("primary_subject", "")),
@@ -2782,11 +2872,11 @@ def _generate_end_shot_artistic(
 
 Ты -- креативный директор. Создай финальный english_prompt для END кадра (T=final) и определи тип связи со следующим кадром.
 
-**LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):**
-- `english_prompt`: ALWAYS in English regardless of source language.
+**LANGUAGE CONTRACT (image prompts follow the requested project language):**
+- `english_prompt`: in {prompt_language_label}; the legacy field name does not select English.
 - `negative_prompt`, `reference_roles_instruction`, `main_subject`, `final_spatial_composition`:
   in {prompt_language_label} (source language) -- these feed downstream QA.
-- `video_prompt`: English-only (unchanged).
+- `video_prompt`: English instructions; preserve source-visible text verbatim in its original script.
 - Для END-редактирования используй префикс `{edit_prefix}`.
 
 **TEXT-IN-IMAGE RULE (critical):**
@@ -2808,6 +2898,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 - camera_plan и shot_description -- ИСТИНА для текущего кадра. END = финальный стоп-кадр ЭТОГО shot_number.
 - Финальная крупность следует `final_shot_size` из technical params (рассчитан из ratio/delta), не "застревает" на camera_plan.
 - PRIMARY SUBJECT LOCK: субъект = shot_description этого кадра. Не подменять из других кадров.
+- При накопительном действии сохраняй уже выполненную часть на прежнем месте и дополняй её до результата. Не проси заменить частичный результат заново нарисованной копией; стирание или преобразование допустимо только по явному исходнику.
 - ENTITY NATURE LOCK: нечеловеческий персонаж сохраняет свои признаки (scales/fur/metal из immutable_attributes). Человек -- без животных/роботических признаков.
 - NAME LOCK: канонические имена из storyboard/scene_characters. Не искажать, не переименовывать в вид/роль.
 
@@ -2816,7 +2907,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 2. [Subject]: результат действия (T=final, ПОСЛЕ факта). ЗАПРЕЩЕНО: процессные глаголы (extending, moving, starts to).
 3. [Composition]: [final_shot_size] + масштаб если ratio!=1.0
 4. [Location]: измененное окружение (если есть)
-5. [Style]: "Ракурс: [camera_position]. [focal_length] [aperture], [camera_model]. Стиль: [стиль]."
+5. [Technical]: "Ракурс: [camera_position]. [focal_length] [aperture], [camera_model]." Художественный стиль добавит код.
 6. [Action result]: последствия движения
 - Если ratio!=1.0: техническая команда ПЕРВОЙ ("Zoom in (scale Xx) to [final_shot_size]..." / "Pull back (scale Xx)...")
 - Если yaw/pitch!=0: "Shift perspective [direction] by [degrees] to reveal [new elements]..."
@@ -2829,15 +2920,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 **ШАГ 1 -- SUBJECT:** main_subject = `shot_frame_spec.primary_subject`. END = результат shot_description + shot_frame_spec + end_technical_params.
 
 **ШАГ 2 -- T=FINAL STATE:**
-- Описывай РЕЗУЛЬТАТ действия (post-fact), НЕ процесс. Любой ing-глагол / "начинает" / "продолжает" из shot_description
-  переведи в финальное видимое состояние. Шаблоны (применяй как образец, не как фильтр):
-    "reaching"  → "hand fully extended toward [target], fingers [closed/spread]"
-    "falling"   → "mid-air at [height], body in [orientation], hair/clothes lifted by airflow"
-    "running"   → "mid-stride, leading foot lifted, opposite arm forward"
-    "grabbing"  → "hand firmly closed around [object], knuckles tense"
-    "opening"   → "[door/lid] fully open at [angle], hinge/latch visible"
-    "tongue extending" → "tongue fully extended, tip at [target]"
-    "shouting"  → "mouth wide open mid-vowel, jaw dropped, no audible glyphs in frame"
+- Описывай конечный видимый момент из end_state_spec, а не процесс или типовую позу по глаголу. Сохраняй заданные позу, контакт и степень завершения действия.
 - Если video_prompt пуст -- выводи END из shot_description + shot_frame_spec + end_technical_params напрямую.
 - Если video_prompt есть -- только transition-подсказка; не переопределяет shot_description.
 - `final_spatial_composition` и `final_*` поля = авторитетный финальный стоп-кадр.
@@ -2849,25 +2932,21 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 - world_physics = источник истины для физики END (опора, контакт/разрыв, перекрытия). forbidden_implications -- не допускай в промпте.
 
 **ШАГ 5 -- PROP_CONTINUITY:** Порядок: Edit image 1: [final_shot_size]: [масштаб IF ratio!=1.0]; [позиция]; [prop changes]; [освещение].
-- removed: "with [item] removed" + negative: "no [item] in [CHARACTER] hands/on [CHARACTER] body" (адресное, не общее).
+- Сразу после крупности ставь конкретную конечную опору, расположение конечностей/реквизита или завершённый результат, а не общее название действия. Неизменную каноническую внешность повторно не перечисляй. Сохраняй текущую одежду и её изменения, освещение, камеру и технические параметры.
+- removed: "with [item] removed" + negative: "[item] in [CHARACTER] hands/on [CHARACTER] body" (адресное нежелательное состояние без дополнительного отрицания).
 - added: "add [item] to [position]". kept+state: финальное состояние, без процессных глаголов. Все изменения ОБЯЗАТЕЛЬНО явно в команде!
 
 **ШАГ 6 -- VISUAL DIFFERENCE ENFORCEMENT:**
-- END ОБЯЗАН визуально отличаться от START. ЗАПРЕЩЕНО копировать описание START.
+- END должен показывать заданные исходником изменения относительно START.
 - Действие произошло -- ДРУГАЯ позиция/состояние. Камера двигалась -- другой framing.
-- Полная статика (delta=0, ratio=1.0) -- ОБЯЗАТЕЛЬНО изменить хотя бы ОДИН элемент как СТАТИЧНЫЙ снимок:
-  micro-expression (corner of mouth slightly tighter / eyebrow lifted), light angle (rotated by N degrees),
-  atmospheric density (denser smoke / thinner haze), reflections (repositioned by geometry),
-  shadows (shifted/elongated), chest fully expanded mid-inhale (как стоп-кадр, НЕ как "breathing" процесс).
+- При полной статике (delta=0, ratio=1.0) сохраняй состояние START; не придумывай изменения мимики, позы, одежды, света или окружения ради различия кадров.
 - Описывай эти изменения как видимый результат, а НЕ как процесс/анимацию.
-- Сила формулировки: используй "noticeably / clearly visible / distinctly" для естественной разницы. НЕ применяй
-  "dramatically" к статичной паузе и НЕ преуменьшай через "slightly / barely / subtly".
-- Фоновая динамика из video_prompt (falling/drifting/flickering/burning/rising/dispersing/melting) -- зафиксируй РЕЗУЛЬТАТ в END.
+- Степень изменения соответствует исходному действию и камере, без обязательного преувеличения. Из video_prompt учитывай только подтверждённую исходником фоновую динамику.
 - Описывай результат семантически: "hand now grasping firmly" (да), "hand moved 20cm" (нет).
 
 **ШАГ 7 -- CONTINUITY LOCKS (при Edit image 1):**
 - Location: сохрани 1-2 фоновых якоря из location_context (не абстрактный градиент). Close-up: якоря как частичные фрагменты, не полный рост.
-- Composition: если крупность плотнее -- continuity ref сохраняет identity/pose/wardrobe/lighting/environment, НЕ старый framing.
+- Composition: continuity ref сохраняет identity и неизменные свойства мира, НЕ старый framing. Поза, одежда, освещение и состояние окружения следуют текущей фазе исходника; приближение камеры не фиксирует прежнюю позу.
 - Мебель из location_context.key_objects -- из location reference, не переопределяй позиции. Не меняй массовку/одежду/декор без основания.
 - Отражения/зеркала -- следуй геометрии финального кадра и world_physics.
 
@@ -2875,16 +2954,16 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 
 **ШАГ 9 -- ЛИНКОВКА:** 1) БЛОКЕРЫ (= both_false, STOP): смена локации | main_subject нет в next_shot | temporal jump | cutaway/insert. 2) score>=8 + stable + delta<=15 + high compat: link_as_next_start=true; иначе reference=true. 3) score 5-7: reference=true. 4) score<5: both_false.
 
-**ШАГ 10 -- NEGATIVE_PROMPT (СТРОГО максимум 20 слов через запятую):** Базовый: blurry, motion blur, watermark. Close-up: + "extra/missing body parts". Prop removed: "no [item] in [CHARACTER] hands". КРИТИЧНО: ОДНА идея = ОДНО слово. НЕ ПОВТОРЯЙ одно и то же разными словами (ошибка: "без другого задника, без абстрактного фона, без замены архитектуры" → исправь: "abstract background").
+**ШАГ 10 -- NEGATIVE_PROMPT (СТРОГО максимум 20 слов через запятую):** Базовый: blurry, motion blur, watermark. Close-up: + "extra/missing body parts". Prop removed: "[item] in [CHARACTER] hands". Одна идея — один короткий пункт, называющий нежелательное состояние без дополнительного отрицания. НЕ ПОВТОРЯЙ одно и то же разными словами.
 
 **ШАГ 11 -- SELF-CHECK (обязательно перед возвратом JSON):**
 1. Каждый noun phrase в english_prompt поддержан shot_description/shot_frame_spec? Нет -- удали.
 2. english_prompt и final_spatial_composition описывают ОДИН кадр? Расходятся -- согласуй.
 3. Процессные глаголы (extending, moving, starts to)? -- замени на результат.
-4. END визуально отличается от START? Нет -- добавь видимое изменение.
-5. Любое относительное движение субъекта/камеры или непустой `transition_spec.environment_delta` про смену видимого окружения? -- в english_prompt должно быть явное изменение фона/боке/световых акцентов относительно START (параллакс, сдвиг деталей среды или заднего плана в крупном плане), без смены локации без оснований.
+4. END соответствует конечной фазе исходного действия? Не добавляй изменение ради отличия кадров, если состояние неподвижно или цикл вернулся в ту же фазу.
+5. Движение камеры согласовано с экранным смещением фона? При трекинге за движущимся героем фон заметно продвигается относительно героя; при неподвижной камере перемещается герой, а не фон. Одного жеста недостаточно для параллакса. Сдвиг должен соответствовать пути, а не быть косметическим изменением нескольких деталей.
 6. ratio~1.0 (0.98-1.02) -- нет ли масштабирования в english_prompt? Удали.
-7. Все 6 обязательных элементов (instruction/subject/composition/location/style/action result) в english_prompt? Нет -- добавь.
+7. Все обязательные элементы (instruction/subject/composition/location/action result) в english_prompt? Нет -- добавь.
 
 === СЛОЙ C: СПРАВОЧНЫЕ ТАБЛИЦЫ ===
 
@@ -2963,7 +3042,10 @@ removing / approaching / moving toward / drifting / then / after that / continue
         "narrative_position": extended_context.get("narrative_position", ""),
         "next_shot": extended_context.get("next_shot", {}),
         "scene_mood": extended_context.get("scene_mood", ""),
-        "current_shot_position": extended_context.get("current_shot_position", "")
+        "current_shot_position": extended_context.get("current_shot_position", ""),
+        "visual_style": extended_context.get("visual_style", ""),
+        "style_images": extended_context.get("style_images", {}),
+        "style_do_not_include": extended_context.get("style_do_not_include", []),
     }
     shot_character_visual_profiles = (
         extended_context.get("end_shot_character_visual_profiles")
@@ -2981,13 +3063,8 @@ removing / approaching / moving toward / drifting / then / after that / continue
         location_anchors.append(anchor)
         if len(location_anchors) >= 2:
             break
-    if not location_anchors:
-        fallback_description = str(location_ctx.get("description", "") or "").strip()
-        if fallback_description:
-            location_anchors.append(fallback_description)
-
     shot_frame_spec_for_prompt = enrich_shot_frame_spec_environment_delta_via_llm(
-        extended_context.get("shot_frame_spec") or {},
+        extended_context.get("full_shot_frame_spec") or extended_context.get("shot_frame_spec") or {},
         video_prompt=str(video_prompt or ""),
     )
 
@@ -3000,12 +3077,12 @@ removing / approaching / moving toward / drifting / then / after that / continue
             "must_not_show": shot_frame_spec_for_prompt.get("must_not_show", []),
             "visible_readable_texts": shot_frame_spec_for_prompt.get("visible_readable_texts", []),
             "hidden_readable_texts": shot_frame_spec_for_prompt.get("hidden_readable_texts", []),
-            "end_state_spec": shot_frame_spec_for_prompt.get("end_state_spec", {}),
+            "end_state_spec": shot_frame_spec_for_prompt.get("end_state_spec") or shot_frame_spec_for_prompt,
             "transition_spec": shot_frame_spec_for_prompt.get("transition_spec", {}),
         }
     else:
         shot_frame_spec_payload = shot_frame_spec_for_prompt
-    scene_continuity_facts_for_prompt: Dict[str, Any] = {}
+    scene_continuity_facts_for_prompt = extended_context.get("scene_continuity_facts") or {}
 
     # Вычисляем явные изменения для LLM
     try:
@@ -3035,11 +3112,11 @@ removing / approaching / moving toward / drifting / then / after that / continue
 
     user_prompt = f"""Создай финальный промпт для END кадра, который является МОДИФИКАЦИЕЙ START кадра.
 {black_screen_end_block}
-LANGUAGE CONTRACT (image_prompt targets Bagel/Flux which perform best on English):
-- `english_prompt`: ALWAYS in English regardless of source language.
+LANGUAGE CONTRACT (image prompts follow the requested project language):
+- `english_prompt`: in {prompt_language_label}; the legacy field name does not select English.
 - `negative_prompt`, `reference_roles_instruction`, `main_subject`, `final_spatial_composition`:
   in {prompt_language_label} (source language) -- these feed downstream QA.
-- `video_prompt`: English-only (unchanged).
+- `video_prompt`: English instructions; preserve source-visible text verbatim in its original script.
 - Для END-редактирования используй `{edit_prefix}`.
 
 TEXT-IN-IMAGE RULE (critical):
@@ -3076,7 +3153,7 @@ NEVER auto-translate signage/labels to English -- source language wins for on-im
 1. Масштаб: {start_shot_size} -> {final_size_label} (Ratio: {ratio_change})
 2. Ракурс: {start_summary['camera_position']} -> {end_technical_params.get('final_camera_position', 'no change')}
 
-ПАСПОРТ ЛОКАЦИИ (КРИТИЧНО ДЛЯ ФОНА):
+ПРОИЗВОДНЫЙ КОНТЕКСТ ЛОКАЦИИ (не заменяет исходник и shot_frame_spec):
 <location_context>
 {json.dumps(location_ctx, ensure_ascii=False, indent=2)}
 </location_context>
@@ -3109,22 +3186,21 @@ TRANSITION HINT (optional video_prompt; may be empty):
 - Освещение: {end_technical_params.get('final_lighting_style', '')}
 - Реквизит: {end_technical_params.get('prop_continuity', {})}
 - Пространственные изменения: {end_technical_params.get('spatial_changes_from_start', '')}
-- Фоновые якоря локации, которые должны остаться видимыми: {json.dumps(location_anchors, ensure_ascii=False)}
+- Возможные ориентиры локации (только если уже видны и остаются в текущем кадре): {json.dumps(location_anchors, ensure_ascii=False)}
 
 КОНТЕКСТ ДЛЯ ПРИНЯТИЯ РЕШЕНИЙ:
 {json.dumps(context_for_decisions, ensure_ascii=False, indent=2)}
 
 ЗАДАЧА:
 1. Создай english_prompt КАК ОДНУ КОМАНДУ РЕДАКТИРОВАНИЯ ИЗОБРАЖЕНИЯ:
-   - Пиши `english_prompt` строго на английском. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
+   - Пиши `english_prompt` на {prompt_language_label}. `negative_prompt` — на {prompt_language_label}. Если язык `negative_prompt` не английский, не добавляй в него английские слова, кроме стандартных camera/lens терминов и авторизованных readable texts.
    - `shot_frame_spec` — это source of truth. Сохрани все факты из `must_show`, не добавляй ничего вне spec и не подменяй `primary_subject`.
    - **НАЧНИ С ИНСТРУКЦИИ**: "{edit_prefix} {final_size_label}: [Zoom/Shift command if ratio/yaw changed]. [Action result]. [Atmosphere/Lighting from location_context]."
    - **КРИТИЧНО - ZOOM/SHIFT**: Если ratio ≠ 1.0, используй "Zoom in (scale Xx)" или "Pull back (scale Xx)". Если yaw ≠ 0, используй "Shift perspective [direction] by [degrees]°".
-   - **КРИТИЧНО - ИСПОЛЬЗУЙ ОПИСАНИЕ ЛОКАЦИИ ИЗ location_context**: ОБЯЗАТЕЛЬНО используй lighting, color_palette и atmosphere из location_context.
-   - **КРИТИЧНО - СОХРАНИ ЯКОРЯ ЛОКАЦИИ**: если `location_anchors` не пуст, явно сохрани в english_prompt хотя бы 1–2 таких фоновых якоря из того же места.
-     Для close-up это должны быть частичные, но узнаваемые фрагменты вокруг героя, а не новый абстрактный фон.
-   - **КРИТИЧНО - CONTINUITY GEOMETRY FIRST**: если END редактирует `image 1` как continuity reference, сохрани идентичность локации (материалы, стиль, топология среды), но при **любом** относительном движении субъекта или камеры **не** требуй пиксельно того же фона, что в START: видимое окружение должно обновиться (параллакс / сдвиг деталей / боке), как в `transition_spec.environment_delta`.
-   - **КРИТИЧНО — ОКРУЖЕНИЕ ПРИ ДВИЖЕНИИ**: если в `transition_spec.environment_delta` или в `video_prompt`/техническом контексте есть движение субъекта (жест, шаг, наклон, бег, …) и/или движение камеры (трекинг, наезд, панорама, кран, …) — в `english_prompt` ОБЯЗАТЕЛЬНО опиши **изменение видимого окружения** относительно START: в широком/среднем плане — сдвиг фона/архитектурных деталей; в крупном — сдвиг боке/световых пятен/отражений. Та же локация, не студийный/абстрактный задник. Без новых объектов вне shot_description.
+   - lighting, color_palette и atmosphere из производного location_context используй только в согласии с исходником и конечной фазой.
+   - Ориентиры location_anchors сохраняй только если они уже видны в START и остаются видимыми при конечном кадрировании и заданных перекрытиях. Не возвращай скрытый предмет или вышедший из кадра ориентир ради преемственности.
+   - **КРИТИЧНО - CONTINUITY GEOMETRY FIRST**: сохрани геометрию мира, а не прежние экранные координаты. Для следящей камеры явно задай заметно продвинувшиеся фоновые ориентиры относительно удерживаемого в кадре героя, согласно направлению и длине пути; ближние и дальние планы имеют разный параллакс. В той же локации могут открываться новые участки и уходить из кадра старые ориентиры.
+   - **КРИТИЧНО — ОКРУЖЕНИЕ ПРИ ДВИЖЕНИИ**: при статичной камере фон остаётся на месте, а перемещающийся субъект меняет положение в кадре. Жест, наклон или мимика не являются основанием двигать фон. Панорама, наезд, отъезд и трекинг меняют проекцию среды согласно своей траектории; не заменяй её произвольным другим местом.
    - **КРИТИЧНО - НЕ ДЕРЖИ СТАРУЮ КОМПОЗИЦИЮ ИЗ CONTINUITY**: если END делает tighter crop / zoom-in по сравнению со START, continuity reference должен сохранять identity, pose lineage, lighting, props and environment continuity, но НЕ старую full-frame composition.
      В `reference_roles_instruction` не описывай image 1 как источник "composition", если финальное кадрирование заметно теснее START.
    - **КРИТИЧНО - ПОДЧИНИ КАДРИРОВАНИЕ ФИНАЛЬНОЙ КРУПНОСТИ**: если `final_shot_size` = Close-up / Medium close-up, сделай героя визуально крупнее и плотнее в кадре;
@@ -3135,19 +3211,20 @@ TRANSITION HINT (optional video_prompt; may be empty):
    - **КРИТИЧНО - SINGLE FRAME COMPOSITION**: если в close-up остаётся видимый краевой фрагмент среды/опоры/разрыва, показывай его как часть того же изображения, а НЕ как отдельную панель, вставку, cutaway strip или split composition.
    - **КРИТИЧНО - WORLD PHYSICS**: если в `shot_frame_spec` или `end_state_spec` есть `world_physics`, переведи его в визуально читаемое состояние мира: опора, поверхность, устойчивость, контакты, зазоры, перекрытия и запрещённые физические трактовки.
      Не замещай это частными edge-case формулировками; выводи финальный кадр из `world_physics`.
-   - **ВИЗУАЛИЗАЦИЯ**: описывай героя только через прямые видимые признаки из PER-SHOT CAST VISUAL CANON. Используй лицо, глаза, пропорции, прическу, одежду, аксессуары и устойчивые видимые признаки. Не тащи в prompt роль, профессию, биографию, характер или речевые паттерны.
+   - **ВИЗУАЛИЗАЦИЯ**: Для персонажа с референсом укажи каноническое имя и видимые факты END: позу, мимику, взгляд и текущую одежду; не перечисляй повторно неизменную внешность из PER-SHOT CAST VISUAL CANON. Если референса нет, добавь только необходимые отличительные признаки. Базовая одежда и аксессуары не возвращаются на персонажа после заданной смены или снятия. Не тащи в prompt роль, профессию, биографию, характер или речевые паттерны.
+   - Не меняй покрой и покрытие неизменной одежды без заданного действия. Требование открыть определённую часть тела не означает оголение соседних участков.
    - **MULTI-CHARACTER LOCK**: если в PER-SHOT CAST VISUAL CANON несколько персонажей, сохраняй их как отдельные визуальные сущности по `shot_role`; не смешивай одежду, лицо, аксессуары и силуэт между ними.
    - Если у персонажа в PER-SHOT CAST VISUAL CANON есть `phase_pose_signature`, используй её как authoritative позу именно этого персонажа в END.
    - **КРИТИЧНО - ОРИЕНТАЦИЯ ПЕРСОНАЖЕЙ (ОБЯЗАТЕЛЬНО ДЛЯ END):** 
      * Если `final_character_orientation` = "facing_each_other" → ПЕРСОНАЖИ СМОТРЯТ ДРУГ НА ДРУГА, НЕ В КАМЕРУ!
      * Явно укажи в промпте: "[Персонаж A] смотрит на [Персонаж B]", "их лица обращены друг к другу", "facing each other"
      * НЕ используй формулировки типа "смотрят в камеру", "looking at camera", "facing camera" если `final_character_orientation` = "facing_each_other"
-     * Если `final_character_orientation` = "facing_camera" → тогда можно "смотрит в камеру", но только при явном direct-address / frontal-lens framing
-     * Если `final_character_orientation` = "facing_away" → "смотрит от камеры", "спиной к камере"
+     * Если `final_character_orientation` = "facing_camera" → корпус виден спереди; взгляд задаётся отдельно по исходнику и не обязан быть в объектив
+     * Если `final_character_orientation` = "facing_away" → корпус спиной к камере; направление головы и взгляда задаётся отдельно по исходнику
      * Если `final_character_orientation` = "profile" → "в профиль", "side view"
      * Если `shot_description` говорит "лицо в сантиметре от его лица" / "лица почти касаются" → это ОБЯЗАТЕЛЬНО означает, что они смотрят друг на друга!
      * ЦЕЛЬ: обеспечить правильную ориентацию персонажей, чтобы они смотрели друг на друга, когда это требуется shot_description
-   - **BACKGROUND & EXTRAS LOCK (без заморозки кадра)**: сохраняй ту же локацию и узнаваемые якоря, но при любом движении субъекта/камеры видимое окружение **должно** отличаться от START там, где это следует из `environment_delta`/video_prompt; не копируй фон 1:1 из Image 1, если ожидается сдвиг. Не подменяй локацию на студию/градиент/небо.
+   - **BACKGROUND & EXTRAS LOCK (без заморозки кадра)**: сохраняй ту же локацию, но при движении камеры или явно заданном перемещении среды видимое окружение меняется согласно `environment_delta`/video_prompt; не копируй фон 1:1 из Image 1, если ожидается сдвиг. Не подменяй локацию на студию/градиент/небо.
    - **ЗАПРЕЩЕНО ПОДМЕНЯТЬ ФОН**: не заменяй continuity/location background на пустое небо, студийную стену, безымянную тёмную плоскость или generic gradient backdrop.
    - **NO OVERLAY TEXT**: если в `shot_frame_spec.visible_readable_texts` нет авторизованного readable text, явно удерживай кадр как unlabeled illustration: no captions, no title cards, no subtitles, no name labels, no credits, no lower-third text.
    - **РЕКВИЗИТ**: Отрази все изменения из prop_continuity (REMOVE/ADD/TRANSFORM).
@@ -3160,7 +3237,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
 - Character Action: "Edit image 1: TRANSFORM subject pose: hand now grasping the object firmly; maintain atmosphere"
 
 2. Создай negative_prompt с учетом континуити.
-   - Если `location_anchors` не пуст, negative_prompt должен запрещать blank/abstract/studio-like background replacement for this END frame.
+   - Не запрещай заданное исходником исчезновение или преобразование окружения; остальные исключения согласуй с конечной фазой.
 3. Определи тип связи (should_link_as_next_start / should_use_prev_end_as_reference).
 
 **ФОРМАТ ВЫВОДА:**
@@ -3170,8 +3247,8 @@ TRANSITION HINT (optional video_prompt; may be empty):
   "character_orientation": "перенеси из technical params, если не требуется иное",
   "spatial_composition": "непустая композиция кадра, согласованная с technical params и shot_frame_spec.must_show",
   "point_of_view": "objective / pov / etc",
-  "initial_state_summary": "непустое статичное T=0 summary без процесса и без последовательности",
-  "english_prompt": "команда редактирования START T=0",
+  "initial_state_summary": "видимое конечное состояние END согласно end_state_spec, без последовательности событий",
+  "english_prompt": "команда редактирования конечного кадра END T=final",
   "negative_prompt": "запреты по типу кадра",
   "reference_image_paths": ["путь1", "путь2"],
   "reference_roles_instruction": "image 1 as...; image 2 as...",
@@ -3253,6 +3330,13 @@ def _convert_end_to_start_shot_item(
 
     def _map_camera_plan_to_shot_size(plan: str) -> str:
         p = (plan or "").lower()
+        if (
+            ("extreme" in p and ("close" in p or "up" in p))
+            or "сверхкруп" in p
+            or "macro" in p
+            or "макро" in p
+        ):
+            return "Extreme close-up"
         if "круп" in p or "close" in p:
             return "Close-up"
         if "сред" in p or "medium" in p:
@@ -3285,6 +3369,9 @@ def _convert_end_to_start_shot_item(
     except Exception:
         style_images_data = {}
 
+    from .style_keeper import ensure_image_style_catalog
+    image_style_catalog = ensure_image_style_catalog(str(safe_storybook_project_dir(project_id)), style_images_data)
+
     extended_context = _build_extended_context(
         project_id=project_id,
         scene={
@@ -3307,6 +3394,11 @@ def _convert_end_to_start_shot_item(
         continuity_reference_path=previous_end_shot_item["output_path"],  # Дополнительная информация
         style_images=style_images_data
     )
+    extended_context["previous_shot"] = {
+        "shot_number": previous_end_shot_item.get("shot_number"),
+        "camera_plan": previous_end_shot_item.get("camera_plan"),
+        **(previous_end_llm_result or {}),
+    }
     
     new_start_llm_result = _generate_shot_prompt(
         extended_context=extended_context,
@@ -3325,6 +3417,7 @@ def _convert_end_to_start_shot_item(
         s = str(v or "").strip().lower()
         if not s:
             return ""
+        s = re.split(r"[;,:]|\s+[—–-]\s+", s, maxsplit=1)[0].strip()
         # Нормализация распространённых синонимов/вариантов
         s = s.replace("-", "_").replace(" ", "_")
         aliases = {
@@ -3332,37 +3425,50 @@ def _convert_end_to_start_shot_item(
             "infront": "in_front",
             "in_front_of": "in_front",
             "facing_front": "in_front",
+            "спереди": "in_front",
+            "впереди": "in_front",
             "back": "behind",
             "rear": "behind",
             "from_behind": "behind",
             "over_shoulder": "behind",
             "over_the_shoulder": "behind",
             "ots": "behind",
+            "сзади": "behind",
+            "со_спины": "behind",
             "profile": "side",
             "three_quarter": "side",
             "left": "side",
             "right": "side",
+            "сбоку": "side",
             "top": "above",
             "birdseye": "above",
             "bird_eye": "above",
             "overhead": "above",
             "high": "above",
+            "сверху": "above",
             "low": "below",
             "underside": "below",
             "under": "below",
+            "снизу": "below",
         }
-        return aliases.get(s, s)
+        normalized = aliases.get(s, s)
+        return normalized if normalized in {"behind", "in_front", "side", "above", "below"} else ""
 
     def _is_pov_break(prev_pos: str, next_pos: str) -> bool:
         """
-        Существенная смена POV: любой переход между различными camera_position
-        (after normalization), например behind→in_front, side→in_front, above→side и т.д.
+        Противоположные стороны и вертикальная смена требуют нового вида.
+        Соседние горизонтальные категории могут описывать тот же косой ракурс.
         """
         if not prev_pos or not next_pos:
             return False
-        return prev_pos != next_pos
+        return prev_pos != next_pos and (
+            prev_pos in {"above", "below"}
+            or next_pos in {"above", "below"}
+            or {prev_pos, next_pos} == {"behind", "in_front"}
+        )
 
     pov_break_detected = False
+    camera_position_changed = False
     try:
         _prev = (previous_end_llm_result or {})
         _next = (new_start_llm_result or {})
@@ -3371,6 +3477,7 @@ def _convert_end_to_start_shot_item(
         _next_raw = _next.get("camera_position")
         prev_pos = _norm_pos(_prev_raw if isinstance(_prev_raw, str) else "")
         next_pos = _norm_pos(_next_raw if isinstance(_next_raw, str) else "")
+        camera_position_changed = bool(prev_pos and next_pos and prev_pos != next_pos)
         if _is_pov_break(prev_pos, next_pos):
             logger.info(
                 f"🎥 POV BREAK: previous_end camera_position='{prev_pos}', next_start camera_position='{next_pos}'. "
@@ -3456,8 +3563,11 @@ def _convert_end_to_start_shot_item(
         seed=seed,  # Linked shots don't need seed consistency
         visual_style=str(extended_context.get("visual_style") or ""),
         style_do_not_include=extended_context.get("style_do_not_include"),
+        image_style_catalog=image_style_catalog,
     )
     
+    new_shot_item["_start_llm_result"] = llm_result_to_use_for_item
+
     # Решение о типе связи: учитываем семантическое решение LLM о link_type
     end_final_size = (previous_end_llm_result or {}).get("final_shot_size", "")
     planned_start_size = _map_camera_plan_to_shot_size(camera_plan)
@@ -3469,6 +3579,8 @@ def _convert_end_to_start_shot_item(
     # Если LLM явно указал "independent" - НЕ копируем, независимо от числовых критериев
     if pov_break_detected:
         # POV break всегда запрещает full_copy и использование previous_end как базы.
+        strict_link = False
+    elif camera_position_changed:
         strict_link = False
     elif llm_link_type == "independent":
         logger.info(f"🔗 LLM указал link_type='independent' - принудительно отключаем копирование")
@@ -3498,7 +3610,7 @@ def _convert_end_to_start_shot_item(
     if not str(end_final_size or "").strip():
         size_compatible = camera_plan_compatible
     else:
-        size_compatible = (planned_start_size == "" or planned_start_size.lower() == str(end_final_size).strip().lower())
+        size_compatible = bool(planned_start_size) and planned_start_size.lower() == str(end_final_size).strip().lower()
 
     if strict_link and size_compatible:
         # Полное копирование допустимо
@@ -3516,7 +3628,9 @@ def _convert_end_to_start_shot_item(
         reason_parts = []
         if llm_link_type == "independent":
             reason_parts.append("LLM указал независимый тип связи")
-        if not strict_link:
+        if camera_position_changed:
+            reason_parts.append("изменение категории ракурса исключает полное копирование")
+        if not strict_link and not llm_should_link:
             reason_parts.append("LLM не рекомендует строгую связь")
         if not size_compatible:
             reason_parts.append("несовместимые размеры кадров")

@@ -4,6 +4,10 @@ category: "storybook"
 source_type: custom_function
 implementation_source: custom_tools.storybook.audio_subtitle.storybook_audio_subtitle_tool
 parameters:
+  - name: narration_path
+    type: str
+    description: "Existing reader audio to copy unchanged; timing requires manual alignment"
+    required: false
   - name: session_id
     type: str
     description: "Execution trace/session identifier"

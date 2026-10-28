@@ -265,7 +265,7 @@ def test_prompt_engineer_substitutes_style_placeholder():
     assert src.count("__STYLE_DIRECTIVES__") == 2, (
         "плейсхолдер должен и объявляться в system-промпте, и подставляться"
     )
-    assert 'system.replace("__STYLE_DIRECTIVES__", compose_style_directives(' in src
+    assert 'system.replace("__STYLE_DIRECTIVES__", "Художественную технику добавит код из каталога' in src
 
 
 # --------------------------------------------------------------------------

@@ -168,7 +168,8 @@ class _ProviderJobStore:
                 return job.get("task_id")
             return None
 
-    def find_latest_output_job_for_shot(self, shot_key: str, output_path: str) -> Optional[Dict[str, Any]]:
+    def find_latest_output_job_for_shot(self, shot_key: str, output_path: str,
+                                       model: Optional[str] = None, include_failed: bool = False) -> Optional[Dict[str, Any]]:
         with self._lock, self._acquire_file_lock():
             self._data = self._load()
             for job in reversed(self._data["jobs"]):
@@ -178,7 +179,9 @@ class _ProviderJobStore:
                     continue
                 if job.get("output_path") != output_path:
                     continue
-                if job.get("status") in {"stale", "failed"}:
+                if model is not None and job.get('model') != model:
+                    continue
+                if job.get("status") == 'stale' or (job.get('status') == 'failed' and not include_failed):
                     continue
                 return _copy_job(job)
             return None
@@ -485,6 +488,9 @@ def _build_input_hash(
     # so shots that never use a reference keep byte-identical hashes (no mass regen).
     if reference_video_hash is not None:
         payload["reference_video_hash"] = reference_video_hash
+    requested_resolution = os.getenv("ROUTERAI_RESOLUTION", "").strip() if provider_name == "routerai" else ""
+    if requested_resolution:
+        payload["requested_resolution"] = requested_resolution
     return _hash_json(payload)
 
 

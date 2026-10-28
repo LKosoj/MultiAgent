@@ -4,6 +4,10 @@ category: "Генерация"
 source_type: custom_function
 implementation_source: custom_tools.storybook.screenplay_shots_generator.screenplay_shots_generator_tool
 parameters:
+  - name: shot_keys
+    type: list
+    description: "Только указанные ключи scene-shot; остальные шоты сохраняются"
+    required: false
   - name: session_id
     type: str
     description: "Идентификатор сессии для трассировки выполнения"

@@ -990,9 +990,11 @@ def _load_shots(project_id):
         return shots_path, [], f"{exc.msg} (line {exc.lineno}, column {exc.colno})"
 
     if isinstance(data, dict) and isinstance(data.get("items"), list):
-        return shots_path, data["items"], None
+        from .video_plan import apply_video_plan
+        return shots_path, apply_video_plan(project_id, data["items"]), None
     if isinstance(data, list):
-        return shots_path, data, None
+        from .video_plan import apply_video_plan
+        return shots_path, apply_video_plan(project_id, data), None
     return shots_path, [], "shots.json must be a list or an object with an items list"
 
 
@@ -1078,7 +1080,7 @@ def _aitunnel_delivery_input_blockers(
             use_blockout_reference=_as_bool(use_blockout_reference),
         ):
             continue
-        if not item.get("start_image"):
+        if not item.get("start_image") and item.get("video_mode") != "references":
             blockers.append(f"video_input_invalid:{_video_shot_key(item)}")
             continue
         pending_items.append(item)
@@ -1092,6 +1094,16 @@ def _aitunnel_delivery_input_blockers(
 
     for item in pending_items:
         try:
+            if item.get("video_mode") == "references":
+                from .video_plan import reference_request
+                payload, _ = reference_request(item, configured_model, None)
+                config = catalog[payload['model']]
+                if (not config.get("supports_image_references")
+                        or (config.get("max_image_references") is not None
+                            and len(payload["input_references"]) > config["max_image_references"])
+                        or payload["duration"] not in config["supported_durations"]):
+                    raise ValueError("Unsupported reference video request")
+                continue
             width, height = _resolve_frame_dimensions(item, item.get("start_image"))
             _resolve_model_and_size(
                 model_catalog=catalog,

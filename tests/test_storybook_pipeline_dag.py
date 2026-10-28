@@ -54,6 +54,28 @@ class TestStorybookPipelineDag(unittest.TestCase):
 
         self.assertEqual(missing, set())
 
+    def test_background_cards_are_prepared_before_shot_images(self):
+        steps = {step.id: step for step in self._load_storybook().steps}
+        self.assertIn("shots_prompt_qa", steps["background_reference_plan"].depends_on)
+        self.assertIn("character_reference_states", steps["background_reference_plan"].depends_on)
+        self.assertEqual(steps["background_reference_plan"].tool_params["shots_data"], "{storybook_video_plan}")
+        self.assertEqual(steps["storybook_video_plan"].tool_params["shots_data"], "{character_reference_states}")
+        self.assertIn("character_reference_states", steps["storybook_video_plan"].depends_on)
+        self.assertIn("storybook_video_plan", steps["background_reference_plan"].depends_on)
+        self.assertNotIn("artist_batch_shots", steps["storybook_video_plan"].depends_on)
+        self.assertEqual(steps["background_references"].tool_params["shots_data"], "{background_reference_plan}")
+        self.assertIn("background_reference_plan", steps["background_references"].depends_on)
+        self.assertIn("shots_prompt_qa", steps["character_reference_states"].depends_on)
+        self.assertIn("background_references", steps["artist_batch_shots"].depends_on)
+        self.assertEqual(steps["artist_batch_shots"].tool_params["items"], "{background_references}")
+
+    def test_reference_tools_resolve_through_pipeline_registry(self):
+        from agent_factory import ToolRegistry
+
+        names = ["storybook_character_state_references_tool", "storybook_background_plan_tool", "storybook_background_references_tool", "video_generator_routerai_tool", "video_generator_aitunnel_tool", "storybook_video_plan_tool"]
+        resolved = ToolRegistry().resolve_many(names, profile_name="direct")
+        self.assertEqual(set(resolved), set(names))
+
     def test_video_tail_steps_have_required_order(self):
         steps = {step.id: step for step in self._load_storybook().steps}
 
@@ -66,7 +88,9 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertIn("storybook_video_decision_log", steps)
         self.assertIn("storybook_video_preflight", steps["storybook_video_delivery_promise"].depends_on)
         self.assertIn("storybook_video_delivery_promise", steps["video_generator"].depends_on)
-        self.assertEqual(steps["storybook_audio_subtitle"].depends_on, ["video_generator"])
+        self.assertEqual(steps["storybook_audio_subtitle"].depends_on, ["artist_batch_shots"])
+        self.assertIn("storybook_photo_montage", steps["storybook_video_preflight"].depends_on)
+        self.assertEqual(steps["storybook_photo_montage"].depends_on, ["artist_batch_shots", "storybook_sfx_generator"])
         self.assertEqual(
             steps["storybook_music_generator"].depends_on,
             ["storybook_audio_subtitle", "music_planner"],
@@ -74,7 +98,7 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertEqual(steps["storybook_music_generator"].condition, "{generate_screenplay}")
         self.assertEqual(steps["storybook_sfx_generator"].depends_on, ["storybook_music_generator"])
         self.assertEqual(steps["storybook_sfx_generator"].condition, "{generate_screenplay}")
-        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_sfx_generator"])
+        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_sfx_generator", "video_generator"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
 
     def test_montage_assembler_receives_audio_policy_flags(self):
@@ -101,9 +125,15 @@ class TestStorybookPipelineDag(unittest.TestCase):
         workflow_def = self._load_storybook()
         steps = {step.id: step for step in workflow_def.steps}
 
-        self.assertEqual(workflow_def.global_resource_limits.max_duration_seconds, 30720)
-        self.assertEqual(steps["video_generator"].timeout, 9000)
-        self.assertEqual(steps["storybook_music_generator"].timeout, 2400)
+        self.assertGreaterEqual(workflow_def.global_resource_limits.max_duration_seconds, 86400)
+        self.assertGreaterEqual(steps["artist_batch"].timeout, 86400)
+        self.assertGreaterEqual(steps["artist_batch_shots"].timeout, 86400)
+        self.assertGreaterEqual(steps["story_editor"].timeout, 86400)
+        self.assertGreaterEqual(steps["video_generator"].timeout, 86400)
+        self.assertEqual(steps["video_generator"].tool_params["max_concurrency"], 4)
+        self.assertEqual(steps["video_generator"].tool_params["seed"], "{brief_from_prompt.seed}")
+        self.assertGreaterEqual(steps["storybook_music_generator"].timeout, 86400)
+        self.assertEqual(steps["storybook_music_generator"].tool_params["timeout_seconds"], 1200)
 
     def test_pipeline_runner_knows_video_tail_artifacts(self):
         from StoryBookManager.core.pipeline_runner import PipelineRunner

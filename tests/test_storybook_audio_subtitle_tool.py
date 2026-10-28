@@ -197,3 +197,22 @@ def test_storybook_audio_subtitle_cue_sheet_exposes_join_keys_for_montage(tmp_pa
     for cue in cue_sheet["cues"]:
         for key in ("scene_number", "shot_number", "text", "text_source"):
             assert key in cue
+
+def test_audio_subtitle_registers_supplied_narration(tmp_path, monkeypatch):
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    base = tmp_path / 'p'
+    _write_json(base / '97_shots/shots.json', {'items': [{'scene_number': 1, 'shot_number': 1, 'timing': '3s', 'narration': 'Supplied poem'}]})
+    source = tmp_path / 'reader.mp3'
+    source.write_bytes(b'original-reader-audio')
+    result = storybook_audio_subtitle_tool('s', 'p', narration_path=str(source))
+    assert result['status'] == 'success'
+    manifest = json.loads((base / '98_audio/audio_manifest.json').read_text())
+    track = manifest['audio_tracks'][0]
+    assert track['role'] == 'narration'
+    assert Path(track['path']).read_bytes() == source.read_bytes()
+    assert manifest['narration_timing'] == 'manual_alignment_required'
+
+def test_explicit_silent_shot_never_uses_visual_description_as_subtitle():
+    lookup = audio_subtitle._build_screenplay_lookup({'screenplay': [{'scene_number': 1, 'voiceover': 'Original poem', 'storyboard': [{'shot_number': 1, 'voiceover': '', 'description': 'The boy silently blocks the window'}]}]})
+    text, _ = audio_subtitle._resolve_cue_text({'scene_number': 1, 'shot_number': 1}, lookup)
+    assert text == ''

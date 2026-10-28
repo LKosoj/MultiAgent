@@ -108,29 +108,25 @@ def _build_character_identity_block(
         ref_path = str(character.get("reference_image_path") or "").strip()
         reference_index = reference_index_lookup.get(ref_path)
         if not reference_index:
+            reference_index = next((index for path, index in reference_index_lookup.items()
+                                    if os.path.basename(path) == os.path.basename(ref_path)), None)
+        if not reference_index:
             continue
 
         immutable = character.get("immutable_attributes") or {}
-        variable = character.get("variable_attributes") or {}
-        accessories = [
-            accessory
-            for accessory in (variable.get("accessories") or [])
-            if isinstance(accessory, str) and accessory.strip()
-        ]
         anchor_parts = [
-            str(character.get("role") or "").strip(),
+            " ".join(str(character.get(key) or "").strip() for key in ("entity_nature", "species")).strip(),
             str(immutable.get("face_shape") or "").strip(),
             str(immutable.get("skin_tone") or "").strip(),
-            _sanitize_anchor_literal_text(str(variable.get("base_clothing") or "").strip(), allowed_texts or [], language),
-            _sanitize_anchor_literal_text(str(accessories[0] or "").strip(), allowed_texts or [], language) if accessories else "",
             str(immutable.get("eye_color") or "").strip(),
             str(immutable.get("body_proportions") or "").strip(),
+            str(character.get("appearance_state") or "").strip(),
         ]
         anchor_parts = [part for part in anchor_parts if part]
         if not anchor_parts:
             continue
 
-        anchor_text = "; ".join(anchor_parts[:5]).rstrip(".")
+        anchor_text = "; ".join(anchor_parts).rstrip(".")
         entries.append(
             {
                 "name": str(character.get("name") or f"character_{reference_index}").strip(),
@@ -196,7 +192,7 @@ def _iter_visible_text_sources(item: Dict[str, Any]) -> List[Tuple[str, str, str
 
 
 def _build_reference_fidelity_block() -> str:
-    return "Match all characters, props, and locations exactly to provided reference images. No generic substitutes, no extra background characters."
+    return "Preserve character identity, canonical location features and art style from reference images. Explicit scene instructions take priority for camera viewpoint, framing, lens, composition, art style, actions, poses, hand assignments, wardrobe changes, prop states, weather, lighting and palette. References do not lock the shot crop or limb pose; left and right mean the character's own anatomical sides. References may show a different moment; do not copy obsolete states or objects absent from the scene. No generic substitutes, no extra background characters."
 
 
 def _build_single_illustration_block() -> str:
@@ -340,6 +336,16 @@ def _collect_visible_text_bindings(
                 seen_candidates.add(normalized)
                 candidate_texts.append(normalized)
 
+    frame_spec = item.get("_shot_frame_spec") or item.get("shot_frame_spec") or {}
+    phase_spec = frame_spec.get(f"{item.get('shot_type', '')}_state_spec") or frame_spec
+    for literal in phase_spec.get("visible_readable_texts") or []:
+        fragments = [next(group for group in match.groups() if group) for match in _QUOTED_FRAGMENT_RE.finditer(str(literal))]
+        for fragment in fragments or [str(literal)]:
+            normalized = " ".join(fragment.split()).strip()
+            if normalized and normalized not in seen_candidates:
+                seen_candidates.add(normalized)
+                candidate_texts.append(normalized)
+
     llm_payload = {
         "scene_language": language,
         "scene_prompt": scene_prompt,
@@ -362,6 +368,7 @@ def _collect_visible_text_bindings(
             if owner_kind == "location"
         ],
         "story_context": story_context,
+        "frame_spec": phase_spec,
         "candidate_texts": candidate_texts,
     }
     system_prompt = (
@@ -374,10 +381,10 @@ def _collect_visible_text_bindings(
         "- Every candidate text from `candidate_texts` must be accounted for exactly once: either in `bindings`, in `ignored_texts`, or in `rejected_candidates`.\n"
         "- Decide binding at the LLM level from scene, bible, story, and beat context. Do not rely on a fixed carrier taxonomy.\n"
         "- Infer the carrier from the provided context itself, not from a predefined list of supported surface types.\n"
-        "- Exact literal texts for characters must come only from `characters` source texts. Exact literal texts for locations/props must come only from `locations` source texts.\n"
+        "- Exact literal texts must come from character/location source texts or `frame_spec.visible_readable_texts` of this current phase. The latter may be a result of an action and need not exist in the location's initial state. Bind it to the carrier specified by the current frame, never to a different surface.\n"
         "- Use `rejected_candidates` only when a quoted fragment from source text is not actually an in-scene readable inscription/slogan/label/badge/sign text source.\n"
         "- Use `story_context` only to decide current-frame visibility, prominence, and which of the authoritative texts should be readable now.\n"
-        "- Exclude dialogue and narration unless the same literal text is also present in authoritative character/location source data as in-scene text.\n"
+        "- Exclude dialogue and narration unless the same literal text is explicitly authorized as in-scene text by character/location source data or current `frame_spec.visible_readable_texts`.\n"
         "- `carrier` must be a precise English description of the exact surface that owns the text in this frame.\n"
         "- `visibility` must be an explicit English requirement that the text stays readable on that exact carrier in the current frame.\n"
         "- If a text should not be readable in the current frame, put it into `ignored_texts` with a short English reason instead of omitting it silently.\n"
@@ -839,6 +846,86 @@ def _apply_blockout_reference_to_item(item: Dict[str, Any], blockout_ref_image: 
     )
 
 
+def _background_reference_binding(
+    item: Dict[str, Any], reference_paths: List[str], language: str = "en",
+    location_paths: Optional[set] = None,
+) -> Tuple[List[str], str]:
+    """Pin a generated background-card sheet and remove the generic location ref."""
+    binding = item.get("background_reference")
+    if not isinstance(binding, dict):
+        return reference_paths, ""
+    sheet = str(binding.get("sheet_path") or "").strip()
+    if not sheet or not os.path.exists(sheet):
+        raise FileNotFoundError(f"Фоновой лист-карточка не найден: {sheet}")
+    try:
+        card = int(binding.get("card_number"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Некорректный номер карточки фонового листа: {binding.get('card_number')!r}") from exc
+    if card < 1:
+        raise ValueError(f"Некорректный номер карточки фонового листа: {card}")
+    location_paths = location_paths or set()
+    location_paths = set(location_paths) | {path for path in reference_paths if "/locations/" in path}
+    kept = [path for path in reference_paths if path not in location_paths and os.path.abspath(path) != os.path.abspath(sheet)]
+    location_index = next((index for index, path in enumerate(reference_paths) if path in location_paths), None)
+    continuity = [path for path in kept if "/97_shots/" in path]
+    character_basenames = {
+        os.path.basename(str(character.get("reference_image_path") or ""))
+        for character in item.get("characters") or [] if isinstance(character, dict)
+    }
+    characters = [path for path in kept if os.path.basename(path) in character_basenames
+                  or ("characters" not in item and "/characters/" in path)]
+    other = [path for path in kept if path not in continuity and path not in characters]
+    max_count = 4 if (os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL") or "").strip() == "llmgateway/gpt-image-2" else 10
+    if len(continuity) + len(characters) + 1 > max_count:
+        raise ValueError("Обязательные референсы персонажей, continuity и фонового листа не помещаются в лимит изображений")
+    kept = continuity + characters + other[:max_count - len(continuity) - len(characters) - 1]
+    if location_index is not None:
+        insert_at = min(location_index, len(kept))
+        paths = kept
+        paths.insert(min(insert_at, max_count - 1, len(paths)), sheet)
+    else:
+        paths = kept + [sheet]
+    image_number = paths.index(sheet) + 1
+    if str(language or "").lower().startswith("ru"):
+        note = f"Используй image {image_number}, карточку {card}, только для фоновой геометрии текущего кадра; не показывай лист, сетку, рамки или номера карточек."
+    else:
+        note = f"Use image {image_number}, card {card}, only for the current frame's background layout; do not show the sheet, grid, borders, or card labels."
+    return paths, note
+
+
+def _replace_stale_background_reference_roles(prompt: str, paths: List[str], item: Dict[str, Any], language: str, sheet_path: str) -> str:
+    """Replace the source role paragraph with the actual reference mapping."""
+    matches = list(re.finditer(r"(?:Опорные образы:|Reference images:)", prompt or "", re.IGNORECASE))
+    core = prompt
+    if matches:
+        role_start = matches[-1].start()
+        role_end = prompt.find("\n\n", role_start)
+        if role_end < 0:
+            role_end = len(prompt)
+        core = (prompt[:role_start] + prompt[role_end:]).strip()
+    roles = []
+    character_names = {
+        os.path.basename(str(character.get("reference_image_path") or "")): str(character.get("name") or "character")
+        for character in (item.get("characters") or []) if isinstance(character, dict)
+    }
+    for index, path in enumerate(paths, 1):
+        if os.path.abspath(path) == os.path.abspath(sheet_path):
+            label = "background-card sheet"
+        elif os.path.basename(path) in character_names:
+            label = f"character — {character_names[os.path.basename(path)]}"
+        elif "/97_shots/" in path:
+            label = "continuity reference"
+        elif "/characters/" in path:
+            label = "character reference"
+        elif "/locations/" in path:
+            label = "location reference"
+        else:
+            label = "supporting reference"
+        roles.append(f"image {index} as {label}")
+    prefix = "Опорные образы" if str(language or "").lower().startswith("ru") else "Reference images"
+    return f"{core}\n\n{prefix}: {'; '.join(roles)}."
+
+
 def _blockout_cache_key(project_id: Any, scene_number: Any, shot_number: Any, shot_type: Any) -> Tuple[Any, Any, Any, Any]:
     return (project_id, scene_number, shot_number, shot_type)
 
@@ -1002,7 +1089,7 @@ def _build_image_generation_prompts(
         "english_prompt": scene_prompt_for_translation,
         "negative_prompt": base_negative_prompt,
     }
-    needs_translation = language != "en" or needs_translation_to_english(prompt_item)
+    needs_translation = language == "en" and needs_translation_to_english(prompt_item)
 
     if needs_translation:
         translated_item = translate_prompts_in_items(
@@ -1130,10 +1217,8 @@ def _build_edit_instruction(
 
     # Создаем промпт для сцены
     scene_prompt = _build_scene_prompt(item, seed)
-    english_prompt, negative_prompt = _build_image_generation_prompts(item, scene_prompt, language)
-    #english_prompt += "\n\n То, чего не должно быть в результате редактирования: " + negative_prompt
     width = int(item.get("width", 1920))
-    height = int(item.get("height", 1080))
+    height = int(item.get("height", 1088))
     true_cfg_scale = item.get("true_cfg_scale", 7.0)
     steps = item.get("num_inference_steps", 65)
     # seed = item.get("seed", None)
@@ -1194,6 +1279,20 @@ def _build_edit_instruction(
             abs_reference_paths.append(ref_path)
     
     reference_paths = abs_reference_paths
+    location_basenames = {
+        os.path.basename(str(location.get("reference_image_path") or ""))
+        for location in (item.get("locations") or [])
+        if isinstance(location, dict) and location.get("reference_image_path")
+    }
+    location_paths = {
+        path for path in reference_paths
+        if os.path.basename(path) in location_basenames
+    }
+    background_note = ""
+    if isinstance(item.get("background_reference"), dict):
+        reference_paths, background_note = _background_reference_binding(
+            item, reference_paths, language, location_paths
+        )
     
     # Логируем исправленные пути к референсам для отладки
     if reference_paths:
@@ -1302,8 +1401,17 @@ def _build_edit_instruction(
     
     logger.info(f"🎨 Создаем изображение используя ТОЛЬКО {ref_count} референсных изображений (без базового):")
     
+    prompt_item = item
+    if background_note:
+        scene_prompt = _replace_stale_background_reference_roles(
+            scene_prompt, paths_list, item, language, str(item["background_reference"].get("sheet_path") or "")
+        )
+        prompt_item = dict(item, reference_image_paths=paths_list)
+    english_prompt, negative_prompt = _build_image_generation_prompts(prompt_item, scene_prompt, language)
     # Используем negative_prompt из upstream/LLM-пайплайна без добавления захардкоженных semantic bans.
     scene_negative = negative_prompt
+    if background_note:
+        english_prompt = f"{english_prompt}\n\n{background_note}".strip()
 
     # ВНИМАНИЕ: агенту явно укажем ВЫЗВАТЬ edit_image_vse_tool с параметрами ниже
     # Промпт строго на английском.
@@ -1318,7 +1426,7 @@ def _build_edit_instruction(
 СТРОГО СЛЕДУЙ ИНСТРУКЦИЯМ НИЖЕ:
 1) Используй инструмент edit_image_vse_tool (а не generate_image_tool).
 2) Обязательно укажи негативный промпт для исключения нежелательных элементов.
-3) Вызови edit_image_vse_tool с аргументами prompt="{english_prompt}", image_paths={image_paths_str}, negative_prompt="{scene_negative}", session_id="{session_id}", output_path="{output_path}", seed={seed}
+3) Вызови edit_image_vse_tool с аргументами prompt="{english_prompt}", image_paths={image_paths_str}, negative_prompt="{scene_negative}", session_id="{session_id}", output_path="{output_path}", seed={seed}, width={width}, height={height}
 
 ВАЖНО - РАБОТАЕМ ТОЛЬКО С РЕФЕРЕНСНЫМИ ИЗОБРАЖЕНИЯМИ:
 - В image_paths передаются {ref_count} референсных изображения персонажей и локаций
@@ -1449,6 +1557,9 @@ def _smart_select_references_for_generation(
     Returns:
         список выбранных путей к референсам (до max_count элементов)
     """
+    model = (os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL") or "").strip()
+    if model == "llmgateway/gpt-image-2":
+        max_count = min(max_count, 4)
     if not available_references:
         return []
     
@@ -1681,11 +1792,44 @@ def _create_canon_reference(
         logger.info(f"📚 Отобрано {len(selected_references)} референсов из {len(reference_paths)} для генерации {entity_data.get('name', 'Unknown')} ({entity_type})")
         
         # Формируем промпт через новый модуль
-        prompt = build_canon_image_prompt(entity_type, entity_data, consistency_rules)
+        prompt = build_canon_image_prompt(
+            entity_type, entity_data, [] if entity_type == "location" else consistency_rules
+        )
+        if entity_type == "location":
+            from agent_command import model_hard
+            from utils import call_openai_api, parse_llm_json
 
-        # --- Подмешиваем единый визуальный стиль проекта (style_images.json) ---
-        # Важно: для канон-референсов локаций иначе стиль может "плавать" (т.к. style_images — текстовые правила).
-        # Мы добавляем это ДО перевода, чтобы translate_prompts_in_items перевёл и стиль тоже.
+            response = call_openai_api(
+                prompt=json.dumps({"location": {key: value for key, value in entity_data.items() if not key.startswith("_")}, "draft_prompt": prompt}, ensure_ascii=False),
+                system_prompt=(
+                    "Prepare a canonical location reference prompt from the supplied location passport and draft. "
+                    "Resolve the historical period into concrete visible architecture and objects, not a generic vintage look. "
+                    "For familiar real places, check that buildings, landmarks, architectural details and emblems existed "
+                    "in the specified period; reconstruct their appearance then rather than their familiar present-day form. "
+                    "If a background detail cannot be dated confidently, use a neutral period-compatible detail. "
+                    "Preserve the location identity, requested views, key objects, weather, lighting and palette. "
+                    "A palette is not a checklist. Use an accent color only when the passport explicitly assigns it "
+                    "to a visible environmental object or surface; otherwise leave it out. Do not invent or recolor "
+                    "objects merely to force an accent into the image. "
+                    "Preserve stable or initial states and explicit absences; do not introduce later plot consequences. "
+                    "Respect explicitly fictional elements in the passport. Do not invent story events. "
+                    "Do not generate or choose an art style; the saved style will be appended by code. "
+                    "Describe visible facts and preserve only explicit absences relevant to this location. "
+                    "Do not enumerate everything absent or forbid entire object categories compatible with the period. "
+                    "Return only a JSON object with a nonempty English english_prompt."
+                ),
+                model=model_hard,
+                max_tokens=4000,
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+            compiled = parse_llm_json(response)
+            prompt = str(compiled.get("english_prompt") or "").strip()
+            if not prompt:
+                raise ValueError("Location reference compilation returned an empty image prompt")
+
+        # Готовую художественную технику берём из общего каталога, без библии всего фильма.
+        # Добавляем до перевода вместе с описанием конкретной сущности.
         def _infer_base_dir_from_output(p: str) -> Optional[str]:
             try:
                 norm = (p or "").replace("\\", "/")
@@ -1701,28 +1845,6 @@ def _create_canon_reference(
             except Exception:
                 return None
 
-        def _pick_style_variant_key(style_images: Dict[str, Any], entity_data_local: Dict[str, Any], output_path_local: str) -> Optional[str]:
-            try:
-                cp = (entity_data_local.get("reference_image_path") or "").lower()
-                nm = (entity_data_local.get("name") or "").lower()
-                op = (output_path_local or "").lower()
-                candidates = []
-                color_palette = style_images.get("color_palette")
-                if isinstance(color_palette, dict):
-                    candidates.extend([str(k) for k in color_palette.keys()])
-                lighting = style_images.get("lighting")
-                if isinstance(lighting, dict):
-                    candidates.extend([str(k) for k in lighting.keys()])
-                for key in candidates:
-                    k = key.lower().strip()
-                    if not k:
-                        continue
-                    if (k in cp) or (k in nm) or (k in op):
-                        return key
-            except Exception:
-                return None
-            return None
-
         base_dir = _infer_base_dir_from_output(output_path)
         if base_dir:
             style_images_path = f"{base_dir}/30_style/style_images.json"
@@ -1736,36 +1858,11 @@ def _create_canon_reference(
                 style_images = {}
 
             if isinstance(style_images, dict) and style_images:
-                style_chunks = []
-                if style_images.get("art_style"):
-                    style_chunks.append(f"Art style: {style_images['art_style']}.")
-                # для локаций часто важно подтянуть конкретную палитру/свет из style_images по ключу
-                variant_key = _pick_style_variant_key(style_images, entity_data, output_path)
-                color_palette = style_images.get("color_palette")
-                lighting = style_images.get("lighting")
-                if variant_key and isinstance(color_palette, dict) and color_palette.get(variant_key):
-                    style_chunks.append(f"Color palette hint ({variant_key}): {color_palette.get(variant_key)}.")
-                elif style_images.get("color_palette"):
-                    style_chunks.append(f"Color palette: {style_images['color_palette']}.")
-                if variant_key and isinstance(lighting, dict) and lighting.get(variant_key):
-                    style_chunks.append(f"Lighting hint ({variant_key}): {lighting.get(variant_key)}.")
-                elif style_images.get("lighting"):
-                    style_chunks.append(f"Lighting: {style_images['lighting']}.")
-                if style_images.get("texture"):
-                    style_chunks.append(f"Texture: {style_images['texture']}.")
-                if style_images.get("detail_density"):
-                    style_chunks.append(f"Detail level: {style_images['detail_density']}.")
-                if style_images.get("model"):
-                    style_chunks.append(f"Model/style notes: {style_images['model']}.")
-                dni = style_images.get("do_not_include")
-                if isinstance(dni, list) and dni:
-                    dni_text = "; ".join([str(x) for x in dni if str(x).strip()])
-                    if dni_text:
-                        style_chunks.append(f"Do not include: {dni_text}.")
+                from .style_keeper import ensure_image_style_catalog
+                catalog = ensure_image_style_catalog(base_dir, style_images)
+                style = catalog["styles"][catalog["default_style_id"]]
+                prompt += f"\n\nIMAGE STYLE:\n{style['prompt']}"
 
-                if style_chunks:
-                    prompt = f"{prompt}\n\nPROJECT VISUAL STYLE:\n" + " ".join(style_chunks)
-        
         # Формируем негативный промпт в зависимости от типа сущности
         if entity_type == "location":
             negative_prompt = "people, person, character, human, man, woman, child, figure, watermark, text, logo"
@@ -1799,10 +1896,12 @@ def _create_canon_reference(
         else:
             negative_prompt = "watermark, text, logo"
         
-        # Переводим промпт на английский
-        from utils import translate_prompts_in_items
-        translated_item = translate_prompts_in_items({"english_prompt": prompt}, 'en')
-        english_prompt = translated_item.get('english_prompt', prompt)
+        if entity_type == "location":
+            english_prompt = prompt
+        else:
+            from utils import translate_prompts_in_items
+            translated_item = translate_prompts_in_items({"english_prompt": prompt}, 'en')
+            english_prompt = translated_item.get('english_prompt', prompt)
         
         # ОБХОДИМ ПРОБЛЕМУ С АГЕНТОМ: вызываем edit_image_vse_tool напрямую
         logger.info(f"🎨 Создаём канонический референс для {entity_data.get('name', 'Unknown')} ({entity_type}) НАПРЯМУЮ через edit_image_vse_tool")
@@ -1867,9 +1966,13 @@ def _preprocess_canon_references(
         return []
     
     canon_tasks = []
+    project_dir = os.path.abspath(str(safe_storybook_project_dir(project_id))) + os.sep
     
     # Анализируем каждый повторный референс
     for ref_path in repeated_refs.keys():
+        if os.path.isfile(ref_path) and os.path.abspath(ref_path).startswith(project_dir):
+            logger.info(f"📁 Готовый проектный референс сохранён: {ref_path}")
+            continue
         # Проверяем, находится ли уже в проектном каталоге И существует ли физически
         if f"/20_bible/references/" in ref_path:
             if os.path.exists(ref_path):
@@ -2339,7 +2442,7 @@ def artist_agent_batch_edit_tool(
             os.makedirs(base_dir, exist_ok=True)
             base_path = os.path.join(base_dir, "base.png")
             w = int(item.get("width", 1920))
-            h = int(item.get("height", 1080))
+            h = int(item.get("height", 1088))
             _write_solid_color_png(base_path, w, h, (0, 0, 0))
             logger.info(f"⬛ BLACK SCREEN: базовый кадр без API (локальный #000000) -> {base_path}")
             return os.path.abspath(base_path)
@@ -2356,7 +2459,7 @@ def artist_agent_batch_edit_tool(
             "watermark, text, logo, nsfw, distorted hands, extra fingers, extra limbs, lowres, deformed face"
         )
         width = int(item.get("width", 1920))
-        height = int(item.get("height", 1080))
+        height = int(item.get("height", 1088))
         # Убираем неиспользуемые параметры
         # steps = item.get("num_inference_steps", 50)
         # seed = item.get("seed", None)
@@ -2374,6 +2477,7 @@ def artist_agent_batch_edit_tool(
    - prompt: "prompt_on_english"
    - session_id: "{session_id}"
    - number: {number}
+   - seed: {seed}
    - negative_prompt: "{negative_prompt}"
    - width: {width}
    - height: {height}
@@ -2460,7 +2564,7 @@ def artist_agent_batch_edit_tool(
                 if not os.path.isabs(out_bs):
                     out_bs = os.path.abspath(out_bs)
                 w_bs = int(item.get("width", 1920))
-                h_bs = int(item.get("height", 1080))
+                h_bs = int(item.get("height", 1088))
                 _write_solid_color_png(out_bs, w_bs, h_bs, (0, 0, 0))
                 logger.info(f"⬛ BLACK SCREEN: финальный кадр без API (локальный #000000) -> {out_bs}")
                 return {
@@ -2535,7 +2639,7 @@ def artist_agent_batch_edit_tool(
                         output_path=item.get("output_path"),
                         seed=seed,
                         width=int(item.get("width", 1920)),
-                        height=int(item.get("height", 1080)),
+                        height=int(item.get("height", 1088)),
                     )
                     log_data = {
                         "🎨 Результат": result,
@@ -2774,7 +2878,8 @@ def _generate_image_from_scratch(
     project_id: str,
     protagonist_data: Dict[str, Any],
     output_path: str,
-    pipeline_type: str
+    pipeline_type: str,
+    seed: Optional[int] = None,
 ) -> bool:
     """Генерирует изображение протагониста с нуля, используя логику из protagonist_initializer."""
     base_dir = str(safe_storybook_project_dir(project_id))
@@ -2791,6 +2896,9 @@ def _generate_image_from_scratch(
         f"base_clothing: {var.get('base_clothing','')}, base_hairstyle: {var.get('base_hairstyle','')}, "
         f"accessories: {', '.join(var.get('accessories', []))}. "
     )
+    for field in ("historical_period", "environment_context"):
+        if protagonist_data.get(field):
+            prompt += f"{field}: {protagonist_data[field]}. "
 
     # Добавляем информацию о стиле из файлов
     style_images_path = f"{base_dir}/30_style/style_images.json"
@@ -2853,8 +2961,9 @@ def _generate_image_from_scratch(
   - session_id: "{session_id}"
   - number: 1
   - negative_prompt: "усиленный_негативный_промпт"
+  - seed: {seed}
   - width: 1920
-  - height: 1080
+  - height: 1088
 В ответе верни только финальный путь к файлу.
 """
     try:
@@ -2884,13 +2993,16 @@ def _generate_canon_reference_from_scratch(
     entity_data: Dict[str, Any],
     output_path: str,
     consistency_rules: List[Dict[str, Any]],
-    pipeline_type: str
+    pipeline_type: str,
+    seed: Optional[int] = None,
 ) -> bool:
     """Генерирует канонический референс без опорных изображений."""
     try:
         _ensure_parent_dir(output_path)
 
-        prompt = build_canon_image_prompt(entity_type, entity_data, consistency_rules)
+        prompt = build_canon_image_prompt(
+            entity_type, entity_data, [] if entity_type == "location" else consistency_rules
+        )
         if not prompt.strip():
             return False
 
@@ -2919,9 +3031,10 @@ def _generate_canon_reference_from_scratch(
    - prompt: "prompt_on_english"
    - session_id: "{session_id}"
    - number: 1
+   - seed: {seed}
    - negative_prompt: "{negative_prompt}"
    - width: 1920
-   - height: 1080
+   - height: 1088
 
 КРИТИЧЕСКИ ВАЖНО:
 - Язык описания изображения (prompt) — ТОЛЬКО английский.
@@ -3108,7 +3221,7 @@ def _ensure_references_exist(
 
         if protagonist_ref_path and protagonist_ref_path in missing_paths and not existing_paths:
             logger.info("Протагонист отсутствует и нет других референсов. Генерируем с нуля...")
-            if _generate_image_from_scratch(session_id, project_id, protagonist, protagonist_ref_path, pipeline_type):
+            if _generate_image_from_scratch(session_id, project_id, protagonist, protagonist_ref_path, pipeline_type, seed=seed):
                 logger.info(f"Изображение протагониста успешно создано: {protagonist_ref_path}")
                 existing_paths.append(protagonist_ref_path)
                 missing_paths.remove(protagonist_ref_path)
@@ -3138,6 +3251,7 @@ def _ensure_references_exist(
                 output_path=path_to_create,
                 consistency_rules=consistency_rules,
                 pipeline_type=pipeline_type,
+                seed=seed,
             ):
                 logger.info(f"Канонический референс создан без опорных изображений: {path_to_create}")
                 existing_paths.append(path_to_create)

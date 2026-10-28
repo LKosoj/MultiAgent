@@ -21,8 +21,36 @@ _AITUNNEL_MODELS_URL = "https://api.aitunnel.ru/public/aitunnel/models/videos"
 _AITUNNEL_MODELS_TIMEOUT_SECONDS = 60
 _AITUNNEL_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _AITUNNEL_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+# The Wan model page documents both anchors; the public catalog omits last_frame.
+# https://aitunnel.ru/models/wan-3-0
+_AITUNNEL_MODEL_CAPABILITIES = {
+    "wan-3.0": {"supported_frame_images": ["first_frame", "last_frame"]},
+}
 _ROUTERAI_MODELS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _ROUTERAI_MODELS_CACHE_LOCK: threading.Lock = threading.Lock()
+
+# https://routerai.ru/models/bytedance/seedance-1-5-pro#capabilities
+_ROUTERAI_MODEL_CAPABILITIES = {
+    # POST /videos rejects input_references despite the public catalog flag.
+    "x-ai/grok-imagine-video-1.5-lite": {
+        "supports_image_references": False,
+    },
+    # https://routerai.ru/models/alibaba/wan-3.0#specs
+    "alibaba/wan-3.0": {
+        "supports_image_references": True,
+        "max_image_references": 10,
+        "supported_durations": list(range(2, 31)),
+        "supported_resolutions": ["480p", "720p", "1080p"],
+        "supported_frame_images": ["first_frame", "last_frame"],
+        "supported_aspect_ratios": ["16:9", "4:3", "1:1", "3:4", "9:16"],
+    },
+    "bytedance/seedance-1-5-pro": {
+        "max_image_references": 2,
+        "supported_durations": list(range(4, 13)),
+        "supported_resolutions": ["480p", "720p", "1080p"],
+        "supported_frame_images": ["first_frame", "last_frame"],
+    },
+}
 
 
 def _get_routerai_video_models(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -43,6 +71,9 @@ def _get_routerai_video_models(force_refresh: bool = False) -> Dict[str, Dict[st
                 continue
             catalog[record["id"]] = {
                 **record,
+                "supports_image_references": bool(record.get("supports_reference_images")),
+                **_ROUTERAI_MODEL_CAPABILITIES.get(record["id"], {}),
+                "_resolution_env": "ROUTERAI_RESOLUTION",
                 "supports_seed": bool(record.get("seed")),
                 "supports_reference_video": "video" in record.get("architecture", {}).get("input_modalities", []),
             }
@@ -71,6 +102,9 @@ def _get_aitunnel_video_models(force_refresh: bool = False) -> Dict[str, Dict[st
         if not isinstance(payload, dict):
             raise RuntimeError(f"Неверный ответ публичного models endpoint: {payload}")
 
+        for model, record in payload.items():
+            record['supports_image_references'] = bool(record.get('supports_input_references'))
+            record.update(_AITUNNEL_MODEL_CAPABILITIES.get(model, {}))
         _AITUNNEL_MODELS_CACHE = payload
         return payload
 

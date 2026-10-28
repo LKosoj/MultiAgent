@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,6 +14,7 @@ def storybook_audio_subtitle_tool(
     language: str = "ru",
     enable: bool = True,
     allow_missing_subtitles: bool = False,
+    narration_path: str = "",
 ) -> Dict[str, Any]:
     """Create subtitle and audio planning artifacts for a storybook project.
 
@@ -23,6 +25,7 @@ def storybook_audio_subtitle_tool(
         enable: When false, skip artifact generation and return planned output paths.
         allow_missing_subtitles: When false (default), an empty cue set is a hard error;
             when true, an empty cue set succeeds with a ``no_subtitle_cues`` warning.
+        narration_path: Existing reader audio to copy unchanged; timing is aligned manually.
     """
     enable = _as_bool(enable)
     allow_missing_subtitles = _as_bool(allow_missing_subtitles)
@@ -120,6 +123,15 @@ def storybook_audio_subtitle_tool(
         },
         "errors": errors,
     }
+    if narration_path:
+        source = Path(narration_path).resolve()
+        target = audio_dir / ("narration" + source.suffix.lower())
+        if source != target.resolve():
+            shutil.copy2(source, target)
+        elif not source.is_file():
+            raise FileNotFoundError(source)
+        audio_manifest["audio_tracks"].append({"role": "narration", "path": str(target)})
+        audio_manifest["narration_timing"] = "manual_alignment_required"
     _write_json(manifest_path, audio_manifest)
 
     if not cues and not allow_missing_subtitles:
@@ -236,7 +248,9 @@ def _build_screenplay_lookup(screenplay_data: Any) -> Dict[str, Dict[Tuple[Any, 
             continue
         scene_number = scene.get("scene_number")
         scene_value = _first_text(scene, ["subtitle", "voiceover", "narration", "dialogue", "action"])
-        if scene_value:
+        if "voiceover" in scene:
+            scene_value = _stringify_text(scene["voiceover"])
+        if scene_value or "voiceover" in scene:
             scene_text[(scene_number, None)] = scene_value
         storyboard = scene.get("storyboard")
         if not isinstance(storyboard, list):
@@ -248,7 +262,9 @@ def _build_screenplay_lookup(screenplay_data: Any) -> Dict[str, Dict[Tuple[Any, 
                 shot,
                 ["subtitle", "subtitle_text", "caption", "voiceover", "narration", "dialogue", "description"],
             )
-            if text:
+            if "voiceover" in shot:
+                text = _stringify_text(shot["voiceover"])
+            if text or "voiceover" in shot:
                 shot_text[(scene_number, shot.get("shot_number"))] = text
             if shot.get("timing") not in (None, ""):
                 shot_timing[(scene_number, shot.get("shot_number"))] = shot.get("timing")
@@ -313,13 +329,17 @@ def _resolve_cue_text(
     screenplay_lookup: Dict[str, Dict[Tuple[Any, Any], Any]],
 ) -> Tuple[str, str]:
     key = (item.get("scene_number"), item.get("shot_number"))
-    shot_text = screenplay_lookup.get("shots", {}).get(key)
-    if shot_text:
-        return shot_text, "screenplay.storyboard"
+    shot_texts = screenplay_lookup.get("shots", {})
+    if key in shot_texts:
+        return shot_texts[key], "screenplay.storyboard"
 
-    scene_text = screenplay_lookup.get("scenes", {}).get((item.get("scene_number"), None))
-    if scene_text:
-        return scene_text, "screenplay.scene"
+    scene_key = (item.get("scene_number"), None)
+    scene_texts = screenplay_lookup.get("scenes", {})
+    if scene_key in scene_texts:
+        return scene_texts[scene_key], "screenplay.scene"
+
+    if "voiceover" in item:
+        return _stringify_text(item["voiceover"]), "shots.item"
 
     item_text = _first_text(
         item,

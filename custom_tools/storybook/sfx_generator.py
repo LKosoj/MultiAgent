@@ -18,7 +18,18 @@ def storybook_sfx_generator_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
-):
+) -> dict:
+    """Generate scene sound effects and register their audio files.
+
+    Args:
+        session_id: Execution trace identifier.
+        project_id: Storybook project identifier.
+        language: Project source language code.
+        enable: Whether to generate sound effects.
+
+    Returns:
+        Generation status, manifest path and track count.
+    """
     try:
         base = _safe_project_dir(project_id)
     except ValueError as exc:
@@ -90,7 +101,7 @@ def _generate_mp3(payload, path):
         raise RuntimeError("SFX requires OPENAI_API_BASE_DB and OPENAI_API_KEY_DB")
     response = requests.post(
         f"{base_url}/audio/speech", json=payload,
-        headers={"Authorization": f"Bearer {api_key}", "X-Title": "MAgent"}, timeout=300,
+        headers={"Authorization": f"Bearer {api_key}", "X-Title": "MAgent"}, timeout=1200,
     )
     response.raise_for_status()
     if not response.content or not response.headers.get("Content-Type", "").lower().startswith("audio/"):
