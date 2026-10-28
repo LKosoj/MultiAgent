@@ -8,6 +8,14 @@ from PIL import Image
 from custom_tools.storybook import video_generator_aitunnel_tool as aitunnel_module
 
 
+@pytest.fixture(autouse=True)
+def isolate_video_configuration(monkeypatch):
+    # Tests set their own behavior independently of the local production .env.
+    monkeypatch.setenv("AITUNNEL_VIDEO_RETRY_CYCLES", "0")
+    monkeypatch.delenv("AITUNNEL_VIDEO_FALLBACK_MODEL", raising=False)
+    monkeypatch.delenv("AITUNNEL_RESOLUTION", raising=False)
+
+
 class _FakeResponse:
     def __init__(self, status_code=200, json_payload=None, text="", content=b""):
         self.status_code = status_code
@@ -85,11 +93,11 @@ def _read_provider_jobs(shots_dir: Path):
 
 
 def test_video_budget_counts_logical_batches_and_reserves_storybook_tail():
-    assert aitunnel_module._minimum_remaining_video_budget_seconds(1, 0, 2) == 5160
-    assert aitunnel_module._minimum_remaining_video_budget_seconds(2, 0, 2) == 5160
-    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 0, 2) == 6240
-    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 2, 2) == 5160
-    assert aitunnel_module._remaining_video_batch_wait_seconds(21, 0, 2) == 11880
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(1, 0, 2) == 6300
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(2, 0, 2) == 6300
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 0, 2) == 8520
+    assert aitunnel_module._minimum_remaining_video_budget_seconds(3, 2, 2) == 6300
+    assert aitunnel_module._remaining_video_batch_wait_seconds(21, 0, 2) == 24420
 
 
 def test_video_does_not_submit_batch_that_exceeds_workflow_deadline(tmp_path, monkeypatch):
@@ -122,14 +130,14 @@ def test_new_video_submission_respects_elapsed_step_budget(monkeypatch):
 
     with pytest.raises(RuntimeError, match="срока шага"):
         aitunnel_module._require_budget_for_new_video_submission(
-            _Deadline(), aitunnel_module.time.monotonic() - 8101,
+            _Deadline(), aitunnel_module.time.monotonic() - (aitunnel_module._VIDEO_STEP_TIMEOUT_SECONDS - 899),
         )
 
 
-def test_one_batch_at_5160_seconds_is_admitted():
+def test_one_batch_at_6300_seconds_is_admitted():
     class _Deadline:
         def remaining_seconds(self):
-            return 5160
+            return 6300
 
     aitunnel_module._require_budget_for_new_video_submission(_Deadline(), aitunnel_module.time.monotonic())
 

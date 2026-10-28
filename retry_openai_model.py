@@ -934,7 +934,7 @@ class RetryOpenAIServerModel:
                 if self.timeout_seconds is not None
                 else httpx.Timeout(
                     connect=10.0,   # Время на установку соединения
-                    read=600.0,     # Время на чтение ответа (10 минут)
+                    read=1200.0,    # Время на чтение ответа (20 минут)
                     write=10.0,     # Время на отправку запроса
                     pool=10.0       # Время на получение соединения из пула
                 )

@@ -4,6 +4,18 @@ category: "storybook"
 source_type: custom_function
 implementation_source: custom_tools.storybook.video_generator_routerai_tool.video_generator_routerai_tool
 parameters:
+  - name: "retry_cycles"
+    type: "int"
+    description: "Число циклов основной и резервной модели; по умолчанию ROUTERAI_VIDEO_RETRY_CYCLES, 0 отключает повторы"
+    required: false
+  - name: "fallback_model"
+    type: "str"
+    description: "Резервная модель; по умолчанию ROUTERAI_VIDEO_FALLBACK_MODEL"
+    required: false
+  - name: "shot_keys"
+    type: "list"
+    description: "Обрабатывать только указанные выходные ключи scene-shot, сохраняя остальные видео"
+    required: false
   - name: "session_id"
     type: "str"
     description: "Идентификатор сессии для трассировки выполнения"
@@ -18,7 +30,8 @@ parameters:
     required: false
   - name: "max_concurrency"
     type: "int"
-    description: "Максимальное количество параллельных запросов к API (по умолчанию 2)"
+    description: "Максимальное количество параллельных запросов к API (по умолчанию 4)"
+    default: 4
     required: false
   - name: "enable"
     type: "bool"

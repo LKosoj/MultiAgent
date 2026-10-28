@@ -26,5 +26,9 @@ parameters:
     required: false
   - name: "height"
     type: "int"
-    description: "Высота результата. По умолчанию 1080"
+    description: "Высота результата. По умолчанию 1088"
+    required: false
+  - name: "seed"
+    type: "int"
+    description: "Общий seed проекта для воспроизводимости генерации."
     required: false

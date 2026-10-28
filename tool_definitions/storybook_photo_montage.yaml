@@ -1,0 +1,18 @@
+name: storybook_photo_montage_tool
+description: "Экспортирует полные фото- и видеотаймлайны с отдельными звуками и собирает фотофильм через ffmpeg"
+category: storybook
+source_type: custom_function
+implementation_source: custom_tools.storybook.timeline_media.storybook_photo_montage_tool
+parameters:
+  - name: session_id
+    type: str
+    required: true
+    description: "Идентификатор выполнения"
+  - name: project_id
+    type: str
+    required: true
+    description: "Идентификатор проекта"
+  - name: enable
+    type: bool
+    required: false
+    description: "Включить экспорт и сборку фотофильма"

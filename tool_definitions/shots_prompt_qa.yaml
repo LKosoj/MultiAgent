@@ -32,6 +32,10 @@ parameters:
     type: int
     description: "Ограничение количества сцен для обработки (опционально)"
     required: false
+  - name: shot_keys
+    type: list
+    description: "Ограничение QA/repair конкретными ключами scene-shot, например ['3-2', '3-4']"
+    required: false
   - name: force
     type: bool
     description: "Если True — игнорирует prompts_validated и выполняет повторную валидацию"

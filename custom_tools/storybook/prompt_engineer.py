@@ -5,9 +5,8 @@ import re
 import logging
 from typing import Dict, Any, List
 from utils import call_openai_api, parse_llm_json
-from agent_command import model_code
+from agent_command import model_code, model_hard
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
-from custom_tools.storybook.style_library_config import compose_style_directives
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +43,7 @@ def _prompt_inputs_fingerprint(
     style_images: Dict[str, Any], negative_list: str, language: str,
 ) -> str:
     payload = {
+        "prompt_version": 6,
         "beats": beats, "story": story, "characters": characters,
         "locations": locations, "style_images": style_images,
         "negative_list": negative_list, "language": language,
@@ -128,7 +128,6 @@ def _build_scene_packets(
 def _annotate_scene_packets(
     scene_packets: List[Dict[str, Any]],
     characters: List[Dict[str, Any]],
-    authoritative_readable_texts: List[str],
 ) -> List[Dict[str, Any]]:
     annotated_packets: List[Dict[str, Any]] = []
     for packet in scene_packets:
@@ -153,18 +152,8 @@ def _annotate_scene_packets(
             if any(name_key in text for text in lowered_haystacks):
                 explicit_character_mentions.append(name)
 
-        explicit_readable_text_mentions: List[str] = []
-        for text in authoritative_readable_texts:
-            candidate = str(text or "").strip()
-            if not candidate:
-                continue
-            candidate_key = candidate.casefold()
-            if any(candidate_key in text for text in lowered_haystacks):
-                explicit_readable_text_mentions.append(candidate)
-
         annotated_packet = dict(packet)
         annotated_packet["explicit_character_mentions"] = explicit_character_mentions
-        annotated_packet["explicit_readable_text_mentions"] = explicit_readable_text_mentions
         annotated_packets.append(annotated_packet)
     return annotated_packets
 
@@ -359,11 +348,15 @@ def _select_frame_specs(
 }}
 
 Правила:
-- Для каждой страницы сначала смотри на final `page_title` и `page_body`. Это главный source of truth.
-- Затем используй `beat` как источник must-have деталей, атмосферы и состава сцены, но не позволяй ему тащить в кадр целую последовательность действий.
+- `page_title` и `page_body` задают литературное содержание страницы. Явно заданная в `beat.goal`, `key_object`, `must_have_details` и `character_appearance_changes` визуальная постановка задаёт видимые состояния и имеет приоритет перед буквальной иллюстрацией речи или стихотворения. Если указан конкретный опорный или финальный кадр, выбери его, не заменяй более ранним эпизодом из текста.
+- Если отдельной визуальной постановки нет, выбирай кадр по финальному тексту страницы. Из последовательности действий бери один момент, сохраняя явно требуемое для него состояние ключевых предметов.
+- Сохраняй явно заданное отсутствие предметов, существенное для выбранного момента: отрази его в `prop_states` и `must_not_show`, чтобы фоновые детали не опровергали это состояние.
+- Фиксируй в `must_show` и `prop_states` заданную позу, опору и физическое расположение персонажей по сторонам границ пространства. Неподвижность не заменяет конкретную позу. Не меняй опору или сторону границы без соответствующего действия в исходном эпизоде.
+- Частичная авторская правка меняет только явно указанные свойства: требования к внешности, одежде или ракурсу не отменяют заданную позу, опору и расположение персонажей. Не превращай запрет сочетания свойств в запрет самой позы; сохраняй остальные факты исходного эпизода.
+- Если авторская правка задаёт видимую постановку конкретного эпизода, выбери момент этого эпизода. Не обходи требование, выбирая соседний эпизод, где заданное взаимодействие или его участники отсутствуют.
 - В `scene_packets[i].explicit_character_mentions` уже собраны канонические персонажи, явно названные в финальном тексте страницы и beat. Если они совместимы с выбранным кадром, не выкидывай их из ensemble без причины.
-- В `scene_packets[i].explicit_readable_text_mentions` уже собраны авторитетные буквальные надписи, которые финальный текст страницы явно поднимает. Используй это как сильную подсказку для visible/hidden readable texts.
-- Выбери один visually strongest freeze-frame, который лучше всего соответствует финальному тексту страницы.
+- Упоминание имени или слова в повествовании само по себе не означает видимую надпись. Readable text разрешён только на заданном в каноне носителе, если этот носитель виден в выбранном моменте; не переноси надпись на другую поверхность.
+- Выбери один visually strongest freeze-frame, который сохраняет явно заданную визуальную постановку и соответствует содержанию страницы.
 - Если страница описывает последствия события или уже свершившееся событие, выбирай кадр с этими последствиями, а не момент за секунду до них.
 - Если страница описывает коллективную катастрофу, общий событийный узел или последствия для нескольких персонажей, не своди кадр к одному позднему наблюдателю, даже если он визуально прост.
 - `must_show` должен содержать только факты, которые можно одновременно увидеть в одном still frame.
@@ -391,7 +384,7 @@ def _select_frame_specs(
     resp = call_openai_api(
         prompt=json.dumps(payload, ensure_ascii=False),
         system_prompt=system,
-        model=model_code,
+        model=model_hard,
         max_tokens=_estimate_prompt_response_max_tokens(len(scene_packets)),
         temperature=0.1,
         response_format={"type": "json_object"},
@@ -452,20 +445,24 @@ def _repair_frame_specs(
 
 Правила:
 - `scene_packets[].page_title` и `scene_packets[].page_body` — главный source of truth.
-- `scene_packets[].explicit_character_mentions` и `scene_packets[].explicit_readable_text_mentions` — сильные input-driven подсказки о том, что финальный текст страницы реально поднимает как видимое/важное.
+- `scene_packets[].explicit_character_mentions` — подсказки о персонажах, которых явно упоминает текст страницы.
+- Не превращай обычное упоминание имени или слова в видимую надпись. Сохраняй заданный каноном носитель текста: не переноси надпись на другую поверхность ради её видимости.
 - `current_frame_specs` можно исправлять, если они выбрали не тот момент, не тот primary subject, не тот scene_mode или конфликтные visible/hidden facts.
 - Если финальный текст страницы описывает коллективное событие, цепочку последствий или общий событийный узел, а один персонаж появляется поздно как наблюдатель или вторичный участник, такой персонаж не должен становиться `primary_subject` ensemble-сцены.
 - В ensemble-сцене `primary_subject` должен описывать событийное ядро кадра, а `observer_characters` — только поздних наблюдателей, боковые входы и вторичные фигуры у края кадра.
 - В ensemble-сцене `visible_characters` должен удерживать персонажей, явно присутствующих в финальном тексте и реально видимых в выбранном моменте; late observer не должен вытеснять основной cast из `visible_characters`.
 - `observer_characters` — это только поздние наблюдатели, боковые входы и периферийные свидетели. Не переноси туда персонажей из событийного ядра только потому, что они видны частично, падают или читаются через последствия.
 - Если страница уже описывает последствия катастрофы, выбранный кадр должен фиксировать эти последствия, а не сцену до них.
+- Если `beat` явно задаёт опорный или финальный кадр и состояния ключевых предметов, сохрани эту визуальную постановку. Не подменяй её более ранним эпизодом или буквальной иллюстрацией строки стихотворения: литературная речь и видимый кадр могут различаться.
 - `must_show` должен фиксировать обязательные видимые последствия и composition anchors.
 - Если страница строится вокруг общего события, `must_show` должен явно удерживать событийное ядро и различимый состав сцены, а не только late observer и фон.
 - `must_not_show` должен выносить соседние моменты, pre-event состояния и физически несовместимые состояния.
+- Сохраняй явно заданное для текущего момента отсутствие или исчерпание предметов в `prop_states` и `must_not_show`; не заменяй его привычными деталями обстановки.
 - `camera_anchor` должен быть привязан к событийному ядру кадра, а не к late observer, если сцена ensemble.
 - `visible_readable_texts` и `hidden_readable_texts` разрешены только как exact строки из `authoritative_readable_texts`.
 - Не придумывай новые readable texts, не сокращай их и не меняй словоформу.
 - `prop_states` должны описывать только одновременно истинные состояния реквизита и аксессуаров.
+- Сохраняй заданные позы, опоры, контакты и физические стороны границ пространства; не заменяй их общей неподвижностью или одной лишь композиционной осью. Референс локации не должен переопределять расположение и позы персонажей выбранного момента.
 - `visible_characters` и `observer_characters` должны содержать только точные канонические имена из `characters.json`, без пояснений в скобках и без описаний состояния.
 - Не пиши narrative summary. Исправляй только визуальные инварианты кадра.
 """
@@ -993,6 +990,7 @@ def _finalize_prompt_from_frame_spec(
         "authoritative_readable_texts": authoritative_readable_texts,
         "current_prompt": prompt_text,
         "current_negative_prompt": negative_prompt,
+        "references": prompt.get("references") or {},
     }
     system = f"""
 Ты — единственный финальный validator-rewriter image prompt'а.
@@ -1006,14 +1004,21 @@ def _finalize_prompt_from_frame_spec(
 - Сохраняй все обязательные факты из `current_frame_spec.must_show` и `current_frame_spec.prop_states`. Нельзя удалять обязательную сущность только ради более гладкой формулировки.
 - Если в `must_show` есть частично видимый персонаж, последствия ловушки, ноги из люка, свисающая камера, лежащие очки или трость, они должны остаться явно видимыми в `english_prompt`.
 - Переписывай процессные формулировки в статичные состояния, но не удаляй их субъектов, объектов и результатов.
+- Сохраняй конкретные позы, опоры и взаимное расположение из `current_frame_spec` и `current_frame_plan.selected_moment`: «неподвижен» не заменяет «стоит» или «сидит». Для важных контактов и направлений явно сохраняй сторону границы и расположение относительно камеры; референсы не меняют эти состояния.
+- Физическое взаимодействие описывай через видимые точки соприкосновения, взаимный поворот участников и положение частей тела или предметов. Проверь, что выбранные позы действительно позволяют заданный контакт; выражение лица, взгляд и удобный портретный ракурс не должны подменять действие другим контактом.
+- Если предмет закрывает, заполняет или перекрывает другой объект, явно опиши занимаемый им участок и результат перекрытия. Не заменяй функциональное состояние простым соседством или размещением на опоре; композиция должна показывать именно заданную степень закрытия.
 - Не используй meta-фразы вроде "Сфокусировать кадр...", "Главный субъект кадра..." и не пересказывай сюжет.
 - Не добавляй и не убирай сущности кадра. Меняй только формулировку до финальной чистой версии.
+- Номера референсов в тексте должны строго соответствовать `references`: сначала `character_paths` в указанном порядке, затем `location_path`. Исправь противоречащие этому номера и списки в текущем промпте.
 - Для ensemble-сцены не схлопывай cast до одного наблюдателя и фона.
 - Readable texts разрешены только как exact строки из `authoritative_readable_texts` и `current_frame_spec.visible_readable_texts`, только внутри `^...^`.
 - Readable texts из `current_frame_spec.hidden_readable_texts` не делай видимыми и не замещай переводами.
 - `negative_prompt` должен оставаться кратким, визуальным и не должен запрещать ни один обязательный факт из `must_show`, `prop_states` и `visible_readable_texts`.
 - Если в кадре есть разрешённые readable texts, запрещай только лишние/неавторизованные надписи, но не сам факт readable text.
-- Не удаляй признак носителя (фактура, мазок, зерно) и параметры оптики: без них кадр теряет стиль.
+- Сохраняй параметры оптики, света, позу и расположение предметов. Художественный стиль добавит код: не генерируй и не выбирай его.
+- Исторический облик уже задан референсами. Не повторяй в image prompt и negative_prompt датировки исторической эпохи, требования её соблюдения и перечни запрещённых эпохой предметов; сохраняй погоду, сезон, состояния текущего кадра и технические параметры.
+- Удали из positive и negative prompt общие сюжетные запреты, производственные метаданные, палитры других локаций и перечисления будущих событий.
+- Не копируй `must_not_show` и `excluded_sequence_parts` целиком в negative_prompt. Оставляй дефекты изображения, несовместимые состояния объектов текущего кадра и явно заданное отсутствие предметов, существенное для этого момента; имена, локации и реквизит других моментов удали.
 - Удали случайные narrative- и prose-хвосты. Оставь один чистый still-frame prompt.
 """
     repaired = parse_llm_json(
@@ -1079,10 +1084,13 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
     with open(f"{base}/20_story/story.json", "r", encoding="utf-8") as f:
         story = json.load(f)
 
+    from .style_keeper import ensure_image_style_catalog
+    image_style_catalog = ensure_image_style_catalog(base, style_images)
+
     expected_names = {f"page_{idx:02d}_prompt.json" for idx in range(1, expected_count + 1)}
     inputs_fingerprint = _prompt_inputs_fingerprint(
         beats=beats, story=story, characters=characters, locations=locations,
-        style_images=style_images, negative_list=negative_list, language=language,
+        style_images={**style_images, "image_style_catalog": {k: v for k, v in image_style_catalog.items() if k != "frame_bindings"}}, negative_list=negative_list, language=language,
     )
     if _prompt_cache_is_current(prompts_dir, expected_names, inputs_fingerprint):
         logger.info("✏️ Промпты текущих страниц совпадают с входами, пропускаем генерацию")
@@ -1094,7 +1102,6 @@ def prompt_engineer_tool(session_id: str, project_id: str, language: str = 'en')
     scene_packets = _annotate_scene_packets(
         _build_scene_packets(beats, story_pages),
         characters,
-        authoritative_readable_texts,
     )
     frame_specs = _select_frame_specs(
         story_title=(story.get("title") or "").strip(),
@@ -1123,7 +1130,7 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
   "_frame_plan": {"selected_moment": "...", "primary_subject": "...", "excluded_sequence_parts": ["..."]},
   "english_prompt": "...", "negative_prompt": "...",
   "references": {"character_paths": ["..."], "location_path": "..."},
-  "technical": {"size": "1920x1080", "aspect": "16:9", "guidance": 7.5, "steps": 30, "sampler": "DPM++ 2M Karras", "seed_policy": "random"}
+  "technical": {"size": "1920x1088", "aspect": "30:17", "guidance": 7.5, "steps": 30, "sampler": "DPM++ 2M Karras", "seed_policy": "random"}
 }]}
 ```
 Генерируй ровно столько промптов, сколько `scene_packets`.
@@ -1136,8 +1143,8 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
 - Не переопределяй `must_show`, `must_not_show`, `prop_states`, `visible_readable_texts`, `hidden_readable_texts` из `frame_specs[i]`.
 
 **Шаг 2 -- ENGLISH_PROMPT (единая команда редактирования):**
-- Шаблон: Действие + Объект + Позиция + Стиль + Освещение + Перспектива.
-- Блок "Стиль" опирается на STYLE MATERIALITY из Layer C: признак носителя обязателен в каждом промпте, оптику и охват бери по крупности плана. Параметр (85mm f/1.8) точнее прилагательного ("крупный портрет").
+- Шаблон: Действие + Объект + Позиция + Освещение + Перспектива.
+- Не генерируй и не выбирай художественный стиль: код добавит готовый стиль из каталога по сохранённой привязке страницы. Сохраняй технические детали кадра: оптику, ракурс, крупность, температуру и направление света, позу и расположение предметов.
 - Один still frame T=0: только одновременно видимые в кадре элементы. Процессные фразы переводи в наблюдаемое состояние.
 - Один главный субъект (primary_subject); остальные -- supporting elements.
 - Ensemble-режим (`scene_mode == "ensemble"`): главный субъект -- событийное ядро, не observer. `observer_characters` вторичны. `visible_characters` остаются различимыми, не схлопывай ensemble до одного наблюдателя.
@@ -1156,7 +1163,7 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
 - `location_path`: из текущего beat.
 
 **Шаг 4 -- NEGATIVE_PROMPT:**
-- Базовые исключения из `negative_list` + технические запреты (blurry, low quality, distorted, watermark, text).
+- Визуальные дефекты, несовместимые состояния объектов текущего кадра и явно заданное отсутствие предметов, существенное для выбранного момента. Не копируй `must_not_show` и `excluded_sequence_parts` целиком в negative_prompt. Не перечисляй имена, локации, предметы, палитры и события других моментов истории.
 - Сценоспецифичные: лишние персонажи, неподходящие объекты/стиль.
 - Если есть обязательный readable text -- запрещай только extra/unapproved, не сам факт readable text.
 - Пространственные запреты: взгляд на объект -> исключай facing_camera/straight-on; over-shoulder -> исключай front-facing.
@@ -1194,7 +1201,7 @@ Source of truth: `frame_specs[i]` -- уже выбранная freeze-frame сп
 __STYLE_DIRECTIVES__
     """
     system = system.replace("__PROMPT_LANGUAGE_LABEL__", prompt_language_label)
-    system = system.replace("__STYLE_DIRECTIVES__", compose_style_directives(style_images))
+    system = system.replace("__STYLE_DIRECTIVES__", "Художественную технику добавит код из каталога; не переноси в промпт общую библию проекта.")
 
     # Батчинг: разбиваем на группы по BATCH_SIZE страниц для стабильного качества
     BATCH_SIZE = 5
@@ -1213,8 +1220,6 @@ __STYLE_DIRECTIVES__
             "beats": batch_beats,
             "characters": characters,
             "locations": locations,
-            "style_images": style_images,
-            "negative_list": negative_list,
             "references_root": f"{base}/20_bible/references",
             "batch_info": f"pages {batch_start + 1}-{batch_end} of {total}",
         }
@@ -1254,6 +1259,17 @@ __STYLE_DIRECTIVES__
             authoritative_readable_texts,
         )
         prompt.pop("_frame_spec", None)
+        if image_style_catalog:
+            page_key = str(int(scene_packet.get("page_number") or 0))
+            style_id = image_style_catalog.get("page_bindings", {}).get(
+                page_key, image_style_catalog["default_style_id"]
+            )
+            style = image_style_catalog["styles"].get(style_id)
+            if not isinstance(style, dict) or not str(style.get("prompt") or "").strip():
+                raise ValueError(f"Unknown or empty page image style: {style_id!r}")
+            prompt["style_id"] = style_id
+            label = "Стиль изображения" if language == "ru" else "Image style"
+            prompt["english_prompt"] += f"\n\n{label}: {style['prompt'].strip()}"
 
     # Пост-обогащение: добавляем явные роли референсов (background/characters) в english_prompt
     try:

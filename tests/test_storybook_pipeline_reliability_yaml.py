@@ -27,7 +27,7 @@ def _load_raw():
 def test_storybook_declares_enforced_duration_budget():
     data = _load_raw()
     grl = data.get("global_resource_limits", {})
-    assert grl.get("max_duration_seconds") == 30720
+    assert grl.get("max_duration_seconds") >= 86400
     assert grl.get("max_api_calls_per_minute") == 15
 
 

@@ -108,10 +108,12 @@ def montage_assembler_tool(
         errors.append(f"Failed to read shots.json: {exc}")
         shots_data = None
 
-    items = _collect_logical_shots(_extract_items(shots_data))
+    from .video_plan import apply_video_plan
+    source_items = _collect_logical_shots(_extract_items(shots_data))
+    items = apply_video_plan(project_id, source_items)
     clips = _build_clip_assets(items, base_dir)
     audio_artifacts = _read_audio_artifacts(audio_dir)
-    _write_final_subtitles(clips, audio_artifacts, paths["subtitles"])
+    _write_final_subtitles(_build_clip_assets(source_items, base_dir), audio_artifacts, paths["subtitles"])
 
     missing_clips = [clip for clip in clips if not clip["exists"]]
     blocked_media_paths = [clip for clip in clips if not clip.get("path_allowed", True)]
@@ -157,7 +159,13 @@ def montage_assembler_tool(
 
     timeline_clips = [clip for clip in clips if clip.get("path_allowed", True)]
     try:
-        _write_fcpxml(paths["timeline"], str(project_id), timeline_clips, [track for track in sfx_tracks if track["exists"]])
+        source_timeline = base_dir / "97_shots" / "shots_timeline.fcpxml"
+        if source_timeline.is_file():
+            from custom_tools.storybook.screenplay_shots_generator_utils.fcpxml_generator import _generate_fcpxml
+            _generate_fcpxml(str(project_id), _extract_items(shots_data), str(source_timeline))
+            shutil.copyfile(source_timeline, paths["timeline"])
+        else:
+            _write_fcpxml(paths["timeline"], str(project_id), timeline_clips, [track for track in sfx_tracks if track["exists"]])
     except Exception as exc:
         errors.append(f"Final Cut XML export failed: {exc}")
 
@@ -650,6 +658,10 @@ def _render_final_video(
     warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     if base_dir is not None:
+        timeline_path = base_dir / "97_shots" / "shots_timeline.fcpxml"
+        if timeline_path.is_file():
+            from custom_tools.storybook.timeline_media import render_fcpxml
+            return render_fcpxml(timeline_path, output_path, ffmpeg_bin=ffmpeg_bin)
         audio_dir = base_dir / "98_audio"
         plan_path = audio_dir / _MUSIC_PLAN_FILENAME
         manifest_path = audio_dir / _MUSIC_MANIFEST_FILENAME
@@ -1511,6 +1523,9 @@ def _resolve_project_media_path(raw_path: str, project_dir: Path) -> tuple[Path,
     primary = (project_dir / candidate).resolve()
     if primary.exists():
         return primary, _is_relative_to(primary, project_dir)
+    repository_path = candidate.resolve()
+    if repository_path.exists() and _is_relative_to(repository_path, project_dir):
+        return repository_path, True
     fallback = (storybook_projects_root() / candidate).resolve()
     if fallback.exists() and _is_relative_to(fallback, project_dir):
         return fallback, True

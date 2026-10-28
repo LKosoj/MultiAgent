@@ -187,7 +187,7 @@ def story_writer_tool(
     )
     age_text = str(age).lower().strip()
     adult_audience = (
-        "18+" in age_text or "adult" in age_text
+        "18+" in age_text or "16+" in age_text or "adult" in age_text
         or age_text in {"взрослые", "для взрослых"}
     )
     if adult_audience:
@@ -197,6 +197,7 @@ def story_writer_tool(
     system = "\n".join(sys_parts)
 
     payload = {
+        "brief": brief,
         "language": lang,
         "genre": genre,
         "target_age": age,

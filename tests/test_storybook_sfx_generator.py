@@ -42,6 +42,7 @@ def test_generates_mp3_with_optional_duration_and_reuses_it(project, monkeypatch
     assert len(calls) == 1
     url, options = calls[0]
     assert url == "https://gateway.example/v1/audio/speech"
+    assert options["timeout"] == 1200
     assert options["headers"]["Authorization"] == "Bearer gateway-key"
     body = options["json"]
     assert body["model"] == "llmgateway/small-sfx"

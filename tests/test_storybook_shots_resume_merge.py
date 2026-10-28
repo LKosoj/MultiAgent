@@ -13,6 +13,22 @@ from pathlib import Path
 
 import pytest
 
+
+def test_regional_style_bindings_hash_ignores_resolved_defaults_but_tracks_overrides():
+    catalog = {"default_style_id": "base", "styles": {"base": {"prompt": "Ink"}, "cold": {"prompt": "Cold ink"}},
+               "location_bindings": {"Yard": "cold"}, "frame_bindings": {}}
+    params = dict(screenplay_data={"screenplay": [{"scene_number": 1, "location_canon_name": "Yard",
+                                                  "storyboard": [{"shot_number": 1}]}]},
+                  characters_data=[], locations_data=[], consistency_rules=[], style_images_data={},
+                  seed=42, language="ru", generate_end_shots=True, image_style_catalog=catalog)
+    original = shots_generator._compute_inputs_hash(**params)
+    catalog["frame_bindings"]["1:1:start"] = "cold"
+    assert shots_generator._compute_inputs_hash(**params) == original
+    catalog["reference_images"] = {"cold": "generated_style.png"}
+    assert shots_generator._compute_inputs_hash(**params) == original
+    catalog["frame_bindings"]["1:1:start"] = "base"
+    assert shots_generator._compute_inputs_hash(**params) != original
+
 # --- stubs before importing the module under test -------------------------------
 agent_command_stub = types.ModuleType("agent_command")
 agent_command_stub.model_hard = "test-model-hard"
@@ -336,11 +352,10 @@ def test_input_hash_invalidates_stale_shortcircuit(tmp_path, monkeypatch):
     assert saved["inputs_hash"] != "stale-hash"
 
 
-def test_partial_scope_discards_stale_on_disk_on_hash_mismatch(tmp_path, monkeypatch):
+def test_partial_scope_preserves_outside_payload_without_claiming_freshness(tmp_path, monkeypatch):
     """R3: под requested_partial блок resume/short-circuit пропускается, поэтому
-    inputs_hash on-disk раньше НЕ сверялся. Если on-disk shots.json от ДРУГИХ входов
-    (hash mismatch), его completed_scenes/items нельзя ни засчитывать завершёнными
-    (ложный generation_completed), ни мёржить superset'ом (смешанный фильм)."""
+    inputs_hash on-disk раньше НЕ сверялся. При hash mismatch внешние items сохраняются
+    как данные, но completed_scenes не засчитываются свежими."""
     root = tmp_path / "projects"
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(root))
     pid = "proj"
@@ -352,9 +367,9 @@ def test_partial_scope_discards_stale_on_disk_on_hash_mismatch(tmp_path, monkeyp
         shots_path,
         {
             "items": [
-                {"scene_number": 1, "shot_number": 1, "shot_type": "start"},
+                {"scene_number": 1, "shot_number": 1, "shot_type": "start", "old_sentinel": "outside-1"},
                 {"scene_number": 2, "shot_number": 1, "shot_type": "start"},
-                {"scene_number": 3, "shot_number": 1, "shot_type": "start"},
+                {"scene_number": 3, "shot_number": 1, "shot_type": "start", "old_sentinel": "outside-3"},
             ],
             "seed": 555,
             "generation_completed": True,
@@ -374,9 +389,10 @@ def test_partial_scope_discards_stale_on_disk_on_hash_mismatch(tmp_path, monkeyp
     # Регенерируется только запрошенная сцена 2.
     assert recorder == [2]
     saved = _load(base)
-    # Устаревшие сцены 1/3 НЕ подмёржены superset'ом — в файле только свежая сцена 2.
-    assert _scene_set(saved) == {2}
-    # Ложный маркер завершённости НЕ выставлен: фильм {1,2,3} не покрыт свежими входами.
+    # Внешние данные сохранены, но не объявлены завершёнными для новых входов.
+    assert _scene_set(saved) == {1, 2, 3}
+    assert any(item.get("old_sentinel") == "outside-1" for item in saved["items"])
+    assert any(item.get("old_sentinel") == "outside-3" for item in saved["items"])
     assert saved["generation_completed"] is False
     assert saved["completed_scenes"] == [2]
     assert saved["inputs_hash"] != "stale-hash"
@@ -505,3 +521,25 @@ def test_total_shots_count_reported(tmp_path, monkeypatch, caplog):
         )
     assert len(result["items"]) == 2
     assert any("2 кадров" in rec.message for rec in caplog.records)
+
+
+def test_shot_scope_preserves_other_shots_in_same_scene(tmp_path, monkeypatch):
+    root = tmp_path / 'projects'
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(root))
+    base = _setup_project(root, 'proj', [(3, [1, 2, 3, 4])])
+    _install_fakes(monkeypatch)
+    shots_generator.screenplay_shots_generator_tool('before', 'proj', generate_end_shots=False, language='ru')
+    document = _load(base)
+    protected = document['items'][0]
+    protected['english_prompt'] = 'USER EDIT - KEEP EXACTLY'
+    for name in ['duration_s','duration_requested_s','duration_source']:
+        protected.pop(name, None)
+    _write_json(base / '97_shots/shots.json', document)
+    calls = []
+    _install_fakes(monkeypatch, recorder=calls)
+    shots_generator.screenplay_shots_generator_tool('after', 'proj', generate_end_shots=False,
+                                                    language='ru', force=True, shot_keys=['3-2','3-3','3-4'])
+    saved = _load(base)
+    assert len(calls) == 3
+    assert saved['items'][0] == protected
+    assert {i['shot_number'] for i in saved['items']} == {1,2,3,4}

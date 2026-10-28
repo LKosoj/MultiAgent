@@ -87,9 +87,9 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
     # Базовый промпт
     if entity_type == "character":
         base_prompt = f"Create canonical reference image of character '{entity_name}'. "
-        base_prompt += "Show ONLY this ONE character against neutral background. "
+        base_prompt += "Show ONLY the described entity against neutral background. Respect whether its role describes an individual or a collective group. For a group, show several members together, not a single representative. "
         base_prompt += f"CRITICAL: Character '{entity_name}' must be VISUALLY DISTINCT and UNIQUE from other characters. "
-        base_prompt += "Use reference images ONLY for style consistency (art style, color palette, lighting technique), NOT for character appearance. "
+        base_prompt += "Use reference images ONLY for drawing technique and material texture, NOT for character appearance or surroundings. The historical period and environment context below govern clothing and props; keep the neutral background. "
         nature = get_character_nature(entity_data)
         constraints = _nature_constraints_text(entity_name, nature)
         if constraints:
@@ -137,28 +137,32 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
                 base_prompt += f"\n{field_name}: {value}"
         
         # CHARACTER SHEET: multi-view для лучшего reference matching
-        base_prompt += "\n\nFORMAT INSTRUCTION: Create a CHARACTER SHEET with multiple views of the SAME character:\n"
+        base_prompt += "\n\nFORMAT INSTRUCTION: For an individual, create a CHARACTER SHEET with multiple views of the SAME character:\n"
         base_prompt += "1. Main view: Front-facing 3/4 portrait (head to waist)\n"
         base_prompt += "2. Side view: Profile view showing silhouette and proportions\n"
         base_prompt += "3. Detail view: Face close-up showing eye color, skin texture, unique features\n"
         base_prompt += "Ensure ALL views show the EXACT SAME character with consistent features and style.\n"
+        base_prompt += "For a collective entity, instead create a GROUP SHEET: several members together, their shared silhouette rhythm and group poses. Preserve anonymous or indistinct faces when specified; do not replace the group with one person's portraits or close-ups.\n"
 
         base_prompt += f"\nCRITICAL INSTRUCTION: Create character '{entity_name}' with ALL these SPECIFIC features. Do NOT blend or average features from reference images. Each character MUST be visually unique and easily distinguishable."
 
         # Negative prompt для предотвращения identity drift
-        base_prompt += f"\n\nNEGATIVE (avoid): multiple characters, group shot, blended features from other characters, generic face, inconsistent features between views"
+        base_prompt += f"\n\nNEGATIVE (avoid): unrelated characters, blended features from other entities, inconsistent canonical features between views"
     
     else:  # location
         base_prompt = f"Create canonical reference image of location '{entity_name}'. "
+        if entity_data.get("historical_period"):
+            base_prompt = f"Historical setting: {entity_data['historical_period']}. " + base_prompt
         base_prompt += "Show ONLY this specific location WITHOUT any characters. "
         base_prompt += f"CRITICAL: Location '{entity_name}' must be VISUALLY DISTINCT and UNIQUE from other locations. "
-        base_prompt += "Use reference images ONLY for style consistency (art style, color palette, lighting technique), NOT for location appearance. "
+        base_prompt += "Use reference images ONLY for drawing technique and material texture, NOT for location appearance. Target location description takes priority for historical period, architecture, weather, season, lighting, palette and objects. Do not copy another location's setting. "
+        base_prompt += "Treat the specified historical period as a literal date constraint, not merely a vintage aesthetic: buildings, landmarks and objects, including their architectural details and emblems in the distant background, must be shown as they existed in that period, not in their present-day form. For a background detail whose dating is uncertain, choose a neutral period-compatible detail instead. "
         base_prompt += f"Location '{entity_name}' must have these SPECIFIC and UNIQUE features:\n"
         
         # Динамически добавляем все атрибуты локации (кроме name и reference_image_path)
         # Структурируем атрибуты по важности
         for key, value in entity_data.items():
-            if key in ["name", "reference_image_path", "location_sheet_instruction"]:
+            if key.startswith("_") or key in ["name", "reference_image_path", "location_sheet_instruction"]:
                 continue
                 
             if isinstance(value, list):
@@ -293,7 +297,8 @@ SYSTEM_PROMPT_ANALYZE_MISSING_LOCATIONS = """Ты - аналитик сцена�
 SYSTEM_PROMPT_ANALYZE_MISSING_CHARACTERS = """Ты - аналитик персонажей. Проанализируй сгенерированный сценарий и существующих персонажей.
 
 ЗАДАЧА:
-Найди ВСЕХ персонажей, упомянутых в сценарии, которых НЕТ в списке существующих персонажей.
+Найди ВСЕХ ВИЗУАЛЬНЫХ персонажей, упомянутых в сценарии, которых НЕТ в списке существующих персонажей. Этот анализ нужен для визуальной библии и изображений-референсов.
+Закадровый рассказчик без визуального тела и другие невидимые источники речи не требуют визуального персонажа: не включай их в new_characters.
 Учитывай:
 - Прямые упоминания в массиве "characters"
 - Персонажей в диалогах
@@ -301,7 +306,7 @@ SYSTEM_PROMPT_ANALYZE_MISSING_CHARACTERS = """Ты - аналитик персо
 - Вариации имён (уменьшительные, прозвища, сокращения одного и того же персонажа)
 
 Примеры:
-- Голосовые персонажи в диалоге (например "ГОЛОС СИСТЕМЫ") = новый персонаж, если его нет в библии
+- Голос без видимого тела (например "ГОЛОС СИСТЕМЫ") = не новый визуальный персонаж
 - Безымянные роли в action (например "охранник", "продавец") = новый персонаж
 - Персонаж, уже присутствующий в библии под любой вариацией имени = существующий персонаж
 

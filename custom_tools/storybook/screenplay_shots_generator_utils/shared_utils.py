@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 _locations_file_lock = threading.Lock()
 
 _shot_frame_spec_lock = threading.Lock()
+# Increment when extraction rules change so persisted phase states are rebuilt.
+_SHOT_FRAME_SPEC_VERSION = 7
 _SHOT_FRAME_SPEC_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -233,10 +235,12 @@ def _deep_merge_shot_frame_spec_patch(base: Dict[str, Any], patch: Dict[str, Any
                 base[key] = copy.deepcopy(pv)
             continue
         bv = base[key]
+        if key == "visible_characters" and isinstance(bv, list):
+            continue
         if isinstance(pv, dict) and isinstance(bv, dict):
             _deep_merge_shot_frame_spec_patch(bv, pv)
         elif isinstance(pv, list) and isinstance(bv, list):
-            if _patch_value_is_meaningful(pv):
+            if not bv and _patch_value_is_meaningful(pv):
                 base[key] = list(pv)
         elif isinstance(pv, str) and isinstance(bv, str):
             if (not bv.strip()) and pv.strip():
@@ -247,17 +251,18 @@ def _deep_merge_shot_frame_spec_patch(base: Dict[str, Any], patch: Dict[str, Any
 
 _SHOT_FRAME_SPEC_COMPLETE_SYSTEM = """Ты дополняешь нормализованный shot_frame_spec (после парсинга JSON извлечения).
 
-Ты заменяешь бывшую эвристическую логику: заполнение пустых полей, согласование START/END и transition.
+Ты заполняешь пустые поля в состояниях START/END и в transition.
 
 Правила:
+- Заполняй только пустые поля. Существующие списки и факты сохраняй; не переписывай заданный результат END ради общего ограничения. Условия конкретной фазы приоритетнее общих значений по умолчанию; противоречия с исходным сценарием исправляет отдельный шаг QA, который видит этот сценарий.
 - Не придумывай новые объекты, персонажей, реквизит и события вне уже переданного spec.
 - Если scene_mode = object_focus или environment и лицо не должно читаться — не заполняй facial_expression/gaze пустыми шаблонами; оставь пусто или сохрани «не применимо», если так во входе.
-- Если transition_spec описывает смену опоры/физики между START и END — при необходимости уточни start_state_spec.world_physics так, чтобы START не противоречил END и transition (как раньше делала гармонизация).
+- Если transition_spec описывает смену опоры/физики между START и END — заполни недостающие поля start_state_spec.world_physics согласно уже заданным состояниям и переходу.
 - Заполни пустые pose_signature / facial_expression / gaze_direction только там, где это следует из must_show, world_physics и phase (start/end).
 - Если affect_delta пуст — заполни только если логически следует из уже заданных выражений/взглядов/физики между START и END; иначе оставь [].
 - При необходимости добавь character_pose_signatures для primary_subject, если заполняешь pose_signature.
 
-Верни СТРОГО JSON — объект PATCH: только ветки и поля, которые нужно установить или заменить.
+Верни СТРОГО JSON — объект PATCH: только пустые ветки и поля, которые нужно дополнить.
 Ключи верхнего уровня допускаются: start_state_spec, end_state_spec, transition_spec, pose_signature, facial_expression, gaze_direction.
 Внутри — только непустые поля для записи. Не дублируй весь spec."""
 
@@ -379,6 +384,9 @@ def _build_phase_shot_character_visual_profiles(
     for profile in shot_character_visual_profiles:
         item = dict(profile or {})
         name = str(item.get("name") or "").strip()
+        if isinstance(state.get("visible_characters"), list) and name.casefold() not in {
+                str(actor).casefold() for actor in state["visible_characters"]}:
+            continue
         phase_pose = pose_map.get(name.casefold(), "")
         if not phase_pose and primary_subject and name.casefold() == primary_subject.casefold():
             phase_pose = fallback_pose
@@ -397,17 +405,25 @@ def _build_shot_frame_spec_cache_key(
     scene_characters: List[str],
     location_time: str,
     location_canon_name: str,
+    scene_action: str = "",
+    scene_continuity_facts: Optional[Dict[str, Any]] = None,
 ) -> str:
+    cache_key_payload = {
+        "spec_version": _SHOT_FRAME_SPEC_VERSION,
+        "scene_number": int(scene_number),
+        "shot_number": int(shot_number),
+        "shot_description": str(shot_description or "").strip(),
+        "camera_plan": camera_plan or "",
+        "scene_characters": scene_characters or [],
+        "location_time": location_time or "",
+        "location_canon_name": location_canon_name or "",
+    }
+    if str(scene_action or "").strip():
+        cache_key_payload["scene_action"] = str(scene_action).strip()
+    if isinstance(scene_continuity_facts, dict) and scene_continuity_facts:
+        cache_key_payload["scene_continuity_facts"] = scene_continuity_facts
     cache_key_payload = json.dumps(
-        {
-            "scene_number": int(scene_number),
-            "shot_number": int(shot_number),
-            "shot_description": str(shot_description or "").strip(),
-            "camera_plan": camera_plan or "",
-            "scene_characters": scene_characters or [],
-            "location_time": location_time or "",
-            "location_canon_name": location_canon_name or "",
-        },
+        cache_key_payload,
         ensure_ascii=False,
         sort_keys=True,
     )
@@ -475,7 +491,6 @@ def _load_shot_frame_spec_from_existing_shots(
     project_id: str,
     scene_number: int,
     shot_number: int,
-    camera_plan: str,
     cache_key: str,
     scene_characters: List[str],
 ) -> Dict[str, Any]:
@@ -501,18 +516,15 @@ def _load_shot_frame_spec_from_existing_shots(
         if not isinstance(raw_spec, dict) or not raw_spec:
             continue
         stored_key = str(item.get("_shot_frame_spec_cache_key") or "").strip()
-        if stored_key and stored_key != cache_key:
-            continue
-        if not stored_key and str(item.get("camera_plan") or "").strip() != str(camera_plan or "").strip():
+        if stored_key != cache_key:
             continue
         spec = _normalize_shot_frame_spec(raw_spec, scene_characters)
         if not spec:
             continue
         logger.info(
-            "♻️ shot_frame_spec: reused from existing shots.json scene=%s shot=%s%s",
+            "♻️ shot_frame_spec: reused from existing shots.json scene=%s shot=%s",
             scene_number,
             shot_number,
-            " (legacy match)" if not stored_key else "",
         )
         return spec
     return {}
@@ -625,7 +637,8 @@ def _normalize_shot_frame_spec(
             "character_pose_signatures": _normalize_character_pose_signatures(raw_state.get("character_pose_signatures")),
             "facial_expression": str(raw_state.get("facial_expression") or fallback.get("facial_expression") or "").strip(),
             "gaze_direction": str(raw_state.get("gaze_direction") or fallback.get("gaze_direction") or "").strip(),
-            "visible_characters": _normalize_characters(raw_state.get("visible_characters")) or list(fallback.get("visible_characters", [])),
+            "visible_characters": (_normalize_characters(raw_state["visible_characters"])
+                                   if "visible_characters" in raw_state else list(fallback.get("visible_characters", []))),
             "must_show": _normalize_list(raw_state.get("must_show")) or list(fallback.get("must_show", [])),
             "must_not_show": _normalize_list(raw_state.get("must_not_show")) or list(fallback.get("must_not_show", [])),
             "visible_readable_texts": _normalize_list(raw_state.get("visible_readable_texts")) or list(fallback.get("visible_readable_texts", [])),
@@ -758,6 +771,8 @@ def _extract_shot_frame_spec_llm(
         scene_characters=scene_characters or [],
         location_time=location_time or "",
         location_canon_name=location_canon_name or "",
+        scene_action=scene_action or "",
+        scene_continuity_facts=scene_continuity_facts,
     )
     with _shot_frame_spec_lock:
         cached = _SHOT_FRAME_SPEC_CACHE.get(cache_key)
@@ -775,7 +790,6 @@ def _extract_shot_frame_spec_llm(
         project_id=project_id,
         scene_number=int(scene_number),
         shot_number=int(shot_number),
-        camera_plan=camera_plan or "",
         cache_key=cache_key,
         scene_characters=scene_characters,
     )
@@ -793,6 +807,8 @@ def _extract_shot_frame_spec_llm(
     system_prompt = """
 Ты — shot frame spec planner для storyboard-шотов.
 Выбери один конкретный внутренний frame spec для ОДНОГО шота, без narrative summary и без выдумывания новых объектов.
+Единственный источник событий и видимого состава текущего шота — shot_description. scene_action содержит только предшествующие шоты и задаёт уже достигнутые состояния; текущие события берутся только из shot_description. scene_characters задаёт допустимые канонические имена, а не обязательное присутствие всех героев. Не добавляй вход, выход, жест или реакцию, которых нет в shot_description, даже если они есть в общем действии сцены.
+Для каждой фазы разделяй положение камеры и персонажей по сторонам преград. В world_physics фиксируй видимую область проёма, сохранённые части поверхности и естественное перекрытие тела; не увеличивай проём ради показа всех перечисленных деталей. При смене видимости персонажей различай физический выход/вход и раскрытие уже присутствующего героя ракурсом или перекрытием. Вход задавай только если его требует shot_description; сохраняй положение и идентичность остальных героев.
 
 Верни СТРОГО JSON-объект такого вида:
 {
@@ -803,8 +819,8 @@ def _extract_shot_frame_spec_llm(
   "facial_expression": "короткое описание видимого выражения лица/микроэмоции; обязательно непусто, если лицо субъекта читается в кадре",
   "gaze_direction": "куда направлен взгляд субъекта в этом кадре; обязательно непусто, если глаза читаются; не 'в камеру' без явного основания",
   "visible_characters": ["точные канонические имена персонажей, реально видимых в кадре"],
-  "must_show": ["список обязательных одновременно видимых фактов этого шота"],
-  "must_not_show": ["что нельзя показывать, потому что это относится к другим моментам/шотам"],
+  "must_show": ["общие факты шота; точный видимый состав каждой фазы задаётся в start_state_spec и end_state_spec"],
+  "must_not_show": ["что запрещено во всех фазах этого шота; не включай сюда его собственные поздние действия и объекты"],
   "visible_readable_texts": ["только тексты, явно видимые именно в этом шоте"],
   "hidden_readable_texts": ["тексты, которые существуют в сцене/каноне, но не должны читаться в этом шоте"],
   "world_physics": {
@@ -868,20 +884,24 @@ def _extract_shot_frame_spec_llm(
     "environment_delta": ["что меняется в окружении между START и END"],
     "physics_delta": ["что меняется в опоре/контактах/целостности среды между START и END"],
     "tempo": "темп перехода",
-    "must_not_introduce": ["что video_prompt не должен привносить сверх START/END"]
+    "must_not_introduce": ["что отсутствует во всём shot_description и не должно добавляться в переход; собственные поздние действия шота разрешены"]
   }
 }
 
 Правила:
 - Ground truth = storyboard shot_description этого шота.
+- Верхний уровень задаёт общие значения, а состояния START/END — точный состав своих фаз. Поздний объект собственного шота может быть запрещён в START, но не в общих must_not_show, END или transition_spec.
 - camera_plan = framing anchor, а не повод подменить содержание.
 - location_time/location_canon_name = только контекст локации и не повод тащить в кадр новые объекты.
 - Не тащи в spec конкретные дисплеи, экраны, подиумы, микрофоны, вывески, реквизит или персонажей, если их нет в shot_description этого шота.
 - Не превращай соседние события сцены в содержимое текущего шота.
+- Охватывай собственный шот целиком: START — его начальное состояние, END — итог после последнего заданного действия, transition_spec — действия между ними. Не принимай позднее действие этого же shot_description за событие соседнего шота и не помещай его в must_not_introduce.
+- Персонаж или предмет, появляющийся позже внутри собственного шота, может отсутствовать в START, но не должен из-за этого запрещаться в END и переходе. Если герой явно выходит из кадра или источник переводит внимание на другой предмет, отрази эту смену в конечной фазе, не удерживай начальный субъект вопреки источнику.
 - Если шот про одного персонажа или один объект, не делай ensemble только потому, что в сцене есть ещё персонажи.
 - visible_characters можно брать только из scene_characters и только точными каноническими именами.
 - must_show должен перечислять только то, что можно одновременно увидеть в одном конкретном кадре.
 - must_not_show используй для явных запретов на чужие события/чужие объекты/чужие зоны сцены, которые часто галлюцинируются.
+- A partial change does not imply complete absence: do not expand a changed part into disappearance or prohibition of the whole object or its unchanged parts unless the source explicitly requires that result.
 - readable texts можно включать только если сам shot_description требует или явно показывает их.
 - `visible_readable_texts` — только тексты, физически существующие в мире кадра как письменный элемент:
   вывеска, табличка, шильдик, дорожный знак, экранный UI, надпись на форме, наклейка, граффити, обложка, табло.
@@ -892,6 +912,7 @@ def _extract_shot_frame_spec_llm(
   Такие вещи относятся к аудио/артикуляции/внутреннему монологу и должны быть в `hidden_readable_texts` либо отсутствовать.
 - Если в шоте важны опора, целостность поверхности, контакт, удержание, зависание, падение, разрыв среды, перекрытие или удар,
   ОБЯЗАТЕЛЬНО опиши это в `world_physics` как состояние мира, а не как литературный пересказ процесса.
+- Проверяй порядок глубины относительно камеры: элемент перегородки не может перекрывать персонажа, находящегося перед этой перегородкой со стороны камеры. Разделение фигур стойкой в композиции не означает перекрытия их тел; не добавляй такое перекрытие вопреки заданной стороне границы.
 - Если лицо/взгляд читаются в кадре, опиши `facial_expression` и `gaze_direction` как часть видимого состояния кадра, а не как абстрактный эмоциональный комментарий.
 - Если для узнаваемости момента важны жест, положение корпуса, поднятая/вытянутая рука, направление реквизита, открытый рот на полуслове или другая выразительная поза, заполни `pose_signature` и удерживай её в START/END как часть видимого состояния кадра.
 - Если в кадре несколько персонажей и их позы одновременно важны для читаемости шота, заполни `character_pose_signatures` внутри `start_state_spec` / `end_state_spec` по точным каноническим именам.
@@ -918,7 +939,9 @@ def _extract_shot_frame_spec_llm(
 - При `early_motion`/`mid_action` `start_state_spec.world_physics`, `pose_signature` и `must_show` обязаны явно отражать соответствующую фазу (например — оторванная от опоры стопа, корпус уже в наклоне, рука уже на полпути), а не противоречить ей описанием полного покоя.
 - `end_state_spec` = финальный стоп-кадр этого же шота (T=final).
 - `transition_spec` = только дельта между START и END; без новых объектов и без пересказа всей сцены.
-- Если в шоте есть любое относительное движение субъекта и/или камеры (ходьба, бег, жест, наклон, поворот, толчок камеры, панорама, наезд/отъезд, трекинг, кран и т.д.), `transition_spec.environment_delta` ОБЯЗАН описывать, как меняется **видимое окружение** между START и END: параллакс фона, сдвиг деталей среды, или в крупном плане — сдвиг боке/световых акцентов/отражений. Это та же локация и материалы, не новая комната и не смена места без оснований в shot_description.
+- Применяй пространственные условия и изменения из scene_continuity_facts к соответствующему эпизоду и шоту. Камера может находиться по другую сторону границы, но это не переносит туда персонажа; при смене ракурса меняется проекция, а не его сторона границы или место на пути относительно остальных участников.
+- При монтажной смене реального и воображаемого эпизодов START уже показывает выбранный мир и его одежду/реквизит; не сохраняй обломки предыдущей среды без явно заданного совмещения. Фазу ходьбы или бега описывай видимой формой из текущего ракурса: широкий шаг, ноги под корпусом, отталкивание, полёт или приземление; уточняй ближнюю/дальнюю ногу и её положение относительно корпуса. Перестановка названий левой и правой ноги сама по себе не меняет силуэт. Цикл может завершаться той же фазой; не меняй позу или реквизит только ради различия START/END. Продвижение и проекция фона должны соответствовать исходному действию и движению камеры.
+- `transition_spec.environment_delta` выводи из движения камеры и среды. Следящая камера удерживает движущегося героя в кадре, а фон заметно смещается навстречу ходу камеры, с параллаксом по глубине. При неподвижной камере фон сохраняет экранные координаты, а перемещающийся герой меняет положение относительно него. Локальный жест, наклон или мимика сами по себе не требуют сдвига фона. Геометрия мира сохраняется; экранное положение, масштаб и видимость его деталей следуют ракурсу, пути камеры и пройденному расстоянию.
 - Никаких объяснений, только JSON.
 """
 
@@ -930,6 +953,8 @@ def _extract_shot_frame_spec_llm(
         "scene_characters": scene_characters or [],
         "location_time": location_time or "",
         "location_canon_name": location_canon_name or "",
+        "scene_action": scene_action or "",
+        "scene_continuity_facts": scene_continuity_facts or {},
     }
 
     try:
@@ -1472,6 +1497,13 @@ def _create_missing_location_llm(
             logger.error(f"❌ Ошибка создания новой локации: {e}")
             return None
 
+def _previous_shot_actions(storyboard: List[Dict[str, Any]], shot_number: int) -> str:
+    """Keep achieved states from earlier shots without leaking future events."""
+    return '\n'.join(
+        f"Shot {sb['shot_number']}: {sb.get('description', '')}"
+        for sb in (storyboard or []) if int(sb.get('shot_number', 0)) < int(shot_number))
+
+
 def _build_extended_context(
     project_id: str,
     scene: Dict[str, Any],
@@ -1504,6 +1536,9 @@ def _build_extended_context(
         shot_loc_canon = ""
     effective_loc_canon = shot_loc_canon or scene_loc_canon
     
+    # Earlier shots preserve achieved states; future scene actions cannot enter this shot.
+    scene_action = _previous_shot_actions(storyboard, shot_number)
+
     # One source of truth for the whole one-shot cycle: if continuity facts were already extracted
     # at scene level, reuse them for generation and downstream QA instead of recomputing later.
     scene_continuity_facts = dict(scene_continuity_facts or {})
@@ -1555,6 +1590,8 @@ def _build_extended_context(
             scene_characters=scene_characters or [],
             location_time=scene.get("location_time", "") or "",
             location_canon_name=effective_loc_canon,
+            scene_action=scene_action or "",
+            scene_continuity_facts=scene_continuity_facts,
         ),
         "available_characters": [
             f"{char.get('name', '')} ({char.get('role', 'character')}; {', '.join(char.get('immutable_attributes', {}).get('unique_features', [])[:2])})"
@@ -1600,7 +1637,7 @@ def _build_extended_context(
         if not isinstance(si, dict) or not si:
             return ""
         chunks: List[str] = []
-        for k in ["art_style", "color_palette", "composition_rules", "lighting", "texture", "material_signature", "detail_density", "model"]:
+        for k in ["art_style", "color_palette", "composition_rules", "lighting", "texture", "material_signature", "detail_density"]:
             v = si.get(k)
             if v:
                 chunks.append(str(v))

@@ -72,3 +72,22 @@ def test_items_builder_ignores_retained_prompt_after_page_count_shrinks(tmp_path
 
     assert [item["page_number"] for item in items["items"]] == [1, 2]
     assert (root / "40_prompts" / "page_03_prompt.json").exists()
+
+
+def test_final_prompt_validator_receives_actual_reference_order(monkeypatch):
+    captured = {}
+
+    def fake_api(**kwargs):
+        captured.update(json.loads(kwargs['prompt']))
+        return json.dumps({'english_prompt': 'Исправленный кадр', 'negative_prompt': 'Без текста'})
+
+    monkeypatch.setattr(pe, 'call_openai_api', fake_api)
+    prompt = {
+        'english_prompt': 'Платонов (референс 1), мальчик (референс 2)',
+        'negative_prompt': 'Без текста',
+        '_frame_plan': {}, '_frame_spec': {},
+        'references': {'character_paths': ['/boy.png', '/platonov.png'], 'location_path': '/yard.png'},
+    }
+    pe._finalize_prompt_from_frame_spec(prompt, {}, 'ru', [])
+
+    assert captured['references'] == prompt['references']

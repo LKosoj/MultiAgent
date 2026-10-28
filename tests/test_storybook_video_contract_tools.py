@@ -17,6 +17,7 @@ def _write_shots(root: Path, project_id: str, items):
 
 
 def _enable_video_env(monkeypatch):
+    monkeypatch.setattr(video_contract, "_active_video_tool_name", lambda: "video_generator_aitunnel_tool")
     monkeypatch.setenv("AITUNNEL_API_KEY", "sk-test")
     monkeypatch.setenv("AITUNNEL_VIDEO_MODEL", "video-model")
     monkeypatch.setattr(video_contract.shutil, "which", lambda name: f"/usr/bin/{name}")
@@ -113,6 +114,8 @@ def test_delivery_promise_blocks_enabled_run_without_capabilities_or_clips(tmp_p
     for name in [
         "AITUNNEL_API_KEY",
         "AITUNNEL_VIDEO_MODEL",
+        "ROUTERAI_API_KEY",
+        "ROUTERAI_VIDEO_MODEL",
         "MINIMAX_API_KEY",
         "KLING_API_KEY",
         "KLING_API_SECRET_KEY",

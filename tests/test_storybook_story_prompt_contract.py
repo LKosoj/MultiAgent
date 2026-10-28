@@ -67,7 +67,7 @@ def test_writer_keeps_adult_brief_explicit_without_child_only_ban(tmp_path, monk
 
 @pytest.mark.parametrize(
     ("target_age", "allows_adult_content"),
-    [("взрослые", True), ("для взрослых", True), ("6-8", False)],
+    [("16+", True), ("взрослые", True), ("для взрослых", True), ("6-8", False)],
 )
 def test_writer_applies_child_ban_only_to_non_adult_russian_audiences(
     tmp_path, monkeypatch, target_age, allows_adult_content,

@@ -14,7 +14,6 @@ from .shared_utils import (
     _create_missing_location_llm,
     _validate_negative_prompt_consistency,
     black_screen_storyboard_shot,
-    merge_style_do_not_into_negative,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,6 +165,7 @@ def _infer_accessory_visibility_via_llm(
     spec = shot_frame_spec if isinstance(shot_frame_spec, dict) else {}
     payload = {
         "shot_type": shot_type,
+        "prop_continuity": llm_result.get("prop_continuity") or {},
         "camera_position": str(llm_result.get("camera_position") or llm_result.get("final_camera_position") or "").strip(),
         "character_orientation": str(llm_result.get("character_orientation") or llm_result.get("final_character_orientation") or "").strip(),
         "point_of_view": str(llm_result.get("point_of_view") or llm_result.get("final_point_of_view") or "").strip(),
@@ -174,7 +174,6 @@ def _infer_accessory_visibility_via_llm(
             "primary_subject": spec.get("primary_subject"),
             "visible_characters": spec.get("visible_characters"),
             "must_show": spec.get("must_show"),
-            "must_not_show": spec.get("must_not_show"),
             "world_physics": spec.get("world_physics"),
         },
         "character_visual_items": visual_items,
@@ -183,7 +182,9 @@ def _infer_accessory_visibility_via_llm(
         "Ты валидатор видимости аксессуаров/элементов одежды в одном storyboard-кадре.\n"
         "Определи, какие предметы обязаны быть видимы, а какие должны быть скрыты/окклюдированы\n"
         "из-за ракурса/ориентации/кадрирования/физики (например, chest-бейдж не виден при back view).\n"
-        "Не придумывай новые предметы.\n"
+        "Все три массива должны касаться ТОЛЬКО одежды и аксессуаров из character_visual_items.\n"
+        "Учитывай снятые/перемещённые предметы из prop_continuity. Не копируй общие запреты сцены, реквизит, локации и события других кадров.\n"
+        "Если дополнительных ограничений видимости нет, верни пустые массивы. Не придумывай новые предметы.\n"
         "Верни только JSON:\n"
         "{\"must_show_additions\": [\"...\"], \"must_not_show_additions\": [\"...\"], \"negative_prompt_tokens\": [\"...\"]}"
     )
@@ -233,7 +234,7 @@ LAYER A — ROLE + CONTRACT
 
 [P0] STORYBOARD LOCKS:
 - Приоритет: shot_frame_spec > shot_description > scene_action (исключение: устойчивые факты сцены).
-- Анализируй ТОЛЬКО текущий кадр. T=0 = статичное состояние БЕЗ намерений и процессов.
+- Анализируй ТОЛЬКО текущий кадр. T=0 — один видимый момент согласно start_state_spec.t0_mode: frozen до события, early_motion в начале движения, mid_action внутри действия.
 - scene_continuity_facts (гардероб/предметы/элементы): используй если не противоречат shot_description и уместны по крупности (Wide/Medium -- включай; Close-up -- только если попадает в кадр). НЕ добавляй токсичность/мат/искажение имен.
 
 ═══════════════════════════════════════════════════════════════
@@ -258,17 +259,18 @@ STEP 3 -- SHOT SIZE / CAMERA:
 
 STEP 4 -- SPATIAL COMPOSITION:
 4a. camera_position: behind/in_front/side/above/below (относительно главного персонажа).
+Смена позы, взгляда или главного персонажа сама по себе не означает перенос камеры. camera_position оценивай относительно текущего персонажа, а физическую неизменность точки съёмки — по camera_plan и предыдущему END. Не переставляй окружение или персонажей ради совпадения относительных категорий.
 4b. character_orientation: facing_camera/facing_away/profile/three_quarter.
 4c. point_of_view: objective/subjective/POV_[имя].
 4d. spatial_composition: position (left/center/right) + depth (fore/mid/back) + subject_dominance (low/medium/high) + background_dominance. Формулируй КАК КОМАНДЫ РЕДАКТИРОВАНИЯ.
 Формат: "subject center midground with medium subject dominance; industrial machinery background with low dominance; eye-level framing from front; objective view"
 4e. FACE/GAZE: если лицо читается -- фиксируй выражение и взгляд (выводи из shot_description/camera_plan/контекста, НЕ default к "neutral"/"blank"/"looking at camera"). При внезапном физическом сдвиге -- раннее напряжение, НЕ пустота.
-4f. facing_camera допустим ТОЛЬКО если shot_description/camera_plan явно требуют прямого взгляда в объектив. Иначе -> three_quarter или profile.
+4f. character_orientation описывает направление корпуса относительно камеры, а gaze_direction — взгляд. facing_camera не означает взгляд в объектив: персонаж может двигаться лицом к камере и смотреть мимо неё на цель. Выводи ориентацию из явно заданного положения камеры, корпуса и пути, не меняя camera_plan ради направления взгляда.
 
 STEP 5 -- INITIAL STATE SUMMARY (T=0):
-5a. Действие/изменение в shot_description -> T=0 = ИСХОДНАЯ ПОЗИЦИЯ (замах, группировка, старт), НЕ результат.
-5b. ЗАПРЕТ КОНТАКТА: субъект и объект НЕ касаются если действие = "схватить/ударить".
-5c. Трансформация окружения (пол проваливается, мост рушится, дверь открывается) -> T=0 = состояние ДО трансформации. Поверхность ЦЕЛОСТНАЯ и СТАБИЛЬНАЯ. ЗАПРЕЩЕНО: "на пороге", "первые признаки", "начинающиеся трещины", "imminent", "threshold of". Если цела — просто ЦЕЛА.
+5a. T=0 берётся из start_state_spec: frozen до события, early_motion в начале изменения, mid_action внутри него; не подменяй его END-результатом.
+5b. Контакт или его отсутствие задаются start_state_spec и исходником; для frozen до целевого касания не показывай уже завершённый захват/удар.
+5c. При трансформации окружения сохраняй заданные начальные целостность и опору. Не восстанавливай повреждённую поверхность и не добавляй разрушение вопреки start_state_spec; frozen сам по себе не означает безопасную устойчивую среду.
 5d. Резкий перевод камеры (snap zoom/whip pan) -> T=0 = начало шота, НЕ финальный кадр.
 5e. Если читается поза/жест -- фиксируй видимую геометрию тела, НЕ generic standing/resting.
 
@@ -304,16 +306,17 @@ T=0 TRANSLATION PATTERNS:
   T=0 static templates        | "standing motionless" / "static pose with" / "frozen in mid-action" / "in pre-action posture"
 
 LINGUISTIC MAPPING (Russian -> camera):
-  "смотрит в окно/на объект"  | camera_position: side/behind; orientation: facing_away/profile
+  "смотрит в окно/на объект"  | направление взгляда к объекту; положение камеры определяется camera_plan
   "через плечо"               | camera_position: behind; orientation: facing_away; объект впереди
-  "лицом к [цели]"            | ориентация к цели; facing_camera ТОЛЬКО если цель = камера/зритель
+  "лицом к [цели]"            | корпус обращён к цели; его видимый ракурс зависит от положения камеры
 
-FORBIDDEN IN T=0 (absolute ban):
+ADDITIONAL RESTRICTIONS ONLY FOR t0_mode=frozen:
   Future intent    : "about to" / "begins to" / "starts to" / "going to" / "will" / "is starting"
   Motion verbs     : "walking" / "running" / "moving" / "approaching" / "advancing" / "retreating"
   Intent phrases   : "preparing to" / "intends to" / "set to"
   Completion verbs : "holding" / "touching" / "hitting" (для целевого действия)
   Completed transforms : результат трансформации окружения, относящийся к более позднему моменту шота
+Для early_motion и mid_action сохраняй видимую геометрию уже идущего действия из start_state_spec, без последовательности событий и без преждевременного END-результата.
 
 CONTEXT FACTORS (P3):
   - location_time -> освещение; scene_mood -> color_palette; scene_pacing -> camera_movement
@@ -331,7 +334,7 @@ JSON OUTPUT FORMAT:
   "point_of_view": "objective/subjective/POV_name",
   "character_actions": "видимая геометрия действий в T=0",
   "environmental_changes": "изменения окружения/освещения",
-  "initial_state_summary": "T=0 состояние (без движения и намерений)",
+  "initial_state_summary": "видимое T=0 состояние согласно start_state_spec.t0_mode, без последовательности событий",
   "location_context": {
     "name": "краткое_имя",
     "key_features": ["unified_element1", "unified_element2", "unified_element3"],
@@ -391,13 +394,11 @@ SHOT FRAME SPEC (авторитетный source of truth):
 
 КРИТИЧНО - АНАЛИЗ ПРОСТРАНСТВЕННЫХ ОТНОШЕНИЙ:
 Обращай ОСОБОЕ ВНИМАНИЕ на ключевые фразы в описании сцены и кадра:
-- "перед ним/ней" → главный персонаж спиной к камере (camera_position: "behind", character_orientation: "facing_away")
-- "за ним/ней" → камера находится впереди персонажа; направление корпуса/взгляда выводи по реальной цели внимания, а не автоматически в объектив
-- "возвышается перед" → персонаж спиной к камере, объект впереди него
-- "лицом к" → определяет направление взгляда персонажа
+- "перед ним/ней", "за ним/ней", "возвышается перед" → положение объектов относительно персонажа, а не камеры; camera_position выводи из camera_plan
+- "лицом к" → определяет направление корпуса к цели; направление взгляда указывай отдельно
 - "стоит напротив" → персонажи лицом друг к другу
 - "поворачивается к" → изменение ориентации
-- "смотрит на" → направление взгляда определяет ориентацию
+- "смотрит на" → направление взгляда; не переопределяет положение камеры или корпуса
 
 УЧИТЫВАЙ КОНТЕКСТ:
 - Время суток для определения освещения
@@ -448,7 +449,7 @@ END-кадр обязан оставаться в границах shot_frame_sp
 **[P0] STORYBOARD LOCKS (camera_plan + shot_description):**
 - camera_plan задает БАЗОВУЮ крупность (START=T=0). END может измениться, если shot_description/camera_plan/video_prompt явно требуют движения.
 - final_shot_size согласуется: shot_description/camera_plan/shot_frame_spec, затем optional video_prompt.
-- PRIMARY SUBJECT LOCK: главный субъект из shot_description. Переключение на другого запрещено.
+- PRIMARY SUBJECT LOCK: главный субъект определяется своей фазой shot_description и shot_frame_spec. Не переключай его произвольно; явную смену внимания или уход героя, заданные внутри этого же шота, сохрани в END.
 
 PRIMARY SOURCE OF TRUTH: END выводится из shot_description + shot_frame_spec. Если video_prompt пустой -- восстанови END как стоп-кадр shot_description, не выдумывай динамику. Если video_prompt есть -- только как вторичная transition-подсказка в пределах shot_frame_spec.
 
@@ -462,7 +463,7 @@ PRIMARY SOURCE OF TRUTH: END выводится из shot_description + shot_fra
 - При явном изменении дистанции или крупности (dolly/zoom/closer/farther/pulls back/tighter/wider) -> ОБЯЗАТЕЛЬНО числовые дельты. Pan/tilt, поза, темп или crane сами по себе допускают delta=0 и ratio=1.0.
 - Камера + персонаж в ОДНОМ направлении -> СЛОЖЕНИЕ; в РАЗНЫХ -> КОМПЕНСАЦИЯ. Пример: "dolly in +30% + steps back -10%" = delta +20%, ratio 1.3/0.9 ~ 1.4.
 - ОГРАНИЧЕНИЯ: delta in [-60,+60] целое, ratio in [0.5,2.0] округленное до 0.1.
-- ИЗМЕНЕНИЕ ПОЗЫ ПРИ СТАТИЧНОЙ КАМЕРЕ (stands up/sits down/kneels): меняет РАКУРС (pitch), НЕ крупность! delta=0, ratio=1.0, фон неизменен.
+- ИЗМЕНЕНИЕ ПОЗЫ ПРИ СТАТИЧНОЙ КАМЕРЕ (stands up/sits down/kneels): меняет положение тела внутри кадра, а не pitch/yaw камеры; delta=0, ratio=1.0, фон неизменен. Следящий наклон камеры допустим только если он явно задан исходником.
   * Камера на месте -> персонаж может быть частично обрезан, изменить final_spatial_composition.
   * Камера следит -> меняется final_camera_pitch_deg и final_camera_angle: "stands up" -> low-angle (pitch<0); "sits down" -> high-angle (pitch>0).
   * Паттерны: "rises from the sofa", "stands up", "gets up", "встает", "поднимается" -> ракурс, НЕ масштаб!
@@ -473,9 +474,9 @@ PRIMARY SOURCE OF TRUTH: END выводится из shot_description + shot_fra
 
 **ШАГ 4 -- FINAL CAMERA/LIGHTING:**
 - Pan/Tilt с углами -> final_camera_yaw_deg/pitch_deg. "handheld/shaky" -> stability=transitional/unstable. "locks off/settles" -> completed=true, stable.
-- Over-shoulder -> camera_position=behind, orientation=facing_away. "смотрит на объект" -> side/behind, facing_away/profile.
-- facing_camera допустим ТОЛЬКО при явном viewer-facing/direct-address. Иначе -- взгляд на источник события / вдоль траектории.
-- Фоновая динамика: ДАЖЕ при delta=0, ratio=1.0 анализируй video_prompt на фоновые процессы (падение, горение, рассеивание и т.д.). spatial_changes_from_start НЕ МОЖЕТ быть пустым при любой динамике в video_prompt.
+- Over-shoulder -> camera_position=behind, orientation=facing_away. "смотрит на объект" задаёт взгляд, а не положение камеры.
+- final_character_orientation описывает корпус относительно камеры независимо от взгляда. facing_camera допустим без обращения к зрителю: взгляд может быть направлен мимо объектива. Согласуй ракурс с camera_plan, направлением корпуса и движения.
+- Фоновая динамика берётся из shot_description и shot_frame_spec. video_prompt может уточнять только подтверждённые ими процессы; при отсутствии заданного изменения spatial_changes_from_start может быть пустым.
 
 **ШАГ 5 -- CONTINUITY SCORE:**
 score = 5 + 2*(location_unchanged) + 2*(characters_unchanged) + 1*(lighting_unchanged) - delta_penalty - 1*(per new_character).
@@ -934,6 +935,160 @@ def _smart_location_match_llm(
         logger.error(f"❌ Ошибка LLM сопоставления локации: {e}")
         return None
 
+def _resolve_location_reference_path(
+    loc_obj: Optional[Dict[str, Any]],
+    location_index_by_name: Dict[str, Dict[str, Any]],
+) -> str:
+    """
+    Возвращает референс локации:
+    1) собственный reference_image_path;
+    2) если пусто — reference_image_path ближайшего parent_location_name.
+    """
+    if not isinstance(loc_obj, dict):
+        return ""
+
+    direct = str(loc_obj.get("reference_image_path") or "").strip()
+    if direct:
+        return direct
+
+    visited = set()
+    parent_name = str(loc_obj.get("parent_location_name") or "").strip()
+    hops = 0
+    while parent_name and hops < 6:
+        key = parent_name.lower()
+        if key in visited:
+            break
+        visited.add(key)
+        parent = location_index_by_name.get(key) or {}
+        parent_ref = str(parent.get("reference_image_path") or "").strip()
+        if parent_ref:
+            return parent_ref
+        parent_name = str(parent.get("parent_location_name") or "").strip()
+        hops += 1
+    return ""
+
+
+def _build_reference_roles_instruction(
+    reference_paths: List[str],
+    shot_characters: List[Dict[str, Any]],
+    shot_locations: List[Dict[str, Any]],
+    location_index_by_name: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> str:
+    if not reference_paths:
+        return ""
+
+    if location_index_by_name is None:
+        location_index_by_name = {
+            str((loc or {}).get("name") or "").strip().lower(): loc
+            for loc in (shot_locations or [])
+            if str((loc or {}).get("name") or "").strip()
+        }
+
+    # Карты путь→имя для быстрого определения роли
+    loc_path_to_name: Dict[str, str] = {}
+    for loc in shot_locations:
+        resolved_ref = _resolve_location_reference_path(loc, location_index_by_name)
+        if resolved_ref and resolved_ref not in loc_path_to_name:
+            loc_path_to_name[resolved_ref] = (loc.get("name") or "").strip()
+    # Карта путь→объект локации (для multi-view sheet и других спец-инструкций)
+    loc_path_to_loc: Dict[str, Dict[str, Any]] = {}
+    for loc in shot_locations:
+        resolved_ref = _resolve_location_reference_path(loc, location_index_by_name)
+        if resolved_ref and resolved_ref not in loc_path_to_loc:
+            loc_path_to_loc[resolved_ref] = loc
+    char_path_to_name = {
+        (c.get("reference_image_path") or "").strip(): (c.get("name") or "").strip()
+        for c in shot_characters
+    }
+    # Карта для типов (continuity, character, location)
+    char_path_to_type = {
+        (c.get("reference_image_path") or "").strip(): c.get("type", "character")
+        for c in shot_characters
+    }
+    role_entries: List[str] = []
+    has_location_multiview_sheet = False
+    has_continuity_role = False
+    for idx, ref in enumerate(reference_paths, start=1):
+        label = ""
+        name = ""
+        if ref in char_path_to_type and char_path_to_type[ref] == "continuity":
+            # Continuity reference is the primary source for surviving background geometry.
+            has_continuity_role = True
+            location_name = ""
+            if shot_locations:
+                location_name = shot_locations[0].get("name", "")
+            label = (
+                f"image {idx} as continuity reference (same world layout and identity; current camera determines screen positions and scale, current shot determines pose, wardrobe and prop states); background source — {location_name}"
+                if location_name else
+                f"image {idx} as continuity reference (same world layout and identity; current camera determines screen positions and scale, current shot determines pose, wardrobe and prop states)"
+            )
+        elif ref in loc_path_to_name and loc_path_to_name[ref]:
+            name = loc_path_to_name[ref]
+            # Если это location sheet (multi-view), явно говорим модели как читать 4-панельный реф
+            loc_obj = loc_path_to_loc.get(ref, {}) or {}
+            if (loc_obj.get("location_sheet_instruction") or "").strip():
+                has_location_multiview_sheet = True
+                # IMPORTANT: avoid the word "panel/sheet" — it often triggers collage outputs.
+                label = (
+                    f"image {idx} as location — {name} "
+                    f"(multi-view reference: select ONE view that matches this shot's camera plan / POV / zone; "
+                    f"use it to ground geometry+palette; do not output split-screen unless storyboard explicitly requires it)"
+                )
+            else:
+                if has_continuity_role:
+                    label = (
+                        f"image {idx} as location support — {name} "
+                        f"(materials+palette+off-frame continuation; preserve world geometry unless this shot explicitly transforms it, with anchor screen positions projected by the current camera)"
+                    )
+                else:
+                    label = f"image {idx} as location — {name} (layout+lighting+palette; if multiple views are shown, select the view matching this shot, not their combined arrangement)"
+        elif ref in char_path_to_name and char_path_to_name[ref]:
+            name = char_path_to_name[ref]
+            # Персонажный референс: приоритет идентичности над всем остальным
+            label = (
+                f"image {idx} as character — {name} "
+                f"(идентичность: лицо, глаза, пропорции; стиль проекта)"
+            )
+        elif "/97_shots/" in ref and ref.endswith(".png"):
+            # Fallback: сгенерированный кадр как continuity reference - ИСТОЧНИК ФОНА
+            has_continuity_role = True
+            location_name = ""
+            if shot_locations:
+                location_name = shot_locations[0].get("name", "")
+            label = (
+                f"image {idx} as continuity reference (same world layout and identity; current camera determines screen positions and scale, current shot determines pose, wardrobe and prop states); background source — {location_name}"
+                if location_name else
+                f"image {idx} as continuity reference (same world layout and identity; current camera determines screen positions and scale, current shot determines pose, wardrobe and prop states)"
+            )
+        else:
+            label = f"image {idx} as style reference (color grading+texture)"
+        role_entries.append(label)
+    if not role_entries:
+        return ""
+
+    roles_text = "; ".join(role_entries)
+    # Компактная, “аспектная” инструкция (лучше следует best-practices и меньше засоряет команду)
+    extra = ""
+    if has_location_multiview_sheet:
+        extra = (
+            " Локация может содержать несколько видов; выход — один кадр (не коллаж), если это явно не запрошено в storyboard. "
+            "Используй один вид для геометрии, остальные — для деталей. "
+            "Сохранён стиль continuity изображения."
+        )
+    if has_continuity_role:
+        extra = (
+            (extra or "" + " " if extra else "")
+            + " Image 1 как continuity: сохранить геометрию и взаимное расположение объектов в пространстве локации, если исходник явно не задаёт их преобразование или смену места. "
+              "Экранные координаты, масштаб и видимость фоновых якорей меняются согласно движению камеры и кадрированию; не фиксируй их в прежних пикселях. "
+              "Референс локации дополняет материалы и продолжение среды, не отменяя требуемый параллакс."
+        )
+    return (
+        f"Опорные образы: {roles_text}."
+        + (f" {extra}" if extra else "")
+        + " Сохрани каноническую идентичность и неизменные элементы локации. Крупность, ракурс, поза, одежда, освещение и состояние предметов заданы текущим кадром."
+    )
+
+
 def _create_shot_item(
     project_id: str,
     scene_number: int,
@@ -958,6 +1113,7 @@ def _create_shot_item(
     seed: Optional[int] = None,
     visual_style: str = "",
     style_do_not_include: Any = None,
+    image_style_catalog: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Создает элемент для shots.json на основе результата LLM.
@@ -965,6 +1121,9 @@ def _create_shot_item(
 
     language = str(language or "en").strip().lower() or "en"
     _is_bs = black_screen_storyboard_shot(camera_plan, shot_frame_spec)
+    raw_english_prompt = (llm_result.get("english_prompt", "") or "").strip()
+    if not raw_english_prompt and not _is_bs:
+        raise ValueError(f"Missing scene image prompt: scene={scene_number} shot={shot_number} type={shot_type}")
     prompt_edit_prefixes = {
         "ru": "Редактируй image 1:",
         "en": "Edit image 1:",
@@ -1000,18 +1159,11 @@ def _create_shot_item(
                 "разделённый экран",
                 "панели",
                 "сетка",
-                "коллаж",
+                "коллаж из отдельных кадров",
                 "триптих",
                 "диптих",
                 "несколько кадров в одном",
                 "разбивка на кадры",
-            ],
-            "continuity_lock": [
-                "без замены фоновой архитектуры",
-                "без смены геометрии локации",
-                "без другого задника",
-                "без абстрактного фона",
-                "без переноса фоновых якорей",
             ],
             "default_negative": "nsfw, водяной знак, текст, логотип, искаженные руки, лишние конечности, деформированное лицо, низкое разрешение, искаженные части",
         },
@@ -1027,16 +1179,9 @@ def _create_shot_item(
                 "multipanel",
                 "paneles multiples",
                 "cuadricula",
-                "collage",
+                "collage de paneles separados",
                 "tripitico",
                 "diptico",
-            ],
-            "continuity_lock": [
-                "sin reemplazar la arquitectura del fondo",
-                "sin cambiar la geometria de la ubicacion",
-                "sin fondo alternativo",
-                "sin fondo abstracto",
-                "sin mover anclas del fondo",
             ],
             "default_negative": "nsfw, marca de agua, texto, logotipo, manos distorsionadas, dedos extra, extremidades extra, baja resolucion, rostro deformado",
         },
@@ -1052,16 +1197,9 @@ def _create_shot_item(
                 "multi-panneaux",
                 "plusieurs panneaux",
                 "grille",
-                "collage",
+                "collage en panneaux séparés",
                 "triptyque",
                 "diptyque",
-            ],
-            "continuity_lock": [
-                "sans remplacer l'architecture de fond",
-                "sans changer la geometrie du lieu",
-                "sans decor alternatif",
-                "sans fond abstrait",
-                "sans deplacer les ancrages de fond",
             ],
             "default_negative": "nsfw, filigrane, texte, logo, mains deformees, doigts supplementaires, membres supplementaires, basse resolution, visage deforme",
         },
@@ -1077,16 +1215,9 @@ def _create_shot_item(
                 "mehrere panels",
                 "multi-panel",
                 "gitter",
-                "collage",
+                "Collage aus getrennten Bildfeldern",
                 "triptychon",
                 "diptychon",
-            ],
-            "continuity_lock": [
-                "keine ersetzung der hintergrundarchitektur",
-                "keine anderung der ortsgeometrie",
-                "kein anderer hintergrund",
-                "kein abstrakter hintergrund",
-                "keine verschiebung der hintergrundanker",
             ],
             "default_negative": "nsfw, wasserzeichen, text, logo, verzerrte hande, zusatzliche finger, zusatzliche gliedmassen, niedrige auflosung, deformiertes gesicht",
         },
@@ -1103,16 +1234,9 @@ def _create_shot_item(
                 "multi-panel",
                 "multiple panels",
                 "grid",
-                "collage",
+                "multi-panel collage",
                 "triptych",
                 "diptych",
-            ],
-            "continuity_lock": [
-                "do not replace background architecture",
-                "do not change location geometry",
-                "no alternate backdrop",
-                "no abstract background",
-                "do not move background anchors",
             ],
             "default_negative": "nsfw, watermark, text, logo, distorted hands, extra limbs, deformed face, lowres, distorted parts",
         },
@@ -1136,7 +1260,10 @@ def _create_shot_item(
     # LLM иногда возвращает некорректный тип (например, float вместо списка) — нормализуем.
     shot_characters = []
     char_index = { (c.get("name") or "").strip().lower(): c for c in characters_data }
-    raw_characters = llm_result.get("characters", [])
+    frame_spec = shot_frame_spec if isinstance(shot_frame_spec, dict) else {}
+    phase_spec = frame_spec.get(f"{shot_type}_state_spec") or frame_spec
+    visible_characters = phase_spec.get("visible_characters", frame_spec.get("visible_characters"))
+    raw_characters = visible_characters if isinstance(visible_characters, list) else llm_result.get("characters", [])
     if isinstance(raw_characters, list):
         normalized_characters = raw_characters
     elif isinstance(raw_characters, str):
@@ -1167,7 +1294,7 @@ def _create_shot_item(
 
     # Fallback: если LLM не вернул список персонажей, попробуем извлечь их из текста
     # (включая storyboard.description текущего шота — это самый надёжный якорь для "кто в кадре").
-    if not shot_characters and not _is_bs:
+    if not shot_characters and not _is_bs and not isinstance(visible_characters, list):
         combined_text = " ".join([
             str(llm_result.get("english_prompt", "")) or "",
             str(llm_result.get("initial_state_summary", "")) or "",
@@ -1213,35 +1340,6 @@ def _create_shot_item(
         for loc in (locations_data or [])
         if str((loc or {}).get("name") or "").strip()
     }
-
-    def _resolve_location_reference_path(loc_obj: Optional[Dict[str, Any]]) -> str:
-        """
-        Возвращает референс локации:
-        1) собственный reference_image_path;
-        2) если пусто — reference_image_path ближайшего parent_location_name.
-        """
-        if not isinstance(loc_obj, dict):
-            return ""
-
-        direct = str(loc_obj.get("reference_image_path") or "").strip()
-        if direct:
-            return direct
-
-        visited = set()
-        parent_name = str(loc_obj.get("parent_location_name") or "").strip()
-        hops = 0
-        while parent_name and hops < 6:
-            key = parent_name.lower()
-            if key in visited:
-                break
-            visited.add(key)
-            parent = location_index_by_name.get(key) or {}
-            parent_ref = str(parent.get("reference_image_path") or "").strip()
-            if parent_ref:
-                return parent_ref
-            parent_name = str(parent.get("parent_location_name") or "").strip()
-            hops += 1
-        return ""
 
     def _sanitize_single_line_llm_value(value: Any) -> str:
         text = str(value or "").strip()
@@ -1307,11 +1405,14 @@ LOCATION_TIME: "{location_time}"
         except Exception as e:
             logger.error(f"❌ Ошибка парсинга сложной location_time: {e}")
     
-    # Выбираем приоритетное название: canonical > script-derived > llm guess.
+    # Технический анализ выбирает локацию конкретного кадра из канона;
+    # общая локация сцены остаётся fallback, а не перезаписывает этот выбор.
+    shot_location_name = _sanitize_single_line_llm_value(llm_result.get("location", ""))
     location_name = (
-        _sanitize_single_line_llm_value(location_canon_name)
+        (shot_location_name if shot_location_name.lower() in location_index_by_name else "")
+        or _sanitize_single_line_llm_value(location_canon_name)
         or location_name_from_script
-        or _sanitize_single_line_llm_value(llm_result.get("location", ""))
+        or shot_location_name
     )
     
     # Логируем что используем для отладки
@@ -1494,7 +1595,7 @@ LOCATION_TIME: "{location_time}"
                                 break
                         if start_location_ref:
                             for loc in (locations_data or []):
-                                if _resolve_location_reference_path(loc) == start_location_ref:
+                                if _resolve_location_reference_path(loc, location_index_by_name) == start_location_ref:
                                     shot_locations = [loc]
                                     break
 
@@ -1547,7 +1648,7 @@ LOCATION_TIME: "{location_time}"
     
     # Добавляем location reference В КОНЦЕ (для smart background selection)
     for loc in shot_locations:
-        ref_path = _resolve_location_reference_path(loc)
+        ref_path = _resolve_location_reference_path(loc, location_index_by_name)
         if ref_path:
             reference_paths.append(ref_path)
     
@@ -1569,7 +1670,11 @@ LOCATION_TIME: "{location_time}"
             continuity_ref = first_ref
 
     # Определяем location ref (в идеале последний референс локации)
-    loc_ref_paths = set(_resolve_location_reference_path(l) for l in shot_locations if _resolve_location_reference_path(l))
+    loc_ref_paths = set(
+        _resolve_location_reference_path(l, location_index_by_name)
+        for l in shot_locations
+        if _resolve_location_reference_path(l, location_index_by_name)
+    )
     location_ref = None
     if loc_ref_paths:
         for r in reversed(reference_paths):
@@ -1717,102 +1822,12 @@ LOCATION_TIME: "{location_time}"
     logger.info(f"🔢 Итоговые референсы: {len(reference_paths)}/{MAX_TOTAL_IMAGES} (characters={num_character_refs}, other={len(other_refs)})")
     
     # Сформируем явную инструкцию о РОЛЯХ референсов (для Nano Banana API)
-    reference_roles_instruction = ""
-    if reference_paths:
-        # Карты путь→имя для быстрого определения роли
-        loc_path_to_name: Dict[str, str] = {}
-        for loc in shot_locations:
-            resolved_ref = _resolve_location_reference_path(loc)
-            if resolved_ref and resolved_ref not in loc_path_to_name:
-                loc_path_to_name[resolved_ref] = (loc.get("name") or "").strip()
-        # Карта путь→объект локации (для multi-view sheet и других спец-инструкций)
-        loc_path_to_loc: Dict[str, Dict[str, Any]] = {}
-        for loc in shot_locations:
-            resolved_ref = _resolve_location_reference_path(loc)
-            if resolved_ref and resolved_ref not in loc_path_to_loc:
-                loc_path_to_loc[resolved_ref] = loc
-        char_path_to_name = { (c.get("reference_image_path") or "").strip(): (c.get("name") or "").strip() for c in shot_characters }
-        # Карта для типов (continuity, character, location)
-        char_path_to_type = { (c.get("reference_image_path") or "").strip(): c.get("type", "character") for c in shot_characters }
-        role_entries: List[str] = []
-        has_location_multiview_sheet = False
-        has_continuity_role = False
-        for idx, ref in enumerate(reference_paths, start=1):
-            label = ""
-            name = ""
-            if ref in char_path_to_type and char_path_to_type[ref] == "continuity":
-                # Continuity reference is the primary source for surviving background geometry.
-                has_continuity_role = True
-                location_name = ""
-                if shot_locations:
-                    location_name = shot_locations[0].get("name", "")
-                label = (
-                    f"image {idx} as continuity reference (pose lineage+lighting, одежда, прическа, предметы, existing background geometry and anchor placement); background source — {location_name}"
-                    if location_name else
-                    f"image {idx} as continuity reference (pose lineage+lighting, одежда, прическа, предметы, existing background geometry and anchor placement)"
-                )
-            elif ref in loc_path_to_name and loc_path_to_name[ref]:
-                name = loc_path_to_name[ref]
-                # Если это location sheet (multi-view), явно говорим модели как читать 4-панельный реф
-                loc_obj = loc_path_to_loc.get(ref, {}) or {}
-                if (loc_obj.get("location_sheet_instruction") or "").strip():
-                    has_location_multiview_sheet = True
-                    # IMPORTANT: avoid the word "panel/sheet" — it often triggers collage outputs.
-                    label = (
-                        f"image {idx} as location — {name} "
-                        f"(multi-view reference: select ONE view that matches this shot's camera plan / POV / zone; "
-                        f"use it to ground geometry+palette; do not output split-screen unless storyboard explicitly requires it)"
-                    )
-                else:
-                    if has_continuity_role:
-                        label = (
-                            f"image {idx} as location support — {name} "
-                            f"(materials+palette+off-frame continuation only; do not replace image 1 background geometry or anchor placement)"
-                        )
-                    else:
-                        label = f"image {idx} as location — {name} (layout+lighting+palette)"
-            elif ref in char_path_to_name and char_path_to_name[ref]:
-                name = char_path_to_name[ref]
-                # Персонажный референс: приоритет идентичности над всем остальным
-                label = (
-                    f"image {idx} as character — {name} "
-                    f"(идентичность: лицо, глаза, пропорции; стиль проекта)"
-                )
-            elif "/97_shots/" in ref and ref.endswith(".png"):
-                # Fallback: сгенерированный кадр как continuity reference - ИСТОЧНИК ФОНА
-                location_name = ""
-                if shot_locations:
-                    location_name = shot_locations[0].get("name", "")
-                label = (
-                    f"image {idx} as continuity reference (pose+composition+lighting, одежда, прическа, предметы); background source — {location_name}"
-                    if location_name else
-                    f"image {idx} as continuity reference (pose+composition+lighting, одежда, прическа, предметы)"
-                )
-            else:
-                label = f"image {idx} as style reference (color grading+texture)"
-            role_entries.append(label)
-        if role_entries:
-            roles_text = "; ".join(role_entries)
-            # Компактная, “аспектная” инструкция (лучше следует best-practices и меньше засоряет команду)
-            extra = ""
-            if has_location_multiview_sheet:
-                extra = (
-                    " Локация может содержать несколько видов; выход — один кадр (не коллаж), если это явно не запрошено в storyboard. "
-                    "Используй один вид для геометрии, остальные — для деталей. "
-                    "Сохранён стиль continuity изображения."
-                )
-            if has_continuity_role:
-                extra = (
-                    (extra or "" + " " if extra else "")
-                    + " Image 1 как continuity: сохранить ту же геометрию фона, архитектурный каркас и относительное положение узнаваемых фоновых якорей, "
-                      "если их не исключает tighter crop или явно не меняет `added`/`removed`. "
-                      "Локация может только дополнять материалы, свет, палитру и выход за пределы кропа, но не заменять layout фона и не переставлять якоря."
-                )
-            reference_roles_instruction = (
-                f"Опорные образы: {roles_text}."
-                + (f" {extra}" if extra else "")
-                + " Сохранить идентичность, перспективу, освещение и естественные тени; избегать отклонения стиля."
-            )
+    reference_roles_instruction = _build_reference_roles_instruction(
+        reference_paths,
+        shot_characters,
+        shot_locations,
+        location_index_by_name,
+    )
 
     if _is_bs and shot_type == "end":
         if language == "ru":
@@ -1875,8 +1890,6 @@ LOCATION_TIME: "{location_time}"
     def _normalize_negative_prompt(
         neg: str,
         needs_text: bool,
-        *,
-        continuity_background_lock: bool = False,
     ) -> str:
         n = (neg or "").strip()
         if not n:
@@ -1920,44 +1933,8 @@ LOCATION_TIME: "{location_time}"
         for t in multipanel_tokens:
             _ensure(t)
 
-        if continuity_background_lock:
-            for t in prompt_language_tokens["continuity_lock"]:
-                _ensure(t)
-
         return ", ".join(parts)
 
-    def _strip_multiview_meta_from_prompt(prompt: str) -> str:
-        """
-        The generator already provides roles/instructions about reference images.
-        If the model also repeats '4 views / panels / sheet' meta inside the core prompt,
-        it often triggers a collage output. We strip those meta lines conservatively.
-        """
-        p = (prompt or "").strip()
-        if not p:
-            return p
-        lines = [ln.strip() for ln in p.splitlines()]
-        drop_keys = [
-            "4 вида",
-            "четыр",
-            "multi-view",
-            "4 views",
-            "panel",
-            "панел",
-            "sheet",
-            "grid",
-            "не разделяйте изображение на панели",
-            "do not split the output",
-            "select the single panel",
-        ]
-        kept: List[str] = []
-        for ln in lines:
-            lnl = ln.lower()
-            if any(k in lnl for k in drop_keys) and ("опорн" in lnl or "reference" in lnl or "location" in lnl):
-                continue
-            kept.append(ln)
-        out = "\n".join([x for x in kept if x]).strip()
-        return out
-    
     # Создаем элемент в формате items.json + расширенные поля
     # Определяем наличие continuity ref для start: обычно это первый референс из /97_shots/
     has_continuity_ref = False
@@ -1965,26 +1942,13 @@ LOCATION_TIME: "{location_time}"
         first_ref = reference_paths[0] or ""
         has_continuity_ref = ("/97_shots/" in first_ref and first_ref.endswith(".png"))
 
-    raw_english_prompt = (llm_result.get("english_prompt", "") or "").strip()
-    normalized_english_prompt = _strip_multiview_meta_from_prompt(raw_english_prompt)
+    normalized_english_prompt = raw_english_prompt
     if shot_type == "start":
         normalized_english_prompt = _normalize_start_prompt_prefix(normalized_english_prompt, has_continuity_ref)
 
     if _is_bs:
         create_pf = prompt_create_prefixes.get(language, prompt_create_prefixes["en"])
         edit_pf = prompt_edit_prefixes.get(language, prompt_edit_prefixes["en"])
-        vs_tail = ""
-        if (visual_style or "").strip():
-            if language == "ru":
-                vs_tail = (
-                    f"\n\nВизуальный стиль серии (дисциплина панели; кадр остаётся чёрным): "
-                    f"{(visual_style or '').strip()}"
-                )
-            else:
-                vs_tail = (
-                    f"\n\nSeries visual style (panel discipline; frame stays black): "
-                    f"{(visual_style or '').strip()}"
-                )
         if shot_type == "start":
             if language == "ru":
                 body = (
@@ -1997,7 +1961,7 @@ LOCATION_TIME: "{location_time}"
                     "a flat pure black (#000000) single panel; no silhouettes, no environment, no gradients, "
                     "no vignette, no film grain, no text, no UI. Black screen — do not depict characters or locations."
                 )
-            normalized_english_prompt = f"{create_pf} {body}{vs_tail}".strip()
+            normalized_english_prompt = f"{create_pf} {body}".strip()
         else:
             if language == "ru":
                 body = (
@@ -2009,17 +1973,19 @@ LOCATION_TIME: "{location_time}"
                     "Turn the frame into flat pure black (#000000): remove any objects, characters, light, textures, "
                     "gradients, and noise — visual null."
                 )
-            normalized_english_prompt = f"{edit_pf} {body}{vs_tail}".strip()
-    elif (visual_style or "").strip():
-        vs = (visual_style or "").strip()
-        if language == "ru":
-            normalized_english_prompt = (
-                f"{normalized_english_prompt}\n\nВизуальный стиль проекта (анкор, без дрейфа стиля): {vs}"
-            ).strip()
-        else:
-            normalized_english_prompt = (
-                f"{normalized_english_prompt}\n\nProject visual style anchor (match treatment; avoid style drift): {vs}"
-            ).strip()
+            normalized_english_prompt = f"{edit_pf} {body}".strip()
+
+    style_id = None
+    if image_style_catalog:
+        frame_key = f"{scene_number}:{shot_number}:{shot_type}"
+        from ..style_keeper import resolve_image_style_id
+        style_id = resolve_image_style_id(image_style_catalog, frame_key, shot_locations)
+        style = image_style_catalog.get("styles", {}).get(style_id)
+        if not isinstance(style, dict) or not str(style.get("prompt") or "").strip():
+            raise ValueError(f"Unknown or empty image style: {style_id!r} for {frame_key}")
+        if not _is_bs:
+            style_label = "Стиль изображения" if language == "ru" else "Image style"
+            normalized_english_prompt += f"\n\n{style_label}: {style['prompt'].strip()}"
 
     # Visibility-pass для аксессуаров/одежды: что должно быть видно/скрыто в этом ракурсе.
     shot_frame_spec_out = dict(shot_frame_spec) if isinstance(shot_frame_spec, dict) else {}
@@ -2059,11 +2025,9 @@ LOCATION_TIME: "{location_time}"
         llm_result.get("initial_state_summary", "") or "",
         llm_result.get("video_prompt", "") or "",
     )
-    continuity_background_lock = bool(shot_type == "end" and continuity_ref and not _is_bs)
     normalized_negative = _normalize_negative_prompt(
         raw_negative,
         needs_text,
-        continuity_background_lock=continuity_background_lock,
     )
     if _is_bs:
         if language == "ru":
@@ -2079,7 +2043,6 @@ LOCATION_TIME: "{location_time}"
         normalized_negative = (
             f"{normalized_negative}, {black_extra}" if (normalized_negative or "").strip() else black_extra
         )
-    normalized_negative = merge_style_do_not_into_negative(normalized_negative, style_do_not_include)
     normalized_negative = _dedup_negative_prompt(normalized_negative)
 
     # NOTE: We intentionally do NOT post-fix the human-readable shot-size phrase in english_prompt.
@@ -2092,6 +2055,7 @@ LOCATION_TIME: "{location_time}"
         "scene_number": scene_number,
         "shot_number": shot_number,
         "shot_type": shot_type,
+        "style_id": style_id,
         "camera_plan": camera_plan,
         "timing": timing,
         "image_path": None,
@@ -2100,7 +2064,7 @@ LOCATION_TIME: "{location_time}"
         "negative_prompt": normalized_negative,
         "reference_image_paths": reference_paths,
         "width": 1920,
-        "height": 1080,
+        "height": 1088,
         "true_cfg_scale": 7.5,
         "num_inference_steps": 30,
         "seed": seed if seed else None,
@@ -2227,7 +2191,7 @@ def _sanitize_start_via_llm(
         "  • Фон только blur-hint сценического света; НЕ делай читаемые ряды кресел/аудиторию как фон.\n"
         "  • Запрещено для конференц-зала: handheld microphone / mic in hand, если storyboard явно не требует handheld.\n\n"
         "**[P2] VIDEO_PROMPT:**\n"
-        "- video_prompt должен быть ОДНОЙ строкой на английском, без кириллицы.\n"
+        "- video_prompt: одна строка с английскими инструкциями; preserve source-visible text verbatim in its original script. Required end results must be explicitly achieved by END.\n"
         "- НЕ добавляй конкретные новые объекты/символы/холограммы/пропсы, которых нет в shot_description этого шота.\n"
         "- REACTION SHOT / SPLIT SCREEN: НЕ пиши 'looking at camera' если это не указано явно.\n"
         "- НЕ утверждай отсутствие объектов ('no X') если это не требуется shot_description.\n"
@@ -2296,6 +2260,7 @@ def _sanitize_start_via_llm(
         "- Wide: 'Camera static; subjects positioned; atmospheric elements move gently'\n\n"
         "**[P2] NEGATIVE_PROMPT:**\n"
         "ПЕРЕД выводом проверь:\n"
+        "- Сохраняй часть объекта, владельца, фазу и степень в условных запретах; не расширяй их до запрета всего объекта и не запрещай обязательные видимые части из positive prompt.\n"
         "- НЕ содержит имён из scene_characters → удали если есть\n"
         "- Правильно: 'no extra characters (excluding [scene_characters names])'\n"
         "- НЕ общие фразы ('no extra characters'), УКАЗЫВАЙ имена\n\n"
@@ -2471,6 +2436,7 @@ def _sanitize_end_via_llm(
         "Используй ВСЕ: final_spatial_composition, final_camera_angle, final_lighting_style, final_character_orientation\n\n"
         "**[P2] NEGATIVE_PROMPT:**\n"
         "- НЕ общие фразы ('no gloves') → УКАЗЫВАЙ персонажа ('no gloves in Father's hands')\n"
+        "- Сохраняй часть объекта, владельца, фазу и степень в условных запретах; не расширяй их до запрета всего объекта и не запрещай обязательные видимые части из positive prompt.\n"
         "- Если shot_description = crowd/group → НЕ используй 'no duplicates'\n\n"
         "**[P1] ЗАПРЕЩЕНО:**\n"
         "- Процессы: removing / approaching / moving toward / drifting\n"

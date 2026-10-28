@@ -30,6 +30,7 @@ inputs:
   sample_before_batch: false
   sample_shot_key: ''
   generate_music: true
+  narration_path: ''
   final_allow_missing_audio: false
 global_retry_policy:
   max_retries: 2
@@ -42,12 +43,12 @@ global_retry_policy:
   - timeout
 global_resource_limits:
   max_api_calls_per_minute: 15
-  max_duration_seconds: 30720
+  max_duration_seconds: 86400
 steps:
 - id: brief_from_prompt
   step_type: tool
   task: Generate brief JSON from a free-form storybook prompt
-  timeout: 120
+  timeout: 1200
   tool_name: brief_from_prompt_tool
   tool_params:
     session_id: '{session_id}'
@@ -72,7 +73,7 @@ steps:
 - id: story_planner
   step_type: tool
   task: Generate synopsis.json and beats.json
-  timeout: 120
+  timeout: 1200
   tool_name: story_planner_tool
   tool_params:
     session_id: '{session_id}'
@@ -83,7 +84,7 @@ steps:
 - id: bible_builder
   step_type: tool
   task: Build characters/locations canon and rules
-  timeout: 120
+  timeout: 1200
   tool_name: bible_builder_tool
   tool_params:
     session_id: '{session_id}'
@@ -94,7 +95,7 @@ steps:
 - id: style_keeper
   step_type: tool
   task: Fix style for text and images and negative list
-  timeout: 120
+  timeout: 1200
   tool_name: style_keeper_tool
   tool_params:
     session_id: '{session_id}'
@@ -104,7 +105,7 @@ steps:
 - id: story_writer
   step_type: tool
   task: Generate story.json with per-page text
-  timeout: 120
+  timeout: 1200
   tool_name: story_writer_tool
   tool_params:
     session_id: '{session_id}'
@@ -115,7 +116,7 @@ steps:
 - id: story_editor
   step_type: tool
   task: Edit and improve story text if it was regenerated
-  timeout: 180
+  timeout: 86400
   tool_name: story_editor_tool
   tool_params:
     session_id: '{session_id}'
@@ -126,7 +127,7 @@ steps:
 - id: prompt_engineer
   step_type: tool
   task: Create per-page EN prompts with references and technical params
-  timeout: 120
+  timeout: 86400
   tool_name: prompt_engineer_tool
   tool_params:
     session_id: '{session_id}'
@@ -148,7 +149,7 @@ steps:
 - id: artist_batch
   step_type: tool
   task: Parallel artist edits with references for final images
-  timeout: 120
+  timeout: 86400
   tool_name: artist_agent_batch_edit_tool
   tool_params:
     session_id: '{session_id}'
@@ -182,7 +183,7 @@ steps:
     session_id: '{session_id}'
     md_path: '{story_planner}/../90_md/book.md'
     pdf_path: '{story_planner}/../95_pdf/book.pdf'
-    css_path: 'doc/storybook_pdf.css'
+    css_path: 'config/storybook/storybook_pdf.css'
     skip_if_up_to_date: true
     page_size: 'A4'
     margins: '14mm'
@@ -191,7 +192,7 @@ steps:
 - id: screenplay_generator
   step_type: tool
   task: Generate director's screenplay in JSON format
-  timeout: 360
+  timeout: 86400
   tool_name: screenplay_generator_tool
   tool_params:
     session_id: '{session_id}'
@@ -203,7 +204,7 @@ steps:
 - id: screenplay_shots_generator
   step_type: tool
   task: Generate shots JSON for storyboard frames
-  timeout: 600
+  timeout: 86400
   tool_name: screenplay_shots_generator_tool
   tool_params:
     session_id: '{session_id}'
@@ -220,7 +221,7 @@ steps:
 - id: shots_prompt_qa
   step_type: tool
   task: LLM validate+repair shots prompts vs screenplay BEFORE generating shot images
-  timeout: 600
+  timeout: 86400
   tool_name: shots_prompt_qa_tool
   tool_params:
     session_id: '{session_id}'
@@ -305,14 +306,70 @@ steps:
   depends_on:
   - blockout_renderer
   condition: '{generate_screenplay}'
+- id: character_reference_states
+  step_type: tool
+  task: Prepare persistent character appearance references and frame bindings
+  timeout: 86400
+  tool_name: storybook_character_state_references_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    shots_data: '{shots_prompt_qa}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - shots_prompt_qa
+  - artist_batch
+- id: storybook_video_plan
+  step_type: tool
+  task: Classify action shots and select video ranges and necessary images before rendering
+  timeout: 86400
+  tool_name: storybook_video_plan_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    shots_data: '{character_reference_states}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - character_reference_states
+- id: background_reference_plan
+  step_type: tool
+  task: Plan linked background views and frame bindings
+  timeout: 86400
+  tool_name: storybook_background_plan_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    shots_data: '{storybook_video_plan}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - storybook_video_plan
+  - character_reference_states
+  - shots_prompt_qa
+  - artist_batch
+- id: background_references
+  step_type: tool
+  task: Render planned background-card sheets before generating shot images
+  timeout: 86400
+  tool_name: storybook_background_references_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    shots_data: '{background_reference_plan}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - background_reference_plan
 - id: artist_batch_shots
   step_type: tool
   task: Parallel artist edits with references for final shots images
-  timeout: 1200
+  timeout: 86400
   tool_name: artist_agent_batch_edit_tool
   tool_params:
     session_id: '{session_id}'
-    items: '{shots_prompt_qa}'
+    items: '{background_references}'
     language: '{language}'
     enable: '{generate_screenplay}'
     #enable: false
@@ -320,6 +377,7 @@ steps:
     generate_blockout: '{generate_blockout}'
   depends_on:
   - shots_prompt_qa
+  - background_references
   - artist_batch
   - blockout_renderer
 - id: storybook_video_preflight
@@ -344,6 +402,8 @@ steps:
     generate_blockout: '{generate_blockout}'
   depends_on:
   - shots_prompt_qa
+  - storybook_photo_montage
+  - storybook_video_plan
 - id: storybook_video_delivery_promise
   step_type: tool
   task: Lock delivery promise for storybook motion-led video
@@ -371,19 +431,21 @@ steps:
 - id: video_generator
   step_type: tool
   task: Generate video from shots
-  timeout: 9000
+  timeout: 86400
   # Дорогой side-effect-шаг: движковый retry запрещён до появления настоящей
   # идемпотентности (полагаемся на provider_jobs.json), иначе слепой повтор
   # пере-триггерит платную генерацию. См. H-2.
   metadata:
     retryable: false
-#  tool_name: video_generator_routerai_tool
+  tool_name: video_generator_routerai_tool
 #  tool_name: video_generator_veo_tool
 #  tool_name: video_generator_mm_tool
-  tool_name: video_generator_aitunnel_tool
+#  tool_name: video_generator_aitunnel_tool
   tool_params:
     session_id: '{session_id}'
     project_id: '{project_id}'
+    max_concurrency: 4
+    seed: '{brief_from_prompt.seed}'
     language: '{language}'
     force_update_prompts: '{force_update_prompts}'
     skip_prompt_enhancement: '{skip_prompt_enhancement}'
@@ -411,13 +473,14 @@ steps:
     session_id: '{session_id}'
     project_id: '{project_id}'
     language: '{language}'
+    narration_path: '{narration_path}'
     enable: '{generate_screenplay}'
   depends_on:
-  - video_generator
+  - artist_batch_shots
 - id: music_planner
   step_type: tool
   task: Plan per-scene leitmotifs (max 2 or 3 by film duration) and neutral theme
-  timeout: 180
+  timeout: 1200
   # Дешёвый LLM-only шаг, но пишет план для дорогого Suno-шага дальше;
   # идемпотентен по хэшу screenplay/brief, движковый retry разрешён.
   metadata:
@@ -438,7 +501,7 @@ steps:
 - id: storybook_music_generator
   step_type: tool
   task: Generate or reuse background music and register it in audio manifest
-  timeout: 2400
+  timeout: 86400
   # Дорогой side-effect-шаг: движковый retry запрещён (идемпотентность на уровне
   # тула через music-манифест). См. H-2.
   metadata:
@@ -456,6 +519,7 @@ steps:
     language: '{language}'
     enable: '{generate_music}'
     provider: suno
+    timeout_seconds: 1200
     instrumental: true
     wait_for_completion: true
   depends_on:
@@ -465,7 +529,7 @@ steps:
 - id: storybook_sfx_generator
   step_type: tool
   task: Generate scene sound effects and register MP3 files in the audio manifest
-  timeout: 2400
+  timeout: 86400
   metadata:
     retryable: false
   tool_name: storybook_sfx_generator_tool
@@ -482,10 +546,24 @@ steps:
   depends_on:
   - storybook_music_generator
   condition: '{generate_screenplay}'
+- id: storybook_photo_montage
+  step_type: tool
+  task: Export complete editable timelines and assemble photo film from images and audio
+  timeout: 86400
+  metadata:
+    retryable: false
+  tool_name: storybook_photo_montage_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - artist_batch_shots
+  - storybook_sfx_generator
 - id: montage_assembler
   step_type: tool
   task: Assemble final video, timeline, subtitles, manifest and final review
-  timeout: 1200
+  timeout: 86400
   # Дорогой side-effect-шаг (ffmpeg-рендер): движковый retry запрещён, повтор
   # рендерит заново без выигрыша. См. H-2.
   metadata:
@@ -509,6 +587,7 @@ steps:
     music_enabled: '{generate_music}'
   depends_on:
   - storybook_sfx_generator
+  - video_generator
 - id: storybook_video_decision_log
   step_type: tool
   task: Persist storybook video provider/model/runtime decisions and final status

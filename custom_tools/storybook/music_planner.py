@@ -39,6 +39,17 @@ def music_planner_tool(
     session_id: str = "",
     project_id: str = "",
 ) -> Dict[str, Any]:
+    """Create a per-scene music plan from the project's screenplay.
+
+    Args:
+        base_dir: Optional project directory override.
+        language: Project source language code.
+        session_id: Execution trace identifier.
+        project_id: Storybook project identifier.
+
+    Returns:
+        Plan status, file path and scene and leitmotif counts.
+    """
     # base_dir wins over project_id (test hook); otherwise resolve project_id
     # via the same safe helper used by the other storybook tools.
     if base_dir is None:

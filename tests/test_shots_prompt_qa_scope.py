@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
 
 import custom_tools.storybook.shots_prompt_qa as sq
+from custom_tools.storybook.screenplay_shots_generator_utils import shared_utils
 
 
 def _write_screenplay(root: Path, pid: str, scenes):
@@ -47,6 +49,15 @@ def _item(scene, shot, shot_type="start"):
         "negative_prompt": "",
         "reference_image_paths": [],
         "_shot_frame_spec": {},
+        "_shot_frame_spec_cache_key": shared_utils._build_shot_frame_spec_cache_key(
+            scene_number=scene,
+            shot_number=shot,
+            shot_description="",
+            camera_plan="MEDIUM SHOT",
+            scene_characters=[],
+            location_time="",
+            location_canon_name="",
+        ),
     }
 
 
@@ -125,6 +136,7 @@ def test_two_partial_runs_union_covers_all(stub_llm):
 def test_skip_gate_skips_when_requested_scene_covered(stub_llm):
     data = _two_scene_items()
     data["prompts_validated_scenes"] = [1, 2]
+    data["prompts_validated_spec_version"] = shared_utils._SHOT_FRAME_SPEC_VERSION
     result = sq.shots_prompt_qa_tool(
         session_id="s", project_id="proj", shots_data=data, enable=True,
         force=False, model="hard", scene_numbers=[1], global_max_repairs=0, dry_run=True,
@@ -145,12 +157,43 @@ def test_skip_gate_runs_when_requested_scene_not_covered(stub_llm):
     assert stub_llm["n"] >= 1
 
 
-def test_legacy_flag_skips_all(stub_llm):
+def test_legacy_flag_without_version_is_revalidated(stub_llm):
     data = _two_scene_items()
     data["prompts_validated"] = True  # легаси-флаг без prompts_validated_scenes
     result = sq.shots_prompt_qa_tool(
         session_id="s", project_id="proj", shots_data=data, enable=True,
         force=False, model="hard", scene_numbers=[1], global_max_repairs=0, dry_run=True,
     )
-    assert stub_llm["n"] == 0
-    assert "_qa_report" not in result
+    assert stub_llm["n"] >= 1
+    assert "_qa_report" in result
+
+
+def test_shot_scope_does_not_apply_repair_to_unselected_shot(stub_llm, monkeypatch):
+    # The model may return a neighboring-shot repair; shot-level scope must discard it.
+    project_root = Path(os.environ["STORYBOOK_PROJECTS_DIR"])
+    _write_screenplay(project_root, "proj", [_scene(1, shots=(1, 2)), _scene(2)])
+    before = _item(1, 1)
+    selected = _item(1, 2)
+
+    def fake_api(**kwargs):
+        return json.dumps({
+            "repairs": [
+                {"scene_number": 1, "shot_number": 1, "shot_type": "start",
+                 "reasons": ["neighbor"], "set": {"english_prompt": "wrong"}},
+                {"scene_number": 1, "shot_number": 2, "shot_type": "start",
+                 "reasons": ["selected"], "set": {"english_prompt": "fixed"}},
+            ],
+            "notes": "ok",
+        })
+
+    stub_llm["n"] = 0
+    monkeypatch.setattr(sq, "call_openai_api", fake_api)
+    result = sq.shots_prompt_qa_tool(
+        session_id="s", project_id="proj",
+        shots_data={"items": [before, selected], "consistency_rules": []},
+        enable=True, force=True, model="hard", shot_keys=["1-2"],
+        global_max_repairs=0, dry_run=True,
+    )
+    assert result["items"][0]["english_prompt"] == "x"
+    assert result["items"][1]["english_prompt"] == "fixed"
+    assert result["prompts_validated"] is False

@@ -32,6 +32,30 @@ def _write_json(path: Path, payload) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+@pytest.mark.parametrize("phase", ["start", "end"])
+@pytest.mark.parametrize("language, label", [("ru", "русском языке"), ("en", "английском языке")])
+def test_artistic_image_prompt_requests_project_language(monkeypatch, phase, language, label):
+    captured = []
+
+    def fake_api(**kwargs):
+        captured.append(kwargs)
+        return '{"english_prompt": "test"}'
+
+    monkeypatch.setattr(shots_generator, "call_openai_api", fake_api)
+    monkeypatch.setattr(shots_generator, "enrich_shot_frame_spec_environment_delta_via_llm", lambda *a, **k: {})
+    if phase == "start":
+        result = shots_generator._generate_shot_artistic({}, {}, language=language)
+    else:
+        result = shots_generator._generate_end_shot_artistic({}, {}, "", {}, language=language)
+
+    assert result == {"english_prompt": "test"}
+    assert len(captured) == 1
+    for prompt in (captured[0]["prompt"], captured[0]["system_prompt"]):
+        assert f"`english_prompt`: in {label}" in prompt
+        assert "ALWAYS in English regardless of source language" not in prompt
+        assert "source-visible text verbatim" in prompt
+
+
 def test_create_shot_item_uses_generation_language_and_drops_canonical_fields():
     item = _create_shot_item(
         project_id="proj",
@@ -64,6 +88,7 @@ def test_create_shot_item_uses_generation_language_and_drops_canonical_fields():
     )
 
     assert item["english_prompt"].startswith("Создай ")
+    assert (item["width"], item["height"]) == (1920, 1088)
     assert "_canonical_english_prompt_en" not in item
     assert "_canonical_negative_prompt_en" not in item
     assert "_canonical_video_prompt_en" not in item

@@ -44,7 +44,7 @@ class _RecordingFactory:
 
 
 def _assert_generation_contract(task: str):
-    for unsupported in ("true_cfg_scale:", "num_inference_steps:", "output_path:", "seed:"):
+    for unsupported in ("true_cfg_scale:", "num_inference_steps:", "output_path:"):
         assert unsupported not in task
     for supported in ("prompt:", "session_id:", "number:", "negative_prompt:", "width:", "height:"):
         assert supported in task
@@ -115,7 +115,7 @@ def test_pp02_identity_is_retained_once_in_english_and_sent_to_translation(monke
 
     monkeypatch.setattr(utils, "needs_translation_to_english", lambda _item: True)
     monkeypatch.setattr(utils, "translate_prompts_in_items", translate)
-    translated_prompt, _negative = artist._build_image_generation_prompts(item, "Детектив входит", "ru")
+    translated_prompt, _negative = artist._build_image_generation_prompts(item, "Детектив входит", "en")
     assert translations[0][1] == "en"
     assert translations[0][0]["english_prompt"].count("emerald") == 1
     assert translated_prompt.count("emerald") == 1
@@ -152,8 +152,10 @@ def test_pp03_canon_translation_reaches_direct_edit_and_agent_task(monkeypatch, 
 
     artist._generate_canon_reference_from_scratch(
         "session-pp03", "character", {"name": "Mira"}, str(tmp_path / "new.png"), [], "workflow",
+        seed=123,
     )
     assert "CONTROL_TRANSLATION" in factory.calls[0]["task"]
+    assert "- seed: 123" in factory.calls[0]["task"]
     assert len(translations) == 2
 
 
@@ -226,3 +228,57 @@ def test_pl01_existing_brief_image_skips_agent(monkeypatch, tmp_path):
     output = protagonist.protagonist_initializer_tool("session-pl01", "project")
     assert Path(output).read_bytes() == b"png"
     assert factory.calls == []
+
+
+def test_identity_anchors_do_not_freeze_variable_wardrobe():
+    item = _character_item('/tmp/mira-reference.png')
+    block = artist._build_character_identity_block(item, 'en')
+    assert 'emerald' in block
+    assert 'red coat' not in block
+    assert 'silver pin' not in block
+
+
+def test_identity_anchors_exclude_plot_role_and_keep_species():
+    item = _character_item('/tmp/mira-reference.png')
+    item['characters'][0].update(
+        role='FUTURE_OUTCOME: later burns the tower',
+        entity_nature='anthropomorphic_animal', species='lynx',
+    )
+    block = artist._build_character_identity_block(item, 'en')
+    assert 'FUTURE_OUTCOME' not in block
+    assert 'lynx' in block
+    assert 'oval' in block and 'emerald' in block
+
+
+def test_russian_render_prompt_preserves_ready_style_without_model_translation(monkeypatch):
+    item = _character_item('/tmp/mira-reference.png')
+    prompt = 'Герой у верстака; 50mm f/4.\n\nСтиль изображения: ГОТОВЫЙ СТИЛЬ КАТАЛОГА'
+    monkeypatch.setattr(artist, '_collect_visible_text_bindings', lambda *args: [])
+    monkeypatch.setattr(utils, 'needs_translation_to_english', lambda *args: True)
+    def forbid_translation(*args, **kwargs):
+        raise AssertionError('The requested Russian prompt must not be translated by a model')
+    monkeypatch.setattr(utils, 'translate_prompts_in_items', forbid_translation)
+    positive, negative = artist._build_image_generation_prompts(item, prompt, 'ru')
+    assert prompt in positive
+    assert '50mm f/4' in positive
+    assert 'ГОТОВЫЙ СТИЛЬ КАТАЛОГА' in positive
+    assert negative
+
+
+def test_reference_fidelity_allows_explicit_scene_changes():
+    block = artist._build_reference_fidelity_block()
+    assert 'Explicit scene instructions take priority' in block
+    assert 'wardrobe' in block and 'weather' in block and 'prop states' in block
+
+
+def test_protagonist_reference_prompt_receives_era_and_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    factory = _RecordingFactory()
+    monkeypatch.setattr(artist, 'AgentFactory', lambda: factory)
+    artist._generate_image_from_scratch('s', 'p', {
+        'name': 'Мальчик', 'historical_period': '1920-е годы',
+        'environment_context': 'Москва, заснеженный двор без автомобилей',
+    }, str(tmp_path / 'hero.png'), 'workflow')
+    task = factory.calls[0]['task']
+    assert '1920-е годы' in task
+    assert 'заснеженный двор без автомобилей' in task

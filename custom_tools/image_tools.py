@@ -421,13 +421,23 @@ def _b64_from_images_api_item(item: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _adapt_gpt_image_request(payload: Dict[str, Any]) -> None:
+    if payload.get("model", "").rsplit("/", 1)[-1] != "gpt-image-2":
+        return
+    payload.pop("response_format", None)
+    negative = payload.pop("negative_prompt", "")
+    if negative:
+        payload["prompt"] += f"\n\nИсключить: {negative}"
+
+
 def generate_image_tool(
     prompt: str,
     session_id: str,
     number: int,
     negative_prompt: str = "",
     width: int = 1920,
-    height: int = 1080,
+    height: int = 1088,
+    seed: Optional[int] = None,
 ) -> str:
     """Генерация изображения (txt2img): только TEXT2IMAGE_MODEL, POST .../images/generations.
 
@@ -439,7 +449,8 @@ def generate_image_tool(
         number: Номер изображения
         negative_prompt: Негативный промпт (что НЕ должно быть в изображении) СТРОГО НА АНГЛИЙСКОМ ЯЗЫКЕ
         width: Ширина изображения (по умолчанию 1920)
-        height: Высота изображения (по умолчанию 1080)
+        height: Высота изображения (по умолчанию 1088)
+        seed: Общее число проекта для воспроизводимости генерации.
     Returns:
         str: Имя файла, в который сохранено изображение или сообщение об ошибке
     """
@@ -465,8 +476,11 @@ def generate_image_tool(
         "response_format": "b64_json",
         "size": f"{int(width)}x{int(height)}",
     }
+    if seed is not None:
+        payload["seed"] = seed
     if negative_prompt:
         payload["negative_prompt"] = negative_prompt
+    _adapt_gpt_image_request(payload)
 
     session = requests.Session()
     try:
@@ -478,7 +492,7 @@ def generate_image_tool(
         )
 
         try:
-            response = session.post(url, json=payload, timeout=120)
+            response = session.post(url, json=payload, timeout=1200)
         except requests.exceptions.RequestException as e:
             return f"Ошибка сетевого запроса API изображений: {str(e)}"
 
@@ -487,6 +501,8 @@ def generate_image_tool(
 
         try:
             response_json = response.json()
+            if isinstance(response_json, dict) and response_json.get("error"):
+                return f"Ошибка API изображений: {response_json['error']}"
             item = response_json["data"][0]
             b64_data = _b64_from_images_api_item(item)
             if not b64_data:
@@ -874,17 +890,18 @@ def _edit_image_vse_post_edits_multipart(
         data["negative_prompt"] = negative_prompt
     if seed is not None:
         data["seed"] = str(seed)
+    _adapt_gpt_image_request(data)
 
     return requests.post(
         url_edits,
         headers={"Authorization": f"Bearer {api_key}", "X-Title": "MultiAgents Image Edit"},
         files=files,
         data=data,
-        timeout=(30, 600),
+        timeout=(30, 1200),
     )
 
 
-def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, output_path: str = None, seed: int = None, negative_prompt: str = "", width: int = 1920, height: int = 1080) -> str:
+def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, output_path: str = None, seed: int = None, negative_prompt: str = "", width: int = 1920, height: int = 1088) -> str:
     """Редактирование изображения (img2img): только IMG2IMG_MODEL (или VSEGPT_IMG2IMG_MODEL).
 
     Сначала POST .../images/edits (multipart); если шлюз отвечает 404 «No image edit route» для этой
@@ -959,6 +976,7 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
 
             for idx in range(2, min(len(encoded_images), 10) + 1):
                 payload[f"image{idx}_url"] = f"data:image/jpeg;base64,{encoded_images[idx - 1]}"
+            _adapt_gpt_image_request(payload)
 
             session = requests.Session()
             try:
@@ -967,7 +985,7 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
                     "Authorization": f"Bearer {api_key}",
                     "X-Title": "MultiAgents Image Edit",
                 })
-                return session.post(url_gen, json=payload, timeout=180)
+                return session.post(url_gen, json=payload, timeout=1200)
             finally:
                 close = getattr(session, "close", None)
                 if callable(close):
@@ -994,6 +1012,8 @@ def edit_image_vse_tool(prompt: str, image_paths: List[str], session_id: str, ou
         if response.status_code == 200:
             # Получаем base64 строку из ответа
             response_json = response.json()
+            if isinstance(response_json, dict) and response_json.get("error"):
+                return f"Ошибка API изображений: {response_json['error']}"
             item = response_json["data"][0]
             b64_data = _b64_from_images_api_item(item)
             if not b64_data:

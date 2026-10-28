@@ -8,6 +8,8 @@ import hashlib
 import uuid
 from typing import Any, Dict, List
 from datetime import datetime
+from pathlib import Path
+from custom_tools.storybook.timeline_media import timeline_items, decorate_timeline
 from .timing_utils import _calculate_shot_durations_from_timestamps, _calculate_total_duration, _time_str_to_seconds
 import logging
 
@@ -22,6 +24,8 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
     import hashlib
     import uuid
     
+    from ..video_plan import apply_video_plan
+    shots_items = timeline_items(apply_video_plan(project_id, shots_items))
     # Создаем корневой элемент
     fcpxml = ET.Element("fcpxml", version="1.11")
     
@@ -72,7 +76,7 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
         shot_num = shot_item.get("shot_number", 1)
         
         # Путь к видеофайлу
-        video_path = f"plots/storybooks/{project_id}/97_shots/{shot_key}/video_final_{scene_num:02d}_{shot_num:02d}.mp4"
+        video_path = shot_item.get("video_path") or f"plots/storybooks/{project_id}/97_shots/{shot_key}/video_final_{scene_num:02d}_{shot_num:02d}.mp4"
         video_asset_name = f"video_final_{scene_num:02d}_{shot_num:02d}"
         video_uid = generate_uid(video_path)
         
@@ -111,7 +115,7 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
             asset_video, "media-rep",
             kind="original-media",
             sig=video_uid,
-            src=f"file://{os.path.abspath(video_path)}"
+            src=Path(video_path).resolve().as_uri()
         )
         
         asset_map[shot_key] = {"asset_id": asset_id, "format_id": format_id}
@@ -211,6 +215,7 @@ def _generate_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], fcpxml_
     ET.SubElement(smart_collection_favorites, "match-ratings", value="favorites")
     
     # Форматируем и сохраняем
+    decorate_timeline(fcpxml, fcpxml_path, project_id, shots_items)
     tree = ET.ElementTree(fcpxml)
     ET.indent(tree, space="    ")
     
@@ -238,6 +243,8 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
     import hashlib
     import uuid
     
+    from ..video_plan import photo_items_for_plan
+    shots_items = timeline_items(photo_items_for_plan(project_id, shots_items))
     # Создаем корневой элемент
     fcpxml = ET.Element("fcpxml", version="1.11")
     
@@ -332,7 +339,7 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
         shot_num = start_shot.get("shot_number", 1)
         
         # Asset для start изображения (как в старой версии - сначала start)
-        start_path = f"plots/storybooks/{project_id}/97_shots/{shot_key}/img_final_start_{scene_num:02d}_{shot_num:02d}.png"
+        start_path = start_shot.get("output_path") or f"plots/storybooks/{project_id}/97_shots/{shot_key}/img_final_start_{scene_num:02d}_{shot_num:02d}.png"
         start_asset_name = f"img_final_start_{scene_num:02d}_{shot_num:02d}"
         start_uid = generate_uid(start_path)
         
@@ -357,14 +364,14 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             asset_start, "media-rep",
             kind="original-media",
             sig=start_uid,
-            src=f"file://{os.path.abspath(start_path)}"
+            src=Path(start_path).resolve().as_uri()
         )
         
         asset_map[shot_key] = {"start": asset_id}
         asset_id += 1
         
         # Asset для end изображения
-        end_path = f"plots/storybooks/{project_id}/97_shots/{shot_key}/img_final_end_{scene_num:02d}_{shot_num:02d}.png"
+        end_path = end_shot.get("output_path") or f"plots/storybooks/{project_id}/97_shots/{shot_key}/img_final_end_{scene_num:02d}_{shot_num:02d}.png"
         end_asset_name = f"img_final_end_{scene_num:02d}_{shot_num:02d}"
         end_uid = generate_uid(end_path)
         
@@ -387,7 +394,7 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             asset_end, "media-rep",
             kind="original-media",
             sig=end_uid,
-            src=f"file://{os.path.abspath(end_path)}"
+            src=Path(end_path).resolve().as_uri()
         )
         
         asset_map[shot_key]["end"] = asset_id
@@ -465,15 +472,15 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             ref=f"r{asset_map[shot_key]['start']}",
             offset=f"{current_offset}s",
             name=start_video_name,
-            start="21599800/6000s",
+            start="0s",
             duration=start_duration_6000
         )
         
         # Добавляем keyword для start
         keyword_start = ET.SubElement(
             video_start, "keyword",
-            start="3600s",
-            duration="10s",
+            start="0s",
+            duration=start_duration_6000,
             value=f"scene_{scene_num:02d}_shot_{shot_num:02d}"
         )
         
@@ -520,15 +527,15 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
             ref=f"r{asset_map[shot_key]['end']}",
             offset=f"{int(end_offset * 6000)}/6000s",
             name=end_video_name,
-            start="3600s",
+            start="0s",
             duration=end_duration_6000
         )
         
         # Добавляем keyword для end
         keyword_end = ET.SubElement(
             video_end, "keyword",
-            start="3600s",
-            duration="10s",
+            start="0s",
+            duration=end_duration_6000,
             value=f"scene_{scene_num:02d}_shot_{shot_num+1:02d}"
         )
         
@@ -554,6 +561,7 @@ def _generate_photo_fcpxml(project_id: str, shots_items: List[Dict[str, Any]], f
     ET.SubElement(smart_collection_favorites, "match-ratings", value="favorites")
     
     # Форматируем и сохраняем
+    decorate_timeline(fcpxml, fcpxml_path, project_id, shots_items)
     tree = ET.ElementTree(fcpxml)
     ET.indent(tree, space="    ")
     

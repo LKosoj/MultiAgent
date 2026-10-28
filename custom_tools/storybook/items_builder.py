@@ -132,8 +132,9 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
         
         # Технические параметры
         technical = pp.get("technical", {})
-        width = technical.get("width") or 1920
-        height = technical.get("height") or 1080
+        size_width, _, size_height = str(technical.get("size", "")).partition("x")
+        width = technical.get("width") or (int(size_width) if size_width.isdecimal() else 1920)
+        height = technical.get("height") or (int(size_height) if size_height.isdecimal() else 1088)
         
         # Собираем все референс-пути
         references = pp.get("references", {}) or {}
@@ -151,6 +152,7 @@ def items_for_artist_tool(session_id: str, project_id: str, language: str) -> st
         item = {
             "project_id": project_id,
             "page_number": page,
+            "style_id": pp.get("style_id"),
             # базовое изображение теперь единое: герой
             "image_path": protagonist_base if os.path.exists(protagonist_base) else None,
             "english_prompt": pp.get("english_prompt", ""),

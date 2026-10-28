@@ -4,6 +4,18 @@ category: "storybook"
 source_type: custom_function
 implementation_source: custom_tools.storybook.video_generator_aitunnel_tool.video_generator_aitunnel_tool
 parameters:
+  - name: "retry_cycles"
+    type: "int"
+    description: "Число циклов основной и резервной модели; по умолчанию AITUNNEL_VIDEO_RETRY_CYCLES"
+    required: false
+  - name: "fallback_model"
+    type: "str"
+    description: "Резервная модель; по умолчанию AITUNNEL_VIDEO_FALLBACK_MODEL"
+    required: false
+  - name: "shot_keys"
+    type: "list"
+    description: "Обрабатывать только указанные выходные ключи scene-shot"
+    required: false
   - name: "session_id"
     type: "str"
     description: "Идентификатор сессии для трассировки выполнения"
