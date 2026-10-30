@@ -49,3 +49,7 @@ parameters:
     description: "Если True — выполняет QA/repair, но НЕ сохраняет shots.json/report на диск"
     required: false
 
+  - name: review_findings
+    type: list
+    description: "Замечания по изображениям с scene_number, shot_number, shot_type, observed и required"
+    required: false

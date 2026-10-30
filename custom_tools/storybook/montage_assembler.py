@@ -123,6 +123,10 @@ def montage_assembler_tool(
         errors.append(f"Missing video clips: {len(missing_clips)}")
     if blocked_media_paths:
         errors.append(f"Blocked video paths outside project: {len(blocked_media_paths)}")
+    from .continuity_review import continuity_acceptance
+    continuity_check = continuity_acceptance(base_dir, 'videos')
+    if not continuity_check['passed']:
+        errors.append(f"Visual continuity acceptance required: {continuity_check}")
 
     manifest_read_error = audio_artifacts.get("audio_manifest_read_error")
     if manifest_read_error:
@@ -217,6 +221,7 @@ def montage_assembler_tool(
             warnings=warnings,
             ffprobe_available=bool(ffprobe_bin),
         )
+        final_review['checks']['continuity'] = continuity_check
     except Exception as exc:
         errors.append(f"Montage assembly failed: {exc}")
         final_review = None

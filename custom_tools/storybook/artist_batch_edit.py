@@ -867,7 +867,8 @@ def _background_reference_binding(
     location_paths = set(location_paths) | {path for path in reference_paths if "/locations/" in path}
     kept = [path for path in reference_paths if path not in location_paths and os.path.abspath(path) != os.path.abspath(sheet)]
     location_index = next((index for index, path in enumerate(reference_paths) if path in location_paths), None)
-    continuity = [path for path in kept if "/97_shots/" in path]
+    continuity = [path for path in kept if "/97_shots/" in path
+                  or (item.get("_continuity_edit_findings") and os.path.abspath(path) == os.path.abspath(item.get("output_path") or ""))]
     character_basenames = {
         os.path.basename(str(character.get("reference_image_path") or ""))
         for character in item.get("characters") or [] if isinstance(character, dict)
@@ -881,6 +882,8 @@ def _background_reference_binding(
     kept = continuity + characters + other[:max_count - len(continuity) - len(characters) - 1]
     if location_index is not None:
         insert_at = min(location_index, len(kept))
+        if item.get("_continuity_edit_findings"):
+            insert_at = max(1, insert_at)
         paths = kept
         paths.insert(min(insert_at, max_count - 1, len(paths)), sheet)
     else:
@@ -1156,9 +1159,19 @@ def _handle_linked_shot(item: Dict[str, Any]) -> bool:
         item["link_copy_failed"] = True
         return False
 
-    # Проверяем, нужно ли копировать
+    from .continuity import current_continuity_image, image_continuity_hash
     copy_needed = False
-    if not os.path.exists(target_path):
+    if image_continuity_hash(item) is not None and not current_continuity_image(item):
+        base = safe_storybook_project_dir(item['project_id'])
+        from .video_plan import select_image_items
+        source_items = select_image_items(item['project_id'], json.loads((base / '97_shots/shots.json').read_text())['items'])
+        source_item = next((frame for frame in source_items
+                            if os.path.abspath(str(frame.get('output_path', ''))) == os.path.abspath(source_path)), None)
+        if not source_item or not current_continuity_image(source_item):
+            item['link_copy_failed'] = True
+            return False
+        copy_needed = True
+    elif not os.path.exists(target_path):
         logger.info(f"📁 Target файл отсутствует, копируем: {os.path.basename(target_path)}")
         copy_needed = True
     else:
@@ -1279,6 +1292,13 @@ def _build_edit_instruction(
             abs_reference_paths.append(ref_path)
     
     reference_paths = abs_reference_paths
+    edit_findings = item.get("_continuity_edit_findings") or []
+    if edit_findings:
+        base = os.path.abspath(item["output_path"])
+        if not os.path.isfile(base):
+            raise FileNotFoundError(f"Continuity edit base not found: {base}")
+        reference_paths = [base] + [path for path in reference_paths if os.path.abspath(path) != base]
+
     location_basenames = {
         os.path.basename(str(location.get("reference_image_path") or ""))
         for location in (item.get("locations") or [])
@@ -1290,9 +1310,15 @@ def _build_edit_instruction(
     }
     background_note = ""
     if isinstance(item.get("background_reference"), dict):
-        reference_paths, background_note = _background_reference_binding(
-            item, reference_paths, language, location_paths
-        )
+        if edit_findings:
+            sheet = str(item["background_reference"].get("sheet_path") or "")
+            reference_paths = [path for path in reference_paths
+                               if path not in location_paths and "/locations/" not in path
+                               and (not sheet or os.path.abspath(path) != os.path.abspath(sheet))]
+        else:
+            reference_paths, background_note = _background_reference_binding(
+                item, reference_paths, language, location_paths
+            )
     
     # Логируем исправленные пути к референсам для отладки
     if reference_paths:
@@ -1368,7 +1394,10 @@ def _build_edit_instruction(
     # Применяем умный отбор
     if len(reference_only_paths) > 10:
         logger.info(f"🎯 Применяем умный отбор из {len(reference_only_paths)} референсов для типа '{entity_type}'")
-        if item.get("_blockout_ref_position"):
+        if edit_findings:
+            reference_only_paths = reference_only_paths[:1] + _smart_select_references_for_generation(
+                entity_type, entity_data, reference_only_paths[1:], max_count=9)
+        elif item.get("_blockout_ref_position"):
             # ТЗ §11.2.1: носитель обстановки (позиция 1) и опорный кадр болванки (позиция 2)
             # закреплены и исключаются из отбора; лимит для остальных снижается до 8.
             pinned_count = min(2, len(reference_only_paths))
@@ -1383,6 +1412,14 @@ def _build_edit_instruction(
                 entity_type, entity_data, reference_only_paths, max_count=10
             )
     
+    if edit_findings:
+        limit = 4 if (os.getenv("IMG2IMG_MODEL") or os.getenv("VSEGPT_IMG2IMG_MODEL") or "").strip() == "llmgateway/gpt-image-2" else 10
+        if len(reference_only_paths) > limit:
+            reference_only_paths = [reference_only_paths[0]] + [path for path in reference_only_paths[1:]
+                                    if "/97_shots/" not in path]
+            reference_only_paths = reference_only_paths[:limit]
+        if len(reference_only_paths) > limit:
+            raise ValueError("Continuity edit references exceed image limit")
     paths_list = reference_only_paths
     images_count = len(paths_list)
     ref_count = len(reference_only_paths)
@@ -1401,17 +1438,32 @@ def _build_edit_instruction(
     
     logger.info(f"🎨 Создаем изображение используя ТОЛЬКО {ref_count} референсных изображений (без базового):")
     
-    prompt_item = item
-    if background_note:
-        scene_prompt = _replace_stale_background_reference_roles(
-            scene_prompt, paths_list, item, language, str(item["background_reference"].get("sheet_path") or "")
-        )
-        prompt_item = dict(item, reference_image_paths=paths_list)
-    english_prompt, negative_prompt = _build_image_generation_prompts(prompt_item, scene_prompt, language)
-    # Используем negative_prompt из upstream/LLM-пайплайна без добавления захардкоженных semantic bans.
-    scene_negative = negative_prompt
-    if background_note:
-        english_prompt = f"{english_prompt}\n\n{background_note}".strip()
+    if edit_findings:
+        if str(language or "").lower().startswith("ru"):
+            english_prompt = ("Исправь на изображении 1 только перечисленные нарушения непрерывности. Требуемые исправления имеют приоритет: "
+                              "перемести или измени затронутые объекты и части композиции как указано. Сохрани только незатронутые "
+                              "композицию, камеру, стиль, фон и другие элементы. Другие изображения используй только "
+                              "как референсы для исправляемого элемента. " + " ".join(
+                                  f"Требуется: {finding['required']}"
+                                  for finding in edit_findings))
+        else:
+            english_prompt = ("Edit image 1 to correct only these continuity findings. Required corrections take priority: move or change affected "
+                              "objects and parts of the composition as specified. Preserve only unaffected composition, camera, "
+                              "style, background and other elements. Use other images only as references for "
+                              "the corrected element. " + " ".join(
+                                  f"Required: {finding['required']}"
+                                  for finding in edit_findings))
+        scene_negative = ""
+    else:
+        prompt_item = item
+        if background_note:
+            scene_prompt = _replace_stale_background_reference_roles(
+                scene_prompt, paths_list, item, language, str(item["background_reference"].get("sheet_path") or "")
+            )
+            prompt_item = dict(item, reference_image_paths=paths_list)
+        english_prompt, scene_negative = _build_image_generation_prompts(prompt_item, scene_prompt, language)
+        if background_note:
+            english_prompt = f"{english_prompt}\n\n{background_note}".strip()
 
     # ВНИМАНИЕ: агенту явно укажем ВЫЗВАТЬ edit_image_vse_tool с параметрами ниже
     # Промпт строго на английском.
@@ -2524,11 +2576,14 @@ def artist_agent_batch_edit_tool(
     def _worker(index: int, item: Dict[str, Any], seed: Optional[int] = None) -> Dict[str, Any]:
         # Используем language из замыкания (переменная доступна из artist_agent_batch_edit_tool)
         link_copy_failed_this_run = False
+        continuity_cache_item = dict(item)
         try:
             # Проверяем, является ли это связанным кадром (из предыдущего end кадра)
+            from .continuity import current_continuity_image, record_continuity_image
             if item.get("copy_from_previous_end", False):
                 logger.info(f"🔗 Элемент {index} связан с предыдущим end кадром, проверяем копирование")
                 if _handle_linked_shot(item):
+                    record_continuity_image(continuity_cache_item)
                     # Файл успешно скопирован или актуален
                     return {
                         "index": index,
@@ -2545,7 +2600,7 @@ def artist_agent_batch_edit_tool(
 
             # Проверяем, существует ли уже финальное изображение
             output_path = item.get("output_path", "")
-            if output_path and os.path.exists(output_path):
+            if output_path and os.path.exists(output_path) and not item.get("_continuity_edit_findings") and current_continuity_image(item):
                 logger.info(f"🖼️ Изображение уже существует: {output_path}, пропускаем генерацию")
                 return {
                     "index": index,
@@ -2566,6 +2621,7 @@ def artist_agent_batch_edit_tool(
                 w_bs = int(item.get("width", 1920))
                 h_bs = int(item.get("height", 1088))
                 _write_solid_color_png(out_bs, w_bs, h_bs, (0, 0, 0))
+                record_continuity_image(continuity_cache_item)
                 logger.info(f"⬛ BLACK SCREEN: финальный кадр без API (локальный #000000) -> {out_bs}")
                 return {
                     "index": index,
@@ -2631,6 +2687,7 @@ def artist_agent_batch_edit_tool(
                         border_style="blue"
                     )
 
+                    prior_mtime = os.stat(item['output_path']).st_mtime_ns if os.path.isfile(item.get('output_path', '')) else None
                     result = edit_image_vse_tool(
                         prompt=english_prompt,
                         image_paths=paths_list,
@@ -2655,8 +2712,9 @@ def artist_agent_batch_edit_tool(
                     file_path = item.get("output_path")
                     
                     # Проверяем, что файл действительно создан
-                    if file_path and os.path.exists(file_path):
+                    if file_path and os.path.exists(file_path) and os.stat(file_path).st_mtime_ns != prior_mtime:
                         logger.info(f"✅ Файл успешно создан на попытке {attempt}: {file_path}")
+                        record_continuity_image(continuity_cache_item)
                         return {
                             "index": index,
                             "ok": True,

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PIL import Image
 
 from custom_tools.storybook import video_plan as vp
 
@@ -55,9 +56,9 @@ def test_nonconsecutive_video_unit_is_rejected(project):
 def test_reference_identity_includes_all_images_mode_and_seed(project):
     base, _ = project
     ref = base / 'hero.png'
-    ref.write_bytes(b'first')
+    Image.new('RGB', (32, 24), 'red').save(ref)
     second = base / 'place.png'
-    second.write_bytes(b'place')
+    Image.new('RGB', (32, 24), 'blue').save(second)
     item = dict(scene_number=1, shot_number=2, video_mode='references', duration_s=7,
                 timing='00:07', video_prompt='Run', reference_image_paths=[str(ref), str(second)],
                 video_seed=0, video_resolution='480p')
@@ -66,7 +67,7 @@ def test_reference_identity_includes_all_images_mode_and_seed(project):
     assert 'frame_images' not in first
     assert len(first['input_references']) == 2
     old = vp.reference_input_hash(item, 'alibaba/wan-3.0', 42)
-    second.write_bytes(b'second')
+    Image.new('RGB', (32, 24), 'green').save(second)
     assert vp.reference_input_hash(item, 'alibaba/wan-3.0', 42) != old
     item['video_model'] = 'bytedance/seedance-2.5'
     assert vp.reference_request(item, 'alibaba/wan-3.0', 42)[0]['model'] == 'bytedance/seedance-2.5'
@@ -100,7 +101,7 @@ def test_adopted_result_is_reused_without_post(project, monkeypatch):
     from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
     base, items = project
     ref = base / 'hero.png'
-    ref.write_bytes(b'reference')
+    Image.new('RGB', (32, 24), 'red').save(ref)
     movie = base / 'approved.mp4'
     movie.write_bytes(b'existing-video')
     test = base / 'trial'
@@ -144,7 +145,7 @@ def test_reference_generation_sends_one_request_and_reuses_result(project, monke
     from custom_tools.storybook import video_generator_aitunnel_tool as generator
     from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
     base, items = project
-    (base / 'hero.png').write_bytes(b'identity')
+    Image.new('RGB', (32, 24), 'red').save(base / 'hero.png')
     (base / '97_shots/video_plan.json').write_text(json.dumps({'units': [unit(base)]}))
     item = vp.apply_video_plan('test', items)[2]
     # Existing storyboard anchors must not leak into reference-only requests.
@@ -198,10 +199,15 @@ def test_reference_prompt_binds_final_image_and_saved_style(project, monkeypatch
         return '{"video_prompt":"Use Image 2 for style; travel, then finish on Image 3."}'
 
     monkeypatch.setattr(utils, 'call_openai_api', generate)
-    prompt, refs = vp.prepare_reference_prompt(base, vp._starts(items)[1:], {}, ['hero.png'], final_image=final, style_image=style_image)
+    group = vp._starts(items)[1:]
+    group[0]['_continuity'] = {'start': {'entities': [{
+        'id': 'arch', 'name': 'Station arch', 'kind': 'landmark', 'reference_path': 'hero.png'}]}}
+    prompt, refs = vp.prepare_reference_prompt(base, group, {}, ['hero.png'], final_image=final, style_image=style_image)
     assert refs == ['hero.png', str(style_image), str(final)]
     assert json.loads(captured['prompt'])['final_image_number'] == 3
     assert json.loads(captured['prompt'])['style_image_number'] == 2
+    assert json.loads(captured['prompt'])['landmark_image_roles'] == [
+        {'entity_id': 'arch', 'name': 'Station arch', 'image_number': 1}]
     assert prompt == 'SAVED INK STYLE\n\nUse Image 2 for style; travel, then finish on Image 3.'
     assert 'not the choice of style' in captured['system_prompt']
     assert 'WRONG' not in prompt
@@ -496,7 +502,7 @@ def test_reference_submit_error_is_saved_and_not_repeated(project, monkeypatch):
     from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
     base, _ = project
     ref = base / 'hero.png'
-    ref.write_bytes(b'reference')
+    Image.new('RGB', (32, 24), 'red').save(ref)
     item = dict(scene_number=1, shot_number=2, duration_s=4, video_prompt='Run',
                 reference_image_paths=[str(ref)], video_path=str(base / 'new.mp4'))
     store = _ProviderJobStore(str(base / '97_shots/provider_jobs.json'), provider_name='routerai')
@@ -540,3 +546,29 @@ def test_reference_prompt_discovers_existing_opening_and_binds_visible_subjects(
     assert refs == ['hero.png', str(opening.resolve()), str(final.resolve())]
     assert json.loads(captured['prompt'])['initial_image_number'] == 2
     assert 'visible from the first frame' in captured['system_prompt']
+
+
+def test_router_reference_jpeg_transport_keeps_source_identity_and_aitunnel_png(project):
+    import base64
+    import io
+    base, _ = project
+    paths = [base / 'red.png', base / 'blue.png']
+    for path, color in zip(paths, ('red', 'blue')):
+        Image.new('RGB', (48, 32), color).save(path)
+    originals = [path.read_bytes() for path in paths]
+    item = dict(scene_number=1, shot_number=1, duration_s=5, video_prompt='Action',
+                reference_image_paths=list(map(str, paths)), width=48, height=32)
+    router, router_identity = vp.reference_request(item, 'model', 7, 'routerai')
+    other, other_identity = vp.reference_request(item, 'model', 7, 'aitunnel')
+    assert router_identity == other_identity
+    assert vp.reference_input_hash(item, 'model', 7, 'routerai') == vp._digest(other_identity)
+    for index, entry in enumerate(router['input_references']):
+        url = entry['image_url']['url']
+        assert url.startswith('data:image/jpeg;base64,')
+        with Image.open(io.BytesIO(base64.b64decode(url.split(',', 1)[1]))) as image:
+            assert image.format == 'JPEG' and image.size == (48, 32)
+            red, _, blue = image.getpixel((10, 10))
+            assert (red > blue) == (index == 0)
+    assert all(entry['image_url']['url'].startswith('data:image/png;base64,') for entry in other['input_references'])
+    assert [path.read_bytes() for path in paths] == originals
+    assert router['seed'] == 7 and router['prompt'] == item['video_prompt']

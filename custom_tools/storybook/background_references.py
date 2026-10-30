@@ -14,7 +14,15 @@ from custom_tools.image_tools import edit_image_vse_tool, generate_image_tool
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
 from utils import call_openai_api, parse_llm_json
 
-_BACKGROUND_REFERENCE_PLAN_VERSION = 13
+_BACKGROUND_REFERENCE_PLAN_VERSION = 16
+
+
+def _landmark_state_signature(frame):
+    continuity = frame.get("continuity") or {}
+    states = continuity.get("states") or {}
+    return tuple(sorted((entity["id"], states[entity["id"]]["id"])
+                        for entity in continuity.get("entities", [])
+                        if entity.get("kind") == "landmark"))
 
 
 def _group_identical_background_views(spaces, frames):
@@ -23,7 +31,8 @@ def _group_identical_background_views(spaces, frames):
         cards = {}
         for card in space.get("cards") or []:
             description = card["description"]
-            key = (description, frames.get(card["frame_key"], {}).get("style_id"))
+            key = (description, frames.get(card["frame_key"], {}).get("style_id"),
+                   _landmark_state_signature(frames.get(card["frame_key"], {})))
             if key not in cards:
                 cards[key] = {"frame_keys": [], "description": description}
             cards[key]["frame_keys"].append(card["frame_key"])
@@ -86,12 +95,23 @@ def _build_background_sheets(spaces, frames, styles, output_dir, skipped=None):
         raise ValueError(f"Background plan coverage is incomplete: {sorted(set(frames) - covered)}")
     sheets, bindings = [], {}
     for space_number, space in enumerate(spaces, 1):
-        cards = space.get("cards") or []
+        groups = {}
+        for card in space.get("cards") or []:
+            split = {}
+            for key in card["frame_keys"]:
+                signature = _landmark_state_signature(frames[key])
+                split.setdefault(signature, []).append(key)
+            for signature, keys in split.items():
+                groups.setdefault(signature, []).append(dict(card, frame_keys=keys))
+        chunks = [(signature, cards[offset:offset + 12]) for signature, cards in groups.items()
+                  for offset in range(0, len(cards), 12)]
         space_id = f"space_{space_number:02d}"
         previous_sheet = None
-        for offset in range(0, len(cards), 12):
-            chunk = cards[offset:offset + 12]
-            sheet_number = offset // 12 + 1
+        previous_signature = None
+        for sheet_number, (signature, chunk) in enumerate(chunks, 1):
+            if signature != previous_signature:
+                previous_sheet = None
+            previous_signature = signature
             path = str(output_dir / f"{space_id}_sheet_{sheet_number:02d}.png")
             descriptions, used_styles, locations = [], {}, []
             for card_number, card in enumerate(chunk, 1):
@@ -107,6 +127,9 @@ def _build_background_sheets(spaces, frames, styles, output_dir, skipped=None):
                             locations.append(location)
             columns = min(4, math.ceil(math.sqrt(len(chunk))))
             rows = math.ceil(len(chunk) / columns)
+            landmarks = {entity['id']: entity for card in chunk for key in card['frame_keys']
+                         for entity in (frames[key].get('continuity') or {}).get('entities', [])
+                         if entity['kind'] == 'landmark'}
             prompt = (
                 f"Создай лист из {len(chunk)} пронумерованных карточек фона: {columns} столбца, {rows} ряда, "
                 "в порядке слева направо, сверху вниз. Незаполненные ячейки последнего ряда оставь пустыми. "
@@ -115,15 +138,22 @@ def _build_background_sheets(spaces, frames, styles, output_dir, skipped=None):
                 "Лист показывает только ОДНО конкретное физическое пространство. Сохрани его устройство; "
                 "каждой карточке соответствует своя проекция камеры, свет и состояние среды. "
                 "Референсы задают устройство места, но не отменяют состояние, указанное в каждой карточке. "
-                "Во всех карточках сохраняй состав, число и взаимное расположение постоянных частей конструкции из референса. "
+                "Описание карточки задаёт кадрирование и масштаб. Сохраняй состав, число и взаимное расположение "
+                "постоянных частей конструкции, попадающих в её поле зрения; не расширяй вид ради показа всего места. "
                 "Повреждение одной части не удаляет её опоры, разделители или соседние секции; изменяй только затронутую часть. "
                 "При неизменной камере состояние среды не меняет масштаб, кадрирование или устройство окружения. "
                 "Не переноси позднее состояние среды в ранний кадр или наоборот. Внешние служебные надписи — только номера карточек. "
-                f"Место: {space.get('name', space_id)}. {space.get('layout', '')}\n\n"
+                f"Место: {space.get('name', space_id)}. Пространственный контекст (не перечень видимого): {space.get('layout', '')}\n\n"
                 + "\n".join(descriptions)
                 + "\n\nГотовые стили (не надписи на изображении):\n"
                 + "\n".join(f"{key}: {value}" for key, value in used_styles.items())
             )
+            if landmarks:
+                prompt += '\n\nОбщие ориентиры (одни и те же физические объекты во всех ракурсах):\n' + '\n'.join(
+                    f"{ident}: {entity['geometry']}" for ident, entity in landmarks.items())
+                prompt += ('\nЭталоны этих ориентиров задают неизменную конструкцию; старые общие виды '
+                           'локации дополняют окружение и не заменяют ориентир другим похожим объектом. '
+                           'Меняй только состояние материала, явно заданное конкретной карточкой.')
             if previous_sheet:
                 prompt += (
                     "\n\nImage 1 — ПРЕДЫДУЩИЙ лист этого же пространства. Создай продолжение его каталога видов, "
@@ -138,6 +168,11 @@ def _build_background_sheets(spaces, frames, styles, output_dir, skipped=None):
                 "previous_sheet": previous_sheet,
                 "width": first_frame["width"], "height": first_frame["height"],
                 "negative_prompt": "персонажи, люди, водяные знаки, логотипы",
+                "landmark_reference_paths": list(dict.fromkeys(entity['reference_path'] for entity in landmarks.values()
+                                                               if entity.get('reference_path'))),
+                "landmark_reference_roles": [dict(id=ident, name=entity.get('name', ident),
+                                                   path=entity['reference_path'])
+                                             for ident, entity in landmarks.items() if entity.get('reference_path')],
             })
             previous_sheet = path
     return sheets, bindings
@@ -169,6 +204,7 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
     screenplay = json.loads((base / "91_screenplay" / "screenplay.json").read_text(encoding="utf-8"))
     catalog = json.loads((base / "30_style" / "image_styles.json").read_text(encoding="utf-8"))
     from .style_keeper import resolve_image_style_id
+    from .continuity import frame_continuity
     locations = json.loads((base / "20_bible" / "locations.json").read_text(encoding="utf-8"))
     locations_by_name = {location["name"]: location for location in locations}
     frames = {}
@@ -190,6 +226,7 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
             "locations": [location["name"] for location in item.get("locations") or []],
             "style_id": resolve_image_style_id(catalog, _frame_key(item), item.get("locations"), item.get("style_id")),
             "width": int(item.get("width") or 1920), "height": int(item.get("height") or 1088),
+            "continuity": frame_continuity(base, item['scene_number'], item['shot_number'], item['shot_type']),
         }
     source = [{key: scene.get(key) for key in (
         "scene_number", "location_time", "action", "scene_continuity_facts", "storyboard",
@@ -201,6 +238,9 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
         for name, location in used_locations.items()
         for path in [_reference_path(base, location.get("reference_image_path"))]
     }
+    for frame in frames.values():
+        for path in frame['continuity'].get('landmark_reference_paths', []):
+            reference_hashes[path] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
     payload = {"screenplay": source, "frames": frames, "locations": used_locations, "language": language}
     input_hash = hashlib.sha256(json.dumps(
         [_BACKGROUND_REFERENCE_PLAN_VERSION, payload, used_styles, reference_hashes], ensure_ascii=False, sort_keys=True,
@@ -224,10 +264,20 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
                 for number, (name, location) in enumerate(local_payload["locations"].items(), 1)
                 if _reference_path(base, location.get("reference_image_path")).is_file()
             ]
+            landmarks = {entity['id']: entity for frame in local_payload['frames'].values()
+                         for entity in (frame.get('continuity') or {}).get('entities', [])
+                         if entity['kind'] == 'landmark' and entity.get('reference_path')}
+            reference_items += [dict(scene_number='LANDMARK', shot_number=ident, shot_type='shared geometry',
+                                     output_path=entity['reference_path']) for ident, entity in landmarks.items()]
             response = call_openai_api(
                 prompt=json.dumps(local_payload, ensure_ascii=False),
                 system_prompt=(
                     "Сначала рассмотри приложенные эталоны и зафиксируй в layout устройство постоянных составных элементов: "
+                    "continuity содержит общие идентификаторы и фиксированное устройство ориентиров. "
+                    "Эталоны LANDMARK и их geometry приоритетнее несовместимых деталей старых REFERENCE. "
+                    "Каждый LANDMARK задаёт только конструкцию своего именованного объекта; другие объекты "
+                    "на его фоне не являются эталонами. Содержимое и изменяемое состояние задаёт текущая фаза. "
+                    "Один id обозначает один физический объект с любой стороны границы; не придумывай другую конструкцию. "
                     "на сколько частей они разделены, какими опорами и разделителями, как части расположены. "
                     "Для видимого деления явно укажи число частей; общая фраза «конструкция сохранена» не заменяет описание. "
                     "Подготовь каталог уникальных осмысленных видов окружения для переданной локации и всех её появлений в сценарии, с привязками кадров. "
@@ -302,6 +352,14 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
         sheets, bindings = _build_background_sheets(plan["spaces"], frames, catalog["styles"], output_dir, plan["skipped"])
         manifest = {"version": _BACKGROUND_REFERENCE_PLAN_VERSION, "input_hash": input_hash,
                     "spaces": plan["spaces"], "skipped": plan["skipped"], "sheets": sheets, "frame_bindings": bindings}
+        previous = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+        retained = {key: value for key, value in previous.get('frame_bindings', {}).items() if key not in frames}
+        retained.update({_frame_key(item): item['background_reference']
+                         for item in json.loads(shots_path.read_text()).get('items', [])
+                         if _frame_key(item) not in frames and item.get('background_reference')})
+        manifest['frame_bindings'].update(retained)
+        retained_paths = {value['sheet_path'] for value in retained.values()}
+        manifest['sheets'] += [sheet for sheet in previous.get('sheets', []) if sheet['path'] in retained_paths]
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return dict(shots_data, _background_plan_hash=input_hash)
@@ -337,15 +395,24 @@ def storybook_background_references_tool(session_id: str, project_id: str, shots
             output = Path(sheet["path"])
             output.parent.mkdir(parents=True, exist_ok=True)
             references = [sheet["previous_sheet"]] if sheet["previous_sheet"] else []
+            references += [path for path in sheet.get('landmark_reference_paths', []) if path not in references]
+            if len(references) > 4:
+                raise ValueError('Shared landmark references exceed the image reference limit')
             references += [str(path) for name in sheet["locations"]
                            for path in [_reference_path(base, locations_by_name[name].get("reference_image_path"))]
                            if path.is_file() and str(path) not in references]
             sheet["reference_image_paths"] = references[:4]
+            prompt = sheet['prompt']
+            for role in sheet.get('landmark_reference_roles', []):
+                if role['path'] in references[:4]:
+                    prompt += (f"\nImage {references.index(role['path']) + 1}: эталон только конструкции "
+                               f"{role['id']} ({role['name']}). Другие объекты на фоне не задают канон; "
+                               "используй их собственные эталоны. Изменяемое состояние и содержимое берутся из карточки.")
             if output.is_file():
                 continue
             if references:
                 edit_image_vse_tool(
-                    session_id=session_id, prompt=sheet["prompt"], image_paths=references[:4],
+                    session_id=session_id, prompt=prompt, image_paths=references[:4],
                     output_path=str(output), width=sheet["width"], height=sheet["height"],
                     negative_prompt=sheet["negative_prompt"],
                     seed=shots_data.get("seed"),

@@ -210,6 +210,9 @@ def video_generator_aitunnel_tool(
     if not items_list:
         logger.warning("⚠️ Список items пуст")
         return _error_result("Список items пуст")
+    if project_dir and enable:
+        from .continuity_review import require_continuity_acceptance
+        require_continuity_acceptance(project_dir, 'images')
 
     if shots_file_path and project_id and (force_update_prompts or not skip_prompt_enhancement):
         description_items = items_list
@@ -1226,9 +1229,9 @@ def _generate_single_video_aitunnel(
                         "submitted_at",
                     )
             else:
-                frame_images = [_build_frame_image_payload(start_image, "first_frame")]
+                frame_images = [_build_frame_image_payload(start_image, "first_frame", provider_name)]
                 if end_image:
-                    frame_images.append(_build_frame_image_payload(end_image, "last_frame"))
+                    frame_images.append(_build_frame_image_payload(end_image, "last_frame", provider_name))
                 payload: Dict[str, Any] = {
                     "model": model_name,
                     "prompt": prompt,
@@ -1412,7 +1415,10 @@ def _resolve_video_prompt(item: Dict[str, Any], language: str) -> str:
     if language == "en" or translate_prompts_in_items is None:
         return prompt
 
-    translated_item = translate_prompts_in_items(item, "en")
+    from .shots_prompt_qa import _frame_visible_text_literals
+    literals = _frame_visible_text_literals(item.get("_shot_frame_spec") or {})
+    translation_options = {"locked_fragments_by_field": {"video_prompt": literals}} if literals else {}
+    translated_item = translate_prompts_in_items({"video_prompt": prompt}, "en", **translation_options)
     return str(translated_item.get("video_prompt", item.get("video_prompt", "")) or "").strip()
 
 

@@ -197,3 +197,60 @@ def test_shot_scope_does_not_apply_repair_to_unselected_shot(stub_llm, monkeypat
     assert result["items"][0]["english_prompt"] == "x"
     assert result["items"][1]["english_prompt"] == "fixed"
     assert result["prompts_validated"] is False
+
+
+def test_qa_reference_repair_accepts_only_existing_previous_end(tmp_path):
+    previous = tmp_path / 'previous.png'
+    previous.write_bytes(b'frame')
+    old = tmp_path / 'older.png'
+    old.write_bytes(b'frame')
+    other = tmp_path / 'other.png'
+    other.write_bytes(b'frame')
+    missing = tmp_path / 'missing.png'
+    items = [_item(1, 1, 'end'), _item(1, 3, 'end'), _item(1, 5, 'start'),
+             _item(1, 5, 'end'), _item(2, 3, 'end'), _item(2, 5, 'start')]
+    items[0]['output_path'], items[1]['output_path'], items[4]['output_path'] = str(old), str(previous), str(other)
+    def apply(scene, shot, phase, path):
+        sq._apply_repairs_to_items(items, [{'scene_number': scene, 'shot_number': shot, 'shot_type': phase,
+                                          'set': {'reference_image_paths': [str(path)]}}])
+    apply(1, 5, 'start', previous)
+    assert items[2]['reference_image_paths'] == [str(previous)]
+    items[2]['reference_image_paths'] = []
+    for path in (old, other, missing):
+        apply(1, 5, 'start', path)
+        assert not items[2]['reference_image_paths']
+    apply(1, 5, 'end', previous)
+    assert not items[3]['reference_image_paths']
+
+
+def test_previous_end_is_offered_and_shown_to_visual_audit(tmp_path, monkeypatch):
+    from PIL import Image
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    _write_screenplay(tmp_path, 'p', [_scene(1, (1, 3))])
+    base = tmp_path / 'p'
+    previous = base / 'previous.png'
+    current = base / 'current.png'
+    Image.new('RGB', (16, 16)).save(previous)
+    Image.new('RGB', (16, 16)).save(current)
+    items = [_item(1, 1, 'end'), _item(1, 3, 'start')]
+    items[0]['output_path'], items[1]['output_path'] = str(previous), str(current)
+    (base / '97_shots').mkdir()
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': items}))
+    rendered, calls = [], []
+    monkeypatch.setattr(sq, '_scene_render_review_image', lambda frames: rendered.append(frames) or 'image')
+    monkeypatch.setattr(sq, '_extract_shot_frame_spec_llm', lambda **kwargs: {})
+    def model(**kwargs):
+        calls.append(kwargs)
+        return '{"violations": []}' if 'AUDIT_INPUT:' in kwargs['prompt'] else '{"repairs": []}'
+    monkeypatch.setattr(sq, 'call_openai_api', model)
+    sq.shots_prompt_qa_tool('s', 'p', shots_data={'items': [items[1]]}, shot_keys=['1-3'], force=True, dry_run=True)
+    assert any(any(item.get('shot_type') == 'PREVIOUS_END_IDENTITY' and item['output_path'] == str(previous)
+                   for item in group) for group in rendered)
+    audit = next(call for call in calls if 'AUDIT_INPUT:' in call['prompt'])
+    assert 'only for object identity' in audit['system_prompt']
+    scene_call = next(call for call in calls if 'INPUT:\n' in call['prompt'] and 'AUDIT_INPUT:' not in call['prompt'])
+    payload = json.loads(scene_call['prompt'].split('INPUT:\n', 1)[1])
+    assert any(ref['reference_image_path'] == str(previous) for ref in payload['available_references'])
+    assert items[1]['reference_image_paths'] == []
+    previous.unlink()
+    assert sq._previous_end_paths(items) == {}

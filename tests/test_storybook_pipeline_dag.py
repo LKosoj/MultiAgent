@@ -72,7 +72,7 @@ class TestStorybookPipelineDag(unittest.TestCase):
     def test_reference_tools_resolve_through_pipeline_registry(self):
         from agent_factory import ToolRegistry
 
-        names = ["storybook_character_state_references_tool", "storybook_background_plan_tool", "storybook_background_references_tool", "video_generator_routerai_tool", "video_generator_aitunnel_tool", "storybook_video_plan_tool"]
+        names = ["storybook_character_state_references_tool", "storybook_background_plan_tool", "storybook_background_references_tool", "storybook_continuity_plan_tool", "storybook_continuity_images_review_tool", "storybook_continuity_videos_review_tool", "video_generator_routerai_tool", "video_generator_aitunnel_tool", "storybook_video_plan_tool"]
         resolved = ToolRegistry().resolve_many(names, profile_name="direct")
         self.assertEqual(set(resolved), set(names))
 
@@ -88,9 +88,13 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertIn("storybook_video_decision_log", steps)
         self.assertIn("storybook_video_preflight", steps["storybook_video_delivery_promise"].depends_on)
         self.assertIn("storybook_video_delivery_promise", steps["video_generator"].depends_on)
+        self.assertIn("storybook_continuity_videos_review", steps["montage_assembler"].depends_on)
         self.assertEqual(steps["storybook_audio_subtitle"].depends_on, ["artist_batch_shots"])
         self.assertIn("storybook_photo_montage", steps["storybook_video_preflight"].depends_on)
-        self.assertEqual(steps["storybook_photo_montage"].depends_on, ["artist_batch_shots", "storybook_sfx_generator"])
+        self.assertEqual(steps["storybook_photo_montage"].depends_on, ["artist_batch_shots", "storybook_sfx_generator", "storybook_continuity_images_review"])
+        self.assertIn("storybook_continuity_plan", steps["screenplay_shots_generator"].depends_on)
+        self.assertIn("storybook_continuity_images_review", steps["storybook_video_preflight"].depends_on)
+        self.assertIn("storybook_continuity_images_review", steps["storybook_photo_montage"].depends_on)
         self.assertEqual(
             steps["storybook_music_generator"].depends_on,
             ["storybook_audio_subtitle", "music_planner"],
@@ -98,7 +102,7 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertEqual(steps["storybook_music_generator"].condition, "{generate_screenplay}")
         self.assertEqual(steps["storybook_sfx_generator"].depends_on, ["storybook_music_generator"])
         self.assertEqual(steps["storybook_sfx_generator"].condition, "{generate_screenplay}")
-        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_sfx_generator", "video_generator"])
+        self.assertEqual(steps["montage_assembler"].depends_on, ["storybook_sfx_generator", "video_generator", "storybook_continuity_videos_review"])
         self.assertEqual(steps["storybook_video_decision_log"].depends_on, ["montage_assembler"])
 
     def test_montage_assembler_receives_audio_policy_flags(self):

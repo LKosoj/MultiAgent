@@ -116,3 +116,12 @@ def test_location_reference_does_not_copy_another_locations_weather():
     assert '1920-е годы' in prompt
     assert 'дождь, без снега и льда' in prompt
     assert 'Target location description takes priority' in prompt
+
+
+def test_individual_canon_sheet_has_face_and_full_body_views():
+    prompt = build_canon_image_prompt('character', {'name': 'Actor'}, [])
+    assert 'Face close-up' in prompt
+    assert 'FULL-BODY FRONT view, head-to-boots' in prompt
+    assert 'FULL-BODY BACK view, head-to-boots' in prompt
+    assert 'neutral solid-color background' in prompt
+    assert 'character, costume, proportions' in prompt

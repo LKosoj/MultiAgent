@@ -138,10 +138,10 @@ def build_canon_image_prompt(entity_type: str, entity_data: Dict[str, Any], cons
         
         # CHARACTER SHEET: multi-view для лучшего reference matching
         base_prompt += "\n\nFORMAT INSTRUCTION: For an individual, create a CHARACTER SHEET with multiple views of the SAME character:\n"
-        base_prompt += "1. Main view: Front-facing 3/4 portrait (head to waist)\n"
-        base_prompt += "2. Side view: Profile view showing silhouette and proportions\n"
-        base_prompt += "3. Detail view: Face close-up showing eye color, skin texture, unique features\n"
-        base_prompt += "Ensure ALL views show the EXACT SAME character with consistent features and style.\n"
+        base_prompt += "1. Face close-up, front or 3/4 view\n"
+        base_prompt += "2. FULL-BODY FRONT view, head-to-boots\n"
+        base_prompt += "3. FULL-BODY BACK view, head-to-boots\n"
+        base_prompt += "Use a neutral solid-color background. Ensure ALL views show the EXACT SAME character, costume, proportions, features and style.\n"
         base_prompt += "For a collective entity, instead create a GROUP SHEET: several members together, their shared silhouette rhythm and group poses. Preserve anonymous or indistinct faces when specified; do not replace the group with one person's portraits or close-ups.\n"
 
         base_prompt += f"\nCRITICAL INSTRUCTION: Create character '{entity_name}' with ALL these SPECIFIC features. Do NOT blend or average features from reference images. Each character MUST be visually unique and easily distinguishable."

@@ -43,8 +43,12 @@ def _validate_plan(plan, frames, expected, known):
         for state in states:
             state_id = state.get("id")
             parent = state.get("parent_id")
-            if not state_id or state_id in ids or parent not in parent_ready:
-                raise ValueError(f"Invalid character state chain for {name}")
+            if not state_id:
+                raise ValueError(f"Invalid character state chain for {name}: missing state id")
+            if state_id in ids:
+                raise ValueError(f"Invalid character state chain for {name}: duplicate or reserved id={state_id}")
+            if parent not in parent_ready:
+                raise ValueError(f"Invalid character state chain for {name}: state={state_id}, parent={parent}; parent must be defined above")
             if not state.get("appearance") or not state.get("changes") or not state.get("frame_keys"):
                 raise ValueError(f"Character state has no appearance: {name}/{state_id}")
             ids.add(state_id)
@@ -78,8 +82,16 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
     elif isinstance(shots_data, str):
         shots_data = json.loads(shots_data)
     items = shots_data.get("items") or []
+    from .continuity import ensure_landmark_references, identity_reference_path
+    ensure_landmark_references(base, session_id, shots_data.get("seed"))
     screenplay = json.loads((base / "91_screenplay" / "screenplay.json").read_text(encoding="utf-8"))
+    for scene in screenplay["screenplay"]:
+        scene.get("scene_continuity_facts", {}).pop("continuity", None)
+        if not scene.get("scene_continuity_facts"):
+            scene.pop("scene_continuity_facts", None)
     characters = json.loads((base / "20_bible" / "characters.json").read_text(encoding="utf-8"))
+    for character in characters:
+        character["reference_image_path"] = identity_reference_path(base, character, session_id, shots_data.get("seed"))
     canonical = {entry["name"]: entry for entry in characters}
     frames, expected = {}, set()
     for item in items:
@@ -99,25 +111,50 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
     manifest_path = base / "97_shots" / "character_reference_states.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else {}
     if manifest.get("input_hash") != input_hash:
-        response = call_openai_api(
-            prompt=json.dumps(payload, ensure_ascii=False),
-            system_prompt=("Спланируй только устойчивые изменения внешности персонажей на весь сценарий. "
-                "Используй текущую фазу каждого кадра, а не общие финальные поля шота. Не создавай состояния для поз, взгляда или временного действия. "
-                "changes и appearance описывают ТОЛЬКО устойчивую внешность самого героя: одежду на теле, причёску, повреждения. "
-                "Не включай туда позу, расположение рук, ракурс камеры, место, освещение, фон или предметы вокруг. "
-                "Снятая одежда в руке, на стуле или в другом месте не меняет внешность героя: такие кадры используют ОДИН референс. "
-                "Одинаковую внешность переиспользуй, даже если изменились действие, окружение или положение реквизита. "
-                "Базовое состояние — base; последующее изменение наследует ближайшее подходящее состояние, а возвращение использует прежнее состояние. "
-                "Фантазия, воспоминание и реальность могут иметь разные состояния: не переноси изменения между ними автоматически. "
-                "Снятие одежды в процессе — действие кадра; новый устойчивый вид начинается после завершения изменения. "
-                "Привязывай каждую пару кадр-персонаж ровно один раз; отсутствующих персонажей не добавляй. "
-                "Верни JSON строго вида {\"characters\":[{\"name\":\"...\",\"base_frame_keys\":[\"...\"],\"states\":[{\"id\":\"...\",\"parent_id\":\"base\",\"changes\":\"...\",\"appearance\":\"полный устойчивый результат\",\"frame_keys\":[\"...\"]}]}]}. "
-                "Пиши по-русски и не добавляй пояснений."),
-            model=model_code, max_tokens=24000, temperature=0.1, response_format={"type": "json_object"})
-        plan = parse_llm_json(response)
-        _validate_plan(plan, frames, expected, set(canonical))
+        previous_states = manifest.get("states") or {}
+        request = dict(payload)
+        if manifest.get("characters"):
+            request["existing_plan"] = {"characters": manifest["characters"]}
+            previous_pairs = {(key, actor["name"]) for actor in manifest["characters"]
+                              for key in list(actor.get("base_frame_keys") or []) + [
+                                  key for state in actor.get("states") or [] for key in state.get("frame_keys") or []]}
+            request["missing_pairs"] = sorted(expected - previous_pairs)
+            request["stale_pairs"] = sorted(previous_pairs - expected)
+        invalid_path = base / "97_shots" / "character_reference_states.invalid.json"
+        if invalid_path.is_file():
+            invalid = json.loads(invalid_path.read_text(encoding="utf-8"))
+            if invalid.get("input_hash") == input_hash:
+                request.update(candidate=invalid["candidate"], validation_error=invalid["error"])
+        for attempt in range(2):
+            response = call_openai_api(
+                prompt=json.dumps(request, ensure_ascii=False),
+                system_prompt=("Спланируй только устойчивые изменения внешности персонажей на весь сценарий. "
+                    "Используй текущую фазу каждого кадра, а не общие финальные поля шота. Не создавай состояния для поз, взгляда или временного действия. "
+                    "changes и appearance описывают ТОЛЬКО устойчивую внешность самого героя: одежду на теле, причёску, повреждения. "
+                    "Не включай туда позу, расположение рук, ракурс камеры, место, освещение, фон или предметы вокруг. "
+                    "Снятая одежда в руке, на стуле или в другом месте не меняет внешность героя: такие кадры используют ОДИН референс. "
+                    "Одинаковую внешность переиспользуй, даже если изменились действие, окружение или положение реквизита. "
+                    "Базовое состояние — base; последующее изменение наследует ближайшее подходящее состояние, а возвращение использует прежнее состояние. "
+                    "base не добавляй в states: для него есть base_frame_keys. parent_id — base или id ранее объявленного состояния этого же героя. "
+                    "Если передан existing_plan, сохраняй его IDs, точные описания и привязки при неизменной внешности; исправляй только необходимые изменения и missing_pairs/stale_pairs. "
+                    "Фантазия, воспоминание и реальность могут иметь разные состояния: не переноси изменения между ними автоматически. "
+                    "Снятие одежды в процессе — действие кадра; новый устойчивый вид начинается после завершения изменения. "
+                    "Привязывай каждую пару кадр-персонаж ровно один раз; имя обязано быть в frames[ключ].characters. "
+                    "Если переданы candidate и validation_error, исправь эту ошибку и верни полный согласованный план. "
+                    "Верни JSON строго вида {\"characters\":[{\"name\":\"...\",\"base_frame_keys\":[\"...\"],\"states\":[{\"id\":\"...\",\"parent_id\":\"base\",\"changes\":\"...\",\"appearance\":\"полный устойчивый результат\",\"frame_keys\":[\"...\"]}]}]}. "
+                    "Пиши по-русски и не добавляй пояснений."),
+                model=model_code, max_tokens=24000, temperature=0.1, response_format={"type": "json_object"})
+            plan = parse_llm_json(response)
+            try:
+                _validate_plan(plan, frames, expected, set(canonical))
+                break
+            except ValueError as exc:
+                _write_json(invalid_path, {"input_hash": input_hash, "candidate": plan, "error": str(exc)})
+                if attempt == 1:
+                    raise
+                request = dict(request, candidate=plan, validation_error=str(exc))
         manifest = {"version": _CHARACTER_REFERENCE_PLAN_VERSION, "input_hash": input_hash,
-                    "characters": plan["characters"], "states": {}}
+                    "characters": plan["characters"], "states": previous_states}
         _write_json(manifest_path, manifest)
     else:
         plan = {"characters": manifest.get("characters") or []}
@@ -133,19 +170,29 @@ def storybook_character_state_references_tool(session_id: str, project_id: str, 
             key = (name, state["id"])
             record = manifest.setdefault("states", {}).get(f"{name}:{state['id']}", {})
             parent = state_lookup[(name, state["parent_id"])]
-            output = Path(record.get("reference_image_path") or (base / "20_bible" / "scene_character_references" / input_hash[:12] / "characters" / f"character_{ordinal[name]:02d}_state_{number:02d}.png"))
             prompt = ("Создай нейтральный референс персонажа. Сохрани личность, неизменные черты, пропорции и стиль исходного референса. "
+                      "Сохрани состав ракурсов и компоновку исходного листа, не превращай его в один портрет. "
                       "Свободные руки, без сцены и временного реквизита. Устойчивое изменение и итоговый вид: " + state["changes"] + "\n" + state["appearance"])
-            if not output.is_file():
+            parent_hash = hashlib.sha256(Path(parent["reference_image_path"]).read_bytes()).hexdigest()
+            reusable = (record.get("parent_id") == state["parent_id"]
+                        and record.get("changes") == state["changes"] and record.get("appearance") == state["appearance"]
+                        and record.get("reference_image_paths") == [parent["reference_image_path"]]
+                        and record.get("parent_hash", parent_hash) == parent_hash)
+            regenerate = bool(record) and not reusable
+            if not reusable:
+                record = {}
+            output = Path(record.get("reference_image_path") or (base / "20_bible" / "scene_character_references" / input_hash[:12] / "characters" / f"character_{ordinal[name]:02d}_state_{number:02d}.png"))
+            if regenerate or not output.is_file():
                 output.parent.mkdir(parents=True, exist_ok=True)
+                previous_mtime = output.stat().st_mtime_ns if output.is_file() else None
                 edit_image_vse_tool(prompt=prompt, image_paths=[parent["reference_image_path"]], session_id=session_id,
                                     output_path=str(output), width=frames[state["frame_keys"][0]]["width"], height=frames[state["frame_keys"][0]]["height"],
                                     negative_prompt="водяные знаки, логотипы, надписи", seed=shots_data.get("seed"))
-                if not output.is_file():
+                if not output.is_file() or output.stat().st_mtime_ns == previous_mtime:
                     raise RuntimeError(f"Character reference was not generated: {output}")
             record = {"state_id": state["id"], "parent_id": state["parent_id"], "reference_image_path": str(output),
                       "appearance": state["appearance"], "changes": state["changes"], "frame_keys": state["frame_keys"], "prompt": prompt,
-                      "reference_image_paths": [parent["reference_image_path"]]}
+                      "reference_image_paths": [parent["reference_image_path"]], "parent_hash": parent_hash}
             manifest["states"][f"{name}:{state['id']}"] = record
             state_lookup[key] = record
     _write_json(manifest_path, manifest)

@@ -332,6 +332,8 @@ def storybook_photo_montage_tool(session_id: str, project_id: str, enable: bool 
         return {"status": "skipped"}
     from custom_tools.storybook.screenplay_shots_generator_utils.fcpxml_generator import _generate_fcpxml, _generate_photo_fcpxml
     base = safe_storybook_project_dir(project_id)
+    from .continuity_review import require_continuity_acceptance
+    require_continuity_acceptance(base, 'images')
     items = _read_json(base / "97_shots/shots.json", {})["items"]
     phases = {}
     for item in items:
