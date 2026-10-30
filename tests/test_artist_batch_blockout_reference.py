@@ -519,3 +519,84 @@ class TestMoreThanTenReferencesKeepsPinnedPositions(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_continuity_edit_uses_base_first_and_correct_background_number(tmp_path, monkeypatch):
+    monkeypatch.setenv('IMG2IMG_MODEL', 'llmgateway/gpt-image-2')
+    base = _touch(str(tmp_path / 'frame.png'))
+    location = _touch(str(tmp_path / 'locations' / 'location.png'))
+    character = _touch(str(tmp_path / 'characters' / 'actor.png'))
+    sheet = _touch(str(tmp_path / 'sheet.png'))
+    previous = _touch(str(tmp_path / '97_shots' / 'previous.png'))
+    second = _touch(str(tmp_path / 'characters' / 'second.png'))
+    item = {'output_path': base, 'reference_image_paths': [previous, location, character, second],
+            'locations': [{'reference_image_path': location}], 'characters': [{'name': 'actor', 'reference_image_path': character}, {'name': 'second', 'reference_image_path': second}],
+            'background_reference': {'sheet_path': sheet, 'card_number': 2},
+            'english_prompt': 'old full prompt', 'negative_prompt': 'obsolete restriction', 'width': 64, 'height': 64,
+            '_continuity_edit_findings': [{'observed': 'wrong position', 'required': 'correct position'}]}
+    _, paths, negative, prompt = _build_edit_instruction('s', item, None, 'en')
+    assert negative == '' and 'obsolete restriction' not in prompt
+    assert paths == [base, previous, character, second]
+    assert sheet not in paths and location not in paths
+    assert 'background reference sheet' not in prompt
+    assert 'correct position' in prompt and 'Required corrections take priority' in prompt
+    assert 'wrong position' not in prompt
+    assert 'old full prompt' not in prompt
+    assert 'only as references for the corrected element' in prompt
+    assert 'Preserve only unaffected composition, camera, style, background' in prompt
+    assert 'only for the current frame\'s background layout' not in prompt
+    assert 'CHARACTER IDENTITY' not in prompt
+    _, russian_paths, _, russian_prompt = _build_edit_instruction('s', item, None, 'ru')
+    assert russian_paths == paths
+    assert 'Исправь на изображении 1' in russian_prompt
+    assert 'Требуемые исправления имеют приоритет' in russian_prompt
+    assert 'Сохрани только незатронутые композицию, камеру, стиль, фон' in russian_prompt
+    assert 'лист референсов фона' not in russian_prompt
+    assert 'Edit image 1' not in russian_prompt
+    assert 'wrong position' not in russian_prompt
+
+
+def test_continuity_edit_bypasses_current_image_cache(tmp_path, monkeypatch):
+    import custom_tools.storybook.artist_batch_edit as artist
+    import custom_tools.storybook.continuity as continuity
+    base = _touch(str(tmp_path / 'frame.png'))
+    reference = _touch(str(tmp_path / 'ref.png'))
+    calls = []
+    monkeypatch.setattr(continuity, 'current_continuity_image', lambda item: True)
+    monkeypatch.setattr(continuity, 'record_continuity_image', lambda item: None)
+    def edit(**kwargs):
+        calls.append(kwargs)
+        Path(kwargs['output_path']).write_bytes(b'edited')
+        return kwargs['output_path']
+    monkeypatch.setattr(artist, 'edit_image_vse_tool', edit)
+    item = {'output_path': base, 'reference_image_paths': [reference], 'english_prompt': 'old',
+            'width': 64, 'height': 64, '_continuity_edit_findings': [{'observed': 'wrong', 'required': 'right'}]}
+    result = json.loads(artist.artist_agent_batch_edit_tool('s', {'items': [item]}, max_concurrency=1, language='en'))
+    assert result[0]['ok'] and len(calls) == 1
+    assert calls[0]['image_paths'][0] == base
+    assert Path(base).read_bytes() == b'edited'
+
+
+def test_continuity_edit_trims_references_to_provider_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv('IMG2IMG_MODEL', 'llmgateway/gpt-image-2')
+    base = _touch(str(tmp_path / 'frame.png'))
+    refs = [_touch(str(tmp_path / f'ref{n}.png')) for n in range(4)]
+    item = {'output_path': base, 'reference_image_paths': refs, 'english_prompt': 'old',
+            '_continuity_edit_findings': [{'observed': 'wrong', 'required': 'correct'}]}
+    _, paths, _, _ = _build_edit_instruction('s', item, None, 'en')
+    assert len(paths) == 4
+
+
+def test_continuity_edit_drops_optional_previous_only_when_over_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv('IMG2IMG_MODEL', 'llmgateway/gpt-image-2')
+    base = _touch(str(tmp_path / '97_shots' / 'current.png'))
+    previous = _touch(str(tmp_path / '97_shots' / 'previous.png'))
+    master = _touch(str(tmp_path / 'master.png'))
+    actors = [_touch(str(tmp_path / f'actor{n}.png')) for n in range(2)]
+    item = {'output_path': base, 'reference_image_paths': [master, previous] + actors,
+            '_continuity_edit_findings': [{'observed': 'wrong', 'required': 'correct'}]}
+    _, paths, _, _ = _build_edit_instruction('s', item, None, 'ru')
+    assert paths == [base, master] + actors
+    item['reference_image_paths'] = [master, previous, actors[0]]
+    _, paths, _, _ = _build_edit_instruction('s', item, None, 'ru')
+    assert paths == [base, master, previous, actors[0]]

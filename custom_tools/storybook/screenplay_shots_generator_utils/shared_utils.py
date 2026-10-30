@@ -1135,6 +1135,9 @@ def black_screen_storyboard_shot(
     """
     cp = (camera_plan or "").strip()
     spec = shot_frame_spec if isinstance(shot_frame_spec, dict) else {}
+    states = (spec, spec.get("start_state_spec"), spec.get("end_state_spec"))
+    if any(isinstance(state, dict) and state.get("visible_characters") for state in states):
+        return False
     anchor = str(spec.get("camera_anchor") or "").strip()
     raw_must = spec.get("must_show") or []
     if not isinstance(raw_must, list):
@@ -1181,16 +1184,16 @@ def black_screen_storyboard_shot(
         response_format={"type": "json_object"},
     )
     obj = parse_llm_json(response)
-    if not isinstance(obj, dict) or "is_black_screen" not in obj:
+    if not isinstance(obj, dict) or not isinstance(obj.get("is_black_screen"), bool):
         # M-24: невалидный ответ классификатора НЕ должен валить всю сцену.
         # Мягкий guard: считаем шот НЕ-чёрным (консервативно генерируем кадр)
         # и НЕ кэшируем фолбэк, чтобы следующий вызов попробовал заново.
         logger.warning(
-            f"black_screen_storyboard_shot: LLM вернула невалидный JSON без поля "
+            f"black_screen_storyboard_shot: LLM вернула невалидный JSON без булевого поля "
             f"is_black_screen, fallback=False: {response!r}"
         )
         return False
-    result = bool(obj.get("is_black_screen"))
+    result = obj["is_black_screen"]
 
     with _BLACK_SCREEN_DETECTION_LOCK:
         _BLACK_SCREEN_DETECTION_CACHE[cache_key] = result

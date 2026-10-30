@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import requests
+from PIL import Image
 
 from custom_tools.storybook import video_plan as vp
 from custom_tools.storybook import video_generator_aitunnel_tool as generator
@@ -15,7 +16,7 @@ MODELS = ('vendor/main-video', 'vendor/backup-video')
 @pytest.fixture(params=['routerai', 'aitunnel'])
 def setup(tmp_path, monkeypatch, request):
     ref = tmp_path / 'hero.png'
-    ref.write_bytes(b'image')
+    Image.new('RGB', (32, 24), 'red').save(ref)
     item = dict(scene_number=1, shot_number=1, video_mode='references', video_prompt='Move',
                 duration_s=4, video_path=str(tmp_path / 'new.mp4'), reference_image_paths=[str(ref)])
     store = _ProviderJobStore(str(tmp_path / 'provider_jobs.json'), provider_name=request.param)

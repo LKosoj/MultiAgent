@@ -1,4 +1,5 @@
 import json
+import copy
 import base64
 import io
 import hashlib
@@ -591,11 +592,30 @@ def _video_prompt_has_unexpected_cyrillic(prompt: str, frame_spec: Dict[str, Any
     return bool(re.search(r"[А-Яа-яЁё]", prose))
 
 
+def _previous_end_paths(items):
+    shots = {}
+    ends = {}
+    for item in items:
+        scene, shot = _safe_int(item.get("scene_number")), _safe_int(item.get("shot_number"))
+        shots.setdefault(scene, set()).add(shot)
+        if str(item.get("shot_type") or "start").lower() == "end":
+            ends[(scene, shot)] = str(item.get("output_path") or "")
+    result = {}
+    for scene, numbers in shots.items():
+        ordered = sorted(numbers)
+        for previous, current in zip(ordered, ordered[1:]):
+            path = ends.get((scene, previous), "")
+            if os.path.isfile(path):
+                result[(scene, current)] = path
+    return result
+
+
 def _apply_repairs_to_items(
     items: List[Dict[str, Any]],
     repairs: List[Dict[str, Any]],
     storyboard_lookup: Optional[Dict[Tuple[int, int], Dict[str, Any]]] = None,
     image_styles: Optional[Dict[str, str]] = None,
+    previous_end_paths: Optional[Dict[Tuple[int, int], str]] = None,
 ) -> Tuple[int, List[Dict[str, Any]]]:
     """
     Applies repairs in-place to items. Returns (applied_count, rejected_repairs)
@@ -618,6 +638,7 @@ def _apply_repairs_to_items(
         except Exception:
             continue
 
+    previous_end_paths = previous_end_paths if previous_end_paths is not None else _previous_end_paths(items)
     allowed_fields = _QA_REPAIR_ITEM_FIELDS
 
     def _video_prompt_contradiction(
@@ -982,6 +1003,9 @@ def _apply_repairs_to_items(
 
                         # Include metadata updated earlier in this repair as well.
                         allow_add: set = set(known_reference_paths)
+                        previous_end = previous_end_paths.get((scene_number, shot_number)) if shot_type == "start" else None
+                        if previous_end and os.path.isfile(previous_end):
+                            allow_add.add(previous_end)
                         try:
                             for c in (target.get("characters") or []):
                                 if isinstance(c, dict):
@@ -1501,6 +1525,7 @@ def shots_prompt_qa_tool(
     force: bool = False,
     global_max_repairs: int = 0,
     dry_run: bool = False,
+    review_findings: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """
     LLM validate+repair: compares generated prompts in shots.json vs screenplay.json scene-by-scene,
@@ -1528,6 +1553,7 @@ def shots_prompt_qa_tool(
         global_max_repairs: Max number of global screenplay-level patch repairs to apply at the end.
             По умолчанию отключено, чтобы не добавлять второй поздний LLM-rewrite поверх scene-level QA.
         dry_run: If True, runs validation/repair but does NOT write shots.json/report to disk.
+        review_findings: Optional rendered-frame findings with scene_number, shot_number, shot_type, observed and required.
 
     Returns:
         Updated shots_data dict (items.json compatible). Also writes updated shots.json and a QA report to disk.
@@ -1569,6 +1595,9 @@ def shots_prompt_qa_tool(
 
     if shots_data is None:
         shots_data = _read_json(shots_path) or {"items": [], "consistency_rules": []}
+
+    saved_items = (_read_json(shots_path) or {}).get("items") or shots_data.get("items") or []
+    previous_end_paths = _previous_end_paths(saved_items)
 
     # Skip повторную валидацию, если ЗАПРОШЕННЫЕ сцены уже провалидированы (если не force).
     # M-27: per-scene coverage. Новый prompts_validated=True выставляется только при полном
@@ -1839,7 +1868,7 @@ For a change of character visibility, distinguish source-required physical exits
    Where the source names a posture, "remains on the support" is insufficient: preserve that posture as well as the support location.
 7. Multi-view location sheets: output ONE continuous frame (no collage/grid/multi-panel) unless storyboard explicitly requires split-screen.
 8. reference_image_paths: change only when strictly necessary. For END shots, continuity start frame reference (img_final_start_*.png) MUST remain.
-   When a source-required entity is missing, use its exact name/path descriptor from available_references for characters/locations and update the reference paths; do not guess file names.
+   When a source-required entity is missing, use its exact name/path descriptor from available_references for characters/locations and update the reference paths; do not guess file names. A listed previous END may be selected only for its specified START and only for object identity; current camera, pose and physical phase follow the current source.
 9. Historical appearance comes from canonical references. Remove historical-period labels, historical-accuracy demands and era-based object ban lists from english_prompt and negative_prompt; preserve current-frame weather, season, states and camera/light details.
 10. START is the beginning of this shot and END is the end of this same shot. Do not reject the shot's own later action as a neighboring event.
 11. Change primary_subject only when this shot's storyboard explicitly changes attention or the hero leaves.
@@ -2046,6 +2075,10 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 "🧪 shots_prompt_qa_tool: scene %s missing embedded scene_continuity_facts; using screenplay input or empty dict",
                 scene_number,
             )
+
+        current_continuity = (scene.get("scene_continuity_facts") or {}).get("continuity")
+        if isinstance(current_continuity, dict):
+            scene_continuity_facts = dict(scene_continuity_facts, continuity=copy.deepcopy(current_continuity))
 
         shot_frame_specs: Dict[int, Dict[str, Any]] = {}
         for sh in (scene.get("storyboard", []) or []):
@@ -2257,6 +2290,11 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 and os.path.isfile(str(item.get("output_path") or ""))
             ]
             review_items = list(pair_items)
+            previous_end = previous_end_paths.get((scene_number, shot_number))
+            if previous_end and any(item.get("shot_type") == "start" for item in scene_items
+                                    if _safe_int(item.get("shot_number")) == shot_number):
+                review_items.append(dict(scene_number=scene_number, shot_number=shot_number,
+                                         shot_type="PREVIOUS_END_IDENTITY", output_path=previous_end))
             canonical_locations = []
             seen_location_paths = set()
             for item in pair_items:
@@ -2276,6 +2314,15 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                         "shot_type": label, "output_path": reference_path,
                     })
             pair_render_review_image = _scene_render_review_image(review_items)
+            from .continuity import frame_continuity
+            continuity_contexts = {item.get('shot_type', 'start'): frame_continuity(
+                base, scene_number, shot_number, item.get('shot_type', 'start')) for item in pair_items}
+            landmark_paths = {path for context in continuity_contexts.values()
+                              for path in context.get('landmark_reference_paths', [])}
+            if landmark_paths:
+                review_items += [dict(scene_number=scene_number, shot_number=shot_number,
+                    shot_type='SHARED_LANDMARK_GEOMETRY', output_path=path) for path in sorted(landmark_paths)]
+                pair_render_review_image = _scene_render_review_image(review_items)
             if not pair_render_review_image:
                 continue
             pair_storyboard = [shot for shot in storyboard if _safe_int(shot.get("shot_number")) == shot_number]
@@ -2284,6 +2331,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 "scene_number": scene_number,
                 "scene_continuity_facts": scene_continuity_facts,
                 "canonical_locations": canonical_locations,
+                "continuity": continuity_contexts,
                 "image_styles": {
                     shot["style_id"]: bound_image_styles[shot["style_id"]]
                     for shot in pair_generated_shots if shot["style_id"]
@@ -2307,6 +2355,10 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 prompt="AUDIT_INPUT:\n" + json.dumps(visual_audit_input, ensure_ascii=False),
                 system_prompt=(
                     "You are a rendered-frame visual audit. Inspect actual labeled pixels before written promises. "
+                    "PREVIOUS_END_IDENTITY is only for object identity; current camera, pose and physical phase follow the current source. "
+                    "Continuity identifies shared physical objects across scenes. SHARED_LANDMARK_GEOMETRY and its "
+                    "fixed geometry override conflicting legacy CANONICAL_LOCATION designs. Current phase states "
+                    "govern damage, support, possession and visibility; an offscreen prop must not follow the actor. "
                     "CANONICAL_LOCATION images identify the architecture and parts of the same place. Compare required visible surviving parts with those references; do not accept an unrelated landmark as their substitute. The current source defines damage, transformations, framing and occlusion: do not copy the canonical state or require its whole inventory in the shot. "
                     "Use each frame's style_id and the saved image_styles to distinguish rendering medium from in-scene materials. Paper grain, brushwork or film grain belonging to that style is not itself a surviving story object; require identifiable object geometry or features before flagging a failed material transformation. "
                     "Compare START/END background landmark positions and scales where visible against camera travel; "
@@ -2352,6 +2404,13 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                 shot_number,
                 len(rendered_image_findings),
             )
+        from .continuity_review import pending_image_findings
+        selected_keys = {f"{item['scene_number']}-{item['shot_number']}" for item in scene_items}
+        rendered_image_findings.extend(pending_image_findings(base, selected_keys))
+        rendered_image_findings.extend(
+            finding for finding in (review_findings or [])
+            if f"{finding.get('scene_number')}-{finding.get('shot_number')}" in selected_keys
+        )
         if rendered_image_findings:
             with _report_lock:
                 report.setdefault("rendered_image_findings", []).extend(rendered_image_findings)
@@ -2364,7 +2423,13 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
             "location_canon_name": scene.get("location_canon_name"),
             "action": scene.get("action"),
             "characters": scene.get("characters"),
-            "available_references": list(available_references.values()),
+            "available_references": list(available_references.values()) + [
+                {"name": f"Previous END for {scene_number}:{shot_number}:start (object identity only)",
+                 "reference_image_path": path}
+                for (scene, shot_number), path in previous_end_paths.items()
+                if scene == scene_number and any(_safe_int(item.get("shot_number")) == shot_number
+                                                 and item.get("shot_type") == "start" for item in scene_items)
+            ],
             "scene_continuity_facts": scene_continuity_facts,
             "shot_frame_specs": shot_frame_specs,
             "storyboard": storyboard,
@@ -2532,6 +2597,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
         with _items_lock:
             applied_count, rejected = _apply_repairs_to_items(
                 items, repairs, storyboard_lookup=storyboard_lookup, image_styles=bound_image_styles,
+                previous_end_paths=previous_end_paths,
             )
 
         with _report_lock:

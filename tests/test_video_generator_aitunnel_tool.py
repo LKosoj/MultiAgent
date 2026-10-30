@@ -239,6 +239,38 @@ def test_legacy_changed_raw_prompt_is_not_confirmed(tmp_path, monkeypatch):
     assert store.find_current_job("1-1", old_hash).get("original_input_hash") is None
 
 
+def test_video_prompt_translation_excludes_image_prompts(monkeypatch):
+    captured = []
+    item = {"video_prompt": "Движение камеры", "english_prompt": "Длинный промпт изображения",
+            "negative_prompt": "Ограничения изображения"}
+
+    def translate(source, language):
+        captured.append((source, language))
+        return {"video_prompt": "Camera movement"}
+
+    monkeypatch.setattr(aitunnel_module, "translate_prompts_in_items", translate)
+    assert aitunnel_module._resolve_video_prompt(item, "ru") == "Camera movement"
+    assert captured == [({"video_prompt": "Движение камеры"}, "en")]
+    assert item["video_prompt"] == "Движение камеры"
+
+
+def test_video_prompt_translation_preserves_required_visible_text(monkeypatch):
+    import utils
+
+    item = {"video_prompt": "Напиши «ЗЕБРА»", "_shot_frame_spec": {
+        "end_state_spec": {"visible_readable_texts": ["ЗЕБРА"]}}}
+
+    def translate(texts, language):
+        assert language == "en"
+        assert "ЗЕБРА" not in texts[0]
+        return [texts[0].replace("Напиши", "Write")]
+
+    monkeypatch.setattr(utils, "_translate_texts_batch", translate)
+    monkeypatch.setattr(aitunnel_module, "translate_prompts_in_items", utils.translate_prompts_in_items)
+    assert aitunnel_module._resolve_video_prompt(item, "ru") == "Write «ЗЕБРА»"
+    assert item["video_prompt"] == "Напиши «ЗЕБРА»"
+
+
 def test_prepared_current_job_cannot_trust_old_output(tmp_path, monkeypatch):
     _patch_project_mode(monkeypatch)
     item = _make_project_item(tmp_path, 1, prompt="Current prompt")

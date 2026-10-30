@@ -735,7 +735,16 @@ def call_openai_api(prompt: str, system_prompt: str = None, max_tokens: int = 10
     
     for attempt in range(max_retries + 1):
         try:
-            response = model(messages, max_tokens=max_tokens, temperature=temperature, response_format=response_format)
+            call_model = model
+            if isinstance(getattr(model, "kwargs", None), dict):
+                from copy import copy
+                call_model = copy(model)
+                call_model.kwargs = dict(model.kwargs, max_tokens=max_tokens, temperature=temperature)
+                inner_model = getattr(model, "model", None)
+                if isinstance(getattr(inner_model, "kwargs", None), dict):
+                    call_model.model = copy(inner_model)
+                    call_model.model.kwargs = dict(inner_model.kwargs, max_tokens=max_tokens, temperature=temperature)
+            response = call_model(messages, max_tokens=max_tokens, temperature=temperature, response_format=response_format)
             
             # Проверяем, что ответ не None
             if response is None:

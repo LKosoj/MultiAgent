@@ -105,7 +105,7 @@ def test_routerai_submit_poll_download_and_reuse(project, monkeypatch, external_
     assert submits[0]["resolution"] == "720p"
     assert submits[0]["aspect_ratio"] == "16:9"
     assert [f["frame_type"] for f in submits[0]["frame_images"]] == ["first_frame", "last_frame"]
-    assert submits[0]["frame_images"][0]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert submits[0]["frame_images"][0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
     assert (shots / "clip.mp4").read_bytes() == b"mp4-result"
     job = json.loads((shots / "provider_jobs.json").read_text())["jobs"][0]
     assert (job["provider"], job["status"], job["currency"]) == ("routerai", "downloaded", "RUB")

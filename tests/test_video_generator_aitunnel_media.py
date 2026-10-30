@@ -182,3 +182,34 @@ def test_should_attach_blockout_reference_all_conditions_met(tmp_path):
 
     attach, path = _should_attach_blockout_reference(item, True, True, 6, {"size": "1920x1080"})
     assert (attach, path) == (True, str(blockout_video))
+
+
+@pytest.mark.parametrize("provider,mime", [("routerai", "image/jpeg"), ("aitunnel", "image/png")])
+@pytest.mark.parametrize("frame_type", ["first_frame", "last_frame"])
+def test_frame_transport_preserves_dimensions_role_and_source(tmp_path, provider, mime, frame_type):
+    import io
+    from PIL import Image
+    from custom_tools.storybook.video_generator_aitunnel_media import _build_frame_image_payload
+
+    source = tmp_path / "frame.png"
+    Image.new("RGB", (1920, 1088), "gray").save(source)
+    original = source.read_bytes()
+    payload = _build_frame_image_payload(str(source), frame_type, provider)
+    header, encoded = payload["image_url"]["url"].split(",", 1)
+    assert header == f"data:{mime};base64"
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as decoded:
+        assert decoded.size == (1920, 1088)
+    assert payload["frame_type"] == frame_type
+    assert source.read_bytes() == original
+
+
+def test_routerai_frame_transport_preserves_transparency_and_urls(tmp_path):
+    from PIL import Image
+    from custom_tools.storybook.video_generator_aitunnel_media import _build_frame_image_payload
+
+    source = tmp_path / "transparent.png"
+    Image.new("RGBA", (32, 32), (0, 0, 0, 0)).save(source)
+    payload = _build_frame_image_payload(str(source), "first_frame", "routerai")
+    assert payload["image_url"]["url"].startswith("data:image/png;base64,")
+    url = "https://example.com/frame.png"
+    assert _build_frame_image_payload(url, "last_frame", "routerai")["image_url"]["url"] == url

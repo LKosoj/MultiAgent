@@ -302,3 +302,42 @@ def test_missing_frame_needs_explicit_skip():
     frames = {"1:1:start": {"style_id": "ink", "locations": [], "width": 1920, "height": 1088}}
     with pytest.raises(ValueError, match="coverage"):
         bg._build_background_sheets([], frames, {"ink": {"prompt": "Ink"}}, Path("out"))
+
+
+def test_landmark_states_separate_views_and_sheets_without_fragmenting_props(tmp_path):
+    def frame(state, visible=True, prop='a'):
+        return {'style_id': 'ink', 'width': 100, 'height': 100, 'locations': [],
+                'continuity': {'entities': [{'id': 'window', 'kind': 'landmark', 'geometry': 'window'},
+                                            {'id': 'prop', 'kind': 'prop'}],
+                               'states': {'window': {'id': state, 'visible': visible}, 'prop': {'id': prop}}}}
+    frames = {'a': frame('intact'), 'b': frame('broken'), 'c': frame('intact', False, 'b')}
+    views = [{'name': 'place', 'cards': [{'frame_key': key, 'description': 'same view'} for key in frames]}]
+    grouped = bg._group_identical_background_views(views, frames)
+    assert [card['frame_keys'] for card in grouped[0]['cards']] == [['a', 'c'], ['b']]
+    mixed = [{'name': 'place', 'cards': [{'frame_keys': ['a', 'b', 'c'], 'description': 'same view'}]}]
+    sheets, bindings = bg._build_background_sheets(mixed, frames, {'ink': {'prompt': 'ink'}}, tmp_path)
+    assert len(sheets) == 2
+    assert bindings['a'] == bindings['c']
+    assert bindings['a']['sheet_path'] != bindings['b']['sheet_path']
+    assert all(sheet['previous_sheet'] is None for sheet in sheets)
+
+
+def test_sheet_chain_stays_within_state_and_missing_continuity_is_unchanged(tmp_path):
+    frames = {}
+    cards = []
+    for number in range(27):
+        key = str(number)
+        frame = {'style_id': 'ink', 'width': 100, 'height': 100, 'locations': []}
+        if number < 14:
+            frame['continuity'] = {'entities': [{'id': 'landmark', 'kind': 'landmark', 'geometry': 'shape'}],
+                                   'states': {'landmark': {'id': 'one' if number < 13 else 'two'}}}
+        frames[key] = frame
+        cards.append({'frame_keys': [key], 'description': key})
+    sheets, bindings = bg._build_background_sheets([{'cards': cards}], frames, {'ink': {'prompt': 'ink'}}, tmp_path)
+    assert [sheet['card_count'] for sheet in sheets] == [12, 1, 1, 12, 1]
+    assert sheets[1]['previous_sheet'] == sheets[0]['path']
+    assert sheets[2]['previous_sheet'] is None
+    assert sheets[3]['previous_sheet'] is None
+    assert sheets[4]['previous_sheet'] == sheets[3]['path']
+    assert len({sheet['path'] for sheet in sheets}) == 5
+    assert len(bindings) == 27

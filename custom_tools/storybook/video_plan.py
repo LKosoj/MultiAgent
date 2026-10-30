@@ -50,6 +50,9 @@ def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
 
 
 def apply_video_plan(project_id, items):
+    from .continuity import bind_continuity_to_items, unit_continuity_hash
+    base = safe_storybook_project_dir(project_id)
+    items = bind_continuity_to_items(base, items)
     path = safe_storybook_project_dir(project_id) / '97_shots/video_plan.json'
     if not path.is_file():
         return items
@@ -59,6 +62,9 @@ def apply_video_plan(project_id, items):
     replacements, covered = {}, set()
     for unit in units:
         keys = unit['shot_keys']
+        expected_continuity = unit_continuity_hash(base, keys)
+        if expected_continuity is not None and unit.get('continuity_hash') != expected_continuity:
+            raise ValueError('Video unit continuity is stale')
         positions = [order.index(k) for k in keys]
         if positions != list(range(positions[0], positions[0] + len(keys))):
             raise ValueError('Video unit must cover contiguous shots')
@@ -91,6 +97,8 @@ def apply_video_plan(project_id, items):
 
 def reference_request(item, model, seed, provider_name='routerai'):
     import base64
+    import io
+    from PIL import Image
     from .video_generator_aitunnel_media import _infer_aspect_ratio
     model = item.get('video_model') or model
     paths = item['reference_image_paths']
@@ -104,9 +112,20 @@ def reference_request(item, model, seed, provider_name='routerai'):
     if selected_seed is not None:
         payload['seed'] = selected_seed
     identity = dict(payload, mode='references', image_hashes=hashes)
-    payload['input_references'] = [{'type': 'image_url', 'image_url': {
-        'url': 'data:image/png;base64,' + base64.b64encode(Path(p).read_bytes()).decode()
-    }} for p in paths]
+    images = []
+    for path in paths:
+        if provider_name == 'routerai':
+            with Image.open(path) as image:
+                output = io.BytesIO()
+                image.convert('RGB').save(output, format='JPEG', quality=85)
+                data = output.getvalue()
+            mime = 'image/jpeg'
+        else:
+            data = Path(path).read_bytes()
+            mime = 'image/png'
+        images.append({'type': 'image_url', 'image_url': {
+            'url': f'data:{mime};base64,' + base64.b64encode(data).decode()}})
+    payload['input_references'] = images
     return payload, identity
 
 
@@ -198,6 +217,8 @@ def _decide(state, questions):
 def choose_video_method(state):
     return _decide(state, {
         'method': {'type': 'choice', 'instructions': (
+            'Use current_video_prompt as the current motion direction when present, subject to '
+            'the current physical continuity and required state changes. '
             'Classify the CURRENT SHOT by its main content. Action: running, pursuit, fighting, '
             'racing, dynamic driving including close-ups; physical action and spatial progress '
             'are the subject. Non-action: dialogue, reflection, emotion, observation, static inserts '
@@ -205,8 +226,14 @@ def choose_video_method(state):
             'movement is background. Camera movement alone does not make a shot action. '
             'Moving-object impacts, collisions and destruction are physical action too. Classify by '
             'content, not camera labels: INSERT or CLOSE-UP does not make dynamic action a static insert. '
+            'Action normally uses references, but use keyframes when an essential exact causal boundary, '
+            'named landmark part or contact position must match the supplied boundary image and the '
+            'transition between known states is controllable. Keep free multi-step action with flexible '
+            'boundaries in references. Use existing separate shots to keep a precise endpoint out of '
+            'the surrounding free-action group; ordinary planned START/END poses alone do not require keyframes. '
             'Classify inserts separately even inside an action scene. Preserve required events and text.'),
-            'criteria': {'references': 'Action', 'keyframes': 'Non-action'}},
+            'criteria': {'references': 'Free continuous action with flexible boundaries',
+                         'keyframes': 'Non-action or a controllable transition with an essential exact boundary'}},
         'continuity': {'type': 'choice', 'instructions': (
             'Does the current shot continue the same uninterrupted physical action as the immediately '
             'previous shot? A change of shot size alone does not interrupt it. A new action, time jump, '
@@ -222,17 +249,22 @@ def _references(base, item):
         paths = [c['reference_image_path'] for c in (item.get('characters') or []) if c.get('reference_image_path')]
     paths += [str(_reference_path(base, c['reference_image_path']))
               for c in (item.get('locations') or []) if c.get('reference_image_path')]
+    for phase in ('start', 'end'):
+        context = (item.get('_continuity') or {}).get(phase) or {}
+        paths += [str(_reference_path(base, p)) for p in context.get('landmark_reference_paths', [])]
     return list(dict.fromkeys(str(_reference_path(base, p)) for p in paths))
 
 
 def _phase(spec):
-    return {k: spec.get(k) for k in ('camera_anchor', 'pose_signature', 'must_show', 'visible_readable_texts')}
+    return {k: spec.get(k) for k in ('camera_anchor', 'pose_signature', 'must_show', 'visible_readable_texts',
+                                     'must_not_show', 'world_physics', 'visible_characters')}
 
 
 def _planning_shot(item):
     spec = item.get('_shot_frame_spec') or {}
-    return dict(shot_key=_key(item), duration_s=_duration(item),
+    result = dict(shot_key=_key(item), duration_s=_duration(item),
                 action=str(item.get('shot_description') or item.get('video_prompt') or '')[:1600],
+                current_video_prompt=str(item.get('video_prompt') or ''),
                 camera=item.get('camera_plan'), voiceover=item.get('voiceover'),
                 opening=_phase(spec.get('start_state_spec') or spec),
                 ending=_phase(spec.get('end_state_spec') or spec),
@@ -241,6 +273,9 @@ def _planning_shot(item):
                 character_reference_states={name: {k: s.get(k) for k in ('state_id', 'reference_image_path')}
                                             for name, s in (item.get('character_reference_states') or {}).items()},
                 style_id=item.get('style_id'))
+    if item.get('_continuity') is not None:
+        result['continuity'] = item['_continuity']
+    return result
 
 
 def _compatible(left, right):
@@ -375,6 +410,12 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
         if final_image not in refs:
             refs.append(final_image)
         state['final_image_number'] = refs.index(final_image) + 1
+    state['landmark_image_roles'] = list({entity['id']: dict(
+        entity_id=entity['id'], name=entity.get('name', entity['id']),
+        image_number=refs.index(entity['reference_path']) + 1)
+        for item in group for context in item.get('_continuity', {}).values()
+        for entity in context.get('entities', [])
+        if entity['kind'] == 'landmark' and entity.get('reference_path') in refs}.values())
     response = call_openai_api(prompt=json.dumps(state, ensure_ascii=False), model=model_ultimate,
         system_prompt=(f'Write one concise video prompt in {language} for one continuous shot. '
                        'Bind every reference explicitly using Image N and its assigned role. '
@@ -394,6 +435,17 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        'An entrance or delayed reveal is allowed only when explicitly required by the opening state. '
                        'A continuity_image_number refers to an earlier interrupted action: preserve identities, '
                        'direction and achieved progress, while respecting the current fragment camera and lighting. '
+                       'Continuity states govern movable props and shared landmark identity throughout the clip. '
+                       'Preserve current_video_prompt motion choices when adapting existing directions; '
+                       'do not restore outdated actions from source descriptions. Current physical continuity '
+                       'and recorded continuity events still govern any necessary correction. '
+                       'Treat must_not_show as phase-scoped constraints, not blanket prohibitions for the whole clip. '
+                       'Character references define appearance only; location references define materials and architecture. '
+                       'landmark_image_roles assigns each numbered image to one named object construction only. '
+                       'Other objects in its background are not authoritative: use their own masters. '
+                       'Current continuity states govern changeable contents, fuel, damage and staging. '
+                       'Use continuity and phase anchors for the exact shared landmark. Temporary objects from identity '
+                       'sheets do not enter staging unless the continuity or phase state requires them. '
                        'All of these images are ordinary numbered references. Include every intermediate '
                        'required event at its supplied time; do not turn boundary images into still holds. '
                        'Boundary references anchor world state and character '
@@ -450,6 +502,8 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
     if isinstance(shots, list):
         shots = {'items': shots}
     items = shots['items'] if isinstance(shots, dict) else shots
+    from .continuity import bind_continuity_to_items
+    items = bind_continuity_to_items(base, items)
     catalog_path = base / '30_style/image_styles.json'
     style_source_path = base / '30_style/style_images.json'
     catalog = (ensure_image_style_catalog(str(base), json.loads(style_source_path.read_text()))
@@ -581,6 +635,10 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 style_id=style_id, style_reference_path=style_image,
                 continues_from_shot=_key(chunks[number - 1][-1]) if number else (_key(resumed) if resumed is not None else None),
                 seed=shots.get('seed'), model=model, resolution=os.getenv(f'{prefix}_RESOLUTION', '480p')))
+            from .continuity import unit_continuity_hash
+            continuity_hash = unit_continuity_hash(base, keys)
+            if continuity_hash is not None:
+                planned[-1]['continuity_hash'] = continuity_hash
         return planned
 
     with ThreadPoolExecutor(max_workers=4) as pool:

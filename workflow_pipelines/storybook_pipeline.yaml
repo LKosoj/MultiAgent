@@ -201,6 +201,17 @@ steps:
     enable: '{generate_screenplay}'
   depends_on:
   - story_editor
+- id: storybook_continuity_plan
+  step_type: tool
+  task: Reconcile shared landmarks and physical object states across the complete screenplay
+  timeout: 86400
+  tool_name: storybook_continuity_plan_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - screenplay_generator
 - id: screenplay_shots_generator
   step_type: tool
   task: Generate shots JSON for storyboard frames
@@ -217,7 +228,7 @@ steps:
     screenplay_time: '{screenplay_time}'
     #enable: false
   depends_on:
-  - screenplay_generator
+  - storybook_continuity_plan
 - id: shots_prompt_qa
   step_type: tool
   task: LLM validate+repair shots prompts vs screenplay BEFORE generating shot images
@@ -380,6 +391,17 @@ steps:
   - background_references
   - artist_batch
   - blockout_renderer
+- id: storybook_continuity_images_review
+  step_type: tool
+  task: Inspect recurring landmark geometry and prop states in generated images
+  timeout: 86400
+  tool_name: storybook_continuity_images_review_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - artist_batch_shots
 - id: storybook_video_preflight
   step_type: tool
   task: Preflight storybook video/audio/render provider capabilities
@@ -404,6 +426,7 @@ steps:
   - shots_prompt_qa
   - storybook_photo_montage
   - storybook_video_plan
+  - storybook_continuity_images_review
 - id: storybook_video_delivery_promise
   step_type: tool
   task: Lock delivery promise for storybook motion-led video
@@ -457,6 +480,17 @@ steps:
   depends_on:
   - storybook_video_delivery_promise
   - artist_batch_shots
+- id: storybook_continuity_videos_review
+  step_type: tool
+  task: Inspect downloaded videos for shared object identity and unauthorized actions
+  timeout: 86400
+  tool_name: storybook_continuity_videos_review_tool
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - video_generator
 - id: storybook_audio_subtitle
   step_type: tool
   task: Prepare first-class audio manifest and subtitles for final montage
@@ -560,6 +594,7 @@ steps:
   depends_on:
   - artist_batch_shots
   - storybook_sfx_generator
+  - storybook_continuity_images_review
 - id: montage_assembler
   step_type: tool
   task: Assemble final video, timeline, subtitles, manifest and final review
@@ -588,6 +623,7 @@ steps:
   depends_on:
   - storybook_sfx_generator
   - video_generator
+  - storybook_continuity_videos_review
 - id: storybook_video_decision_log
   step_type: tool
   task: Persist storybook video provider/model/runtime decisions and final status

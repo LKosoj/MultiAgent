@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import mimetypes
 import os
@@ -218,8 +219,14 @@ def _resolution_rank(value: str) -> int:
     return 0
 
 
-def _build_frame_image_payload(image_ref: str, frame_type: str) -> Dict[str, Any]:
+def _build_frame_image_payload(image_ref: str, frame_type: str, provider_name: str = "aitunnel") -> Dict[str, Any]:
     image_url = _normalize_image_reference(image_ref)
+    if provider_name == "routerai" and not _is_url_or_data_url(image_ref):
+        with Image.open(image_ref) as image:
+            if image.convert("RGBA").getchannel("A").getextrema() == (255, 255):
+                output = io.BytesIO()
+                image.convert("RGB").save(output, format="JPEG", quality=95)
+                image_url = "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii")
     return {
         "type": "image_url",
         "image_url": {"url": image_url},

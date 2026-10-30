@@ -49,6 +49,7 @@ def test_variants_use_parent_and_explicit_return_to_base(tmp_path, monkeypatch):
     monkeypatch.setattr(cr, "edit_image_vse_tool", edit)
     result = cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0, "outside": {"keep": True}})
     assert len(calls) == 2
+    assert all("Сохрани состав ракурсов и компоновку" in call["prompt"] for call in calls)
     assert all(call["seed"] == 0 for call in calls)
     assert calls[1]["image_paths"] == [calls[0]["output_path"]]
     assert result["outside"] == {"keep": True}
@@ -120,3 +121,123 @@ def test_artist_keeps_existing_project_appearance_reference(tmp_path, monkeypatc
     result = artist._preprocess_canon_references(items[:2], [], "s", 1)
     assert calls == [] and result == []
     assert variant.read_bytes() == before
+
+
+def test_invalid_planner_binding_is_repaired_once_with_original_payload(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    requests = []
+    valid = _plan()
+    invalid = {"characters": [{"name": "Actor", "base_frame_keys": ["unknown:frame"], "states": []}]}
+
+    def planner(**kwargs):
+        requests.append(kwargs)
+        return json.dumps(invalid if len(requests) == 1 else valid)
+
+    monkeypatch.setattr(cr, "call_openai_api", planner)
+    monkeypatch.setattr(cr, "edit_image_vse_tool", lambda **kwargs: Image.new("RGB", (16, 16)).save(kwargs["output_path"]))
+    result = cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    assert result["items"]
+    assert len(requests) == 2
+    original_payload = json.loads(requests[0]["prompt"])
+    repaired_payload = json.loads(requests[1]["prompt"])
+    assert all(repaired_payload[key] == original_payload[key] for key in ("screenplay", "frames", "characters", "language"))
+    assert repaired_payload["candidate"] == invalid
+    assert "validation_error" in repaired_payload
+
+
+def test_two_invalid_plans_abort_before_manifest_or_image_edit(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    shots_path = base / "97_shots/shots.json"
+    before = shots_path.read_bytes()
+    calls = []
+    invalid = {"characters": [{"name": "Actor", "base_frame_keys": ["unknown:frame"], "states": []}]}
+    monkeypatch.setattr(cr, "call_openai_api", lambda **kwargs: calls.append(kwargs) or json.dumps(invalid))
+    monkeypatch.setattr(cr, "edit_image_vse_tool", lambda **kwargs: pytest.fail("Invalid plan must not edit images"))
+    with pytest.raises(ValueError, match="Invalid or duplicate character frame binding"):
+        cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    assert len(calls) == 2
+    assert shots_path.read_bytes() == before
+    assert not (base / "97_shots/character_reference_states.json").exists()
+
+
+def test_source_extension_reuses_existing_states_and_retries_bad_parent_plan(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    old_plan = _plan()
+    requests = []
+    responses = [old_plan]
+    monkeypatch.setattr(cr, "call_openai_api", lambda **kwargs: requests.append(json.loads(kwargs["prompt"])) or json.dumps(responses.pop(0)))
+    edits = []
+
+    def edit(**kwargs):
+        edits.append(kwargs)
+        Image.new("RGB", (16, 16), "blue").save(kwargs["output_path"])
+
+    monkeypatch.setattr(cr, "edit_image_vse_tool", edit)
+    cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    assert len(edits) == 2
+    old_manifest = json.loads((base / "97_shots/character_reference_states.json").read_text())
+    old_paths = {key: value["reference_image_path"] for key, value in old_manifest["states"].items()}
+    screenplay = json.loads((base / "91_screenplay/screenplay.json").read_text())
+    screenplay["screenplay"].append({"scene_number": 6, "action": "context"})
+    (base / "91_screenplay/screenplay.json").write_text(json.dumps(screenplay))
+    extra = dict(items[0], scene_number=6)
+    items = items + [extra]
+    (base / "97_shots/shots.json").write_text(json.dumps({"items": items}))
+    bad = json.loads(json.dumps(old_plan))
+    bad["characters"][0]["states"][0]["parent_id"] = "missing_parent"
+    good = json.loads(json.dumps(old_plan))
+    good["characters"][0]["base_frame_keys"].append("6:1:start")
+    responses[:] = [bad, good]
+    requests.clear()
+    result = cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    assert len(requests) == 2
+    for request in requests:
+        assert request["existing_plan"] == {"characters": old_manifest["characters"]}
+        assert request["missing_pairs"] == [["6:1:start", "Actor"]]
+        assert request["stale_pairs"] == []
+    assert "coat_off" in requests[1]["validation_error"] and "parent" in requests[1]["validation_error"]
+    assert len(edits) == 2
+    manifest = json.loads((base / "97_shots/character_reference_states.json").read_text())
+    assert manifest["input_hash"]
+    assert set(manifest["states"]) == set(old_paths) and all(Path(path).read_bytes() for path in old_paths.values())
+    assert result["items"][-1]["character_reference_states"]["Actor"]["state_id"] == "base"
+    assert (base / "97_shots/character_reference_states.invalid.json").is_file()
+
+
+def test_changed_parent_asset_reuses_it_and_rerenders_only_child(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    planner_calls = []
+    monkeypatch.setattr(cr, "call_openai_api", lambda **kwargs: planner_calls.append(kwargs) or json.dumps(_plan()))
+    edits = []
+
+    def edit(**kwargs):
+        edits.append(kwargs)
+        Image.new("RGB", (16, 16), "blue").save(kwargs["output_path"])
+
+    monkeypatch.setattr(cr, "edit_image_vse_tool", edit)
+    cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    manifest = json.loads((base / "97_shots/character_reference_states.json").read_text())
+    parent_path = Path(manifest["states"]["Actor:coat_off"]["reference_image_path"])
+    child_path = Path(manifest["states"]["Actor:wounded"]["reference_image_path"])
+    parent_path.write_bytes(b"green-parent")
+    edits_before = len(edits)
+    cr.storybook_character_state_references_tool("s", "project", {"items": items, "seed": 0})
+    assert len(planner_calls) == 1
+    assert len(edits) == edits_before + 1
+    assert parent_path.read_bytes() == b"green-parent"
+    assert edits[-1]["output_path"] == str(child_path)
+    assert edits[-1]["image_paths"] == [str(parent_path)]
+
+
+def test_prop_geometry_update_does_not_replan_character_appearance(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    monkeypatch.setattr(cr, "call_openai_api", lambda **kwargs: json.dumps(_plan()))
+    monkeypatch.setattr(cr, "edit_image_vse_tool", lambda **kwargs: Image.new("RGB", (16, 16)).save(kwargs["output_path"]))
+    cr.storybook_character_state_references_tool("s", "project", {"items": items})
+    path = base / "91_screenplay/screenplay.json"
+    screenplay = json.loads(path.read_text())
+    screenplay["screenplay"][0]["scene_continuity_facts"] = {"continuity": {"geometry": "changed doorway"}}
+    path.write_text(json.dumps(screenplay), encoding="utf-8")
+    monkeypatch.setattr(cr, "call_openai_api", lambda **kwargs: pytest.fail("Appearance has not changed"))
+    cr.storybook_character_state_references_tool("s", "project", {"items": items})
+    assert json.loads(path.read_text()) == screenplay

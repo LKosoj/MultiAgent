@@ -1,0 +1,22 @@
+name: storybook_continuity_plan_tool
+description: "Согласует физическую непрерывность объектов и ориентиров между сценами до генерации раскадровки"
+category: "Генерация"
+source_type: custom_function
+implementation_source: custom_tools.storybook.continuity.storybook_continuity_plan_tool
+parameters:
+  - name: session_id
+    type: str
+    required: true
+    description: "Идентификатор сессии"
+  - name: project_id
+    type: str
+    required: true
+    description: "Идентификатор проекта"
+  - name: enable
+    type: bool
+    required: false
+    description: "Включить планирование непрерывности"
+  - name: review_findings
+    type: list
+    required: false
+    description: "Замечания к опубликованному плану с точным entity_id; гипотезы проверяются по исходнику"
