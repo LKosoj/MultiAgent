@@ -825,11 +825,22 @@ class _ResearchLoopCoordinator:
                 )
             if terminal_reason is ResearchStopReason.COMPLETE:
                 try:
+                    # Без флага непривязанное evidence продолжает исследование
+                    # только у формулы, у которой уже есть входные bindings;
+                    # формула без bindings завершается обычным путём.
                     pending_formula_continuation = (
+                        self._semantic_repair_continuation
+                        and self._has_pending_required_formula_continuation(state)
+                    ) or (
                         _has_unbound_latest_probe_evidence(state)
-                        or (
+                        and (
                             self._semantic_repair_continuation
-                            and self._has_pending_required_formula_continuation(state)
+                            or any(
+                                item.required
+                                and item.kind is SemanticItemKind.FORMULA
+                                and item.binding_ids
+                                for item in state.query_spec.semantic_items
+                            )
                         )
                     )
                 except AdaptiveResearchStateStoreError:
@@ -4125,207 +4136,6 @@ def _missing_exact_aggregate_operand_names(
             )
         )
     )
-
-
-def _has_confirmed_differently_named_aggregate_input(
-    state: ResearchState,
-    proposal: NewBindingProposal | DerivedExpressionBinding,
-    formula: str,
-    schema_names: tuple[str, ...],
-    *,
-    confirmed_columns: tuple[ColumnRef, ...] | None = None,
-) -> bool:
-    if isinstance(proposal, NewBindingProposal):
-        if not isinstance(proposal.candidate, DerivedExpressionCandidate):
-            return False
-        source_id = proposal.source_id
-        input_columns = proposal.candidate.input_columns
-    else:
-        source_id = proposal.source_id
-        input_columns = proposal.input_columns
-    operand_names = {
-        name.casefold()
-        for name in _missing_exact_aggregate_operand_names(formula, schema_names, ())
-    }
-    different_inputs = tuple(
-        column for column in input_columns if column.column.casefold() not in operand_names
-    )
-    missing_names = _missing_exact_aggregate_operand_names(
-        formula,
-        schema_names,
-        tuple(column.column for column in input_columns),
-    )
-    if confirmed_columns is None:
-        confirmed_columns = tuple(
-            binding.physical_column
-            for binding in state.bindings
-            if isinstance(binding, PhysicalColumnBinding)
-            and binding.source_id == source_id
-            and binding.status in (BindingStatus.CANDIDATE, BindingStatus.SUPPORTED)
-            and binding.evidence_ids
-        )
-    return (
-        bool(different_inputs)
-        and len(different_inputs) == len(missing_names)
-        and all(
-            any(
-                column.column == confirmed.column
-                and (
-                    column.table == confirmed.table
-                    or column.table
-                    in {
-                        confirmed.table.table,
-                        _logical_table_name(confirmed.table),
-                    }
-                )
-                for confirmed in confirmed_columns
-            )
-            for column in different_inputs
-        )
-    )
-
-
-def _has_same_batch_confirmed_differently_named_aggregate_input(
-    state: ResearchState,
-    decision: ResearchDecisionV1,
-    resolved: ResolvedResearchDecision,
-    documents: tuple[tuple[str, DocumentRef], ...],
-    loaded_schema: LoadedSchema,
-) -> bool:
-    if not documents or not isinstance(loaded_schema, LoadedSchema):
-        return False
-    items = {item.source_id: item for item in state.query_spec.semantic_items}
-    bindings = {binding.binding_id: binding for binding in state.bindings}
-    document_map = dict(documents)
-    schema_names = tuple(
-        column
-        for table in loaded_schema.schema.values()
-        if isinstance(table, Mapping)
-        for column in get_table_columns(table)
-    )
-    saw_mismatch = False
-    for proposal in decision.proposals:
-        if (
-            isinstance(proposal, NewBindingProposal)
-            and isinstance(proposal.candidate, DerivedExpressionCandidate)
-            and (item := items.get(proposal.source_id)) is not None
-            and (document := document_map.get(proposal.source_id)) is not None
-            and proposal.candidate.document_id == document.document_id
-        ):
-            candidate: NewBindingProposal | DerivedExpressionBinding = proposal
-            input_columns = proposal.candidate.input_columns
-        elif (
-            isinstance(proposal, BindingAssessment)
-            and proposal.certificate == "consistent"
-            and isinstance(proposal.subject, ExistingBindingRef)
-            and isinstance(
-                binding := bindings.get(proposal.subject.binding_id),
-                DerivedExpressionBinding,
-            )
-            and binding.status is BindingStatus.CANDIDATE
-            and binding.evidence_ids
-            and (item := items.get(binding.source_id)) is not None
-            and (document := document_map.get(binding.source_id)) is not None
-            and binding.document == document
-            and (formula := _formula_part(item.normalized_meaning)) is not None
-            and _formula_part(binding.expression.expression) == formula
-        ):
-            candidate = binding
-            input_columns = binding.input_columns
-        else:
-            continue
-        formula = _formula_part(item.normalized_meaning) or ""
-        if not _exact_aggregate_operand_input_mismatch(
-            formula,
-            schema_names,
-            tuple(column.column for column in input_columns),
-        ):
-            continue
-        saw_mismatch = True
-        confirmed_columns = tuple(
-            binding.physical_column
-            for binding in state.bindings
-            if isinstance(binding, PhysicalColumnBinding)
-            and binding.source_id == candidate.source_id
-            and binding.status in (BindingStatus.CANDIDATE, BindingStatus.SUPPORTED)
-            and binding.evidence_ids
-        ) + tuple(
-            binding.physical_column
-            if isinstance(binding, PhysicalColumnBinding)
-            else binding.discriminator_column
-            for binding in resolved.admission.bindings
-            if isinstance(binding, (PhysicalColumnBinding, DiscriminatorValueBinding))
-            and binding.source_id == candidate.source_id
-            and binding.status in (BindingStatus.CANDIDATE, BindingStatus.SUPPORTED)
-            and binding.evidence_ids
-        )
-        if not _has_confirmed_differently_named_aggregate_input(
-            state,
-            candidate,
-            formula,
-            schema_names,
-            confirmed_columns=confirmed_columns,
-        ):
-            return False
-    return saw_mismatch
-
-
-def _has_exact_aggregate_operand_mismatch(
-    state: ResearchState,
-    decision: ResearchDecisionV1,
-    documents: tuple[tuple[str, DocumentRef], ...],
-    loaded_schema: LoadedSchema,
-) -> bool:
-    if not documents or not isinstance(loaded_schema, LoadedSchema):
-        return False
-    items = {item.source_id: item for item in state.query_spec.semantic_items}
-    bindings = {binding.binding_id: binding for binding in state.bindings}
-    document_map = dict(documents)
-    schema_names = tuple(
-        column
-        for table in loaded_schema.schema.values()
-        if isinstance(table, Mapping)
-        for column in get_table_columns(table)
-    )
-    for proposal in decision.proposals:
-        if (
-            isinstance(proposal, NewBindingProposal)
-            and isinstance(proposal.candidate, DerivedExpressionCandidate)
-            and (item := items.get(proposal.source_id)) is not None
-            and (document := document_map.get(proposal.source_id)) is not None
-            and proposal.candidate.document_id == document.document_id
-        ):
-            formula = _formula_part(item.normalized_meaning) or ""
-            if _exact_aggregate_operand_input_mismatch(
-                formula,
-                schema_names,
-                tuple(column.column for column in proposal.candidate.input_columns),
-            ) and not _has_confirmed_differently_named_aggregate_input(
-                state, proposal, formula, schema_names
-            ):
-                return True
-        if (
-            isinstance(proposal, BindingAssessment)
-            and proposal.certificate == "consistent"
-            and isinstance(proposal.subject, ExistingBindingRef)
-            and isinstance(
-                binding := bindings.get(proposal.subject.binding_id),
-                DerivedExpressionBinding,
-            )
-            and binding.status is BindingStatus.CANDIDATE
-            and (item := items.get(binding.source_id)) is not None
-            and (document := document_map.get(binding.source_id)) is not None
-            and binding.document == document
-            and (formula := _formula_part(item.normalized_meaning)) is not None
-            and _formula_part(binding.expression.expression) == formula
-            and _exact_aggregate_operand_input_mismatch(
-                formula,
-                schema_names,
-                tuple(column.column for column in binding.input_columns),
-            )
-        ):
-            return True
-    return False
 
 
 def _has_exact_formula_predicate_mismatch(

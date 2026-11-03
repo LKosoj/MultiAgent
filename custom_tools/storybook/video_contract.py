@@ -3,11 +3,14 @@ import os
 import re
 import shutil
 import subprocess
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Optional
 
 import yaml
 
+from custom_tools.storybook import video_run_config
 from custom_tools.storybook.blockout_assets import read_index as _read_blockout_asset_index
 from custom_tools.storybook.blockout_common import MIN_BLENDER_VERSION
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
@@ -45,7 +48,7 @@ _TOOL_NAME_TO_PROVIDER = {
 }
 
 
-STORYBOOK_WORKFLOW_ACTIONS = (
+_LEGACY_WORKFLOW_ACTIONS = (
     {
         "id": "project_inventory",
         "label": "List storybook projects and selected project inventory",
@@ -55,7 +58,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -67,7 +69,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -79,7 +80,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -91,7 +91,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Web artifact editing needs explicit write/backup UX before enabling.",
     },
@@ -104,7 +103,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Web media overwrite needs explicit backup and preview flow.",
     },
@@ -117,7 +115,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Destructive project operations need dedicated web confirmations.",
     },
@@ -130,7 +127,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -142,7 +138,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -154,7 +149,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -166,7 +160,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -178,7 +171,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "available",
-            "streamlit": "available",
         },
     },
     {
@@ -190,7 +182,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Web WorkflowManager currently starts whole YAML pipelines only.",
     },
@@ -203,7 +194,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Requires latest StoryBookManager project checkpoint context.",
     },
@@ -216,7 +206,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "available",
             "react": "unsupported",
-            "streamlit": "unsupported",
         },
         "reason": "Pause/resume is bound to the local PipelineRunner instance.",
     },
@@ -226,7 +215,7 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "category": "execution",
         "status": "manager_only",
         "service_action": None,
-        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "surfaces": {"storybook_manager": "available", "react": "unsupported"},
         "reason": "Blockout rendering needs local Blender and file-system access.",
     },
     {
@@ -235,7 +224,7 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "category": "execution",
         "status": "manager_only",
         "service_action": None,
-        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "surfaces": {"storybook_manager": "available", "react": "unsupported"},
         "reason": "Preview assembly runs ffmpeg over local blockout frames.",
     },
     {
@@ -244,7 +233,7 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "category": "media_manager",
         "status": "manager_only",
         "service_action": None,
-        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "surfaces": {"storybook_manager": "available", "react": "unsupported"},
         "reason": "Side-by-side blockout review is a desktop-only flow.",
     },
     {
@@ -253,7 +242,7 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "category": "artifact_editor",
         "status": "manager_only",
         "service_action": None,
-        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "surfaces": {"storybook_manager": "available", "react": "unsupported"},
         "reason": "Asset mapping editing needs the object library preview.",
     },
     {
@@ -265,7 +254,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "not_implemented",
             "react": "not_implemented",
-            "streamlit": "not_implemented",
         },
     },
     {
@@ -277,7 +265,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "not_implemented",
             "react": "not_implemented",
-            "streamlit": "not_implemented",
         },
     },
     {
@@ -286,7 +273,7 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "category": "selective_regeneration",
         "status": "manager_only",
         "service_action": None,
-        "surfaces": {"storybook_manager": "available", "react": "unsupported", "streamlit": "unsupported"},
+        "surfaces": {"storybook_manager": "available", "react": "unsupported"},
         "reason": "Blockout rendering needs local Blender and file-system access.",
     },
     {
@@ -298,7 +285,6 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "not_implemented",
             "react": "not_implemented",
-            "streamlit": "not_implemented",
         },
     },
     {
@@ -310,10 +296,53 @@ STORYBOOK_WORKFLOW_ACTIONS = (
         "surfaces": {
             "storybook_manager": "unsupported",
             "react": "available",
-            "streamlit": "available",
         },
     },
 )
+
+
+def _build_workflow_actions() -> list[dict]:
+    """Старые записи + возможности studio; studio заменяет записи из supersedes."""
+    from custom_tools.storybook.studio.capabilities import registry
+
+    entries: dict[str, dict] = {}
+    replaced_by: dict[str, str] = {}
+    for cap in registry().values():
+        entry = {
+            "id": cap.id,
+            "label": cap.title,
+            "category": cap.category,
+            "status": "available",
+            "service_action": cap.action,
+            "surfaces": {"storybook_manager": "available", "react": "available"},
+            "access": cap.access,
+            "client_fn": cap.client_fn,
+            "tk_handler": cap.tk_handler,
+        }
+        if cap.reason:
+            entry["reason"] = cap.reason
+        entries[cap.id] = entry
+        for old in cap.supersedes:
+            replaced_by.setdefault(old, cap.id)
+
+    actions: list[dict] = []
+    placed: set[str] = set()
+    for legacy in _LEGACY_WORKFLOW_ACTIONS:
+        new_id = replaced_by.get(legacy["id"])
+        if new_id is None:
+            actions.append(dict(legacy))
+        elif new_id not in placed:  # новая запись встаёт на место старой
+            actions.append(entries[new_id])
+            placed.add(new_id)
+    actions.extend(entry for cap_id, entry in entries.items() if cap_id not in placed)
+    return actions
+
+
+def __getattr__(name: str):
+    # ленивый кортеж: модули studio сами импортируют этот файл (круговой импорт)
+    if name == "STORYBOOK_WORKFLOW_ACTIONS":
+        return tuple(_build_workflow_actions())
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def storybook_workflow_actions(project_id: str | None = None) -> dict:
@@ -323,7 +352,7 @@ def storybook_workflow_actions(project_id: str | None = None) -> dict:
         "status": "success",
         "workflow_name": STORYBOOK_WORKFLOW_NAME,
         "project_id": str(project_id).strip() if project_id else None,
-        "actions": [dict(action) for action in STORYBOOK_WORKFLOW_ACTIONS],
+        "actions": _build_workflow_actions(),
     }
 
 
@@ -351,6 +380,7 @@ def storybook_video_preflight_tool(
     enable: bool = True,
     generate_blockout: bool = False,
     use_blockout_reference: bool = False,
+    video_provider: str = "",
 ) -> dict:
     """Write a provider capability preflight summary for storybook video.
 
@@ -361,8 +391,11 @@ def storybook_video_preflight_tool(
         enable: Whether video generation is requested for this run.
         generate_blockout: Whether the project's blockout layer is enabled (раздел 11.4).
         use_blockout_reference: Whether the blockout clip will be submitted as a video reference.
+        video_provider: Explicit video provider from the pipeline input; empty = project settings/env.
     """
-    summary = _provider_summary(session_id, project_id, language, enable, generate_blockout, use_blockout_reference)
+    video_run_config.bind_run_project(project_id)
+    summary = _provider_summary(session_id, project_id, language, enable, generate_blockout, use_blockout_reference,
+                                video_provider=video_provider)
     _atomic_write_json(Path(summary["artifact_path"]), summary)
     return summary
 
@@ -374,6 +407,7 @@ def storybook_video_delivery_promise_tool(
     enable: bool = True,
     generate_blockout: bool = False,
     use_blockout_reference: bool = False,
+    video_provider: str = "",
 ) -> dict:
     """Write the explicit delivery promise for motion-led storybook video.
 
@@ -384,9 +418,12 @@ def storybook_video_delivery_promise_tool(
         enable: Whether video generation is requested for this run.
         generate_blockout: Whether the project's blockout layer is enabled (раздел 11.4).
         use_blockout_reference: Whether the blockout clip will be submitted as a video reference.
+        video_provider: Explicit video provider from the pipeline input; empty = project settings/env.
     """
+    video_run_config.bind_run_project(project_id)
     enabled = _as_bool(enable)
-    summary = _provider_summary(session_id, project_id, language, enabled, generate_blockout, use_blockout_reference)
+    summary = _provider_summary(session_id, project_id, language, enabled, generate_blockout, use_blockout_reference,
+                                video_provider=video_provider)
     delivery_items = summary["expected_video_items"]
     required_aitunnel_items = []
     if summary["provider"] in {"aitunnel", "routerai"}:
@@ -400,7 +437,7 @@ def storybook_video_delivery_promise_tool(
             )
         except Exception:
             job_store = None
-        configured_model = (os.getenv(f"{provider_name.upper()}_VIDEO_MODEL") or "").strip()
+        configured_model = video_run_config.video_setting("VIDEO_MODEL", provider_name, project_id)
         catalog = None
         if _as_bool(generate_blockout) and _as_bool(use_blockout_reference):
             try:
@@ -497,6 +534,7 @@ def storybook_video_decision_log_tool(
         approved: Whether the recorded decisions were explicitly approved.
     """
     approved = _as_bool(approved)
+    video_run_config.bind_run_project(project_id)
     base = _project_dir(project_id)
     artifact_path = str(_contract_dir(project_id) / "decision_log.json")
     preflight = _read_json(_contract_dir(project_id) / "provider_menu_summary.json")
@@ -516,6 +554,9 @@ def storybook_video_decision_log_tool(
     else:
         status = "incomplete"
     decisions = _decision_entries(preflight, delivery, approved)
+    budget_entry = _budget_decision_entry(base, preflight.get("provider") or "none", approved)
+    if budget_entry:
+        decisions.append(budget_entry)
     payload = {
         "version": CONTRACT_VERSION,
         "session_id": session_id,
@@ -539,6 +580,7 @@ def storybook_video_music_readiness(
     generate_music: bool = True,
     generate_blockout: Optional[bool] = None,
     blockout_use_as_video_reference: Optional[bool] = None,
+    video_provider: str = "",
 ) -> dict:
     """Return a UI-safe readiness summary for storybook video, music, and render.
 
@@ -556,7 +598,8 @@ def storybook_video_music_readiness(
     resolved_generate_blockout, resolved_use_reference = _resolve_blockout_flags(
         base, generate_blockout, blockout_use_as_video_reference
     )
-    summary = _provider_summary(session_id, project_id, language, enable, resolved_generate_blockout, resolved_use_reference)
+    summary = _provider_summary(session_id, project_id, language, enable, resolved_generate_blockout, resolved_use_reference,
+                                video_provider=video_provider)
     summary["blockout"]["blender"] = _probe_blockout_blender_readiness()
     summary["blockout"]["asset_library"] = _blockout_asset_library_summary()
     contract_dir = base / "96_video_contract"
@@ -680,12 +723,13 @@ def storybook_video_music_readiness(
     return payload
 
 
-def _provider_summary(session_id, project_id, language, enable, generate_blockout=False, use_blockout_reference=False):
+def _provider_summary(session_id, project_id, language, enable, generate_blockout=False, use_blockout_reference=False,
+                      video_provider=""):
     enabled = _as_bool(enable)
     blockout_enabled = _as_bool(generate_blockout)
     blockout_use_reference = _as_bool(use_blockout_reference)
     shots_path, items, shots_error = _load_shots(project_id)
-    provider, providers = _select_provider()
+    provider, providers = _select_provider(project_id, video_provider)
     ffmpeg_path = shutil.which("ffmpeg")
     ffprobe_path = shutil.which("ffprobe")
     capabilities = {
@@ -1046,7 +1090,7 @@ def _aitunnel_delivery_input_blockers(
         )
     except Exception:
         job_store = None
-    configured_model = (os.getenv(f"{provider_name.upper()}_VIDEO_MODEL") or "").strip()
+    configured_model = video_run_config.video_setting("VIDEO_MODEL", provider_name, project_id)
     catalog = None
     for item in expected_items:
         if use_blockout_reference and generate_blockout:
@@ -1123,8 +1167,22 @@ def _video_shot_key(item):
     return f"{item.get('scene_number', '?')}-{item.get('shot_number', '?')}"
 
 
-def _active_video_tool_name():
-    """Return the uncommented tool_name of the video_generator step (fail-closed)."""
+# Область «для какого проекта и провайдера отвечаем»: читалки интерфейса не привязывают
+# проект к процессу, а задают его на время одного вызова (контекст, не общая переменная).
+_provider_scope: ContextVar = ContextVar("storybook_video_provider_scope", default=None)
+
+
+@contextmanager
+def _scoped_provider(project_id=None, explicit=""):
+    token = _provider_scope.set((project_id or None, explicit or ""))
+    try:
+        yield
+    finally:
+        _provider_scope.reset(token)
+
+
+def _video_step_tool_name():
+    """The raw tool_name of the video_generator step (fail-closed)."""
     try:
         data = yaml.safe_load(_WORKFLOW_YAML_PATH.read_text(encoding="utf-8"))
         for step in data["steps"]:
@@ -1135,22 +1193,38 @@ def _active_video_tool_name():
         return None
 
 
-def _active_video_provider():
+def _active_video_tool_name():
+    """Return the real provider tool_name of the video_generator step (fail-closed).
+
+    Шаг указывает на диспетчер: тогда имя берётся из выбранного провайдера
+    (вход прогона -> настройки проекта -> STORYBOOK_VIDEO_PROVIDER -> routerai).
+    Имя самого диспетчера не возвращается никогда: его используют как имя модуля
+    и функции настоящего видеоинструмента (continuity_review, video_plan и др.).
+    """
+    name = _video_step_tool_name()
+    if name == video_run_config.DISPATCH_TOOL_NAME:
+        project_id, explicit = _provider_scope.get() or (None, "")
+        return video_run_config.tool_name_for(video_run_config.effective_provider(project_id, explicit))
+    return name
+
+
+def _active_video_provider(project_id=None, explicit=""):
     """Map the active video tool_name to a provider name, or None if unresolved."""
-    return _TOOL_NAME_TO_PROVIDER.get(_active_video_tool_name())
+    with _scoped_provider(project_id, explicit):
+        return _TOOL_NAME_TO_PROVIDER.get(_active_video_tool_name())
 
 
-def _select_provider():
-    active = _active_video_provider()
+def _select_provider(project_id=None, explicit=""):
+    active = _active_video_provider(project_id, explicit)
     providers = [
         {
             "name": "routerai",
-            "configured": _has_env("ROUTERAI_API_KEY") and _has_env("ROUTERAI_VIDEO_MODEL"),
+            "configured": _has_env("ROUTERAI_API_KEY") and bool(video_run_config.video_setting("VIDEO_MODEL", "routerai", project_id)),
             "required_env": ["ROUTERAI_API_KEY", "ROUTERAI_VIDEO_MODEL"],
         },
         {
             "name": "aitunnel",
-            "configured": _has_env("AITUNNEL_API_KEY") and _has_env("AITUNNEL_VIDEO_MODEL"),
+            "configured": _has_env("AITUNNEL_API_KEY") and bool(video_run_config.video_setting("VIDEO_MODEL", "aitunnel", project_id)),
             "required_env": ["AITUNNEL_API_KEY", "AITUNNEL_VIDEO_MODEL"],
         },
         {
@@ -1234,6 +1308,31 @@ def _decision_entries(preflight, delivery, approved):
             "approved": approved,
         },
     ]
+
+
+def _budget_decision_entry(base, provider, approved):
+    """Запись журнала решений о денежном бюджете; `None`, если бюджет не задан."""
+    from custom_tools.storybook import video_budget
+
+    budget = video_budget.current_budget_rub(base)
+    if budget <= 0:
+        return None
+    jobs = video_budget._read_jobs(base)
+    spent = video_budget.spent_rub(jobs)
+    report = video_budget.read_report(base)
+    return {
+        "name": "budget",
+        "options_considered": ["unlimited", "budget_rub"],
+        "selected": "budget_rub",
+        "reason": f"Video budget {budget:g} RUB, spent {spent['total']:g} RUB"
+                  + (": stopped, budget exhausted" if report else ""),
+        "confidence": 0.9,
+        "cost": {"amount": spent["total"], "currency": "RUB", "source": "provider_jobs"},
+        "approved": approved,
+        "budget_rub": budget,
+        "spent_rub": spent["total"],
+        "provider": provider,
+    }
 
 
 def _known_provider_cost(provider):

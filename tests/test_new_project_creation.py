@@ -3,7 +3,20 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
+
+
+def _tk_scope(name):
+    """Модули, которые заглушка tkinter не должна оставлять в sys.modules."""
+    return (
+        name == "tkinter" or name.startswith("tkinter.") or name == "_tkinter"
+        or name == "StoryBookManager" or name.startswith("StoryBookManager")
+    )
+
+
+# снимок до подмены; на выходе из импортов возвращаем как было (см. конец блока)
+_saved_modules = {n: m for n, m in sys.modules.items() if _tk_scope(n)}
+_saved_path = list(sys.path)
 
 
 tk_mock = MagicMock()
@@ -64,7 +77,12 @@ sys.path.insert(0, str(project_root / "StoryBookManager"))
 
 from StoryBookManager.config.settings import app_settings
 from StoryBookManager.core.project_manager import ProjectManager
-from StoryBookManager.gui.project_panel import ProjectPanel
+
+# возвращаем tkinter и StoryBookManager.* как были, чтобы заглушка не протекла в другие тесты
+for _name in [n for n in sys.modules if _tk_scope(n)]:
+    del sys.modules[_name]
+sys.modules.update(_saved_modules)
+sys.path[:] = _saved_path  # иначе StoryBookManager/utils перекрывает корневой utils
 
 
 class TestNewProjectCreation(unittest.TestCase):
@@ -142,47 +160,11 @@ class TestNewProjectCreation(unittest.TestCase):
         self.assertNotEqual(first.project_id, second.project_id)
         self.assertTrue(second.project_id.startswith("storybook"))
 
-    def test_project_panel_cancel_does_not_create_project(self):
-        with patch.object(ProjectPanel, "__init__", lambda self, parent, project_manager, on_project_selected: None):
-            panel = ProjectPanel(MagicMock(), self.pm, MagicMock())
-            panel.project_manager = self.pm
-
-            with patch("StoryBookManager.gui.project_panel.NewProjectDialog") as dialog_cls:
-                dialog_cls.return_value.result = None
-                panel.create_new_project()
-
-        self.assertEqual(self.pm.list_projects(), [])
-
-    @patch("StoryBookManager.gui.project_panel.messagebox.showinfo")
-    def test_project_panel_creates_project_and_refreshes_list(self, mock_showinfo):
-        dialog_result = {
-            "title": "Тайна маяка",
-            "project_id": "",
-            "description": "История о девочке, которая нашла старый маяк и помогла кораблям вернуться домой.",
-            "genre": "сказка",
-            "target_age": "6-8 лет",
-            "pages_min": 9,
-            "pages_max": 12,
-            "words_per_page_min": 150,
-            "words_per_page_max": 220,
-            "language": "ru",
-        }
-
-        with patch.object(ProjectPanel, "__init__", lambda self, parent, project_manager, on_project_selected: None):
-            panel = ProjectPanel(MagicMock(), self.pm, MagicMock())
-            panel.project_manager = self.pm
-            panel.refresh_projects = MagicMock()
-            panel.projects_tree = MagicMock()
-            panel.projects_tree.get_children.return_value = []
-            panel.on_project_select = MagicMock()
-
-            with patch("StoryBookManager.gui.project_panel.NewProjectDialog") as dialog_cls:
-                dialog_cls.return_value.result = dialog_result
-                panel.create_new_project()
-
-        self.assertEqual(len(self.pm.list_projects()), 1)
-        panel.refresh_projects.assert_called_once()
-        mock_showinfo.assert_called_once()
+    def test_list_projects_hides_service_dirs(self):
+        for name in ("_shared_internal", ".hidden", "real"):
+            (self.test_projects_dir / name).mkdir()
+        self.assertEqual([p.project_id for p in self.pm.list_projects()], ["real"])
+        self.assertFalse(self.pm.generate_project_id("_x").startswith("_"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,51 @@
+// Тексты экрана «Настройки». Каждое значение - однострочный литерал: так его читает тест паритета
+// (tests/fixtures/storybook_screens/golden_settings_texts.json).
+
+export const SETTINGS_TEXTS = {
+  title: "Настройки приложения",
+  loading: "Загрузка настроек…",
+  load_error: "Не удалось загрузить настройки: {reason}.",
+  save_error: "Не удалось сохранить настройки: {reason}.",
+  retry: "Повторить",
+  field_projects: "Папка проектов",
+  field_backups: "Папка бэкапов",
+  field_logs: "Папка журналов",
+  field_max_backups: "Число бэкапов",
+  field_log_level: "Уровень журнала",
+  max_backups_hint: "От 1 до 100.",
+  path_ok: "Папка доступна",
+  path_missing: "Папки не существует",
+  path_not_dir: "Это не папка",
+  path_not_writable: "Нет прав на запись",
+  path_checking: "Проверяем…",
+  path_resolved: "Полный путь: {path}",
+  path_empty: "Поле «{name}» не должно быть пустым.",
+  max_backups_invalid: "Поле «Число бэкапов» должно быть целым от 1 до 100.",
+  source_env: "Папка задана переменной окружения сервера",
+  source_default: "по умолчанию",
+  locked_run: "Недоступно, пока идёт прогон",
+  level_debug: "Подробный",
+  level_info: "Обычный",
+  level_warning: "Предупреждения",
+  level_error: "Только ошибки",
+  level_critical: "Критические",
+  reset: "Сбросить к значениям по умолчанию",
+  save: "Сохранить",
+  saving: "Сохранение…",
+  unsaved: "не сохранено",
+  unsaved_note: "Есть несохранённые изменения.",
+  no_rights: "Настройки может менять администратор",
+  conflict: "Данные изменили после того, как вы их открыли. Обновите и повторите правку.",
+  conflict_refresh: "Обновить",
+  tk_note: "Параметры окна Tk (тема, масштаб, автосохранение) задаются в приложении Tk.",
+  toast_saved: "Настройки сохранены",
+  reset_title: "Сбросить настройки?",
+  reset_body: "Папки и параметры вернутся к значениям по умолчанию. Проекты не затрагиваются.",
+  reset_go: "Сбросить",
+  cancel: "Отмена",
+} as const;
+
+export type SettingsTextId = keyof typeof SETTINGS_TEXTS;
+
+export const settingsFmt = (id: SettingsTextId, vars: Record<string, string | number> = {}): string =>
+  SETTINGS_TEXTS[id].replace(/\{(\w+)\}/g, (m, name: string) => (name in vars ? String(vars[name]) : m));

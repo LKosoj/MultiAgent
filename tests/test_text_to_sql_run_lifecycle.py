@@ -4322,7 +4322,7 @@ async def test_durable_follower_cancel_exception_releases_for_one_retry(
 
     monkeypatch.setattr(service_module, "handle_service_action", fail_then_cancel)
     monkeypatch.setattr(run_manager_module, "run_agent", reject_runner)
-    monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 2)
     manager = run_manager_module.RunManager(store)
     info = None
     try:
@@ -4432,6 +4432,10 @@ async def test_durable_follower_cancel_timeout_keeps_singleflight_until_exceptio
         )
         assert first_result.failed is True
         assert first_result.explicit_false is False
+        # Окно 0.01 нужно было только для таймаута первой отмены; повторная
+        # отмена записывает терминальное состояние из потока и не должна
+        # зависеть от нагрузки на машину.
+        monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 2)
         assert await manager.cancel("original-run") is True
         assert calls == [_principal(), _principal()]
         assert max_active == 1
@@ -4666,7 +4670,7 @@ async def test_uncached_cancel_completed_exception_releases_for_one_retry(
         return {"cancelled": True}
 
     monkeypatch.setattr(service_module, "handle_service_action", fail_then_cancel)
-    monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(run_manager_module, "_RUN_CANCEL_WAIT_SECONDS", 2)
     manager = run_manager_module.RunManager(store)
     try:
         assert await manager.cancel_uncached_text_to_sql(

@@ -6,18 +6,15 @@
 создание бэкапов, получение информации о проектах.
 """
 
-import os
 import json
-import random
-import re
-import shutil
-import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 import logging
 
-from config.settings import app_settings
+from StoryBookManager.config.settings import app_settings
+from custom_tools.storybook.studio import project_store
+from custom_tools.storybook.studio.errors import StudioError
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +99,8 @@ class Project:
                 if dir_path.exists():
                     files = []
                     for ext in ['.png', '.jpg', '.jpeg', '.mp4', '.avi']:
-                        files.extend(dir_path.rglob(f"*{ext}"))
+                        files.extend(f for f in dir_path.rglob(f"*{ext}")
+                                     if "_versions" not in f.relative_to(dir_path).parts)
                     structure["media_dirs"][key] = {
                         "path": str(dir_path),
                         "files_count": len(files),
@@ -169,15 +167,14 @@ class Project:
             
             shots_dir = self.project_path / "97_shots"
             if shots_dir.exists():
-                video_files = list(shots_dir.rglob("*.mp4"))
+                # версии шотов (_versions) не считаются готовым видео
+                video_files = [f for f in shots_dir.rglob("*.mp4") if "_versions" not in f.relative_to(shots_dir).parts]
                 info["has_video"] = len(video_files) > 0
             
-            # Thumbnail - первое изображение из 50_images
-            images_dir = self.project_path / "50_images"
-            if images_dir.exists():
-                image_files = list(images_dir.rglob("*.png"))
-                if image_files:
-                    info["thumbnail"] = str(image_files[0])
+            # Thumbnail - обложка проекта (общее правило studio)
+            cover = project_store.pick_cover(self.project_path)
+            if cover:
+                info["thumbnail"] = str(self.project_path / cover)
                     
         except Exception as e:
             logger.warning(f"Ошибка получения превью для проекта {self.project_id}: {e}")
@@ -188,16 +185,8 @@ class Project:
 class ProjectManager:
     """Управление проектами storybook"""
 
-    PROJECT_STRUCTURE = (
-        "10_synopsis",
-        "20_bible/references/characters",
-        "20_bible/references/locations",
-        "30_style",
-        "40_prompts",
-        "50_images",
-        "60_layout/preview",
-    )
-    
+    PROJECT_STRUCTURE = project_store.PROJECT_STRUCTURE
+
     def __init__(self):
         from custom_tools.storybook.project_paths import storybook_projects_root
 
@@ -209,18 +198,7 @@ class ProjectManager:
 
     def generate_project_id(self, base_name: str = "") -> str:
         """Генерирует уникальный project_id на основе названия или подсказки."""
-        normalized = re.sub(r"[^a-zA-Z0-9]+", "_", (base_name or "").strip().lower()).strip("_")
-        if not normalized:
-            normalized = "storybook"
-
-        candidate = normalized
-        if not (self.projects_dir / candidate).exists():
-            return candidate
-
-        while True:
-            candidate = f"{normalized}_{uuid.uuid4().hex[:8]}"
-            if not (self.projects_dir / candidate).exists():
-                return candidate
+        return project_store.suggest_project_id(base_name, self.projects_dir)
 
     def create_project(
         self,
@@ -236,43 +214,20 @@ class ProjectManager:
         project_id_hint: str = "",
     ) -> Project:
         """Создает новый проект с директорией и заполненным 00_brief.json."""
-        project_id = self.generate_project_id(project_id_hint or title)
-        self.projects_dir.mkdir(parents=True, exist_ok=True)
-
-        project_path = self.projects_dir / project_id
-        project_path.mkdir(parents=True, exist_ok=False)
-        for relative_path in self.PROJECT_STRUCTURE:
-            (project_path / relative_path).mkdir(parents=True, exist_ok=True)
-
-        storybook_prompt = (
-            f"Название: {title}\n"
-            f"Жанр: {genre}\n"
-            f"Возраст: {target_age}\n"
-            f"Описание: {description}"
+        project_id = project_store.create_project(
+            self.projects_dir,
+            title=title,
+            description=description,
+            genre=genre,
+            target_age=target_age,
+            language=language,
+            pages_min=pages_min,
+            pages_max=pages_max,
+            words_per_page_min=words_per_page_min,
+            words_per_page_max=words_per_page_max,
+            id_hint=project_id_hint,
         )
-        brief = {
-            "title": title,
-            "genre": genre,
-            "target_age": target_age,
-            "language": language,
-            "description": description,
-            "main_characters": [],
-            "main_locations": [],
-            "pages_min": pages_min,
-            "pages_max": pages_max,
-            "words_per_page_min": words_per_page_min,
-            "words_per_page_max": words_per_page_max,
-            "moral": "",
-            "storybook_prompt": storybook_prompt,
-            "seed": random.randint(1, 1000000),
-        }
-
-        brief_path = project_path / "00_brief.json"
-        with open(brief_path, "w", encoding="utf-8") as f:
-            json.dump(brief, f, ensure_ascii=False, indent=2)
-
-        logger.info(f"Создан новый проект {project_id}: {brief_path}")
-        return Project(project_id, project_path)
+        return Project(project_id, self.projects_dir / project_id)
     
     def list_projects(self) -> List[Project]:
         """Возвращает список всех проектов"""
@@ -283,13 +238,11 @@ class ProjectManager:
                 logger.warning(f"Директория проектов не найдена: {self.projects_dir}")
                 return projects
             
-            for item in self.projects_dir.iterdir():
-                if item.is_dir() and not item.name.startswith('.'):
-                    try:
-                        project = Project(item.name, item)
-                        projects.append(project)
-                    except Exception as e:
-                        logger.warning(f"Ошибка загрузки проекта {item.name}: {e}")
+            for item in project_store.list_project_dirs(self.projects_dir):
+                try:
+                    projects.append(Project(item.name, item))
+                except Exception as e:
+                    logger.warning(f"Ошибка загрузки проекта {item.name}: {e}")
             
             # Сортируем по дате изменения (новые сверху)
             projects.sort(key=lambda p: p.modified_date or datetime.min, reverse=True)
@@ -321,116 +274,55 @@ class ProjectManager:
     def backup_project(self, project_id: str) -> Optional[str]:
         """Создает бэкап проекта"""
         try:
-            project_path = self.projects_dir / project_id
-            # Защита от path traversal через project_id (L56)
-            try:
-                project_path.resolve().relative_to(self.projects_dir.resolve())
-            except ValueError:
-                logger.error(f"Небезопасный project_id: {project_id}")
-                return None
-            if not project_path.exists():
-                logger.warning(f"Проект {project_id} не найден для создания бэкапа")
-                return None
-            
-            # Создаем имя бэкапа с временной меткой
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_name = f"{project_id}_backup_{timestamp}"
-            backup_path = self.backup_dir / backup_name
-            
-            # Копируем проект
-            shutil.copytree(project_path, backup_path)
-            
-            logger.info(f"Создан бэкап проекта {project_id}: {backup_path}")
-            
-            # Удаляем старые бэкапы если их больше максимального количества
-            self._cleanup_old_backups(project_id)
-            
-            return str(backup_path)
-            
+            info = project_store.create_backup(
+                self.projects_dir, self.backup_dir, project_id,
+                max_backups=app_settings.get("max_backup_files", 10),
+            )
+            return info["path"]
+        except StudioError as e:
+            logger.error(f"Не удалось создать бэкап проекта {project_id}: {e.message}")
+            return None
         except Exception as e:
             logger.error(f"Ошибка создания бэкапа проекта {project_id}: {e}")
             return None
 
     def export_project(self, project_id: str, output_path: str, progress_callback=None) -> bool:
         """Экспортирует проект в ZIP-архив"""
-        import zipfile
         try:
             project_path = self.projects_dir / project_id
             if not project_path.exists():
                 logger.warning(f"Проект {project_id} не найден для экспорта")
                 return False
-            
-            files_to_zip = []
-            for root, _, files in os.walk(project_path):
-                for file in files:
-                    files_to_zip.append(os.path.join(root, file))
-                    
-            total_files = len(files_to_zip)
-            if total_files == 0:
-                logger.warning(f"Проект {project_id} пуст, нечего экспортировать")
-                return False
-                
-            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for i, file_path in enumerate(files_to_zip):
-                    arcname = os.path.relpath(file_path, project_path)
-                    zipf.write(file_path, arcname)
-                    if progress_callback:
-                        progress_callback(i + 1, total_files)
-                        
+
+            def on_progress(current, total, _message=""):
+                if progress_callback:
+                    progress_callback(current, total)
+
+            project_store.export_zip(project_path, Path(output_path), on_progress)
             logger.info(f"Проект {project_id} экспортирован в {output_path}")
             return True
-            
+        except StudioError as e:
+            logger.warning(f"Проект {project_id} не экспортирован: {e.message}")
+            return False
         except Exception as e:
             logger.error(f"Ошибка экспорта проекта {project_id}: {e}")
             return False
     
     def _cleanup_old_backups(self, project_id: str):
         """Удаляет старые бэкапы, оставляя только последние N"""
-        try:
-            max_backups = app_settings.get("max_backup_files", 10)
-            
-            # Находим все бэкапы данного проекта
-            backup_pattern = f"{project_id}_backup_*"
-            backups = list(self.backup_dir.glob(backup_pattern))
-            
-            # Сортируем по дате создания
-            backups.sort(key=lambda p: p.stat().st_ctime, reverse=True)
-            
-            # Удаляем старые бэкапы
-            for backup in backups[max_backups:]:
-                shutil.rmtree(backup)
-                logger.info(f"Удален старый бэкап: {backup}")
-                
-        except Exception as e:
-            logger.warning(f"Ошибка очистки старых бэкапов: {e}")
+        project_store.cleanup_backups(self.backup_dir, project_id, app_settings.get("max_backup_files", 10))
     
     def delete_project(self, project_id: str, create_backup: bool = True) -> bool:
-        """Удаляет проект (с созданием бэкапа)"""
+        """Удаляет проект (бэкап делается всегда, create_backup оставлен для совместимости)"""
         try:
-            project_path = self.projects_dir / project_id
-            # Защита от path traversal через project_id (L56)
-            try:
-                project_path.resolve().relative_to(self.projects_dir.resolve())
-            except ValueError:
-                logger.error(f"Небезопасный project_id: {project_id}")
-                return False
-            if not project_path.exists():
-                logger.warning(f"Проект {project_id} не найден для удаления")
-                return False
-            
-            # Создаем бэкап перед удалением
-            if create_backup:
-                backup_path = self.backup_project(project_id)
-                if not backup_path:
-                    logger.error(f"Не удалось создать бэкап перед удалением проекта {project_id}")
-                    return False
-            
-            # Удаляем проект
-            shutil.rmtree(project_path)
-            logger.info(f"Проект {project_id} удален")
-            
+            project_store.delete_project(
+                self.projects_dir, self.backup_dir, project_id,
+                max_backups=app_settings.get("max_backup_files", 10),
+            )
             return True
-            
+        except StudioError as e:
+            logger.error(f"Проект {project_id} не удалён: {e.message}")
+            return False
         except Exception as e:
             logger.error(f"Ошибка удаления проекта {project_id}: {e}")
             return False

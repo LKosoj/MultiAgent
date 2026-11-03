@@ -109,3 +109,33 @@ def _storybook_tool_projects_dir(request, monkeypatch):
         tmp_path = request.getfixturevalue("tmp_path")
         monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path / "plots" / "storybooks"))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _normalized_umask():
+    """Каталоги состояния workflow обязаны иметь режим 0700 (state_files.py).
+    При umask 0002 (например, у claude-bot) они получают 0775 и отвергаются,
+    поэтому на время теста фиксируем umask 0022, а потом возвращаем прежний.
+    """
+    previous = os.umask(0o022)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.fixture(autouse=True)
+def _restore_storybook_projects_env():
+    """Старт FastAPI-приложения (apply_runtime_environment) пишет
+    STORYBOOK_PROJECTS_DIR напрямую в os.environ. Без восстановления значение
+    утекает в следующие тесты, и storybook-инструменты ищут проекты в реальном
+    plots/storybooks вместо tmp_path.
+    """
+    previous = os.environ.get("STORYBOOK_PROJECTS_DIR")
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("STORYBOOK_PROJECTS_DIR", None)
+        else:
+            os.environ["STORYBOOK_PROJECTS_DIR"] = previous

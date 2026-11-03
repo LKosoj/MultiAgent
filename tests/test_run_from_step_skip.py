@@ -179,15 +179,17 @@ class TestStepOutputArtifacts(unittest.TestCase):
         artifacts = PipelineRunner._step_output_artifacts(wf)
         self.assertEqual(artifacts["video_generator"], ["custom/marker.json"])
 
-    def test_audio_subtitle_requires_video_ledger(self):
+    def test_audio_subtitle_skips_video_ledger_but_montage_requires_it(self):
         if not YAML_PATH.exists():
             self.skipTest("storybook_pipeline.yaml not found")
         from workflow.models import WorkflowDefinition
         from StoryBookManager.core.pipeline_runner import PipelineRunner
 
         wf = WorkflowDefinition.from_yaml(YAML_PATH)
-        required = PipelineRunner._collect_required_artifacts(wf, "storybook_audio_subtitle")
-        self.assertIn("97_shots/provider_jobs.json", required)
+        subtitle_required = PipelineRunner._collect_required_artifacts(wf, "storybook_audio_subtitle")
+        self.assertNotIn("97_shots/provider_jobs.json", subtitle_required)
+        montage_required = PipelineRunner._collect_required_artifacts(wf, "montage_assembler")
+        self.assertIn("97_shots/provider_jobs.json", montage_required)
 
 
 class TestHookErrorPropagation(unittest.TestCase):

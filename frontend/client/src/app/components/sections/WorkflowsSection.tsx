@@ -13,14 +13,8 @@ import {
   workflowNumberMin,
   type WorkflowParams,
 } from "../../utils/workflowParams";
-import {
-  buildStorybookProjectPayload,
-  isStorybookWorkflowName,
-  summarizeStorybookReadiness,
-  summarizeStorybookWorkflowActions,
-  type StorybookReadinessSummary,
-  type StorybookWorkflowActionsSummary,
-} from "../../utils/storybookReadiness";
+import { isStorybookWorkflowName } from "../../utils/storybookReadiness";
+import { workflowProjectId } from "../../lib/storybook/workflowLink";
 
 const extractFinalOutput = (payload: unknown) => {
   if (!payload) return null;
@@ -89,9 +83,6 @@ type Props = {
   workflowResults: Record<string, unknown>;
   workflowRunHistory: WorkflowRunHistoryEntry[];
   workflowArtifacts: Record<string, unknown>;
-  storybookReadiness: unknown;
-  storybookReadinessLoading: boolean;
-  storybookReadinessError: string | null;
   builderInfo: {
     name: string;
     version: string;
@@ -117,7 +108,7 @@ type Props = {
   setWorkflowOptions: React.Dispatch<React.SetStateAction<{ useEnhanced: boolean; enableTelemetry: boolean }>>;
   setWorkflowParams: React.Dispatch<React.SetStateAction<WorkflowParams>>;
   handleRunWorkflow: () => void | Promise<void>;
-  handleFetchStorybookReadiness: (sourceParams?: Record<string, unknown>) => void;
+  onOpenStorybook: (projectId: string | null) => void;
   handleFetchWorkflowStatus: (id: string) => void;
   handleFetchWorkflowArtifacts: (id: string) => void;
   handleFetchWorkflowResult: (id: string) => void;
@@ -173,9 +164,6 @@ export function WorkflowsSection({
   workflowResults,
   workflowRunHistory,
   workflowArtifacts,
-  storybookReadiness,
-  storybookReadinessLoading,
-  storybookReadinessError,
   builderInfo,
   builderInputs,
   builderSteps,
@@ -193,7 +181,7 @@ export function WorkflowsSection({
   setWorkflowOptions,
   setWorkflowParams,
   handleRunWorkflow,
-  handleFetchStorybookReadiness,
+  onOpenStorybook,
   handleFetchWorkflowStatus,
   handleFetchWorkflowArtifacts,
   handleFetchWorkflowResult,
@@ -226,114 +214,8 @@ export function WorkflowsSection({
   const [isSubmittingYaml, setIsSubmittingYaml] = useState(false);
   const [logsModalAutoRefresh, setLogsModalAutoRefresh] = useState(true);
   const [runLogsAutoRefresh, setRunLogsAutoRefresh] = useState(true);
-  const [storybookValidation, setStorybookValidation] = useState<unknown>(null);
-  const [storybookValidationLoading, setStorybookValidationLoading] = useState(false);
-  const [storybookValidationError, setStorybookValidationError] = useState<string | null>(null);
-  const [storybookProjectInventory, setStorybookProjectInventory] = useState<unknown>(null);
-  const [storybookProjectInventoryLoading, setStorybookProjectInventoryLoading] = useState(false);
-  const [storybookProjectInventoryError, setStorybookProjectInventoryError] = useState<string | null>(null);
   const runLogsInFlightRef = useRef<Set<string>>(new Set());
   const selectedIsStorybook = Boolean(selectedWorkflow && isStorybookWorkflowName(selectedWorkflow.name));
-  const storybookReadinessSummary = useMemo(
-    () => (storybookReadiness ? summarizeStorybookReadiness(storybookReadiness) : null),
-    [storybookReadiness],
-  );
-  const storybookWorkflowActionsSummary = useMemo(
-    () => (storybookReadiness ? summarizeStorybookWorkflowActions(storybookReadiness) : null),
-    [storybookReadiness],
-  );
-
-  const renderStorybookReadinessSummary = (summary: StorybookReadinessSummary) => (
-    <div className="run-result">
-      <div className="section-header">
-        <div>
-          <div className="label">Video/music readiness</div>
-          <div className="card-description">
-            {summary.projectId || "storybook_project"} · {summary.generationEnabled === false ? "video disabled" : "video enabled"}
-          </div>
-        </div>
-        <span className="status-tag" data-status={summary.severity}>
-          {summary.severity === "success" ? "ready" : "attention"}
-        </span>
-      </div>
-      <div className="stack">
-        {summary.rows.map((row) => (
-          <div key={row.key} className="inline">
-            <span className="status-tag" data-status={row.level}>
-              {row.level}
-            </span>
-            <span className="label">{row.label}</span>
-            <span className="card-description">{row.value}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-
-  const renderStorybookWorkflowActionsSummary = (summary: StorybookWorkflowActionsSummary) => (
-    <div className="run-result">
-      <div className="section-header">
-        <div>
-          <div className="label">Storybook action contract</div>
-          <div className="card-description">{summary.workflowName}</div>
-        </div>
-        <span className="status-chip">{summary.actions.length} actions</span>
-      </div>
-      <div className="stack">
-        {summary.rows.map((row) => (
-          <div key={row.key} className="inline">
-            <span className="status-tag" data-status={row.level}>
-              {row.level}
-            </span>
-            <span className="label">{row.label}</span>
-            <span className="card-description">{row.value}</span>
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-
-  const handleValidateStorybookProject = useCallback(async () => {
-    setStorybookValidationLoading(true);
-    setStorybookValidationError(null);
-    setStorybookValidation(null);
-    try {
-      const response = await runServiceAction(
-        "workflows.storybook_validate",
-        buildStorybookProjectPayload(workflowInputs, workflowParams),
-      );
-      setStorybookValidation((response as any)?.validation ?? response);
-    } catch (err) {
-      setStorybookValidationError(err instanceof Error ? err.message : "Не удалось проверить проект");
-    } finally {
-      setStorybookValidationLoading(false);
-    }
-  }, [runServiceAction, workflowInputs, workflowParams]);
-
-  const handleFetchStorybookProjectInventory = useCallback(async () => {
-    setStorybookProjectInventoryLoading(true);
-    setStorybookProjectInventoryError(null);
-    setStorybookProjectInventory(null);
-    try {
-      const response = await runServiceAction("workflows.storybook_project_inventory", {
-        ...buildStorybookProjectPayload(workflowInputs, workflowParams),
-        max_items: 40,
-      });
-      setStorybookProjectInventory((response as any)?.inventory ?? response);
-    } catch (err) {
-      setStorybookProjectInventoryError(err instanceof Error ? err.message : "Не удалось загрузить inventory проекта");
-    } finally {
-      setStorybookProjectInventoryLoading(false);
-    }
-  }, [runServiceAction, workflowInputs, workflowParams]);
-
-  useEffect(() => {
-    setStorybookValidation(null);
-    setStorybookValidationError(null);
-    setStorybookProjectInventory(null);
-    setStorybookProjectInventoryError(null);
-  }, [selectedWorkflow?.name, workflowParams]);
-
   const handleGenerateReport = async (runId: string) => {
     setReportError(null);
     try {
@@ -773,32 +655,13 @@ export function WorkflowsSection({
               </div>
               <div className="button-row">
                 {selectedIsStorybook ? (
-                  <>
-                    <button
-                      className="button secondary"
-                      type="button"
-                      onClick={handleValidateStorybookProject}
-                      disabled={isBusy || storybookValidationLoading}
-                    >
-                      {storybookValidationLoading ? "Проверка..." : "Проверить проект"}
-                    </button>
-                    <button
-                      className="button secondary"
-                      type="button"
-                      onClick={() => handleFetchStorybookReadiness()}
-                      disabled={isBusy || storybookReadinessLoading}
-                    >
-                      {storybookReadinessLoading ? "Проверка..." : "Video/music readiness"}
-                    </button>
-                    <button
-                      className="button secondary"
-                      type="button"
-                      onClick={handleFetchStorybookProjectInventory}
-                      disabled={isBusy || storybookProjectInventoryLoading}
-                    >
-                      {storybookProjectInventoryLoading ? "Загрузка..." : "Project inventory"}
-                    </button>
-                  </>
+                  <button
+                    className="button secondary"
+                    type="button"
+                    onClick={() => onOpenStorybook(workflowProjectId(workflowInputs, workflowParams))}
+                  >
+                    Открыть в Storybook
+                  </button>
                 ) : null}
                 <button
                   className="button"
@@ -817,31 +680,6 @@ export function WorkflowsSection({
                   Обновить inputs
                 </button>
               </div>
-              {selectedIsStorybook && storybookReadinessError ? (
-                <div className="card-description">Ошибка readiness: {storybookReadinessError}</div>
-              ) : null}
-              {selectedIsStorybook && storybookValidationError ? (
-                <div className="card-description">Ошибка validation: {storybookValidationError}</div>
-              ) : null}
-              {selectedIsStorybook && storybookProjectInventoryError ? (
-                <div className="card-description">Ошибка inventory: {storybookProjectInventoryError}</div>
-              ) : null}
-              {selectedIsStorybook && storybookValidation ? (
-                <div className="run-result">
-                  <div className="label">Project validation</div>
-                  <KeyValueList data={storybookValidation} />
-                </div>
-              ) : null}
-              {selectedIsStorybook && storybookProjectInventory ? (
-                <div className="run-result">
-                  <div className="label">Storybook project inventory</div>
-                  <KeyValueList data={storybookProjectInventory} />
-                </div>
-              ) : null}
-              {selectedIsStorybook && storybookReadinessSummary ? renderStorybookReadinessSummary(storybookReadinessSummary) : null}
-              {selectedIsStorybook && storybookWorkflowActionsSummary
-                ? renderStorybookWorkflowActionsSummary(storybookWorkflowActionsSummary)
-                : null}
               {workflowRunError ? <div className="card-description">Ошибка: {workflowRunError}</div> : null}
               <div className="run-result">
                 <div className="section-header">
@@ -893,8 +731,6 @@ export function WorkflowsSection({
             <span className="status-chip">{workflowRunsLoading ? "Обновление..." : `Активных: ${workflowRuns.length}`}</span>
           </div>
           {workflowRunsError ? <div className="card-description">Ошибка: {workflowRunsError}</div> : null}
-          {storybookReadinessError ? <div className="card-description">Ошибка readiness: {storybookReadinessError}</div> : null}
-          {storybookReadinessSummary ? renderStorybookReadinessSummary(storybookReadinessSummary) : null}
           {workflowRuns.length === 0 && !workflowRunsLoading ? (
             <div className="card-description">Нет активных workflow.</div>
           ) : null}
@@ -1103,10 +939,9 @@ export function WorkflowsSection({
                           <button
                             className="button secondary"
                             type="button"
-                            onClick={() => handleFetchStorybookReadiness(entry.parameters)}
-                            disabled={isBusy || storybookReadinessLoading}
+                            onClick={() => onOpenStorybook(workflowProjectId({}, entry.parameters as WorkflowParams))}
                           >
-                            Video/music summary
+                            Открыть в Storybook
                           </button>
                         ) : null}
                       </div>

@@ -1,22 +1,14 @@
-"""Раздел 18.4 ТЗ (docs/tz-blockout-reference-pipeline.md): регистрация
-вкладки «Болванка» в StoryBookManager/gui/main_window.py.
+"""Проводка оболочки в StoryBookManager/gui/main_window.py (раздел 18.4 ТЗ
+docs/tz-blockout-reference-pipeline.md): регистрация болванки, закрытие окна
+с отменой прогона, смена проекта, горячие клавиши.
 
-Headless — tkinter не установлен в этом окружении (образец подмены
-sys.modules["tkinter"]: tests/test_generation_panel_pipeline_config.py).
-main_window.py импортирует остальные панели напрямую по имени, поэтому они
-тоже подменяются лёгкими фейковыми модулями — реальные project_panel.py и
-т.п. не участвуют.
+Headless: настоящий tkinter подменяется в sys.modules лёгкими фейками.
 
 Проверяет:
 - on_project_selected() догружает blockout_panel вместе с остальными
   панелями;
-- on_generation_complete() обновляет blockout_panel ДО проверки
-  несохранённых изменений в редакторе (иначе «Нет» в диалоге о
-  несохранённых изменениях в редакторе обрезал бы обновление вкладки
-  «Болванка» тоже);
-- run_from_step() переключает вкладки по ссылке на виджет
-  (self.generation_panel), а не по магическому индексу (критерий A19 —
-  ручная проверка по ТЗ, но регрессия неверного индекса ловится и здесь).
+- run_from_step() открывает раздел «Генерация» по id и передаёт режим
+  в новый экран.
 """
 
 import importlib
@@ -28,30 +20,6 @@ from unittest.mock import MagicMock, patch
 
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
-
-
-class FakeNotebook:
-    """Записывает вызовы select() — чтобы отличить select(3) (магический
-    индекс) от select(виджет)."""
-
-    def __init__(self):
-        self.select_calls = []
-        self.tabs = []
-
-    def add(self, widget, **kwargs):
-        self.tabs.append(widget)
-
-    def select(self, *args):
-        self.select_calls.append(args[0] if args else None)
-
-    def index(self, _end):
-        return len(self.tabs)
-
-    def bind(self, *args, **kwargs):
-        return None
-
-    def tab(self, *args, **kwargs):
-        return None
 
 
 def _import_main_window():
@@ -98,23 +66,9 @@ def _import_main_window():
         "StoryBookManager.core.project_manager": _fake_panel_module(
             "StoryBookManager.core.project_manager", "ProjectManager"
         ),
-        "StoryBookManager.gui.project_panel": _fake_panel_module(
-            "StoryBookManager.gui.project_panel", "ProjectPanel"
-        ),
-        "StoryBookManager.gui.editor_panel": _fake_panel_module(
-            "StoryBookManager.gui.editor_panel", "EditorPanel"
-        ),
-        "StoryBookManager.gui.media_panel": _fake_panel_module(
-            "StoryBookManager.gui.media_panel", "MediaPanel"
-        ),
-        "StoryBookManager.gui.generation_panel": _fake_panel_module(
-            "StoryBookManager.gui.generation_panel", "GenerationPanel"
-        ),
-        "StoryBookManager.gui.blockout_panel": _fake_panel_module(
-            "StoryBookManager.gui.blockout_panel", "BlockoutPanel"
-        ),
-        "StoryBookManager.gui.settings_dialog": _fake_panel_module(
-            "StoryBookManager.gui.settings_dialog", "SettingsDialog"
+        # экран «Кадры» подключается лениво в create_panels; здесь он не нужен
+        "StoryBookManager.gui.shots.adapter": _fake_panel_module(
+            "StoryBookManager.gui.shots.adapter", "ShotsAdapter"
         ),
     }
 
@@ -126,15 +80,75 @@ class TestBlockoutPanelWiring(unittest.TestCase):
     def _make_window(self, module):
         MainWindow = module.MainWindow
         win = MainWindow.__new__(MainWindow)
-        win.notebook = FakeNotebook()
+        win.show_section = MagicMock()
+        win.topbar = MagicMock()
+        win.navigation = MagicMock()
         win.current_project = types.SimpleNamespace(project_id="proj1", name="Проект 1")
-        win.project_info_label = MagicMock()
         win.editor_panel = MagicMock()
-        win.media_panel = MagicMock()
-        win.generation_panel = MagicMock()
+        win.shots = MagicMock()
+        win.generation = MagicMock()
         win.blockout_panel = MagicMock()
+        win.overview = MagicMock()
+        win.sections = {}
+        win.poller = MagicMock()
         win.set_status = MagicMock()
         return win, MainWindow
+
+    def _closing_window(self, module, owner="Tk"):
+        win, MainWindow = self._make_window(module)
+        win.root = MagicMock()
+        win._run_view = types.SimpleNamespace(owner_name=owner, stop_enabled=True)
+        win._shutdown_shell = MagicMock()
+        win.editor_panel.has_unsaved_changes.return_value = True
+
+        win.bridge = MagicMock()
+        return win, MainWindow
+
+    def test_close_sends_run_cancel_directly_even_if_bridge_pool_is_busy(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        module = _import_main_window()
+        win, MainWindow = self._closing_window(module)
+        # пул моста целиком занят: задача через него не выполнилась бы
+        gate = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=1)
+        pool.submit(gate.wait)
+        calls = []
+        try:
+            with patch("StoryBookManager.gui.shell.dialogs.ConfirmDialog.ask", return_value=True), \
+                    patch.object(module.messagebox, "askyesnocancel", create=True, return_value=False), \
+                    patch("custom_tools.storybook.studio.capabilities.invoke",
+                          side_effect=lambda cap, payload: calls.append((cap, payload)) or {"status": "success"}):
+                MainWindow.on_closing(win)
+        finally:
+            gate.set()
+            pool.shutdown(wait=True)
+        self.assertEqual(calls, [("run_cancel", {"project_id": "proj1"})])
+        win.bridge.call.assert_not_called()
+        win._shutdown_shell.assert_called_once()
+
+    def test_run_cancel_sent_even_if_closing_raises_after_confirmation(self):
+        module = _import_main_window()
+        win, MainWindow = self._closing_window(module)
+        win.editor_panel.has_unsaved_changes.side_effect = RuntimeError("сбой")
+        calls = []
+        with patch("StoryBookManager.gui.shell.dialogs.ConfirmDialog.ask", return_value=True), \
+                patch("custom_tools.storybook.studio.capabilities.invoke",
+                      side_effect=lambda cap, payload: calls.append((cap, payload)) or {"status": "success"}):
+            MainWindow.on_closing(win)
+        self.assertEqual(calls, [("run_cancel", {"project_id": "proj1"})])   # ровно один раз
+        win._shutdown_shell.assert_called_once()
+        win.root.destroy.assert_called_once()
+
+    def test_cancel_in_unsaved_dialog_does_not_touch_run(self):
+        module = _import_main_window()
+        win, MainWindow = self._closing_window(module)
+        with patch("StoryBookManager.gui.shell.dialogs.ConfirmDialog.ask", return_value=True), \
+                patch.object(module.messagebox, "askyesnocancel", create=True, return_value=None), \
+                patch("custom_tools.storybook.studio.capabilities.invoke") as invoke:
+            MainWindow.on_closing(win)
+        invoke.assert_not_called()
+        win._shutdown_shell.assert_not_called()
 
     def test_on_project_selected_loads_blockout_panel(self):
         module = _import_main_window()
@@ -145,48 +159,14 @@ class TestBlockoutPanelWiring(unittest.TestCase):
 
         win.blockout_panel.load_project.assert_called_once_with(project)
 
-    def test_on_generation_complete_refreshes_blockout_panel_before_unsaved_changes_check(self):
-        module = _import_main_window()
-        win, MainWindow = self._make_window(module)
-
-        call_order = []
-        win.media_panel.refresh_media = MagicMock(side_effect=lambda: call_order.append("media"))
-        win.blockout_panel.refresh = MagicMock(side_effect=lambda: call_order.append("blockout"))
-        win.editor_panel.has_unsaved_changes = MagicMock(
-            side_effect=lambda: (call_order.append("unsaved_check"), False)[1]
-        )
-        win.editor_panel.load_project = MagicMock()
-
-        MainWindow.on_generation_complete(win)
-
-        self.assertEqual(call_order, ["media", "blockout", "unsaved_check"])
-        win.blockout_panel.refresh.assert_called_once()
-
-    def test_on_generation_complete_refreshes_blockout_panel_even_if_editor_reload_declined(self):
-        """Раздел 18.4: обновление вкладки «Болванка» не должно зависеть от
-        ответа человека в диалоге «есть несохранённые изменения» редактора —
-        оно вызывается раньше этого диалога."""
-        module = _import_main_window()
-        win, MainWindow = self._make_window(module)
-        win.media_panel.refresh_media = MagicMock()
-        win.blockout_panel.refresh = MagicMock()
-        win.editor_panel.has_unsaved_changes = MagicMock(return_value=True)
-        win.editor_panel.load_project = MagicMock()
-
-        with patch.object(module.messagebox, "askyesno", return_value=False):
-            MainWindow.on_generation_complete(win)
-
-        win.blockout_panel.refresh.assert_called_once()
-        win.editor_panel.load_project.assert_not_called()
-
-    def test_run_from_step_selects_generation_panel_by_widget_not_magic_index(self):
+    def test_run_from_step_opens_generation_section_by_id(self):
         module = _import_main_window()
         win, MainWindow = self._make_window(module)
 
         MainWindow.run_from_step(win)
 
-        self.assertEqual(win.notebook.select_calls, [win.generation_panel])
-        win.generation_panel.run_from_step.assert_called_once()
+        win.show_section.assert_called_once_with("generation")
+        win.generation.apply_intent.assert_called_once_with(mode="from_step")
 
     def test_run_from_step_warns_and_skips_when_no_project(self):
         module = _import_main_window()
@@ -197,7 +177,155 @@ class TestBlockoutPanelWiring(unittest.TestCase):
             MainWindow.run_from_step(win)
 
         mock_warn.assert_called_once()
-        self.assertEqual(win.notebook.select_calls, [])
+        win.show_section.assert_not_called()
+
+
+class TestShellWiring(unittest.TestCase):
+    """Проводка оболочки на фейках: разделы, F5, Ctrl+S, смена проекта, пауза в верхней строке."""
+
+    def _win(self, project=None):
+        module = _import_main_window()
+        win = module.MainWindow.__new__(module.MainWindow)
+        win.current_project = project
+        win.host = types.SimpleNamespace(current="projects", show=MagicMock(
+            side_effect=lambda sid: setattr(win.host, "current", sid)))
+        win.navigation = MagicMock()
+        win.topbar = MagicMock()
+        win.overview = MagicMock()
+        win.poller = MagicMock()
+        win.set_status = MagicMock()
+        win.editor_panel = MagicMock()
+        win.shots = MagicMock()
+        win.blockout_panel = MagicMock()
+        win.sections = {sid: MagicMock(**{"can_leave.return_value": True})
+                        for sid in ("projects", "overview", "files", "shots")}
+        return module, win
+
+    def test_section_without_project_is_refused(self):
+        module, win = self._win()
+        with patch.object(module.notify, "info") as info:
+            self.assertFalse(module.MainWindow.show_section(win, "shots"))
+        info.assert_called_once()
+        win.host.show.assert_not_called()
+
+    def test_opening_project_lands_on_overview_and_resets_topbar(self):
+        module, win = self._win()
+        project = types.SimpleNamespace(project_id="p2", name="Второй")
+        module.MainWindow.show_section = module.MainWindow.show_section
+        win.show_section = lambda sid, **kw: module.MainWindow.show_section(win, sid, **kw)
+        win._update_topbar_visibility = MagicMock()
+        module.MainWindow.on_project_selected(win, project)
+        self.assertEqual(win.host.current, "overview")
+        win.topbar.set_stage.assert_called_with("")
+        win.overview.update_view.assert_called()
+        win.poller.start.assert_called_once_with("p2")
+        win.navigation.set_project_available.assert_called_with(True)
+
+    def test_refresh_and_save_go_to_current_section(self):
+        module, win = self._win(types.SimpleNamespace(project_id="p", name="П"))
+        win.host.current = "files"
+        module.MainWindow.refresh_section(win)
+        win.sections["files"].on_refresh.assert_called_once()
+        module.MainWindow.save_current(win)
+        win.sections["files"].on_save.assert_called_once()
+        win.sections["shots"].on_save.assert_not_called()
+
+    def test_new_project_opens_projects_and_creates(self):
+        module, win = self._win()
+        win.show_section = MagicMock()
+        win.project_panel = MagicMock()
+        module.MainWindow.new_project(win)
+        win.show_section.assert_called_once_with("projects")
+        win.project_panel.create_new_project.assert_called_once()
+
+    def test_unavailable_resets_overview(self):
+        module, win = self._win()
+        module.MainWindow._on_status_unavailable(win)
+        win.topbar.show_unavailable.assert_called_once()
+        win.overview.update_view.assert_called_once()
+
+    # --- финальное ревью: Ctrl+K, Ctrl+S, закрытие, фильтр обзора ---------------------
+    def test_ctrl_k_asks_current_section_before_project_change(self):
+        module, win = self._win(types.SimpleNamespace(project_id="p", name="П"))
+        win.host.current = "shots"
+        win.sections["shots"].can_leave.return_value = False
+        win.project_manager = MagicMock()
+        win.on_project_selected = MagicMock()
+        win._current_section_can_leave = lambda: module.MainWindow._current_section_can_leave(win)
+        module.MainWindow._open_project_by_id(win, "p2")
+        win.sections["shots"].can_leave.assert_called_once()
+        win.on_project_selected.assert_not_called()
+        win.sections["shots"].can_leave.return_value = True
+        module.MainWindow._open_project_by_id(win, "p2")
+        win.on_project_selected.assert_called_once()
+
+    def test_ctrl_k_without_project_asks_settings_section(self):
+        module, win = self._win()
+        win.host.current = "settings"
+        win.sections["settings"] = MagicMock(**{"can_leave.return_value": False})
+        win.project_manager = MagicMock()
+        win.on_project_selected = MagicMock()
+        win._current_section_can_leave = lambda: module.MainWindow._current_section_can_leave(win)
+        module.MainWindow._open_project_by_id(win, "p2")
+        win.sections["settings"].can_leave.assert_called_once()
+        win.on_project_selected.assert_not_called()
+        win.editor_panel.can_leave.assert_not_called()
+
+    def test_opening_project_does_not_ask_again_about_unsaved(self):
+        module, win = self._win()
+        win.sections["projects"].can_leave.return_value = False  # повторный вопрос сорвал бы переход
+        win.show_section = lambda sid, **kw: module.MainWindow.show_section(win, sid, **kw)
+        win._update_topbar_visibility = MagicMock()
+        module.MainWindow.on_project_selected(win, types.SimpleNamespace(project_id="p2", name="Второй"))
+        self.assertEqual(win.host.current, "overview")
+        win.sections["projects"].can_leave.assert_not_called()
+
+    def test_ctrl_s_works_in_settings_without_project(self):
+        module, win = self._win()
+        win.host.current = "settings"
+        win.sections["settings"] = MagicMock()
+        module.MainWindow.save_current(win)
+        win.sections["settings"].on_save.assert_called_once()
+        win.host.current = "files"
+        module.MainWindow.save_current(win)
+        win.sections["files"].on_save.assert_not_called()
+
+    def test_goto_filtered_applies_intent_only_after_successful_switch(self):
+        module, win = self._win()
+        win.show_section = MagicMock(return_value=False)
+        module.MainWindow._goto_filtered(win, "shots", "failed")
+        win.shots.apply_intent.assert_not_called()
+        win.show_section.return_value = True
+        module.MainWindow._goto_filtered(win, "shots", "failed")
+        win.shots.apply_intent.assert_called_once_with(filter="failed")
+
+    def test_shutdown_destroys_project_panel_before_bridge_close(self):
+        module, win = self._win()
+        order = MagicMock()
+        win.project_panel, win.bridge = order.project_panel, order.bridge
+        win.movie = win.blockout_panel = win.editor_panel = win.settings_screen = MagicMock()
+        win.generation = win.toasts = MagicMock()
+        module.MainWindow._shutdown_shell(win)
+        names = [c[0] for c in order.mock_calls]
+        self.assertLess(names.index("project_panel.destroy"), names.index("bridge.close"))
+
+    def test_closing_asks_current_section_after_run_dialog_and_stays_if_refused(self):
+        module, win = self._win(types.SimpleNamespace(project_id="p", name="П"))
+        win.root = MagicMock()
+        win._run_view = types.SimpleNamespace(owner_name="Tk", stop_enabled=True)
+        win._shutdown_shell = MagicMock()
+        win.bridge = MagicMock()
+        win.editor_panel.has_unsaved_changes.return_value = False
+        win.host.current = "shots"
+        win.sections["shots"].can_leave.return_value = False
+        win._current_section_can_leave = lambda: module.MainWindow._current_section_can_leave(win)
+        win._confirm_close_with_run = lambda: module.MainWindow._confirm_close_with_run(win)
+        with patch("StoryBookManager.gui.shell.dialogs.ConfirmDialog.ask", return_value=True), \
+                patch("custom_tools.storybook.studio.capabilities.invoke") as invoke:
+            module.MainWindow.on_closing(win)
+        win.sections["shots"].can_leave.assert_called_once()
+        invoke.assert_not_called()
+        win.root.destroy.assert_not_called()
 
 
 if __name__ == "__main__":

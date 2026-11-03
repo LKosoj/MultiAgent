@@ -1,0 +1,26 @@
+# Цены на платные генерации storybook, рубли.
+# Мы цен не знаем и не придумываем: все значения null, владелец заполняет сам.
+# Пока цена видео неизвестна, денежный бюджет больше 0 не работает
+# (ошибка budget_price_unknown), а оценка стоимости пишет «цена неизвестна».
+#
+# Цена видео задаётся либо за секунду (per_second_rub), либо за ролик
+# (per_clip_rub); если заданы обе, берётся per_second_rub.
+# by_resolution переопределяет цену модели для разрешения, например:
+#   by_resolution: {"720p": {per_second_rub: 12.5}}
+version: 1
+currency: RUB
+video:
+  routerai:
+    models:
+      "bytedance/seedance-1-5-pro":
+        per_second_rub: null
+        per_clip_rub: null
+        by_resolution: {}
+  aitunnel:
+    models: {}
+images:
+  per_image_rub: null
+music:
+  per_track_rub: null
+sfx:
+  per_effect_rub: null

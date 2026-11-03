@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Карта ресурсов болванки",
+  "properties": {
+    "characters": {
+      "type": "array",
+      "title": "Персонажи",
+      "items": {
+        "type": "object",
+        "title": "Персонаж",
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Имя"
+          },
+          "asset_id": {
+            "type": "string",
+            "title": "Ресурс"
+          }
+        },
+        "x-recommended": [
+          "name",
+          "asset_id"
+        ]
+      }
+    },
+    "locations": {
+      "type": "array",
+      "title": "Места",
+      "items": {
+        "type": "object",
+        "title": "Место",
+        "properties": {
+          "location": {
+            "type": "string",
+            "title": "Место"
+          },
+          "key_object": {
+            "type": "string",
+            "title": "Предмет"
+          },
+          "asset_id": {
+            "type": "string",
+            "title": "Ресурс"
+          }
+        },
+        "x-recommended": [
+          "location",
+          "key_object",
+          "asset_id"
+        ]
+      }
+    }
+  },
+  "x-recommended": [
+    "characters",
+    "locations"
+  ]
+}

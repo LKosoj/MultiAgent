@@ -1,0 +1,794 @@
+{
+ "filter_from_intent": [
+  {
+   "in": [
+    "stale"
+   ],
+   "out": {
+    "stale_only": true
+   }
+  },
+  {
+   "in": [
+    "errors"
+   ],
+   "out": {
+    "state": "error"
+   }
+  },
+  {
+   "in": [
+    "ready"
+   ],
+   "out": {
+    "state": "ready"
+   }
+  },
+  {
+   "in": [
+    "approved"
+   ],
+   "out": {
+    "review": "approved"
+   }
+  },
+  {
+   "in": [
+    "pending"
+   ],
+   "out": {
+    "review": "pending"
+   }
+  },
+  {
+   "in": [
+    "redo"
+   ],
+   "out": {
+    "review": "redo"
+   }
+  },
+  {
+   "in": [
+    "missing_images"
+   ],
+   "out": {}
+  },
+  {
+   "in": [
+    null
+   ],
+   "out": {}
+  },
+  {
+   "in": [
+    "unknown"
+   ],
+   "out": {}
+  }
+ ],
+ "next_status_on_key": [
+  {
+   "in": [
+    "pending",
+    "a"
+   ],
+   "out": "approved"
+  },
+  {
+   "in": [
+    "approved",
+    "a"
+   ],
+   "out": "pending"
+  },
+  {
+   "in": [
+    "approved",
+    "r"
+   ],
+   "out": "redo"
+  },
+  {
+   "in": [
+    "redo",
+    "x"
+   ],
+   "out": "rejected"
+  },
+  {
+   "in": [
+    "pending",
+    "A"
+   ],
+   "out": "approved"
+  },
+  {
+   "in": [
+    "pending",
+    "q"
+   ],
+   "out": null
+  }
+ ],
+ "plural_shots": [
+  {
+   "in": [
+    1
+   ],
+   "out": "1 шот"
+  },
+  {
+   "in": [
+    2
+   ],
+   "out": "2 шота"
+  },
+  {
+   "in": [
+    5
+   ],
+   "out": "5 шотов"
+  },
+  {
+   "in": [
+    11
+   ],
+   "out": "11 шотов"
+  },
+  {
+   "in": [
+    21
+   ],
+   "out": "21 шот"
+  },
+  {
+   "in": [
+    22
+   ],
+   "out": "22 шота"
+  }
+ ],
+ "default_what": [
+  {
+   "in": [
+    [
+     "start"
+    ],
+    []
+   ],
+   "out": "both"
+  },
+  {
+   "in": [
+    [
+     "video"
+    ],
+    []
+   ],
+   "out": "video"
+  },
+  {
+   "in": [
+    [],
+    [
+     "end"
+    ]
+   ],
+   "out": "both"
+  },
+  {
+   "in": [
+    [],
+    []
+   ],
+   "out": "both"
+  }
+ ],
+ "regen_button": [
+  {
+   "in": [
+    1180,
+    false
+   ],
+   "out": {
+    "label": "Перегенерировать за 1\u00a0180\u00a0₽",
+    "note": null
+   }
+  },
+  {
+   "in": [
+    0,
+    false
+   ],
+   "out": {
+    "label": "Перегенерировать",
+    "note": null
+   }
+  },
+  {
+   "in": [
+    0,
+    true
+   ],
+   "out": {
+    "label": "Перегенерировать без оценки",
+    "note": "regen_cost_unknown"
+   }
+  },
+  {
+   "in": [
+    340,
+    true
+   ],
+   "out": {
+    "label": "Перегенерировать за 340\u00a0₽",
+    "note": "regen_cost_partial"
+   }
+  }
+ ],
+ "format_rub_exact": [
+  {
+   "in": [
+    6.36
+   ],
+   "out": "6,36\u00a0₽"
+  },
+  {
+   "in": [
+    6.5
+   ],
+   "out": "6,50\u00a0₽"
+  },
+  {
+   "in": [
+    1180
+   ],
+   "out": "1\u00a0180\u00a0₽"
+  }
+ ],
+ "neighbor_key": [
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    "b",
+    1
+   ],
+   "out": "c"
+  },
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    "c",
+    1
+   ],
+   "out": "c"
+  },
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    "a",
+    -1
+   ],
+   "out": "a"
+  },
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    null,
+    1
+   ],
+   "out": "a"
+  },
+  {
+   "in": [
+    [],
+    null,
+    1
+   ],
+   "out": null
+  }
+ ],
+ "bulk_target_keys": [
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    [
+     "c",
+     "a"
+    ],
+    "b"
+   ],
+   "out": [
+    "a",
+    "c"
+   ]
+  },
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    [],
+    "b"
+   ],
+   "out": [
+    "b"
+   ]
+  },
+  {
+   "in": [
+    [
+     "a",
+     "b",
+     "c"
+    ],
+    [],
+    null
+   ],
+   "out": []
+  }
+ ],
+ "error_text": [
+  {
+   "in": [
+    "conflict",
+    "review_changed",
+    "сервер"
+   ],
+   "out": "Ревью шота изменено в другом месте. Данные обновлены, повторите действие."
+  },
+  {
+   "in": [
+    "conflict",
+    "plan_changed",
+    "сервер"
+   ],
+   "out": "План изменился с момента показа. Проверьте его ещё раз."
+  },
+  {
+   "in": [
+    "conflict",
+    "cost_changed",
+    "сервер"
+   ],
+   "out": "Стоимость изменилась. Проверьте сумму ещё раз."
+  },
+  {
+   "in": [
+    "conflict",
+    "regeneration_pending",
+    "сервер"
+   ],
+   "out": "Предыдущая перегенерация ещё не завершена."
+  },
+  {
+   "in": [
+    "locked",
+    null,
+    "сервер"
+   ],
+   "out": "С этим проектом уже работает другое приложение или прогон. Дождитесь конца или остановите прогон."
+  },
+  {
+   "in": [
+    "internal",
+    null,
+    "Сообщение сервера"
+   ],
+   "out": "Сообщение сервера"
+  }
+ ],
+ "dirty_changes": [
+  {
+   "in": [
+    {
+     "start": {
+      "prompt": "a",
+      "negative_prompt": "n"
+     },
+     "end": {
+      "prompt": "b",
+      "negative_prompt": ""
+     },
+     "video": {
+      "prompt": "v",
+      "duration_s": 5
+     },
+     "editable": {
+      "fields": [
+       "start_prompt",
+       "end_prompt",
+       "video_prompt",
+       "start_negative_prompt",
+       "end_negative_prompt",
+       "duration_s"
+      ]
+     }
+    },
+    {
+     "start_prompt": "a",
+     "duration_s": 5
+    }
+   ],
+   "out": {}
+  },
+  {
+   "in": [
+    {
+     "start": {
+      "prompt": "a",
+      "negative_prompt": "n"
+     },
+     "end": {
+      "prompt": "b",
+      "negative_prompt": ""
+     },
+     "video": {
+      "prompt": "v",
+      "duration_s": 5
+     },
+     "editable": {
+      "fields": [
+       "video_prompt"
+      ]
+     }
+    },
+    {
+     "start_prompt": "x",
+     "video_prompt": "w"
+    }
+   ],
+   "out": {
+    "video_prompt": "w"
+   }
+  },
+  {
+   "in": [
+    {
+     "start": {
+      "prompt": "a",
+      "negative_prompt": "n"
+     },
+     "end": {
+      "prompt": "b",
+      "negative_prompt": ""
+     },
+     "video": {
+      "prompt": "v",
+      "duration_s": 5
+     },
+     "editable": {
+      "fields": [
+       "start_prompt",
+       "end_prompt",
+       "video_prompt",
+       "start_negative_prompt",
+       "end_negative_prompt",
+       "duration_s"
+      ]
+     }
+    },
+    {
+     "start_prompt": "a2"
+    }
+   ],
+   "out": {
+    "start_prompt": "a2"
+   }
+  }
+ ],
+ "layout_rows": [
+  {
+   "in": [
+    [
+     "1-1",
+     "1-2",
+     "2-1"
+    ],
+    "list",
+    1
+   ],
+   "out": {
+    "rows": [
+     {
+      "kind": "header",
+      "scene": 1,
+      "top": 0,
+      "height": 32
+     },
+     {
+      "kind": "row",
+      "keys": [
+       "1-1"
+      ],
+      "top": 32,
+      "height": 64
+     },
+     {
+      "kind": "row",
+      "keys": [
+       "1-2"
+      ],
+      "top": 96,
+      "height": 64
+     },
+     {
+      "kind": "header",
+      "scene": 2,
+      "top": 160,
+      "height": 32
+     },
+     {
+      "kind": "row",
+      "keys": [
+       "2-1"
+      ],
+      "top": 192,
+      "height": 64
+     }
+    ],
+    "total": 256
+   }
+  },
+  {
+   "in": [
+    [
+     "1-1",
+     "1-2",
+     "1-3"
+    ],
+    "grid",
+    2
+   ],
+   "out": {
+    "rows": [
+     {
+      "kind": "header",
+      "scene": 1,
+      "top": 0,
+      "height": 32
+     },
+     {
+      "kind": "grid",
+      "keys": [
+       "1-1",
+       "1-2"
+      ],
+      "top": 32,
+      "height": 120
+     },
+     {
+      "kind": "grid",
+      "keys": [
+       "1-3"
+      ],
+      "top": 152,
+      "height": 120
+     }
+    ],
+    "total": 272
+   }
+  }
+ ],
+ "visible_range": [
+  {
+   "in": [
+    [],
+    0,
+    100,
+    0
+   ],
+   "out": [
+    0,
+    -1
+   ]
+  },
+  {
+   "in": [
+    [
+     {
+      "top": 0,
+      "height": 32
+     },
+     {
+      "top": 32,
+      "height": 64
+     },
+     {
+      "top": 96,
+      "height": 64
+     },
+     {
+      "top": 160,
+      "height": 32
+     },
+     {
+      "top": 192,
+      "height": 64
+     }
+    ],
+    0,
+    100,
+    0
+   ],
+   "out": [
+    0,
+    2
+   ]
+  },
+  {
+   "in": [
+    [
+     {
+      "top": 0,
+      "height": 32
+     },
+     {
+      "top": 32,
+      "height": 64
+     },
+     {
+      "top": 96,
+      "height": 64
+     },
+     {
+      "top": 160,
+      "height": 32
+     },
+     {
+      "top": 192,
+      "height": 64
+     }
+    ],
+    100,
+    60,
+    0
+   ],
+   "out": [
+    2,
+    2
+   ]
+  },
+  {
+   "in": [
+    [
+     {
+      "top": 0,
+      "height": 32
+     },
+     {
+      "top": 32,
+      "height": 64
+     },
+     {
+      "top": 96,
+      "height": 64
+     },
+     {
+      "top": 160,
+      "height": 32
+     },
+     {
+      "top": 192,
+      "height": 64
+     }
+    ],
+    100,
+    60,
+    40
+   ],
+   "out": [
+    1,
+    4
+   ]
+  },
+  {
+   "in": [
+    [
+     {
+      "top": 0,
+      "height": 32
+     },
+     {
+      "top": 32,
+      "height": 64
+     },
+     {
+      "top": 96,
+      "height": 64
+     },
+     {
+      "top": 160,
+      "height": 32
+     },
+     {
+      "top": 192,
+      "height": 64
+     }
+    ],
+    10000,
+    100,
+    0
+   ],
+   "out": [
+    4,
+    4
+   ]
+  }
+ ],
+ "left_column_width": [
+  {
+   "in": [
+    1099
+   ],
+   "out": 280
+  },
+  {
+   "in": [
+    1100
+   ],
+   "out": 360
+  },
+  {
+   "in": [
+    1499
+   ],
+   "out": 360
+  },
+  {
+   "in": [
+    1500
+   ],
+   "out": 440
+  }
+ ],
+ "columns_for_width": [
+  {
+   "in": [
+    344
+   ],
+   "out": 2
+  },
+  {
+   "in": [
+    428
+   ],
+   "out": 3
+  },
+  {
+   "in": [
+    264
+   ],
+   "out": 1
+  },
+  {
+   "in": [
+    100
+   ],
+   "out": 1
+  }
+ ]
+}

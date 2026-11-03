@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Шоты",
+  "properties": {
+    "items": {
+      "type": "array",
+      "title": "Шоты",
+      "items": {
+        "type": "object",
+        "title": "Шот",
+        "properties": {
+          "scene_number": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Сцена"
+          },
+          "shot_number": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Шот"
+          },
+          "shot_type": {
+            "type": "string",
+            "title": "Тип шота"
+          },
+          "timing": {
+            "type": "string",
+            "title": "Тайминг"
+          },
+          "english_prompt": {
+            "type": "string",
+            "title": "Промпт картинки"
+          },
+          "video_prompt": {
+            "type": "string",
+            "title": "Промпт видео"
+          },
+          "negative_prompt": {
+            "type": "string",
+            "title": "Негативный промпт"
+          },
+          "reference_image_paths": {
+            "type": "array",
+            "title": "Референсы",
+            "items": {
+              "type": "string"
+            }
+          },
+          "width": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Ширина"
+          },
+          "height": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Высота"
+          },
+          "seed": {
+            "type": "integer",
+            "title": "Зерно случайности"
+          },
+          "image_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "title": "Путь к картинке"
+          },
+          "output_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "title": "Путь к результату"
+          },
+          "video_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "title": "Путь к видео"
+          }
+        },
+        "required": [
+          "scene_number",
+          "shot_number",
+          "shot_type"
+        ],
+        "x-recommended": [
+          "timing",
+          "english_prompt",
+          "video_prompt",
+          "negative_prompt",
+          "reference_image_paths",
+          "width",
+          "height",
+          "seed"
+        ]
+      }
+    }
+  },
+  "required": [
+    "items"
+  ]
+}

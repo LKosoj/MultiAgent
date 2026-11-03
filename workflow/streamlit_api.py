@@ -1173,7 +1173,12 @@ class WorkflowManager:
                     if "project_id" in parameters
                     else workflow_def.inputs.get("project_id")
                 )
-                project_lock = acquire_storybook_project_lock(project_id)
+                if parameters.get("studio_plan"):
+                    # пробы статуса берут замок на миг: пара повторов вместо ложного «занят»
+                    from custom_tools.storybook.studio.run_control import acquire_lock_with_retries
+                    project_lock = acquire_lock_with_retries(project_id)
+                else:
+                    project_lock = acquire_storybook_project_lock(project_id)
                 if project_lock is None:
                     raise WorkflowExecutionError("Storybook project is already running")
 
@@ -1224,14 +1229,21 @@ class WorkflowManager:
                     parameters,
                     workflow_name=workflow_def.name,
                 ):
-                    result = loop.run_until_complete(
-                        self.engine.execute_workflow_from_yaml(
+                    if parameters.get("studio_plan"):
+                        # план студии Storybook: замок проекта уже взят выше
+                        from custom_tools.storybook.studio.run_exec import execute_plan_raw
+                        run_coro = execute_plan_raw(
+                            self.engine, parameters["studio_plan"],
+                            run_id=parameters.get("studio_run_id"),
+                            surface="react", launcher="backend", lock_held=True)
+                    else:
+                        run_coro = self.engine.execute_workflow_from_yaml(
                             workflow_file,
                             context=context,
                             client_id=client_id,
                             **parameters
                         )
-                    )
+                    result = loop.run_until_complete(run_coro)
                 worker_config_versions = _capture_active_yaml_config_versions()
                 
                 result_status = getattr(result, "status", WorkflowStatus.COMPLETED)

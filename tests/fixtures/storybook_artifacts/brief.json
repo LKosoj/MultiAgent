@@ -1,0 +1,20 @@
+{
+  "title": "Лисёнок и луна",
+  "language": "ru",
+  "genre": "сказка",
+  "target_age": "5-7",
+  "pages_min": 2,
+  "pages_max": 3,
+  "words_per_page_min": 50,
+  "words_per_page_max": 80,
+  "description": "Лисёнок ищет луну.",
+  "main_characters": [
+    "Лисёнок"
+  ],
+  "main_locations": [
+    "Лес"
+  ],
+  "moral": "Не сдавайся.",
+  "storybook_prompt": "Сказка про лисёнка.",
+  "seed": 42
+}

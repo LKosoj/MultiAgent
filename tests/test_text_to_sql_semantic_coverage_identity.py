@@ -482,9 +482,9 @@ def test_selected_bindings_follow_canonical_source_and_binding_order() -> None:
     )
 
 
-@pytest.mark.parametrize("freshness", ("stale", "unavailable", "revalidate", "future"))
+@pytest.mark.parametrize("freshness", ("stale", "unavailable", "revalidate"))
 def test_supported_binding_requires_current_fresh_evidence(freshness: str) -> None:
-    completed_at = NOW + timedelta(seconds=1) if freshness == "future" else NOW
+    completed_at = NOW
     valid_until = NOW if freshness == "revalidate" else None
     evidence = _document_evidence(
         "document-evidence",
@@ -517,6 +517,32 @@ def test_supported_binding_requires_current_fresh_evidence(freshness: str) -> No
         CoverageInputErrorCode.STALE_BINDING_EVIDENCE,
         ("source-a",),
         lambda: _validate(state, _context(documents=documents)),
+    )
+
+
+def test_coverage_does_not_compare_evidence_clock_with_context_clock() -> None:
+    # R1492 (R6-уточнение): coverage не сравнивает observed_at/created_at с часами
+    # context; свежесть решают state/run/schema identity и document/data validity.
+    evidence = _document_evidence(
+        "document-evidence",
+        completed_at=NOW + timedelta(seconds=1),
+    )
+    state = _state(
+        bindings=(_document_binding("source-a", "binding-a", evidence.evidence_id),),
+        evidence=(evidence,),
+    )
+    documents = (
+        DocumentSourceState(
+            document_id="coverage-document",
+            availability=DocumentSourceAvailability.AVAILABLE,
+            source_version="v1",
+        ),
+    )
+
+    requirements = _validate(state, _context(documents=documents))
+
+    assert tuple(binding.binding_id for binding in requirements.selected_bindings) == (
+        "binding-a",
     )
 
 

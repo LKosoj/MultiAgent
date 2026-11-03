@@ -445,9 +445,12 @@ def test_result_review_prompts_for_grain_and_allows_single_observation() -> None
     checklist = prompts[0]["review_binding_role_checklist"]
     assert checklist["instruction"] == (
         "Before returning consistent, compare every item below with the SQL in its "
-        "required semantic role. If the requested meaning and selected physical "
-        "column conflict with trusted schema descriptions, return "
-        "semantic_binding_mismatch for this binding."
+        "required semantic role. Do not independently relitigate a SUPPORTED "
+        "binding that the SQL follows solely because the requested phrase and "
+        "column description differ. Return semantic_binding_mismatch only when "
+        "a positive trusted fact identifies a different physical attribute for "
+        "the requested role, or the SQL AST or returned data contradicts the "
+        "selected binding."
     )
     assert checklist["items"] == [
         {
@@ -3970,9 +3973,9 @@ def test_result_review_rejects_aggregate_for_dimension_only_output() -> None:
             in instruction
             and "Words such as list, values, categories, labels, what, or which do not imply uniqueness"
             in instruction
-            and "When the requested output is a proven unique identity of a root entity and a "
-            "joined child relation is used only to qualify that entity, with no child output "
-            "requested, return each qualifying root identity once" in instruction
+            and "When a requested root entity identity is qualified only by "
+            "joined child rows, repeated root identities contradict the requested entity grain; "
+            "return each qualifying root identity once" in instruction
             and "does not apply to counts, metrics, formulas, or requested child rows"
             in instruction
         ):

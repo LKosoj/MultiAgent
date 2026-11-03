@@ -126,8 +126,10 @@ def test_decision_identity_json_and_schema_are_unchanged() -> None:
     assert canonical_digest(decision) == (
         "sha256:35c448c0dbe3d7e6861094b4fd747cc50bcb2c9d9f7065637ff5fb47e07e6251"
     )
+    # Схема расширена взаимоисключающими handle-формами (source_handles,
+    # citation_evidence_handles, join_handle); план: refines R2561, 4a614d3.
     assert canonical_digest(ResearchDecisionV1.model_json_schema()) == (
-        "sha256:7dd5e4dc0d831ec9183651818522c104d2afdf0aa19497e8c63e945e0b207e95"
+        "sha256:f1e8033f6ee134fcf859216d0fdb1ffa72292606c98636dadacbeb93686aeae0"
     )
     assert canonical_digest(ToolIntent.model_json_schema()) == (
         "sha256:f92074173045d807a909d21ca66a4db0500bb1750a52cbb1692781084eb31374"

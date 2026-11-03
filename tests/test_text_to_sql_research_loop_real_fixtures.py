@@ -279,6 +279,7 @@ def _bounded_research_context(schema: dict[str, object]):
     def build(
         state: ResearchState,
         _feedbacks: tuple[str, ...],
+        *_extra: object,
     ) -> str:
         return canonical_json_bytes(
             {
@@ -330,6 +331,17 @@ def _state_with_second_required_item(
             "unresolved_items": ("source-1", "source-2"),
         }
     )
+
+
+def _evidence_handles(state: ResearchState) -> dict[str, str]:
+    """Model-facing evidence handles: e1.. over the sorted evidence IDs."""
+
+    return {
+        value: f"e{index}"
+        for index, value in enumerate(
+            sorted(record.evidence_id for record in state.evidence), 1
+        )
+    }
 
 
 def _context_payload(
@@ -468,7 +480,7 @@ def test_bounded_context_refreshes_exact_omissions_after_final_rollback(monkeypa
     assert isinstance(omitted, dict)
 
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
-    assert [item["source_id"] for item in query_spec["semantic_items"]] == ["source-1"]
+    assert [item["source_handle"] for item in query_spec["semantic_items"]] == ["s1"]
     assert omitted == {
         "semantic_items": len(state.query_spec.semantic_items)
         - len(query_spec["semantic_items"]),
@@ -509,8 +521,8 @@ def test_bounded_context_omits_result_expectation_without_its_source() -> None:
     _, payload = _context_payload(state, policy)
     included = payload["state"]
 
-    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]] == ["source-1"]
-    assert [item["evidence_id"] for item in included["evidence"]] == [evidence.evidence_id]
+    assert [item["source_handle"] for item in included["query_spec"]["semantic_items"]] == ["s1"]
+    assert [item["evidence_handle"] for item in included["evidence"]] == ["e1"]
     assert included["result_expectations"] == []
     assert payload["omitted"]["result_expectations"] == 1
 
@@ -586,10 +598,10 @@ def test_bounded_context_keeps_unresolved_source_when_binding_bundle_does_not_fi
     _, payload = _context_payload(state, policy)
     included = payload["state"]
 
-    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]] == [
-        "source-1"
+    assert [item["source_handle"] for item in included["query_spec"]["semantic_items"]] == [
+        "s1"
     ]
-    assert included["unresolved_items"] == ["source-1"]
+    assert included["unresolved_source_handles"] == ["s1"]
     assert [item["binding_id"] for item in included["bindings"]] == ["binding-1"]
     assert included["evidence"] == []
     assert payload["omitted"] == {"evidence": 1}
@@ -664,11 +676,9 @@ def test_bounded_context_prioritizes_validated_join_over_supported_binding_bundl
     included = payload["state"]
 
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
-    assert [item["join_id"] for item in included["join_candidates"]] == ["join-1"]
+    assert [item["join_handle"] for item in included["join_candidates"]] == ["j1"]
     assert included["bindings"] == []
-    assert [item["evidence_id"] for item in included["evidence"]] == [
-        "evidence-join"
-    ]
+    assert [item["evidence_handle"] for item in included["evidence"]] == ["e2"]
     assert payload["omitted"]["bindings"] == 1
 
 
@@ -681,7 +691,10 @@ def test_bounded_context_keeps_validated_join_when_its_evidence_exceeds_prompt_c
         table=TableRef(namespace="main", schema=None, table="customers"),
         column="order_id",
     )
-    evidence = _context_evidence(base, "evidence-join", "x" * 40_000)
+    # The largest observation EvidenceRecord allows: it no longer fits the
+    # _MAX_SCHEMA_RESEARCH_PROMPT_BYTES next to the fixed instructions, yet stays within
+    # the policy's inline bytes.
+    evidence = _context_evidence(base, "evidence-join", "x" * 65_536)
     join = JoinCandidate(
         join_id="join-1",
         left=column,
@@ -711,12 +724,12 @@ def test_bounded_context_keeps_validated_join_when_its_evidence_exceeds_prompt_c
         validation_feedback=None,
     )
 
-    assert len(prompt.encode("utf-8")) <= 32_768
+    assert len(prompt.encode("utf-8")) <= production_research._MAX_SCHEMA_RESEARCH_PROMPT_BYTES
     assert state.model_dump(mode="python", round_trip=True) == before
     assert included["evidence"] == []
     assert included["join_candidates"] == [
         {
-            "join_id": "join-1",
+            "join_handle": "j1",
             "left": column.model_dump(mode="json", by_alias=True),
             "right": related_column.model_dump(mode="json", by_alias=True),
             "join_type": "inner",
@@ -728,7 +741,7 @@ def test_bounded_context_keeps_validated_join_when_its_evidence_exceeds_prompt_c
                 ).model_dump(mode="json", by_alias=True)
             ],
             "status": "validated",
-            "evidence_ids": [evidence.evidence_id],
+            "evidence_handles": ["e1"],
         }
     ]
 
@@ -771,13 +784,13 @@ def test_bounded_context_keeps_compact_inline_evidence_for_required_binding() ->
     included = payload["state"]
 
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
-    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]] == [
-        "source-1"
+    assert [item["source_handle"] for item in included["query_spec"]["semantic_items"]] == [
+        "s1"
     ]
     assert [item["binding_id"] for item in included["bindings"]] == ["binding-1"]
     assert included["evidence"] == [
         {
-            "evidence_id": "evidence-1",
+            "evidence_handle": "e1",
             "source_kind": "schema",
             "target": column.model_dump(mode="json", by_alias=True),
             "probe_kind": "inspect_column",
@@ -792,7 +805,10 @@ def test_bounded_context_keeps_compact_inline_evidence_for_required_binding() ->
 
 
 def test_bounded_context_keeps_old_exact_inspection_for_active_candidate() -> None:
-    policy = _bounded_context_policy(3_250)
+    # 3_250 only fits the proposal evidence now: handle keys made each model
+    # view entry longer, so the cap is raised until the exact inspection fits
+    # but the newer noise still does not.
+    policy = _bounded_context_policy(3_500)
     base = _initial_state("bounded-old-inspection", "sha256:" + "a" * 64, policy)
     table = TableRef(namespace="main", schema=None, table="orders")
     column = ColumnRef(table=table, column="id")
@@ -865,11 +881,15 @@ def test_bounded_context_keeps_old_exact_inspection_for_active_candidate() -> No
 
     _, payload = _context_payload(state, policy)
     included = payload["state"]
-    included_evidence_ids = {item["evidence_id"] for item in included["evidence"]}
+    handles = _evidence_handles(state)
+    included_evidence_handles = {item["evidence_handle"] for item in included["evidence"]}
 
     assert [item["binding_id"] for item in included["bindings"]] == ["binding-1"]
-    assert exact_inspection.evidence_id in included_evidence_ids
-    assert any(item.evidence_id not in included_evidence_ids for item in newer_noise)
+    assert handles[exact_inspection.evidence_id] in included_evidence_handles
+    assert any(
+        handles[item.evidence_id] not in included_evidence_handles
+        for item in newer_noise
+    )
 
 
 def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None:
@@ -961,7 +981,7 @@ def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None
             ),
             "evidence": evidence,
             "bindings": bindings,
-            "unresolved_items": (eur_id, czk_id),
+            "unresolved_items": (formula_id, eur_id, czk_id),
         }
     )
     schema = {
@@ -1008,26 +1028,32 @@ def test_bounded_context_keeps_all_required_r41_binding_decision_facts() -> None
         )
 
         assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
-        assert len(prompt.encode("utf-8")) <= 32 * 1024
+        assert (
+            len(prompt.encode("utf-8"))
+            <= production_research._MAX_SCHEMA_RESEARCH_PROMPT_BYTES
+        )
+        # Handles are s1.. over the sorted source IDs: formula, eur, czk.
         assert {
-            item["source_id"] for item in included["query_spec"]["semantic_items"]
-        } == {formula_id, eur_id, czk_id}
+            item["source_handle"] for item in included["query_spec"]["semantic_items"]
+        } == {"s1", "s2", "s3"}
         assert {item["binding_id"] for item in included["bindings"]} == {
             eur_binding_id,
             czk_binding_id,
         }
-        included_evidence_ids = {item["evidence_id"] for item in included["evidence"]}
-        assert included_evidence_ids == {raw_evidence_id}
+        included_evidence_handles = {
+            item["evidence_handle"] for item in included["evidence"]
+        }
+        assert included_evidence_handles == {_evidence_handles(state)[raw_evidence_id]}
         assert all(
-            set(item["evidence_ids"]).issubset(included_evidence_ids)
+            set(item["evidence_handles"]).issubset(included_evidence_handles)
             for item in included["bindings"]
         )
         assert all(
             set(item) == {
                 "binding_id",
-                "source_id",
+                "source_handle",
                 "kind",
-                "evidence_ids",
+                "evidence_handles",
                 "status",
                 "discriminator_column",
                 "discriminator_predicate",
@@ -1103,7 +1129,7 @@ def test_bounded_context_keeps_unresolved_item_and_identifier_atomic() -> None:
 
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
     assert query_spec["semantic_items"] == []
-    assert included["unresolved_items"] == []
+    assert included["unresolved_source_handles"] == []
     assert payload["omitted"]["semantic_items"] == 1
 
 
@@ -1198,7 +1224,7 @@ def test_bounded_context_hides_active_facts_without_all_source_items() -> None:
     assert isinstance(query_spec, dict)
 
     assert len(context.encode("utf-8")) <= policy.result_volume.inline_bytes
-    assert [item["source_id"] for item in query_spec["semantic_items"]] == ["source-1"]
+    assert [item["source_handle"] for item in query_spec["semantic_items"]] == ["s1"]
     assert included["hypotheses"] == []
     assert included["bindings"] == []
 
@@ -1493,13 +1519,15 @@ def test_bounded_production_context_keeps_completed_actions_nonreexecutable_when
     payload = json.loads(context)
     included = payload["state"]
     assert len(context.encode("utf-8")) <= 16 * 1024
-    assert len(prompt.encode("utf-8")) <= 64 * 1024
+    assert len(prompt.encode("utf-8")) <= production_research._MAX_SCHEMA_RESEARCH_PROMPT_BYTES
     assert canonical_json_bytes(state) == before
-    assert [item["source_id"] for item in included["query_spec"]["semantic_items"]][0] == "source-1"
+    handles = _evidence_handles(state)
+    assert [item["source_handle"] for item in included["query_spec"]["semantic_items"]][0] == "s1"
     assert included["hypotheses"][0]["hypothesis_id"] == hypothesis.hypothesis_id
     assert included["bindings"][0]["binding_id"] == binding.binding_id
-    assert included["join_candidates"][0]["join_id"] == join.join_id
-    assert evidence[-1].evidence_id in {item["evidence_id"] for item in included["evidence"]}
+    assert included["join_candidates"][0]["join_handle"] == "j1"
+    included_evidence_handles = {item["evidence_handle"] for item in included["evidence"]}
+    assert handles[evidence[-1].evidence_id] in included_evidence_handles
     assert payload["completed_actions_are_not_reexecutable"] is True
     assert payload["rejected_duplicate_actions"][0]["action_digest"] == (
         completed_action.action_digest
@@ -1507,9 +1535,9 @@ def test_bounded_production_context_keeps_completed_actions_nonreexecutable_when
     assert payload["omitted"]["evidence"] > 0
     assert payload["omitted"]["evidence"] == len(evidence) - len(included["evidence"])
     assert {
-        item["source_id"] for item in included["query_spec"]["semantic_items"]
-    } >= {source.source_id, base.query_spec.semantic_items[0].source_id}
-    assert evidence[0].evidence_id not in context
+        item["source_handle"] for item in included["query_spec"]["semantic_items"]
+    } >= {"s1", "s2"}
+    assert handles[evidence[0].evidence_id] not in included_evidence_handles
     claim = resolve_research_tool_claim(
         "inspect_table",
         {"table": "orders"},
@@ -1525,13 +1553,13 @@ def test_bounded_production_context_keeps_completed_actions_nonreexecutable_when
 class _StopReviewContinueModel:
     """Independent stop-review stub: always allows one more research turn.
 
-    The scripted vertical-fixture script below deliberately spends its first
-    three turns gathering schema evidence before it has enough facts to
-    propose a join or binding. That is exactly the "three consecutive
-    non-novel turns" shape the production stop-review safety valve is
-    designed to interrupt (see research_loop._consecutive_non_novel), so a
-    real run always needs this independent review to grant a "continue"
-    before the scripted turn can proceed. It never contradicts trusted facts
+    The scripted vertical-fixture script below deliberately spends several
+    turns gathering schema evidence before it has enough facts to propose a
+    join or binding. That is exactly the "unbroken run of non-novel turns"
+    shape the production stop-review safety valve is designed to interrupt
+    (see research_loop._consecutive_non_novel), so a real run needs this
+    independent review to grant a "continue" before the scripted turn can
+    proceed. It never contradicts trusted facts
     and never selects a binding itself; it only unblocks the next scripted,
     already-planned research turn.
     """
@@ -1579,9 +1607,26 @@ class _VerticalFixtureModel:
         assert isinstance(state, dict)
         revision = state["revision"]
         fact_table = _fact_table(schema)
+        # Production grants one independent stop review per unbroken run of
+        # non-novel turns (research_loop._consecutive_non_novel) and then at
+        # most two normal decisions (_stop_review_follow_up_decision_allowed),
+        # so a novel turn must land within those two. Only new joins and the
+        # binding are novel here (a declared join is validated on proposal,
+        # so its later assessment changes nothing). The two joins and the
+        # binding are therefore spread between the evidence-only turns.
         if revision == 0:
-            return _tool("inspect_table", {"table": fact_table})
+            return _tool(
+                "inspect_relationships",
+                {"table": fact_table, "top_k": 4, "depth": 1},
+            )
         if revision == 1:
+            return _tool("inspect_table", {"table": fact_table})
+        relations = _relationships(state, fact_table)
+        targets = _relationship_targets(state, fact_table)
+        relationship_evidence = _evidence_id_for_kind(state, "inspect_relationships")
+        if revision == 2:
+            return _tool("inspect_table", {"table": targets[0]})
+        if revision == 3:
             return _tool(
                 "get_distinct_values",
                 {
@@ -1589,16 +1634,17 @@ class _VerticalFixtureModel:
                     "column": _text_column(state, fact_table),
                     "top_k": 4,
                 },
+                proposals=(
+                    _new_join_proposal(
+                        proposal_key="proposal:join-0",
+                        relationship=relations[targets[0]],
+                        citation_evidence_id=relationship_evidence,
+                    ),
+                ),
             )
-        if revision == 2:
-            return _tool(
-                "inspect_relationships",
-                {"table": fact_table, "top_k": 4, "depth": 1},
-            )
-        targets = _relationship_targets(state, fact_table)
-        if revision == 3:
-            return _tool("inspect_table", {"table": targets[0]})
         if revision == 4:
+            return _tool("inspect_table", {"table": targets[1]})
+        if revision == 5:
             return _tool(
                 "get_distinct_values",
                 {
@@ -1607,8 +1653,6 @@ class _VerticalFixtureModel:
                     "top_k": 4,
                 },
             )
-        if revision == 5:
-            return _tool("inspect_table", {"table": targets[1]})
         if revision == 6:
             return _tool(
                 "get_distinct_values",
@@ -1620,32 +1664,48 @@ class _VerticalFixtureModel:
             )
         entity_table, catalog_table = _vertical_roles(state, fact_table, targets)
         fact_value = _text_column(state, fact_table)
-        relations = _relationships(state, fact_table)
         if revision == 7:
-            relationship_evidence = _evidence_id_for_kind(
-                state, "inspect_relationships"
-            )
-            return _tool(
-                "inspect_column",
-                {"table": fact_table, "column": fact_value},
-                proposals=tuple(
-                    _new_join_proposal(
-                        proposal_key=f"proposal:join-{index}",
-                        relationship=relations[target],
-                        citation_evidence_id=relationship_evidence,
-                    )
-                    for index, target in enumerate(targets)
-                ),
-            )
-        if revision == 8:
-            relationship_evidence = _evidence_id_for_kind(
-                state, "inspect_relationships"
-            )
             return _tool(
                 "inspect_column",
                 {
                     "table": fact_table,
                     "column": _relationship_key(relations[targets[0]], "from_column"),
+                },
+            )
+        if revision == 8:
+            return _tool(
+                "inspect_column",
+                {
+                    "table": fact_table,
+                    "column": _relationship_key(relations[targets[1]], "from_column"),
+                },
+                proposals=(
+                    _new_join_proposal(
+                        proposal_key="proposal:join-1",
+                        relationship=relations[targets[1]],
+                        citation_evidence_id=relationship_evidence,
+                    ),
+                ),
+            )
+        if revision == 9:
+            return _tool(
+                "inspect_column",
+                {
+                    "table": catalog_table,
+                    "column": _relationship_key(relations[catalog_table], "to_column"),
+                },
+            )
+        if revision == 10:
+            return _tool(
+                "inspect_column",
+                {"table": catalog_table, "column": _text_column(state, catalog_table)},
+            )
+        if revision == 11:
+            return _tool(
+                "inspect_column",
+                {
+                    "table": entity_table,
+                    "column": _relationship_key(relations[entity_table], "to_column"),
                 },
                 proposals=tuple(
                     {
@@ -1660,34 +1720,10 @@ class _VerticalFixtureModel:
                     for join in state["join_candidates"]
                 ),
             )
-        if revision == 9:
-            return _tool(
-                "inspect_column",
-                {
-                    "table": fact_table,
-                    "column": _relationship_key(relations[targets[1]], "from_column"),
-                },
-            )
-        if revision == 10:
-            return _tool(
-                "inspect_column",
-                {
-                    "table": catalog_table,
-                    "column": _relationship_key(relations[catalog_table], "to_column"),
-                },
-            )
-        if revision == 11:
-            return _tool(
-                "inspect_column",
-                {"table": catalog_table, "column": _text_column(state, catalog_table)},
-            )
         if revision == 12:
             return _tool(
                 "inspect_column",
-                {
-                    "table": entity_table,
-                    "column": _relationship_key(relations[entity_table], "to_column"),
-                },
+                {"table": fact_table, "column": fact_value},
             )
         if revision == 13:
             return _tool(
@@ -2086,7 +2122,8 @@ def test_production_registry_uses_continuation_segment_after_complete(
         required=True,
         operator=PredicateOperator.GT,
         literal_or_reference=None,
-        status=SemanticItemStatus.UNRESOLVED,
+        # A required binding-free formula must be RESOLVED (plan R1798).
+        status=SemanticItemStatus.RESOLVED,
         binding_ids=(),
     )
     state = state.model_copy(
@@ -2370,6 +2407,8 @@ def test_production_exact_document_formula_enables_initial_continuation(
             "normalized_meaning": f"{formula}; qualifying detail rows are shared.",
             "operator": None,
             "literal_or_reference": None,
+            # A required binding-free formula must be RESOLVED (plan R1798).
+            "status": SemanticItemStatus.RESOLVED,
         }
     )
     state = ResearchState.model_validate(
@@ -2446,7 +2485,7 @@ def test_production_exact_document_formula_enables_initial_continuation(
         bounded_context = json.loads(assembly.research_context(state, ()))
         assert bounded_context["exact_formula_documents"] == [
             {
-                "source_id": formula_item.source_id,
+                "source_handle": "s1",
                 "document": {
                     "document_id": document.document_id,
                     "namespace": document.namespace,
@@ -2638,25 +2677,22 @@ def test_production_registry_admits_sample_rows_with_its_planned_limit(
     assert json.loads(result.inline_payload_json)["rows"] == [["member-a"]]
 
 
-# The scripted vertical-fixture research turns spend their first three turns
-# (table, column, relationship inspection) gathering schema evidence with no
-# hypothesis/binding/join/unresolved-item change, and several more such
-# evidence-only turns later while confirming the discovered relationships.
-# The production stop-review safety valve (_consecutive_non_novel in
-# research_loop.py) requires one independent, budget-charged review call
-# before any research turn that follows three such non-novel turns in a row.
-# Given this script's fixed shape, that happens right before each of these
-# revisions. Revision 14 additionally needs a review because, once the model
-# budget below is sized to be fully spent by the end of the run (see
-# total_model_calls), remaining headroom briefly drops under the separate
-# "at least 3 calls left" safety margin the coordinator also checks before a
-# final decision (_model_budget_supports in research_loop.py); that margin
-# check triggers one more independent review with reason=BUDGET_EXHAUSTED,
-# which this fixture's stub also answers with "continue". This exact set was
-# measured empirically against the current production budget/stagnation
-# logic and is expected to stay stable, since the fixture and script have no
-# randomness.
-_STOP_REVIEW_REVISIONS = (3, 4, 5, 6, 7, 11, 12, 13, 14)
+# The scripted vertical-fixture turns are mostly evidence-only (non-novel):
+# only the two joins and the binding change the research state. Production
+# (_consecutive_non_novel in research_loop.py) asks for one independent,
+# budget-charged stop review before a turn that follows an unbroken run of
+# non-novel turns (two at the very start of a run, three later), and then
+# allows at most two normal decisions, one of which must be novel. The
+# script places its novel turns so that this happens right before revisions
+# 2, 7 and 12. Revision 14 additionally needs a review because, once the
+# model budget below is sized to be fully spent by the end of the run (see
+# total_model_calls), the remaining headroom drops under the separate "at
+# least 3 calls left" margin the coordinator checks before a final decision
+# (_model_budget_supports in research_loop.py); that triggers one more
+# independent review with reason=BUDGET_EXHAUSTED, which the stub also
+# answers with "continue". The set is fixed because the fixture and script
+# have no randomness.
+_STOP_REVIEW_REVISIONS = (2, 7, 12, 14)
 
 
 @pytest.mark.parametrize(

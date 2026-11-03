@@ -28,12 +28,16 @@ class PipelineRunner:
 
     def __init__(self):
         self.engine = None
+        self.engine_error: Optional[str] = None  # причина, если движок не поднялся
         self.current_workflow_id: Optional[str] = None
         self._original_on_step_completed = None
         self._original_execute_workflow_step = None
         self._hook_lock = threading.Lock()  # сериализует install/uninstall хуков
         self._pause_event = threading.Event()
         self._pause_event.set()  # не на паузе по умолчанию
+        self._studio_project: Optional[str] = None  # проект, чей замок держит этот раннер
+        self._studio_observer = None  # запись состояния прогона для студии (React видит Tk-прогон)
+        self._studio_result = None
         self._initialize_engine()
     
     def _initialize_engine(self):
@@ -41,12 +45,15 @@ class PipelineRunner:
         try:
             from workflow.enhanced_engine import EnhancedWorkflowEngine
             self.engine = EnhancedWorkflowEngine()
+            self.engine_error = None
             logger.info("✅ Workflow engine инициализирован")
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации workflow engine: {e}")
             self.engine = None
+            self.engine_error = f"{type(e).__name__}: {e}"
     
-    def _install_step_hook(self, progress_callback: Callable, total_steps: int):
+    def _install_step_hook(self, progress_callback: Callable, total_steps: int,
+                           step_ids: Optional[List[str]] = None):
         """Оборачивает engine-хуки для step tracker, progress и паузы."""
         if not self.engine or not progress_callback:
             return
@@ -65,6 +72,10 @@ class PipelineRunner:
             original_execute_step = self._original_execute_workflow_step
 
             async def _hooked_execute_workflow_step(step, context, workflow_def):
+                observer = await self._studio_begin(step_ids)
+                if observer is not None:
+                    await self._studio_gate(observer)
+                    self._studio_safe(observer.session.step_started, step, context)
                 try:
                     progress_callback(
                         message=f"Шаг '{step.id}' выполняется",
@@ -78,6 +89,8 @@ class PipelineRunner:
 
             async def _hooked_on_step_completed(workflow_id, step, step_result, context, step_results):
                 await original(workflow_id, step, step_result, context, step_results)
+                if self._studio_observer is not None:
+                    self._studio_safe(self._studio_observer.session.step_finished, step, step_result)
                 completed_count[0] += 1
                 progress = (completed_count[0] / total_steps) * 100 if total_steps > 0 else 0
                 duration = step_result.duration_seconds if hasattr(step_result, 'duration_seconds') else None
@@ -106,6 +119,49 @@ class PipelineRunner:
 
             self.engine._execute_workflow_step = _hooked_execute_workflow_step
             self.engine._on_step_completed = _hooked_on_step_completed
+
+    async def _studio_begin(self, step_ids: Optional[List[str]]):
+        """Первый шаг прогона заводит наблюдателя студии; любая его ошибка Tk не ломает."""
+        if self._studio_observer is not None:
+            return self._studio_observer
+        if not self._studio_project or not self.current_workflow_id:
+            return None
+        try:
+            from custom_tools.storybook.studio.run_observer import TkRunObserver
+            self._studio_observer = TkRunObserver(
+                self.engine, self._studio_project, self.current_workflow_id, step_ids or [])
+        except Exception as e:
+            logger.warning(f"Наблюдатель студии не запущен: {e}")
+        return self._studio_observer
+
+    async def _studio_gate(self, observer) -> None:
+        try:
+            await observer.session.gate()
+        except Exception as e:
+            logger.warning(f"Гейт паузы студии: {e}")
+
+    @staticmethod
+    def _studio_safe(func, *args, **kwargs) -> None:
+        try:
+            func(*args, **kwargs)
+        except Exception as e:
+            logger.warning(f"Запись состояния студии: {e}")
+
+    def _studio_request(self, **kwargs) -> None:
+        if self._studio_observer is not None:
+            self._studio_safe(self._studio_observer.request, **kwargs)
+
+    async def _studio_finish(self) -> None:
+        observer, result = self._studio_observer, self._studio_result
+        self._studio_observer = None
+        self._studio_result = None
+        if observer is None:
+            return
+        try:
+            error = None if result is not None else RuntimeError("Прогон прерван ошибкой")
+            await observer.finish(result, error)
+        except Exception as e:
+            logger.warning(f"Завершение записи студии: {e}")
 
     def _uninstall_step_hook(self):
         """Восстанавливает оригинальные engine-хуки."""
@@ -159,7 +215,10 @@ class PipelineRunner:
         """
         from custom_tools.storybook.project_paths import acquire_storybook_project_lock
 
-        return acquire_storybook_project_lock(project_id)
+        handle = acquire_storybook_project_lock(project_id)
+        if handle is not None:
+            self._studio_project = project_id
+        return handle
 
     @staticmethod
     def _release_project_lock(handle) -> None:
@@ -219,121 +278,21 @@ class PipelineRunner:
 
     @staticmethod
     def _step_output_artifacts(workflow_def=None) -> Dict[str, List[str]]:
-        """Канонические артефакты storybook pipeline для проверки частичного запуска.
-
-        Если передан workflow_def и у шага задан metadata.output_artifacts —
-        он имеет приоритет над встроенным словарём. Так источник истины об
-        ожидаемых артефактах постепенно переносится в саму pipeline metadata
-        (см. §6.5 аудита), а словарь ниже остаётся обратно-совместимым fallback.
-        """
-        artifacts: Dict[str, List[str]] = {
-            "brief_from_prompt": ["00_brief.json"],
-            "init_project": ["00_brief.json"],
-            "story_planner": ["10_synopsis/synopsis.json", "10_synopsis/beats.json"],
-            "bible_builder": [
-                "20_bible/characters.json",
-                "20_bible/locations.json",
-                "20_bible/consistency_rules.json",
-            ],
-            "style_keeper": ["30_style/style_text.json", "30_style/style_images.json"],
-            "story_writer": ["20_story/story.json"],
-            "story_editor": ["20_story/story.json"],
-            "prompt_engineer": ["40_prompts"],
-            "items_builder": ["40_prompts"],
-            "artist_batch": ["50_images"],
-            "assemble_md": ["90_md/book.md"],
-            "md_to_pdf": ["95_pdf/book.pdf"],
-            "screenplay_generator": ["91_screenplay/screenplay.json"],
-            "screenplay_shots_generator": ["97_shots/shots.json"],
-            "blockout_scene_builder": [
-                "93_blockout/chains.json",
-                "93_blockout/scene_spec.json",
-                "93_blockout/asset_map.json",
-                "93_blockout/report.json",
-            ],
-            # у "blockout_renderer" записи нет: его артефакты лежат по путям вида
-            # 93_blockout/scene_NN_shot_MM/…, то есть зависят от состава шотов,
-            # а реестр оперирует фиксированными путями. Отчёт числится за
-            # blockout_scene_builder — он его создаёт (разделы 10.1, 20.3)
-            "blockout_preview": [
-                "93_blockout/preview/blockout_all.mp4",
-                "93_blockout/preview/contact_sheet.png",
-            ],
-            "shots_prompt_qa": ["97_shots/shots.json"],
-            "artist_batch_shots": ["97_shots/shots.json"],
-            "storybook_video_preflight": ["96_video_contract/provider_menu_summary.json"],
-            "storybook_video_delivery_promise": ["96_video_contract/delivery_promise.json"],
-            # Каталог 97_shots существует уже после кадров, поэтому маркером
-            # реально стартовавшей видео-генерации служит durable-леджер задач.
-            "video_generator": ["97_shots/provider_jobs.json"],
-            "storybook_audio_subtitle": [
-                "98_audio/subtitles.srt",
-                "98_audio/audio_manifest.json",
-                "98_audio/cue_sheet.json",
-            ],
-            "storybook_music_generator": [
-                "98_audio/audio_manifest.json",
-                "98_audio/music_manifest.json",
-            ],
-            "montage_assembler": [
-                "99_final/final_video.mp4",
-                "99_final/timeline.fcpxml",
-                "99_final/subtitles.srt",
-                "99_final/manifest.json",
-                "99_final/final_review.json",
-            ],
-            "storybook_video_decision_log": ["96_video_contract/decision_log.json"],
-        }
-        if workflow_def is not None:
-            for step in getattr(workflow_def, "steps", None) or []:
-                override = (getattr(step, "metadata", None) or {}).get("output_artifacts")
-                if override:
-                    artifacts[step.id] = list(override)
-        return artifacts
+        """Канонические артефакты storybook pipeline для проверки частичного запуска."""
+        from custom_tools.storybook.studio import run_plan
+        return run_plan.step_output_artifacts(workflow_def)
 
     @staticmethod
     def _read_generate_blockout_flag(project_path: Optional[Path]) -> bool:
-        """Читает флаг generate_blockout из 00_brief.json (ТЗ раздел 18.8, Р6:
-        отсутствующий ключ/файл/проект трактуется как False)."""
-        if project_path is None:
-            return False
-        brief_path = project_path / "00_brief.json"
-        try:
-            with open(brief_path, "r", encoding="utf-8") as f:
-                brief_data = json.load(f)
-        except (OSError, ValueError):
-            return False
-        if not isinstance(brief_data, dict):
-            return False
-        return bool(brief_data.get("generate_blockout", False))
+        """Флаг generate_blockout из 00_brief.json (нет файла/ключа - False)."""
+        from custom_tools.storybook.studio import run_plan
+        return run_plan.read_generate_blockout_flag(project_path)
 
     @staticmethod
     def _read_blockout_allowed_durations(project_path: Optional[Path]) -> List[int]:
-        """Читает blockout_allowed_durations из 00_brief.json тем же безопасным
-        способом, что и _read_generate_blockout_flag (ТЗ раздел 18.6, Р3):
-        отсутствующий/битый файл и пустой список трактуются одинаково — как
-        «весь набор модели» (раздел 6.1), поэтому в обоих случаях возвращается
-        пустой список."""
-        if project_path is None:
-            return []
-        brief_path = project_path / "00_brief.json"
-        try:
-            with open(brief_path, "r", encoding="utf-8") as f:
-                brief_data = json.load(f)
-        except (OSError, ValueError):
-            return []
-        if not isinstance(brief_data, dict):
-            return []
-        raw = brief_data.get("blockout_allowed_durations") or []
-        if not isinstance(raw, list):
-            return []
-        result: List[int] = []
-        for value in raw:
-            try:
-                result.append(int(value))
-            except (TypeError, ValueError):
-                continue
-        return result
+        """blockout_allowed_durations из 00_brief.json тем же безопасным чтением."""
+        from custom_tools.storybook.studio import run_plan
+        return run_plan.read_blockout_allowed_durations(project_path)
 
     @classmethod
     def _collect_required_artifacts(
@@ -342,57 +301,9 @@ class PipelineRunner:
         start_step: str,
         project_path: Optional[Path] = None,
     ) -> List[str]:
-        """Возвращает список артефактов, обязательных перед запуском start_step.
-
-        ``project_path``, если передан, отфильтровывает артефакты шагов, гейтированных
-        флагом ``generate_blockout`` (раздел 18.8): при выключенном слое болванок
-        частичный запуск не должен требовать их артефактов.
-        """
-        step_map = {step.id: step for step in workflow_def.steps}
-        artifact_map = cls._step_output_artifacts(workflow_def)
-        # Признак «шаг гейтирован болванкой» — точное строковое совпадение с
-        # шаблоном enable в YAML. ТЗ (раздел 18.8) не задаёт более надёжного
-        # признака (например, отдельного metadata-флага у шага): если формат
-        # шаблона когда-нибудь изменится (другой пробел, составное выражение),
-        # совпадение тихо перестанет находить шаг, и его артефакты снова станут
-        # обязательными при generate_blockout: false — вернутся ложные ошибки
-        # частичного запуска, которые эта фильтрация чинит.
-        blockout_gated_steps = {
-            step.id
-            for step in workflow_def.steps
-            if (step.tool_params or {}).get("enable") == "{generate_blockout}"
-        }
-        generate_blockout = cls._read_generate_blockout_flag(project_path)
-        visited: Set[str] = set()
-        visiting: Set[str] = set()
-        required: List[str] = []
-
-        def _require_dependency(step_id: str):
-            if step_id == start_step or step_id in visited or step_id in visiting:
-                return
-            if step_id not in step_map:
-                return
-            visiting.add(step_id)
-            for dep_id in step_map[step_id].depends_on:
-                _require_dependency(dep_id)
-            visiting.remove(step_id)
-            visited.add(step_id)
-            if step_id in blockout_gated_steps and not generate_blockout:
-                return
-            required.extend(artifact_map.get(step_id, []))
-
-        start = step_map.get(start_step)
-        if start is not None:
-            for dep_id in start.depends_on:
-                _require_dependency(dep_id)
-
-        unique_required: List[str] = []
-        seen: Set[str] = set()
-        for artifact in required:
-            if artifact not in seen:
-                seen.add(artifact)
-                unique_required.append(artifact)
-        return unique_required
+        """Артефакты, обязательные перед запуском start_step (общая логика со студией)."""
+        from custom_tools.storybook.studio import run_plan
+        return run_plan.collect_required_artifacts(workflow_def, start_step, project_path)
 
     async def run_full_pipeline(self, project_id: str, task: str,
                                progress_callback: Optional[Callable] = None,
@@ -433,7 +344,7 @@ class PipelineRunner:
             total_steps = len(workflow_def.steps)
 
             if progress_callback:
-                self._install_step_hook(progress_callback, total_steps)
+                self._install_step_hook(progress_callback, total_steps, [s.id for s in workflow_def.steps])
 
             execution_variables = {"project_id": project_id, "task": task}
             execution_variables.update(input_overrides)
@@ -451,6 +362,7 @@ class PipelineRunner:
                 **execution_variables
             )
 
+            self._studio_result = result
             self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Pipeline завершен для проекта {project_id}")
             return self._build_runner_response(
@@ -465,6 +377,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка выполнения pipeline: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            await self._studio_finish()
             self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
@@ -568,7 +481,7 @@ class PipelineRunner:
             workflow_def.steps = remaining_steps
 
             if progress_callback:
-                self._install_step_hook(progress_callback, len(workflow_def.steps))
+                self._install_step_hook(progress_callback, len(workflow_def.steps), [s.id for s in workflow_def.steps])
 
             workflow_inputs = workflow_def.inputs if isinstance(workflow_def.inputs, dict) else {}
             context_variables = workflow_inputs.copy()
@@ -598,6 +511,7 @@ class PipelineRunner:
 
             result = await self.engine.execute_workflow(workflow_def, context)
 
+            self._studio_result = result
             self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Partial pipeline завершен для проекта {project_id} с шага {step_id}")
             response = self._build_runner_response(
@@ -615,6 +529,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка выполнения pipeline с шага {step_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            await self._studio_finish()
             self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
@@ -630,6 +545,18 @@ class PipelineRunner:
             logger.error(f"Ошибка получения checkpoint для workflow {workflow_id}: {e}")
             return None
 
+    @staticmethod
+    def _like_escape(value: str) -> str:
+        """Экранирует \\, % и _ для LIKE ... ESCAPE '\\'."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    @staticmethod
+    def _workflow_id_matches_project(workflow_id: str, project_id: str,
+                                     context_json: Optional[str] = None) -> bool:
+        """Точная проверка, что прогон принадлежит проекту (общая логика со студией)."""
+        from custom_tools.storybook.studio import run_plan
+        return run_plan.workflow_id_matches_project(workflow_id, project_id, context_json)
+
     async def _get_latest_project_checkpoint(self, project_id: str):
         """Возвращает последний checkpoint для проекта по workflow_id."""
         if not self.engine or not getattr(self.engine, "state_manager", None):
@@ -641,17 +568,23 @@ class PipelineRunner:
             store = self.engine.state_manager.store
             with sqlite3.connect(store.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                row = conn.execute(
+                # LIKE только сужает выборку, точное совпадение проверяем в Python
+                rows = conn.execute(
                     """
-                    SELECT workflow_id
+                    SELECT workflow_id, context
                     FROM workflow_checkpoints
-                    WHERE workflow_id LIKE ?
+                    WHERE workflow_id LIKE ? ESCAPE '\\'
                     ORDER BY timestamp DESC
-                    LIMIT 1
                     """,
-                    (f"%{project_id}%",),
-                ).fetchone()
-
+                    (f"%{self._like_escape(project_id)}%",),
+                )
+                # Курсор читаем построчно до первого совпадения, без LIMIT:
+                # чужие свежие прогоны с подстрокой id не должны скрыть нужный
+                row = next(
+                    (r for r in rows
+                     if self._workflow_id_matches_project(r["workflow_id"], project_id, r["context"])),
+                    None,
+                )
             if not row:
                 return None
 
@@ -736,7 +669,7 @@ class PipelineRunner:
             workflow_def.steps = [single_step]
 
             if progress_callback:
-                self._install_step_hook(progress_callback, 1)
+                self._install_step_hook(progress_callback, 1, [step_id])
 
             workflow_inputs = workflow_def.inputs if isinstance(workflow_def.inputs, dict) else {}
             context_variables = copy.deepcopy(workflow_inputs)
@@ -771,6 +704,7 @@ class PipelineRunner:
 
             result = await self.engine.execute_workflow(workflow_def, context)
 
+            self._studio_result = result
             self._report_failed_steps(result, progress_callback)
             logger.info(f"✅ Single-step rerun завершён для проекта {project_id}, шаг {step_id}")
             response = self._build_runner_response(
@@ -789,6 +723,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка single-step rerun для шага {step_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            await self._studio_finish()
             self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
@@ -850,10 +785,11 @@ class PipelineRunner:
 
             total_steps = len(workflow_def.steps)
             if progress_callback:
-                self._install_step_hook(progress_callback, total_steps)
+                self._install_step_hook(progress_callback, total_steps, [s.id for s in workflow_def.steps])
 
             self.current_workflow_id = workflow_id
             result = await self.engine.execute_workflow(workflow_def, context)
+            self._studio_result = result
             self._report_failed_steps(result, progress_callback)
             logger.info(
                 "✅ Workflow %s возобновлён из checkpoint (%s)",
@@ -876,6 +812,7 @@ class PipelineRunner:
             logger.error(f"❌ Ошибка восстановления workflow {workflow_id}: {e}")
             return {"status": "error", "message": str(e)}
         finally:
+            await self._studio_finish()
             self._release_project_lock(project_lock)
             self._uninstall_step_hook()
             self.current_workflow_id = None
@@ -886,6 +823,7 @@ class PipelineRunner:
             return {"status": "error", "message": "Нет активного pipeline для паузы"}
 
         self._pause_event.clear()
+        self._studio_request(pause=True)
         workflow_id = self.current_workflow_id
 
         if self.engine:
@@ -947,6 +885,7 @@ class PipelineRunner:
                 logger.error(f"Ошибка обновления статуса при resume: {e}")
 
         self._pause_event.set()
+        self._studio_request(pause=False)
         logger.info(f"▶ Pipeline {workflow_id} возобновлён")
         return {"status": "resumed", "workflow_id": workflow_id}
 
@@ -960,6 +899,7 @@ class PipelineRunner:
             return {"status": "error", "message": "Нет активного pipeline для отмены"}
 
         try:
+            self._studio_request(cancel=True)
             await self.engine.cancel_workflow(
                 workflow_id,
                 reason="Отменено пользователем из StoryBookManager"
@@ -969,6 +909,37 @@ class PipelineRunner:
         except Exception as e:
             logger.error(f"❌ Ошибка отмены pipeline {workflow_id}: {e}")
             return {"status": "error", "message": str(e)}
+
+    async def cancel_stale_workflow(self, workflow_id: str,
+                                    project_id: Optional[str] = None) -> Dict[str, Any]:
+        """Помечает сохранённый (не обязательно активный) прогон отменённым.
+
+        Нужен для «Начать сначала»: иначе старый checkpoint остаётся running/failed
+        и диалог восстановления появляется при каждом открытии проекта.
+        """
+        if not self.engine:
+            return {"status": "error", "message": "Workflow engine не инициализирован"}
+
+        # Если проект сейчас выполняется в другой сессии, чужой живой прогон не трогаем
+        lock = None
+        if project_id:
+            lock = self._acquire_project_lock(project_id)
+            if lock is None:
+                return {"status": "error", "message": "Проект занят другим прогоном"}
+
+        try:
+            await self.engine.cancel_workflow(
+                workflow_id,
+                reason="Начать сначала (из StoryBookManager)"
+            )
+            logger.info(f"🚫 Старый прогон {workflow_id} помечен отменённым")
+            return {"status": "cancelled", "workflow_id": workflow_id}
+        except Exception as e:
+            logger.error(f"❌ Ошибка отмены старого прогона {workflow_id}: {e}")
+            return {"status": "error", "message": str(e)}
+        finally:
+            if lock is not None:
+                self._release_project_lock(lock)
 
     async def get_incomplete_workflows(self, project_id: str) -> list:
         """Находит незавершённые workflow для проекта в SQLite.
@@ -989,7 +960,7 @@ class PipelineRunner:
                 conn.row_factory = sqlite3.Row
                 cursor = conn.execute("""
                     SELECT wc.workflow_id, wc.status, wc.current_step,
-                           wc.completed_steps, wc.timestamp, wc.resumable
+                           wc.completed_steps, wc.timestamp, wc.resumable, wc.context
                     FROM workflow_checkpoints wc
                     INNER JOIN (
                         SELECT workflow_id, MAX(timestamp) AS max_ts
@@ -998,11 +969,14 @@ class PipelineRunner:
                     ) latest ON wc.workflow_id = latest.workflow_id
                                 AND wc.timestamp = latest.max_ts
                     WHERE wc.status NOT IN ('completed', 'cancelled')
-                    AND wc.workflow_id LIKE ?
+                    AND wc.workflow_id LIKE ? ESCAPE '\\'
                     ORDER BY wc.timestamp DESC
-                """, (f"%{project_id}%",))
+                """, (f"%{self._like_escape(project_id)}%",))
 
                 for row in cursor.fetchall():
+                    # LIKE только сужает выборку, точное совпадение проверяем в Python
+                    if not self._workflow_id_matches_project(row["workflow_id"], project_id, row["context"]):
+                        continue
                     results.append({
                         "workflow_id": row["workflow_id"],
                         "status": row["status"],

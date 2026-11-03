@@ -22,3 +22,8 @@ parameters:
     description: "Флаг включения генерации видео для текущего запуска"
     required: false
     default: true
+  - name: "video_provider"
+    type: "str"
+    description: "Провайдер видео из входа пайплайна; пусто - настройки проекта или окружение"
+    required: false
+    default: ""

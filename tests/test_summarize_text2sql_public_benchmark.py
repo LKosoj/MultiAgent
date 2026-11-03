@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -182,6 +183,13 @@ def _observation(*, status: str, reason: str = "") -> dict:
     }
 
 
+def _rewrite(path: Path, text: str, *, encoding: str = "utf-8") -> None:
+    # Релизная выгрузка запечатывает файлы в 0444; без root перезапись
+    # возможна только после снятия защиты (сами проверки 0444 остаются).
+    os.chmod(path, 0o644)
+    path.write_text(text, encoding=encoding)
+
+
 def _write_two_case_evaluated_run(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     output_dir = tmp_path / "run"
     output_dir.mkdir()
@@ -327,11 +335,12 @@ def test_post_repeat_evaluation_requires_aligned_case_evidence_and_counters(
             "by_database": {},
             "by_difficulty": {},
         }.get(field, 0.0)
-    diagnostics_path.write_text(
+    _rewrite(
+        diagnostics_path,
         "".join(json.dumps(row) + "\n" for row in diagnostics),
         encoding="utf-8",
     )
-    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    _rewrite(summary_path, json.dumps(summary) + "\n", encoding="utf-8")
     evaluation_path = output_dir / "evaluation_manifest.json"
     evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
     evaluation["diagnostics_sha256"] = (
@@ -340,7 +349,7 @@ def test_post_repeat_evaluation_requires_aligned_case_evidence_and_counters(
     evaluation["summary_sha256"] = (
         "sha256:" + hashlib.sha256(summary_path.read_bytes()).hexdigest()
     )
-    evaluation_path.write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+    _rewrite(evaluation_path, json.dumps(evaluation) + "\n", encoding="utf-8")
 
     with pytest.raises(release.SandboxError, match="post-repeat"):
         release.validate_post_repeat_evaluation(
@@ -355,13 +364,13 @@ def test_post_repeat_summary_allows_a_different_valid_created_at(
     summary_path = output_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["created_at"] = "2026-08-03T12:00:00+00:00"
-    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    _rewrite(summary_path, json.dumps(summary) + "\n", encoding="utf-8")
     evaluation_path = output_dir / "evaluation_manifest.json"
     evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
     evaluation["summary_sha256"] = (
         "sha256:" + hashlib.sha256(summary_path.read_bytes()).hexdigest()
     )
-    evaluation_path.write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+    _rewrite(evaluation_path, json.dumps(evaluation) + "\n", encoding="utf-8")
 
     release.validate_post_repeat_evaluation(
         output_dir, evaluator_identity=identity
@@ -378,14 +387,15 @@ def test_post_repeat_evaluation_rejects_malformed_nested_diagnostic_shape(
         for line in diagnostics_path.read_text(encoding="utf-8").splitlines()
     ]
     diagnostics[0]["schema_research"]["ready_for_sql"] = "yes"
-    diagnostics_path.write_text(
+    _rewrite(
+        diagnostics_path,
         "".join(json.dumps(row) + "\n" for row in diagnostics),
         encoding="utf-8",
     )
     summary_path = output_dir / "summary.json"
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     summary["research_stop_reasons"] = {"COMPLETE": 1}
-    summary_path.write_text(json.dumps(summary) + "\n", encoding="utf-8")
+    _rewrite(summary_path, json.dumps(summary) + "\n", encoding="utf-8")
     evaluation_path = output_dir / "evaluation_manifest.json"
     evaluation = json.loads(evaluation_path.read_text(encoding="utf-8"))
     evaluation["diagnostics_sha256"] = (
@@ -394,7 +404,7 @@ def test_post_repeat_evaluation_rejects_malformed_nested_diagnostic_shape(
     evaluation["summary_sha256"] = (
         "sha256:" + hashlib.sha256(summary_path.read_bytes()).hexdigest()
     )
-    evaluation_path.write_text(json.dumps(evaluation) + "\n", encoding="utf-8")
+    _rewrite(evaluation_path, json.dumps(evaluation) + "\n", encoding="utf-8")
 
     with pytest.raises(release.SandboxError):
         release.validate_post_repeat_evaluation(

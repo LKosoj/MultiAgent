@@ -1,9 +1,21 @@
 import sys
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from pathlib import Path
 import os
-from datetime import datetime
+
+
+def _tk_scope(name):
+    """Модули, которые заглушка tkinter не должна оставлять в sys.modules."""
+    return (
+        name == "tkinter" or name.startswith("tkinter.") or name == "_tkinter"
+        or name == "StoryBookManager" or name.startswith("StoryBookManager")
+    )
+
+
+# снимок до подмены; на выходе из импортов возвращаем как было (см. конец блока)
+_saved_modules = {n: m for n, m in sys.modules.items() if _tk_scope(n)}
+_saved_path = list(sys.path)
 
 # Mock tkinter before importing anything from GUI
 tk_mock = MagicMock()
@@ -42,9 +54,14 @@ sys.path.insert(0, str(project_root))
 sys.path.insert(0, str(project_root / "StoryBookManager"))
 
 from StoryBookManager.core.project_manager import ProjectManager
-from StoryBookManager.gui.project_panel import ProjectPanel
 
 from StoryBookManager.config.settings import app_settings
+
+# возвращаем tkinter и StoryBookManager.* как были, чтобы заглушка не протекла в другие тесты
+for _name in [n for n in sys.modules if _tk_scope(n)]:
+    del sys.modules[_name]
+sys.modules.update(_saved_modules)
+sys.path[:] = _saved_path  # иначе StoryBookManager/utils перекрывает корневой utils
 
 class TestExportProject(unittest.TestCase):
     def setUp(self):
@@ -105,53 +122,6 @@ class TestExportProject(unittest.TestCase):
         with zipfile.ZipFile(output_zip, 'r') as zf:
             files = zf.namelist()
             self.assertTrue(any("dummy.txt" in f for f in files))
-
-    @patch('StoryBookManager.gui.project_panel.filedialog.asksaveasfilename')
-    @patch('StoryBookManager.gui.project_panel.messagebox.showinfo')
-    @patch('StoryBookManager.gui.project_panel.tk.Toplevel')
-    def test_export_selected_project_ui(self, mock_toplevel, mock_showinfo, mock_asksaveasfilename):
-        """Проверяет UI-обертку экспорта в ProjectPanel"""
-        parent = MagicMock()
-        with patch.object(ProjectPanel, '__init__', lambda x, y: None):
-            panel = ProjectPanel(parent)
-            panel.project_manager = self.pm
-            
-            # Mock selected project
-            mock_project = MagicMock()
-            mock_project.project_id = self.project_id
-            panel.selected_project = mock_project
-
-            # Экспорт теперь выполняется в фоновом потоке и планирует
-            # UI-колбэки через self.after(); в тесте выполняем их синхронно.
-            panel.after = lambda ms, cb=None, *a: (cb(*a) if callable(cb) else None)
-
-            output_zip = str(project_root / "tests" / f"{self.project_id}_ui.zip")
-            mock_asksaveasfilename.return_value = output_zip
-
-            # Call export (runs in a daemon thread)
-            panel.export_selected_project()
-
-            # Дожидаемся, пока фоновый поток допишет ZIP-архив
-            import time
-            for _ in range(50):
-                if Path(output_zip).exists():
-                    break
-                time.sleep(0.1)
-
-            # Verify file was created
-            self.assertTrue(Path(output_zip).exists())
-            
-            # Verify correct initial filename was suggested
-            date_str = datetime.now().strftime("%Y%m%d")
-            expected_default = f"{self.project_id}_{date_str}.zip"
-            
-            mock_asksaveasfilename.assert_called_once()
-            args, kwargs = mock_asksaveasfilename.call_args
-            self.assertEqual(kwargs.get('initialfile'), expected_default)
-            
-            # Clean up
-            if Path(output_zip).exists():
-                Path(output_zip).unlink()
 
 if __name__ == '__main__':
     unittest.main()

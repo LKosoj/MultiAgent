@@ -14,7 +14,6 @@ manual_scripts=(
   "test_brainstormer.py"
   "test_memory_archivist.py"
   "StoryBookManager/test_universal_editor.py"
-  "StoryBookManager/test_schema_validation.py"
 )
 
 printf 'Manual smoke scripts excluded from default pytest:\n'

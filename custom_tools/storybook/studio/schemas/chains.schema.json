@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Цепочки болванки",
+  "properties": {
+    "chains": {
+      "type": "array",
+      "title": "Цепочки",
+      "items": {
+        "type": "object",
+        "title": "Цепочка",
+        "properties": {
+          "chain_id": {
+            "type": "string",
+            "title": "Идентификатор цепочки"
+          }
+        },
+        "required": [
+          "chain_id"
+        ]
+      }
+    }
+  },
+  "required": [
+    "chains"
+  ]
+}

@@ -1,0 +1,1465 @@
+{
+ "status": "success",
+ "version": 1,
+ "generated_at": 0,
+ "cache": {
+  "static_hit": false
+ },
+ "project": {
+  "id": "demo",
+  "title": "demo",
+  "language": null
+ },
+ "stage": {
+  "current": "done",
+  "title": "Готово",
+  "items": [
+   {
+    "id": "story",
+    "title": "Сюжет",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 8,
+    "total": 8
+   },
+   {
+    "id": "book",
+    "title": "Книга",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 4,
+    "total": 4
+   },
+   {
+    "id": "screenplay",
+    "title": "Сценарий и кадры",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 4,
+    "total": 4
+   },
+   {
+    "id": "blockout",
+    "title": "Болванка",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 3,
+    "total": 3
+   },
+   {
+    "id": "images",
+    "title": "Картинки",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 6,
+    "total": 6
+   },
+   {
+    "id": "video",
+    "title": "Видео",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 4,
+    "total": 4
+   },
+   {
+    "id": "sound",
+    "title": "Звук",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 4,
+    "total": 4
+   },
+   {
+    "id": "montage",
+    "title": "Монтаж",
+    "state": "done",
+    "state_title": "Готов",
+    "done": 2,
+    "total": 3
+   }
+  ]
+ },
+ "steps": [
+  {
+   "id": "brief_from_prompt",
+   "order": 1,
+   "title": "Бриф из промпта",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [],
+   "artifacts": [
+    {
+     "rel": "00_brief.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "init_project",
+   "order": 2,
+   "title": "Создание проекта",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "brief_from_prompt"
+   ],
+   "artifacts": [
+    {
+     "rel": "00_brief.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "story_planner",
+   "order": 3,
+   "title": "План истории",
+   "stage": "story",
+   "optional": false,
+   "state": "done",
+   "display_state": "done",
+   "state_title": "Готов",
+   "source": "run_file",
+   "confidence": "medium",
+   "started_at": "2026-10-23T22:18:20Z",
+   "finished_at": "2026-10-23T22:18:21Z",
+   "duration_seconds": 0.428,
+   "error": null,
+   "note_code": null,
+   "outdated_hint": null,
+   "depends_on": [
+    "init_project"
+   ],
+   "artifacts": [
+    {
+     "rel": "10_synopsis/synopsis.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "10_synopsis/beats.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "bible_builder",
+   "order": 4,
+   "title": "Библия мира",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "story_planner"
+   ],
+   "artifacts": [
+    {
+     "rel": "20_bible/characters.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "20_bible/locations.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "20_bible/consistency_rules.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "style_keeper",
+   "order": 5,
+   "title": "Единый стиль",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "bible_builder"
+   ],
+   "artifacts": [
+    {
+     "rel": "30_style/style_text.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "30_style/style_images.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "story_writer",
+   "order": 6,
+   "title": "Написание текста",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "style_keeper"
+   ],
+   "artifacts": [
+    {
+     "rel": "20_story/story.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "story_editor",
+   "order": 7,
+   "title": "Редактура текста",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "story_writer"
+   ],
+   "artifacts": [
+    {
+     "rel": "20_story/story.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "prompt_engineer",
+   "order": 8,
+   "title": "Промпты для иллюстраций",
+   "stage": "story",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "story_editor"
+   ],
+   "artifacts": [
+    {
+     "rel": "40_prompts",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "items_builder",
+   "order": 9,
+   "title": "Список изображений",
+   "stage": "book",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "prompt_engineer"
+   ],
+   "artifacts": [
+    {
+     "rel": "40_prompts",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "artist_batch",
+   "order": 10,
+   "title": "Иллюстрации книги",
+   "stage": "book",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "items_builder"
+   ],
+   "artifacts": [
+    {
+     "rel": "50_images",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "assemble_md",
+   "order": 11,
+   "title": "Сборка книги",
+   "stage": "book",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "artist_batch",
+    "story_editor"
+   ],
+   "artifacts": [
+    {
+     "rel": "90_md/book.md",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "md_to_pdf",
+   "order": 12,
+   "title": "Книга в PDF",
+   "stage": "book",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "assemble_md"
+   ],
+   "artifacts": [
+    {
+     "rel": "95_pdf/book.pdf",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "screenplay_generator",
+   "order": 13,
+   "title": "Сценарий",
+   "stage": "screenplay",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "story_editor"
+   ],
+   "artifacts": [
+    {
+     "rel": "91_screenplay/screenplay.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_continuity_plan",
+   "order": 14,
+   "title": "План непрерывности",
+   "stage": "screenplay",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "screenplay_generator"
+   ],
+   "artifacts": [
+    {
+     "rel": "20_bible/continuity_plan.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "screenplay_shots_generator",
+   "order": 15,
+   "title": "Раскадровка",
+   "stage": "screenplay",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_continuity_plan"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/shots.json",
+     "state": "present",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "shots_prompt_qa",
+   "order": 16,
+   "title": "Проверка промптов шотов",
+   "stage": "screenplay",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "screenplay_shots_generator"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/shots.json",
+     "state": "present",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "blockout_scene_builder",
+   "order": 17,
+   "title": "Болванка: сборка сцен",
+   "stage": "blockout",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "shots_prompt_qa"
+   ],
+   "artifacts": [
+    {
+     "rel": "93_blockout/chains.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "93_blockout/scene_spec.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "93_blockout/asset_map.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "93_blockout/report.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "blockout_renderer",
+   "order": 18,
+   "title": "Болванка: рендер",
+   "stage": "blockout",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "blockout_scene_builder"
+   ],
+   "artifacts": []
+  },
+  {
+   "id": "blockout_preview",
+   "order": 19,
+   "title": "Болванка: превью",
+   "stage": "blockout",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "blockout_renderer"
+   ],
+   "artifacts": [
+    {
+     "rel": "93_blockout/preview/blockout_all.mp4",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "93_blockout/preview/contact_sheet.png",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "character_reference_states",
+   "order": 20,
+   "title": "Референсы состояний героев",
+   "stage": "images",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "shots_prompt_qa",
+    "artist_batch"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/character_reference_states.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_video_plan",
+   "order": 21,
+   "title": "План видео",
+   "stage": "images",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "character_reference_states"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/video_plan.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "background_reference_plan",
+   "order": 22,
+   "title": "План фонов",
+   "stage": "images",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_video_plan",
+    "character_reference_states",
+    "shots_prompt_qa",
+    "artist_batch"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/background_references.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "background_references",
+   "order": 23,
+   "title": "Референсы фонов",
+   "stage": "images",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "background_reference_plan"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/background_references.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "artist_batch_shots",
+   "order": 24,
+   "title": "Кадры шотов",
+   "stage": "images",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "shots_prompt_qa",
+    "background_references",
+    "artist_batch",
+    "blockout_renderer"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/shots.json",
+     "state": "present",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_continuity_images_review",
+   "order": 25,
+   "title": "Проверка кадров",
+   "stage": "images",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "artist_batch_shots"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/continuity_images_review.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_video_preflight",
+   "order": 26,
+   "title": "Предпусковая проверка видео",
+   "stage": "video",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "shots_prompt_qa",
+    "storybook_photo_montage",
+    "storybook_video_plan",
+    "storybook_continuity_images_review"
+   ],
+   "artifacts": [
+    {
+     "rel": "96_video_contract/provider_menu_summary.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_video_delivery_promise",
+   "order": 27,
+   "title": "Что будет сгенерировано",
+   "stage": "video",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_video_preflight",
+    "artist_batch_shots"
+   ],
+   "artifacts": [
+    {
+     "rel": "96_video_contract/delivery_promise.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "video_generator",
+   "order": 28,
+   "title": "Генерация видео",
+   "stage": "video",
+   "optional": false,
+   "state": "done",
+   "display_state": "done",
+   "state_title": "Готов",
+   "source": "artifacts",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": "2026-11-03T05:52:29Z",
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "artifacts_only",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_video_delivery_promise",
+    "artist_batch_shots"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/provider_jobs.json",
+     "state": "present",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_continuity_videos_review",
+   "order": 29,
+   "title": "Проверка видео",
+   "stage": "video",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "video_generator"
+   ],
+   "artifacts": [
+    {
+     "rel": "97_shots/continuity_videos_review.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_audio_subtitle",
+   "order": 30,
+   "title": "Озвучка и субтитры",
+   "stage": "sound",
+   "optional": false,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "artist_batch_shots"
+   ],
+   "artifacts": [
+    {
+     "rel": "98_audio/subtitles.srt",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "98_audio/audio_manifest.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "98_audio/cue_sheet.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "music_planner",
+   "order": 31,
+   "title": "План музыки",
+   "stage": "sound",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_audio_subtitle"
+   ],
+   "artifacts": [
+    {
+     "rel": "98_audio/music_plan.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_music_generator",
+   "order": 32,
+   "title": "Музыка",
+   "stage": "sound",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_audio_subtitle",
+    "music_planner"
+   ],
+   "artifacts": [
+    {
+     "rel": "98_audio/audio_manifest.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "98_audio/music_manifest.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_sfx_generator",
+   "order": 33,
+   "title": "Звуковые эффекты",
+   "stage": "sound",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_music_generator"
+   ],
+   "artifacts": [
+    {
+     "rel": "98_audio/sfx_manifest.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_photo_montage",
+   "order": 34,
+   "title": "Фотомонтаж",
+   "stage": "montage",
+   "optional": true,
+   "state": "skipped",
+   "display_state": "skipped",
+   "state_title": "Пропущен",
+   "source": "downstream",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "bypassed",
+   "outdated_hint": null,
+   "depends_on": [
+    "artist_batch_shots",
+    "storybook_sfx_generator",
+    "storybook_continuity_images_review"
+   ],
+   "artifacts": [
+    {
+     "rel": "99_final/photo_video.mp4",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "montage_assembler",
+   "order": 35,
+   "title": "Финальный монтаж",
+   "stage": "montage",
+   "optional": false,
+   "state": "done",
+   "display_state": "done",
+   "state_title": "Готов",
+   "source": "artifacts",
+   "confidence": "low",
+   "started_at": null,
+   "finished_at": "2026-11-03T05:52:29Z",
+   "duration_seconds": null,
+   "error": null,
+   "note_code": "artifacts_only",
+   "outdated_hint": null,
+   "depends_on": [
+    "storybook_sfx_generator",
+    "video_generator",
+    "storybook_continuity_videos_review"
+   ],
+   "artifacts": [
+    {
+     "rel": "99_final/final_video.mp4",
+     "state": "present",
+     "mtime": null
+    },
+    {
+     "rel": "99_final/timeline.fcpxml",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "99_final/subtitles.srt",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "99_final/manifest.json",
+     "state": "missing",
+     "mtime": null
+    },
+    {
+     "rel": "99_final/final_review.json",
+     "state": "present",
+     "mtime": null
+    }
+   ]
+  },
+  {
+   "id": "storybook_video_decision_log",
+   "order": 36,
+   "title": "Журнал решений",
+   "stage": "montage",
+   "optional": true,
+   "state": "not_run",
+   "display_state": "not_run",
+   "state_title": "Не выполнялся",
+   "source": "none",
+   "confidence": "medium",
+   "started_at": null,
+   "finished_at": null,
+   "duration_seconds": null,
+   "error": null,
+   "note_code": null,
+   "outdated_hint": null,
+   "depends_on": [
+    "montage_assembler"
+   ],
+   "artifacts": [
+    {
+     "rel": "96_video_contract/decision_log.json",
+     "state": "missing",
+     "mtime": null
+    }
+   ]
+  }
+ ],
+ "artifacts": [
+  {
+   "id": "brief",
+   "title": "Бриф",
+   "rel": "00_brief.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "synopsis",
+   "title": "Синопсис",
+   "rel": "10_synopsis/synopsis.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "characters",
+   "title": "Персонажи",
+   "rel": "20_bible/characters.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "style",
+   "title": "Стиль",
+   "rel": "30_style/style_text.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "story",
+   "title": "Текст истории",
+   "rel": "20_story/story.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "book_md",
+   "title": "Книга (Markdown)",
+   "rel": "90_md/book.md",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "book_pdf",
+   "title": "Книга (PDF)",
+   "rel": "95_pdf/book.pdf",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "screenplay",
+   "title": "Сценарий",
+   "rel": "91_screenplay/screenplay.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "shots",
+   "title": "Шоты",
+   "rel": "97_shots/shots.json",
+   "state": "present",
+   "mtime": null,
+   "size_bytes": 1
+  },
+  {
+   "id": "video_plan",
+   "title": "План видео",
+   "rel": "97_shots/video_plan.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "character_refs",
+   "title": "Эталоны героев",
+   "rel": "97_shots/character_reference_states.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "background_refs",
+   "title": "Эталоны фонов",
+   "rel": "97_shots/background_references.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "images_review",
+   "title": "Ревью кадров",
+   "rel": "97_shots/continuity_images_review.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "videos_review",
+   "title": "Ревью видео",
+   "rel": "97_shots/continuity_videos_review.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "delivery_promise",
+   "title": "Обещание результата",
+   "rel": "96_video_contract/delivery_promise.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "provider_jobs",
+   "title": "Задачи провайдера",
+   "rel": "97_shots/provider_jobs.json",
+   "state": "present",
+   "mtime": null,
+   "size_bytes": 1
+  },
+  {
+   "id": "audio",
+   "title": "Озвучка",
+   "rel": "98_audio/audio_manifest.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "subtitles",
+   "title": "Субтитры",
+   "rel": "98_audio/subtitles.srt",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "music",
+   "title": "Музыка",
+   "rel": "98_audio/music_manifest.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "sfx",
+   "title": "Звуковые эффекты",
+   "rel": "98_audio/sfx_manifest.json",
+   "state": "missing",
+   "mtime": null,
+   "size_bytes": null
+  },
+  {
+   "id": "final_video",
+   "title": "Финальное видео",
+   "rel": "99_final/final_video.mp4",
+   "state": "present",
+   "mtime": null,
+   "size_bytes": 1
+  },
+  {
+   "id": "final_review",
+   "title": "Итоговая проверка",
+   "rel": "99_final/final_review.json",
+   "state": "present",
+   "mtime": null,
+   "size_bytes": 1
+  }
+ ],
+ "shots": {
+  "source": "shots.json",
+  "partial": false,
+  "total": 2,
+  "with_images": 2,
+  "with_videos": 2,
+  "video_expected": 2,
+  "ready": 2,
+  "errors": 0,
+  "stale": null,
+  "approved": null,
+  "review_pending": null,
+  "redo": null,
+  "ready_basis": "files",
+  "items": null
+ },
+ "final_video": {
+  "exists": true,
+  "path": "99_final/final_video.mp4",
+  "size_bytes": 5,
+  "mtime": null,
+  "duration_seconds": 12.0,
+  "width": 1280,
+  "height": 720,
+  "review_passed": true,
+  "review_errors": 0,
+  "review_warnings": 0,
+  "photo_video_exists": false,
+  "older_than_shots": false
+ },
+ "spend": {
+  "scope": "video_jobs",
+  "currency": "RUB",
+  "total": 4.0,
+  "by_status": {
+   "downloaded": 4.0
+  },
+  "wasted": 0.0,
+  "by_provider": {
+   "routerai": 4.0
+  },
+  "other_currencies": {},
+  "jobs_total": 1,
+  "jobs_failed": 0,
+  "jobs_unknown_cost": 0,
+  "assumed_rub": 0.0,
+  "budget_rub": null,
+  "budget_left_rub": null
+ },
+ "warnings": {
+  "count": null,
+  "source": null
+ },
+ "active_run": {
+  "state": "idle",
+  "locked": false,
+  "run_id": null,
+  "workflow_id": null,
+  "surface": null,
+  "current_step": null,
+  "step_index": null,
+  "step_total": 36,
+  "percent": null,
+  "pause_requested": false,
+  "cancel_requested": false,
+  "stale_control": false,
+  "text": "Прогон не запущен"
+ },
+ "last_run": null,
+ "incomplete_runs": [],
+ "next_action": {
+  "code": "done",
+  "title": "Проект готов — посмотрите фильм",
+  "detail": "",
+  "severity": "success",
+  "target": {
+   "screen": "movie",
+   "filter": null,
+   "step_id": null,
+   "mode": null
+  }
+ },
+ "flags": {
+  "generate_screenplay": {
+   "value": true,
+   "source": "default"
+  },
+  "generate_blockout": {
+   "value": true,
+   "source": "default"
+  },
+  "generate_music": {
+   "value": true,
+   "source": "default"
+  },
+  "generate_sfx": {
+   "value": true,
+   "source": "default"
+  }
+ },
+ "sources": {
+  "run_files": 1,
+  "run_files_unparsed": 0,
+  "shots": "ok",
+  "provider_jobs": "ok",
+  "step_runs": "absent",
+  "runs_db": "no_file"
+ },
+ "hook_errors": []
+}

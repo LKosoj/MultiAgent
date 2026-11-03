@@ -52,6 +52,7 @@ _CODE_FENCE_RE = re.compile(
     r"^\s*```(?P<label>[A-Za-z0-9_+-]*)[ \t]*(?:\r?\n)?(?P<body>.*?)\r?\n?```\s*$",
     flags=re.DOTALL,
 )
+_SQL_FENCE_LABELS = {"", "sql", "postgres", "postgresql", "sqlite"}
 
 
 def _json_candidate_from_fence(raw_output: str) -> str:
@@ -85,6 +86,43 @@ def _json_candidate_from_text(raw_output: str) -> str:
     if any(delimiter in outside for delimiter in "{}["):
         return raw_output
     return raw_output[start:end]
+
+
+def _strip_leading_sql_comments(sql_text: str) -> str:
+    remaining = sql_text.lstrip()
+    while True:
+        if remaining.startswith("--"):
+            newline = remaining.find("\n")
+            if newline == -1:
+                return ""
+            remaining = remaining[newline + 1 :].lstrip()
+            continue
+        if remaining.startswith("/*"):
+            end = remaining.find("*/", 2)
+            if end == -1:
+                return remaining
+            remaining = remaining[end + 2 :].lstrip()
+            continue
+        return remaining
+
+
+def _recoverable_sql_generation_text(raw_output: str) -> Optional[str]:
+    sql_text = raw_output.strip()
+    if not sql_text:
+        return None
+
+    fence_match = _CODE_FENCE_RE.match(sql_text)
+    if fence_match is not None:
+        label = fence_match.group("label").lower()
+        if label not in _SQL_FENCE_LABELS:
+            return None
+        sql_text = fence_match.group("body").strip()
+
+    if sql_text.lstrip().startswith(("{", "[")):
+        return None
+    if re.match(r"(?is)^(select|with)\b", _strip_leading_sql_comments(sql_text)):
+        return sql_text
+    return None
 
 
 class WorkflowEngine(DynamicAgentSystem):
@@ -838,6 +876,19 @@ class WorkflowEngine(DynamicAgentSystem):
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
+            if step.id == "sql_generation":
+                sql_text = _recoverable_sql_generation_text(raw_output)
+                if sql_text is not None:
+                    fallback_output = {
+                        "sql": sql_text,
+                        "description": "Recovered from non-JSON sql_generation output",
+                        "output_normalization_warning": (
+                            "sql_generation returned a non-JSON string; "
+                            "treating it as raw SQL for verification"
+                        ),
+                    }
+                    self._validate_step_output_requirements(step, fallback_output)
+                    return fallback_output, True
             snippet = _redact_workflow_log_value(raw_output[:200])
             raise WorkflowStepError(
                 f"Step '{step.id}' declared output_schema=json_object but "

@@ -1608,7 +1608,7 @@ def test_sql_explain_error_masks_dsn(monkeypatch):
     monkeypatch.setattr(
         _sql_generation_api,
         "sql_safety_check",
-        lambda q, *, sql_validator, dsn=None, safety_policy=None: {
+        lambda q, *, sql_validator, dsn=None, safety_policy=None, static_only=False: {
             "is_safe": True,
             "issues": [],
         },

@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Итоговая проверка",
+  "properties": {
+    "passed": {
+      "type": "boolean",
+      "title": "Пройдена"
+    },
+    "checks": {
+      "type": "object",
+      "title": "Проверки"
+    },
+    "errors": {
+      "type": "array",
+      "title": "Ошибки"
+    },
+    "warnings": {
+      "type": "array",
+      "title": "Предупреждения"
+    }
+  },
+  "required": [
+    "passed"
+  ],
+  "x-recommended": [
+    "checks",
+    "errors",
+    "warnings"
+  ]
+}

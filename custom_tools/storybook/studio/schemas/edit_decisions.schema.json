@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Решения монтажа",
+  "properties": {
+    "sequence": {
+      "type": "array",
+      "title": "Монтажная последовательность",
+      "items": {
+        "type": "object",
+        "title": "Элемент монтажа",
+        "properties": {
+          "index": {
+            "type": "integer",
+            "title": "Номер"
+          },
+          "source_path": {
+            "type": "string",
+            "title": "Источник"
+          },
+          "timeline_start_seconds": {
+            "type": "number",
+            "title": "Начало, с"
+          },
+          "timeline_end_seconds": {
+            "type": "number",
+            "title": "Конец, с"
+          }
+        },
+        "required": [
+          "index",
+          "source_path",
+          "timeline_start_seconds",
+          "timeline_end_seconds"
+        ]
+      }
+    }
+  },
+  "required": [
+    "sequence"
+  ]
+}

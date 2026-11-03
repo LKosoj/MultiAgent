@@ -4,6 +4,7 @@ from pathlib import Path
 import utils
 
 from custom_tools.storybook import artist_batch_edit as artist
+from custom_tools.storybook.style_keeper import _IMAGE_STYLE_CATALOG_VERSION
 
 
 def test_canon_reference_uses_cached_catalog_style_only(tmp_path, monkeypatch):
@@ -25,6 +26,7 @@ def test_canon_reference_uses_cached_catalog_style_only(tmp_path, monkeypatch):
     (style_dir / "image_styles.json").write_text(
         json.dumps(
             {
+                "version": _IMAGE_STYLE_CATALOG_VERSION,
                 "default_style_id": "main",
                 "styles": {"main": {"prompt": "READY_STYLE"}},
                 "frame_bindings": {},

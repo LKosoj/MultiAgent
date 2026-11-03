@@ -295,7 +295,9 @@ def screenplay_shots_generator_tool(
     Returns:
         Словарь в формате items.json для совместимости с artist_agent_batch_edit_tool.
     """
-    
+    from . import video_run_config
+    video_run_config.bind_run_project(project_id)  # провайдер/модель берутся из настроек прогона проекта
+
     if not enable:
         logger.info("🎬 Генерация кадров отключена (enable=False)")
         # Возвращаем пустую структуру в формате items.json

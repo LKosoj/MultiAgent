@@ -48,6 +48,7 @@ def montage_assembler_tool(
     enable: bool = True,
     allow_missing_audio: bool = False,
     music_enabled: bool = False,
+    subtitles_enabled: bool = True,
 ) -> Dict[str, Any]:
     """Assemble storybook clips into final video artifacts and run QA checks.
 
@@ -59,10 +60,13 @@ def montage_assembler_tool(
         allow_missing_audio: When true, allow a video-only montage if audio is missing.
         music_enabled: When true, music was requested; a missing audio track becomes a
             blocker (or warning when allow_missing_audio=True).
+        subtitles_enabled: When false, final subtitles are not written and the subtitle
+            check is reported as disabled (passed).
     """
     enable = _as_bool(enable)
     allow_missing_audio = _as_bool(allow_missing_audio)
     music_enabled = _as_bool(music_enabled)
+    subtitles_enabled = _as_bool(subtitles_enabled)
     try:
         base_dir = _safe_project_dir(project_id)
     except ValueError as exc:
@@ -113,7 +117,8 @@ def montage_assembler_tool(
     items = apply_video_plan(project_id, source_items)
     clips = _build_clip_assets(items, base_dir)
     audio_artifacts = _read_audio_artifacts(audio_dir)
-    _write_final_subtitles(_build_clip_assets(source_items, base_dir), audio_artifacts, paths["subtitles"])
+    if subtitles_enabled:
+        _write_final_subtitles(_build_clip_assets(source_items, base_dir), audio_artifacts, paths["subtitles"])
 
     missing_clips = [clip for clip in clips if not clip["exists"]]
     blocked_media_paths = [clip for clip in clips if not clip.get("path_allowed", True)]
@@ -212,6 +217,7 @@ def montage_assembler_tool(
             final_probe=final_probe,
             expected_duration=expected_duration,
             subtitles_path=paths["subtitles"],
+            subtitles_enabled=subtitles_enabled,
             render_result=render_result,
             blackdetect_result=blackdetect_result,
             volume_result=volume_result,
@@ -1207,12 +1213,19 @@ def _build_final_review(
     items: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
     ffprobe_available: bool = True,
+    subtitles_enabled: bool = True,
 ) -> Dict[str, Any]:
     container = _container_check(output_path, final_probe)
     duration = _duration_check(expected_duration, final_probe)
     black_frame = _black_frame_check(blackdetect_result, clips, expected_duration)
     audio = _audio_check(final_probe, volume_result, audio_required, expected_duration)
-    subtitles = _subtitle_check(subtitles_path)
+    subtitles = _subtitle_check(subtitles_path) if subtitles_enabled else {
+        "passed": True,
+        "status": "disabled",
+        "path": str(subtitles_path),
+        "exists": subtitles_path.exists(),
+        "cue_count": 0,
+    }
     monotony = _monotony_check(items)
     freeze = _freeze_check(clips, expected_duration, ffprobe_available)
 

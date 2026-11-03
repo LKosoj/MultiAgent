@@ -6,7 +6,6 @@
 - SchemaIntrospector бросает ValueError при битом JSON
 - Нет fallback_to_legacy в ui_config.json
 - Нет _get_default_ui_config в SchemaIntrospector
-- EditorPanel содержит обработку ошибок конфигурации
 """
 
 import json
@@ -91,33 +90,6 @@ class TestFallbackToLegacyRemoved(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertNotIn("fallback_to_legacy", source)
-
-
-class TestEditorPanelHandlesConfigError(unittest.TestCase):
-    """Проверяет что EditorPanel обрабатывает ошибки конфигурации"""
-
-    def test_editor_panel_catches_config_errors(self):
-        """EditorPanel содержит try/except для SchemaIntrospector"""
-        source = (
-            SOURCE_DIR / "gui" / "editor_panel.py"
-        ).read_text(encoding="utf-8")
-
-        # Должен быть try/except при создании introspector
-        self.assertIn("_ui_config_error", source)
-        self.assertIn("FileNotFoundError", source)
-
-    def test_load_file_checks_config_error(self):
-        """load_file проверяет _ui_config_error перед загрузкой"""
-        source = (
-            SOURCE_DIR / "gui" / "editor_panel.py"
-        ).read_text(encoding="utf-8")
-
-        start = source.index("def load_file(self")
-        next_def = source.index("\n    def ", start + 1)
-        method_body = source[start:next_def]
-
-        self.assertIn("_ui_config_error", method_body)
-        self.assertIn("Ошибка конфигурации UI", method_body)
 
 
 class TestLoadUiConfigLogic(unittest.TestCase):

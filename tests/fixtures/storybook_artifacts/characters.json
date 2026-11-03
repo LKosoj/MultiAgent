@@ -1,0 +1,16 @@
+[
+  {
+    "name": "Лисёнок",
+    "age": "5",
+    "role": "герой",
+    "immutable_attributes": {
+      "eye_color": "карие"
+    },
+    "variable_attributes": {
+      "base_clothing": "шарф"
+    },
+    "no_go_rules": [
+      "не рисовать людей"
+    ]
+  }
+]

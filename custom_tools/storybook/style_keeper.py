@@ -156,13 +156,16 @@ def ensure_video_style_references(base, catalog, style_ids, session_id, seed, it
     return references
 
 
-def style_keeper_tool(session_id: str, project_id: str) -> str:
+def style_keeper_tool(session_id: str, project_id: str, style_profile: str = "", style_preset: str = "") -> str:
     """Фиксирует style_text.json, style_images.json, negative_prompt_list.txt.
 
     Args:
         project_id (str): Идентификатор проекта. Используется для чтения материалов
             из `10_synopsis` и `20_bible` и записи итогов в `30_style`.
         session_id (str): Идентификатор сессии.
+        style_profile (str): Профиль каталога стилей; пусто — активный по умолчанию.
+        style_preset (str): Пресет из каталога; пусто — выбирает модель. Если стиль взят
+            из цитаты задания, пресет игнорируется с предупреждением.
 
     Returns:
         str: Путь к каталогу `30_style` с итоговыми файлами.
@@ -190,7 +193,9 @@ def style_keeper_tool(session_id: str, project_id: str) -> str:
     with open(f"{bible_dir}/locations.json", "r", encoding="utf-8") as f:
         locations = json.load(f)
 
-    catalog_note = compose_style_catalog_note()
+    style_profile = str(style_profile or "").strip() or None
+    style_preset = str(style_preset or "").strip()
+    catalog_note = compose_style_catalog_note(style_profile)
     system = f"""Ты арт-директор. Верни JSON с полями style_text, style_preset_id, style_overrides, source_style_quote и negative_list.
 
 {catalog_note}
@@ -243,7 +248,13 @@ negative_list: строка с запятыми — запреты, специф
     )
     data = parse_llm_json(resp)
 
-    preset = resolve_preset(data.get("style_preset_id"))
+    preset_id = data.get("style_preset_id")
+    if style_preset:
+        if style_preset in get_active_style_profile(style_profile).presets:
+            preset_id = style_preset
+        else:
+            logger.warning("style_keeper: пресет %r не найден в каталоге, выбор модели сохранён", style_preset)
+    preset = resolve_preset(preset_id, style_profile)
     style_images = merge_preset_into_style_images(preset, data.get("style_overrides"))
     negative_terms = compose_negative_seed(preset)
     source_quote = str(data.get("source_style_quote") or "").strip()
@@ -258,7 +269,9 @@ negative_list: строка с запятыми — запреты, специф
             if not value:
                 raise ValueError(f"style_keeper: отсутствует исходное описание {field}")
             style_images[field] = value
-        profile = get_active_style_profile()
+        if style_preset:
+            logger.warning("style_keeper: стиль взят из цитаты задания, пресет %r игнорируется", style_preset)
+        profile = get_active_style_profile(style_profile)
         style_images["source_style_quote"] = source_quote
         style_images["camera_defaults"] = {}
         style_images["style_pitfalls"] = list(profile.universal_pitfalls)

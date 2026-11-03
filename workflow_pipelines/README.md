@@ -60,8 +60,10 @@ ROUTERAI_VIDEO_RETRY_CYCLES=3
 ROUTERAI_RESOLUTION=480p
 ```
 
-В шаге `video_generator` файла `storybook_pipeline.yaml` выберите
-`tool_name: video_generator_routerai_tool`, закомментировав строку текущего провайдера.
+Провайдер видео выбирается входом пайплайна `video_provider` (`routerai`, `aitunnel`,
+`minimax`, `veo`) или настройкой прогона проекта (`.studio/run_settings.json`); без них
+действует `STORYBOOK_VIDEO_PROVIDER`, а по умолчанию `routerai`. Шаг `video_generator`
+использует диспетчер `video_generator_dispatch_tool`, править `storybook_pipeline.yaml` не нужно.
 Ключ и модель также можно записать в корневой `.env` проекта.
 
 Модель выбирается по идентификатору из [каталога RouterAI](https://routerai.ru/models?output_modalities%5B%5D=video).

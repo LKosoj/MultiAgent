@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "shot_key": "1-1",
+      "status": "downloaded",
+      "input_hash": "abc",
+      "provider": "aitunnel",
+      "model": "veo"
+    }
+  ]
+}

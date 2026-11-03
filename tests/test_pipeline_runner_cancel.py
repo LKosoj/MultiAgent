@@ -6,10 +6,11 @@
 - Сохраняется workflow_id при запуске
 - cancel_pipeline возвращает ошибку если нет активного pipeline
 - run_pipeline_sync использует переданный runner
-- GenerationPanel._cancel_event корректно работает
 """
 
 import asyncio
+import os
+import tempfile
 import threading
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,14 @@ sys.path.insert(0, str(project_root))
 class TestPipelineRunnerCancel(unittest.TestCase):
     """Тесты для PipelineRunner.cancel_pipeline и связанной логики"""
 
+    def setUp(self):
+        # проекты во временной папке: иначе .pipeline.lock ложится в настоящий plots/storybooks
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(os.environ, {"STORYBOOK_PROJECTS_DIR": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
+
     def _make_runner_with_mock_engine(self):
         """Создаёт PipelineRunner с замоканным engine"""
         with patch(
@@ -35,6 +44,36 @@ class TestPipelineRunnerCancel(unittest.TestCase):
             runner.engine = MagicMock()
             runner.engine.cancel_workflow = AsyncMock(return_value=None)
             return runner
+
+    def test_cancel_stale_workflow_calls_engine_with_given_id(self):
+        """cancel_stale_workflow отменяет чужой/старый id, не трогая current_workflow_id"""
+        runner = self._make_runner_with_mock_engine()
+        runner.current_workflow_id = None
+        runner._acquire_project_lock = lambda project_id: "LOCK"
+        runner._release_project_lock = lambda handle: None
+
+        result = asyncio.get_event_loop().run_until_complete(
+            runner.cancel_stale_workflow("sbm_x_deadbeef", "x")
+        )
+        self.assertEqual(result["status"], "cancelled")
+        self.assertEqual(runner.engine.cancel_workflow.call_args.args[0], "sbm_x_deadbeef")
+
+    def test_cancel_stale_workflow_no_engine_returns_error(self):
+        runner = self._make_runner_with_mock_engine()
+        runner.engine = None
+        result = asyncio.get_event_loop().run_until_complete(
+            runner.cancel_stale_workflow("sbm_x_deadbeef")
+        )
+        self.assertEqual(result["status"], "error")
+
+    def test_cancel_stale_workflow_skipped_when_project_locked(self):
+        runner = self._make_runner_with_mock_engine()
+        runner._acquire_project_lock = lambda project_id: None
+        result = asyncio.get_event_loop().run_until_complete(
+            runner.cancel_stale_workflow("sbm_x_deadbeef", "x")
+        )
+        self.assertEqual(result["status"], "error")
+        runner.engine.cancel_workflow.assert_not_called()
 
     def test_cancel_pipeline_no_engine(self):
         """cancel_pipeline возвращает ошибку если engine=None"""

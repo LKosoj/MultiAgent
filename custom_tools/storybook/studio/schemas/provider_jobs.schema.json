@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Задачи провайдера",
+  "properties": {
+    "jobs": {
+      "type": "array",
+      "title": "Задачи",
+      "items": {
+        "type": "object",
+        "title": "Задача",
+        "properties": {
+          "shot_key": {
+            "type": "string",
+            "title": "Ключ шота"
+          },
+          "status": {
+            "type": "string",
+            "title": "Статус"
+          },
+          "input_hash": {
+            "type": "string",
+            "title": "Отпечаток входа"
+          },
+          "provider": {
+            "type": "string",
+            "title": "Провайдер"
+          },
+          "model": {
+            "type": "string",
+            "title": "Модель"
+          }
+        },
+        "required": [
+          "shot_key",
+          "status",
+          "input_hash"
+        ],
+        "x-recommended": [
+          "provider",
+          "model"
+        ]
+      }
+    }
+  },
+  "required": [
+    "jobs"
+  ]
+}

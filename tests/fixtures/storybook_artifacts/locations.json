@@ -1,0 +1,14 @@
+[
+  {
+    "name": "Лес",
+    "description": "Тёмный лес.",
+    "key_objects": [
+      "ель"
+    ],
+    "lighting": "лунный свет",
+    "color_palette": [
+      "синий"
+    ],
+    "atmosphere": "тихо"
+  }
+]

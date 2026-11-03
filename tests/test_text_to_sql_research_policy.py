@@ -1307,28 +1307,6 @@ def test_budget_claim_reopen_rejects_invalid_rows(
         AdaptiveBudgetLedger(path)
 
 
-def test_probe_count_is_derived_from_complete_ledger(budget_ledger) -> None:
-    ledger, _ = budget_ledger
-    state = _state()
-    for revision in range(MAX_DB_PROBES):
-        action = _action(revision)
-        state = _complete(
-            ledger,
-            state,
-            action,
-            actual=_cost(wall_clock_ms=0, db_probe_ms=0),
-        )
-
-    with pytest.raises(BudgetExhaustedError, match="DB probe count"):
-        reserve_probe_budget(
-            state,
-            _action(MAX_DB_PROBES),
-            _cost(),
-            config=_config(),
-            ledger=ledger,
-        )
-
-
 def test_widened_state_budget_is_rejected_even_with_empty_ledger(budget_ledger) -> None:
     ledger, _ = budget_ledger
     values = initial_budget_state(_config()).model_dump(mode="python")

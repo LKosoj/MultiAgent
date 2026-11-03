@@ -11,6 +11,7 @@ import { MemorySection } from "./components/sections/MemorySection";
 import { DashboardSection } from "./components/sections/DashboardSection";
 import { DynamicAgentsSection } from "./components/sections/DynamicAgentsSection";
 import { TextToSqlSection } from "./components/sections/TextToSqlSection";
+import { StorybookSection, type OpenRequest } from "./components/sections/StorybookSection";
 import {
   ConfigSection,
   TelemetrySection,
@@ -31,10 +32,6 @@ import {
   initialWorkflowParams,
   type WorkflowParams,
 } from "./utils/workflowParams";
-import {
-  buildStorybookReadinessPayload,
-  extractStorybookReadiness,
-} from "./utils/storybookReadiness";
 import {
   closeTextToSqlPendingActions,
   createTextToSqlFollowRegistry,
@@ -58,6 +55,7 @@ const STUDIO_SECTIONS = [
   { id: "agents", label: "Агенты" },
   { id: "dynamic-agents", label: "Динамические агенты" },
   { id: "workflows", label: "Workflow" },
+  { id: "storybook", label: "Storybook" },
   { id: "text-to-sql", label: "Text-to-SQL" },
   { id: "db", label: "DB плагины" },
   { id: "memory", label: "Память/RAG" },
@@ -202,9 +200,10 @@ type AguiStudioProps = {
   onForget: () => void;
   principal: AuthPrincipal;
   isAdmin: boolean;
+  backendUrl: string;
 };
 
-function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
+function AguiStudio({ onForget, isAdmin, backendUrl }: AguiStudioProps) {
   const { agent } = useAgent({ agentId: "default" });
   const { copilotkit } = useCopilotKit();
   const { toasts, dismiss: dismissToast, notify } = useToast();
@@ -283,9 +282,7 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
   const [builderYaml, setBuilderYaml] = useState("");
   const [builderSaveName, setBuilderSaveName] = useState("");
   const [workflowRunError, setWorkflowRunError] = useState<string | null>(null);
-  const [storybookReadiness, setStorybookReadiness] = useState<unknown>(null);
-  const [storybookReadinessLoading, setStorybookReadinessLoading] = useState(false);
-  const [storybookReadinessError, setStorybookReadinessError] = useState<string | null>(null);
+  const [storybookOpen, setStorybookOpen] = useState<OpenRequest>(null);
   const [builderError, setBuilderError] = useState<string | null>(null);
   const [workflowYamlModal, setWorkflowYamlModal] = useState<{
     open: boolean;
@@ -978,8 +975,6 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
 
   const loadWorkflowInputs = useCallback(
     async (workflowName: string) => {
-      setStorybookReadiness(null);
-      setStorybookReadinessError(null);
       const result = (await runServiceAction("workflows.parse_yaml", { workflow_name: workflowName })) as {
         pipeline_info?: { inputs?: Record<string, unknown> };
       };
@@ -993,18 +988,11 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
   const handleSelectWorkflow = useCallback(
     async (workflow: WorkflowInfo) => {
       setSelectedWorkflow(workflow);
-      setStorybookReadiness(null);
-      setStorybookReadinessError(null);
       setWorkflowTab("run");
       await loadWorkflowInputs(workflow.name);
     },
     [loadWorkflowInputs],
   );
-
-  useEffect(() => {
-    setStorybookReadiness(null);
-    setStorybookReadinessError(null);
-  }, [selectedWorkflow?.name, workflowParams]);
 
   const handleViewWorkflowYaml = useCallback(
     async (workflow: WorkflowInfo) => {
@@ -1105,28 +1093,10 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
     }
   }, [refreshWorkflowRuns, runServiceAction, selectedWorkflow, workflowInputs, workflowOptions, workflowParams]);
 
-  const handleFetchStorybookReadiness = useCallback(
-    async (sourceParams?: Record<string, unknown>) => {
-      setStorybookReadinessLoading(true);
-      setStorybookReadinessError(null);
-      setStorybookReadiness(null);
-      try {
-        const payload = buildStorybookReadinessPayload(
-          workflowInputs,
-          (sourceParams ?? workflowParams) as WorkflowParams,
-        );
-        const response = await runServiceAction("workflows.storybook_readiness", payload, {
-          timeoutMs: 30000,
-        });
-        setStorybookReadiness(extractStorybookReadiness(response));
-      } catch (err) {
-        setStorybookReadinessError(err instanceof Error ? err.message : "Не удалось проверить video/music readiness");
-      } finally {
-        setStorybookReadinessLoading(false);
-      }
-    },
-    [runServiceAction, workflowInputs, workflowParams],
-  );
+  const openStorybook = useCallback((projectId: string | null) => {
+    setStorybookOpen((prev) => ({ projectId, n: (prev?.n ?? 0) + 1 }));
+    setActiveSection("storybook");
+  }, []);
 
   const handleCancelWorkflow = useCallback(
     async (runId: string) => {
@@ -1578,9 +1548,6 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
               workflowResults={workflowResults}
               workflowRunHistory={workflowRunHistory}
               workflowArtifacts={workflowArtifacts}
-              storybookReadiness={storybookReadiness}
-              storybookReadinessLoading={storybookReadinessLoading}
-              storybookReadinessError={storybookReadinessError}
               builderInfo={builderInfo}
               builderInputs={builderInputs}
               builderSteps={builderSteps}
@@ -1598,7 +1565,7 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
               setWorkflowOptions={setWorkflowOptions}
               setWorkflowParams={setWorkflowParams}
               handleRunWorkflow={handleRunWorkflow}
-              handleFetchStorybookReadiness={handleFetchStorybookReadiness}
+              onOpenStorybook={openStorybook}
               handleFetchWorkflowStatus={handleFetchWorkflowStatus}
               handleFetchWorkflowArtifacts={handleFetchWorkflowArtifacts}
               handleFetchWorkflowResult={handleFetchWorkflowResult}
@@ -1616,6 +1583,17 @@ function AguiStudio({ onForget, isAdmin }: AguiStudioProps) {
               handleSaveYaml={handleSaveYaml}
             />
           ) : null}
+
+          <div hidden={activeSection !== "storybook"}>
+            <StorybookSection
+              runServiceAction={runServiceAction}
+              backendUrl={backendUrl}
+              isAdmin={isAdmin}
+              active={activeSection === "storybook"}
+              notify={notify}
+              openRequest={storybookOpen}
+            />
+          </div>
 
           <div hidden={activeSection !== "text-to-sql"}>
             <TextToSqlSection
@@ -1945,7 +1923,7 @@ function AuthenticatedStudio({
 
   return (
     <CopilotKitProvider agents__unsafe_dev_only={{ default: agent as any }} renderToolCalls={[wildcardRenderer]} showDevConsole="auto">
-      <AguiStudio principal={principal} isAdmin={isAdmin} onForget={onForget} />
+      <AguiStudio principal={principal} isAdmin={isAdmin} onForget={onForget} backendUrl={backendUrl} />
     </CopilotKitProvider>
   );
 }

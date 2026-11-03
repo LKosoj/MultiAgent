@@ -113,6 +113,40 @@ class TestStorybookPipelineDag(unittest.TestCase):
         self.assertEqual(params["allow_missing_audio"], "{final_allow_missing_audio}")
         self.assertEqual(params["music_enabled"], "{generate_music}")
 
+    def test_run_settings_inputs_and_defaults_keep_old_behavior(self):
+        inputs = self._load_storybook().inputs
+        for name, default in {
+            "video_provider": "", "budget_rub": 0, "generate_sfx": True, "generate_subtitles": True,
+            "style_profile": "", "style_preset": "", "generate_music": True,
+        }.items():
+            self.assertIn(name, inputs)
+            self.assertEqual(inputs[name], default, name)
+
+    def test_video_step_goes_through_dispatcher_with_provider_and_budget(self):
+        steps = {step.id: step for step in self._load_storybook().steps}
+        video = steps["video_generator"]
+        self.assertEqual(video.tool_name, "video_generator_dispatch_tool")
+        self.assertEqual(video.tool_params["video_provider"], "{video_provider}")
+        self.assertEqual(video.tool_params["budget_rub"], "{budget_rub}")
+        self.assertFalse(video.metadata.get("retryable", True))
+        for step_id in ("storybook_video_preflight", "storybook_video_delivery_promise"):
+            self.assertEqual(steps[step_id].tool_params["video_provider"], "{video_provider}")
+
+    def test_toggles_reach_sfx_subtitles_and_style_steps(self):
+        steps = {step.id: step for step in self._load_storybook().steps}
+        self.assertEqual(steps["storybook_sfx_generator"].tool_params["enable"], "{generate_sfx}")
+        self.assertEqual(steps["storybook_audio_subtitle"].tool_params["generate_subtitles"], "{generate_subtitles}")
+        self.assertEqual(steps["montage_assembler"].tool_params["subtitles_enabled"], "{generate_subtitles}")
+        style = steps["style_keeper"].tool_params
+        self.assertEqual(style["style_profile"], "{style_profile}")
+        self.assertEqual(style["style_preset"], "{style_preset}")
+
+    def test_dispatcher_resolves_through_pipeline_registry(self):
+        from agent_factory import ToolRegistry
+
+        resolved = ToolRegistry().resolve_many(["video_generator_dispatch_tool"], profile_name="direct")
+        self.assertEqual(set(resolved), {"video_generator_dispatch_tool"})
+
     def test_book_assembly_uses_initialized_project_root(self):
         steps = {step.id: step for step in self._load_storybook().steps}
 

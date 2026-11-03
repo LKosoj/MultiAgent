@@ -167,4 +167,4 @@ def test_pp09_start_examples_keep_frozen_environment_before_change(monkeypatch):
     system = captured[0]["system_prompt"]
     assert "first hairline crack at edges" not in system
     assert "door barely ajar" not in system
-    assert "Поверхность ЦЕЛОСТНАЯ и СТАБИЛЬНАЯ" in system
+    assert "сохраняй заданные начальные целостность и опору" in system

@@ -4,6 +4,15 @@ from pathlib import Path
 from typing import Any
 
 from custom_tools.storybook import project_paths
+from custom_tools.storybook.studio.project_store import is_service_dir
+
+
+def _has_shot_video(project_path: Path) -> bool:
+    """Есть ли видео шотов; копии в 97_shots/_versions не считаются."""
+    shots_dir = project_path / "97_shots"
+    if not shots_dir.exists():
+        return False
+    return any("_versions" not in f.relative_to(shots_dir).parts for f in shots_dir.rglob("*.mp4"))
 
 
 CONTRACT_VERSION = 1
@@ -74,7 +83,7 @@ def storybook_project_inventory(project_id: str | None = None, max_items: int = 
 def _iter_projects(projects_dir: Path) -> list[Path]:
     if not projects_dir.exists():
         return []
-    projects = [path for path in projects_dir.iterdir() if path.is_dir() and not path.name.startswith(".")]
+    projects = [path for path in projects_dir.iterdir() if path.is_dir() and not is_service_dir(path.name)]
     projects.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
     return projects
 
@@ -97,7 +106,7 @@ def _project_preview(project_path: Path, include_size: bool) -> dict[str, Any]:
         "characters_count": len(brief.get("main_characters") or []) if isinstance(brief.get("main_characters"), list) else 0,
         "pages_count": len(story.get("pages") or []) if isinstance(story.get("pages"), list) else 0,
         "has_pdf": (project_path / "95_pdf" / "book.pdf").exists(),
-        "has_video": any((project_path / "97_shots").rglob("*.mp4")) if (project_path / "97_shots").exists() else False,
+        "has_video": _has_shot_video(project_path),
         "thumbnail": thumbnail,
         "size_bytes": _dir_size(project_path) if include_size else None,
         "created": _iso_mtime(project_path, ctime=True),
@@ -133,7 +142,7 @@ def _media_inventory(project_path: Path, max_items: int) -> dict[str, Any]:
         if not media_dir.exists():
             continue
         for path in media_dir.rglob("*"):
-            if not path.is_file():
+            if not path.is_file() or "_versions" in path.relative_to(media_dir).parts:
                 continue
             kind = _media_kind(path)
             if kind is None:

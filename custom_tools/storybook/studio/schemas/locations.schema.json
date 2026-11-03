@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "title": "Места",
+  "items": {
+    "type": "object",
+    "title": "Место",
+    "properties": {
+      "name": {
+        "type": "string",
+        "title": "Название",
+        "minLength": 1
+      },
+      "description": {
+        "type": "string",
+        "title": "Описание"
+      },
+      "key_objects": {
+        "type": "array",
+        "title": "Ключевые предметы",
+        "items": {
+          "type": "string"
+        }
+      },
+      "lighting": {
+        "type": "string",
+        "title": "Освещение"
+      },
+      "color_palette": {
+        "type": "array",
+        "title": "Палитра",
+        "items": {
+          "type": "string"
+        }
+      },
+      "atmosphere": {
+        "type": "string",
+        "title": "Атмосфера"
+      }
+    },
+    "required": [
+      "name",
+      "description"
+    ],
+    "x-recommended": [
+      "key_objects",
+      "lighting",
+      "color_palette",
+      "atmosphere"
+    ]
+  }
+}

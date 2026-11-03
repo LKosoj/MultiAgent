@@ -673,7 +673,9 @@ def test_parallel_workflow_tools_and_retry_attempts_get_distinct_invocation_ids(
     assert {item["run_id"] for item in starts} == set(manager.active_runs)
 
 
-def test_retry_engine_redacts_exception_boundary(caplog):
+def test_retry_engine_redacts_exception_boundary(caplog, monkeypatch):
+    # маскирование PII включается только явным флагом (по умолчанию выключено)
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     workflow_pkg = _install_light_workflow_package()
     retry_engine = workflow_pkg.retry_engine.RetryEngine()
     models = workflow_pkg.models
@@ -705,7 +707,9 @@ def test_retry_engine_redacts_exception_boundary(caplog):
     assert "[EMAIL]" in combined
 
 
-def test_adaptive_retry_engine_redacts_failed_step_result(caplog):
+def test_adaptive_retry_engine_redacts_failed_step_result(caplog, monkeypatch):
+    # маскирование PII включается только явным флагом (по умолчанию выключено)
+    monkeypatch.setenv("PII_MASKING_ENABLED", "1")
     _install_light_workflow_package()
     from workflow.resilience.retry import AdaptiveRetryEngine
 

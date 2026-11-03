@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Бриф",
+  "properties": {
+    "title": {
+      "type": "string",
+      "title": "Название",
+      "minLength": 1
+    },
+    "language": {
+      "type": "string",
+      "title": "Язык"
+    },
+    "description": {
+      "type": "string",
+      "title": "Описание"
+    },
+    "pages_min": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Страниц не меньше"
+    },
+    "pages_max": {
+      "type": "integer",
+      "minimum": 1,
+      "title": "Страниц не больше"
+    },
+    "main_characters": {
+      "type": "array",
+      "title": "Главные герои",
+      "items": {
+        "type": "string"
+      }
+    },
+    "main_locations": {
+      "type": "array",
+      "title": "Главные места",
+      "items": {
+        "type": "string"
+      }
+    },
+    "genre": {
+      "type": "string",
+      "title": "Жанр"
+    },
+    "target_age": {
+      "type": "string",
+      "title": "Возраст читателя"
+    },
+    "moral": {
+      "type": "string",
+      "title": "Мораль"
+    },
+    "storybook_prompt": {
+      "type": "string",
+      "title": "Исходное задание"
+    },
+    "words_per_page_min": {
+      "type": "integer",
+      "title": "Слов на странице не меньше"
+    },
+    "words_per_page_max": {
+      "type": "integer",
+      "title": "Слов на странице не больше"
+    },
+    "seed": {
+      "type": "integer",
+      "title": "Зерно случайности"
+    }
+  },
+  "required": [
+    "title",
+    "language",
+    "description",
+    "pages_min",
+    "pages_max",
+    "main_characters",
+    "main_locations"
+  ],
+  "x-recommended": [
+    "genre",
+    "target_age",
+    "moral",
+    "storybook_prompt",
+    "words_per_page_min",
+    "words_per_page_max",
+    "seed"
+  ]
+}

@@ -75,14 +75,15 @@ def test_pp13_bible_request_carries_requested_language(tmp_path, monkeypatch, la
 
 
 def test_pp13_baseline_request_omits_language(tmp_path, monkeypatch):
-    source = Path("/tmp/multiagent-prompt-remediation.Ghskbe/custom_tools/storybook/bible_builder.py")
+    source = Path(__file__).parent / "fixtures" / "storybook" / "bible_builder_initial.py"
     baseline = types.ModuleType("custom_tools.storybook.bible_builder_baseline")
     baseline.__package__ = "custom_tools.storybook"
     baseline.__file__ = str(source)
     exec(compile(source.read_bytes(), str(source), "exec"), baseline.__dict__)
 
-    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    synopsis = tmp_path / "project" / "10_synopsis"
+    # Исходная версия модуля берёт путь plots/storybooks/... от текущей папки
+    monkeypatch.chdir(tmp_path)
+    synopsis = tmp_path / "plots" / "storybooks" / "project" / "10_synopsis"
     synopsis.mkdir(parents=True)
     (synopsis / "synopsis.json").write_text("{}", encoding="utf-8")
     (synopsis / "beats.json").write_text("[]", encoding="utf-8")

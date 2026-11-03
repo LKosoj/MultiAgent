@@ -1,0 +1,16 @@
+{
+  "characters": [
+    {
+      "name": "Лисёнок",
+      "asset_id": "fox_cub"
+    }
+  ],
+  "locations": [
+    {
+      "location": "Лес",
+      "key_object": "ель",
+      "asset_id": "fir"
+    }
+  ],
+  "unmapped": []
+}
