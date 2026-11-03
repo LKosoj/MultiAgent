@@ -137,7 +137,7 @@ def _allow_end_location_change_via_llm(
                 "Консервативное правило: без явного подтверждения смена локации запрещена."
             ),
             model=model_lite,
-            max_tokens=200,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -2192,7 +2192,7 @@ Continuity reference path: {continuity_ref_path if continuity_ref_path else 'Н�
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_ultimate,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.4,
             response_format={"type": "json_object"},
         )
@@ -2785,7 +2785,7 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
             prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=1200,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -2818,7 +2818,7 @@ SELF-CHECK: 1) каждый noun phrase поддержан shot_description? 2) 
                 prompt="INPUT:\n" + json.dumps(corrective_payload, ensure_ascii=False),
                 system_prompt=system_prompt,
                 model=model_hard,
-                max_tokens=1200,
+                max_tokens=32768,
                 temperature=0.0,
                 response_format={"type": "json_object"},
             )
@@ -3270,7 +3270,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_ultimate,
-            max_tokens=12000,
+            max_tokens=32768,
             temperature=0.4,
             response_format={"type": "json_object"},
         )

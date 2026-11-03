@@ -10,7 +10,7 @@ memory_policy:
   scope_read: session              # Нужен доступ ко всей сессии для проверки
   allow_scope_escalation: true     # Может расширять поиск
   search_enabled: true             # Семантический поиск для проверки фактов
-  max_tokens: 8000                # Стандартный контекст
+  max_tokens: 32768                # Стандартный контекст
   last_k_steps: 6                 # Больше истории для контекста проверки
   priority_strategic: 0.2         # Меньше стратегического, больше фактического
   strategic_write: false          # Не пишет стратегию

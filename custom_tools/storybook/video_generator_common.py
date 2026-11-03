@@ -484,7 +484,7 @@ TASK:
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=500,  # Ограничиваем длину ответа
+            max_tokens=32768,  # Ограничиваем длину ответа
             temperature=0.1  # Минимальная креативность
         )
         
@@ -574,7 +574,7 @@ def _simple_translate_prompt(prompt: str) -> Optional[str]:
             prompt=f"Translate to English. Keep structure exactly. One line output:\n\n{prompt}",
             system_prompt="You are a translator. Translate the video prompt to English. Do NOT add any new actions or details. Keep the exact same structure and meaning.",
             model=model_hard,
-            max_tokens=300,
+            max_tokens=32768,
             temperature=0.0
         )
         

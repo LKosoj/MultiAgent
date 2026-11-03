@@ -213,7 +213,7 @@ class RagMemory(AgentMemory):
             ChatMessage(role=MessageRole.SYSTEM, content=system_prompt),
             ChatMessage(role=MessageRole.USER, content=user_prompt),
         ]
-        response = model(messages, max_tokens=4000)
+        response = model(messages, max_tokens=32768)
 
         if hasattr(response, "content") and isinstance(response.content, str):
             summary = response.content.strip()

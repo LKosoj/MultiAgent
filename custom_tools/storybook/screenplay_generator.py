@@ -85,7 +85,7 @@ def _repair_mixed_script_fields(screenplay_data: Dict[str, Any]) -> None:
     repaired = _llm_json_call(
         system_prompt='Исправь посторонние иероглифы и склеенные языковые фрагменты в русских текстах. Сохрани смысл, факты и технические параметры. Не добавляй события. Верни JSON {"texts": ["исправленный текст"]} в исходном порядке, без пропусков.',
         payload={"texts": [value for _, _, value in pending]},
-        model=model_hard, temperature=0.0, max_tokens=12000,
+        model=model_hard, temperature=0.0, max_tokens=32768,
     ).get("texts")
     if not isinstance(repaired, list) or len(repaired) != len(pending) or any(
         not isinstance(text, str) or not text.strip() or pattern.search(text) for text in repaired
@@ -124,7 +124,7 @@ def _refresh_location_bindings(screenplay_data: Dict[str, Any], locations: list)
                  {"shot_number": sh["shot_number"], "description": sh.get("description")}
                  for sh in sc.get("storyboard", [])]}
             for sc in scenes]},
-        model=model_hard, temperature=0.0, max_tokens=12000,
+        model=model_hard, temperature=0.0, max_tokens=32768,
     )
     rows = result.get("bindings") or []
     by_scene = {row["scene_number"]: row for row in rows}
@@ -481,7 +481,7 @@ def _extract_story_anchors_llm(
         system_prompt=system_prompt,
         model=model_hard,
         temperature=0.2,
-        max_tokens=6000,
+        max_tokens=32768,
         response_format={"type": "json_object"},
         max_retries=3,
     )

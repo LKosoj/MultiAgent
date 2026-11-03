@@ -12,7 +12,7 @@ memory_policy:
   scope_read: agent                # Читает свои данные
   allow_scope_escalation: false   # Без расширения (творческая изоляция)
   search_enabled: true            # Семантический поиск для стилей и примеров
-  max_tokens: 5000                # Средний контекст
+  max_tokens: 32768                # Средний контекст
   last_k_steps: 4                 # Немного истории для стиля
   priority_strategic: 0.2         # Больше тактического, творческого фокуса
   strategic_write: false          # Не пишет стратегию

@@ -27,7 +27,7 @@ def analyze_missing_locations(screenplay_data: Dict[str, Any], existing_location
             prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT_ANALYZE_MISSING_LOCATIONS,
             model=model_hard,
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"}
         )
@@ -55,7 +55,7 @@ def analyze_missing_characters(screenplay_data: Dict[str, Any], existing_charact
             prompt=user_prompt,
             system_prompt=SYSTEM_PROMPT_ANALYZE_MISSING_CHARACTERS,
             model=model_hard,
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"}
         )

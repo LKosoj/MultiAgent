@@ -198,7 +198,7 @@ def brainstorm_with_method(
             prompt=user_prompt,
             system_prompt=method['system_prompt'] + add_prompt,
             model=model,
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=temperature
         )
         
@@ -374,7 +374,7 @@ def multi_model_brainstorm(
             prompt=synthesis_prompt,
             system_prompt=system_prompt,
             model=model_ultimate,
-            max_tokens=12000,
+            max_tokens=32768,
             temperature=0.6
         )
         
@@ -385,7 +385,7 @@ def multi_model_brainstorm(
                 prompt=synthesis_prompt,
                 system_prompt=system_prompt,
                 model=model_hard,
-                max_tokens=12000,
+                max_tokens=32768,
                 temperature=0.6
             )
             

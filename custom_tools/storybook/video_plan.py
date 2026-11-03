@@ -473,7 +473,7 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        + VIDEO_PROMPT_RULES
                        + '- Here the main event is the one continuous action across the supplied shots; '
                          'keep every required event at its supplied time.\n'),
-        max_tokens=2600, temperature=0.2, response_format={'type': 'json_object'})
+        max_tokens=32768, temperature=0.2, response_format={'type': 'json_object'})
     prompt = finalize_video_prompt(parse_llm_json(response)['video_prompt'], group)
     catalog_path = base / '30_style/image_styles.json'
     if catalog_path.is_file():

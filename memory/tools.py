@@ -1785,7 +1785,7 @@ def summary_agent_memory_step(
         ]
 
         # Генерируем summary
-        response = model(messages, max_tokens=4000)
+        response = model(messages, max_tokens=32768)
 
         # Извлекаем текст из ответа (аналогично get_memory_summary)
         if hasattr(response, 'content') and isinstance(response.content, str):

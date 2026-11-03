@@ -193,7 +193,7 @@ def _infer_accessory_visibility_via_llm(
             prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
             system_prompt=system_prompt,
             model=model_lite,
-            max_tokens=500,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -413,7 +413,7 @@ SHOT FRAME SPEC (авторитетный source of truth):
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -599,7 +599,7 @@ TRANSITION HINT (optional video_prompt; may be empty):
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -744,7 +744,7 @@ CAMERA_PLAN: "{camera_plan}" (тип кадра: {shot_type})
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_ultimate,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"}
         )
@@ -918,7 +918,7 @@ def _smart_location_match_llm(
             prompt=system_prompt,
             system_prompt=f"Ты эксперт по анализу локаций. Анализируешь сцену {scene_number}, шот {shot_number}.",
             model=model_ultimate,
-            max_tokens=10,
+            max_tokens=32768,
             temperature=0.1
         )
         
@@ -1395,7 +1395,7 @@ LOCATION_TIME: "{location_time}"
                 prompt=complex_parsing_prompt,
                 system_prompt="Ты эксперт по парсингу сценариев. Определи основную локацию из текста сценария.",
                 model=model_ultimate,
-                max_tokens=50,
+                max_tokens=32768,
                 temperature=0.1
             )
             
@@ -1508,7 +1508,7 @@ LOCATION_TIME: "{location_time}"
                         "Не выдумывай новые названия."
                     ),
                     model=model_ultimate,
-                    max_tokens=300,
+                    max_tokens=32768,
                     temperature=0.0,
                     response_format={"type": "json_object"},
                 )
@@ -2343,7 +2343,7 @@ def _sanitize_start_via_llm(
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -2566,7 +2566,7 @@ def _sanitize_end_via_llm(
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=8000,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )

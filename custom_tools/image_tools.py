@@ -298,7 +298,7 @@ def generate_smart_summary(analysis_results_json: str, analysis_types: List[str]
                     prompt=llm_prompt,
                     system_prompt=system_prompt,
                     model=model_code,
-                    max_tokens=8000,
+                    max_tokens=32768,
                     temperature=0.2,
                     response_format={"type": "json_object"}
                 )
@@ -338,7 +338,7 @@ def generate_smart_summary(analysis_results_json: str, analysis_types: List[str]
                         llm_data["areas_for_improvement"] = ["Некорректный формат ответа LLM"]
                 else:
                     logger.error("call_openai_api вернул None или пустой ответ для умной сводки")
-                    logger.error(f"Параметры запроса: model={model_code}, max_tokens=8000, temperature=0.2")
+                    logger.error(f"Параметры запроса: model={model_code}, max_tokens=32768, temperature=0.2")
                     logger.error(f"Тип модели: {type(model_code)}")
                     logger.error(f"Полученный ответ: {repr(llm_response)}")
 
@@ -845,7 +845,8 @@ def analyze_image_tool(image_input: str, analysis_prompt: str = None, analysis_t
             prompt=final_analysis_prompt,
             system_prompt=system_prompt,
             model=model_vision,
-            max_tokens=2000,
+            max_tokens=(getattr(model_vision, "max_tokens", None)
+                        or getattr(model_vision, "kwargs", {}).get("max_tokens", 32768)),
             temperature=0.1,
             image_url=image_url,
             response_format={"type": "json_object"}

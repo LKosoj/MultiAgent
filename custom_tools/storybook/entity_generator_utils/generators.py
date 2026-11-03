@@ -40,7 +40,7 @@ def generate_location_description(
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=2000,
+            max_tokens=32768,
             temperature=0.3,
             response_format={"type": "json_object"}
         )
@@ -96,7 +96,7 @@ def generate_character_description(
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=2000,
+            max_tokens=32768,
             temperature=0.3,
             response_format={"type": "json_object"}
         )
