@@ -8,7 +8,9 @@ from pathlib import Path
 
 import requests
 
+from . import video_run_config
 from .project_paths import safe_storybook_project_dir
+from .video_budget import reserve_budget
 from .video_generator_common import parse_duration_seconds_from_timing
 
 
@@ -44,9 +46,9 @@ def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
                                              item.get('characters'), item.get('locations')) for item in items],
                     'style_source_images': {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                                             if Path(path).is_file() else None for path in assets},
-                    'model': os.getenv(f'{prefix}_VIDEO_MODEL'),
+                    'model': video_run_config.video_setting('VIDEO_MODEL', prefix.lower(), base.name if base else None) or None,
                     'provider_tool': _active_video_tool_name(),
-                    'resolution': os.getenv(f'{prefix}_RESOLUTION')})
+                    'resolution': video_run_config.video_setting('RESOLUTION', prefix.lower(), base.name if base else None) or None})
 
 
 def apply_video_plan(project_id, items):
@@ -105,7 +107,7 @@ def reference_request(item, model, seed, provider_name='routerai'):
     hashes = [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths]
     payload = {'model': model, 'prompt': item['video_prompt'],
                'duration': int(round(_duration(item))),
-               'resolution': item.get('video_resolution') or os.getenv(f'{provider_name.upper()}_RESOLUTION', '480p'),
+               'resolution': item.get('video_resolution') or video_run_config.video_setting('RESOLUTION', provider_name) or '480p',
                'aspect_ratio': _infer_aspect_ratio(int(item.get('width') or 1920), int(item.get('height') or 1088)),
                'generate_audio': False}
     selected_seed = item['video_seed'] if 'video_seed' in item else seed
@@ -179,7 +181,10 @@ def generate_reference_video(item, api_key, model, seed, store, model_catalog,
         if job['status'] == 'submitting':
             raise RuntimeError('Reference submission without ID must not be repeated')
         _require_budget_for_new_video_submission(deadline, started_at, remaining, workers)
-        store.update_job(key, input_hash, {'status': 'submitting'}, 'submitting_at')
+        # денежный бюджет: проверка и запись резерва под одним замком (video_budget)
+        with reserve_budget(store.path.parent.parent, provider_name, model, payload['duration'],
+                            payload['resolution'], key) as reservation:
+            store.update_job(key, input_hash, {'status': 'submitting', **reservation}, 'submitting_at')
         response = requests.post(base + '/videos', headers=headers, json=payload, timeout=1200)
         try:
             response.raise_for_status()
@@ -492,6 +497,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
     """
     if not enable:
         return {'status': 'skipped'}
+    video_run_config.bind_run_project(project_id)
     from .video_generator_common import _get_routerai_video_models, _get_aitunnel_video_models
     from .video_contract import _active_video_tool_name
     from .style_keeper import ensure_image_style_catalog, ensure_video_style_references, resolve_image_style_id
@@ -545,7 +551,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                     items=render_items())
     active_tool = _active_video_tool_name()
     prefix = 'AITUNNEL' if active_tool == 'video_generator_aitunnel_tool' else 'ROUTERAI'
-    model = os.environ.get(f'{prefix}_VIDEO_MODEL', '')
+    model = video_run_config.video_setting('VIDEO_MODEL', prefix.lower(), project_id)
     config = (_get_aitunnel_video_models().get(model, {}) if prefix == 'AITUNNEL' else
               _get_routerai_video_models().get(model, {}) if active_tool == 'video_generator_routerai_tool' else {})
     all_starts = _starts(items)
@@ -634,7 +640,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 reference_image_paths=refs, start_reference_path=initial, end_reference_path=final,
                 style_id=style_id, style_reference_path=style_image,
                 continues_from_shot=_key(chunks[number - 1][-1]) if number else (_key(resumed) if resumed is not None else None),
-                seed=shots.get('seed'), model=model, resolution=os.getenv(f'{prefix}_RESOLUTION', '480p')))
+                seed=shots.get('seed'), model=model, resolution=video_run_config.video_setting('RESOLUTION', prefix.lower(), project_id) or '480p'))
             from .continuity import unit_continuity_hash
             continuity_hash = unit_continuity_hash(base, keys)
             if continuity_hash is not None:

@@ -774,5 +774,5 @@ def test_research_uses_a_narrower_runtime_policy_and_real_read_only_sqlite_file(
     assert result.success is True, result.outcome["error_message"]
     assert result.data == [[7]]
     assert seen["safety_policy"] is requested_policy
-    assert result.to_mapping()["timeout_enforcement_mode"] == "supervisor"
+    assert result.to_mapping()["timeout_enforcement_mode"] == "driver"
     assert result.to_mapping()["cancellation_enforcement_mode"] == "supervisor"

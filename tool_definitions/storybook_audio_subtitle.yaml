@@ -28,3 +28,7 @@ parameters:
     type: bool
     description: "If false (default), zero subtitle cues is a hard error; if true, an empty cue set succeeds with a no_subtitle_cues warning"
     required: false
+  - name: generate_subtitles
+    type: bool
+    description: "If false, subtitles.srt is not written and missing cues are not an error; cue sheet and audio manifest are still produced"
+    required: false

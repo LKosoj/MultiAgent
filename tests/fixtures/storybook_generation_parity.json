@@ -1,0 +1,739 @@
+{
+  "texts": {
+    "title": "Генерация",
+    "loading": "Загрузка настроек и оценки…",
+    "load_error": "Не удалось загрузить экран: {reason}.",
+    "retry": "Повторить",
+    "tab_settings": "Настройки",
+    "tab_summary": "Сводка",
+    "tab_progress": "Ход",
+    "tab_log": "Журнал",
+    "section_mode": "Режим запуска",
+    "section_settings": "Настройки прогона",
+    "section_summary": "Сводка перед запуском",
+    "section_run": "Прогон",
+    "section_steps": "Шаги",
+    "section_log": "Журнал",
+    "section_history": "Прошлые прогоны",
+    "mode_full": "Весь пайплайн",
+    "mode_from_step": "С выбранного шага",
+    "mode_single_step": "Только один шаг",
+    "mode_resume": "Продолжить после сбоя",
+    "mode_regenerate_shots": "Перегенерировать выбранные шоты",
+    "mode_step": "Шаг",
+    "mode_resume_none": "Продолжать нечего: прошлый прогон завершён",
+    "mode_shots_none": "Отметьте шоты в разделе «Кадры»",
+    "mode_shots_count": "Выбрано шотов: {n}",
+    "regen_what": "Что перегенерировать",
+    "regen_images": "Картинки",
+    "regen_video": "Видео",
+    "regen_both": "Картинки и видео",
+    "regen_music": "Музыку",
+    "regen_film": "Пересобрать фильм",
+    "brief_task": "Опишите сказку",
+    "brief_task_hint": "Одна-две фразы: о чём сказка и для кого. Остальное придумает пайплайн.",
+    "brief_exists": "Бриф уже есть. Поля ниже заменят значения только если вы их измените.",
+    "brief_pages_min": "Страниц, не меньше",
+    "brief_pages_max": "Страниц, не больше",
+    "brief_words_min": "Слов на странице, не меньше",
+    "brief_words_max": "Слов на странице, не больше",
+    "brief_language": "Язык",
+    "brief_screenplay_time": "Длительность сценария, сек",
+    "brief_end_shots": "Делать конечные кадры",
+    "brief_blockout_on": "Болванка: включена",
+    "brief_blockout_off": "Болванка: выключена",
+    "brief_blockout_link": "Настроить в разделе «Болванка»",
+    "field_int_positive": "Поле «{name}» должно быть целым числом больше нуля.",
+    "field_min_max": "Поле «{name}»: минимум не может быть больше максимума.",
+    "video_provider": "Провайдер видео",
+    "video_model": "Модель",
+    "video_fallback_model": "Запасная модель",
+    "video_retry_cycles": "Повторов при сбое",
+    "video_resolution": "Разрешение",
+    "video_durations": "Допустимые длительности, сек",
+    "style": "Стиль",
+    "audio_music": "Музыка",
+    "audio_sfx": "Звуковые эффекты",
+    "audio_subtitles": "Субтитры",
+    "budget": "Бюджет, ₽",
+    "budget_hint": "Пусто: без ограничения. Бюджет можно менять и во время прогона.",
+    "budget_invalid": "Бюджет должен быть числом не меньше нуля.",
+    "advanced": "Дополнительно",
+    "adv_force_prompts": "Обновить промпты заново",
+    "adv_skip_enhance": "Не улучшать промпты",
+    "adv_sample_first": "Сначала один пробный шот",
+    "adv_final_no_audio": "Собрать фильм даже без звука",
+    "source_setting": "из настроек проекта",
+    "source_env": "из окружения сервера",
+    "source_default": "по умолчанию",
+    "reset_defaults": "Сбросить к значениям по умолчанию",
+    "save": "Сохранить настройки",
+    "saved": "Настройки сохранены",
+    "settings_locked": "Пока идёт прогон, настройки менять нельзя. Бюджет менять можно.",
+    "restored_settings": "Восстановлены несохранённые настройки",
+    "restored_discard": "Отбросить",
+    "settings_conflict": "Настройки изменили в другом окне. Обновите их и повторите.",
+    "summary_dirty": "по несохранённым настройкам",
+    "estimate_label": "Оценка: {cost}",
+    "estimate_not_less": "Оценка: не менее {cost} (цена {parts} неизвестна)",
+    "estimate_unknown": "Оценка: цена неизвестна",
+    "estimate_rough": "ориентировочно",
+    "estimate_failed": "Оценку стоимости получить не удалось: {reason}. Запуск возможен только с подтверждением «Запустить без оценки».",
+    "comp_video": "Видео",
+    "comp_images": "Картинки",
+    "comp_music": "Музыка",
+    "comp_sfx": "Эффекты",
+    "comp_text_llm": "Тексты",
+    "budget_none": "Бюджет не задан",
+    "budget_enough": "Бюджет: хватает",
+    "budget_short": "Бюджет меньше оценки на {sum}",
+    "budget_cannot": "Бюджет проверить нельзя",
+    "key_found": "Ключ найден",
+    "key_missing": "Нет ключа для провайдера {name}",
+    "notes_errors": "Ошибки",
+    "notes_warnings": "Предупреждения",
+    "notes_info": "Сведения",
+    "steps_to_run": "Будут выполнены шаги: {steps}",
+    "steps_skipped": "Уже готовы и будут пропущены: {steps}",
+    "go": "Запустить",
+    "go_cost": "Запустить (оценка {cost})",
+    "go_no_estimate": "Запустить без оценки",
+    "go_running": "Прогон идёт",
+    "go_regen": "Перегенерировать",
+    "go_regen_cost": "Перегенерировать (оценка {cost})",
+    "why_engine": "Движок пайплайна не загружен: {reason}. Запуск недоступен.",
+    "why_no_rights": "Недостаточно прав: запуск прогона разрешён администратору",
+    "why_pick_step": "Выберите шаг",
+    "why_no_brief": "Опишите сказку: у проекта ещё нет брифа",
+    "why_no_shots": "Отметьте шоты в разделе «Кадры»",
+    "why_plan": "План запуска не готов: {reason}",
+    "why_issues": "Исправьте настройки прогона: {reason}",
+    "why_no_key": "Нет ключа для провайдера {name}",
+    "why_loading": "Загрузка настроек и оценки…",
+    "why_busy": "Проект занят другим прогоном",
+    "step_block": "Для шага «{step}» нужны результаты шагов: {needed}; запустите их раньше",
+    "confirm_start_title": "Запустить прогон?",
+    "confirm_start_body": "Режим: {mode}. Оценка стоимости: {cost}. Платные запросы начнут тратить деньги сразу.",
+    "confirm_start_ok": "Запустить",
+    "confirm_none_title": "Запустить без оценки?",
+    "confirm_none_body": "Стоимость прогона неизвестна: цену части работ определить не удалось. Деньги могут быть потрачены сверх ожидаемого.",
+    "confirm_none_ok": "Запустить без оценки",
+    "confirm_over_title": "Оценка выше бюджета",
+    "confirm_over_body": "Оценка {cost}, а бюджет меньше на {sum}. Прогон может остановиться, когда бюджет кончится.",
+    "confirm_over_raise": "Поднять бюджет и запустить",
+    "confirm_over_go": "Запустить как есть",
+    "confirm_cancel": "Отмена",
+    "confirm_restart_title": "Начать прогон сначала?",
+    "confirm_restart_body": "Готовые шаги будут выполнены заново, платные запросы повторятся. Уже сделанные файлы сохранятся как версии.",
+    "confirm_restart_ok": "Начать сначала",
+    "confirm_discard_body": "Прошлый незавершённый прогон будет отмечен отменённым. Готовые файлы останутся; шаги выполнятся заново.",
+    "confirm_mark_title": "Пометить прогон прерванным?",
+    "confirm_mark_body": "Используйте, если приложение, где шёл прогон, закрыто. Готовые файлы сохранятся.",
+    "confirm_mark_ok": "Пометить",
+    "changed_plan": "Пока вы подтверждали, план запуска изменился. Проверьте его и запустите ещё раз.",
+    "changed_cost": "Пока вы подтверждали, оценка изменилась. Проверьте её и запустите ещё раз.",
+    "mark_locked": "Приложение, где шёл прогон, ещё держит проект. Закройте его и повторите.",
+    "rerun_start": "Запустить заново",
+    "rerun_idle": "Прогон ещё не запускался",
+    "rerun_busy": "Недоступно, пока идёт прогон",
+    "rerun_resume": "Открыть «Генерацию»: продолжить прогон после сбоя",
+    "rerun_full": "Открыть «Генерацию»: запустить пайплайн заново",
+    "rerun_step": "Открыть «Генерацию» с этим шагом",
+    "open_in_generation": "Открыть в «Генерации»",
+    "started": "Прогон запущен",
+    "finished": "Прогон завершён за {time}",
+    "failed_toast": "Прогон остановился на шаге «{step}»: {reason}. Готовые шаги сохранены.",
+    "cancelled_toast": "Прогон остановлен",
+    "marked": "Прогон помечен прерванным",
+    "log_copied": "Журнал скопирован",
+    "pause": "Пауза",
+    "resume": "Продолжить",
+    "stop": "Стоп",
+    "mark_interrupted": "Пометить прерванным",
+    "banner_engine": "Движок пайплайна не загружен: {reason}. Запуск недоступен.",
+    "banner_other": "{text}",
+    "banner_unresponsive": "Приложение, которое ведёт прогон, давно не отвечает. Если оно закрыто, пометьте прогон прерванным.",
+    "banner_interrupted": "Прогон прерван на шаге «{step}». Готовые шаги сохранены, прогон можно продолжить.",
+    "banner_failed": "Прогон остановился на шаге «{step}»: {reason}. Готовые шаги сохранены.",
+    "banner_stale": "Запрос на остановку или паузу не дошёл до прогона. Обновите экран.",
+    "banner_completed": "Прогон завершён за {time}.",
+    "inflight": "По шотам {keys} уже отправлены оплаченные задачи. Дождитесь результата, иначе вы заплатите дважды.",
+    "inflight_wait": "Дождаться",
+    "inflight_abandon": "Бросить задания и перегенерировать",
+    "inflight_abandon_hint": "Оплаченные задачи будут брошены без результата",
+    "paid_pending": "По шотам {keys} уже есть оплаченные задачи. Дождитесь результата или бросьте задания.",
+    "step_n_of": "Шаг {n} из {total}: {name}",
+    "progress_idle": "Прогон не идёт",
+    "progress_starting": "Прогон начинается…",
+    "video_progress": "Видео: {done} из {total}",
+    "video_failed": "не получилось: {n}",
+    "spent": "Потрачено: {sum}",
+    "spent_of": "Потрачено: {sum} из {budget}",
+    "eta": "Осталось примерно {time}",
+    "eta_none": "Времени пока нет данных",
+    "other_surface": "{text}",
+    "steps_col_step": "Шаг",
+    "steps_col_status": "Статус",
+    "steps_col_time": "Время",
+    "log_empty": "Журнал пока пуст",
+    "log_truncated": "Показаны последние {n} строк",
+    "log_deleted": "Журнал этого прогона уже удалён",
+    "log_clear": "Очистить вид",
+    "log_copy": "Копировать",
+    "log_save": "Сохранить в файл",
+    "log_follow": "Следить за концом",
+    "log_error": "Журнал недоступен: {reason}",
+    "history_empty": "Прошлых прогонов нет",
+    "history_where_tk": "Приложение",
+    "history_where_react": "Браузер",
+    "history_resumable": "можно продолжить",
+    "history_unfinished": "не завершён",
+    "history_col_start": "Начало",
+    "history_col_mode": "Режим",
+    "history_col_where": "Где",
+    "history_col_result": "Итог",
+    "history_col_duration": "Длительность",
+    "history_open_log": "Журнал",
+    "log_back": "К журналу текущего прогона",
+    "step_from_here": "С этого шага",
+    "step_only_this": "Только этот шаг",
+    "key_shortcuts": "Ctrl/Cmd+Enter запуск, Ctrl+. стоп, Ctrl/Cmd+S сохранить, Alt+P пауза, Alt+L журнал"
+  },
+  "step_status_labels": {
+    "pending": "Ожидает",
+    "running": "Выполняется",
+    "completed": "Готово",
+    "failed": "Ошибка",
+    "skipped": "Пропущен",
+    "retrying": "Повтор"
+  },
+  "titles": {
+    "s1": "Шаг 1"
+  },
+  "start_button_base": {
+    "loading": false,
+    "engineError": null,
+    "isAdmin": true,
+    "runState": "idle",
+    "locked": false,
+    "selection": {
+      "mode": "full",
+      "stepId": null,
+      "shotKeys": []
+    },
+    "hasBrief": true,
+    "task": "",
+    "plan": {
+      "can_start": true,
+      "problems": []
+    },
+    "planError": null,
+    "issues": [],
+    "provider": {
+      "title": "Veo",
+      "credentials_found": true
+    },
+    "estimate": {
+      "complete": true,
+      "total_known_rub": 120,
+      "unknown_components": [],
+      "components": [],
+      "budget_verdict": "no_budget"
+    },
+    "estimateError": null,
+    "regen": null
+  },
+  "vectors": {
+    "start_button": [
+      {
+        "in": [
+          {}
+        ],
+        "out": {
+          "label": "Запустить (оценка 120 ₽)",
+          "enabled": true,
+          "reason": null
+        }
+      },
+      {
+        "in": [
+          {
+            "loading": true
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Загрузка настроек и оценки…"
+        }
+      },
+      {
+        "in": [
+          {
+            "engineError": "нет pandoc"
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Движок пайплайна не загружен: нет pandoc. Запуск недоступен."
+        }
+      },
+      {
+        "in": [
+          {
+            "isAdmin": false
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Недостаточно прав: запуск прогона разрешён администратору"
+        }
+      },
+      {
+        "in": [
+          {
+            "runState": "running"
+          }
+        ],
+        "out": {
+          "label": "Прогон идёт",
+          "enabled": false,
+          "reason": null
+        }
+      },
+      {
+        "in": [
+          {
+            "provider": {
+              "title": "Veo",
+              "credentials_found": false
+            }
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Нет ключа для провайдера Veo"
+        }
+      },
+      {
+        "in": [
+          {
+            "plan": {
+              "can_start": false,
+              "problems": [
+                {
+                  "level": "error",
+                  "code": "engine_unavailable",
+                  "message": "Движок прогона недоступен",
+                  "step_id": null,
+                  "artifact": null
+                }
+              ]
+            }
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Движок прогона недоступен"
+        }
+      },
+      {
+        "in": [
+          {
+            "issues": [
+              {
+                "code": "x",
+                "level": "error",
+                "field": "budget_rub",
+                "message": "Бюджет задан неверно",
+                "scope": "run"
+              }
+            ]
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Исправьте настройки прогона: Бюджет задан неверно"
+        }
+      },
+      {
+        "in": [
+          {
+            "estimate": {
+              "complete": true,
+              "total_known_rub": 0,
+              "unknown_components": [],
+              "components": [],
+              "budget_verdict": "no_budget"
+            }
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": true,
+          "reason": null
+        }
+      },
+      {
+        "in": [
+          {
+            "estimate": {
+              "complete": false,
+              "total_known_rub": 0,
+              "unknown_components": [
+                "video"
+              ],
+              "components": [],
+              "budget_verdict": "cannot_check"
+            }
+          }
+        ],
+        "out": {
+          "label": "Запустить без оценки",
+          "enabled": true,
+          "reason": null
+        }
+      },
+      {
+        "in": [
+          {
+            "estimate": null,
+            "estimateError": "сервер не ответил"
+          }
+        ],
+        "out": {
+          "label": "Запустить без оценки",
+          "enabled": true,
+          "reason": "сервер не ответил"
+        }
+      },
+      {
+        "in": [
+          {
+            "selection": {
+              "mode": "from_step",
+              "stepId": null,
+              "shotKeys": []
+            }
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Выберите шаг"
+        }
+      },
+      {
+        "in": [
+          {
+            "selection": {
+              "mode": "regenerate_shots",
+              "stepId": null,
+              "shotKeys": []
+            }
+          }
+        ],
+        "out": {
+          "label": "Перегенерировать",
+          "enabled": false,
+          "reason": "Отметьте шоты в разделе «Кадры»"
+        }
+      },
+      {
+        "in": [
+          {
+            "selection": {
+              "mode": "regenerate_shots",
+              "stepId": null,
+              "shotKeys": [
+                "1-1"
+              ]
+            },
+            "regen": {
+              "can_start": true,
+              "cost_rub": 50,
+              "unknown_cost": false,
+              "problem": null
+            }
+          }
+        ],
+        "out": {
+          "label": "Перегенерировать (оценка 50 ₽)",
+          "enabled": true,
+          "reason": null
+        }
+      },
+      {
+        "in": [
+          {
+            "hasBrief": false
+          }
+        ],
+        "out": {
+          "label": "Запустить",
+          "enabled": false,
+          "reason": "Опишите сказку: у проекта ещё нет брифа"
+        }
+      }
+    ],
+    "rerun_view": [
+      {
+        "in": [
+          "idle",
+          true
+        ],
+        "out": {
+          "enabled": false,
+          "hint": "Прогон ещё не запускался",
+          "mode": null
+        }
+      },
+      {
+        "in": [
+          "running",
+          true
+        ],
+        "out": {
+          "enabled": false,
+          "hint": "Недоступно, пока идёт прогон",
+          "mode": null
+        }
+      },
+      {
+        "in": [
+          "paused",
+          true
+        ],
+        "out": {
+          "enabled": false,
+          "hint": "Недоступно, пока идёт прогон",
+          "mode": null
+        }
+      },
+      {
+        "in": [
+          "failed",
+          true
+        ],
+        "out": {
+          "enabled": true,
+          "hint": "Открыть «Генерацию»: продолжить прогон после сбоя",
+          "mode": "resume"
+        }
+      },
+      {
+        "in": [
+          "interrupted",
+          true
+        ],
+        "out": {
+          "enabled": true,
+          "hint": "Открыть «Генерацию»: продолжить прогон после сбоя",
+          "mode": "resume"
+        }
+      },
+      {
+        "in": [
+          "interrupted",
+          false
+        ],
+        "out": {
+          "enabled": true,
+          "hint": "Открыть «Генерацию»: запустить пайплайн заново",
+          "mode": "full"
+        }
+      },
+      {
+        "in": [
+          "completed",
+          true
+        ],
+        "out": {
+          "enabled": true,
+          "hint": "Открыть «Генерацию»: запустить пайплайн заново",
+          "mode": "full"
+        }
+      }
+    ],
+    "estimate_headline": [
+      {
+        "in": [
+          {
+            "complete": true,
+            "total_known_rub": 1180,
+            "unknown_components": []
+          }
+        ],
+        "out": "Оценка: 1 180 ₽"
+      },
+      {
+        "in": [
+          {
+            "complete": true,
+            "total_known_rub": 0.3,
+            "unknown_components": []
+          }
+        ],
+        "out": "Оценка: 0,30 ₽"
+      },
+      {
+        "in": [
+          {
+            "complete": false,
+            "total_known_rub": 200,
+            "unknown_components": [
+              "music",
+              "sfx"
+            ]
+          }
+        ],
+        "out": "Оценка: не менее 200 ₽ (цена музыки, эффектов неизвестна)"
+      },
+      {
+        "in": [
+          {
+            "complete": false,
+            "total_known_rub": 0,
+            "unknown_components": [
+              "video"
+            ]
+          }
+        ],
+        "out": "Оценка: цена неизвестна"
+      }
+    ],
+    "parse_log_line": [
+      {
+        "in": [
+          "2026-11-03T12:00:01 INFO Шаг начат"
+        ],
+        "out": {
+          "time": "12:00:01",
+          "level": "INFO",
+          "word": "ИНФО",
+          "text": "Шаг начат"
+        }
+      },
+      {
+        "in": [
+          "2026-11-03T12:00:02 WARNING Мало места\nвторая строка"
+        ],
+        "out": {
+          "time": "12:00:02",
+          "level": "WARNING",
+          "word": "ВНИМАНИЕ",
+          "text": "Мало места\nвторая строка"
+        }
+      },
+      {
+        "in": [
+          "2026-11-03T12:00:03 ERROR Сбой"
+        ],
+        "out": {
+          "time": "12:00:03",
+          "level": "ERROR",
+          "word": "ОШИБКА",
+          "text": "Сбой"
+        }
+      },
+      {
+        "in": [
+          "просто текст"
+        ],
+        "out": {
+          "time": null,
+          "level": null,
+          "word": null,
+          "text": "просто текст"
+        }
+      }
+    ],
+    "banner_for": [
+      {
+        "in": [
+          {
+            "state": "idle",
+            "engine": {
+              "available": false,
+              "error": "нет pandoc"
+            }
+          }
+        ],
+        "out": {
+          "kind": "engine",
+          "text": "Движок пайплайна не загружен: нет pandoc. Запуск недоступен."
+        }
+      },
+      {
+        "in": [
+          {
+            "state": "interrupted",
+            "failure": {
+              "step_id": "s1",
+              "message": null
+            }
+          }
+        ],
+        "out": {
+          "kind": "interrupted",
+          "text": "Прогон прерван на шаге «Шаг 1». Готовые шаги сохранены, прогон можно продолжить."
+        }
+      },
+      {
+        "in": [
+          {
+            "state": "failed",
+            "failure": {
+              "step_id": "s1",
+              "message": "нет ключа"
+            }
+          }
+        ],
+        "out": {
+          "kind": "failed",
+          "text": "Прогон остановился на шаге «Шаг 1»: нет ключа. Готовые шаги сохранены."
+        }
+      },
+      {
+        "in": [
+          {
+            "state": "running",
+            "unresponsive": true
+          }
+        ],
+        "out": {
+          "kind": "unresponsive",
+          "text": "Приложение, которое ведёт прогон, давно не отвечает. Если оно закрыто, пометьте прогон прерванным."
+        }
+      },
+      {
+        "in": [
+          {
+            "state": "completed",
+            "run": {
+              "started_at": "2026-11-03T12:00:00",
+              "finished_at": "2026-11-03T12:42:00"
+            }
+          }
+        ],
+        "out": {
+          "kind": "completed",
+          "text": "Прогон завершён за 42 мин."
+        }
+      },
+      {
+        "in": [
+          {
+            "state": "idle"
+          }
+        ],
+        "out": null
+      }
+    ]
+  }
+}

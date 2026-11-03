@@ -13,7 +13,7 @@ import os
 import shutil
 import threading
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
 from datetime import datetime
 import logging
 
@@ -22,7 +22,7 @@ from jsonschema import ValidationError
 
 # Удален импорт schemas.py - теперь используется гибридная генерация схем
 # from config.schemas import SCHEMA_MAPPING
-from config.settings import app_settings
+from StoryBookManager.config.settings import app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,8 @@ def merge_write_shots_json(
     baseline_items: Optional[List[Dict[str, Any]]],
     fresh_root: Optional[Dict[str, Any]] = None,
     baseline_root: Optional[Dict[str, Any]] = None,
-) -> None:
+    precondition: Optional[Callable[[Optional[bytes]], None]] = None,
+) -> Dict[str, Any]:
     """Общий протокол записи shots.json для интерфейсных писателей (10.2, A42).
 
     flock на sidecar {shots_path}.lock -> перечитывание файла под захваченной
@@ -191,6 +192,11 @@ def merge_write_shots_json(
     (по умолчанию) — вызывающий код не просит сливать корневые поля, они
     остаются как на диске (обратная совместимость для вызовов, которым нужен
     только items).
+
+    precondition (необязательный) вызывается под захваченной блокировкой до
+    слияния и получает сырые байты файла (None, если файла нет); исключение
+    из него прерывает запись (блокировка снимается). Возвращает итоговый
+    документ, записанный на диск (старые вызовы результат игнорируют).
     """
     field_updates, deleted_keys, fresh_by_key = _compute_shots_field_updates(
         fresh_items, baseline_items
@@ -208,6 +214,12 @@ def merge_write_shots_json(
         with open(lock_path, "a+", encoding="utf-8") as lock_f:
             fcntl.flock(lock_f, fcntl.LOCK_EX)
             try:
+                if precondition is not None:
+                    try:
+                        raw_before: Optional[bytes] = shots_path.read_bytes()
+                    except FileNotFoundError:
+                        raw_before = None
+                    precondition(raw_before)
                 on_disk = _read_shots_json_best_effort(shots_path)
                 items = on_disk.get("items")
                 if not isinstance(items, list):
@@ -239,6 +251,10 @@ def merge_write_shots_json(
                 try:
                     with open(tmp_path, "w", encoding="utf-8") as wf:
                         json.dump(on_disk, wf, ensure_ascii=False, indent=2)
+                    try:
+                        os.chmod(tmp_path, os.stat(shots_path).st_mode & 0o7777)  # права исходного файла
+                    except OSError:
+                        pass
                     os.replace(tmp_path, shots_path)
                 except Exception:
                     try:
@@ -246,6 +262,7 @@ def merge_write_shots_json(
                     except OSError:
                         pass
                     raise
+                return on_disk
             finally:
                 fcntl.flock(lock_f, fcntl.LOCK_UN)
 
@@ -429,23 +446,9 @@ class FileManager:
     
     def _get_default_file_path(self, file_type: str) -> str:
         """Возвращает стандартный путь к файлу по его типу"""
-        file_mapping = {
-            "brief": "00_brief.json",
-            "synopsis": "10_synopsis/synopsis.json",
-            "beats": "10_synopsis/beats.json",
-            "characters": "20_bible/characters.json",
-            "locations": "20_bible/locations.json",
-            "consistency_rules": "20_bible/consistency_rules.json",
-            "story": "20_story/story.json",
-            "style_text": "30_style/style_text.json",
-            "style_images": "30_style/style_images.json",
-            "screenplay": "91_screenplay/screenplay.json",
-            "shots": "97_shots/shots.json",
-            "asset_map": "93_blockout/asset_map.json",
-            "scene_spec": "93_blockout/scene_spec.json",
-            "chains": "93_blockout/chains.json"
-        }
-        
+        # единый реестр путей (22 артефакта); для редактора файлов см. studio/artifacts.py
+        from custom_tools.storybook.storybook_surface import JSON_ARTIFACTS as file_mapping
+
         relative_path = file_mapping.get(file_type)
         if relative_path is None:
             raise ValueError(f"Неизвестный тип файла: {file_type}")

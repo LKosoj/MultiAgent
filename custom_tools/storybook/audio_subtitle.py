@@ -15,6 +15,7 @@ def storybook_audio_subtitle_tool(
     enable: bool = True,
     allow_missing_subtitles: bool = False,
     narration_path: str = "",
+    generate_subtitles: bool = True,
 ) -> Dict[str, Any]:
     """Create subtitle and audio planning artifacts for a storybook project.
 
@@ -26,9 +27,13 @@ def storybook_audio_subtitle_tool(
         allow_missing_subtitles: When false (default), an empty cue set is a hard error;
             when true, an empty cue set succeeds with a ``no_subtitle_cues`` warning.
         narration_path: Existing reader audio to copy unchanged; timing is aligned manually.
+        generate_subtitles: When false, subtitles.srt is not written and missing cues are not an error;
+            cue_sheet and the audio manifest are still produced.
     """
     enable = _as_bool(enable)
-    allow_missing_subtitles = _as_bool(allow_missing_subtitles)
+    # выключенные субтитры = осознанно «без реплик»: отсутствие реплик не ошибка
+    generate_subtitles = _as_bool(generate_subtitles)
+    allow_missing_subtitles = _as_bool(allow_missing_subtitles) or not generate_subtitles
     try:
         base_dir = _safe_project_dir(project_id)
     except ValueError as exc:
@@ -83,12 +88,13 @@ def storybook_audio_subtitle_tool(
     cues, skipped = _build_cues(items, screenplay_lookup)
 
     warnings: List[str] = []
-    if not cues and allow_missing_subtitles:
+    if not cues and allow_missing_subtitles and generate_subtitles:
         warnings.append("no_subtitle_cues")
 
     # subtitles.srt is a planning/preview artifact only; montage (WS-F) rebuilds the
     # final SRT from edit_decisions x cue_sheet against the real timeline.
-    _atomic_write_text(subtitles_path, _format_srt(cues))
+    if generate_subtitles:
+        _atomic_write_text(subtitles_path, _format_srt(cues))
 
     # cue_sheet.json is the authoritative source of cue TEXT for montage. It exposes the
     # (scene_number, shot_number) join keys plus per-cue text/text_source, and marks the
@@ -117,6 +123,7 @@ def storybook_audio_subtitle_tool(
         "subtitles_path": str(subtitles_path),
         "cue_sheet_path": str(cue_sheet_path),
         "cue_count": len(cues),
+        "subtitles_enabled": generate_subtitles,
         "sources": {
             "shots_json": str(shots_path) if shots_path.exists() else None,
             "screenplay_json": str(screenplay_path) if screenplay_path.exists() else None,
@@ -338,6 +345,12 @@ def _resolve_cue_text(
     if scene_key in scene_texts:
         return scene_texts[scene_key], "screenplay.scene"
 
+    # Явный текст для зрителя главнее voiceover; пустое явное поле = «нет поля».
+    viewer_text = _first_text(item, ["subtitle", "subtitle_text", "caption"])
+    if viewer_text:
+        return viewer_text, "shots.item"
+
+    # Пустая речь не должна подменяться описанием кадра.
     if "voiceover" in item:
         return _stringify_text(item["voiceover"]), "shots.item"
 

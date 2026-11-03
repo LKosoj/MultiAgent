@@ -189,7 +189,7 @@ describe("storybook readiness helpers", () => {
             category: "preflight",
             status: "available",
             service_action: "workflows.storybook_validate",
-            surfaces: { storybook_manager: "available", react: "available", streamlit: "available" },
+            surfaces: { storybook_manager: "available", react: "available" },
           },
           {
             id: "regenerate_video",
@@ -197,7 +197,7 @@ describe("storybook readiness helpers", () => {
             category: "selective_regeneration",
             status: "not_implemented",
             service_action: null,
-            surfaces: { storybook_manager: "not_implemented", react: "not_implemented", streamlit: "not_implemented" },
+            surfaces: { storybook_manager: "not_implemented", react: "not_implemented" },
           },
         ],
       },
@@ -210,7 +210,7 @@ describe("storybook readiness helpers", () => {
     expect(summary?.actions.map((action) => action.id)).toEqual(["validate_project", "regenerate_video"]);
     expect(summary?.rows.find((row) => row.key === "validate_project")).toMatchObject({
       level: "success",
-      value: "available; manager=available, react=available, streamlit=available",
+      value: "available; manager=available, react=available",
     });
     expect(summary?.rows.find((row) => row.key === "regenerate_video")).toMatchObject({
       level: "error",

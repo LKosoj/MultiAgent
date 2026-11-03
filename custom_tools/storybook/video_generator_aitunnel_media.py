@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PIL import Image
 
+from custom_tools.storybook import video_run_config
 from custom_tools.storybook.video_generator_common import _get_active_aitunnel_model_record
 
 
@@ -90,7 +91,12 @@ def _resolve_size_params(
     resolution = _infer_resolution(width, height)
     aspect_ratio = _infer_aspect_ratio(width, height)
 
-    requested_resolution = os.getenv(model_config.get("_resolution_env", ""), "").strip()
+    resolution_env = model_config.get("_resolution_env", "")
+    if resolution_env.endswith("_RESOLUTION"):
+        # <ПРОВАЙДЕР>_RESOLUTION: настройка проекта важнее окружения
+        requested_resolution = video_run_config.video_setting("RESOLUTION", resolution_env[:-len("_RESOLUTION")].lower())
+    else:
+        requested_resolution = os.getenv(resolution_env, "").strip()
     if requested_resolution:
         if requested_resolution not in (model_config.get("supported_resolutions") or []):
             raise ValueError(f"Модель не поддерживает запрошенное разрешение {requested_resolution}")

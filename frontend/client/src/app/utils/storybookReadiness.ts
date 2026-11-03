@@ -197,7 +197,7 @@ export const summarizeStorybookWorkflowActions = (payload: unknown): StorybookWo
     label: action.label,
     value: `${action.status}; manager=${action.surfaces.storybook_manager ?? "unknown"}, react=${
       action.surfaces.react ?? "unknown"
-    }, streamlit=${action.surfaces.streamlit ?? "unknown"}${action.reason ? `; ${action.reason}` : ""}`,
+    }${action.reason ? `; ${action.reason}` : ""}`,
     level: workflowActionLevel(action.status),
   }));
   return {

@@ -1506,9 +1506,10 @@ def _fill_bounded_state_view(
     evidence_records = {item.evidence_id: item for item in state.evidence}
     def encode_current() -> bytes | None:
         _refresh_omitted_counts(state_payload, view, context)
+        # Размер проверяем у итогового вида с короткими handle-ами, как его увидит модель.
         return _encode_context(
             schema,
-            context,
+            _with_model_identifier_handles(context, state),
             policy,
             maximum_bytes,
             fits_prompt,

@@ -1176,11 +1176,13 @@ def _write_video_model_caps(caps_file_path: str, payload: Dict[str, Any]) -> Non
 
 def _resolve_aitunnel_capabilities(caps_file_path: str, provider_name: str = "aitunnel") -> Dict[str, Any]:
     """Возможности модели из каталога провайдера или кэша."""
+    from custom_tools.storybook import video_run_config  # лист графа импортов: только внутри функции
+
     provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
     tool_name = f"video_generator_{provider_name}_tool"
     model_env = f"{provider_name.upper()}_VIDEO_MODEL"
     warnings: List[Dict[str, Any]] = []
-    configured_model = (os.getenv(model_env) or "").strip()
+    configured_model = video_run_config.video_setting("VIDEO_MODEL", provider_name)
     record: Optional[Dict[str, Any]] = None
     # Причина неудачи — три разных сценария, тексты P14 не должны их путать.
     reason = f"переменная окружения {model_env} не задана"

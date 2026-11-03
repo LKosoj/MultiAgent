@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -33,7 +34,9 @@ from custom_tools.storybook.video_generator_common import (
     sync_items_to_memory,
     update_shots_with_descriptions,
 )
+from custom_tools.storybook import video_run_config
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.video_budget import BudgetExceededError, reserve_budget
 from tool_runtime_context import get_runtime_context_deadline
 
 logger = logging.getLogger(__name__)
@@ -172,7 +175,13 @@ def video_generator_aitunnel_tool(
     items_list: List[Dict[str, Any]] = []
     project_dir: Optional[Path] = None
 
+    if not project_id:
+        # вызов без проекта (items=[...]): привязка прошлого прогона не должна подставлять чужие модель и разрешение
+        video_run_config.bind_run_project(None)
     if project_id:
+        # прямой вызов (одиночный шаг): модель и разрешение должны браться из одних и тех же настроек проекта,
+        # иначе хеш входа расходится и ролик зря перегенерируется за деньги
+        video_run_config.bind_run_project(project_id)
         project_dir = safe_storybook_project_dir(project_id)
         shots_file_path = str(project_dir / "97_shots" / "shots.json")
         if os.path.exists(shots_file_path):
@@ -271,15 +280,15 @@ def video_generator_aitunnel_tool(
     api_key = os.getenv(f"{env_prefix}_API_KEY")
     if not api_key:
         return _error_result(f"{env_prefix}_API_KEY не найден")
-    configured_model = (os.getenv(f"{env_prefix}_VIDEO_MODEL") or "").strip()
+    configured_model = video_run_config.video_setting("VIDEO_MODEL", _provider_name, project_id)
     if not configured_model:
         return _error_result(f"{env_prefix}_VIDEO_MODEL не задан")
 
     fallback_model = (fallback_model if fallback_model is not None else
-                      os.getenv(f"{env_prefix}_VIDEO_FALLBACK_MODEL", "")).strip()
+                      video_run_config.video_setting("VIDEO_FALLBACK_MODEL", _provider_name, project_id)).strip()
     try:
         retry_cycles = int(retry_cycles if retry_cycles is not None else
-                           os.getenv(f"{env_prefix}_VIDEO_RETRY_CYCLES", "1"))
+                           video_run_config.video_setting("VIDEO_RETRY_CYCLES", _provider_name, project_id) or "1")
         if retry_cycles < 0:
             raise ValueError("negative cycle count")
     except (TypeError, ValueError):
@@ -440,6 +449,9 @@ def video_generator_aitunnel_tool(
         stats["remaining"] = remaining
 
     message = f"Сгенерировано {successful} из {total} видео {provider_label}"
+    if any(result.get("error_code") in _BUDGET_ERROR_CODES for result in results):
+        stats["budget_stopped"] = True
+        message += ". Остановлено: исчерпан бюджет"
     if successful == total:
         return {
             "status": "success",
@@ -727,6 +739,8 @@ def _as_bool(value: Any) -> bool:
 # 2-5 — намеренно выключенный референс не является наблюдением, о котором
 # нужно предупреждать.
 _P09_SKIPPED_REASON = "condition_1_reference_disabled"
+# коды остановки по денежному бюджету (video_budget.BudgetExceededError.code)
+_BUDGET_ERROR_CODES = {"budget_exceeded", "budget_price_unknown"}
 
 
 def _write_video_generator_report_section(
@@ -760,6 +774,15 @@ def _write_video_generator_report_section(
         scene_number = result.get("scene_number")
         shot_number = result.get("shot_number")
         processed_keys.add((scene_number, shot_number))
+        if result.get("error_code") in _BUDGET_ERROR_CODES:
+            findings.append({
+                "code": "V_BUDGET",
+                "level": "error",
+                "scene_number": scene_number,
+                "shot_number": shot_number,
+                "message": str(result.get("error") or ""),
+                "details": {"error_code": result.get("error_code")},
+            })
         reason = result.get("video_reference_rejected_reason")
         if reason and reason != _P09_SKIPPED_REASON:
             findings.append({
@@ -931,9 +954,15 @@ def _generate_single_video_aitunnel(
     del session_id
     if item.get("video_mode") == "references":
         from .video_plan import generate_reference_video
-        return generate_reference_video(item, api_key, configured_model, seed, job_store, model_catalog,
-                                        deadline, video_step_started_at, remaining_new_output_items, worker_count,
-                                        provider_name=provider_name)
+        try:
+            return generate_reference_video(item, api_key, configured_model, seed, job_store, model_catalog,
+                                            deadline, video_step_started_at, remaining_new_output_items, worker_count,
+                                            provider_name=provider_name)
+        except BudgetExceededError as exc:
+            # остановка по бюджету — не сбой провайдера: шот помечается кодом, ретраи не платят
+            return {"success": False, "error": str(exc), "error_code": exc.code,
+                    "scene_number": item.get("scene_number", "?"), "shot_number": item.get("shot_number", "?"),
+                    "video_path": item.get("video_path")}
     provider_label = "RouterAI" if provider_name == "routerai" else "AITUNNEL"
 
     scene_number = item.get("scene_number", "?")
@@ -1256,20 +1285,31 @@ def _generate_single_video_aitunnel(
                     remaining_new_output_items,
                     worker_count,
                 )
-                if job_store:
-                    job_store.update_job(
-                        shot_key,
-                        input_hash,
-                        {
-                            "status": "submitting",
-                            "model": model_name,
-                            "prompt_hash": prompt_hash,
-                            "source_image_hashes": source_image_hashes,
-                            "output_path": str(video_path),
-                            "error": None,
-                        },
-                        "submitting_at",
+                # денежный бюджет: проверка и запись резерва под одним замком (video_budget);
+                # бюджет 0 — ничего не делает
+                budget_guard = (
+                    reserve_budget(
+                        job_store.path.parent.parent, provider_name, model_name, duration,
+                        size_params.get("resolution", ""), shot_key,
                     )
+                    if job_store else nullcontext({})
+                )
+                with budget_guard as reservation:
+                    if job_store:
+                        job_store.update_job(
+                            shot_key,
+                            input_hash,
+                            {
+                                "status": "submitting",
+                                "model": model_name,
+                                "prompt_hash": prompt_hash,
+                                "source_image_hashes": source_image_hashes,
+                                "output_path": str(video_path),
+                                "error": None,
+                                **reservation,
+                            },
+                            "submitting_at",
+                        )
                 submit_response = requests.post(
                     f"{base_url}/videos",
                     headers=headers,
@@ -1398,7 +1438,7 @@ def _generate_single_video_aitunnel(
                 status = "failed"
             job_store.update_job(shot_key, input_hash, {"status": status, "error": str(exc)}, "failed_at")
         logger.error("❌ %s: ошибка генерации %s-%s: %s", provider_label, scene_number, shot_number, exc)
-        return {
+        failure = {
             "success": False,
             "error": str(exc),
             "scene_number": scene_number,
@@ -1406,6 +1446,9 @@ def _generate_single_video_aitunnel(
             "video_path": video_path,
             "video_reference_rejected_reason": video_reference_rejected_reason,
         }
+        if isinstance(exc, BudgetExceededError):
+            failure["error_code"] = exc.code
+        return failure
 
 
 def _resolve_video_prompt(item: Dict[str, Any], language: str) -> str:

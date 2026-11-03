@@ -1,0 +1,18 @@
+[
+  {
+    "id": "b1",
+    "page_number": 1,
+    "goal": "Лисёнок видит луну",
+    "characters_in_frame": "Лисёнок",
+    "emotion": "удивление",
+    "location_hint": "Лес"
+  },
+  {
+    "id": "b2",
+    "page_number": 2,
+    "goal": "Лисёнок идёт к луне",
+    "characters_in_frame": "Лисёнок",
+    "emotion": "решимость",
+    "location_hint": "Поле"
+  }
+]

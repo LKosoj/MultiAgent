@@ -1,0 +1,25 @@
+{
+  "concept": {
+    "title": "Лисёнок"
+  },
+  "characters": [
+    {
+      "name": "Лисёнок"
+    }
+  ],
+  "world_description": "Лес",
+  "screenplay": [
+    {
+      "scene_number": 1,
+      "location_time": "Лес, ночь",
+      "action": "Лисёнок смотрит вверх.",
+      "voiceover": "Жил лисёнок.",
+      "storyboard": [
+        {
+          "shot_number": 1,
+          "timing": "00:05"
+        }
+      ]
+    }
+  ]
+}

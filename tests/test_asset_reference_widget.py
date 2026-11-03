@@ -134,7 +134,7 @@ SAMPLE_ASSET_MAP = {
 
 
 class FakeVar:
-    """Минимальный mock Tk-переменной (образец: tests/test_blockout_panel.py)."""
+    """Минимальный mock Tk-переменной (минимальный фейк без Tk)."""
 
     def __init__(self, value=None):
         self.value = value
@@ -159,7 +159,7 @@ class FakeStringVar(FakeVar):
 
 
 class FakeWidget:
-    """Минимальный mock-виджет Tk/ttk (образец: tests/test_blockout_panel.py)."""
+    """Минимальный mock-виджет Tk/ttk (минимальный фейк без Tk)."""
 
     def __init__(self, *args, **kwargs):
         self.args = args
@@ -248,7 +248,7 @@ class FakeCombobox(FakeWidget):
 def _import_universal_json_editor():
     """Свежий импорт universal_json_editor с фейковым tkinter (headless).
 
-    В отличие от tests/test_blockout_panel.py, модуль делает ЛОКАЛЬНЫЕ
+    Модуль делает ЛОКАЛЬНЫЕ
     `import tkinter as tk` внутри некоторых методов (например,
     `_create_dropdown_selector_with_subfields`) — они выполняются не при
     импорте модуля, а при построении формы, поэтому подмену sys.modules

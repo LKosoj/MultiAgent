@@ -30,7 +30,13 @@ inputs:
   sample_before_batch: false
   sample_shot_key: ''
   generate_music: true
+  generate_sfx: true
+  generate_subtitles: true
   narration_path: ''
+  video_provider: ''       # '' = настройка проекта (run_settings.json) / STORYBOOK_VIDEO_PROVIDER / routerai
+  budget_rub: 0            # денежный бюджет на платную отправку видео; 0 = без ограничения
+  style_profile: ''        # '' = как в окружении (STORYBOOK_STYLE_PROFILE / default)
+  style_preset: ''         # '' = пресет выбирает модель по брифу
   final_allow_missing_audio: false
 global_retry_policy:
   max_retries: 2
@@ -100,6 +106,8 @@ steps:
   tool_params:
     session_id: '{session_id}'
     project_id: '{project_id}'
+    style_profile: '{style_profile}'
+    style_preset: '{style_preset}'
   depends_on:
   - bible_builder
 - id: story_writer
@@ -422,6 +430,7 @@ steps:
     enable: '{generate_screenplay}'
     use_blockout_reference: '{blockout_use_as_video_reference}'
     generate_blockout: '{generate_blockout}'
+    video_provider: '{video_provider}'
   depends_on:
   - shots_prompt_qa
   - storybook_photo_montage
@@ -448,6 +457,7 @@ steps:
     enable: '{generate_screenplay}'
     use_blockout_reference: '{blockout_use_as_video_reference}'
     generate_blockout: '{generate_blockout}'
+    video_provider: '{video_provider}'
   depends_on:
   - storybook_video_preflight
   - artist_batch_shots
@@ -460,10 +470,8 @@ steps:
   # пере-триггерит платную генерацию. См. H-2.
   metadata:
     retryable: false
-  tool_name: video_generator_routerai_tool
-#  tool_name: video_generator_veo_tool
-#  tool_name: video_generator_mm_tool
-#  tool_name: video_generator_aitunnel_tool
+  # провайдер выбирается входом video_provider (или настройкой проекта), а не правкой tool_name
+  tool_name: video_generator_dispatch_tool
   tool_params:
     session_id: '{session_id}'
     project_id: '{project_id}'
@@ -477,6 +485,8 @@ steps:
     enable: '{generate_screenplay}'
     use_blockout_reference: '{blockout_use_as_video_reference}'
     generate_blockout: '{generate_blockout}'
+    video_provider: '{video_provider}'
+    budget_rub: '{budget_rub}'
   depends_on:
   - storybook_video_delivery_promise
   - artist_batch_shots
@@ -508,6 +518,7 @@ steps:
     project_id: '{project_id}'
     language: '{language}'
     narration_path: '{narration_path}'
+    generate_subtitles: '{generate_subtitles}'
     enable: '{generate_screenplay}'
   depends_on:
   - artist_batch_shots
@@ -576,7 +587,7 @@ steps:
     session_id: '{session_id}'
     project_id: '{project_id}'
     language: '{language}'
-    enable: '{generate_screenplay}'
+    enable: '{generate_sfx}'
   depends_on:
   - storybook_music_generator
   condition: '{generate_screenplay}'
@@ -620,6 +631,7 @@ steps:
     enable: '{generate_screenplay}'
     allow_missing_audio: '{final_allow_missing_audio}'
     music_enabled: '{generate_music}'
+    subtitles_enabled: '{generate_subtitles}'
   depends_on:
   - storybook_sfx_generator
   - video_generator

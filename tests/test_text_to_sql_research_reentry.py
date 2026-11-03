@@ -714,7 +714,7 @@ async def test_unbound_formula_missing_evidence_continues_existing_research(
     item = case.query_spec.semantic_items[0].model_copy(
         update={
             "kind": SemanticItemKind.FORMULA,
-            "status": SemanticItemStatus.UNRESOLVED,
+            "status": SemanticItemStatus.RESOLVED,
             "binding_ids": (),
         }
     )

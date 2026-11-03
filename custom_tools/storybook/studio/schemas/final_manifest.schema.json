@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Манифест фильма",
+  "properties": {
+    "status": {
+      "type": "string",
+      "title": "Состояние"
+    },
+    "final_video_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "title": "Итоговое видео"
+    },
+    "errors": {
+      "type": "array",
+      "title": "Ошибки"
+    },
+    "warnings": {
+      "type": "array",
+      "title": "Предупреждения"
+    }
+  },
+  "required": [
+    "status"
+  ],
+  "x-recommended": [
+    "final_video_path",
+    "errors",
+    "warnings"
+  ]
+}

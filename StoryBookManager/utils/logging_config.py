@@ -6,7 +6,7 @@
 import logging
 import logging.handlers
 from pathlib import Path
-from config.settings import app_settings
+from StoryBookManager.config.settings import app_settings
 
 def setup_logging():
     """Настраивает систему логирования"""

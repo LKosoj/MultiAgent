@@ -1899,10 +1899,30 @@ def test_semantic_binding_with_join_route_is_a_distinct_binding(
         namespace=namespace,
     )
     binding = candidate_state.bindings[0]
-    join = candidate_state.join_candidates[0]
+    # Кандидат-привязку нельзя оставлять неоценённой при следующем коммите,
+    # поэтому сначала оцениваем её, как в тесте физической колонки.
+    supported_state = _commit_candidate(
+        candidate_state,
+        _semantic_commit(
+            (
+                {
+                    "proposal_type": "binding_assessment",
+                    "subject": {
+                        "reference_kind": "existing",
+                        "binding_id": binding.binding_id,
+                    },
+                    "certificate": "consistent",
+                    "citation_evidence_ids": ("evidence-1",),
+                },
+            )
+        ),
+        loaded=loaded,
+        namespace=namespace,
+    )
+    join = supported_state.join_candidates[0]
 
     routed_state = _commit_candidate(
-        candidate_state,
+        supported_state,
         _semantic_commit(
             (
                 {
@@ -2050,7 +2070,8 @@ def test_loaded_schema_columns_validate_multihop_join_without_declared_fk() -> N
         namespace=namespace,
     )
     join = candidate_state.join_candidates[0]
-    assert join.status.value == "candidate"
+    # Связный multi-hop путь получает VALIDATED сразу при коммите (R6 в плане).
+    assert join.status.value == "validated"
 
     resolved = resolve_research_decision(
         candidate_state,

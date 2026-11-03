@@ -1,0 +1,1203 @@
+{
+ "vectors": {
+  "form_from_settings": [
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "projects_directory": "/data/p",
+     "backup_directory": "/data/b",
+     "logs_directory": "/data/l",
+     "max_backup_files": "5",
+     "log_level": "INFO"
+    }
+   },
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/env/p",
+        "default": "/env/p",
+        "source": "env"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "projects_directory": "/env/p",
+     "backup_directory": "/data/b",
+     "logs_directory": "/data/l",
+     "max_backup_files": "5",
+     "log_level": "INFO"
+    }
+   }
+  ],
+  "changed_fields": [
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     }
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "debug"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     }
+    ],
+    "out": [
+     "log_level"
+    ]
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": " 5 ",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     }
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     {
+      "projects_directory": " /data/p ",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     }
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/x",
+      "logs_directory": "/data/l",
+      "max_backup_files": "7",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     }
+    ],
+    "out": [
+     "backup_directory",
+     "max_backup_files"
+    ]
+   }
+  ],
+  "field_lock": [
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     },
+     "projects_directory"
+    ],
+    "out": {
+     "disabled": false,
+     "note": null
+    }
+   },
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/env/p",
+        "default": "/env/p",
+        "source": "env"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     },
+     "projects_directory"
+    ],
+    "out": {
+     "disabled": true,
+     "note": "Папка задана переменной окружения сервера"
+    }
+   },
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": "Недоступно, пока идёт прогон"
+     },
+     "projects_directory"
+    ],
+    "out": {
+     "disabled": true,
+     "note": "Недоступно, пока идёт прогон"
+    }
+   },
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": "Недоступно, пока идёт прогон"
+     },
+     "backup_directory"
+    ],
+    "out": {
+     "disabled": false,
+     "note": null
+    }
+   },
+   {
+    "in": [
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/env/p",
+        "default": "/env/p",
+        "source": "env"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     },
+     "log_level"
+    ],
+    "out": {
+     "disabled": false,
+     "note": null
+    }
+   }
+  ],
+  "default_mark": [
+   {
+    "in": [
+     {
+      "source": "default"
+     }
+    ],
+    "out": "по умолчанию"
+   },
+   {
+    "in": [
+     {
+      "source": "file"
+     }
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     {
+      "source": "env"
+     }
+    ],
+    "out": null
+   }
+  ],
+  "build_update": [
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "debug"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": true,
+     "payload": {
+      "log_level": "DEBUG",
+      "expected_digest": "s1:abc"
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": " /new/b ",
+      "logs_directory": "/data/l",
+      "max_backup_files": "10",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": true,
+     "payload": {
+      "backup_directory": "/new/b",
+      "max_backup_files": 10,
+      "expected_digest": "s1:abc"
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "0",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": false,
+     "errors": {
+      "max_backup_files": "Поле «Число бэкапов» должно быть целым от 1 до 100."
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "101",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": false,
+     "errors": {
+      "max_backup_files": "Поле «Число бэкапов» должно быть целым от 1 до 100."
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "2,5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": false,
+     "errors": {
+      "max_backup_files": "Поле «Число бэкапов» должно быть целым от 1 до 100."
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": false,
+     "errors": {
+      "max_backup_files": "Поле «Число бэкапов» должно быть целым от 1 до 100."
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "  ",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": false,
+     "errors": {
+      "logs_directory": "Поле «Папка журналов» не должно быть пустым."
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/other",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/env/p",
+        "default": "/env/p",
+        "source": "env"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": true,
+     "payload": {
+      "expected_digest": "s1:abc"
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/other",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "ERROR"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": "Недоступно, пока идёт прогон"
+     }
+    ],
+    "out": {
+     "ok": true,
+     "payload": {
+      "log_level": "ERROR",
+      "expected_digest": "s1:abc"
+     }
+    }
+   },
+   {
+    "in": [
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "projects_directory": "/data/p",
+      "backup_directory": "/data/b",
+      "logs_directory": "/data/l",
+      "max_backup_files": "5",
+      "log_level": "INFO"
+     },
+     {
+      "settings": {
+       "projects_directory": {
+        "value": "/data/p",
+        "default": "/data/p",
+        "source": "file"
+       },
+       "backup_directory": {
+        "value": "/data/b",
+        "default": "/data/b",
+        "source": "file"
+       },
+       "logs_directory": {
+        "value": "/data/l",
+        "default": "/data/l",
+        "source": "default"
+       },
+       "max_backup_files": {
+        "value": 5,
+        "default": 5,
+        "source": "file"
+       },
+       "log_level": {
+        "value": "info",
+        "default": "info",
+        "source": "file"
+       }
+      },
+      "checks": {},
+      "warnings": [],
+      "digest": "s1:abc",
+      "projects_directory_locked_reason": null
+     }
+    ],
+    "out": {
+     "ok": true,
+     "payload": {
+      "expected_digest": "s1:abc"
+     }
+    }
+   }
+  ],
+  "field_for_server_error": [
+   {
+    "in": [
+     "Папка проектов: папки не существует"
+    ],
+    "out": "projects_directory"
+   },
+   {
+    "in": [
+     "Папка бэкапов: это не папка"
+    ],
+    "out": "backup_directory"
+   },
+   {
+    "in": [
+     "Папка логов: нет прав на запись"
+    ],
+    "out": "logs_directory"
+   },
+   {
+    "in": [
+     "Поле «Число бэкапов» должно быть целым от 1 до 100"
+    ],
+    "out": "max_backup_files"
+   },
+   {
+    "in": [
+     "Поле «Уровень логов» должно быть одним из: DEBUG, INFO, WARNING, ERROR, CRITICAL"
+    ],
+    "out": "log_level"
+   },
+   {
+    "in": [
+     "Папки проектов, бэкапов и логов не должны лежать друг в друге"
+    ],
+    "out": "paths"
+   },
+   {
+    "in": [
+     "Что-то иное"
+    ],
+    "out": "paths"
+   }
+  ],
+  "path_check_view": [
+   {
+    "in": [
+     {
+      "state": "ok",
+      "message": "Папка доступна",
+      "resolved": "/a/b"
+     },
+     false
+    ],
+    "out": {
+     "tone": "ok",
+     "text": "Папка доступна",
+     "resolved": "/a/b"
+    }
+   },
+   {
+    "in": [
+     {
+      "state": "missing",
+      "message": "Папки не существует"
+     },
+     false
+    ],
+    "out": {
+     "tone": "warn",
+     "text": "Папки не существует",
+     "resolved": null
+    }
+   },
+   {
+    "in": [
+     {
+      "state": "not_dir",
+      "message": "Это не папка"
+     },
+     false
+    ],
+    "out": {
+     "tone": "warn",
+     "text": "Это не папка",
+     "resolved": null
+    }
+   },
+   {
+    "in": [
+     {
+      "state": "not_writable",
+      "message": "Нет прав на запись"
+     },
+     false
+    ],
+    "out": {
+     "tone": "warn",
+     "text": "Нет прав на запись",
+     "resolved": null
+    }
+   },
+   {
+    "in": [
+     null,
+     false
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     null,
+     true
+    ],
+    "out": {
+     "tone": "pending",
+     "text": "Проверяем…",
+     "resolved": null
+    }
+   },
+   {
+    "in": [
+     {
+      "state": "ok",
+      "message": "x"
+     },
+     true
+    ],
+    "out": {
+     "tone": "pending",
+     "text": "Проверяем…",
+     "resolved": null
+    }
+   }
+  ],
+  "log_level_label": [
+   {
+    "in": [
+     "DEBUG"
+    ],
+    "out": "Подробный"
+   },
+   {
+    "in": [
+     "info"
+    ],
+    "out": "Обычный"
+   },
+   {
+    "in": [
+     "WARNING"
+    ],
+    "out": "Предупреждения"
+   },
+   {
+    "in": [
+     "ERROR"
+    ],
+    "out": "Только ошибки"
+   },
+   {
+    "in": [
+     "CRITICAL"
+    ],
+    "out": "Критические"
+   },
+   {
+    "in": [
+     "TRACE"
+    ],
+    "out": "TRACE"
+   }
+  ],
+  "should_check_path": [
+   {
+    "in": [
+     ""
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "  "
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "/a"
+    ],
+    "out": true
+   }
+  ]
+ }
+}

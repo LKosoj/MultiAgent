@@ -1,0 +1,2352 @@
+{
+ "server_findings": {
+  "shots_bad": {
+   "key": "shots",
+   "content": {
+    "items": [
+     {
+      "shot_number": "x",
+      "scene_number": 1,
+      "width": 0,
+      "english_prompt": 5
+     }
+    ]
+   },
+   "findings": [
+    {
+     "severity": "error",
+     "code": "type",
+     "path": [
+      "items",
+      0,
+      "english_prompt"
+     ],
+     "pointer": "/items/0/english_prompt",
+     "label": "Шоты · элемент 1 · Промпт картинки",
+     "message": "Ожидается строка, сейчас целое число"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "height"
+     ],
+     "pointer": "/items/0/height",
+     "label": "Шоты · элемент 1 · Высота",
+     "message": "Рекомендуется заполнить поле «Высота»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "negative_prompt"
+     ],
+     "pointer": "/items/0/negative_prompt",
+     "label": "Шоты · элемент 1 · Негативный промпт",
+     "message": "Рекомендуется заполнить поле «Негативный промпт»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "reference_image_paths"
+     ],
+     "pointer": "/items/0/reference_image_paths",
+     "label": "Шоты · элемент 1 · Референсы",
+     "message": "Рекомендуется заполнить поле «Референсы»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "seed"
+     ],
+     "pointer": "/items/0/seed",
+     "label": "Шоты · элемент 1 · Зерно случайности",
+     "message": "Рекомендуется заполнить поле «Зерно случайности»"
+    },
+    {
+     "severity": "error",
+     "code": "type",
+     "path": [
+      "items",
+      0,
+      "shot_number"
+     ],
+     "pointer": "/items/0/shot_number",
+     "label": "Шоты · элемент 1 · Шот",
+     "message": "Ожидается целое число, сейчас строка"
+    },
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "items",
+      0,
+      "shot_type"
+     ],
+     "pointer": "/items/0/shot_type",
+     "label": "Шоты · элемент 1 · Тип шота",
+     "message": "Не заполнено обязательное поле «Тип шота»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "timing"
+     ],
+     "pointer": "/items/0/timing",
+     "label": "Шоты · элемент 1 · Тайминг",
+     "message": "Рекомендуется заполнить поле «Тайминг»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "items",
+      0,
+      "video_prompt"
+     ],
+     "pointer": "/items/0/video_prompt",
+     "label": "Шоты · элемент 1 · Промпт видео",
+     "message": "Рекомендуется заполнить поле «Промпт видео»"
+    },
+    {
+     "severity": "error",
+     "code": "range",
+     "path": [
+      "items",
+      0,
+      "width"
+     ],
+     "pointer": "/items/0/width",
+     "label": "Шоты · элемент 1 · Ширина",
+     "message": "Слишком мало: не меньше 1"
+    }
+   ]
+  },
+  "brief_bad": {
+   "key": "brief",
+   "content": {
+    "title": "T",
+    "pages_min": "много"
+   },
+   "findings": [
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "description"
+     ],
+     "pointer": "/description",
+     "label": "Бриф · Описание",
+     "message": "Не заполнено обязательное поле «Описание»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "genre"
+     ],
+     "pointer": "/genre",
+     "label": "Бриф · Жанр",
+     "message": "Рекомендуется заполнить поле «Жанр»"
+    },
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "language"
+     ],
+     "pointer": "/language",
+     "label": "Бриф · Язык",
+     "message": "Не заполнено обязательное поле «Язык»"
+    },
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "main_characters"
+     ],
+     "pointer": "/main_characters",
+     "label": "Бриф · Главные герои",
+     "message": "Не заполнено обязательное поле «Главные герои»"
+    },
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "main_locations"
+     ],
+     "pointer": "/main_locations",
+     "label": "Бриф · Главные места",
+     "message": "Не заполнено обязательное поле «Главные места»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "moral"
+     ],
+     "pointer": "/moral",
+     "label": "Бриф · Мораль",
+     "message": "Рекомендуется заполнить поле «Мораль»"
+    },
+    {
+     "severity": "error",
+     "code": "required",
+     "path": [
+      "pages_max"
+     ],
+     "pointer": "/pages_max",
+     "label": "Бриф · Страниц не больше",
+     "message": "Не заполнено обязательное поле «Страниц не больше»"
+    },
+    {
+     "severity": "error",
+     "code": "type",
+     "path": [
+      "pages_min"
+     ],
+     "pointer": "/pages_min",
+     "label": "Бриф · Страниц не меньше",
+     "message": "Ожидается целое число, сейчас строка"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "seed"
+     ],
+     "pointer": "/seed",
+     "label": "Бриф · Зерно случайности",
+     "message": "Рекомендуется заполнить поле «Зерно случайности»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "storybook_prompt"
+     ],
+     "pointer": "/storybook_prompt",
+     "label": "Бриф · Исходное задание",
+     "message": "Рекомендуется заполнить поле «Исходное задание»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "target_age"
+     ],
+     "pointer": "/target_age",
+     "label": "Бриф · Возраст читателя",
+     "message": "Рекомендуется заполнить поле «Возраст читателя»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "words_per_page_max"
+     ],
+     "pointer": "/words_per_page_max",
+     "label": "Бриф · Слов на странице не больше",
+     "message": "Рекомендуется заполнить поле «Слов на странице не больше»"
+    },
+    {
+     "severity": "warning",
+     "code": "recommended",
+     "path": [
+      "words_per_page_min"
+     ],
+     "pointer": "/words_per_page_min",
+     "label": "Бриф · Слов на странице не меньше",
+     "message": "Рекомендуется заполнить поле «Слов на странице не меньше»"
+    }
+   ]
+  },
+  "brief_root": {
+   "key": "brief",
+   "content": [
+    1
+   ],
+   "findings": [
+    {
+     "severity": "error",
+     "code": "root",
+     "path": [],
+     "pointer": "",
+     "label": "Бриф",
+     "message": "Ожидается объект, сейчас список"
+    }
+   ]
+  }
+ },
+ "vectors": {
+  "list_rows": [
+   {
+    "in": [
+     [
+      {
+       "artifact_key": "k",
+       "title": "Заголовок",
+       "path": "a/k.json",
+       "exists": true,
+       "status": "present",
+       "size": 1,
+       "modified": null,
+       "editable": true,
+       "read_only_reason": "",
+       "careful": false,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      },
+      {
+       "artifact_key": "m",
+       "title": "Нет",
+       "path": "m.json",
+       "exists": false,
+       "status": "missing",
+       "size": 1,
+       "modified": null,
+       "editable": true,
+       "read_only_reason": "",
+       "careful": false,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      },
+      {
+       "artifact_key": "r",
+       "title": "Чтение",
+       "path": "a/k.json",
+       "exists": true,
+       "status": "invalid",
+       "size": 1,
+       "modified": null,
+       "editable": false,
+       "read_only_reason": "Создаётся пайплайном",
+       "careful": true,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      }
+     ]
+    ],
+    "out": [
+     {
+      "key": "k",
+      "title": "Заголовок",
+      "status": "present",
+      "statusText": "Есть",
+      "badges": [],
+      "tooltip": "a/k.json"
+     },
+     {
+      "key": "m",
+      "title": "Нет",
+      "status": "missing",
+      "statusText": "Нет",
+      "badges": [],
+      "tooltip": "m.json"
+     },
+     {
+      "key": "r",
+      "title": "Чтение",
+      "status": "invalid",
+      "statusText": "Повреждён",
+      "badges": [
+       "Только чтение",
+       "Осторожно"
+      ],
+      "tooltip": "a/k.json\nСоздаётся пайплайном\nПайплайн читает этот файл как вход: неверная правка сломает следующие шаги."
+     }
+    ]
+   }
+  ],
+  "parse_error_text": [
+   {
+    "in": [
+     {
+      "line": 3,
+      "column": 5,
+      "message": "Ожидалась запятая"
+     }
+    ],
+    "out": "строка 3, столбец 5: Ожидалась запятая"
+   },
+   {
+    "in": [
+     {
+      "line": null,
+      "column": null,
+      "message": "Пустой файл"
+     }
+    ],
+    "out": "Пустой файл"
+   },
+   {
+    "in": [
+     {
+      "line": 7,
+      "column": null,
+      "message": "Обрыв"
+     }
+    ],
+    "out": "строка 7, столбец 1: Обрыв"
+   }
+  ],
+  "resolve_editor_screen": [
+   {
+    "in": [
+     {
+      "key": null,
+      "phase": "idle",
+      "read": null
+     }
+    ],
+    "out": "empty"
+   },
+   {
+    "in": [
+     {
+      "key": "k",
+      "phase": "loading",
+      "read": null
+     }
+    ],
+    "out": "loading"
+   },
+   {
+    "in": [
+     {
+      "key": "k",
+      "phase": "idle",
+      "read": null
+     }
+    ],
+    "out": "loading"
+   },
+   {
+    "in": [
+     {
+      "key": "k",
+      "phase": "error",
+      "read": null
+     }
+    ],
+    "out": "error"
+   },
+   {
+    "in": [
+     {
+      "key": "k",
+      "phase": "ready",
+      "read": {
+       "exists": false
+      }
+     }
+    ],
+    "out": "missing"
+   },
+   {
+    "in": [
+     {
+      "key": "k",
+      "phase": "ready",
+      "read": {
+       "exists": true
+      }
+     }
+    ],
+    "out": "ready"
+   }
+  ],
+  "editor_banners": [
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": null,
+       "run_state": "free",
+       "run_state_message": "",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": null
+     }
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": {
+        "line": 2,
+        "column": 4,
+        "message": "Ожидалась запятая"
+       },
+       "run_state": "free",
+       "run_state_message": "",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": null
+     }
+    ],
+    "out": [
+     {
+      "tone": "error",
+      "text": "Файл «Бриф» повреждён: строка 2, столбец 4: Ожидалась запятая. Откройте его в режиме JSON или откатите к прошлой версии."
+     }
+    ]
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": false,
+       "read_only_reason": "Создаётся пайплайном",
+       "parse_error": null,
+       "run_state": "free",
+       "run_state_message": "",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": null
+     }
+    ],
+    "out": [
+     {
+      "tone": "info",
+      "text": "Только чтение: Создаётся пайплайном"
+     }
+    ]
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": null,
+       "run_state": "free",
+       "run_state_message": "",
+       "exists": true
+      },
+      "forbidden": true,
+      "versionDate": null
+     }
+    ],
+    "out": [
+     {
+      "tone": "warn",
+      "text": "Только чтение: недостаточно прав"
+     }
+    ]
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": null,
+       "run_state": "busy",
+       "run_state_message": "Идёт шаг «Шоты»",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": null
+     }
+    ],
+    "out": [
+     {
+      "tone": "warn",
+      "text": "Файл занят прогоном. Идёт шаг «Шоты»"
+     }
+    ]
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": null,
+       "run_state": "warn",
+       "run_state_message": "Файл читает пайплайн",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": null
+     }
+    ],
+    "out": [
+     {
+      "tone": "warn",
+      "text": "Файл читает пайплайн"
+     }
+    ]
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "title": "Бриф",
+       "editable": true,
+       "read_only_reason": "",
+       "parse_error": null,
+       "run_state": "busy",
+       "run_state_message": "x",
+       "exists": true
+      },
+      "forbidden": false,
+      "versionDate": "01.02.2026 10:00"
+     }
+    ],
+    "out": [
+     {
+      "tone": "info",
+      "text": "Это версия от 01.02.2026 10:00. Она открыта только для чтения."
+     }
+    ]
+   }
+  ],
+  "editor_access": [
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "free"
+      },
+      "viewingVersion": false,
+      "forbidden": false,
+      "dirty": true,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": false,
+     "canSave": true
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "free"
+      },
+      "viewingVersion": false,
+      "forbidden": false,
+      "dirty": false,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": false,
+     "canSave": false
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "free"
+      },
+      "viewingVersion": false,
+      "forbidden": false,
+      "dirty": true,
+      "saving": true
+     }
+    ],
+    "out": {
+     "readOnly": false,
+     "canSave": false
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": false,
+       "run_state": "free"
+      },
+      "viewingVersion": false,
+      "forbidden": false,
+      "dirty": true,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": true,
+     "canSave": false
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "busy"
+      },
+      "viewingVersion": false,
+      "forbidden": false,
+      "dirty": true,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": true,
+     "canSave": false
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "free"
+      },
+      "viewingVersion": true,
+      "forbidden": false,
+      "dirty": true,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": true,
+     "canSave": false
+    }
+   },
+   {
+    "in": [
+     {
+      "read": {
+       "editable": true,
+       "run_state": "free"
+      },
+      "viewingVersion": false,
+      "forbidden": true,
+      "dirty": true,
+      "saving": false
+     }
+    ],
+    "out": {
+     "readOnly": true,
+     "canSave": false
+    }
+   }
+  ],
+  "counts_text": [
+   {
+    "in": [
+     {
+      "errors": 0,
+      "warnings": 0
+     }
+    ],
+    "out": "Ошибок: 0, замечаний: 0"
+   },
+   {
+    "in": [
+     {
+      "errors": 3,
+      "warnings": 12
+     }
+    ],
+    "out": "Ошибок: 3, замечаний: 12"
+   }
+  ],
+  "finding_rows": [
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "english_prompt"
+       ],
+       "pointer": "/items/0/english_prompt",
+       "label": "Шоты · элемент 1 · Промпт картинки",
+       "message": "Ожидается строка, сейчас целое число"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "height"
+       ],
+       "pointer": "/items/0/height",
+       "label": "Шоты · элемент 1 · Высота",
+       "message": "Рекомендуется заполнить поле «Высота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "negative_prompt"
+       ],
+       "pointer": "/items/0/negative_prompt",
+       "label": "Шоты · элемент 1 · Негативный промпт",
+       "message": "Рекомендуется заполнить поле «Негативный промпт»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "reference_image_paths"
+       ],
+       "pointer": "/items/0/reference_image_paths",
+       "label": "Шоты · элемент 1 · Референсы",
+       "message": "Рекомендуется заполнить поле «Референсы»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "seed"
+       ],
+       "pointer": "/items/0/seed",
+       "label": "Шоты · элемент 1 · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "shot_number"
+       ],
+       "pointer": "/items/0/shot_number",
+       "label": "Шоты · элемент 1 · Шот",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "items",
+        0,
+        "shot_type"
+       ],
+       "pointer": "/items/0/shot_type",
+       "label": "Шоты · элемент 1 · Тип шота",
+       "message": "Не заполнено обязательное поле «Тип шота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "timing"
+       ],
+       "pointer": "/items/0/timing",
+       "label": "Шоты · элемент 1 · Тайминг",
+       "message": "Рекомендуется заполнить поле «Тайминг»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "video_prompt"
+       ],
+       "pointer": "/items/0/video_prompt",
+       "label": "Шоты · элемент 1 · Промпт видео",
+       "message": "Рекомендуется заполнить поле «Промпт видео»"
+      },
+      {
+       "severity": "error",
+       "code": "range",
+       "path": [
+        "items",
+        0,
+        "width"
+       ],
+       "pointer": "/items/0/width",
+       "label": "Шоты · элемент 1 · Ширина",
+       "message": "Слишком мало: не меньше 1"
+      }
+     ]
+    ],
+    "out": [
+     {
+      "pointer": "/items/0/english_prompt",
+      "path": [
+       "items",
+       0,
+       "english_prompt"
+      ],
+      "where": "Шоты · элемент 1 · Промпт картинки",
+      "message": "Ожидается строка, сейчас целое число",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/height",
+      "path": [
+       "items",
+       0,
+       "height"
+      ],
+      "where": "Шоты · элемент 1 · Высота",
+      "message": "Рекомендуется заполнить поле «Высота»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/negative_prompt",
+      "path": [
+       "items",
+       0,
+       "negative_prompt"
+      ],
+      "where": "Шоты · элемент 1 · Негативный промпт",
+      "message": "Рекомендуется заполнить поле «Негативный промпт»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/reference_image_paths",
+      "path": [
+       "items",
+       0,
+       "reference_image_paths"
+      ],
+      "where": "Шоты · элемент 1 · Референсы",
+      "message": "Рекомендуется заполнить поле «Референсы»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/seed",
+      "path": [
+       "items",
+       0,
+       "seed"
+      ],
+      "where": "Шоты · элемент 1 · Зерно случайности",
+      "message": "Рекомендуется заполнить поле «Зерно случайности»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/shot_number",
+      "path": [
+       "items",
+       0,
+       "shot_number"
+      ],
+      "where": "Шоты · элемент 1 · Шот",
+      "message": "Ожидается целое число, сейчас строка",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/shot_type",
+      "path": [
+       "items",
+       0,
+       "shot_type"
+      ],
+      "where": "Шоты · элемент 1 · Тип шота",
+      "message": "Не заполнено обязательное поле «Тип шота»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/timing",
+      "path": [
+       "items",
+       0,
+       "timing"
+      ],
+      "where": "Шоты · элемент 1 · Тайминг",
+      "message": "Рекомендуется заполнить поле «Тайминг»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/video_prompt",
+      "path": [
+       "items",
+       0,
+       "video_prompt"
+      ],
+      "where": "Шоты · элемент 1 · Промпт видео",
+      "message": "Рекомендуется заполнить поле «Промпт видео»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/items/0/width",
+      "path": [
+       "items",
+       0,
+       "width"
+      ],
+      "where": "Шоты · элемент 1 · Ширина",
+      "message": "Слишком мало: не меньше 1",
+      "severity": "error",
+      "line": null,
+      "column": null
+     }
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "description"
+       ],
+       "pointer": "/description",
+       "label": "Бриф · Описание",
+       "message": "Не заполнено обязательное поле «Описание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "genre"
+       ],
+       "pointer": "/genre",
+       "label": "Бриф · Жанр",
+       "message": "Рекомендуется заполнить поле «Жанр»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "language"
+       ],
+       "pointer": "/language",
+       "label": "Бриф · Язык",
+       "message": "Не заполнено обязательное поле «Язык»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_characters"
+       ],
+       "pointer": "/main_characters",
+       "label": "Бриф · Главные герои",
+       "message": "Не заполнено обязательное поле «Главные герои»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_locations"
+       ],
+       "pointer": "/main_locations",
+       "label": "Бриф · Главные места",
+       "message": "Не заполнено обязательное поле «Главные места»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "moral"
+       ],
+       "pointer": "/moral",
+       "label": "Бриф · Мораль",
+       "message": "Рекомендуется заполнить поле «Мораль»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "pages_max"
+       ],
+       "pointer": "/pages_max",
+       "label": "Бриф · Страниц не больше",
+       "message": "Не заполнено обязательное поле «Страниц не больше»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "pages_min"
+       ],
+       "pointer": "/pages_min",
+       "label": "Бриф · Страниц не меньше",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "seed"
+       ],
+       "pointer": "/seed",
+       "label": "Бриф · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "storybook_prompt"
+       ],
+       "pointer": "/storybook_prompt",
+       "label": "Бриф · Исходное задание",
+       "message": "Рекомендуется заполнить поле «Исходное задание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "target_age"
+       ],
+       "pointer": "/target_age",
+       "label": "Бриф · Возраст читателя",
+       "message": "Рекомендуется заполнить поле «Возраст читателя»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_max"
+       ],
+       "pointer": "/words_per_page_max",
+       "label": "Бриф · Слов на странице не больше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не больше»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_min"
+       ],
+       "pointer": "/words_per_page_min",
+       "label": "Бриф · Слов на странице не меньше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не меньше»"
+      }
+     ]
+    ],
+    "out": [
+     {
+      "pointer": "/description",
+      "path": [
+       "description"
+      ],
+      "where": "Бриф · Описание",
+      "message": "Не заполнено обязательное поле «Описание»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/genre",
+      "path": [
+       "genre"
+      ],
+      "where": "Бриф · Жанр",
+      "message": "Рекомендуется заполнить поле «Жанр»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/language",
+      "path": [
+       "language"
+      ],
+      "where": "Бриф · Язык",
+      "message": "Не заполнено обязательное поле «Язык»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/main_characters",
+      "path": [
+       "main_characters"
+      ],
+      "where": "Бриф · Главные герои",
+      "message": "Не заполнено обязательное поле «Главные герои»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/main_locations",
+      "path": [
+       "main_locations"
+      ],
+      "where": "Бриф · Главные места",
+      "message": "Не заполнено обязательное поле «Главные места»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/moral",
+      "path": [
+       "moral"
+      ],
+      "where": "Бриф · Мораль",
+      "message": "Рекомендуется заполнить поле «Мораль»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/pages_max",
+      "path": [
+       "pages_max"
+      ],
+      "where": "Бриф · Страниц не больше",
+      "message": "Не заполнено обязательное поле «Страниц не больше»",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/pages_min",
+      "path": [
+       "pages_min"
+      ],
+      "where": "Бриф · Страниц не меньше",
+      "message": "Ожидается целое число, сейчас строка",
+      "severity": "error",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/seed",
+      "path": [
+       "seed"
+      ],
+      "where": "Бриф · Зерно случайности",
+      "message": "Рекомендуется заполнить поле «Зерно случайности»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/storybook_prompt",
+      "path": [
+       "storybook_prompt"
+      ],
+      "where": "Бриф · Исходное задание",
+      "message": "Рекомендуется заполнить поле «Исходное задание»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/target_age",
+      "path": [
+       "target_age"
+      ],
+      "where": "Бриф · Возраст читателя",
+      "message": "Рекомендуется заполнить поле «Возраст читателя»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/words_per_page_max",
+      "path": [
+       "words_per_page_max"
+      ],
+      "where": "Бриф · Слов на странице не больше",
+      "message": "Рекомендуется заполнить поле «Слов на странице не больше»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     },
+     {
+      "pointer": "/words_per_page_min",
+      "path": [
+       "words_per_page_min"
+      ],
+      "where": "Бриф · Слов на странице не меньше",
+      "message": "Рекомендуется заполнить поле «Слов на странице не меньше»",
+      "severity": "warning",
+      "line": null,
+      "column": null
+     }
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "root",
+       "path": [],
+       "pointer": "",
+       "label": "Бриф",
+       "message": "Ожидается объект, сейчас список"
+      }
+     ]
+    ],
+    "out": [
+     {
+      "pointer": "",
+      "path": [],
+      "where": "Бриф",
+      "message": "Ожидается объект, сейчас список",
+      "severity": "error",
+      "line": null,
+      "column": null
+     }
+    ]
+   }
+  ],
+  "can_save_anyway": [
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "english_prompt"
+       ],
+       "pointer": "/items/0/english_prompt",
+       "label": "Шоты · элемент 1 · Промпт картинки",
+       "message": "Ожидается строка, сейчас целое число"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "height"
+       ],
+       "pointer": "/items/0/height",
+       "label": "Шоты · элемент 1 · Высота",
+       "message": "Рекомендуется заполнить поле «Высота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "negative_prompt"
+       ],
+       "pointer": "/items/0/negative_prompt",
+       "label": "Шоты · элемент 1 · Негативный промпт",
+       "message": "Рекомендуется заполнить поле «Негативный промпт»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "reference_image_paths"
+       ],
+       "pointer": "/items/0/reference_image_paths",
+       "label": "Шоты · элемент 1 · Референсы",
+       "message": "Рекомендуется заполнить поле «Референсы»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "seed"
+       ],
+       "pointer": "/items/0/seed",
+       "label": "Шоты · элемент 1 · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "shot_number"
+       ],
+       "pointer": "/items/0/shot_number",
+       "label": "Шоты · элемент 1 · Шот",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "items",
+        0,
+        "shot_type"
+       ],
+       "pointer": "/items/0/shot_type",
+       "label": "Шоты · элемент 1 · Тип шота",
+       "message": "Не заполнено обязательное поле «Тип шота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "timing"
+       ],
+       "pointer": "/items/0/timing",
+       "label": "Шоты · элемент 1 · Тайминг",
+       "message": "Рекомендуется заполнить поле «Тайминг»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "video_prompt"
+       ],
+       "pointer": "/items/0/video_prompt",
+       "label": "Шоты · элемент 1 · Промпт видео",
+       "message": "Рекомендуется заполнить поле «Промпт видео»"
+      },
+      {
+       "severity": "error",
+       "code": "range",
+       "path": [
+        "items",
+        0,
+        "width"
+       ],
+       "pointer": "/items/0/width",
+       "label": "Шоты · элемент 1 · Ширина",
+       "message": "Слишком мало: не меньше 1"
+      }
+     ]
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "description"
+       ],
+       "pointer": "/description",
+       "label": "Бриф · Описание",
+       "message": "Не заполнено обязательное поле «Описание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "genre"
+       ],
+       "pointer": "/genre",
+       "label": "Бриф · Жанр",
+       "message": "Рекомендуется заполнить поле «Жанр»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "language"
+       ],
+       "pointer": "/language",
+       "label": "Бриф · Язык",
+       "message": "Не заполнено обязательное поле «Язык»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_characters"
+       ],
+       "pointer": "/main_characters",
+       "label": "Бриф · Главные герои",
+       "message": "Не заполнено обязательное поле «Главные герои»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_locations"
+       ],
+       "pointer": "/main_locations",
+       "label": "Бриф · Главные места",
+       "message": "Не заполнено обязательное поле «Главные места»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "moral"
+       ],
+       "pointer": "/moral",
+       "label": "Бриф · Мораль",
+       "message": "Рекомендуется заполнить поле «Мораль»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "pages_max"
+       ],
+       "pointer": "/pages_max",
+       "label": "Бриф · Страниц не больше",
+       "message": "Не заполнено обязательное поле «Страниц не больше»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "pages_min"
+       ],
+       "pointer": "/pages_min",
+       "label": "Бриф · Страниц не меньше",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "seed"
+       ],
+       "pointer": "/seed",
+       "label": "Бриф · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "storybook_prompt"
+       ],
+       "pointer": "/storybook_prompt",
+       "label": "Бриф · Исходное задание",
+       "message": "Рекомендуется заполнить поле «Исходное задание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "target_age"
+       ],
+       "pointer": "/target_age",
+       "label": "Бриф · Возраст читателя",
+       "message": "Рекомендуется заполнить поле «Возраст читателя»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_max"
+       ],
+       "pointer": "/words_per_page_max",
+       "label": "Бриф · Слов на странице не больше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не больше»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_min"
+       ],
+       "pointer": "/words_per_page_min",
+       "label": "Бриф · Слов на странице не меньше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не меньше»"
+      }
+     ]
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "root",
+       "path": [],
+       "pointer": "",
+       "label": "Бриф",
+       "message": "Ожидается объект, сейчас список"
+      }
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     []
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "warning",
+       "code": "recommended"
+      }
+     ]
+    ],
+    "out": false
+   }
+  ],
+  "error_count": [
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "english_prompt"
+       ],
+       "pointer": "/items/0/english_prompt",
+       "label": "Шоты · элемент 1 · Промпт картинки",
+       "message": "Ожидается строка, сейчас целое число"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "height"
+       ],
+       "pointer": "/items/0/height",
+       "label": "Шоты · элемент 1 · Высота",
+       "message": "Рекомендуется заполнить поле «Высота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "negative_prompt"
+       ],
+       "pointer": "/items/0/negative_prompt",
+       "label": "Шоты · элемент 1 · Негативный промпт",
+       "message": "Рекомендуется заполнить поле «Негативный промпт»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "reference_image_paths"
+       ],
+       "pointer": "/items/0/reference_image_paths",
+       "label": "Шоты · элемент 1 · Референсы",
+       "message": "Рекомендуется заполнить поле «Референсы»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "seed"
+       ],
+       "pointer": "/items/0/seed",
+       "label": "Шоты · элемент 1 · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "items",
+        0,
+        "shot_number"
+       ],
+       "pointer": "/items/0/shot_number",
+       "label": "Шоты · элемент 1 · Шот",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "items",
+        0,
+        "shot_type"
+       ],
+       "pointer": "/items/0/shot_type",
+       "label": "Шоты · элемент 1 · Тип шота",
+       "message": "Не заполнено обязательное поле «Тип шота»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "timing"
+       ],
+       "pointer": "/items/0/timing",
+       "label": "Шоты · элемент 1 · Тайминг",
+       "message": "Рекомендуется заполнить поле «Тайминг»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "items",
+        0,
+        "video_prompt"
+       ],
+       "pointer": "/items/0/video_prompt",
+       "label": "Шоты · элемент 1 · Промпт видео",
+       "message": "Рекомендуется заполнить поле «Промпт видео»"
+      },
+      {
+       "severity": "error",
+       "code": "range",
+       "path": [
+        "items",
+        0,
+        "width"
+       ],
+       "pointer": "/items/0/width",
+       "label": "Шоты · элемент 1 · Ширина",
+       "message": "Слишком мало: не меньше 1"
+      }
+     ]
+    ],
+    "out": 4
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "description"
+       ],
+       "pointer": "/description",
+       "label": "Бриф · Описание",
+       "message": "Не заполнено обязательное поле «Описание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "genre"
+       ],
+       "pointer": "/genre",
+       "label": "Бриф · Жанр",
+       "message": "Рекомендуется заполнить поле «Жанр»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "language"
+       ],
+       "pointer": "/language",
+       "label": "Бриф · Язык",
+       "message": "Не заполнено обязательное поле «Язык»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_characters"
+       ],
+       "pointer": "/main_characters",
+       "label": "Бриф · Главные герои",
+       "message": "Не заполнено обязательное поле «Главные герои»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "main_locations"
+       ],
+       "pointer": "/main_locations",
+       "label": "Бриф · Главные места",
+       "message": "Не заполнено обязательное поле «Главные места»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "moral"
+       ],
+       "pointer": "/moral",
+       "label": "Бриф · Мораль",
+       "message": "Рекомендуется заполнить поле «Мораль»"
+      },
+      {
+       "severity": "error",
+       "code": "required",
+       "path": [
+        "pages_max"
+       ],
+       "pointer": "/pages_max",
+       "label": "Бриф · Страниц не больше",
+       "message": "Не заполнено обязательное поле «Страниц не больше»"
+      },
+      {
+       "severity": "error",
+       "code": "type",
+       "path": [
+        "pages_min"
+       ],
+       "pointer": "/pages_min",
+       "label": "Бриф · Страниц не меньше",
+       "message": "Ожидается целое число, сейчас строка"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "seed"
+       ],
+       "pointer": "/seed",
+       "label": "Бриф · Зерно случайности",
+       "message": "Рекомендуется заполнить поле «Зерно случайности»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "storybook_prompt"
+       ],
+       "pointer": "/storybook_prompt",
+       "label": "Бриф · Исходное задание",
+       "message": "Рекомендуется заполнить поле «Исходное задание»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "target_age"
+       ],
+       "pointer": "/target_age",
+       "label": "Бриф · Возраст читателя",
+       "message": "Рекомендуется заполнить поле «Возраст читателя»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_max"
+       ],
+       "pointer": "/words_per_page_max",
+       "label": "Бриф · Слов на странице не больше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не больше»"
+      },
+      {
+       "severity": "warning",
+       "code": "recommended",
+       "path": [
+        "words_per_page_min"
+       ],
+       "pointer": "/words_per_page_min",
+       "label": "Бриф · Слов на странице не меньше",
+       "message": "Рекомендуется заполнить поле «Слов на странице не меньше»"
+      }
+     ]
+    ],
+    "out": 6
+   },
+   {
+    "in": [
+     [
+      {
+       "severity": "error",
+       "code": "root",
+       "path": [],
+       "pointer": "",
+       "label": "Бриф",
+       "message": "Ожидается объект, сейчас список"
+      }
+     ]
+    ],
+    "out": 1
+   }
+  ],
+  "ancestor_pointers": [
+   {
+    "in": [
+     ""
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     "/a"
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     "/items/3/timing"
+    ],
+    "out": [
+     "/items",
+     "/items/3"
+    ]
+   },
+   {
+    "in": [
+     "/items/3"
+    ],
+    "out": [
+     "/items"
+    ]
+   }
+  ],
+  "cursor_for_finding": [
+   {
+    "in": [
+     {
+      "path": [
+       "a",
+       "y"
+      ],
+      "line": null,
+      "column": null
+     },
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}"
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     {
+      "path": [
+       "zz"
+      ],
+      "line": null,
+      "column": null
+     },
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}"
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     {
+      "path": [],
+      "line": 3,
+      "column": 5
+     },
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}"
+    ],
+    "out": 16
+   },
+   {
+    "in": [
+     {
+      "path": [],
+      "line": 99,
+      "column": 99
+     },
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}"
+    ],
+    "out": 75
+   }
+  ],
+  "version_rows": [
+   {
+    "in": [
+     [
+      {
+       "version_id": "v1",
+       "created_at": "2026-01-02T10:05:00",
+       "size": 100,
+       "digest8": "abcd1234",
+       "reason": "save",
+       "reason_title": "Сохранение"
+      },
+      {
+       "version_id": "v2",
+       "created_at": "2026-03-04T11:06:00",
+       "size": 2048,
+       "digest8": "abcd1235",
+       "reason": "restore",
+       "reason_title": "Откат"
+      }
+     ]
+    ],
+    "out": [
+     {
+      "id": "v2",
+      "date": "04.03.2026 11:06",
+      "size": "2.0 КБ",
+      "reason": "Откат"
+     },
+     {
+      "id": "v1",
+      "date": "02.01.2026 10:05",
+      "size": "100 Б",
+      "reason": "Сохранение"
+     }
+    ]
+   }
+  ],
+  "format_diff_value": [
+   {
+    "in": [
+     "короткая",
+     true
+    ],
+    "out": "короткая"
+   },
+   {
+    "in": [
+     "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+     true
+    ],
+    "out": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx…"
+   },
+   {
+    "in": [
+     {
+      "a": 1
+     },
+     true
+    ],
+    "out": "{\"a\":1}"
+   },
+   {
+    "in": [
+     "удалено",
+     false
+    ],
+    "out": "нет"
+   },
+   {
+    "in": [
+     null,
+     true
+    ],
+    "out": "null"
+   }
+  ],
+  "diff_rows": [
+   {
+    "in": [
+     [
+      {
+       "path": [
+        "a"
+       ],
+       "pointer": "/a",
+       "label": "Название",
+       "op": "changed",
+       "before": "1",
+       "after": "2"
+      },
+      {
+       "path": [
+        "b"
+       ],
+       "pointer": "/b",
+       "label": "",
+       "op": "added",
+       "before": null,
+       "after": [
+        1
+       ]
+      },
+      {
+       "path": [],
+       "pointer": "",
+       "label": "",
+       "op": "removed",
+       "before": 5,
+       "after": null
+      }
+     ]
+    ],
+    "out": [
+     {
+      "where": "Название",
+      "before": "1",
+      "after": "2"
+     },
+     {
+      "where": "/b",
+      "before": "нет",
+      "after": "[1]"
+     },
+     {
+      "where": "/",
+      "before": "5",
+      "after": "нет"
+     }
+    ]
+   }
+  ],
+  "summarize_validate_all": [
+   {
+    "in": [
+     [
+      {
+       "key": "a",
+       "title": "A",
+       "counts": {
+        "errors": 0,
+        "warnings": 0
+       },
+       "error": null
+      }
+     ]
+    ],
+    "out": {
+     "checked": 1,
+     "errors": 0,
+     "warnings": 0,
+     "passed": true,
+     "problems": []
+    }
+   },
+   {
+    "in": [
+     [
+      {
+       "key": "a",
+       "title": "A",
+       "counts": {
+        "errors": 0,
+        "warnings": 2
+       },
+       "error": null
+      },
+      {
+       "key": "b",
+       "title": "B",
+       "counts": {
+        "errors": 1,
+        "warnings": 0
+       },
+       "error": null
+      }
+     ]
+    ],
+    "out": {
+     "checked": 2,
+     "errors": 1,
+     "warnings": 2,
+     "passed": false,
+     "problems": [
+      {
+       "key": "a",
+       "title": "A",
+       "counts": {
+        "errors": 0,
+        "warnings": 2
+       },
+       "error": null
+      },
+      {
+       "key": "b",
+       "title": "B",
+       "counts": {
+        "errors": 1,
+        "warnings": 0
+       },
+       "error": null
+      }
+     ]
+    }
+   },
+   {
+    "in": [
+     [
+      {
+       "key": "a",
+       "title": "A",
+       "counts": null,
+       "error": "Нет связи"
+      }
+     ]
+    ],
+    "out": {
+     "checked": 1,
+     "errors": 0,
+     "warnings": 0,
+     "passed": false,
+     "problems": [
+      {
+       "key": "a",
+       "title": "A",
+       "counts": null,
+       "error": "Нет связи"
+      }
+     ]
+    }
+   },
+   {
+    "in": [
+     []
+    ],
+    "out": {
+     "checked": 0,
+     "errors": 0,
+     "warnings": 0,
+     "passed": true,
+     "problems": []
+    }
+   }
+  ],
+  "validate_all_text": [
+   {
+    "in": [
+     {
+      "checked": 5,
+      "errors": 1,
+      "warnings": 2,
+      "passed": false,
+      "problems": []
+     }
+    ],
+    "out": "Проверено файлов: 5. Ошибок: 1, замечаний: 2."
+   }
+  ],
+  "files_to_validate": [
+   {
+    "in": [
+     [
+      {
+       "artifact_key": "k",
+       "title": "Заголовок",
+       "path": "a/k.json",
+       "exists": true,
+       "status": "present",
+       "size": 1,
+       "modified": null,
+       "editable": true,
+       "read_only_reason": "",
+       "careful": false,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      },
+      {
+       "artifact_key": "m",
+       "title": "Нет",
+       "path": "m.json",
+       "exists": false,
+       "status": "missing",
+       "size": 1,
+       "modified": null,
+       "editable": true,
+       "read_only_reason": "",
+       "careful": false,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      },
+      {
+       "artifact_key": "r",
+       "title": "Чтение",
+       "path": "a/k.json",
+       "exists": true,
+       "status": "invalid",
+       "size": 1,
+       "modified": null,
+       "editable": false,
+       "read_only_reason": "Создаётся пайплайном",
+       "careful": true,
+       "root": "object",
+       "writers": [],
+       "produced_by": "",
+       "run_state": "free",
+       "run_state_message": "",
+       "history_count": 0,
+       "error": null
+      }
+     ]
+    ],
+    "out": [
+     "k",
+     "r"
+    ]
+   }
+  ]
+ }
+}

@@ -3,6 +3,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+_BUDGET_ERROR_CODES = {'budget_exceeded', 'budget_price_unknown'}
+
 
 def generate_with_model_fallback(generate, item, params, cycles=1, fallback_model=None):
     model = item.get('video_model') or params['configured_model']
@@ -49,6 +51,9 @@ def generate_with_model_fallback(generate, item, params, cycles=1, fallback_mode
                                  error=result.get('error')))
             if result.get('success'):
                 return dict(result, model=candidate_model, video_attempts=attempts)
+            if result.get('error_code') in _BUDGET_ERROR_CODES:
+                # остановка по денежному бюджету не лечится повтором и резервной моделью
+                return dict(result, video_attempts=attempts)
             job = current_job(candidate_model)
             if job:
                 if job.get('task_id') and job.get('status') != 'failed' and job.get('provider_status') not in {'failed', 'cancelled', 'canceled', 'error'}:

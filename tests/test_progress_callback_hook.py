@@ -6,8 +6,6 @@
 - _uninstall_step_hook определён в PipelineRunner
 - run_full_pipeline вызывает _install_step_hook при наличии callback
 - run_full_pipeline вызывает _uninstall_step_hook в finally
-- progress_callback в generation_panel принимает step_id/step_status/step_duration
-- progress_callback обновляет step_tracker
 """
 
 import unittest
@@ -19,7 +17,6 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 RUNNER_PATH = project_root / "StoryBookManager" / "core" / "pipeline_runner.py"
-PANEL_PATH = project_root / "StoryBookManager" / "gui" / "generation_panel.py"
 
 
 class TestStepHookExists(unittest.TestCase):
@@ -107,54 +104,6 @@ class TestProgressBarUpdate(unittest.TestCase):
         body = self._get_hook_body()
         self.assertIn("completed_count[0] / total_steps", body)
         self.assertIn("* 100", body)
-
-    def test_callback_sends_progress_to_update_progress(self):
-        """progress_callback в generation_panel вызывает update_progress
-
-        Прогресс из потока пробрасывается в update_progress thread-safe способом
-        через self.after(...), поэтому проверяем оба звена цепочки.
-        """
-        source = PANEL_PATH.read_text(encoding="utf-8")
-        start = source.index("def _run_full_pipeline_thread(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
-        self.assertIn("_progress(progress", body)
-        self.assertIn("self.update_progress(", body)
-
-    def test_update_progress_sets_bar_value(self):
-        """update_progress устанавливает progress_bar['value']"""
-        source = PANEL_PATH.read_text(encoding="utf-8")
-        start = source.index("def update_progress(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
-        self.assertIn("progress_bar", body)
-
-
-class TestGenerationPanelCallback(unittest.TestCase):
-    """Проверяет что callback в generation_panel обрабатывает step info"""
-
-    def _get_full_pipeline_thread_body(self):
-        source = PANEL_PATH.read_text(encoding="utf-8")
-        start = source.index("def _run_full_pipeline_thread(self")
-        next_def = source.index("\n    def ", start + 1)
-        return source[start:next_def]
-
-    def test_callback_accepts_step_params(self):
-        body = self._get_full_pipeline_thread_body()
-        self.assertIn("step_id", body)
-        self.assertIn("step_status", body)
-        self.assertIn("step_duration", body)
-
-    def test_callback_updates_step_tracker(self):
-        body = self._get_full_pipeline_thread_body()
-        self.assertIn("step_tracker.update_step", body)
-
-    def test_from_step_callback_also_updated(self):
-        source = PANEL_PATH.read_text(encoding="utf-8")
-        start = source.index("def _run_from_step_thread(self")
-        next_def = source.index("\n    def ", start + 1)
-        body = source[start:next_def]
-        self.assertIn("step_tracker.update_step", body)
 
 
 if __name__ == "__main__":

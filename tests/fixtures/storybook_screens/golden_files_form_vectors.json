@@ -1,0 +1,1917 @@
+{
+ "contents": {
+  "shots_sample": {
+   "key": "shots",
+   "content": {
+    "items": [
+     {
+      "shot_number": 1,
+      "scene_number": 1,
+      "shot_type": "wide",
+      "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+      "video_prompt": "line one\nline two",
+      "reference_image_paths": [
+       "a.png",
+       "b.png"
+      ],
+      "seed": null,
+      "width": 1024,
+      "height": 576,
+      "timing": {
+       "start": 0,
+       "end": 2.5
+      },
+      "extra": {
+       "nested": [
+        1,
+        "x"
+       ]
+      }
+     },
+     {
+      "shot_number": 2,
+      "scene_number": 1,
+      "shot_type": "close"
+     }
+    ]
+   }
+  },
+  "brief_sample": {
+   "key": "brief",
+   "content": {
+    "title": "Лиса",
+    "description": "Короткое описание",
+    "pages_min": 3,
+    "pages_max": 8,
+    "main_characters": [
+     "Лиса",
+     "Заяц"
+    ],
+    "seed": null,
+    "flag": true
+   }
+  },
+  "beats_root_array": {
+   "key": "beats",
+   "content": [
+    {
+     "id": "b1",
+     "goal": "Цель",
+     "page_number": 1
+    },
+    {
+     "id": "b2",
+     "goal": "Другая",
+     "page_number": 2
+    }
+   ]
+  },
+  "mixed": {
+   "key": "unknown_key",
+   "content": {
+    "a": [
+     1,
+     "x"
+    ],
+    "b": [
+     [
+      1
+     ],
+     [
+      2
+     ]
+    ],
+    "c": {},
+    "k/ey~": "v",
+    "nums": [
+     1,
+     2.5
+    ]
+   }
+  },
+  "root_scalar": {
+   "key": "brief",
+   "content": 5
+  },
+  "empty_array": {
+   "key": "beats",
+   "content": []
+  }
+ },
+ "vectors": {
+  "build_fields": [
+   {
+    "in": [
+     "shots",
+     {
+      "items": [
+       {
+        "shot_number": 1,
+        "scene_number": 1,
+        "shot_type": "wide",
+        "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+        "video_prompt": "line one\nline two",
+        "reference_image_paths": [
+         "a.png",
+         "b.png"
+        ],
+        "seed": null,
+        "width": 1024,
+        "height": 576,
+        "timing": {
+         "start": 0,
+         "end": 2.5
+        },
+        "extra": {
+         "nested": [
+          1,
+          "x"
+         ]
+        }
+       },
+       {
+        "shot_number": 2,
+        "scene_number": 1,
+        "shot_type": "close"
+       }
+      ]
+     }
+    ],
+    "out": [
+     {
+      "pointer": "/items",
+      "path": [
+       "items"
+      ],
+      "label": "Шоты",
+      "kind": "list",
+      "value": null,
+      "readOnly": false,
+      "depth": 0,
+      "size": 19
+     },
+     {
+      "pointer": "/items/0",
+      "path": [
+       "items",
+       0
+      ],
+      "label": "Шот 1",
+      "kind": "item",
+      "value": null,
+      "readOnly": false,
+      "depth": 1,
+      "size": 14
+     },
+     {
+      "pointer": "/items/0/shot_number",
+      "path": [
+       "items",
+       0,
+       "shot_number"
+      ],
+      "label": "Шот",
+      "kind": "number",
+      "value": 1,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/scene_number",
+      "path": [
+       "items",
+       0,
+       "scene_number"
+      ],
+      "label": "Сцена",
+      "kind": "number",
+      "value": 1,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/shot_type",
+      "path": [
+       "items",
+       0,
+       "shot_type"
+      ],
+      "label": "Тип шота",
+      "kind": "string",
+      "value": "wide",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/english_prompt",
+      "path": [
+       "items",
+       0,
+       "english_prompt"
+      ],
+      "label": "Промпт картинки",
+      "kind": "text",
+      "value": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/video_prompt",
+      "path": [
+       "items",
+       0,
+       "video_prompt"
+      ],
+      "label": "Промпт видео",
+      "kind": "text",
+      "value": "line one\nline two",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/reference_image_paths",
+      "path": [
+       "items",
+       0,
+       "reference_image_paths"
+      ],
+      "label": "Референсы",
+      "kind": "lines",
+      "value": [
+       "a.png",
+       "b.png"
+      ],
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/seed",
+      "path": [
+       "items",
+       0,
+       "seed"
+      ],
+      "label": "Зерно случайности",
+      "kind": "null",
+      "value": null,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/width",
+      "path": [
+       "items",
+       0,
+       "width"
+      ],
+      "label": "Ширина",
+      "kind": "number",
+      "value": 1024,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/height",
+      "path": [
+       "items",
+       0,
+       "height"
+      ],
+      "label": "Высота",
+      "kind": "number",
+      "value": 576,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/timing",
+      "path": [
+       "items",
+       0,
+       "timing"
+      ],
+      "label": "Тайминг",
+      "kind": "group",
+      "value": null,
+      "readOnly": false,
+      "depth": 2,
+      "size": 2
+     },
+     {
+      "pointer": "/items/0/timing/start",
+      "path": [
+       "items",
+       0,
+       "timing",
+       "start"
+      ],
+      "label": "start",
+      "kind": "number",
+      "value": 0,
+      "readOnly": false,
+      "depth": 3,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/timing/end",
+      "path": [
+       "items",
+       0,
+       "timing",
+       "end"
+      ],
+      "label": "end",
+      "kind": "number",
+      "value": 2.5,
+      "readOnly": false,
+      "depth": 3,
+      "size": 0
+     },
+     {
+      "pointer": "/items/0/extra",
+      "path": [
+       "items",
+       0,
+       "extra"
+      ],
+      "label": "extra",
+      "kind": "group",
+      "value": null,
+      "readOnly": false,
+      "depth": 2,
+      "size": 1
+     },
+     {
+      "pointer": "/items/0/extra/nested",
+      "path": [
+       "items",
+       0,
+       "extra",
+       "nested"
+      ],
+      "label": "nested",
+      "kind": "raw",
+      "value": [
+       1,
+       "x"
+      ],
+      "readOnly": true,
+      "depth": 3,
+      "size": 0
+     },
+     {
+      "pointer": "/items/1",
+      "path": [
+       "items",
+       1
+      ],
+      "label": "Шот 2",
+      "kind": "item",
+      "value": null,
+      "readOnly": false,
+      "depth": 1,
+      "size": 3
+     },
+     {
+      "pointer": "/items/1/shot_number",
+      "path": [
+       "items",
+       1,
+       "shot_number"
+      ],
+      "label": "Шот",
+      "kind": "number",
+      "value": 2,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/1/scene_number",
+      "path": [
+       "items",
+       1,
+       "scene_number"
+      ],
+      "label": "Сцена",
+      "kind": "number",
+      "value": 1,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/items/1/shot_type",
+      "path": [
+       "items",
+       1,
+       "shot_type"
+      ],
+      "label": "Тип шота",
+      "kind": "string",
+      "value": "close",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     }
+    ]
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     }
+    ],
+    "out": [
+     {
+      "pointer": "/title",
+      "path": [
+       "title"
+      ],
+      "label": "Название",
+      "kind": "string",
+      "value": "Лиса",
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/description",
+      "path": [
+       "description"
+      ],
+      "label": "Описание",
+      "kind": "string",
+      "value": "Короткое описание",
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/pages_min",
+      "path": [
+       "pages_min"
+      ],
+      "label": "Страниц не меньше",
+      "kind": "number",
+      "value": 3,
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/pages_max",
+      "path": [
+       "pages_max"
+      ],
+      "label": "Страниц не больше",
+      "kind": "number",
+      "value": 8,
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/main_characters",
+      "path": [
+       "main_characters"
+      ],
+      "label": "Главные герои",
+      "kind": "lines",
+      "value": [
+       "Лиса",
+       "Заяц"
+      ],
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/seed",
+      "path": [
+       "seed"
+      ],
+      "label": "Зерно случайности",
+      "kind": "null",
+      "value": null,
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/flag",
+      "path": [
+       "flag"
+      ],
+      "label": "flag",
+      "kind": "bool",
+      "value": true,
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     }
+    ]
+   },
+   {
+    "in": [
+     "beats",
+     [
+      {
+       "id": "b1",
+       "goal": "Цель",
+       "page_number": 1
+      },
+      {
+       "id": "b2",
+       "goal": "Другая",
+       "page_number": 2
+      }
+     ]
+    ],
+    "out": [
+     {
+      "pointer": "",
+      "path": [],
+      "label": "Сюжетные точки",
+      "kind": "list",
+      "value": null,
+      "readOnly": false,
+      "depth": 0,
+      "size": 8
+     },
+     {
+      "pointer": "/0",
+      "path": [
+       0
+      ],
+      "label": "Сюжетная точка 1",
+      "kind": "item",
+      "value": null,
+      "readOnly": false,
+      "depth": 1,
+      "size": 3
+     },
+     {
+      "pointer": "/0/id",
+      "path": [
+       0,
+       "id"
+      ],
+      "label": "Идентификатор",
+      "kind": "string",
+      "value": "b1",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/0/goal",
+      "path": [
+       0,
+       "goal"
+      ],
+      "label": "Цель",
+      "kind": "string",
+      "value": "Цель",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/0/page_number",
+      "path": [
+       0,
+       "page_number"
+      ],
+      "label": "Страница",
+      "kind": "number",
+      "value": 1,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/1",
+      "path": [
+       1
+      ],
+      "label": "Сюжетная точка 2",
+      "kind": "item",
+      "value": null,
+      "readOnly": false,
+      "depth": 1,
+      "size": 3
+     },
+     {
+      "pointer": "/1/id",
+      "path": [
+       1,
+       "id"
+      ],
+      "label": "Идентификатор",
+      "kind": "string",
+      "value": "b2",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/1/goal",
+      "path": [
+       1,
+       "goal"
+      ],
+      "label": "Цель",
+      "kind": "string",
+      "value": "Другая",
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     },
+     {
+      "pointer": "/1/page_number",
+      "path": [
+       1,
+       "page_number"
+      ],
+      "label": "Страница",
+      "kind": "number",
+      "value": 2,
+      "readOnly": false,
+      "depth": 2,
+      "size": 0
+     }
+    ]
+   },
+   {
+    "in": [
+     "unknown_key",
+     {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     }
+    ],
+    "out": [
+     {
+      "pointer": "/a",
+      "path": [
+       "a"
+      ],
+      "label": "a",
+      "kind": "raw",
+      "value": [
+       1,
+       "x"
+      ],
+      "readOnly": true,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/b",
+      "path": [
+       "b"
+      ],
+      "label": "b",
+      "kind": "raw",
+      "value": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "readOnly": true,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/c",
+      "path": [
+       "c"
+      ],
+      "label": "c",
+      "kind": "group",
+      "value": null,
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/k~1ey~0",
+      "path": [
+       "k/ey~"
+      ],
+      "label": "k/ey~",
+      "kind": "string",
+      "value": "v",
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     },
+     {
+      "pointer": "/nums",
+      "path": [
+       "nums"
+      ],
+      "label": "nums",
+      "kind": "numlines",
+      "value": [
+       1,
+       2.5
+      ],
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     }
+    ]
+   },
+   {
+    "in": [
+     "brief",
+     5
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "beats",
+     []
+    ],
+    "out": [
+     {
+      "pointer": "",
+      "path": [],
+      "label": "Сюжетные точки",
+      "kind": "lines",
+      "value": [],
+      "readOnly": false,
+      "depth": 0,
+      "size": 0
+     }
+    ]
+   }
+  ],
+  "apply_input": [
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/title",
+     "Новое"
+    ],
+    "out": {
+     "content": {
+      "title": "Новое",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/pages_min",
+     "12"
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 12,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/pages_min",
+     "1,5"
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 1.5,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/pages_min",
+     "abc"
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": "Поле «Страниц не меньше» должно быть числом."
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/pages_min",
+     ""
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": "Поле «Страниц не меньше» должно быть числом."
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/flag",
+     false
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": false
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/seed",
+     "42"
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": "42",
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/seed",
+     ""
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "brief",
+     {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Заяц"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "/main_characters",
+     "Лиса\n\nСова\n"
+    ],
+    "out": {
+     "content": {
+      "title": "Лиса",
+      "description": "Короткое описание",
+      "pages_min": 3,
+      "pages_max": 8,
+      "main_characters": [
+       "Лиса",
+       "Сова"
+      ],
+      "seed": null,
+      "flag": true
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "shots",
+     {
+      "items": [
+       {
+        "shot_number": 1,
+        "scene_number": 1,
+        "shot_type": "wide",
+        "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+        "video_prompt": "line one\nline two",
+        "reference_image_paths": [
+         "a.png",
+         "b.png"
+        ],
+        "seed": null,
+        "width": 1024,
+        "height": 576,
+        "timing": {
+         "start": 0,
+         "end": 2.5
+        },
+        "extra": {
+         "nested": [
+          1,
+          "x"
+         ]
+        }
+       },
+       {
+        "shot_number": 2,
+        "scene_number": 1,
+        "shot_type": "close"
+       }
+      ]
+     },
+     "/items/0/video_prompt",
+     "один\nдва\nтри"
+    ],
+    "out": {
+     "content": {
+      "items": [
+       {
+        "shot_number": 1,
+        "scene_number": 1,
+        "shot_type": "wide",
+        "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+        "video_prompt": "один\nдва\nтри",
+        "reference_image_paths": [
+         "a.png",
+         "b.png"
+        ],
+        "seed": null,
+        "width": 1024,
+        "height": 576,
+        "timing": {
+         "start": 0,
+         "end": 2.5
+        },
+        "extra": {
+         "nested": [
+          1,
+          "x"
+         ]
+        }
+       },
+       {
+        "shot_number": 2,
+        "scene_number": 1,
+        "shot_type": "close"
+       }
+      ]
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "shots",
+     {
+      "items": [
+       {
+        "shot_number": 1,
+        "scene_number": 1,
+        "shot_type": "wide",
+        "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+        "video_prompt": "line one\nline two",
+        "reference_image_paths": [
+         "a.png",
+         "b.png"
+        ],
+        "seed": null,
+        "width": 1024,
+        "height": 576,
+        "timing": {
+         "start": 0,
+         "end": 2.5
+        },
+        "extra": {
+         "nested": [
+          1,
+          "x"
+         ]
+        }
+       },
+       {
+        "shot_number": 2,
+        "scene_number": 1,
+        "shot_type": "close"
+       }
+      ]
+     },
+     "/items/0/reference_image_paths",
+     ""
+    ],
+    "out": {
+     "content": {
+      "items": [
+       {
+        "shot_number": 1,
+        "scene_number": 1,
+        "shot_type": "wide",
+        "english_prompt": "A very long prompt that goes on and on to describe a quiet forest clearing at dawn with soft light",
+        "video_prompt": "line one\nline two",
+        "reference_image_paths": [],
+        "seed": null,
+        "width": 1024,
+        "height": 576,
+        "timing": {
+         "start": 0,
+         "end": 2.5
+        },
+        "extra": {
+         "nested": [
+          1,
+          "x"
+         ]
+        }
+       },
+       {
+        "shot_number": 2,
+        "scene_number": 1,
+        "shot_type": "close"
+       }
+      ]
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "unknown_key",
+     {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "/nums",
+     "1\n2,5\n"
+    ],
+    "out": {
+     "content": {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "error": null
+    }
+   },
+   {
+    "in": [
+     "unknown_key",
+     {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "/nums",
+     "1\nx"
+    ],
+    "out": {
+     "content": {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "error": "Поле «nums» должно быть числом."
+    }
+   },
+   {
+    "in": [
+     "unknown_key",
+     {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "/a",
+     "ignored"
+    ],
+    "out": {
+     "content": {
+      "a": [
+       1,
+       "x"
+      ],
+      "b": [
+       [
+        1
+       ],
+       [
+        2
+       ]
+      ],
+      "c": {},
+      "k/ey~": "v",
+      "nums": [
+       1,
+       2.5
+      ]
+     },
+     "error": null
+    }
+   }
+  ],
+  "json_offset_of": [
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     []
+    ],
+    "out": 0
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "a"
+     ]
+    ],
+    "out": 9
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "b"
+     ]
+    ],
+    "out": 19
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "b",
+      1
+     ]
+    ],
+    "out": 39
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "b",
+      1,
+      "y"
+     ]
+    ],
+    "out": 45
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "k"
+     ]
+    ],
+    "out": 64
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      "zz"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      1
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      1,
+      0
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "{\n  \"a\": 1,\n  \"b\": [\n    {\"x\": 1},\n    {\"y\": \"s,}\"}\n  ],\n  \"k\": \"q\\\"uote\"\n}",
+     [
+      2,
+      "a"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     []
+    ],
+    "out": 0
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "a"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "b"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "b",
+      1
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "b",
+      1,
+      "y"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "k"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      "zz"
+     ]
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      1
+     ]
+    ],
+    "out": 4
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      1,
+      0
+     ]
+    ],
+    "out": 5
+   },
+   {
+    "in": [
+     "[1, [2, 3], {\"a\": null}]",
+     [
+      2,
+      "a"
+     ]
+    ],
+    "out": 18
+   }
+  ],
+  "line_col_at": [
+   {
+    "in": [
+     "ab\ncd\nef",
+     0
+    ],
+    "out": {
+     "line": 1,
+     "column": 1
+    }
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     4
+    ],
+    "out": {
+     "line": 2,
+     "column": 2
+    }
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     8
+    ],
+    "out": {
+     "line": 3,
+     "column": 3
+    }
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     99
+    ],
+    "out": {
+     "line": 3,
+     "column": 3
+    }
+   }
+  ],
+  "offset_at": [
+   {
+    "in": [
+     "ab\ncd\nef",
+     1,
+     1
+    ],
+    "out": 0
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     2,
+     2
+    ],
+    "out": 4
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     3,
+     99
+    ],
+    "out": 8
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     99,
+     1
+    ],
+    "out": 6
+   },
+   {
+    "in": [
+     "ab\ncd\nef",
+     0,
+     0
+    ],
+    "out": 0
+   }
+  ],
+  "parse_number": [
+   {
+    "in": [
+     "12"
+    ],
+    "out": 12
+   },
+   {
+    "in": [
+     " 3,5 "
+    ],
+    "out": 3.5
+   },
+   {
+    "in": [
+     "-2"
+    ],
+    "out": -2
+   },
+   {
+    "in": [
+     "+.5"
+    ],
+    "out": 0.5
+   },
+   {
+    "in": [
+     "1e3"
+    ],
+    "out": 1000
+   },
+   {
+    "in": [
+     "abc"
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     ""
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "1.2.3"
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "Infinity"
+    ],
+    "out": null
+   },
+   {
+    "in": [
+     "0x10"
+    ],
+    "out": null
+   }
+  ],
+  "pointer_of": [
+   {
+    "in": [
+     []
+    ],
+    "out": ""
+   },
+   {
+    "in": [
+     [
+      "a"
+     ]
+    ],
+    "out": "/a"
+   },
+   {
+    "in": [
+     [
+      "a",
+      0,
+      "b"
+     ]
+    ],
+    "out": "/a/0/b"
+   },
+   {
+    "in": [
+     [
+      "k/ey~"
+     ]
+    ],
+    "out": "/k~1ey~0"
+   }
+  ],
+  "template_of": [
+   {
+    "in": [
+     []
+    ],
+    "out": ""
+   },
+   {
+    "in": [
+     [
+      "items",
+      3,
+      "timing"
+     ]
+    ],
+    "out": "/items/*/timing"
+   },
+   {
+    "in": [
+     [
+      "a",
+      0,
+      "b",
+      12
+     ]
+    ],
+    "out": "/a/*/b/*"
+   }
+  ],
+  "label_for": [
+   {
+    "in": [
+     "shots",
+     [
+      "items",
+      0,
+      "timing"
+     ]
+    ],
+    "out": "Тайминг"
+   },
+   {
+    "in": [
+     "shots",
+     [
+      "items",
+      1
+     ]
+    ],
+    "out": "Шот 2"
+   },
+   {
+    "in": [
+     "shots",
+     [
+      "items",
+      0,
+      "unknown"
+     ]
+    ],
+    "out": "unknown"
+   },
+   {
+    "in": [
+     "unknown",
+     [
+      0
+     ]
+    ],
+    "out": "Элемент 1"
+   },
+   {
+    "in": [
+     "brief",
+     []
+    ],
+    "out": "Бриф"
+   },
+   {
+    "in": [
+     "beats",
+     [
+      2
+     ]
+    ],
+    "out": "Сюжетная точка 3"
+   },
+   {
+    "in": [
+     "unknown",
+     [
+      "x"
+     ]
+    ],
+    "out": "x"
+   }
+  ],
+  "is_long_string": [
+   {
+    "in": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "a\nb"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     ""
+    ],
+    "out": false
+   }
+  ],
+  "content_to_text": [
+   {
+    "in": [
+     {
+      "я": [
+       1,
+       {
+        "a": null
+       }
+      ]
+     }
+    ],
+    "out": "{\n  \"я\": [\n    1,\n    {\n      \"a\": null\n    }\n  ]\n}"
+   },
+   {
+    "in": [
+     []
+    ],
+    "out": "[]"
+   },
+   {
+    "in": [
+     "s"
+    ],
+    "out": "\"s\""
+   }
+  ]
+ }
+}

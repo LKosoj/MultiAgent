@@ -47,16 +47,19 @@ StoryBookManager/
 │   ├── project_manager.py     # Управление проектами
 │   ├── file_manager.py        # Работа с файлами
 │   ├── pipeline_runner.py     # Интеграция с workflow
-│   └── media_processor.py     # Обработка медиа
+│   └── studio_bridge.py       # Мост к возможностям студии (фоновые вызовы)
 ├── gui/                        # Пользовательский интерфейс
-│   ├── main_window.py         # Главное окно
-│   ├── project_panel.py       # Панель проектов
-│   ├── editor_panel.py        # Редактор JSON
-│   ├── media_panel.py         # Просмотрщик медиа
-│   └── generation_panel.py    # Панель генерации
+│   ├── main_window.py         # Главное окно (оболочка). Имена project_panel, blockout_panel,
+│   │                          #   editor_panel в нём - это экраны ProjectsScreen, BlockoutScreen, FilesScreen
+│   ├── shell/                 # Оболочка: навигация, верхняя строка, тосты, опрос состояния
+│   ├── sections/              # «Проекты» и «Обзор»
+│   ├── shots/                 # «Кадры»
+│   ├── generation/            # «Генерация»
+│   ├── screens/               # «Болванка», «Файлы», «Фильм», «Настройки»
+│   ├── universal_json_editor.py # Генератор форм по схеме (нужен file_manager для валидации)
+│   └── theme.py, theme_tokens.py # Тема и размеры
 └── utils/                      # Утилиты
-    ├── logging_config.py      # Настройка логирования
-    └── json_validator.py      # Валидация JSON
+    └── logging_config.py      # Настройка логирования
 ```
 
 ## 🎯 Основные функции
@@ -274,8 +277,7 @@ StoryBook Manager интегрируется с существующим `workfl
 
 1. Добавьте JSON схему в `config/schemas.py`
 2. Расширьте `core/file_manager.py` для работы с новым типом
-3. Добавьте форму редактирования в `gui/editor_panel.py`
-4. Обновите валидацию в `utils/json_validator.py`
+3. Добавьте форму редактирования в `gui/screens/files_*` (экран «Файлы»)
 
 ## 📝 Логирование
 

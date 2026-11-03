@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Манифест ресурсов",
+  "properties": {
+    "clips": {
+      "type": "array",
+      "title": "Клипы",
+      "items": {
+        "type": "object",
+        "title": "Клип",
+        "properties": {
+          "scene_number": {
+            "type": "integer",
+            "title": "Сцена"
+          },
+          "shot_number": {
+            "type": "integer",
+            "title": "Шот"
+          }
+        },
+        "required": [
+          "scene_number",
+          "shot_number"
+        ]
+      }
+    },
+    "missing_clips": {
+      "type": "array",
+      "title": "Недостающие клипы"
+    },
+    "audio": {
+      "type": "object",
+      "title": "Звук"
+    }
+  },
+  "required": [
+    "clips"
+  ],
+  "x-recommended": [
+    "missing_clips",
+    "audio"
+  ]
+}

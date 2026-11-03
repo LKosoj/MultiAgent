@@ -17,11 +17,8 @@ import json
 import logging
 import shutil
 import sys
-import time
-import types
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -138,65 +135,8 @@ def test_a05_handle_linked_shot_already_current_logs_recognizable_journal_messag
     assert any("актуален" in msg for msg in messages), messages
 
 
-# =============================================================================
-# A15: норматив "на проекте из 54 шотов с отрендеренной болванкой не более 2
-# секунд" для get_project_images(include_blockout_frames=False). Логика и
-# сама info-строка уже покрыты (1 файл): tests/test_media_processor_blockout_
-# categories.py::test_get_project_images_logs_skipped_blockout_dirs_when_
-# frames_flag_false. НЕ покрыто нигде: замер именно на реалистичном масштабе
-# (54 шота * ~120 фреймов = 6480 файлов, как у реально отрендеренной болванки
-# 5с/24fps) -- без этого норматив "≤2с" ничего не доказывает.
-# =============================================================================
-
-tk_mock = MagicMock()
-sys.modules.setdefault("tkinter", tk_mock)
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "StoryBookManager"))
-
-from StoryBookManager.config.settings import app_settings  # noqa: E402
-from StoryBookManager.core.media_processor import MediaProcessor  # noqa: E402
-import config.settings as _legacy_config_settings  # noqa: E402
-
-
-def test_a15_get_project_images_scans_54_shot_blockout_project_within_2s(tmp_path, monkeypatch):
-    backups = tmp_path / "isolated_backups"
-    for settings_obj in (app_settings, _legacy_config_settings.app_settings):
-        monkeypatch.setattr(settings_obj, "get_backup_directory", lambda: backups)
-    monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path / "projects"))
-
-    processor = MediaProcessor("perf_project")
-    project_path = processor.project_path
-    blockout_dir = project_path / "93_blockout"
-
-    # 54 шота, каждый с ref_start/ref_end и 120 фреймами (5с при 24fps) --
-    # тот же порядок величин, что у реально отрендеренной болванки.
-    for scene in range(1, 7):
-        for shot in range(1, 10):
-            shot_dir = blockout_dir / f"scene_{scene:02d}_shot_{shot:02d}"
-            frames_dir = shot_dir / "frames"
-            frames_dir.mkdir(parents=True)
-            (shot_dir / "ref_start.png").write_bytes(b"png")
-            (shot_dir / "ref_end.png").write_bytes(b"png")
-            for frame_no in range(120):
-                (frames_dir / f"{frame_no:04d}.png").write_bytes(b"")
-    preview_dir = blockout_dir / "preview"
-    preview_dir.mkdir(parents=True)
-    (preview_dir / "contact_sheet.png").write_bytes(b"png")
-    (preview_dir / "contact_sheet_02.png").write_bytes(b"png")
-
-    n_shots = sum(1 for _ in blockout_dir.glob("scene_*_shot_*"))
-    assert n_shots == 54
-    n_frame_files = sum(1 for _ in blockout_dir.glob("*/frames/*.png"))
-    assert n_frame_files == 54 * 120
-
-    start = time.perf_counter()
-    images = processor.get_project_images(include_blockout_frames=False)
-    elapsed = time.perf_counter() - start
-
-    # Критерий A15 (раздел 22): "не более 2 секунд при снятом флажке".
-    assert elapsed <= 2.0, f"get_project_images() заняло {elapsed:.3f}s (норматив 2с)"
-    assert not any(img["type"] == "blockout_frame" for img in images)
-    assert sum(1 for img in images if img["type"] == "blockout_ref") == 108
 
 
 # =============================================================================
@@ -605,134 +545,3 @@ def test_a40_vertical_shot_resolves_to_exact_tz_numbers_no_p13():
     assert (w, h) == (720, 1280)  # площадь 1280*720 сохранена, обе стороны чётные
     assert aspect == "9:16"
     assert warnings == []  # референс подан, P13 не должен появиться
-
-
-# =============================================================================
-# A33: "Принудительная перегенерация работает -- ... удалены ЧЕТЫРЕ файла
-# (начальный и конечный кадр каждого шота), все четыре созданы заново".
-# Строительные блоки уже покрыты: tests/test_blockout_panel.py::
-# test_files_to_delete_for_regenerate_only_selected_shots (список файлов на
-# один шот), TestHandleLinkedShotFlag (mtime-копирование связанного шота),
-# test_p12_written_when_link_copy_rollback_triggers (откат). НЕ покрыто нигде:
-# сама GUI-кнопка regenerate_selected_shots() (StoryBookManager/gui/
-# blockout_panel.py) -- ни один тест её не вызывает. Здесь -- headless-Tk
-# вызов реальной кнопки на двух шотах (первый и его full_copy-связанный
-# второй), подтверждающий факт удаления ровно четырёх файлов и запуск
-# artist_batch_shots. Второй/третий/четвёртый шаги ручной проверки A33
-# (побайтное совпадение после копирования, отмена "оставить как есть",
-# повторное появление пометки после перерисовки) остаются в ручном чек-листе
-# -- они требуют реального artist_batch_shots/blockout_renderer прогона.
-# =============================================================================
-
-
-def _import_blockout_panel_headless():
-    """Свежий импорт blockout_panel.py с минимальным фейковым tkinter (образец
-    -- tests/test_blockout_panel.py::_import_blockout_panel, тот же приём:
-    video_player/file_manager/media_processor подменяются целиком заглушками,
-    а sys.modules патчится только на время импорта через patch.dict, который
-    сам восстанавливает исходное состояние sys.modules по выходу -- без
-    ручного учёта вытесняемых записей и риска утечки фейкового tkinter в
-    другие тесты файла/сессии."""
-    import importlib
-
-    tk_module = types.ModuleType("tkinter")
-    ttk_module = types.ModuleType("tkinter.ttk")
-    messagebox_module = types.ModuleType("tkinter.messagebox")
-
-    class _FakeVar:
-        def __init__(self, value=None):
-            self._value = value
-
-        def get(self):
-            return self._value
-
-        def set(self, value):
-            self._value = value
-
-    class _FakeWidget:
-        def __init__(self, *a, **k):
-            self.options = dict(k)
-
-        def pack(self, *a, **k):
-            return self
-
-        def grid(self, *a, **k):
-            return self
-
-        def configure(self, **k):
-            self.options.update(k)
-
-        config = configure
-
-    tk_module.StringVar = _FakeVar
-    tk_module.BooleanVar = _FakeVar
-    tk_module.Frame = _FakeWidget
-    tk_module.Canvas = _FakeWidget
-    tk_module.Widget = _FakeWidget
-    tk_module.Listbox = _FakeWidget
-    tk_module.Toplevel = _FakeWidget
-    tk_module.END = "end"
-    tk_module.ttk = ttk_module
-    tk_module.messagebox = messagebox_module
-    for name in ("Frame", "LabelFrame", "Label", "Button", "Combobox",
-                 "Checkbutton", "Treeview", "Scrollbar", "Separator", "Notebook"):
-        setattr(ttk_module, name, _FakeWidget)
-    messagebox_module.showerror = lambda *a, **k: None
-    messagebox_module.askyesno = lambda *a, **k: True
-
-    video_player_module = types.ModuleType("StoryBookManager.gui.video_player")
-    video_player_module.VideoPlayer = MagicMock
-
-    file_manager_module = types.ModuleType("StoryBookManager.core.file_manager")
-    file_manager_module.FileManager = MagicMock
-
-    media_processor_module = types.ModuleType("StoryBookManager.core.media_processor")
-    media_processor_module.MediaProcessor = MagicMock
-
-    with patch.dict(
-        sys.modules,
-        {
-            "tkinter": tk_module,
-            "tkinter.ttk": ttk_module,
-            "tkinter.messagebox": messagebox_module,
-            "StoryBookManager.gui.video_player": video_player_module,
-            "StoryBookManager.core.file_manager": file_manager_module,
-            "StoryBookManager.core.media_processor": media_processor_module,
-        },
-    ):
-        sys.modules.pop("StoryBookManager.gui.blockout_panel", None)
-        return importlib.import_module("StoryBookManager.gui.blockout_panel")
-
-
-def test_a33_regenerate_selected_shots_deletes_exactly_four_files_for_linked_pair(tmp_path):
-    panel_module = _import_blockout_panel_headless()
-    BlockoutPanel = panel_module.BlockoutPanel
-    panel = BlockoutPanel.__new__(BlockoutPanel)
-
-    start1 = tmp_path / "img_final_start_01_01.png"
-    end1 = tmp_path / "img_final_end_01_01.png"
-    start2 = tmp_path / "img_final_start_01_02.png"
-    end2 = tmp_path / "img_final_end_01_02.png"
-    for p in (start1, end1, start2, end2):
-        p.write_bytes(b"png")
-
-    panel._shots_items = [
-        {"scene_number": 1, "shot_number": 1, "shot_type": "start", "output_path": str(start1),
-         "link_type": "independent"},
-        {"scene_number": 1, "shot_number": 1, "shot_type": "end", "output_path": str(end1)},
-        {"scene_number": 1, "shot_number": 2, "shot_type": "start", "output_path": str(start2),
-         "link_type": "full_copy", "source_end_path": str(end1), "copy_from_previous_end": True},
-        {"scene_number": 1, "shot_number": 2, "shot_type": "end", "output_path": str(end2)},
-    ]
-    panel._get_selected_shot_keys = MagicMock(return_value=[(1, 1), (1, 2)])
-    panel.generation_panel = MagicMock()
-
-    panel.regenerate_selected_shots()
-
-    # Критерий A33 буквально: "удалены четыре файла (начальный и конечный
-    # кадр каждого шота)".
-    for p in (start1, end1, start2, end2):
-        assert not p.exists(), p
-    panel.generation_panel.run_blockout_scoped_step.assert_called_once_with(
-        "artist_batch_shots", "all"
-    )

@@ -155,6 +155,7 @@ class PromptsConfig:
         REQUIRED_KEYS = {
             "schema_linking": {"system_prompt"},
             "sql_generation": {"system_prompt", "user_prompt_rules"},
+            "nlu_query_understanding": {"system_prompt", "completeness_system_prompt_suffix"},
         }
         default_profile = profiles[_DEFAULT_PROFILE]
         for section, keys in REQUIRED_KEYS.items():

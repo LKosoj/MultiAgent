@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Текстовый стиль",
+  "properties": {
+    "narrative_voice": {
+      "type": "string",
+      "title": "Голос рассказчика"
+    },
+    "sentence_length": {
+      "type": "string",
+      "title": "Длина предложений"
+    },
+    "vocabulary_bounds": {
+      "type": "string",
+      "title": "Границы словаря"
+    }
+  },
+  "x-recommended": [
+    "narrative_voice",
+    "sentence_length",
+    "vocabulary_bounds"
+  ]
+}

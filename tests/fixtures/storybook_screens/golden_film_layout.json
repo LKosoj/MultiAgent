@@ -1,0 +1,1054 @@
+{
+ "cases": [
+  {
+   "name": "base",
+   "timeline": {
+    "status": "success",
+    "project_id": "demo",
+    "source": "edit_decisions",
+    "duration_s": 15,
+    "shots": [
+     {
+      "key": "1-1",
+      "scene": 1,
+      "shot": 1,
+      "index": 1,
+      "start_s": 0,
+      "end_s": 5,
+      "duration_s": 5,
+      "planned_duration_s": 5,
+      "actual_duration_s": 5.06,
+      "in_cut": true,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": false,
+      "unit": null,
+      "video": "97_shots/scene_01_shot_01/video_final_01_01.mp4",
+      "start_image": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "end_image": null,
+      "thumb_path": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "warnings": []
+     },
+     {
+      "key": "1-2",
+      "scene": 1,
+      "shot": 2,
+      "index": 2,
+      "start_s": 5,
+      "end_s": 15,
+      "duration_s": 10,
+      "planned_duration_s": 2,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": true,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": []
+     },
+     {
+      "key": "1-3",
+      "scene": 1,
+      "shot": 3,
+      "index": null,
+      "start_s": 7,
+      "end_s": 15,
+      "duration_s": 8,
+      "planned_duration_s": 8,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": true,
+      "covered_by": "1-2",
+      "unit_span": false,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": [
+       "unit_member_approximate"
+      ]
+     }
+    ],
+    "scenes": [
+     {
+      "scene": 1,
+      "start_s": 0,
+      "end_s": 15,
+      "duration_s": 15,
+      "shot_keys": [
+       "1-1",
+       "1-2",
+       "1-3"
+      ]
+     }
+    ],
+    "tracks": {
+     "narration": {
+      "status": "unavailable",
+      "note": "Озвучка не подключена (TTS недоступен)",
+      "clips": []
+     },
+     "music": {
+      "status": "present",
+      "source": "plan",
+      "note": "",
+      "clips": [
+       {
+        "id": "music:boy:1",
+        "role": "music",
+        "label": "boy",
+        "path": "98_audio/music/boy.mp3",
+        "exists": true,
+        "scene": 1,
+        "music_id": "boy",
+        "start_s": 0,
+        "end_s": 15,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": null,
+        "placement": "scene"
+       }
+      ]
+     },
+     "sfx": {
+      "status": "present",
+      "note": "",
+      "clips": [
+       {
+        "id": "sfx:aa:1",
+        "role": "sfx",
+        "label": "aa",
+        "path": "98_audio/sfx/aa.mp3",
+        "exists": true,
+        "scene": 1,
+        "music_id": null,
+        "start_s": 0,
+        "end_s": 15,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": false,
+        "placement": "scene"
+       }
+      ]
+     }
+    },
+    "subtitles": {
+     "source": "final",
+     "path": "99_final/subtitles.srt",
+     "count": 3,
+     "duration_s": 14
+    },
+    "final": {
+     "video": {
+      "path": "99_final/final_video.mp4",
+      "type": "final_video",
+      "size": 1,
+      "modified": "1970-01-01T00:33:20+00:00",
+      "duration_s": 15,
+      "exists": true,
+      "older_than_shots": false
+     },
+     "photo_video": null,
+     "render_report_path": null,
+     "final_review_path": null,
+     "review_passed": null,
+     "stale_hint": false
+    },
+    "missing": [
+     "narration"
+    ],
+    "warnings": [
+     {
+      "code": "unit_member_approximate",
+      "message": "Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "key": "1-3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/sfx/aa.mp3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/music/boy.mp3"
+     }
+    ],
+    "durations_pending": 0,
+    "labels": {
+     "types": {
+      "illustration": "Иллюстрация",
+      "reference": "Референс",
+      "shot": "Кадр шота",
+      "shot_video": "Видео шота",
+      "final_video": "Финальное видео",
+      "audio": "Звук",
+      "music": "Музыка",
+      "sfx": "Эффект",
+      "subtitles": "Субтитры",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью",
+      "photo_video": "Фотомонтаж",
+      "narration": "Озвучка"
+     },
+     "categories": {
+      "book_page": "Страница книги",
+      "character": "Герой",
+      "landmark": "Ориентир",
+      "location": "Локация",
+      "background": "Фон (лист пространства)",
+      "start_frame": "Кадр начала",
+      "end_frame": "Кадр конца",
+      "shot_other": "Другое изображение шота",
+      "shot_clip": "Видео шота",
+      "video_unit": "Видео-блок (несколько шотов)",
+      "video_unit_variant": "Вариант видео-блока",
+      "shot_video_other": "Другое видео шота",
+      "final": "Итоговый фильм",
+      "photo": "Из картинок",
+      "planned": "Черновые титры",
+      "final_subs": "Титры фильма",
+      "narration": "Озвучка",
+      "leitmotif": "Лейтмотив",
+      "neutral": "Нейтральная музыка",
+      "scene_sfx": "Эффект сцены",
+      "audio_other": "Другой звук",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью"
+     }
+    }
+   },
+   "cues": [
+    {
+     "source_index": 1,
+     "start_s": 0.5,
+     "end_s": 3,
+     "text": "Привет, снег",
+     "index": 1,
+     "start_tc": "00:00:00,500",
+     "end_tc": "00:00:03,000",
+     "shot_key": "1-1"
+    },
+    {
+     "source_index": 2,
+     "start_s": 5,
+     "end_s": 7.5,
+     "text": "А вот и зима",
+     "index": 2,
+     "start_tc": "00:00:05,000",
+     "end_tc": "00:00:07,500",
+     "shot_key": "1-2"
+    },
+    {
+     "source_index": 3,
+     "start_s": 9,
+     "end_s": 14,
+     "text": "Ты пришёл",
+     "index": 3,
+     "start_tc": "00:00:09,000",
+     "end_tc": "00:00:14,000",
+     "shot_key": "1-3"
+    }
+   ],
+   "layout": {
+    "blocks": [
+     {
+      "track": "shots",
+      "start_s": 0,
+      "end_s": 5,
+      "label": "Шот 1-1",
+      "tone": "shot",
+      "key": "1-1",
+      "tooltip": "Шот 1-1 · 0:00 – 0:05",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "shots",
+      "start_s": 5,
+      "end_s": 15,
+      "label": "Шот 1-2",
+      "tone": "unit",
+      "key": "1-2",
+      "tooltip": "Шот 1-2 · 0:05 – 0:15",
+      "approximate": false,
+      "warning": false,
+      "nested": true
+     },
+     {
+      "track": "shots",
+      "start_s": 7,
+      "end_s": 15,
+      "label": "Шот 1-3",
+      "tone": "covered",
+      "key": "1-3",
+      "tooltip": "Шот 1-3 · 0:07 – 0:15\nТаймлайн приблизительный.\nЗамечание: Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "approximate": true,
+      "warning": true,
+      "nested": true
+     },
+     {
+      "track": "music",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "boy",
+      "tone": "clip",
+      "key": "music:boy:1",
+      "tooltip": "boy · 0:00 – 0:15 · по сцене",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "sfx",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "aa",
+      "tone": "clip",
+      "key": "sfx:aa:1",
+      "tooltip": "aa · 0:00 – 0:15 · по сцене",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 0.5,
+      "end_s": 3,
+      "label": "Привет, снег",
+      "tone": "cue",
+      "key": "1",
+      "tooltip": "0:00 – 0:03\nПривет, снег",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 5,
+      "end_s": 7.5,
+      "label": "А вот и зима",
+      "tone": "cue",
+      "key": "2",
+      "tooltip": "0:05 – 0:07\nА вот и зима",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 9,
+      "end_s": 14,
+      "label": "Ты пришёл",
+      "tone": "cue",
+      "key": "3",
+      "tooltip": "0:09 – 0:14\nТы пришёл",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     }
+    ],
+    "duration_s": 15,
+    "out_of_cut": 0
+   }
+  },
+  {
+   "name": "partial_no_film",
+   "timeline": {
+    "status": "success",
+    "project_id": "demo",
+    "source": "edit_decisions",
+    "duration_s": 15,
+    "shots": [
+     {
+      "key": "1-1",
+      "scene": 1,
+      "shot": 1,
+      "index": 1,
+      "start_s": null,
+      "end_s": null,
+      "duration_s": 5,
+      "planned_duration_s": 5,
+      "actual_duration_s": 5.06,
+      "in_cut": false,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": false,
+      "unit": null,
+      "video": "97_shots/scene_01_shot_01/video_final_01_01.mp4",
+      "start_image": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "end_image": null,
+      "thumb_path": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "warnings": []
+     },
+     {
+      "key": "1-2",
+      "scene": 1,
+      "shot": 2,
+      "index": 2,
+      "start_s": 5,
+      "end_s": 15,
+      "duration_s": 10,
+      "planned_duration_s": 2,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": true,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": [
+       "shot_not_in_cut"
+      ]
+     },
+     {
+      "key": "1-3",
+      "scene": 1,
+      "shot": 3,
+      "index": null,
+      "start_s": 7,
+      "end_s": 15,
+      "duration_s": 8,
+      "planned_duration_s": 8,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": true,
+      "covered_by": "1-2",
+      "unit_span": false,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": [
+       "unit_member_approximate"
+      ]
+     }
+    ],
+    "scenes": [
+     {
+      "scene": 1,
+      "start_s": 0,
+      "end_s": 15,
+      "duration_s": 15,
+      "shot_keys": [
+       "1-1",
+       "1-2",
+       "1-3"
+      ]
+     }
+    ],
+    "tracks": {
+     "narration": {
+      "status": "missing",
+      "note": "Озвучка не найдена",
+      "clips": []
+     },
+     "music": {
+      "status": "present",
+      "source": "plan",
+      "note": "",
+      "clips": [
+       {
+        "id": "music:boy:1",
+        "role": "music",
+        "label": "boy",
+        "path": "98_audio/music/boy.mp3",
+        "exists": true,
+        "scene": null,
+        "music_id": "boy",
+        "start_s": 0,
+        "end_s": null,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": true,
+        "placement": "film"
+       }
+      ]
+     },
+     "sfx": {
+      "status": "present",
+      "note": "",
+      "clips": [
+       {
+        "id": "sfx:aa:1",
+        "role": "sfx",
+        "label": "aa",
+        "path": "98_audio/sfx/aa.mp3",
+        "exists": false,
+        "scene": 1,
+        "music_id": null,
+        "start_s": 0,
+        "end_s": 15,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": false,
+        "placement": "scene"
+       }
+      ]
+     }
+    },
+    "subtitles": {
+     "source": "final",
+     "path": "99_final/subtitles.srt",
+     "count": 3,
+     "duration_s": 14
+    },
+    "final": {
+     "video": null,
+     "photo_video": null,
+     "render_report_path": null,
+     "final_review_path": null,
+     "review_passed": null,
+     "stale_hint": false
+    },
+    "missing": [
+     "narration"
+    ],
+    "warnings": [
+     {
+      "code": "unit_member_approximate",
+      "message": "Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "key": "1-3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/sfx/aa.mp3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/music/boy.mp3"
+     },
+     {
+      "code": "shot_not_in_cut",
+      "message": "Шот 1-2 не попал в монтаж",
+      "key": "1-2"
+     }
+    ],
+    "durations_pending": 0,
+    "labels": {
+     "types": {
+      "illustration": "Иллюстрация",
+      "reference": "Референс",
+      "shot": "Кадр шота",
+      "shot_video": "Видео шота",
+      "final_video": "Финальное видео",
+      "audio": "Звук",
+      "music": "Музыка",
+      "sfx": "Эффект",
+      "subtitles": "Субтитры",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью",
+      "photo_video": "Фотомонтаж",
+      "narration": "Озвучка"
+     },
+     "categories": {
+      "book_page": "Страница книги",
+      "character": "Герой",
+      "landmark": "Ориентир",
+      "location": "Локация",
+      "background": "Фон (лист пространства)",
+      "start_frame": "Кадр начала",
+      "end_frame": "Кадр конца",
+      "shot_other": "Другое изображение шота",
+      "shot_clip": "Видео шота",
+      "video_unit": "Видео-блок (несколько шотов)",
+      "video_unit_variant": "Вариант видео-блока",
+      "shot_video_other": "Другое видео шота",
+      "final": "Итоговый фильм",
+      "photo": "Из картинок",
+      "planned": "Черновые титры",
+      "final_subs": "Титры фильма",
+      "narration": "Озвучка",
+      "leitmotif": "Лейтмотив",
+      "neutral": "Нейтральная музыка",
+      "scene_sfx": "Эффект сцены",
+      "audio_other": "Другой звук",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью"
+     }
+    }
+   },
+   "cues": [],
+   "layout": {
+    "blocks": [
+     {
+      "track": "shots",
+      "start_s": 5,
+      "end_s": 15,
+      "label": "Шот 1-2",
+      "tone": "unit",
+      "key": "1-2",
+      "tooltip": "Шот 1-2 · 0:05 – 0:15\nЗамечание: Шот 1-2 не попал в монтаж",
+      "approximate": false,
+      "warning": true,
+      "nested": true
+     },
+     {
+      "track": "shots",
+      "start_s": 7,
+      "end_s": 15,
+      "label": "Шот 1-3",
+      "tone": "covered",
+      "key": "1-3",
+      "tooltip": "Шот 1-3 · 0:07 – 0:15\nТаймлайн приблизительный.\nЗамечание: Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "approximate": true,
+      "warning": true,
+      "nested": true
+     },
+     {
+      "track": "music",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "boy (повтор)",
+      "tone": "clip",
+      "key": "music:boy:1",
+      "tooltip": "boy (повтор) · 0:00 – 0:15 · на весь фильм",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "sfx",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "aa (файла нет)",
+      "tone": "missing",
+      "key": "sfx:aa:1",
+      "tooltip": "aa (файла нет) · 0:00 – 0:15 · по сцене",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     }
+    ],
+    "duration_s": 15,
+    "out_of_cut": 1
+   }
+  },
+  {
+   "name": "unknown_warning_code",
+   "timeline": {
+    "status": "success",
+    "project_id": "demo",
+    "source": "edit_decisions",
+    "duration_s": 15,
+    "shots": [
+     {
+      "key": "1-1",
+      "scene": 1,
+      "shot": 1,
+      "index": 1,
+      "start_s": 0,
+      "end_s": 5,
+      "duration_s": 5,
+      "planned_duration_s": 5,
+      "actual_duration_s": 5.06,
+      "in_cut": true,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": false,
+      "unit": null,
+      "video": "97_shots/scene_01_shot_01/video_final_01_01.mp4",
+      "start_image": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "end_image": null,
+      "thumb_path": "97_shots/scene_01_shot_01/img_final_start_01_01.png",
+      "warnings": [
+       "future_code"
+      ]
+     },
+     {
+      "key": "1-2",
+      "scene": 1,
+      "shot": 2,
+      "index": 2,
+      "start_s": 5,
+      "end_s": 15,
+      "duration_s": 10,
+      "planned_duration_s": 2,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": false,
+      "covered_by": null,
+      "unit_span": true,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": []
+     },
+     {
+      "key": "1-3",
+      "scene": 1,
+      "shot": 3,
+      "index": null,
+      "start_s": 7,
+      "end_s": 15,
+      "duration_s": 8,
+      "planned_duration_s": 8,
+      "actual_duration_s": null,
+      "in_cut": true,
+      "approximate": true,
+      "covered_by": "1-2",
+      "unit_span": false,
+      "unit": {
+       "keys": [
+        "1-2",
+        "1-3"
+       ],
+       "path": "97_shots/video_units/1-2_1-3.mp4"
+      },
+      "video": "97_shots/video_units/1-2_1-3.mp4",
+      "start_image": null,
+      "end_image": null,
+      "thumb_path": "97_shots/video_units/1-2_1-3.mp4",
+      "warnings": [
+       "unit_member_approximate"
+      ]
+     }
+    ],
+    "scenes": [
+     {
+      "scene": 1,
+      "start_s": 0,
+      "end_s": 15,
+      "duration_s": 15,
+      "shot_keys": [
+       "1-1",
+       "1-2",
+       "1-3"
+      ]
+     }
+    ],
+    "tracks": {
+     "narration": {
+      "status": "unavailable",
+      "note": "Озвучка не подключена (TTS недоступен)",
+      "clips": []
+     },
+     "music": {
+      "status": "present",
+      "source": "plan",
+      "note": "",
+      "clips": [
+       {
+        "id": "music:boy:1",
+        "role": "music",
+        "label": "boy",
+        "path": "98_audio/music/boy.mp3",
+        "exists": true,
+        "scene": 1,
+        "music_id": "boy",
+        "start_s": 0,
+        "end_s": 15,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": null,
+        "placement": "scene"
+       }
+      ]
+     },
+     "sfx": {
+      "status": "present",
+      "note": "",
+      "clips": [
+       {
+        "id": "sfx:aa:1",
+        "role": "sfx",
+        "label": "aa",
+        "path": "98_audio/sfx/aa.mp3",
+        "exists": true,
+        "scene": 1,
+        "music_id": null,
+        "start_s": 0,
+        "end_s": 15,
+        "duration_s": 15,
+        "source_duration_s": null,
+        "loop": false,
+        "placement": "scene"
+       }
+      ]
+     }
+    },
+    "subtitles": {
+     "source": "final",
+     "path": "99_final/subtitles.srt",
+     "count": 3,
+     "duration_s": 14
+    },
+    "final": {
+     "video": {
+      "path": "99_final/final_video.mp4",
+      "type": "final_video",
+      "size": 1,
+      "modified": "1970-01-01T00:33:20+00:00",
+      "duration_s": 15,
+      "exists": true,
+      "older_than_shots": false
+     },
+     "photo_video": null,
+     "render_report_path": null,
+     "final_review_path": null,
+     "review_passed": null,
+     "stale_hint": false
+    },
+    "missing": [
+     "narration"
+    ],
+    "warnings": [
+     {
+      "code": "unit_member_approximate",
+      "message": "Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "key": "1-3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/sfx/aa.mp3"
+     },
+     {
+      "code": "audio_unknown_duration",
+      "message": "Длительность звукового файла неизвестна",
+      "path": "98_audio/music/boy.mp3"
+     }
+    ],
+    "durations_pending": 0,
+    "labels": {
+     "types": {
+      "illustration": "Иллюстрация",
+      "reference": "Референс",
+      "shot": "Кадр шота",
+      "shot_video": "Видео шота",
+      "final_video": "Финальное видео",
+      "audio": "Звук",
+      "music": "Музыка",
+      "sfx": "Эффект",
+      "subtitles": "Субтитры",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью",
+      "photo_video": "Фотомонтаж",
+      "narration": "Озвучка"
+     },
+     "categories": {
+      "book_page": "Страница книги",
+      "character": "Герой",
+      "landmark": "Ориентир",
+      "location": "Локация",
+      "background": "Фон (лист пространства)",
+      "start_frame": "Кадр начала",
+      "end_frame": "Кадр конца",
+      "shot_other": "Другое изображение шота",
+      "shot_clip": "Видео шота",
+      "video_unit": "Видео-блок (несколько шотов)",
+      "video_unit_variant": "Вариант видео-блока",
+      "shot_video_other": "Другое видео шота",
+      "final": "Итоговый фильм",
+      "photo": "Из картинок",
+      "planned": "Черновые титры",
+      "final_subs": "Титры фильма",
+      "narration": "Озвучка",
+      "leitmotif": "Лейтмотив",
+      "neutral": "Нейтральная музыка",
+      "scene_sfx": "Эффект сцены",
+      "audio_other": "Другой звук",
+      "blockout_ref": "Болванка: референс",
+      "blockout_frame": "Болванка: кадр",
+      "blockout_sheet": "Болванка: лист",
+      "blockout_video": "Болванка: видео",
+      "blockout_preview": "Болванка: превью"
+     }
+    }
+   },
+   "cues": [
+    {
+     "source_index": 1,
+     "start_s": 0.5,
+     "end_s": 3,
+     "text": "Привет, снег",
+     "index": 1,
+     "start_tc": "00:00:00,500",
+     "end_tc": "00:00:03,000",
+     "shot_key": "1-1"
+    },
+    {
+     "source_index": 2,
+     "start_s": 5,
+     "end_s": 7.5,
+     "text": "А вот и зима",
+     "index": 2,
+     "start_tc": "00:00:05,000",
+     "end_tc": "00:00:07,500",
+     "shot_key": "1-2"
+    },
+    {
+     "source_index": 3,
+     "start_s": 9,
+     "end_s": 14,
+     "text": "Ты пришёл",
+     "index": 3,
+     "start_tc": "00:00:09,000",
+     "end_tc": "00:00:14,000",
+     "shot_key": "1-3"
+    }
+   ],
+   "layout": {
+    "blocks": [
+     {
+      "track": "shots",
+      "start_s": 0,
+      "end_s": 5,
+      "label": "Шот 1-1",
+      "tone": "shot",
+      "key": "1-1",
+      "tooltip": "Шот 1-1 · 0:00 – 0:05",
+      "approximate": false,
+      "warning": true,
+      "nested": false
+     },
+     {
+      "track": "shots",
+      "start_s": 5,
+      "end_s": 15,
+      "label": "Шот 1-2",
+      "tone": "unit",
+      "key": "1-2",
+      "tooltip": "Шот 1-2 · 0:05 – 0:15",
+      "approximate": false,
+      "warning": false,
+      "nested": true
+     },
+     {
+      "track": "shots",
+      "start_s": 7,
+      "end_s": 15,
+      "label": "Шот 1-3",
+      "tone": "covered",
+      "key": "1-3",
+      "tooltip": "Шот 1-3 · 0:07 – 0:15\nТаймлайн приблизительный.\nЗамечание: Время шота 1-3 приблизительное: он смонтирован в одном видео-блоке с 1-2",
+      "approximate": true,
+      "warning": true,
+      "nested": true
+     },
+     {
+      "track": "music",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "boy",
+      "tone": "clip",
+      "key": "music:boy:1",
+      "tooltip": "boy · 0:00 – 0:15 · по сцене",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "sfx",
+      "start_s": 0,
+      "end_s": 15,
+      "label": "aa",
+      "tone": "clip",
+      "key": "sfx:aa:1",
+      "tooltip": "aa · 0:00 – 0:15 · по сцене",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 0.5,
+      "end_s": 3,
+      "label": "Привет, снег",
+      "tone": "cue",
+      "key": "1",
+      "tooltip": "0:00 – 0:03\nПривет, снег",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 5,
+      "end_s": 7.5,
+      "label": "А вот и зима",
+      "tone": "cue",
+      "key": "2",
+      "tooltip": "0:05 – 0:07\nА вот и зима",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     },
+     {
+      "track": "subtitles",
+      "start_s": 9,
+      "end_s": 14,
+      "label": "Ты пришёл",
+      "tone": "cue",
+      "key": "3",
+      "tooltip": "0:09 – 0:14\nТы пришёл",
+      "approximate": false,
+      "warning": false,
+      "nested": false
+     }
+    ],
+    "duration_s": 15,
+    "out_of_cut": 0
+   }
+  }
+ ]
+}

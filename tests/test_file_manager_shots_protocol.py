@@ -12,7 +12,7 @@
 - сохранение поведения при параллельных потоках (mutual exclusion через
   fcntl.flock не корраптит файл и не теряет ничьи поля).
 
-Образец изоляции backup_dir/STORYBOOK_PROJECTS_DIR — tests/test_media_processor_blockout_categories.py.
+Образец изоляции backup_dir/STORYBOOK_PROJECTS_DIR — tests/test_storybook_manager_project_paths.py.
 """
 
 import json
@@ -31,13 +31,12 @@ from StoryBookManager.core.file_manager import (  # noqa: E402
     FileManager,
     merge_write_shots_json,
 )
-import config.settings as _legacy_config_settings  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolated_backup_dir(tmp_path, monkeypatch):
     backups = tmp_path / "isolated_backups"
-    for settings_obj in (app_settings, _legacy_config_settings.app_settings):
+    for settings_obj in (app_settings,):
         monkeypatch.setattr(settings_obj, "get_backup_directory", lambda: backups)
 
 
@@ -431,3 +430,57 @@ def test_save_json_file_shots_root_edit_preserves_concurrent_root_addition(tmp_p
     result = json.loads(shots_path.read_text(encoding="utf-8"))
     assert result["seed"] == 999
     assert result["blockout_rendered_at"] == "2026-08-16T10:00:00Z"
+
+
+# ---------------------------------------------------------------------------
+# precondition и возврат итогового документа (studio/artifacts.py, Ф10)
+# ---------------------------------------------------------------------------
+
+def test_merge_write_shots_json_precondition_runs_under_lock_and_gets_bytes(tmp_path):
+    import fcntl
+
+    shots_path = tmp_path / "97_shots" / "shots.json"
+    shots_path.parent.mkdir(parents=True)
+    item = {"scene_number": 1, "shot_number": 1, "shot_type": "start", "duration_s": 5}
+    shots_path.write_text(json.dumps({"items": [item]}), encoding="utf-8")
+    seen = {}
+
+    def precondition(raw):
+        seen["raw"] = raw
+        # замок уже взят: неблокирующая попытка из другого дескриптора не проходит
+        with open(f"{shots_path}.lock", "a+", encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                seen["locked"] = False
+                fcntl.flock(probe, fcntl.LOCK_UN)
+            except BlockingIOError:
+                seen["locked"] = True
+
+    result = merge_write_shots_json(
+        shots_path, [dict(item, duration_s=9)], [dict(item)], precondition=precondition
+    )
+
+    assert seen["locked"] is True
+    assert json.loads(seen["raw"].decode("utf-8"))["items"][0]["duration_s"] == 5
+    assert result["items"][0]["duration_s"] == 9
+    assert json.loads(shots_path.read_text(encoding="utf-8")) == result
+
+
+def test_merge_write_shots_json_precondition_error_aborts_and_releases_lock(tmp_path):
+    shots_path = tmp_path / "97_shots" / "shots.json"
+    shots_path.parent.mkdir(parents=True)
+    item = {"scene_number": 1, "shot_number": 1, "shot_type": "start", "duration_s": 5}
+    original = json.dumps({"items": [item]})
+    shots_path.write_text(original, encoding="utf-8")
+
+    def refuse(raw):
+        raise RuntimeError("conflict")
+
+    with pytest.raises(RuntimeError):
+        merge_write_shots_json(shots_path, [dict(item, duration_s=9)], [dict(item)], precondition=refuse)
+
+    assert shots_path.read_text(encoding="utf-8") == original
+    assert not list(shots_path.parent.glob("*.tmp"))
+    # замок снят: следующая запись проходит
+    merge_write_shots_json(shots_path, [dict(item, duration_s=7)], [dict(item)])
+    assert json.loads(shots_path.read_text(encoding="utf-8"))["items"][0]["duration_s"] == 7

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Сценарий",
+  "properties": {
+    "concept": {
+      "type": "object",
+      "title": "Концепция"
+    },
+    "characters": {
+      "type": "array",
+      "title": "Персонажи",
+      "items": {
+        "type": "object"
+      }
+    },
+    "world_description": {
+      "type": "string",
+      "title": "Описание мира"
+    },
+    "screenplay": {
+      "type": "array",
+      "title": "Сцены",
+      "items": {
+        "type": "object",
+        "title": "Сцена",
+        "properties": {
+          "scene_number": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Номер сцены"
+          },
+          "storyboard": {
+            "type": "array",
+            "title": "Раскадровка",
+            "items": {
+              "type": "object",
+              "title": "Шот раскадровки",
+              "properties": {
+                "shot_number": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "title": "Номер шота"
+                },
+                "timing": {
+                  "type": "string",
+                  "title": "Тайминг"
+                }
+              },
+              "required": [
+                "shot_number",
+                "timing"
+              ]
+            }
+          },
+          "location_time": {
+            "type": "string",
+            "title": "Место и время"
+          },
+          "action": {
+            "type": "string",
+            "title": "Действие"
+          },
+          "voiceover": {
+            "type": "string",
+            "title": "Закадровый текст"
+          }
+        },
+        "required": [
+          "scene_number",
+          "storyboard"
+        ],
+        "x-recommended": [
+          "location_time",
+          "action",
+          "voiceover"
+        ]
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "screenplay"
+  ],
+  "x-recommended": [
+    "concept",
+    "characters",
+    "world_description"
+  ]
+}

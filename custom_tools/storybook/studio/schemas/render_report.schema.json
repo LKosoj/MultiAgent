@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Отчёт сборки",
+  "properties": {
+    "render_result": {
+      "type": "object",
+      "title": "Результат сборки"
+    },
+    "errors": {
+      "type": "array",
+      "title": "Ошибки"
+    },
+    "warnings": {
+      "type": "array",
+      "title": "Предупреждения"
+    }
+  },
+  "x-recommended": [
+    "render_result",
+    "errors",
+    "warnings"
+  ]
+}

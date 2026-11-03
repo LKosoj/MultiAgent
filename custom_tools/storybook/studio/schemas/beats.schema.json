@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "title": "Сюжетные точки",
+  "items": {
+    "type": "object",
+    "title": "Сюжетная точка",
+    "properties": {
+      "page_number": {
+        "type": "integer",
+        "minimum": 1,
+        "title": "Страница"
+      },
+      "goal": {
+        "type": "string",
+        "title": "Цель"
+      },
+      "id": {
+        "type": "string",
+        "title": "Идентификатор"
+      },
+      "characters_in_frame": {
+        "title": "Герои в кадре"
+      },
+      "emotion": {
+        "type": "string",
+        "title": "Эмоция"
+      },
+      "location_hint": {
+        "type": "string",
+        "title": "Место"
+      }
+    },
+    "required": [
+      "page_number",
+      "goal"
+    ],
+    "x-recommended": [
+      "id",
+      "characters_in_frame",
+      "emotion",
+      "location_hint"
+    ]
+  }
+}

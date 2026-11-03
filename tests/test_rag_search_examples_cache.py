@@ -46,6 +46,8 @@ def _setup_searcher(monkeypatch, *, chroma_results):
     monkeypatch.setenv("DB_DSN", "sqlite:///tmp/test_rag_cache.db")
     # Отключаем opt-in file fallbacks
     monkeypatch.delenv("VECTOR_DB_SEARCH_ALLOW_FILE_FALLBACKS", raising=False)
+    # Кэшировать можно только при известной embedding-модели (cacheable в _build_cache_info).
+    monkeypatch.setenv("RAG_EMBEDDING_MODEL_ID", "test-embedding-model")
 
     searcher = RAGSearcher()
 

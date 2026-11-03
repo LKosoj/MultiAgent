@@ -326,6 +326,11 @@ def _project_root() -> Path:
 
 
 def _require_service_action_role(action: str, principal: Principal) -> None:
+    from ._storybook_actions import is_storybook_action, require_storybook_role
+
+    if is_storybook_action(action):
+        require_storybook_role(action, principal)
+        return
     if action not in _ALL_SERVICE_ACTIONS:
         raise PermissionError(f"service action '{action}' is not classified")
     if action in _USER_ACTIONS:
@@ -3413,6 +3418,11 @@ def handle_service_action(
     else:
         principal = principal or current_principal()
     _require_service_action_role(action, principal)
+
+    from ._storybook_actions import dispatch as storybook_dispatch, is_storybook_action
+
+    if is_storybook_action(action):
+        return storybook_dispatch(action, payload, principal)
 
     agent_manager = _LazyManager(_agent_manager)
     wf_manager = _LazyManager(_wf_manager)

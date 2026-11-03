@@ -15,6 +15,7 @@ from backend.fastapi_app.agui.retention import (
     create_operational_retention_coordinator,
 )
 from backend.fastapi_app.agui.store import (
+    AGUI_EVENT_STORE_SCHEMA_VERSION,
     EventStore,
     OperationalRetentionLeaseConflictError,
 )
@@ -42,7 +43,7 @@ def test_v5_store_migrates_retention_state_additively(tmp_path) -> None:
                 WHERE type = 'table' AND name = 'operational_retention_state'
                 """
             ).fetchone()
-        assert version == 8
+        assert version == AGUI_EVENT_STORE_SCHEMA_VERSION
         assert table == ("operational_retention_state",)
     finally:
         migrated.close()

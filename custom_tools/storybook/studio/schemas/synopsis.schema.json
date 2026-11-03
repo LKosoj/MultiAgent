@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Синопсис",
+  "properties": {
+    "logline": {
+      "type": "string",
+      "title": "Логлайн"
+    },
+    "description": {
+      "type": "string",
+      "title": "Описание"
+    },
+    "moral": {
+      "type": "string",
+      "title": "Мораль"
+    },
+    "target_age": {
+      "type": "string",
+      "title": "Возраст читателя"
+    },
+    "vocabulary_limits": {
+      "type": "string",
+      "title": "Ограничения словаря"
+    }
+  },
+  "required": [
+    "logline",
+    "description"
+  ],
+  "x-recommended": [
+    "moral",
+    "target_age",
+    "vocabulary_limits"
+  ]
+}

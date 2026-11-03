@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "array",
+  "title": "Персонажи",
+  "items": {
+    "type": "object",
+    "title": "Персонаж",
+    "properties": {
+      "name": {
+        "type": "string",
+        "title": "Имя",
+        "minLength": 1
+      },
+      "age": {
+        "title": "Возраст"
+      },
+      "role": {
+        "type": "string",
+        "title": "Роль"
+      },
+      "immutable_attributes": {
+        "type": "object",
+        "title": "Неизменные черты"
+      },
+      "variable_attributes": {
+        "type": "object",
+        "title": "Меняющиеся черты"
+      },
+      "no_go_rules": {
+        "type": "array",
+        "title": "Запреты",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "x-recommended": [
+      "age",
+      "role",
+      "immutable_attributes",
+      "variable_attributes",
+      "no_go_rules"
+    ]
+  }
+}

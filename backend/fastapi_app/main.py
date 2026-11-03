@@ -16,7 +16,7 @@ from typing import Any, AsyncIterator, Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from logging_setup import setup_comprehensive_logging
 
@@ -174,6 +174,9 @@ def _durable_supervised_run_ids() -> frozenset[str]:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     validate_auth_configuration()
+    from custom_tools.storybook.studio.app_settings import apply_runtime_environment
+
+    apply_runtime_environment()  # корень проектов storybook из настроек, если не задан окружением
     _import_legacy_text_to_sql_history_once()
     supervisor = configure_workflow_process_supervisor(store)
     retention = create_operational_retention_coordinator(
@@ -355,6 +358,42 @@ async def register_text_to_sql_connection(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         raise
     return _connection_metadata_response(result, field="connection")
+
+
+_MEDIA_HEADERS = {"Cache-Control": "private, max-age=300", "X-Content-Type-Options": "nosniff"}
+_THUMB_SIZES = (128, 256, 512)
+
+
+@app.get("/v1/storybook/projects/{project_id}/media", name="v1_storybook_media")
+async def storybook_media(
+    project_id: str, request: Request, path: str, t: str | None = None
+) -> FileResponse:
+    from backend.fastapi_app.agui import _storybook_media as media
+
+    media.authorize_media_request(request, project_id, t)
+    target, mime = media.locate_media_file(project_id, path)
+    # Range (206/416) FileResponse обрабатывает сам
+    # ZIP-выгрузку отдаём вложением (скачивание), остальное - для показа в странице
+    filename = target.name if mime == "application/zip" else None
+    return FileResponse(target, media_type=mime, headers=_MEDIA_HEADERS, filename=filename)
+
+
+@app.get("/v1/storybook/projects/{project_id}/thumb", name="v1_storybook_thumb")
+async def storybook_thumb(
+    project_id: str, request: Request, path: str, size: int = 256, t: str | None = None
+) -> Response:
+    from backend.fastapi_app.agui import _storybook_media as media
+
+    media.authorize_media_request(request, project_id, t)
+    if size not in _THUMB_SIZES:
+        raise HTTPException(status_code=400, detail="unsupported thumbnail size")
+    source, placeholder = await asyncio.to_thread(
+        media.make_thumb_response_source, project_id, path, size
+    )
+    if placeholder:
+        headers = {**_MEDIA_HEADERS, "X-Studio-Placeholder": "1"}
+        return Response(content=source, media_type="image/jpeg", headers=headers)
+    return FileResponse(source, media_type="image/jpeg", headers=_MEDIA_HEADERS)
 
 
 @app.post("/agent")

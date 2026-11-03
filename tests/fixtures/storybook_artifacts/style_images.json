@@ -1,0 +1,13 @@
+{
+  "art_style": "акварель",
+  "color_palette": [
+    "синий"
+  ],
+  "lighting": "мягкий",
+  "camera_defaults": {
+    "lens": "35mm"
+  },
+  "do_not_include": [
+    "текст"
+  ]
+}

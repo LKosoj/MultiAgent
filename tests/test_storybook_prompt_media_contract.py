@@ -175,6 +175,7 @@ def test_pp14_real_preparation_reload_and_resolution_translate_once(
     )
     aitunnel.video_generator_aitunnel_tool(
         "s", project_id="project", enable=True, language=language, skip_prompt_enhancement=True,
+        force_update_prompts=True,
     )
     assert preparation_calls == [original_prompt]
     assert translations == provider_translations

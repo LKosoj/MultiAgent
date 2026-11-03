@@ -1,0 +1,37 @@
+{
+  "items": [
+    {
+      "scene_number": 1,
+      "shot_number": 1,
+      "shot_type": "start",
+      "timing": "00:05",
+      "english_prompt": "A fox cub",
+      "video_prompt": "Fox looks up",
+      "negative_prompt": "text",
+      "reference_image_paths": [],
+      "width": 1280,
+      "height": 720,
+      "seed": 7,
+      "image_path": null,
+      "output_path": null,
+      "video_path": null
+    },
+    {
+      "scene_number": 1,
+      "shot_number": 1,
+      "shot_type": "end",
+      "timing": "00:05",
+      "english_prompt": "A fox cub",
+      "video_prompt": "Fox looks up",
+      "negative_prompt": "text",
+      "reference_image_paths": [],
+      "width": 1280,
+      "height": 720,
+      "seed": 7,
+      "image_path": null,
+      "output_path": null,
+      "video_path": null
+    }
+  ],
+  "seed": 7
+}

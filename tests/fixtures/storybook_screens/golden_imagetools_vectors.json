@@ -1,0 +1,969 @@
+{
+ "vectors": {
+  "zoom_step": [
+   {
+    "in": [
+     1.0,
+     "in"
+    ],
+    "out": 1.25
+   },
+   {
+    "in": [
+     1.0,
+     "out"
+    ],
+    "out": 0.8
+   },
+   {
+    "in": [
+     1.25,
+     "in"
+    ],
+    "out": 1.5625
+   },
+   {
+    "in": [
+     6.5,
+     "in"
+    ],
+    "out": 8.0
+   },
+   {
+    "in": [
+     8.0,
+     "in"
+    ],
+    "out": 8.0
+   },
+   {
+    "in": [
+     8.0,
+     "out"
+    ],
+    "out": 6.4
+   },
+   {
+    "in": [
+     0.1,
+     "out"
+    ],
+    "out": 0.1
+   },
+   {
+    "in": [
+     0.11,
+     "out"
+    ],
+    "out": 0.1
+   },
+   {
+    "in": [
+     0.1,
+     "in"
+    ],
+    "out": 0.125
+   },
+   {
+    "in": [
+     null,
+     "in"
+    ],
+    "out": 1.25
+   },
+   {
+    "in": [
+     0,
+     "in"
+    ],
+    "out": 1.25
+   },
+   {
+    "in": [
+     -2,
+     "out"
+    ],
+    "out": 0.8
+   },
+   {
+    "in": [
+     2.0,
+     "in"
+    ],
+    "out": 2.5
+   }
+  ],
+  "fit_scale": [
+   {
+    "in": [
+     800,
+     600,
+     1600,
+     1200
+    ],
+    "out": 0.475
+   },
+   {
+    "in": [
+     800,
+     600,
+     400,
+     300
+    ],
+    "out": 1.9
+   },
+   {
+    "in": [
+     1000,
+     500,
+     500,
+     1000
+    ],
+    "out": 0.475
+   },
+   {
+    "in": [
+     800,
+     600,
+     0,
+     300
+    ],
+    "out": 1.0
+   },
+   {
+    "in": [
+     800,
+     600,
+     null,
+     300
+    ],
+    "out": 1.0
+   },
+   {
+    "in": [
+     0,
+     0,
+     100,
+     100
+    ],
+    "out": 1.0
+   },
+   {
+    "in": [
+     100,
+     100,
+     100000,
+     100000
+    ],
+    "out": 0.1
+   },
+   {
+    "in": [
+     100000,
+     100000,
+     10,
+     10
+    ],
+    "out": 8.0
+   },
+   {
+    "in": [
+     1024,
+     680,
+     1920,
+     1088
+    ],
+    "out": 0.5067
+   }
+  ],
+  "zoom_percent": [
+   {
+    "in": [
+     1.0
+    ],
+    "out": "100%"
+   },
+   {
+    "in": [
+     1.25
+    ],
+    "out": "125%"
+   },
+   {
+    "in": [
+     0.1
+    ],
+    "out": "10%"
+   },
+   {
+    "in": [
+     8.0
+    ],
+    "out": "800%"
+   },
+   {
+    "in": [
+     0.7
+    ],
+    "out": "70%"
+   },
+   {
+    "in": [
+     1.5625
+    ],
+    "out": "156%"
+   },
+   {
+    "in": [
+     null
+    ],
+    "out": "100%"
+   }
+  ],
+  "pan_allowed": [
+   {
+    "in": [
+     1.0,
+     [
+      800,
+      600
+     ],
+     [
+      400,
+      300
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     2.0,
+     [
+      800,
+      600
+     ],
+     [
+      400,
+      300
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     2.0,
+     [
+      800,
+      600
+     ],
+     [
+      500,
+      300
+     ]
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     1.0,
+     [
+      800,
+      600
+     ],
+     [
+      800,
+      600
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     1.0,
+     [
+      800,
+      600
+     ],
+     [
+      900,
+      100
+     ]
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     0.5,
+     [
+      800,
+      600
+     ],
+     [
+      1600,
+      1200
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     1.0,
+     [
+      800,
+      600
+     ],
+     [
+      0,
+      0
+     ]
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     0,
+     [
+      800,
+      600
+     ],
+     [
+      1600,
+      1200
+     ]
+    ],
+    "out": false
+   }
+  ],
+  "edit_can_submit": [
+   {
+    "in": [
+     "сделай небо розовым",
+     0,
+     true
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "  abcd  ",
+     0,
+     true
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "abcde",
+     0,
+     true
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "  abcde  ",
+     3,
+     true
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "abcde",
+     4,
+     true
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "abcde",
+     -1,
+     true
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "abcde",
+     1,
+     false
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "",
+     0,
+     true
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     null,
+     0,
+     true
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "привет",
+     2,
+     true
+    ],
+    "out": true
+   }
+  ],
+  "edit_button": [
+   {
+    "in": [
+     5.0,
+     false
+    ],
+    "out": {
+     "label": "Править за 5 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     1180.0,
+     false
+    ],
+    "out": {
+     "label": "Править за 1 180 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0.3,
+     false
+    ],
+    "out": {
+     "label": "Править за 0,30 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0,
+     true
+    ],
+    "out": {
+     "label": "Править без оценки",
+     "note": "edit_cost_unknown"
+    }
+   },
+   {
+    "in": [
+     0,
+     false
+    ],
+    "out": {
+     "label": "Править",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0.0,
+     true
+    ],
+    "out": {
+     "label": "Править без оценки",
+     "note": "edit_cost_unknown"
+    }
+   },
+   {
+    "in": [
+     6.4,
+     true
+    ],
+    "out": {
+     "label": "Править за 6 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     null,
+     true
+    ],
+    "out": {
+     "label": "Править без оценки",
+     "note": "edit_cost_unknown"
+    }
+   },
+   {
+    "in": [
+     null,
+     false
+    ],
+    "out": {
+     "label": "Править",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0.5,
+     false
+    ],
+    "out": {
+     "label": "Править за 1 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     2.5,
+     false
+    ],
+    "out": {
+     "label": "Править за 3 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0.004,
+     false
+    ],
+    "out": {
+     "label": "Править за 0 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     0.005,
+     false
+    ],
+    "out": {
+     "label": "Править за 0,01 ₽",
+     "note": null
+    }
+   },
+   {
+    "in": [
+     1.4,
+     false
+    ],
+    "out": {
+     "label": "Править за 1 ₽",
+     "note": null
+    }
+   }
+  ],
+  "edit_error_text": [
+   {
+    "in": [
+     "conflict",
+     "plan_changed",
+     false
+    ],
+    "out": "edit_plan_changed"
+   },
+   {
+    "in": [
+     "conflict",
+     "cost_changed",
+     false
+    ],
+    "out": "edit_cost_changed"
+   },
+   {
+    "in": [
+     "conflict",
+     "cost_confirmation_required",
+     true
+    ],
+    "out": "edit_confirm_unknown"
+   },
+   {
+    "in": [
+     "conflict",
+     "cost_confirmation_required",
+     false
+    ],
+    "out": "edit_cost_changed"
+   },
+   {
+    "in": [
+     "locked",
+     null,
+     false
+    ],
+    "out": "edit_busy"
+   },
+   {
+    "in": [
+     "conflict",
+     "regeneration_pending",
+     false
+    ],
+    "out": "edit_busy"
+   },
+   {
+    "in": [
+     "conflict",
+     "edit_running",
+     false
+    ],
+    "out": "edit_busy"
+   },
+   {
+    "in": [
+     "unavailable",
+     "edit_failed",
+     false
+    ],
+    "out": "edit_failed"
+   },
+   {
+    "in": [
+     "invalid_argument",
+     null,
+     false
+    ],
+    "out": "edit_failed"
+   },
+   {
+    "in": [
+     "internal",
+     null,
+     false
+    ],
+    "out": "edit_failed"
+   },
+   {
+    "in": [
+     "not_found",
+     null,
+     false
+    ],
+    "out": "edit_failed"
+   },
+   {
+    "in": [
+     "interrupted",
+     null,
+     false
+    ],
+    "out": "edit_failed"
+   }
+  ],
+  "editable_extension": [
+   {
+    "in": [
+     "a.png"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "A.PNG"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "x.JPEG"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "x.jpg"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "p.webp"
+    ],
+    "out": true
+   },
+   {
+    "in": [
+     "a.gif"
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "a.png.txt"
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "noext"
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     ".png"
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     ""
+    ],
+    "out": false
+   },
+   {
+    "in": [
+     "dir.v2/a.bmp"
+    ],
+    "out": false
+   }
+  ],
+  "gallery_groups": [
+   {
+    "in": [
+     []
+    ],
+    "out": []
+   },
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/b.png",
+       "name": "b.png",
+       "page": 2
+      },
+      {
+       "path": "50_images/a.png",
+       "name": "a.png",
+       "page": 1
+      },
+      {
+       "path": "50_images/c10.png",
+       "name": "c10.png",
+       "page": 3
+      },
+      {
+       "path": "50_images/c9.png",
+       "name": "c9.png",
+       "page": 3
+      },
+      {
+       "path": "50_images/z.png",
+       "name": "z.png",
+       "page": null
+      },
+      {
+       "path": "50_images/y.png",
+       "name": "y.png",
+       "page": null
+      }
+     ]
+    ],
+    "out": [
+     {
+      "title": "Страница 1",
+      "page": 1,
+      "items": [
+       "a.png"
+      ]
+     },
+     {
+      "title": "Страница 2",
+      "page": 2,
+      "items": [
+       "b.png"
+      ]
+     },
+     {
+      "title": "Страница 3",
+      "page": 3,
+      "items": [
+       "c9.png",
+       "c10.png"
+      ]
+     },
+     {
+      "title": "Без номера страницы",
+      "page": null,
+      "items": [
+       "y.png",
+       "z.png"
+      ]
+     }
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/page_10.png",
+       "name": "page_10.png",
+       "page": 10
+      },
+      {
+       "path": "50_images/page_2.png",
+       "name": "page_2.png",
+       "page": 2
+      },
+      {
+       "path": "50_images/Img10.png",
+       "name": "Img10.png",
+       "page": 2
+      },
+      {
+       "path": "50_images/img3.png",
+       "name": "img3.png",
+       "page": 2
+      }
+     ]
+    ],
+    "out": [
+     {
+      "title": "Страница 2",
+      "page": 2,
+      "items": [
+       "img3.png",
+       "Img10.png",
+       "page_2.png"
+      ]
+     },
+     {
+      "title": "Страница 10",
+      "page": 10,
+      "items": [
+       "page_10.png"
+      ]
+     }
+    ]
+   }
+  ],
+  "gallery_filter": [
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/Cat.png",
+       "name": "Cat.png",
+       "page": 1
+      },
+      {
+       "path": "50_images/dog.png",
+       "name": "dog.png",
+       "page": 1
+      },
+      {
+       "path": "50_images/cat2.png",
+       "name": "cat2.png",
+       "page": 2
+      }
+     ],
+     "cat"
+    ],
+    "out": [
+     "Cat.png",
+     "cat2.png"
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/Cat.png",
+       "name": "Cat.png",
+       "page": 1
+      },
+      {
+       "path": "50_images/dog.png",
+       "name": "dog.png",
+       "page": 1
+      }
+     ],
+     "  DOG "
+    ],
+    "out": [
+     "dog.png"
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/Cat.png",
+       "name": "Cat.png",
+       "page": 1
+      }
+     ],
+     ""
+    ],
+    "out": [
+     "Cat.png"
+    ]
+   },
+   {
+    "in": [
+     [
+      {
+       "path": "50_images/Cat.png",
+       "name": "Cat.png",
+       "page": 1
+      }
+     ],
+     "zzz"
+    ],
+    "out": []
+   }
+  ],
+  "file_info_lines": [
+   {
+    "in": [
+     "a.png",
+     "12,3 КБ",
+     "3 ноября 2026, 10:15",
+     1920,
+     1088
+    ],
+    "out": [
+     "Файл: a.png",
+     "Размер: 12,3 КБ",
+     "Изменён: 3 ноября 2026, 10:15",
+     "Размеры: 1920 × 1088"
+    ]
+   },
+   {
+    "in": [
+     "a.png",
+     "512 Б",
+     "—",
+     null,
+     null
+    ],
+    "out": [
+     "Файл: a.png",
+     "Размер: 512 Б",
+     "Изменён: —"
+    ]
+   },
+   {
+    "in": [
+     "b.jpg",
+     "1,0 МБ",
+     "1 января 2026, 00:00",
+     0,
+     10
+    ],
+    "out": [
+     "Файл: b.jpg",
+     "Размер: 1,0 МБ",
+     "Изменён: 1 января 2026, 00:00"
+    ]
+   }
+  ]
+ }
+}

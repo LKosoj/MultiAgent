@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from custom_tools.storybook import video_run_config
+
 
 _PROVIDER_NAME = "aitunnel"
 _PROVIDER_JOBS_VERSION = 2
@@ -488,7 +490,7 @@ def _build_input_hash(
     # so shots that never use a reference keep byte-identical hashes (no mass regen).
     if reference_video_hash is not None:
         payload["reference_video_hash"] = reference_video_hash
-    requested_resolution = os.getenv("ROUTERAI_RESOLUTION", "").strip() if provider_name == "routerai" else ""
+    requested_resolution = video_run_config.video_setting("RESOLUTION", "routerai") if provider_name == "routerai" else ""
     if requested_resolution:
         payload["requested_resolution"] = requested_resolution
     return _hash_json(payload)

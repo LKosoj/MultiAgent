@@ -1443,14 +1443,15 @@ def _build_edit_instruction(
             english_prompt = ("Исправь на изображении 1 только перечисленные нарушения непрерывности. Требуемые исправления имеют приоритет: "
                               "перемести или измени затронутые объекты и части композиции как указано. Сохрани только незатронутые "
                               "композицию, камеру, стиль, фон и другие элементы. Другие изображения используй только "
-                              "как референсы для исправляемого элемента. " + " ".join(
+                              "как референсы для исправляемого элемента. Если требуется направление силуэта или профиля, "
+                              "сделай его читаемым по контуру головы и носа, а не округлым анфасным пятном. " + " ".join(
                                   f"Требуется: {finding['required']}"
                                   for finding in edit_findings))
         else:
             english_prompt = ("Edit image 1 to correct only these continuity findings. Required corrections take priority: move or change affected "
                               "objects and parts of the composition as specified. Preserve only unaffected composition, camera, "
                               "style, background and other elements. Use other images only as references for "
-                              "the corrected element. " + " ".join(
+                              "the corrected element. If a silhouette or profile direction is required, make it readable in the head and nose contour, not a round frontal blob. " + " ".join(
                                   f"Required: {finding['required']}"
                                   for finding in edit_findings))
         scene_negative = ""

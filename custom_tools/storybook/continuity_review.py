@@ -202,6 +202,7 @@ def _audit(task, pictures, chunk_number):
             'identity, location, support, holder, motion, visibility or required causal state changes. '
             'Also enforce explicitly required character presence, relative spatial order and concealed identity. '
             'Facial features on generic background figures do not by themselves reveal a concealed identity; blur and graphic simplification are visual treatment, not narrative anonymity. '
+            'For a deliberately flat shadow or silhouette, enforce its registered broad position and direction, but do not fail on a fine facial-profile contour that is not visually readable in the source image. '
             'Reject reference-sheet overlays copied into the output: card numbers, grids and sheet borders. '
             'This includes contact sheets with multiple independent camera views or pose studies in one frame, '
             'even without borders or numbers; collage texture alone is not a contact sheet. '

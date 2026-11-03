@@ -108,6 +108,13 @@ def _pipeline_default_bool(workflow_name: str, input_name: str) -> bool:
     return value
 
 
+def _pipeline_default_number(workflow_name: str, input_name: str) -> float:
+    value = _pipeline_input_default(workflow_name, input_name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(f"{workflow_name}.yaml inputs.{input_name} must be a number")
+    return float(value)
+
+
 def _pipeline_default_list_int(workflow_name: str, input_name: str) -> list[int]:
     value = _pipeline_input_default(workflow_name, input_name)
     if not isinstance(value, list):
@@ -127,6 +134,10 @@ def _storybook_default_int(input_name: str) -> int:
 
 def _storybook_default_bool(input_name: str) -> bool:
     return _pipeline_default_bool("storybook_pipeline", input_name)
+
+
+def _storybook_default_number(input_name: str) -> float:
+    return _pipeline_default_number("storybook_pipeline", input_name)
 
 
 def _storybook_default_list_int(input_name: str) -> list[int]:
@@ -334,6 +345,36 @@ class StorybookPipelineRequest(_BasePipelineRequest):
     )
     generate_music: bool = Field(
         default_factory=lambda: _storybook_default_bool("generate_music"),
+        validate_default=True,
+    )
+    generate_sfx: bool = Field(
+        default_factory=lambda: _storybook_default_bool("generate_sfx"),
+        validate_default=True,
+    )
+    generate_subtitles: bool = Field(
+        default_factory=lambda: _storybook_default_bool("generate_subtitles"),
+        validate_default=True,
+    )
+    narration_path: str = Field(
+        default_factory=lambda: _storybook_default_str("narration_path", allow_empty=True),
+        validate_default=True,
+    )
+    video_provider: str = Field(
+        default_factory=lambda: _storybook_default_str("video_provider", allow_empty=True),
+        validate_default=True,
+    )
+    budget_rub: float = Field(
+        default_factory=lambda: _storybook_default_number("budget_rub"),
+        ge=0,
+        allow_inf_nan=False,
+        validate_default=True,
+    )
+    style_profile: str = Field(
+        default_factory=lambda: _storybook_default_str("style_profile", allow_empty=True),
+        validate_default=True,
+    )
+    style_preset: str = Field(
+        default_factory=lambda: _storybook_default_str("style_preset", allow_empty=True),
         validate_default=True,
     )
     final_allow_missing_audio: bool = Field(

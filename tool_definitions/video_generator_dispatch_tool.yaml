@@ -1,0 +1,83 @@
+name: video_generator_dispatch_tool
+description: "Генерирует видео из изображений через выбранного провайдера (routerai, aitunnel, minimax, veo); провайдер берётся из входа video_provider, настройки проекта или STORYBOOK_VIDEO_PROVIDER"
+category: "storybook"
+source_type: custom_function
+implementation_source: custom_tools.storybook.video_generator_dispatch_tool.video_generator_dispatch_tool
+parameters:
+  - name: "video_provider"
+    type: "str"
+    description: "Провайдер видео: routerai, aitunnel, minimax или veo. Пусто — настройка проекта, затем STORYBOOK_VIDEO_PROVIDER, затем routerai"
+    required: false
+  - name: "budget_rub"
+    type: "float"
+    description: "Запасной денежный бюджет в рублях на платную отправку видео, если у проекта нет файла настроек прогона; 0 — без ограничения. Работает только с routerai и aitunnel"
+    default: 0
+    required: false
+  - name: "retry_cycles"
+    type: "int"
+    description: "Число циклов основной и резервной модели; по умолчанию <ПРОВАЙДЕР>_VIDEO_RETRY_CYCLES, 0 отключает повторы"
+    required: false
+  - name: "fallback_model"
+    type: "str"
+    description: "Резервная модель; по умолчанию <ПРОВАЙДЕР>_VIDEO_FALLBACK_MODEL"
+    required: false
+  - name: "shot_keys"
+    type: "list"
+    description: "Обрабатывать только указанные выходные ключи scene-shot, сохраняя остальные видео"
+    required: false
+  - name: "session_id"
+    type: "str"
+    description: "Идентификатор сессии для трассировки выполнения"
+    required: true
+  - name: "project_id"
+    type: "str"
+    description: "Идентификатор проекта для логирования и контекста"
+    required: false
+  - name: "items"
+    type: "Any"
+    description: "Данные items или JSON-строка с кадрами для конвертации в видео. Ожидаемая структура: {items: [список кадров], consistency_rules: [правила]}. Инструмент автоматически найдет start/end изображения в директории video_path"
+    required: false
+  - name: "max_concurrency"
+    type: "int"
+    description: "Максимальное количество параллельных запросов к API (пусто — значение провайдера по умолчанию)"
+    required: false
+  - name: "enable"
+    type: "bool"
+    description: "Если True, выполняет генерацию видео. Если False, пропускает выполнение (по умолчанию False)"
+    required: false
+  - name: "seed"
+    type: "int"
+    description: "Сид для генерации видео"
+    required: false
+  - name: "language"
+    type: "str"
+    description: "Язык генерации для корректного перевода промптов (по умолчанию 'en')"
+    required: false
+  - name: "force_update_prompts"
+    type: "bool"
+    description: "Если True, принудительно обновляет video_prompt независимо от timestamp (по умолчанию False)"
+    required: false
+  - name: "skip_prompt_enhancement"
+    type: "bool"
+    description: "Если True, пропускает улучшение промпта LLM (только перевод, без добавления деталей и без галлюцинаций). По умолчанию False"
+    default: false
+    required: false
+  - name: "sample_before_batch"
+    type: "bool"
+    description: "Если True, обрабатывает только один выбранный или первый ожидающий шот перед пакетной генерацией"
+    default: false
+    required: false
+  - name: "sample_shot_key"
+    type: "str"
+    description: "Ключ шота в формате scene-shot для sample_before_batch; если не задан, берется первый ожидающий шот"
+    required: false
+  - name: "generate_blockout"
+    type: "bool"
+    description: "Если True, включает слой болванок проекта"
+    default: false
+    required: false
+  - name: "use_blockout_reference"
+    type: "bool"
+    description: "Если True, подаёт ролик болванки как видео-референс"
+    default: false
+    required: false

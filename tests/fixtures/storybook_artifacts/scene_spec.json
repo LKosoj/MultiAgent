@@ -1,0 +1,14 @@
+{
+  "project_id": "demo",
+  "fps": 24,
+  "resolution": [
+    1280,
+    720
+  ],
+  "spec_version": 1,
+  "chains": [
+    {
+      "chain_id": "scene_01_chain_01"
+    }
+  ]
+}

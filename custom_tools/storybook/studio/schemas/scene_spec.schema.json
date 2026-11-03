@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Описание сцены болванки",
+  "properties": {
+    "chains": {
+      "type": "array",
+      "title": "Цепочки",
+      "items": {
+        "type": "object",
+        "title": "Цепочка",
+        "properties": {
+          "chain_id": {
+            "type": "string",
+            "title": "Идентификатор цепочки"
+          }
+        },
+        "required": [
+          "chain_id"
+        ]
+      }
+    },
+    "project_id": {
+      "type": "string",
+      "title": "Проект"
+    },
+    "spec_version": {
+      "type": "integer",
+      "title": "Версия описания"
+    },
+    "fps": {
+      "type": "number",
+      "title": "Кадров в секунду",
+      "exclusiveMinimum": 0
+    },
+    "resolution": {
+      "title": "Разрешение"
+    }
+  },
+  "required": [
+    "chains"
+  ],
+  "x-recommended": [
+    "project_id",
+    "spec_version",
+    "fps",
+    "resolution"
+  ]
+}

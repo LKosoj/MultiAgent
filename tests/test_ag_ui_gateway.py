@@ -906,6 +906,9 @@ def _text_to_sql_result(
             if succeeded
             else {"status": "not_attempted"}
         ),
+        "ambiguity": None,
+        "result_review": {},
+        "provenance": {},
     }
     return {
         "run_id": run_id,
@@ -1011,6 +1014,22 @@ def _load_runner_with_service_stub(monkeypatch, handle_service_action):
 def _install_service_action_stub(monkeypatch, handle_service_action) -> None:
     module_name = "backend.fastapi_app.agui.service"
     stub_service = types.ModuleType(module_name)
+
+    class ServiceTransportContext:
+        def __init__(
+            self,
+            *,
+            run_id,
+            principal,
+            cancellation_request_id=None,
+            cancellation_provenance=None,
+        ) -> None:
+            self.run_id = run_id
+            self.principal = principal
+            self.cancellation_request_id = cancellation_request_id
+            self.cancellation_provenance = cancellation_provenance
+
+    stub_service.ServiceTransportContext = ServiceTransportContext
     stub_service.handle_service_action = handle_service_action
     monkeypatch.setitem(sys.modules, module_name, stub_service)
 

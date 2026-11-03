@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Стиль изображений",
+  "properties": {
+    "art_style": {
+      "type": "string",
+      "title": "Художественный стиль"
+    },
+    "color_palette": {
+      "type": [
+        "array",
+        "string"
+      ],
+      "title": "Палитра",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lighting": {
+      "type": "string",
+      "title": "Освещение"
+    },
+    "camera_defaults": {
+      "type": "object",
+      "title": "Камера по умолчанию"
+    },
+    "do_not_include": {
+      "type": [
+        "array",
+        "string"
+      ],
+      "title": "Не рисовать",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "x-recommended": [
+    "art_style",
+    "color_palette",
+    "lighting",
+    "camera_defaults",
+    "do_not_include"
+  ]
+}

@@ -582,8 +582,9 @@ def test_video_music_readiness_treats_missing_shots_as_pre_run_warning(tmp_path,
     assert "shots_json_missing_before_run" in result["warnings"]
     assert result["music"]["status"] == "disabled"
     action_ids = [action["id"] for action in result["workflow_actions"]["actions"]]
-    assert "project_inventory" in action_ids
-    assert "artifact_edit" in action_ids
+    # старые project_inventory / artifact_edit заменены возможностями студии
+    assert "projects_list" in action_ids
+    assert "artifact_save" in action_ids
     assert "media_edit" in action_ids
     assert "video_music_readiness" in action_ids
 
@@ -1110,7 +1111,7 @@ def test_live_yaml_video_step_maps_to_known_provider():
 def test_blockout_actions_registered_manager_only_and_web_unsupported():
     """A36 (раздел 18.7): пять новых действий болванки в реестре, с
     status: manager_only и surfaces.storybook_manager: available; на веб —
-    unsupported. Старая regenerate_image остаётся нетронутой."""
+    unsupported (Streamlit заморожен, ключа streamlit в surfaces нет). Старая regenerate_image остаётся нетронутой."""
     actions = {action["id"]: action for action in video_contract.STORYBOOK_WORKFLOW_ACTIONS}
 
     for action_id in (
@@ -1125,7 +1126,7 @@ def test_blockout_actions_registered_manager_only_and_web_unsupported():
         assert action["status"] == "manager_only"
         assert action["surfaces"]["storybook_manager"] == "available"
         assert action["surfaces"]["react"] == "unsupported"
-        assert action["surfaces"]["streamlit"] == "unsupported"
+        assert "streamlit" not in action["surfaces"]
 
     assert actions["blockout_regenerate_shots"]["category"] == "selective_regeneration"
 
@@ -1139,3 +1140,43 @@ def test_storybook_workflow_actions_tool_returns_blockout_entries():
     ids = {action["id"] for action in result["actions"]}
     assert {"blockout_render", "blockout_preview_build", "blockout_review",
             "blockout_asset_map_edit", "blockout_regenerate_shots"} <= ids
+
+
+def test_workflow_actions_merge_studio_registry_and_supersedes(monkeypatch):
+    from custom_tools.storybook.studio import capabilities as caps
+
+    monkeypatch.setattr(caps, "_REGISTRY", dict(caps.registry()))
+
+    @caps.capability("tmp_new", title="Новая", access="write", category="tmp",
+                     supersedes=("run_from_step",), project_scoped=False)
+    def tmp_new() -> dict:
+        return {}
+
+    @caps.capability("tmp_extra", title="Ещё", access="read", project_scoped=False)
+    def tmp_extra() -> dict:
+        return {}
+
+    legacy_ids = [a["id"] for a in video_contract._LEGACY_WORKFLOW_ACTIONS]
+    # старые действия, уже заменённые настоящими возможностями студии
+    superseded = {old for cap in caps.registry().values() for old in cap.supersedes} - {"run_from_step"}
+    result = video_contract.storybook_workflow_actions("demo")
+    assert set(result) == {"version", "status", "workflow_name", "project_id", "actions"}
+    assert result["project_id"] == "demo"
+    ids = [a["id"] for a in result["actions"]]
+    assert "run_from_step" not in ids
+    # новая запись встала на место старой, остальные legacy на местах
+    assert ids.index("tmp_new") == legacy_ids.index("run_from_step")
+    assert [i for i in ids if i in legacy_ids] == [
+        i for i in legacy_ids if i != "run_from_step" and (i not in superseded or i in ids)
+    ]
+    by_id = {a["id"]: a for a in result["actions"]}
+    new = by_id["tmp_new"]
+    assert new["status"] == "available" and new["service_action"] == "storybook.tmp_new"
+    assert new["surfaces"] == {"storybook_manager": "available", "react": "available"}
+    assert new["access"] == "write" and new["client_fn"] == "tmpNew"
+    assert ids[-3:].count("tmp_extra") == 1
+    assert {a["id"] for a in video_contract.STORYBOOK_WORKFLOW_ACTIONS} == set(ids)
+
+
+def test_legacy_workflow_actions_have_no_streamlit_surface():
+    assert all("streamlit" not in a["surfaces"] for a in video_contract._LEGACY_WORKFLOW_ACTIONS)

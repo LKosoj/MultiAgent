@@ -12,4 +12,12 @@ parameters:
     type: "str"
     description: "Идентификатор проекта"
     required: true
+  - name: "style_profile"
+    type: "str"
+    description: "Профиль каталога стилей; пусто - активный по умолчанию"
+    required: false
+  - name: "style_preset"
+    type: "str"
+    description: "Пресет из каталога; пусто - выбирает модель. Игнорируется, если стиль взят из цитаты задания"
+    required: false
 

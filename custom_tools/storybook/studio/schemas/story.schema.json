@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "История",
+  "properties": {
+    "title": {
+      "type": "string",
+      "title": "Название"
+    },
+    "pages": {
+      "type": "array",
+      "title": "Страницы",
+      "items": {
+        "type": "object",
+        "title": "Страница",
+        "properties": {
+          "page": {
+            "type": "integer",
+            "minimum": 1,
+            "title": "Номер"
+          },
+          "body": {
+            "type": "string",
+            "title": "Текст",
+            "minLength": 1
+          },
+          "title": {
+            "type": "string",
+            "title": "Заголовок"
+          }
+        },
+        "required": [
+          "page",
+          "body"
+        ],
+        "x-recommended": [
+          "title"
+        ]
+      },
+      "minItems": 1
+    }
+  },
+  "required": [
+    "title",
+    "pages"
+  ]
+}

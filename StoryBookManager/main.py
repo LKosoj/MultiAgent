@@ -50,19 +50,20 @@ def main():
         # Проверяем наличие директории проектов, определённой настройками
         storybook_root, storybook_root_exists = _prepare_projects_root()
         if not storybook_root_exists:
-            logger.error(f"Не найдена директория проектов: {storybook_root}")
-            messagebox.showerror(
-                "Ошибка инициализации",
-                f"Не найдена директория проектов:\n{storybook_root}\n\n"
-                "Проверьте настройку «Директория проектов» в диалоге настроек StoryBookManager."
-            )
-            return 1
+            # Окно всё равно открываем: иначе настройки не поправить
+            logger.warning(f"Не найдена директория проектов: {storybook_root}")
 
         logger.info("🚀 Запуск StoryBook Manager")
         
+        # Windows: до создания окна, иначе система растянет его и текст будет размытым
+        from StoryBookManager.gui.theme_tokens import enable_dpi_awareness
+        enable_dpi_awareness()
+
         # Создаем главное окно приложения
         root = tk.Tk()
         app = MainWindow(root)
+        if not storybook_root_exists:
+            root.after(200, app.prompt_missing_projects_dir)
         
         # Запускаем основной цикл приложения
         root.mainloop()

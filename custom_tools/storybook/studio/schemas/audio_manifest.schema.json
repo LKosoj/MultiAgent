@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "title": "Манифест озвучки",
+  "properties": {
+    "audio_tracks": {
+      "type": "array",
+      "title": "Дорожки",
+      "items": {
+        "type": "object",
+        "title": "Дорожка",
+        "properties": {
+          "role": {
+            "type": "string",
+            "title": "Роль"
+          },
+          "path": {
+            "type": "string",
+            "title": "Файл"
+          }
+        },
+        "required": [
+          "role",
+          "path"
+        ]
+      }
+    },
+    "project_id": {
+      "type": "string",
+      "title": "Проект"
+    },
+    "language": {
+      "type": "string",
+      "title": "Язык"
+    },
+    "tts_status": {
+      "type": "string",
+      "title": "Состояние озвучки"
+    },
+    "subtitles_path": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "title": "Субтитры"
+    }
+  },
+  "required": [
+    "audio_tracks"
+  ],
+  "x-recommended": [
+    "project_id",
+    "language",
+    "tts_status",
+    "subtitles_path"
+  ]
+}

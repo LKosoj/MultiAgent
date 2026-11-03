@@ -5154,6 +5154,19 @@ def test_partial_filter_binding_assessment_feedback_names_all_join_routes(
             ),
         }
     )
+    # Канонический direct-кандидат получаем из состояния без выбранных кандидатов:
+    # коммит при неоценённых discriminator-кандидатах редьюсер теперь отклоняет.
+    setup_item = item.model_copy(
+        update={"binding_ids": (), "status": SemanticItemStatus.UNRESOLVED}
+    )
+    setup_state = state.model_copy(
+        update={
+            "bindings": (),
+            "query_spec": state.query_spec.model_copy(
+                update={"semantic_items": (setup_item,)}
+            ),
+        }
+    )
     direct = next(
         binding
         for binding in _resolve_fixture(
@@ -5166,7 +5179,7 @@ def test_partial_filter_binding_assessment_feedback_names_all_join_routes(
             ),
             loaded=loaded_schema,
             namespace=namespace,
-            state=state,
+            state=setup_state,
             registry=_make_registry(namespace),
         ).admission.bindings
         if binding.binding_id not in (direct.binding_id, via_catalog.binding_id)
@@ -14828,12 +14841,6 @@ def test_exact_aggregate_operand_ignores_quoted_aggregate_text() -> None:
     )
 
 
-def test_exact_aggregate_operand_skips_no_document_opaque_schema() -> None:
-    assert not _research_loop_module._has_exact_aggregate_operand_mismatch(
-        None, None, (), object()
-    )
-
-
 @pytest.mark.parametrize(
     ("formula", "schema_names", "input_names", "mismatch"),
     (
@@ -14969,117 +14976,6 @@ def _exact_aggregate_candidate_state(
     return loaded_schema, state, document, candidate
 
 
-@pytest.mark.parametrize(("input_column", "rejects"), (("id", True), ("status", False)))
-def test_exact_aggregate_operand_preflight_checks_existing_candidate_assessment(
-    input_column, rejects
-) -> None:
-    loaded_schema, state, document, candidate = _exact_aggregate_candidate_state(
-        input_column
-    )
-    decision = ResearchDecisionV1.model_validate(
-        {
-            "decision_version": 1,
-            "proposals": (
-                {
-                    "proposal_type": "binding_assessment",
-                    "subject": {
-                        "reference_kind": "existing",
-                        "binding_id": candidate.binding_id,
-                    },
-                    "certificate": "consistent",
-                    "citation_evidence_ids": candidate.evidence_ids,
-                },
-            ),
-            "next": {"next_kind": "semantic_commit"},
-        }
-    )
-
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state, decision, ((candidate.source_id, document),), loaded_schema
-    ) is rejects
-
-
-def _differently_named_exact_aggregate_input():
-    loaded_schema, namespace = _fixture_schema(
-        {
-            "public.orders": {
-                "columns": {
-                    "id": {"type": "INTEGER"},
-                    "status": {"type": "TEXT"},
-                    "logical_status": {"type": "TEXT"},
-                }
-            }
-        }
-    )
-    base = _supported_state_after_probe(namespace, observed_at=_FIXTURE_NOW)
-    physical = base.bindings[0].model_copy(
-        update={
-            "confidence": 0.0,
-            "status": BindingStatus.CANDIDATE,
-            "validator_rule": None,
-        }
-    )
-    item = base.query_spec.semantic_items[0].model_copy(
-        update={
-            "kind": SemanticItemKind.FORMULA,
-            "normalized_meaning": "COUNT(logical_status)",
-            "required": True,
-            "status": SemanticItemStatus.PARTIALLY_RESOLVED,
-            "binding_ids": (physical.binding_id,),
-        }
-    )
-    state = ResearchState.model_validate(
-        {
-            **base.model_dump(mode="python", by_alias=True, round_trip=True),
-            "bindings": (physical,),
-            "query_spec": base.query_spec.model_copy(
-                update={"semantic_items": (item,)}
-            ),
-            "unresolved_items": (item.source_id,),
-        }
-    )
-    document = DocumentRef(document_id="aggregate-rule", namespace="main")
-
-    def decision(input_column: str) -> ResearchDecisionV1:
-        return ResearchDecisionV1.model_validate(
-            {
-                "decision_version": 1,
-                "proposals": (
-                    {
-                        "proposal_type": "new_binding",
-                        "proposal_key": "proposal:exact-aggregate",
-                        "source_id": item.source_id,
-                        "candidate": {
-                            "kind": "derived_expression",
-                            "expression_claim": "COUNT(logical_status)",
-                            "document_id": document.document_id,
-                            "rule_excerpt": "COUNT(logical_status)",
-                            "input_columns": (
-                                {
-                                    "table": "public.orders",
-                                    "column": input_column,
-                                },
-                            ),
-                        },
-                        "join_references": (),
-                        "citation_evidence_ids": (physical.evidence_ids[0],),
-                    },
-                ),
-                "next": {"next_kind": "semantic_commit"},
-            }
-        )
-
-    return loaded_schema, state, document, decision
-
-
-def test_exact_aggregate_preflight_accepts_confirmed_differently_named_input() -> None:
-    loaded_schema, state, document, decision = _differently_named_exact_aggregate_input()
-
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state, decision("status"), ((state.query_spec.semantic_items[0].source_id, document),), loaded_schema
-    ) is False
-
-
 def test_exact_aggregate_preflight_accepts_existing_confirmed_renamed_input(
     tmp_path,
 ) -> None:
@@ -15168,64 +15064,6 @@ def test_exact_aggregate_preflight_accepts_existing_confirmed_renamed_input(
 
     assert feedback is None
     assert reason is None
-
-
-def test_exact_aggregate_preflight_keeps_unconfirmed_or_missing_input_rejected() -> None:
-    loaded_schema, state, document, decision = _differently_named_exact_aggregate_input()
-    source_id = state.query_spec.semantic_items[0].source_id
-    without_physical = ResearchState.model_validate(
-        {
-            **state.model_dump(mode="python", by_alias=True, round_trip=True),
-            "bindings": (),
-            "query_spec": state.query_spec.model_copy(
-                update={
-                    "semantic_items": (
-                        state.query_spec.semantic_items[0].model_copy(
-                            update={
-                                "binding_ids": (),
-                                "status": SemanticItemStatus.UNRESOLVED,
-                            }
-                        ),
-                    )
-                }
-            ),
-        }
-    )
-
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        without_physical, decision("status"), ((source_id, document),), loaded_schema
-    )
-    different_source = ResearchState.model_validate(
-        {
-            **without_physical.model_dump(
-                mode="python", by_alias=True, round_trip=True
-            ),
-            "bindings": (
-                state.bindings[0].model_copy(update={"source_id": "source-2"}),
-            ),
-            "query_spec": without_physical.query_spec.model_copy(
-                update={
-                    "semantic_items": (
-                        without_physical.query_spec.semantic_items[0],
-                        without_physical.query_spec.semantic_items[0].model_copy(
-                            update={
-                                "source_id": "source-2",
-                                "required": False,
-                                "status": SemanticItemStatus.PARTIALLY_RESOLVED,
-                                "binding_ids": (state.bindings[0].binding_id,),
-                            }
-                        ),
-                    )
-                }
-            ),
-        }
-    )
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        different_source, decision("status"), ((source_id, document),), loaded_schema
-    )
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state, decision("id"), ((source_id, document),), loaded_schema
-    )
 
 
 def _same_batch_differently_named_exact_aggregate_input():
@@ -15491,10 +15329,9 @@ def test_exact_aggregate_preflight_detects_compact_connector_input(tmp_path) -> 
         tmp_path, loaded_schema, state, document, decision
     )
 
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state, decision, ((item.source_id, document),), loaded_schema
-    )
-    assert feedback == "UNRESOLVABLE_PREFLIGHT"
+    # Предпроверка больше не отклоняет несовпадение имён операнда: входы формулы
+    # привязываются по смыслу, а не по физическим именам.
+    assert feedback is None
     assert reason is None
 
 
@@ -15683,18 +15520,12 @@ def test_exact_aggregate_preflight_keeps_invalid_same_batch_input_rejected(tmp_p
         tmp_path, loaded_schema, state, document, invalid
     )
 
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state,
-        invalid,
-        ((state.query_spec.semantic_items[0].source_id, document),),
-        loaded_schema,
-    )
     assert feedback == "UNRESOLVABLE_PREFLIGHT"
     assert reason is None
 
 
 @pytest.mark.parametrize("change", ("other_source", "other_input", "missing_input"))
-def test_exact_aggregate_preflight_requires_matching_same_batch_input(
+def test_exact_aggregate_preflight_does_not_reject_unmatched_same_batch_input(
     tmp_path, change: str
 ) -> None:
     loaded_schema, state, document, decision = (
@@ -15760,13 +15591,9 @@ def test_exact_aggregate_preflight_requires_matching_same_batch_input(
         decision.model_copy(update={"proposals": proposals}),
     )
 
-    assert _research_loop_module._has_exact_aggregate_operand_mismatch(
-        state,
-        decision.model_copy(update={"proposals": proposals}),
-        ((state.query_spec.semantic_items[0].source_id, document),),
-        loaded_schema,
-    )
-    assert feedback == "UNRESOLVABLE_PREFLIGHT"
+    # Предпроверка больше не отклоняет несовпадение имён операнда: входы формулы
+    # привязываются по смыслу, а не по физическим именам.
+    assert feedback is None
     assert reason is None
 
 
@@ -16099,7 +15926,10 @@ def test_exact_formula_retry_hint_keeps_roles_separate_across_sources() -> None:
     )
 
     assert hint is not None
-    assert "Missing same-name aggregate operand: status" in hint
+    # Операнд агрегата больше не требует одноимённой колонки: роль остаётся
+    # только у предиката, а подсказка не выдаёт операнд за пропущенный.
+    assert "Missing same-name aggregate operand" not in hint
+    assert "Formula operand labels alone do not require same-named physical columns" in hint
     assert "Missing exact predicate column: status" in hint
 
 
@@ -17551,7 +17381,12 @@ def test_model_retries_keep_mismatch_formula_hint_after_preflight_rejection(
         state.query_spec.semantic_items[0].normalized_meaning,
         state.query_spec.semantic_items[0].normalized_meaning,
     ), contexts[1:]))
-    assert all("Missing same-name aggregate operand: RecordRef" in context for context in contexts[1:])
+    assert all(
+        "Formula operand labels alone do not require same-named physical columns"
+        in context
+        and "Missing same-name aggregate operand" not in context
+        for context in contexts[1:]
+    )
 
 
 def test_immediate_retry_hint_filter_excludes_other_source_assessment() -> None:
@@ -17597,7 +17432,8 @@ def test_exact_formula_hint_uses_only_candidate_inputs_for_missing_operands() ->
     )
 
     assert hint is not None
-    assert "Missing same-name aggregate operand: RecordRef" in hint
+    assert "Missing same-name aggregate operand" not in hint
+    assert "Formula operand labels alone do not require same-named physical columns" in hint
     assert "RecordRef, OtherRef" not in hint
 
 
@@ -22690,6 +22526,22 @@ def test_unresolvable_preflight_reports_absent_tool_with_valid_proposal() -> Non
         {"public.alpha": {"columns": {"signal": {"type": "TEXT"}}}}
     )
     state = _policy_state(namespace, with_evidence=True)
+    # Предложение валидно, только если цитируемое evidence уже наблюдало эту
+    # точную колонку; иначе preflight добавляет missing_probe.
+    signal_action, signal_evidence = _observed_column_evidence(
+        state,
+        ColumnRef(
+            table=TableRef(namespace="main", schema="public", table="alpha"),
+            column="signal",
+        ),
+        invocation_id="signal-evidence",
+    )
+    state = state.model_copy(
+        update={
+            "evidence": (*state.evidence, signal_evidence),
+            "action_history": (*state.action_history, signal_action),
+        }
+    )
     decision = ResearchDecisionV1.model_validate(
         {
             "decision_version": 1,
@@ -22706,7 +22558,7 @@ def test_unresolvable_preflight_reports_absent_tool_with_valid_proposal() -> Non
                         },
                     },
                     "join_references": (),
-                    "citation_evidence_ids": (state.evidence[0].evidence_id,),
+                    "citation_evidence_ids": (signal_evidence.evidence_id,),
                 },
             ),
             "next": {

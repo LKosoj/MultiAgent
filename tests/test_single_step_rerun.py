@@ -192,21 +192,22 @@ class TestSingleStepRerun(unittest.TestCase):
                     """
                     CREATE TABLE workflow_checkpoints (
                         workflow_id TEXT NOT NULL,
-                        timestamp TEXT NOT NULL
+                        timestamp TEXT NOT NULL,
+                        context TEXT
                     )
                     """
                 )
                 conn.execute(
                     "INSERT INTO workflow_checkpoints (workflow_id, timestamp) VALUES (?, ?)",
-                    ("sbm_proj1_old", "2026-03-21T10:00:00"),
+                    ("sbm_proj1_aaaaaaaa", "2026-03-21T10:00:00"),
                 )
                 conn.execute(
                     "INSERT INTO workflow_checkpoints (workflow_id, timestamp) VALUES (?, ?)",
-                    ("sbm_proj1_new", "2026-03-22T10:00:00"),
+                    ("sbm_proj1_bbbbbbbb", "2026-03-22T10:00:00"),
                 )
                 conn.execute(
                     "INSERT INTO workflow_checkpoints (workflow_id, timestamp) VALUES (?, ?)",
-                    ("sbm_other_project", "2026-03-23T10:00:00"),
+                    ("sbm_other_cccccccc", "2026-03-23T10:00:00"),
                 )
 
             checkpoint = MagicMock()
@@ -221,7 +222,7 @@ class TestSingleStepRerun(unittest.TestCase):
 
         self.assertIs(result, checkpoint)
         runner.engine.state_manager.store.get_latest_checkpoint.assert_awaited_once_with(
-            "sbm_proj1_new"
+            "sbm_proj1_bbbbbbbb"
         )
 
 
