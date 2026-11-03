@@ -12,8 +12,11 @@ import fcntl
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
+
+from .video_prompt_rules import VIDEO_PROMPT_RULES, finalize_video_prompt
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +427,7 @@ RULES:
 - Do NOT invent new actions, objects, or characters not in original prompt or image
 - Do NOT add readable text/logos/years unless visible in image
 - Format: Camera clause → Subject (appearance from image + action from original) → Environment (from image) → Tempo
-
+""" + VIDEO_PROMPT_RULES + """
 SELF-CHECK before output: every noun phrase either from original prompt OR from image analysis. If neither → delete."""
 
         # Формируем user_prompt
@@ -603,6 +606,16 @@ _UPDATE_SHOTS_WRITABLE_FIELDS = (
     "video_prompt_updated_timestamp",
 )
 _PREPARED_ENGLISH_VIDEO_PROMPT_KEY = "_prepared_english_video_prompt"
+
+
+def _with_continuity(shots_file_path: str, item: Dict[str, Any]) -> Dict[str, Any]:
+    """Кадр с фактами плана непрерывности (якоря формы предметов); без плана — как есть."""
+    from .continuity import bind_continuity_to_items
+    try:
+        return bind_continuity_to_items(Path(shots_file_path).resolve().parent.parent, [item])[0]
+    except Exception as exc:
+        logger.warning("⚠️ Не удалось прочитать план непрерывности для якорей формы: %s", exc)
+        return item
 
 
 def _serialized_shot_item(item: Dict[str, Any]) -> Dict[str, Any]:
@@ -804,6 +817,7 @@ def update_shots_with_descriptions(
             )
 
         if enhanced_prompt:
+            enhanced_prompt = finalize_video_prompt(enhanced_prompt, [_with_continuity(shots_file_path, item)])
             with _changes_lock:
                 item["video_prompt"] = enhanced_prompt
                 if re.search(r"[А-Яа-яЁё]", original_video_prompt):

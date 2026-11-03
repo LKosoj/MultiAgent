@@ -149,3 +149,14 @@ def test_visual_canon_analysis_excludes_nonvisual_narration(monkeypatch):
     assert result == []
     assert 'ВИЗУАЛЬНЫХ' in captured['system_prompt']
     assert 'Закадровый рассказчик без визуального тела' in captured['system_prompt']
+
+
+def test_screenplay_requires_story_readable_without_sound(monkeypatch):
+    from custom_tools.storybook import screenplay_generator as module
+    prompts = []
+    monkeypatch.setattr(module, '_llm_json_call', lambda **kwargs: prompts.append(kwargs['system_prompt']) or {'storyboard': []})
+    monkeypatch.setattr(module, 'call_openai_api', lambda **kwargs: prompts.append(kwargs['system_prompt']) or '{}')
+    module._generate_storyboard_for_scene_llm(scene_number=1, screenplay_core={'screenplay': []}, story_anchors={}, bible_location_names=[])
+    module._validate_and_repair_screenplay_llm(story_anchors={}, screenplay_json={'screenplay': []}, screenplay_time=60)
+    assert all('Немой просмотр' in prompt for prompt in prompts) and len(prompts) == 2
+    assert 'silent_readability' in prompts[1]

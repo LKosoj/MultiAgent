@@ -14,6 +14,7 @@ from custom_tools.storybook.audio_subtitle import (
     _format_srt_timestamp,
     _parse_timing_range,
 )
+from custom_tools.storybook.color_match import FILM_GRAIN_FILTER, match_scene_colors
 from custom_tools.storybook.project_paths import (
     safe_storybook_project_dir,
     storybook_projects_root,
@@ -669,10 +670,14 @@ def _render_final_video(
     warnings: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     if base_dir is not None:
+        # Планы сцены подгоняются по цвету к её первому плану; зерно ложится поверх всего ролика.
+        path_map = match_scene_colors(ffmpeg_bin, clips, base_dir / "97_shots" / "color_matched", warnings)
+        clips = [dict(clip, path=path_map.get(str(Path(clip["path"]).resolve()), clip["path"])) for clip in clips]
         timeline_path = base_dir / "97_shots" / "shots_timeline.fcpxml"
         if timeline_path.is_file():
             from custom_tools.storybook.timeline_media import render_fcpxml
-            return render_fcpxml(timeline_path, output_path, ffmpeg_bin=ffmpeg_bin)
+            return render_fcpxml(timeline_path, output_path, ffmpeg_bin=ffmpeg_bin,
+                                 path_map=path_map, video_filter=FILM_GRAIN_FILTER)
         audio_dir = base_dir / "98_audio"
         plan_path = audio_dir / _MUSIC_PLAN_FILENAME
         manifest_path = audio_dir / _MUSIC_MANIFEST_FILENAME
@@ -1083,7 +1088,7 @@ def _build_video_filter(clips: List[Dict[str, Any]]) -> str:
             f"[{label}]"
         )
         cursor += duration
-    parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[vout]")
+    parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0,{FILM_GRAIN_FILTER}[vout]")
     return ";".join(parts)
 
 

@@ -605,3 +605,11 @@ def test_invalid_motion_repair_reports_enum_and_publishes_complete_entity(tmp_pa
         if scene.get('scene_continuity_facts') == {}:
             scene.pop('scene_continuity_facts')
     assert current == source
+
+
+def test_frame_binding_carries_object_shape_anchor(tmp_path):
+    plan = _plan()
+    plan['entities'][0]['shape'] = 'the suitcase: a hard-shell brown leather box with brass corners'
+    base = _managed_project(tmp_path, plan)
+    bound = ct.bind_continuity_to_items(base, [{'scene_number': 1, 'shot_number': 1, 'shot_type': 'start'}])
+    assert bound[0]['_continuity']['start']['entities'][0]['shape'] == plan['entities'][0]['shape']

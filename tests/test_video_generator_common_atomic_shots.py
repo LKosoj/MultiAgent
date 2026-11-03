@@ -188,3 +188,29 @@ def test_concurrent_writers_keep_json_valid(tmp_path, monkeypatch):
     assert isinstance(saved, dict)
     assert isinstance(saved.get("items"), list)
     assert list(tmp_path.glob("shots.json.*.tmp")) == []
+
+
+def test_enhanced_prompt_gets_static_camera_and_shape_lock(tmp_path, monkeypatch):
+    from custom_tools.storybook.video_prompt_rules import STATIC_CAMERA_SENTENCE
+    monkeypatch.setattr(vgc, "generate_image_description", lambda *a, **k: "desc-new")
+    monkeypatch.setattr(vgc, "enhance_video_prompt", lambda *a, **k: "Static wide shot: the hero rests by the boulder.")
+    base = tmp_path / "project"
+    img = base / "97_shots/s1.png"
+    _write_json(base / "20_bible/continuity_plan.json", {
+        "entities": [{"id": "stone", "name": "Камень", "kind": "prop", "world_id": "real",
+                      "shape": "the boulder: a perfectly round grey granite sphere",
+                      "states": [{"id": "rest"}]}],
+        "frames": {f"1:1:{phase}": {"world_id": "real", "entities": [
+            {"id": "stone", "state_id": "rest", "visible": True}]} for phase in ("start", "end")},
+    })
+    img.parent.mkdir(parents=True)
+    img.write_bytes(b"x")
+    shots_path = base / "97_shots/shots.json"
+    _write_json(shots_path, {"items": []})
+
+    vgc.update_shots_with_descriptions(str(shots_path), [_start_item(img)], force_update=True)
+
+    saved = json.loads(shots_path.read_text(encoding="utf-8"))["items"][0]["video_prompt"]
+    assert saved == (f"{STATIC_CAMERA_SENTENCE} Static wide shot: the hero rests by the boulder. "
+                     "Shape lock: the boulder: a perfectly round grey granite sphere.")
+    assert "_continuity" not in json.loads(shots_path.read_text(encoding="utf-8"))["items"][0]

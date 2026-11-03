@@ -19,7 +19,7 @@ _BOUNDARY_INSTRUCTION = (
     'Для изменения только видимости или полного перекрытия используй visible=false, не выдумывай физическое событие. '
     'Не закрепляй случайные позы, направления и предосторожности из производных описаний как сквозные физические ограничения: для этого требуется явное авторское условие либо необходимость в причинной цепочке событий. '
     'При протяжённом приближении оставляй в начале запас пути, правдоподобный для времени движения: персонажи ещё не у цели; неподвижные цель и предметы не переноси и не показывай принудительно, используй visible=false или дальний план. '
-    'Сохраняй исходные id, geometry, reference_path и текст; не переписывай верный исходник ради ошибочного плана. '
+    'Сохраняй исходные id, geometry, shape, reference_path и текст; не переписывай верный исходник ради ошибочного плана. '
 )
 logger = logging.getLogger(__name__)
 
@@ -466,7 +466,7 @@ def storybook_continuity_plan_tool(session_id: str, project_id: str, enable: boo
         return _publish_plan(base, source, _repair_candidate(base, source, existing, fingerprint))
     response = call_openai_api(
         prompt=json.dumps(dict(_planning_source(source), existing_entities=[
-            {key: entity.get(key) for key in ('id', 'name', 'kind', 'world_id', 'geometry')}
+            {key: entity.get(key) for key in ('id', 'name', 'kind', 'world_id', 'geometry', 'shape')}
             for entity in existing.get('entities', [])]), ensure_ascii=False), model=model_ultimate, temperature=0.1,
         max_tokens=24000, response_format={'type': 'json_object'},
         system_prompt=(
@@ -495,7 +495,7 @@ def storybook_continuity_plan_tool(session_id: str, project_id: str, enable: boo
             'В character_identity дай очищенные unique_features/accessories, сохранив одежду и личность; '
             'excluded_entity_ids перечисляет только отделимый реквизит, который не должен попасть в эталон личности. '
             'Верни JSON {entities:[{id,name,kind:"landmark|prop",world_id,locations:[точные имена локаций],'
-            'geometry:строка,reference_location:точное имя локации для landmark,initial_state:state_id,'
+            'geometry:строка,shape:строка,reference_location:точное имя локации для landmark,initial_state:state_id,'
             'states:[{id,description,space,support,holder:null|имя,motion:"stationary|moving"}],'
             'transitions:[{at:"1:1:start",from:state_id,to:state_id,evidence:ТОЧНАЯ цитата '
             'из соответствующего description ПОСЛЕ repairs}]}],'
@@ -506,7 +506,9 @@ def storybook_continuity_plan_tool(session_id: str, project_id: str, enable: boo
             'префикса scene. Покрой START и END КАЖДОГО шота, даже если entities пуст. entities кадра содержит только важные '
             'для него объекты: visible=false сохраняет существенное отсутствие/удалённое положение без требования '
             'рисовать предмет в кадре. Каждый переход состояния задаётся transitions в точной фазе. Состояние '
-            'сохраняется между переходами независимо от видимости. Пиши на языке исходника.'),
+            'сохраняется между переходами независимо от видимости. Пиши на языке исходника, кроме shape. '
+            'shape — английская фраза до 15 слов: предмет, его неизменный силуэт и материал в любом ракурсе '
+            '(например, "the boulder: a perfectly round, smooth grey granite sphere"); без состояния, места и действия.'),
     )
     plan = parse_llm_json(response)
     plan['_input_hash'] = fingerprint
@@ -627,7 +629,8 @@ def frame_continuity(base, scene, shot, phase):
     selected, states = [], {}
     for binding in frame['entities']:
         entity = entities[binding['id']]
-        selected.append({key: entity[key] for key in ('id', 'name', 'kind', 'world_id', 'geometry', 'reference_path') if key in entity})
+        selected.append({key: entity[key] for key in ('id', 'name', 'kind', 'world_id', 'geometry', 'shape', 'reference_path')
+                         if key in entity})
         if entity['kind'] != 'landmark':
             selected[-1].pop('reference_path', None)
         state = next(state for state in entity['states'] if state['id'] == binding['state_id'])

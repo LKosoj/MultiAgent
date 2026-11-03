@@ -208,9 +208,19 @@ def _media_path(asset):
     return Path(unquote(urlsplit(asset.find("media-rep").get("src")).path))
 
 
-def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg"):
-    """Render the exported timeline, rebuilding when XML or referenced bytes change."""
+def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg", path_map=None, video_filter=None):
+    """Render the exported timeline, rebuilding when XML or referenced bytes change.
+
+    path_map подменяет видеоряд ресурсов (например, копиями с подогнанным цветом), звук берётся из исходника;
+    video_filter добавляется в конец видеоцепочки каждого фрагмента.
+    """
     timeline_path, output_path = Path(timeline_path), Path(output_path)
+    path_map = path_map or {}
+
+    def visual_path(asset):
+        source = _media_path(asset)
+        return Path(path_map.get(str(source.resolve()), source))
+
     root = ET.parse(timeline_path).getroot()
     resources = {a.get("id"): a for a in root.findall("./resources/asset")}
     sequence = root.find(".//sequence")
@@ -220,7 +230,8 @@ def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg"):
     rate = 1 / _seconds(fmt.get("frameDuration", "1/24s"))
     digest = hashlib.sha256(Path(__file__).read_bytes())
     digest.update(timeline_path.read_bytes())
-    for path in sorted({_media_path(a) for a in resources.values()}):
+    digest.update(str(video_filter or "").encode())
+    for path in sorted({_media_path(a) for a in resources.values()} | {visual_path(a) for a in resources.values()}):
         with path.open("rb") as f:
             for chunk in iter(lambda: f.read(1024 * 1024), b""):
                 digest.update(chunk)
@@ -264,7 +275,7 @@ def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg"):
             transition = _seconds(group[1].get("duration")) if len(group) == 3 else 0
             visual = [group[0], group[-1]] if len(group) == 3 else group
             for n, clip in enumerate(visual):
-                path = _media_path(resources[clip.get("ref")])
+                path = visual_path(resources[clip.get("ref")])
                 length = _seconds(clip.get("duration")) + transition
                 lengths.append(length)
                 if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -281,6 +292,9 @@ def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg"):
             if transition:
                 filters.append(f"[v0][v1]xfade=transition=fade:duration={transition}:offset={lengths[0]-transition}[v]")
             label = "[v]" if transition else "[v0]"
+            if video_filter:
+                filters.append(f"{label}{video_filter}[vf]")
+                label = "[vf]"
             target = temporary / f"{number:04d}.mp4"
             command += ["-filter_complex", ";".join(filters), "-map", label, "-an", "-c:v", "libx264",
                         "-threads", "2", "-preset", "veryfast", "-crf", "18", "-video_track_timescale", "24000", str(target)]

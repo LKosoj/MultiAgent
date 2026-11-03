@@ -27,6 +27,7 @@ from custom_tools.storybook.screenplay_shots_generator_utils.technical import (
     _build_reference_roles_instruction,
 )
 from custom_tools.storybook.project_paths import safe_storybook_project_dir
+from custom_tools.storybook.video_prompt_rules import VIDEO_PROMPT_RULES, video_prompt_violations
 from custom_tools.storybook.domain_glossary_config import (
     resolve_active_domain_profile,
     compose_anchor_glossary_note,
@@ -343,6 +344,8 @@ def _llm_judge_video_prompt_lite(
         "- Describe transition/micro-dynamics, not static restatement.\n"
         "- Preserve natural occlusion by opaque barriers: costume descriptions do not require hidden body parts to become visible through an opening. For quiet observation, retain subtle breathing and source-consistent gaze rather than replacing living reaction with a wardrobe reveal.\n"
         "- No invented story events. No raw newlines in strings.\n"
+        "## Format rules for rewritten_candidate\n"
+        + VIDEO_PROMPT_RULES
     )
     # M-25: \u0434\u043e\u043c\u0435\u043d\u043d\u044b\u0439 RU->EN glossary/anchor-pattern \u0432\u044b\u043d\u0435\u0441\u0435\u043d \u0432 domain_glossary_config.
     # \u0414\u0435\u0444\u043e\u043b\u0442\u043d\u044b\u0439 \u043f\u0440\u043e\u0444\u0438\u043b\u044c \u043f\u0443\u0441\u0442 => note == "" (\u043f\u0440\u043e\u043c\u043f\u0442 \u043e\u0441\u0442\u0430\u0451\u0442\u0441\u044f \u0443\u043d\u0438\u0432\u0435\u0440\u0441\u0430\u043b\u044c\u043d\u044b\u043c).
@@ -2155,7 +2158,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                         cp = ""
                         desc_i = ""
                     vp = str(it.get("video_prompt", "") or "")
-                    issues = _detect_closeup_video_prompt_violations(vp, cp, desc_i)
+                    issues = _detect_closeup_video_prompt_violations(vp, cp, desc_i) + video_prompt_violations(vp)
                     if issues:
                         detected_violations.append(
                             {
