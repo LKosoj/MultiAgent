@@ -21,6 +21,7 @@ from .video_generator_common import (
     _read_previous_video_caps,
 )
 from .video_generator_aitunnel_media import _select_best_supported_duration
+from .video_prompt_rules import VIDEO_PROMPT_RULES
 
 
 # Импорты из модуля screenplay_shots_generator_utils
@@ -1868,7 +1869,7 @@ T=0 управляется полем `shot_frame_spec.t0_mode` (для START ф
 - Close-up: обязателен токен "close-up". Фон = blur-hint, без room-establishing.
 - Split screen: обязателен токен "split-screen".
 - Quality keywords: natural/energetic/slow and deliberate/graceful/confident/fluid movement.
-
+{VIDEO_PROMPT_RULES}
 **ШАГ 8 — NEGATIVE_PROMPT (КОМПАКТНО, максимум 30 слов, на языке проекта):**
 - Называй нежелательные состояния без дополнительного отрицания: размытие, водяной знак, лишние или отсутствующие части тела.
 - Не запрещай разрешённый исходником текст, заданное кадрирование или обрезку частей вне кадра. Для POV исключай противоречащий ему внешний ракурс.

@@ -572,3 +572,23 @@ def test_router_reference_jpeg_transport_keeps_source_identity_and_aitunnel_png(
     assert all(entry['image_url']['url'].startswith('data:image/png;base64,') for entry in other['input_references'])
     assert [path.read_bytes() for path in paths] == originals
     assert router['seed'] == 7 and router['prompt'] == item['video_prompt']
+
+
+def test_empty_shot_unit_gets_no_style_image_with_hero(project, monkeypatch):
+    base, items, _ = planning_setup(project, monkeypatch)
+    courtyard = base / 'courtyard.png'
+    courtyard.write_bytes(b'location')
+    for item in items:
+        item['locations'] = [{'name': 'Courtyard', 'reference_image_path': str(courtyard)}]
+        if item['shot_number'] == 3:
+            item['characters'] = []
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {
+        'method': 'keyframes' if state['current']['shot_key'] == '1-1' else 'references', 'continuity': 'new'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items, 'seed': 123})
+    units = {tuple(u['shot_keys']): u for u in json.loads((base / '97_shots/video_plan.json').read_text())['units']}
+    style = str((base / 'style_ink.png').resolve())
+    assert units[('1-2',)]['style_reference_path'] == style
+    assert style in units[('1-2',)]['reference_image_paths']
+    assert units[('1-3',)]['style_reference_path'] is None
+    assert style not in units[('1-3',)]['reference_image_paths']
+    assert str(base / 'hero.png') not in units[('1-3',)]['reference_image_paths']

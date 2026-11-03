@@ -12,6 +12,7 @@ from . import video_run_config
 from .project_paths import safe_storybook_project_dir
 from .video_budget import reserve_budget
 from .video_generator_common import parse_duration_seconds_from_timing
+from .video_prompt_rules import VIDEO_PROMPT_RULES, finalize_video_prompt
 
 
 def _key(item):
@@ -38,7 +39,7 @@ def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
     assets = {str(_reference_path(base, entry['reference_image_path']))
               for item in items for field in ('characters', 'locations') for entry in item.get(field) or []
               if base is not None and entry.get('reference_image_path')}
-    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'language': language, 'reference_prompt_version': 8,
+    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'language': language, 'reference_prompt_version': 9,
                     'styles': {key: style['prompt'] for key, style in (catalog or {}).get('styles', {}).items()},
                     'style_image_model': os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL'), 'seed': seed,
                     'style_reference_instruction': _STYLE_REFERENCE_INSTRUCTION,
@@ -468,9 +469,12 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        'Do not invent fixed-duration holds. Preserve clothing and character order. '
                        'Reference sheets supply identity, not a multi-panel output. Do not invent events, '
                        'paste the film bible, generate a new style, or include narration, dialogue, '
-                       'subtitles or audio instructions. Sound is assembled separately. Return JSON video_prompt.'),
+                       'subtitles or audio instructions. Sound is assembled separately. Return JSON video_prompt.\n'
+                       + VIDEO_PROMPT_RULES
+                       + '- Here the main event is the one continuous action across the supplied shots; '
+                         'keep every required event at its supplied time.\n'),
         max_tokens=2600, temperature=0.2, response_format={'type': 'json_object'})
-    prompt = parse_llm_json(response)['video_prompt']
+    prompt = finalize_video_prompt(parse_llm_json(response)['video_prompt'], group)
     catalog_path = base / '30_style/image_styles.json'
     if catalog_path.is_file():
         catalog = json.loads(catalog_path.read_text())
@@ -627,8 +631,10 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                     roles[str(_reference_path(base, variant['reference_image_path']))] = name
             state['reference_images'] = [{'image': n, 'subject': roles.get(path)} for n, path in enumerate(refs, 1)]
             style_id = chunk[0]['style_id']
-            style_image = style_references[style_id]
-            required = set(refs) | {initial, final, style_image} | ({continuity} if continuity else set())
+            # Эталон стиля нарисован с героем: в пустой план он подмешал бы персонажа.
+            has_characters = any(item.get('characters') or item.get('character_reference_states') for item in chunk)
+            style_image = style_references[style_id] if has_characters else None
+            required = set(refs) | {initial, final} | ({style_image} if style_image else set()) | ({continuity} if continuity else set())
             if config.get('max_image_references') is not None and len(required) > config['max_image_references']:
                 raise ValueError(f'Too many references for action {_key(chunk[0])}')
             prompt, refs = prepare_reference_prompt(base, chunk, state, refs, language,

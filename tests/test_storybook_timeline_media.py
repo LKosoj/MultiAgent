@@ -230,3 +230,25 @@ def test_motion_timeline_keeps_clip_end_and_audio_anchor_when_retimed(tmp_path, 
     with Image.open(frame) as image:
         red, green, blue = image.convert("RGB").getpixel((80, 48))
         assert blue > 200 and red < 50
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="ffmpeg required")
+def test_render_uses_color_matched_video_and_final_filter(tmp_path, monkeypatch):
+    from custom_tools.storybook.timeline_media import render_fcpxml
+    base, items = _project(tmp_path, monkeypatch)
+    red, blue = base / "red.mp4", base / "blue.mp4"
+    for path, color in [(red, "red"), (blue, "blue")]:
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"color={color}:s=160x96:r=24:d=3",
+                        "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path)], check=True)
+    items = [dict(item, video_path=str(red)) for item in items]
+    timeline = base / "97_shots/shots_timeline.fcpxml"
+    fg._generate_fcpxml("test", items, str(timeline))
+    output = base / "99_final/matched.mp4"
+    plain = render_fcpxml(timeline, output)
+    report = render_fcpxml(timeline, output, path_map={str(red.resolve()): str(blue)}, video_filter="hflip")
+    assert not report["cached"] and report["input_hash"] != plain["input_hash"]
+    frame = tmp_path / "frame.png"
+    subprocess.run(["ffmpeg", "-v", "error", "-ss", "1", "-i", str(output), "-frames:v", "1", str(frame)], check=True)
+    with Image.open(frame) as image:
+        r, g, b = image.convert("RGB").getpixel((80, 48))
+        assert b > 200 and r < 50
