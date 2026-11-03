@@ -184,7 +184,7 @@ def _audit(task, pictures, chunk_number):
             'url': 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode()}}])
     request['prompt'] = content
     response = call_openai_api(
-        model=model_ultimate, max_tokens=4000, temperature=0.1, response_format={'type': 'json_object'},
+        model=model_ultimate, max_tokens=32768, temperature=0.1, response_format={'type': 'json_object'},
         **request,
         system_prompt=(
             'Inspect actual labeled pixels against their own phase and the shared object identities. '
@@ -422,7 +422,7 @@ def _repair_media(base, tasks, kind, session_id):
                           and frame.get('shot_type', 'start') == 'start')
         existing_prompt = target['video_prompt']
         response = call_openai_api(
-            model=model_ultimate, temperature=0.1, max_tokens=4000, response_format={'type': 'json_object'},
+            model=model_ultimate, temperature=0.1, max_tokens=32768, response_format={'type': 'json_object'},
             prompt=json.dumps({'existing_prompt': existing_prompt, 'expected_frames': task['contexts'],
                 'reference_images': item.get('reference_image_paths'),
                 'findings': verdicts[task['input_hash']]['verdicts']},

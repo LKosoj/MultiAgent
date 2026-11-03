@@ -10,7 +10,7 @@ memory_policy:
   scope_read: session              # Читает данные всех агентов в сессии
   allow_scope_escalation: false   # Без расширения (специализированный агент)
   search_enabled: true            # Семантический поиск для примеров диаграмм
-  max_tokens: 6000                # Средний контекст
+  max_tokens: 32768                # Средний контекст
   last_k_steps: 5                 # Стандартные шаги
   priority_strategic: 0.2         # Больше тактического фокуса
   strategic_write: false          # Не пишет стратегию

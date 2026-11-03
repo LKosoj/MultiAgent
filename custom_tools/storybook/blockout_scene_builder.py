@@ -629,7 +629,7 @@ def llm_resolve_asset(display_name: str, description_context: str, language: str
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=400,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -1047,7 +1047,7 @@ def llm_parse_chain_spatial(chain_payload: Dict[str, Any]) -> Optional[Dict[str,
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=2000,
+            max_tokens=32768,
             temperature=0.2,
             response_format={"type": "json_object"},
         )

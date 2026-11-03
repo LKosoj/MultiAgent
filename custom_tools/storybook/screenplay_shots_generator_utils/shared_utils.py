@@ -195,7 +195,7 @@ def enrich_shot_frame_spec_environment_delta_via_llm(
             prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
             system_prompt=system_prompt,
             model=model_lite,
-            max_tokens=900,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -280,7 +280,7 @@ def _complete_shot_frame_spec_fields_via_llm(spec: Dict[str, Any]) -> Dict[str, 
             prompt="NORMALIZED_SHOT_FRAME_SPEC:\n" + json.dumps(out, ensure_ascii=False),
             system_prompt=_SHOT_FRAME_SPEC_COMPLETE_SYSTEM,
             model=model_lite,
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -330,7 +330,7 @@ def _sanitize_readable_texts_via_llm(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "}"
             ),
             model=model_lite,
-            max_tokens=900,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -962,7 +962,7 @@ def _extract_shot_frame_spec_llm(
             prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
             system_prompt=system_prompt,
             model=model_hard,
-            max_tokens=3500,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -1179,7 +1179,7 @@ def black_screen_storyboard_shot(
         prompt=cache_payload,
         system_prompt=system_prompt,
         model=model_lite,
-        max_tokens=40,
+        max_tokens=32768,
         temperature=0.0,
         response_format={"type": "json_object"},
     )
@@ -1400,7 +1400,7 @@ def _create_missing_location_llm(
                 prompt=normalization_prompt,
                 system_prompt="Ты эксперт по обработке текста. Нормализуй название локации согласно инструкциям.",
                 model=model_ultimate,
-                max_tokens=50,
+                max_tokens=32768,
                 temperature=0.1
             )
             
@@ -1474,7 +1474,7 @@ def _create_missing_location_llm(
                 prompt=system_prompt,
                 system_prompt="Ты эксперт по созданию описаний локаций для кинематографа. Создай детальное описание новой локации в JSON формате.",
                 model=model_ultimate,
-                max_tokens=1000,
+                max_tokens=32768,
                 temperature=0.3,
                 response_format={"type": "json_object"}
             )

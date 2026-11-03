@@ -183,7 +183,7 @@ def _plan_via_llm(context: Dict[str, Any], budget: int, language: str) -> Option
             prompt=json.dumps(context, ensure_ascii=False, indent=2),
             system_prompt=_system_prompt(budget, language),
             model=model_hard,
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )

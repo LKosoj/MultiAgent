@@ -80,7 +80,7 @@ def ensure_image_style_catalog(base: str, style_images: Dict[str, Any]) -> Dict[
             "Не назначай стили кадрам: привязки использует код."
         ),
         model=model_code,
-        max_tokens=8000,
+        max_tokens=32768,
         temperature=0.1,
         response_format={"type": "json_object"},
     )

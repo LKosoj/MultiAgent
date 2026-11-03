@@ -10,7 +10,7 @@ memory_policy:
   scope_read: agent               # Только свои данные (изоляция безопасности)
   allow_scope_escalation: false   # Без расширения (безопасность)
   search_enabled: false           # Без семантического поиска
-  max_tokens: 10000               # Минимальный контекст
+  max_tokens: 32768               # Минимальный контекст
   last_k_steps: 2                 # Только текущий контекст
   priority_strategic: 0.1         # Минимальный стратегический фокус
   strategic_write: false          # Не пишет стратегию

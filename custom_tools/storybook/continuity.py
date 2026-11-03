@@ -257,7 +257,7 @@ def _review_staging_repairs(base, source, plan):
                     sorted(selected), len(changes), len(json.dumps(payload, ensure_ascii=False)))
         review = parse_llm_json(call_openai_api(
             prompt=json.dumps(payload, ensure_ascii=False), model=model_ultimate, temperature=0.1,
-            max_tokens=2000, response_format={'type': 'json_object'},
+            max_tokens=32768, response_format={'type': 'json_object'},
             system_prompt=(_BOUNDARY_INSTRUCTION + 'Независимо проверь только предложенные изменения постановки до их применения. '
                 'Первичные авторские материалы приоритетнее производного before: само наличие детали в before не делает её авторским требованием. '
                 'Разрешены минимальные исправления, необходимые для физических состояний, общей геометрии '
@@ -334,7 +334,7 @@ def _repair_candidate(base, source, plan, fingerprint, review_findings=None):
                     attempt + 1, len(candidate_context['entities']), len(json.dumps(payload, ensure_ascii=False)), last_error)
         response = call_openai_api(
             prompt=json.dumps(payload, ensure_ascii=False),
-            model=model_ultimate, temperature=0.1, max_tokens=8000, response_format={'type': 'json_object'},
+            model=model_ultimate, temperature=0.1, max_tokens=32768, response_format={'type': 'json_object'},
             system_prompt=(
                 _BOUNDARY_INSTRUCTION +
                 'Проверь сохранённый план физической непрерывности и исправь его через минимальный JSON-патч. '

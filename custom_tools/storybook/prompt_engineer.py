@@ -773,7 +773,7 @@ def _repair_prompt_state_conflicts(
             prompt=json.dumps(payload, ensure_ascii=False),
             system_prompt=system,
             model=model_code,
-            max_tokens=2200,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -842,7 +842,7 @@ def _repair_prompt_scene_alignment(
             prompt=json.dumps(payload, ensure_ascii=False),
             system_prompt=system,
             model=model_code,
-            max_tokens=2200,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -901,7 +901,7 @@ def _polish_prompt_surface(
             prompt=json.dumps(payload, ensure_ascii=False),
             system_prompt=system,
             model=model_code,
-            max_tokens=1800,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -957,7 +957,7 @@ def _freeze_frame_surface_rewrite(
             prompt=json.dumps(payload, ensure_ascii=False),
             system_prompt=system,
             model=model_code,
-            max_tokens=1600,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )
@@ -1026,7 +1026,7 @@ def _finalize_prompt_from_frame_spec(
             prompt=json.dumps(payload, ensure_ascii=False),
             system_prompt=system,
             model=model_code,
-            max_tokens=2200,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"},
         )

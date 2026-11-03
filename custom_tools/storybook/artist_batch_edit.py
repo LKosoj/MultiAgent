@@ -393,7 +393,7 @@ def _collect_visible_text_bindings(
     response = call_openai_api(
         prompt="Source data:\n" + json.dumps(llm_payload, ensure_ascii=False, indent=2),
         system_prompt=system_prompt,
-        max_tokens=1400,
+        max_tokens=32768,
         temperature=0.1,
         response_format={"type": "json_object"},
         max_retries=2,
@@ -1872,7 +1872,7 @@ def _create_canon_reference(
                     "Return only a JSON object with a nonempty English english_prompt."
                 ),
                 model=model_hard,
-                max_tokens=4000,
+                max_tokens=32768,
                 temperature=0.1,
                 response_format={"type": "json_object"},
             )

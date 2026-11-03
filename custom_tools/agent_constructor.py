@@ -66,7 +66,7 @@ def parse_spec(description: str, context: Optional[Dict[str, Any]] = None) -> Di
     raw = call_openai_api(
         prompt=user_prompt,
         system_prompt=sys_prompt,
-        max_tokens=1200,
+        max_tokens=32768,
         temperature=0.0,
         response_format={"type": "json_object"},
     )
@@ -392,7 +392,7 @@ def generate_agent_profile(spec: Dict[str, Any], tools_resolved: List[Dict[str, 
     prompt_text = call_openai_api(
         prompt=prompt_compose_user,
         system_prompt=prompt_compose_system,
-        max_tokens=1600,
+        max_tokens=32768,
         temperature=0.2,
     ) or f"Роль: {spec.get('persona', '')}. Цели: {', '.join(spec.get('goals', []))}"
 
@@ -423,7 +423,7 @@ def generate_agent_profile(spec: Dict[str, Any], tools_resolved: List[Dict[str, 
     description_text = call_openai_api(
         prompt=desc_user,
         system_prompt=desc_system,
-        max_tokens=400,
+        max_tokens=32768,
         temperature=0.3,
     ) or (spec.get("persona") or "Generated agent")
     if isinstance(description_text, str):

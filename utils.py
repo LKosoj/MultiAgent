@@ -1324,7 +1324,7 @@ def _translate_texts_batch(texts: List[str], target_language: str) -> List[str]:
             prompt=user_prompt,
             system_prompt=system_prompt,
             model=model_code,  # Используем быструю модель для перевода
-            max_tokens=4000,
+            max_tokens=32768,
             temperature=0.1,
             response_format={"type": "json_object"}
         )

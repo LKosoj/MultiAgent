@@ -215,7 +215,7 @@ def _llm_check_closeup_room_details(video_prompt: str, camera_plan: str, storybo
             prompt=user,
             system_prompt=sys,
             model=model_obj,
-            max_tokens=400,
+            max_tokens=32768,
             temperature=0.0,
             response_format={"type": "json_object"},
         )
@@ -369,7 +369,7 @@ def _llm_judge_video_prompt_lite(
         prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
         system_prompt=sys,
         model=model_obj,
-        max_tokens=6000,
+        max_tokens=32768,
         temperature=0.0,
         response_format={"type": "json_object"},
     )
@@ -482,7 +482,7 @@ def _llm_judge_end_english_prompt_candidate(
         prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
         system_prompt=sys,
         model=model_obj,
-        max_tokens=2500,
+        max_tokens=32768,
         temperature=0.0,
         response_format={"type": "json_object"},
         **({"image_url": rendered_image_url} if rendered_image_url else {}),
@@ -565,7 +565,7 @@ def _llm_judge_english_prompt_set_safe(
         prompt="INPUT:\n" + json.dumps(payload, ensure_ascii=False),
         system_prompt=sys,
         model=model_obj,
-        max_tokens=2000,
+        max_tokens=32768,
         temperature=0.0,
         response_format={"type": "json_object"},
     )
@@ -2374,7 +2374,7 @@ A prompt-only repair is insufficient when the derived spec still contradicts the
                     "or additional scene rules. Return JSON only: {\"violations\":[{\"shot_number\":1,\"shot_type\":\"end\",\"observed\":\"...\",\"required\":\"...\"}]}."
                 ),
                 model=model_obj,
-                max_tokens=6000,
+                max_tokens=32768,
                 temperature=0.1,
                 response_format={"type": "json_object"},
                 image_url=pair_render_review_image,
