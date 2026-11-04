@@ -1293,6 +1293,7 @@ def _build_edit_instruction(
     
     reference_paths = abs_reference_paths
     edit_findings = item.get("_continuity_edit_findings") or []
+    locked_entities = item.get("_continuity_locked_entities") or []
     if edit_findings:
         base = os.path.abspath(item["output_path"])
         if not os.path.isfile(base):
@@ -1454,6 +1455,13 @@ def _build_edit_instruction(
                               "the corrected element. If a silhouette or profile direction is required, make it readable in the head and nose contour, not a round frontal blob. " + " ".join(
                                   f"Required: {finding['required']}"
                                   for finding in edit_findings))
+        locked_text = ""
+        if locked_entities:
+            locked_text = " Preserve these continuity anchors exactly: " + "; ".join(
+                f"{entity.get('name') or entity.get('id')}: geometry={entity.get('geometry')}; shape={entity.get('shape')}"
+                for entity in locked_entities
+            ) + "."
+            english_prompt += locked_text
         scene_negative = ""
     else:
         prompt_item = item
