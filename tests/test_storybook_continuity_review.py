@@ -364,6 +364,24 @@ def test_repair_scope_uses_only_localized_frame_violation_but_both_phases(tmp_pa
     assert {item['shot_type'] for item in artist_items} == {'start', 'end'}
 
 
+def test_repair_restores_unaffected_phase_after_artist_writes_group(tmp_path, monkeypatch):
+    base, items, calls = _repair_scope_fixture(tmp_path, monkeypatch)
+    report = {'tasks': {'group': {'id': '1-1|1-2|1-3', 'verdicts': [
+        {'violations': [{'frame_key': '1:2:end', 'observed': 'wrong', 'required': 'right'}], 'uncertain': []}]}}}
+    (base / '97_shots/continuity_images_review.json').write_text(json.dumps(report))
+
+    def artist(**kwargs):
+        for item in kwargs['items']['items']:
+            Path(item['output_path']).write_bytes(b'artist-output')
+        return json.dumps([{'ok': True} for _ in kwargs['items']['items']])
+
+    monkeypatch.setattr('custom_tools.storybook.artist_batch_edit.artist_agent_batch_edit_tool', artist)
+    task = {'id': '1-1|1-2|1-3', 'input_hash': 'group', 'group': items}
+    _REAL_REPAIR_MEDIA(base, [task], 'images', 'session')
+    assert (base / '97_shots/2-start.png').read_bytes() == b'2-start'
+    assert (base / '97_shots/2-end.png').read_bytes() == b'artist-output'
+
+
 def test_repair_scope_expands_only_transitive_copy_dependencies(tmp_path, monkeypatch):
     base, items, calls = _repair_scope_fixture(tmp_path, monkeypatch, count=5)
     by_key = {(item['shot_number'], item['shot_type']): item for item in items}

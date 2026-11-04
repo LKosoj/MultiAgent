@@ -389,12 +389,43 @@ def _repair_media(base, tasks, kind, session_id):
             frame_key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
             if frame_key in frame_findings and not item.get('copy_from_previous_end') and Path(item['output_path']).is_file():
                 item['_continuity_edit_findings'] = frame_findings[frame_key]
+                anchors = {}
+                for context in (item.get('_continuity') or {}).values():
+                    for entity in context.get('entities', []):
+                        entity_id = str(entity.get('id') or '')
+                        if not entity_id:
+                            continue
+                        anchors[entity_id] = {
+                            'id': entity_id,
+                            'name': entity.get('name'),
+                            'geometry': entity.get('geometry'),
+                            'shape': entity.get('shape'),
+                        }
+                item['_continuity_locked_entities'] = list(anchors.values())
+        baseline_bytes = {
+            str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
+            for item in rendered['items'] if Path(item['output_path']).is_file()
+        }
         result = artist_agent_batch_edit_tool(session_id=session_id, items=rendered, enable=True,
                                               language=language, max_concurrency=4)
         rows = json.loads(result)
         failed = [row for row in rows if not row.get('ok')]
         if failed:
             raise RuntimeError(f'Continuity image repair failed: {failed}')
+        # The artist receives a small group of references, but may still write
+        # to every item in that group. Restore frames without a finding so an
+        # accepted neighbouring phase cannot be changed as a side effect.
+        editable = {
+            str(Path(by_frame[key]['output_path']).resolve())
+            for key in frame_findings if key in by_frame
+        }
+        for item in rendered['items']:
+            path = Path(item['output_path'])
+            if str(path.resolve()) in editable or not path.is_file():
+                continue
+            original = baseline_bytes.get(str(path.resolve()))
+            if original is not None:
+                path.write_bytes(original)
         return
     from .video_contract import _active_video_tool_name
     import importlib
@@ -589,7 +620,21 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 rejected_ids = {task['id'] for task in rejected}
                 rejected.extend(task for task in tasks if task['id'] not in rejected_ids
                                 and current[task['id']] != task['input_hash'])
+        rollback = {}
+        if kind == 'images':
+            rollback = {
+                str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
+                for task in rejected for item in task['group']
+                if Path(item['output_path']).is_file()
+            }
         _repair_media(base, rejected, kind, session_id)
+        post = _review(session_id, project_id, kind, enable, repair=False)
+        if post.get('acceptance', {}).get('passed') or not rollback:
+            return post
+        for path, content in rollback.items():
+            Path(path).write_bytes(content)
+        # Rebuild the report against the previous bytes. This makes a failed
+        # repair a no-op for continuity state and leaves the accepted baseline.
         return _review(session_id, project_id, kind, enable, repair=False)
     return {'status': 'success' if check['passed'] else 'error', 'review_path': str(path), 'acceptance': check}
 
