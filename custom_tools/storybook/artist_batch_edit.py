@@ -1462,6 +1462,12 @@ def _build_edit_instruction(
                 for entity in locked_entities
             ) + "."
             english_prompt += locked_text
+        english_prompt += (
+            " Image 1 is the current target frame and is the only source of composition, camera, "
+            "facade, window placement and character placement. Images 2 and later are reference "
+            "details only; never replace the target composition with a reference image. "
+            "When a hand is named, use the character's anatomical right hand, not screen-right."
+        )
         scene_negative = ""
     else:
         prompt_item = item
@@ -1489,8 +1495,8 @@ def _build_edit_instruction(
 2) Обязательно укажи негативный промпт для исключения нежелательных элементов.
 3) Вызови edit_image_vse_tool с аргументами prompt="{english_prompt}", image_paths={image_paths_str}, negative_prompt="{scene_negative}", session_id="{session_id}", output_path="{output_path}", seed={seed}, width={width}, height={height}
 
-ВАЖНО - РАБОТАЕМ ТОЛЬКО С РЕФЕРЕНСНЫМИ ИЗОБРАЖЕНИЯМИ:
-- В image_paths передаются {ref_count} референсных изображения персонажей и локаций
+ВАЖНО - РАБОТАЕМ С ТЕКУЩИМ КАДРОМ И СПРАВОЧНЫМИ ИЗОБРАЖЕНИЯМИ:
+- В image_paths первым передаётся текущее целевое изображение (image 1), остальные изображения — только справочные детали
 - edit_image_vse_tool объединит все референсы и отредактирует изображения согласно промпту
 - Результат будет сохранен как одно финальное изображение
 
