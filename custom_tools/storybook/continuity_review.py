@@ -14,6 +14,9 @@ from .continuity import (_digest, _source, _PLAN_VERSION, _write, bind_continuit
 from .project_paths import safe_storybook_project_dir
 
 _REVIEW_VERSION = 8
+_AUDIT_IMAGE_MAX_SIDE = 640
+_AUDIT_JPEG_QUALITY = 75
+_AUDIT_VIDEO_MAX_SAMPLES = 5
 
 
 def validate_current_continuity(base):
@@ -176,9 +179,9 @@ def _audit(task, pictures, chunk_number):
             continue
         with Image.open(picture['output_path']) as source:
             image = source.convert('RGB')
-            image.thumbnail((960, 960))
+            image.thumbnail((_AUDIT_IMAGE_MAX_SIDE, _AUDIT_IMAGE_MAX_SIDE))
             output = io.BytesIO()
-            image.save(output, format='JPEG', quality=88)
+            image.save(output, format='JPEG', quality=_AUDIT_JPEG_QUALITY)
         label = f"{picture['scene_number']}.{picture['shot_number']} {picture['shot_type']}"
         content.extend([{'type': 'text', 'text': label}, {'type': 'image_url', 'image_url': {
             'url': 'data:image/jpeg;base64,' + base64.b64encode(output.getvalue()).decode()}}])
@@ -385,10 +388,10 @@ def _repair_media(base, tasks, kind, session_id):
             incoming = dict(shots, items=selected, scope_shot_keys=keys)
             planned = storybook_background_plan_tool(session_id, base.name, incoming, language=language)
             rendered = storybook_background_references_tool(session_id, base.name, planned, language=language)
+        locked_by_frame = {}
         for item in rendered['items']:
             frame_key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
             if frame_key in frame_findings and not item.get('copy_from_previous_end') and Path(item['output_path']).is_file():
-                item['_continuity_edit_findings'] = frame_findings[frame_key]
                 anchors = {}
                 for context in (item.get('_continuity') or {}).values():
                     for entity in context.get('entities', []):
@@ -401,20 +404,61 @@ def _repair_media(base, tasks, kind, session_id):
                             'geometry': entity.get('geometry'),
                             'shape': entity.get('shape'),
                         }
-                item['_continuity_locked_entities'] = list(anchors.values())
+                locked_by_frame[frame_key] = list(anchors.values())
         baseline_bytes = {
             str(Path(item['output_path']).resolve()): Path(item['output_path']).read_bytes()
             for item in rendered['items'] if Path(item['output_path']).is_file()
         }
-        result = artist_agent_batch_edit_tool(session_id=session_id, items=rendered, enable=True,
-                                              language=language, max_concurrency=4)
-        rows = json.loads(result)
-        failed = [row for row in rows if not row.get('ok')]
-        if failed:
-            raise RuntimeError(f'Continuity image repair failed: {failed}')
-        # The artist receives a small group of references, but may still write
-        # to every item in that group. Restore frames without a finding so an
-        # accepted neighbouring phase cannot be changed as a side effect.
+        by_frame_key = {
+            f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}": item
+            for item in rendered['items']
+        }
+        for frame_key, findings in frame_findings.items():
+            item = by_frame_key.get(frame_key)
+            if item is None or item.get('copy_from_previous_end'):
+                continue
+            for finding in findings:
+                operation_item = dict(item,
+                                      _continuity_edit_findings=[finding],
+                                      _continuity_locked_entities=locked_by_frame.get(frame_key, []))
+                entity_id = str(finding.get('entity_id') or '')
+                if entity_id:
+                    entity_refs = []
+                    entity_kind = None
+                    for context in (item.get('_continuity') or {}).values():
+                        for entity in context.get('entities', []):
+                            if str(entity.get('id') or '') == entity_id and entity.get('reference_path'):
+                                entity_refs.append(entity['reference_path'])
+                                entity_kind = entity.get('kind')
+                    if entity_refs:
+                        operation_item['reference_image_paths'] = (
+                            [item['output_path']]
+                            if entity_kind == 'landmark'
+                            else [item['output_path'], *dict.fromkeys(entity_refs)]
+                        )
+                operation = dict(rendered, items=[dict(
+                    operation_item)])
+                result = artist_agent_batch_edit_tool(
+                    session_id=session_id, items=operation, enable=True,
+                    language=language, max_concurrency=1,
+                )
+                rows = json.loads(result)
+                failed = [row for row in rows if not row.get('ok')]
+                if failed:
+                    raise RuntimeError(f'Continuity image repair failed: {failed}')
+        edited_paths = {
+            str(Path(by_frame[key]['output_path']).resolve())
+            for key in frame_findings if key in by_frame
+        }
+        for item in rendered['items']:
+            if not item.get('copy_from_previous_end') or not item.get('source_end_path'):
+                continue
+            source = Path(item['source_end_path'])
+            target = Path(item['output_path'])
+            if str(source.resolve()) in edited_paths and source.is_file():
+                target.write_bytes(source.read_bytes())
+        # Restore frames without a finding so an accepted neighbouring phase
+        # cannot be changed as a side effect of a scoped operation.
         editable = {
             str(Path(by_frame[key]['output_path']).resolve())
             for key in frame_findings if key in by_frame
@@ -452,24 +496,9 @@ def _repair_media(base, tasks, kind, session_id):
             target = next(frame for frame in shots['items'] if f"{frame['scene_number']}-{frame['shot_number']}" == key
                           and frame.get('shot_type', 'start') == 'start')
         existing_prompt = target['video_prompt']
-        response = call_openai_api(
-            model=model_ultimate, temperature=0.1, max_tokens=32768, response_format={'type': 'json_object'},
-            prompt=json.dumps({'existing_prompt': existing_prompt, 'expected_frames': task['contexts'],
-                'reference_images': item.get('reference_image_paths'),
-                'findings': verdicts[task['input_hash']]['verdicts']},
-                ensure_ascii=False),
-            system_prompt=(
-                'Исправь промпт видеогенерации по фактическим нарушениям визуальной непрерывности. '
-                'Перепиши коротко: убери повторы, противоречия и необязательные микродвижения, не дописывай длинные запреты. '
-                'Сохрани исходное действие и сюжет, оптику, движение камеры, физику, длительность, порядок событий, все Image N и их роли. '
-                'Не теряй обязательные физические условия ради сокращения. '
-                'Не добавляй новых референсов или событий. Общие ориентиры сохраняют свою конструкцию; '
-                'реквизит меняется только по заданным событиям. Отдельный предмет не следует за героем. '
-                'Ограничения START/END относятся к своим фазам, не останавливай всё движение ради конечной позы. '
-                'Уточни только причины перечисленных нарушений и способ их избежать. '
-                'Сохрани язык и художественный стиль исходного промпта. Верни JSON {video_prompt:строка}.'),
-        )
-        prompt = parse_llm_json(response)['video_prompt'].strip()
+        findings = [finding for verdict in verdicts[task['input_hash']]['verdicts']
+                    for finding in verdict.get('violations', [])]
+        prompt = _append_video_repair_requirements(existing_prompt, findings)
         if not prompt or prompt == existing_prompt:
             raise ValueError('Continuity video repair did not change the rejected prompt')
         target['video_prompt'] = prompt
@@ -481,14 +510,36 @@ def _repair_media(base, tasks, kind, session_id):
 
 
 def _video_sample_indices(events, planned_duration, duration, fps, frame_count):
+    del events, planned_duration
     last = frame_count - 1
-    count = max(2, math.ceil(duration))
+    interior_count = min(max(0, math.ceil(duration) - 1), _AUDIT_VIDEO_MAX_SAMPLES - 2)
     indices = {0, last}
-    indices.update(min(last, int((index + 0.5) * duration / count * fps)) for index in range(count))
-    for event in events:
-        frame = min(last, max(0, int(event * duration / planned_duration * fps)))
-        indices.update(min(last, max(0, frame + step)) for step in (-1, 0, 1))
+    for position in range(1, interior_count + 1):
+        indices.add(min(last, max(0, round(position * duration / (interior_count + 1) * fps))))
     return sorted(indices)
+
+
+def _append_video_repair_requirements(existing_prompt, findings):
+    """Preserve the authored prompt and append verified continuity constraints."""
+    requirements = []
+    entity_ids = {str(finding.get('entity_id') or '') for finding in findings if isinstance(finding, dict)}
+    for finding in findings:
+        required = (str(finding.get('required') or '') if isinstance(finding, dict)
+                    else str(finding)).strip()
+        if required and required not in requirements:
+            requirements.append(required)
+    if not requirements:
+        return existing_prompt
+    if any('Мальчик' in entity_id or entity_id == 'boy' for entity_id in entity_ids):
+        requirements.append('When the required support is a knee on the sill, place the knee itself on the sill; never substitute a boot or foot.')
+    if any('shovel' in entity_id or 'лопат' in entity_id.lower() for entity_id in entity_ids):
+        requirements.append("Use the character's anatomical right hand for the shovel; never transfer it to the left hand.")
+    if any('jacket' in entity_id or 'куртк' in entity_id.lower() for entity_id in entity_ids):
+        requirements.append('Keep the final jacket state exactly as required; do not restore the jacket to the shoulders after it is removed.')
+    requirements = list(dict.fromkeys(requirements))
+    suffix = "\n\nContinuity repair requirements (preserve all authored action and camera instructions):\n"
+    suffix += "\n".join(f"- {required}" for required in requirements)
+    return existing_prompt.rstrip() + suffix
 
 
 def _review(session_id, project_id, kind, enable, repair=True, review_findings=None):
@@ -516,16 +567,21 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
         if kind == 'images':
             media_hashes = {p: _file_hash(p) for p in task['media']}
             prior = []
-            for record in previous.values():
-                if (record.get('id') == task['id'] and record.get('state_hash') == task['state_hash']
-                        and record.get('media_hashes') == media_hashes):
-                    for verdict in record.get('verdicts', []):
-                        for finding in verdict.get('violations', []):
-                            if finding not in prior:
-                                prior.append(finding)
-            for finding in findings_by_task.get(task['input_hash'], []):
-                if finding not in prior:
-                    prior.append(finding)
+            explicit_findings = findings_by_task.get(task['input_hash'], [])
+            if explicit_findings:
+                # Operator-triggered repair is targeted: stale findings from a
+                # previous audit must not reopen unrelated frames in the same
+                # continuity group.
+                prior.extend(explicit_findings)
+            else:
+                for record in previous.values():
+                    if (record.get('id') == task['id']
+                            and record.get('state_hash') == task['state_hash']
+                            and record.get('media_hashes') == media_hashes):
+                        for verdict in record.get('verdicts', []):
+                            for finding in verdict.get('violations', []):
+                                if finding not in prior:
+                                    prior.append(finding)
             expected_keys = {f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
                              for item in task['group']}
             if any(finding.get('frame_key') not in expected_keys for finding in prior):
@@ -571,7 +627,7 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                 indices = _video_sample_indices(task.get('events', []), task['planned_duration'], duration, fps, frame_count)
                 expression = '+'.join(f'eq(n\\,{index})' for index in indices)
                 subprocess.run(['ffmpeg', '-v', 'error', '-y', '-i', task['media'][0], '-vf',
-                                f'select={expression},scale=960:-1', '-vsync', '0', str(Path(temporary) / '%03d.jpg')],
+                                f'select={expression},scale={_AUDIT_IMAGE_MAX_SIDE}:-1', '-vsync', '0', str(Path(temporary) / '%03d.jpg')],
                                capture_output=True, check=True)
                 images = sorted(Path(temporary).glob('*.jpg'))
                 if len(images) != len(indices):
@@ -602,7 +658,9 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                     record_continuity_image(item, basis='visual_review')
     check = continuity_acceptance(base, kind)
     if not check['passed'] and repair:
-        rejected = [task for task in tasks if not report['tasks'][task['input_hash']]['passed']]
+        rejected = [task for task in tasks
+                    if not report['tasks'][task['input_hash']]['passed']
+                    and (not findings_by_task or task['input_hash'] in findings_by_task)]
         if kind == 'videos':
             image_keys = {str(Path(item['output_path']).resolve()):
                           f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
@@ -651,12 +709,14 @@ def storybook_continuity_images_review_tool(session_id: str, project_id: str, en
     return _review(session_id, project_id, 'images', enable, review_findings=review_findings)
 
 
-def storybook_continuity_videos_review_tool(session_id: str, project_id: str, enable: bool = True) -> dict:
+def storybook_continuity_videos_review_tool(session_id: str, project_id: str, enable: bool = True,
+                                            repair: bool = True) -> dict:
     """Accept physical actions and object identity in downloaded video clips.
 
     Args:
         session_id: Pipeline execution identifier.
         project_id: Storybook project identifier.
         enable: Whether to inspect generated video clips.
+        repair: Whether to start automatic source-image/prompt/video repairs after review.
     """
-    return _review(session_id, project_id, 'videos', enable)
+    return _review(session_id, project_id, 'videos', enable, repair=repair)

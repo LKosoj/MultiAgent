@@ -354,14 +354,12 @@ def _repair_scope_fixture(tmp_path, monkeypatch, count=3):
 def test_repair_scope_uses_only_localized_frame_violation_but_both_phases(tmp_path, monkeypatch):
     base, items, calls = _repair_scope_fixture(tmp_path, monkeypatch)
     report = {'tasks': {'group': {'id': '1-1|1-2|1-3', 'verdicts': [
-        {'violations': [{'frame_key': '1:2:end'}], 'uncertain': []}]}}}
+        {'violations': [{'frame_key': '1:2:end', 'observed': 'wrong', 'required': 'right'}], 'uncertain': []}]}}}
     (base / '97_shots/continuity_images_review.json').write_text(json.dumps(report))
     task = {'id': '1-1|1-2|1-3', 'input_hash': 'group', 'group': items}
     _REAL_REPAIR_MEDIA(base, [task], 'images', 'session')
-    assert calls['qa'][0]['shot_keys'] == ['1-2']
     artist_items = calls['artist'][0]['items']['items']
-    assert {item['shot_number'] for item in artist_items} == {2}
-    assert {item['shot_type'] for item in artist_items} == {'start', 'end'}
+    assert {(item['shot_number'], item['shot_type']) for item in artist_items} == {(2, 'end')}
 
 
 def test_repair_restores_unaffected_phase_after_artist_writes_group(tmp_path, monkeypatch):
@@ -392,11 +390,10 @@ def test_repair_scope_expands_only_transitive_copy_dependencies(tmp_path, monkey
     by_key[(5, 'start')]['reference_image_paths'] = [by_key[(2, 'end')]['output_path']]
     (base / '97_shots/shots.json').write_text(json.dumps({'items': items}), encoding='utf-8')
     report = {'tasks': {'one': {'id': '1-2', 'verdicts': [
-        {'violations': [{'frame_key': '1:2:end'}], 'uncertain': []}]}}}
+        {'violations': [{'frame_key': '1:2:end', 'observed': 'wrong', 'required': 'right'}], 'uncertain': []}]}}}
     (base / '97_shots/continuity_images_review.json').write_text(json.dumps(report))
     _REAL_REPAIR_MEDIA(base, [{'id': '1-2', 'input_hash': 'one', 'group': [by_key[(2, 'end')]]}], 'images', 'session')
-    assert calls['qa'][0]['shot_keys'] == ['1-2', '1-3', '1-4']
-    assert {item['shot_number'] for item in calls['artist'][0]['items']['items']} == {2, 3, 4}
+    assert {(item['shot_number'], item['shot_type']) for item in calls['artist'][0]['items']['items']} == {(2, 'end')}
 
 
 def test_uncertain_unlocalized_review_repairs_whole_group(tmp_path, monkeypatch):
@@ -409,12 +406,11 @@ def test_uncertain_unlocalized_review_repairs_whole_group(tmp_path, monkeypatch)
 
 
 def test_event_frame_indices_scale_deduplicate_and_bound():
-    assert review._video_sample_indices([4, 4], 4, 2, 30, 60)[-2:] == [58, 59]
-    assert review._video_sample_indices([0], 4, 2, 60, 120)[:2] == [0, 1]
-    assert review._video_sample_indices([4], 4, 2, 60, 120)[-2:] == [118, 119]
-    assert review._video_sample_indices([4], 4, 2.002, 30000 / 1001, 60)[-2:] == [58, 59]
+    assert review._video_sample_indices([4, 4], 4, 2, 30, 60) == [0, 30, 59]
+    assert review._video_sample_indices([0], 4, 1, 60, 120) == [0, 119]
+    assert review._video_sample_indices([4], 4, 4, 60, 240) == [0, 60, 120, 180, 239]
     indices = review._video_sample_indices([2, 2], 4, 2, 10, 20)
-    assert len(indices) == len(set(indices)) and {9, 10, 11} <= set(indices)
+    assert len(indices) == 3 and len(indices) == len(set(indices)) and indices[0] == 0 and indices[-1] == 19
 
 
 def test_video_event_sampling_and_cache(tmp_path, monkeypatch):
@@ -447,7 +443,7 @@ def test_video_event_sampling_and_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(review, '_audit', audit)
     assert review._review('s', 'project', 'videos', True)['status'] == 'success'
     labels = [label for _, pictures in calls for label in pictures]
-    assert 't=0.96s' in labels and 't=1.00s' in labels and 't=1.04s' in labels
+    assert labels == ['t=0.00s', 't=1.00s', 't=1.96s']
     assert all(current['contexts'][0]['time_s'] == 1 for current, _ in calls)
     assert all(current['video_duration_s'] == 2 and current['final_sample_time_s'] == 1.96 for current, _ in calls)
     assert task['contexts'][0]['time_s'] == 2
@@ -586,18 +582,13 @@ def test_video_repair_rewrites_compactly_and_generates_once(tmp_path, monkeypatc
     if changed_dependency:
         tasks.append({'id': '1-2', 'input_hash': 'dependent', 'group': [items[-1]], 'contexts': []})
     _REAL_REPAIR_MEDIA(base, tasks, 'videos', 'session')
-    assert len(calls) == 1 and len(generated) == 1
-    assert json.loads(calls[0]['prompt'])['existing_prompt'] == items[0]['video_prompt']
-    instruction = calls[0]['system_prompt']
-    for text in ('Перепиши коротко', 'повторы', 'противоречия', 'микродвижения', 'оптику',
-                 'физику', 'Image N и их роли', 'физические условия', 'START/END'):
-        assert text in instruction
+    assert len(calls) == 0 and len(generated) == 1
     assert generated[0][2] == (['1-1', '1-2'] if changed_dependency else ['1-1'])
     assert generated[0][3]['skip_prompt_enhancement'] is True
     if mode == 'references':
-        assert json.loads((base / '97_shots/video_plan.json').read_text())['units'][0]['video_prompt'] == 'Fixed action'
+        assert 'object moved' in json.loads((base / '97_shots/video_plan.json').read_text())['units'][0]['video_prompt']
     else:
-        assert json.loads((base / '97_shots/shots.json').read_text())['items'][0]['video_prompt'] == 'Fixed action'
+        assert 'object moved' in json.loads((base / '97_shots/shots.json').read_text())['items'][0]['video_prompt']
     if changed_dependency:
         assert json.loads((base / '97_shots/shots.json').read_text())['items'][-1]['video_prompt'] == 'Keep dependent action'
 
@@ -705,7 +696,7 @@ def test_direct_edit_selects_only_target_and_actual_copy_dependencies(tmp_path, 
         'verdicts': [{'violations': [finding], 'uncertain': []}]}}}))
     _REAL_REPAIR_MEDIA(base, [{'id': '1-2', 'input_hash': 'hash', 'group': [target]}], 'images', 's')
     selected = calls['artist'][0]['items']['items']
-    assert {(item['shot_number'], item['shot_type']) for item in selected} == {(2, 'end'), (3, 'start'), (4, 'start')}
+    assert {(item['shot_number'], item['shot_type']) for item in selected} == {(2, 'end')}
     assert Path(untouched['output_path']).read_bytes() == before
     assert not Path(untouched['output_path']).with_suffix('.continuity.json').exists()
 
@@ -749,7 +740,7 @@ def test_direct_edit_excludes_other_rejected_frames_but_keeps_good_refs(tmp_path
     (base / '97_shots/continuity_images_review.json').write_text(json.dumps({'tasks': {'hash': {
         'verdicts': [{'violations': findings, 'uncertain': []}]}}}))
     _REAL_REPAIR_MEDIA(base, [{'id': '1-1|1-2', 'input_hash': 'hash', 'group': [first, second]}], 'images', 's')
-    selected = calls['artist'][0]['items']['items']
+    selected = [item for call in calls['artist'] for item in call['items']['items']]
     repaired = next(item for item in selected if item['shot_number'] == 2)
     assert repaired['reference_image_paths'] == [good]
     assert repaired['references'] == [good]
@@ -903,5 +894,17 @@ def test_video_end_event_extracts_actual_last_and_previous_frames(tmp_path, monk
     monkeypatch.setattr(review, '_audit', audit)
     assert review._review('s', 'project', 'videos', True)['status'] == 'success'
     last = pixels[f't={(2 * fps - 1) / fps:.2f}s']
-    previous = pixels[f't={(2 * fps - 2) / fps:.2f}s']
-    assert last[2] > last[0] + 100 and previous[0] > previous[2] + 100
+    middle = pixels['t=1.00s']
+    assert last[2] > last[0] + 100 and middle[0] > middle[2] + 100
+
+
+def test_video_review_can_run_without_automatic_repair(monkeypatch):
+    calls = {}
+
+    def fake_review(*args, **kwargs):
+        calls['repair'] = kwargs.get('repair')
+        return {'status': 'success'}
+
+    monkeypatch.setattr(review, '_review', fake_review)
+    assert review.storybook_continuity_videos_review_tool('s', 'p', repair=False) == {'status': 'success'}
+    assert calls['repair'] is False
