@@ -45,6 +45,27 @@
                 "timing": {
                   "type": "string",
                   "title": "Тайминг"
+                },
+                "voiceover_id": {
+                  "type": "string"
+                },
+                "voiceover_order": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "pause_before": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "pause_after": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "dialogue_ids": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
                 }
               },
               "required": [
@@ -64,6 +85,71 @@
           "voiceover": {
             "type": "string",
             "title": "Закадровый текст"
+          },
+          "voiceover_id": {
+            "type": "string"
+          },
+          "voiceover_order": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "pause_before": {
+            "type": "number",
+            "minimum": 0
+          },
+          "pause_after": {
+            "type": "number",
+            "minimum": 0
+          },
+          "silence_duration": {
+            "type": "number",
+            "minimum": 0
+          },
+          "dialogue": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "order": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "shot_number": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "character": {
+                  "type": "string"
+                },
+                "speaker_id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "enum": [
+                    "on_screen",
+                    "off_screen",
+                    "narrator"
+                  ]
+                },
+                "line": {
+                  "type": "string"
+                },
+                "direction": {
+                  "type": "string"
+                },
+                "pause_before": {
+                  "type": "number",
+                  "minimum": 0
+                },
+                "pause_after": {
+                  "type": "number",
+                  "minimum": 0
+                }
+              }
+            }
           }
         },
         "required": [

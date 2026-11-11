@@ -304,7 +304,7 @@ REPORT_TITLES: dict[str, str] = {
     "continuity_videos": "Проверка видео",
     "decision_log": "Журнал решений",
     "render_report": "Отчёт о сборке фильма",
-    "final_review": "Итоговая проверка фильма",
+    "final_review": "Техническая проверка фильма",
     "video_plan": "План видео",
     "quality_review": "Журнал проверок качества",
 }
@@ -881,13 +881,13 @@ def _parse_final_review(data: dict, ctx: dict) -> tuple[list[Finding], dict]:
         if f:
             out.append(f)
     if data.get("passed") is False and not out:
-        out.append(_finding(src, "error", "final_review_failed", "Итоговая проверка фильма не пройдена.", file))
+        out.append(_finding(src, "error", "final_review_failed", "Техническая проверка фильма не пройдена.", file))
     if data.get("passed") is True:
         clips = _i(data.get("clip_count"))
         dur = _num(data.get("expected_duration_seconds"))
         out.append(_finding(
             src, "info", "final_review_passed",
-            "Итоговая проверка пройдена"
+            "Техническая проверка пройдена"
             + (f": клипов {clips}" if clips is not None else "")
             + (f", длительность {_fmt(dur)} с" if dur is not None else "") + ".", file))
     return out, meta

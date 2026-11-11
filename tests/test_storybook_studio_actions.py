@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+
 from backend.fastapi_app.agui import _storybook_actions as actions
 from backend.fastapi_app.agui.auth import Principal
 from custom_tools.storybook.studio import capabilities as caps
@@ -73,6 +75,6 @@ def test_result_is_serialized(service, temp_caps):
 def test_media_token_survives_redaction(service, tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
     monkeypatch.setenv("STORYBOOK_MEDIA_SIGNING_KEY", "k")
-    (tmp_path / "demo").mkdir()
+    make_series_project(tmp_path)
     result = service.handle_service_action("storybook.media_token", {"project_id": "demo"}, principal=ADMIN)
     assert result["status"] == "success" and verify_media_token("demo", result["t"])

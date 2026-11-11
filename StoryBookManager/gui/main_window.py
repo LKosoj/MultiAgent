@@ -260,6 +260,9 @@ class MainWindow:
         from StoryBookManager.gui.screens.settings_screen import SettingsScreen
 
         self.sections = {}
+        from StoryBookManager.gui.sections.series_screen import SeriesScreen
+        self.series_panel = SeriesScreen(self.host, self.bridge, self.on_series_selected)
+        self._add_section("series", self.series_panel)
 
         self.project_panel = ProjectsScreen(
             self.host, self.project_manager, self.on_project_selected, self.on_projects_changed, self.bridge,
@@ -309,6 +312,7 @@ class MainWindow:
         self._add_section("blockout", self.blockout_panel)
 
         self.editor_panel = FilesScreen(self.host, self.bridge, project_id)
+        self.editor_panel.sync_invoke = lambda cap, payload: __import__("custom_tools.storybook.studio.capabilities", fromlist=["invoke"]).invoke(cap, self.bridge.scoped_payload(cap, payload))
         self._add_section("files", self.editor_panel)
 
         self.settings_screen = SettingsScreen(self.host, self.bridge, on_applied=self.apply_settings)
@@ -323,6 +327,9 @@ class MainWindow:
         """Открыть раздел; False, если нельзя (нет проекта или раздел не отпускает)."""
         section = section_by_id(section_id)
         if section is None:
+            return False
+        if section_id == "series" and self.series_panel.project is None:
+            notify.info(NEED_PROJECT_HINT)
             return False
         if section.needs_project and self.current_project is None:
             notify.info(NEED_PROJECT_HINT)
@@ -547,38 +554,36 @@ class MainWindow:
             messagebox.showerror("Ошибка", f"Не удалось загрузить данные:\n{e}")
 
     def on_project_selected(self, project):
-        """Обработчик выбора проекта"""
-        try:
-            self.current_project = project
+        """Открыть общий проект и выбрать серию перед работой с фильмом."""
+        self.bridge.set_series(project.project_id, None)
+        self.current_project = None
+        self.poller.stop()
+        self.navigation.set_project_available(False)
+        self.series_panel.set_project(project)
+        self.host.show("series")
+        self._update_topbar_visibility()
 
-            # Открываем навигацию и верхнюю строку
-            self.navigation.set_project_available(True)
-            self.topbar.set_project(project.name, project.project_id)
-            self._last_brief = None
-            self._last_overview = None
-            self._run_view = None
-            self.topbar.update_view(RunView(), "")
-            self.topbar.set_stage("")
-            self.overview.update_view(overview_logic.loading_view())
-
-            # Загружаем данные проекта в панели
-            self.editor_panel.load_project(project)
-            self.blockout_panel.load_project(project)
-            for adapter in self.sections.values():
-                adapter.on_project_changed(project)
-
-            # режим опроса до старта, иначе уйдёт лишний brief-запрос перед полным статусом
-            self.poller.set_mode("full" if LANDING_AFTER_OPEN == "overview" else "brief")
-            self.poller.start(project.project_id)
-            # вопрос о несохранённом уже задан до смены проекта (см. _open_project_by_id)
-            self.show_section(LANDING_AFTER_OPEN, force=True)
-
-            self.set_status(f"Загружен проект: {project.name}")
-            logger.info(f"Выбран проект: {project.project_id}")
-
-        except Exception as e:
-            logger.error(f"Ошибка при выборе проекта: {e}")
-            messagebox.showerror("Ошибка", f"Не удалось загрузить проект:\n{e}")
+    def on_series_selected(self, project, series):
+        from StoryBookManager.core.project_manager import Project
+        selected = Project(project.project_id, project.project_path / "series" / series["series_id"])
+        selected.name = series["title"]
+        selected.series_id = series["series_id"]
+        self.bridge.set_series(project.project_id, selected.series_id)
+        self.current_project = selected
+        self.navigation.set_project_available(True)
+        self.topbar.set_project(f"Серия: {selected.name}", selected.project_id)
+        self._last_brief = self._last_overview = self._run_view = None
+        self.topbar.update_view(RunView(), "")
+        self.topbar.set_stage("")
+        self.overview.update_view(overview_logic.loading_view())
+        self.editor_panel.load_project(selected)
+        self.blockout_panel.load_project(selected)
+        for adapter in self.sections.values():
+            adapter.on_project_changed(selected)
+        self.poller.set_mode("full" if LANDING_AFTER_OPEN == "overview" else "brief")
+        self.poller.start(selected.project_id)
+        self.show_section(LANDING_AFTER_OPEN, force=True)
+        self.set_status(f"Загружена серия: {selected.name}")
 
     def on_file_changed(self, file_type: str, file_path: str):
         """Обработчик изменения файла"""
@@ -831,7 +836,7 @@ class MainWindow:
                 return
             import threading
             from custom_tools.storybook.studio.capabilities import invoke
-            payload = {"project_id": self.current_project.project_id}
+            payload = {"project_id": self.current_project.project_id, "series_id": self.current_project.series_id}
         except Exception:
             logger.exception("Не удалось подготовить запрос остановки при закрытии")
             return

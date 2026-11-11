@@ -32,22 +32,22 @@ def _signing_key() -> bytes:
     return _process_key
 
 
-def _sign(project_id: str, exp: str) -> str:
-    message = f"sbm1|{project_id}|{exp}".encode("utf-8")
+def _sign(project_id: str, exp: str, series_id: str | None = None) -> str:
+    message = f"sbm2|{project_id}|{series_id or ''}|{exp}".encode("utf-8")
     return hmac.new(_signing_key(), message, hashlib.sha256).hexdigest()
 
 
-def issue_media_token(project_id: str, ttl: int = DEFAULT_TTL_SECONDS, now: float | None = None) -> dict:
+def issue_media_token(project_id: str, ttl: int = DEFAULT_TTL_SECONDS, now: float | None = None, *, series_id: str | None = None) -> dict:
     current = time.time() if now is None else now
     exp = str(int(current) + int(ttl))
     return {
-        "token": f"{exp}.{_sign(project_id, exp)}",
+        "token": f"{exp}.{_sign(project_id, exp, series_id)}",
         "expires_at": int(exp),
         "ttl_seconds": int(ttl),
     }
 
 
-def verify_media_token(project_id: str, token: str | None, now: float | None = None) -> bool:
+def verify_media_token(project_id: str, token: str | None, now: float | None = None, *, series_id: str | None = None) -> bool:
     if not isinstance(token, str) or "." not in token:
         return False
     exp, _, signature = token.partition(".")
@@ -59,4 +59,4 @@ def verify_media_token(project_id: str, token: str | None, now: float | None = N
     if int(exp) < current:
         return False
     # compare_digest не принимает не-ASCII str, поэтому сравниваем байты
-    return hmac.compare_digest(signature.encode("utf-8"), _sign(project_id, exp).encode("ascii"))
+    return hmac.compare_digest(signature.encode("utf-8"), _sign(project_id, exp, series_id).encode("ascii"))

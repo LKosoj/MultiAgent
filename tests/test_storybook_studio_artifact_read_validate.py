@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import artifacts as art
 from custom_tools.storybook.studio import capabilities as caps
 from custom_tools.storybook.studio import schemas
@@ -21,12 +24,13 @@ def _fixture(key):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
-    return tmp_path / "demo"
+    series = make_series_project(tmp_path)
+    with series_scope("demo", "main"):
+        yield series
 
 
 def _call(cap, **payload):
-    return caps.invoke(cap, {"project_id": "demo", **payload})
+    return caps.invoke(cap, {"project_id": "demo", "series_id": "main", **payload})
 
 
 def _put(project, key, text):
@@ -79,8 +83,8 @@ def test_read_missing_file_is_not_an_error(project):
 
 def test_read_bad_arguments(project):
     assert _call("artifact_read", key="nope")["error"]["code"] == "invalid_argument"
-    assert caps.invoke("artifact_read", {"project_id": "..", "key": "brief"})["error"]["code"] == "invalid_argument"
-    assert caps.invoke("artifact_read", {"project_id": "ghost", "key": "brief"})["error"]["code"] == "not_found"
+    assert caps.invoke("artifact_read", {"project_id": "..", "series_id": "main", "key": "brief"})["error"]["code"] == "invalid_argument"
+    assert caps.invoke("artifact_read", {"project_id": "ghost", "series_id": "main", "key": "brief"})["error"]["code"] == "not_found"
     for bad in ("../x", "", "a/b", "/etc/passwd", "20260101T000000000000_save_zzzzzzzz"):
         assert _call("artifact_read", key="brief", version_id=bad)["error"]["code"] in ("invalid_argument",), bad
 

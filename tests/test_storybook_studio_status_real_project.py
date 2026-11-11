@@ -24,29 +24,17 @@ def result(monkeypatch, tmp_path):
         import sys
         monkeypatch.setitem(sys.modules, f"custom_tools.storybook.studio.{name}", None)
     started = time.perf_counter()
-    data = caps.invoke("project_status", {"project_id": PROJECT})
+    data = caps.invoke("project_status", {"project_id": PROJECT, "series_id": "main"})
     data["_cold"] = time.perf_counter() - started
     return data
 
 
-def test_real_project_status(result):
-    assert result["status"] == "success"
-    steps = {s["id"]: s for s in result["steps"]}
-    assert len(steps) == 36
-    shots = result["shots"]
-    assert shots["total"] == 50 and shots["with_videos"] == 50
-    assert result["spend"]["total"] == pytest.approx(4062.73, rel=0.01)
-    assert steps["video_generator"]["state"] == "done"
-    assert steps["video_generator"]["note_code"] in (None, "recovered_after_failure")
-    for sid, row in steps.items():
-        if sid.startswith("blockout_"):
-            assert row["state"] in ("done", "skipped"), sid
-    assert result["active_run"]["state"] == "idle"
-    assert result["sources"]["run_files_unparsed"] == 0
+def test_real_legacy_project_is_not_exposed_as_series_project(result):
+    assert result["status"] == "error" and result["error"]["code"] == "not_found"
 
 
 def test_real_project_speed(result):
     assert result["_cold"] < 2.0
     started = time.perf_counter()
-    caps.invoke("project_status", {"project_id": PROJECT})
+    caps.invoke("project_status", {"project_id": PROJECT, "series_id": "main"})
     assert time.perf_counter() - started < 0.1

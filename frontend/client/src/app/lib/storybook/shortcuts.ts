@@ -5,7 +5,7 @@ export type ShortcutAction =
   | { type: "screen"; screen: StorybookScreen }
   | { type: "palette" }
   | { type: "refresh" }
-  | { type: "create_prompt" }
+  | { type: "create_project" }
   | { type: "focus_search" };
 
 export type ShortcutEvent = {
@@ -57,7 +57,7 @@ export const matchShortcut = (ev: ShortcutEvent, ctx: ShortcutContext): Shortcut
       return enabled ? { type: "screen", screen } : null;
     }
     if (ctrl && !ev.altKey && isKey(ev, "k", "KeyK")) return { type: "palette" };
-    if (isKey(ev, "n", "KeyN") && ctx.screen === "projects") return { type: "create_prompt" };
+    if (isKey(ev, "n", "KeyN") && ctx.screen === "projects") return { type: "create_project" };
     return null;
   }
 

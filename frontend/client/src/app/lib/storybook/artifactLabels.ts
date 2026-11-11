@@ -214,6 +214,13 @@ export const ARTIFACT_LABELS: Record<string, Record<string, string>> =
     "/moral": "Мораль",
     "/target_age": "Возраст читателя",
     "/vocabulary_limits": "Ограничения словаря"
+  },
+  "video_plan": {
+    "": "План видео",
+    "/decisions": "Способы генерации",
+    "/shot_intervals": "Время кадров и реплик",
+    "/source_hash": "Отпечаток входа",
+    "/units": "Видеоклипы"
   }
 }
 // END JSON

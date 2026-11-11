@@ -23,8 +23,12 @@ from typing import Any, Optional
 
 from custom_tools.storybook import video_pricing, video_run_config
 from custom_tools.storybook.project_paths import (
+    acquire_storybook_project_guard,
     acquire_storybook_project_lock,
+    current_series_scope,
+    require_safe_storybook_project_id,
     release_storybook_project_lock,
+    _require_current_lock,
 )
 
 from . import cost_estimate, provider_catalog, style_catalog
@@ -103,7 +107,6 @@ def read_stored(project_id: str) -> tuple[dict, Optional[str]]:
 
 
 def _write_atomic(path: Path, payload: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -477,38 +480,60 @@ def run_settings_get(project_id: str) -> dict:
 
 @capability("run_settings_save", title="Сохранить настройки прогона", access="write")
 def run_settings_save(project_id: str, settings: dict, expected_digest: Optional[str] = None) -> dict:
+    project_id = require_safe_storybook_project_id(project_id)
     base = project_dir(project_id)
-    issues = validate(settings, project_id, strict=True)
-    blocking = _blocking(issues, for_save=True)
-    if blocking:
-        raise StudioError("invalid_argument", "Настройки не сохранены: " + "; ".join(i["message"] for i in blocking),
-                          issues=issues)
-    new = normalize(settings)
-    new["version"] = SCHEMA_VERSION
-    path = base / SETTINGS_RELPATH
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(path) + ".lock", "a+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            exists = path.is_file()
-            current, read_error = read_stored(project_id)
-            if read_error and exists:
-                current = {}
-            if exists and not read_error:
-                if expected_digest != digest(current):
+    scope = current_series_scope()
+    scoped = bool(scope and scope[0] == project_id)
+    guard = None
+    directory_fd = None
+    try:
+        directory_fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+        identity = os.fstat(directory_fd)
+        if scoped:
+            guard = acquire_storybook_project_guard(project_id)
+            if guard is None:
+                raise StudioError("locked", MSG_LOCKED)
+        issues = validate(settings, project_id, strict=True)
+        blocking = _blocking(issues, for_save=True)
+        if blocking:
+            raise StudioError("invalid_argument", "Настройки не сохранены: " + "; ".join(i["message"] for i in blocking),
+                              issues=issues)
+        new = normalize(settings)
+        new["version"] = SCHEMA_VERSION
+        path = base / SETTINGS_RELPATH
+        path.parent.mkdir(exist_ok=True)
+        with open(str(path) + ".lock", "a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                _require_current_lock(lock)
+                actual = base.stat()
+                if (identity.st_dev, identity.st_ino) != (actual.st_dev, actual.st_ino):
+                    raise StudioError("not_found", "Серия заменена. Выберите серию заново")
+                exists = path.is_file()
+                current, read_error = read_stored(project_id)
+                if read_error and exists:
+                    current = {}
+                if exists and not read_error:
+                    if expected_digest != digest(current):
+                        raise StudioError("conflict", MSG_CONFLICT, digest=digest(current))
+                elif expected_digest not in (None, digest({})):
                     raise StudioError("conflict", MSG_CONFLICT, digest=digest(current))
-            elif expected_digest not in (None, digest({})):
-                raise StudioError("conflict", MSG_CONFLICT, digest=digest(current))
-            if _run_active(project_id):
-                before = normalize(current)
-                after = copy.deepcopy(new)
-                before["budget_rub"] = after["budget_rub"] = None
-                if before != after:
-                    raise StudioError("locked", MSG_LOCKED)
-            _write_atomic(path, new)
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-    return success(settings=new, digest=digest(new), issues=issues)
+                if _run_active(project_id):
+                    before = normalize(current)
+                    after = copy.deepcopy(new)
+                    before["budget_rub"] = after["budget_rub"] = None
+                    if before != after:
+                        raise StudioError("locked", MSG_LOCKED)
+                _write_atomic(path, new)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return success(settings=new, digest=digest(new), issues=issues)
+    except FileNotFoundError as exc:
+        raise StudioError("not_found", "Проект или серия удалены. Выберите серию заново") from exc
+    finally:
+        release_storybook_project_lock(guard)
+        if directory_fd is not None:
+            os.close(directory_fd)
 
 
 @capability("provider_catalog", title="Провайдеры и модели видео", access="read", project_scoped=False)

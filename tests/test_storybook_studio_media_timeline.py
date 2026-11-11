@@ -4,6 +4,9 @@ import os
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities
 from custom_tools.storybook.studio import media_timeline
 
@@ -39,8 +42,7 @@ def _probe_guard(monkeypatch):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / "demo"
-    root.mkdir()
+    root = make_series_project(tmp_path, "demo")
 
     def put(rel, data=b"x", mtime=None):
         path = root / rel
@@ -51,11 +53,12 @@ def project(tmp_path, monkeypatch):
         return path
 
     put.root = root
-    return put
+    with series_scope("demo", "main"):
+        yield put
 
 
 def timeline(**kw):
-    return capabilities.invoke("media_timeline", {"project_id": "demo", **kw})
+    return capabilities.invoke("media_timeline", {"project_id": "demo", "series_id": "main", **kw})
 
 
 def seq(*rows):
@@ -257,7 +260,7 @@ def test_sfx_duplicates_collapsed(project):
 def test_labels_cover_responses(project):
     full(project)
     r = timeline()
-    inv = capabilities.invoke("media_inventory", {"project_id": "demo"})
+    inv = capabilities.invoke("media_inventory", {"project_id": "demo", "series_id": "main"})
     for item in inv["items"]:
         assert item["type"] in r["labels"]["types"] and item["category"] in r["labels"]["categories"]
     assert r["final"]["video"]["type"] in r["labels"]["types"]

@@ -1,13 +1,12 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 
 import type { BackgroundQueue } from "../../../lib/storybook/backgroundQueue";
 import type { StorybookClient } from "../../../lib/storybook/client";
 import type { ProjectCard as Card } from "../../../lib/storybook/projects";
 import { cardModified, cardSubtitle } from "../../../lib/storybook/projectsView";
 import { T } from "../../../lib/storybook/texts";
-import { useCoverUrl } from "../../../lib/storybook/useCoverUrl";
 
 type Props = {
   card: Card;
@@ -19,30 +18,11 @@ type Props = {
   onOpen: (id: string) => void;
 };
 
-// Карточка проекта; обложку и размер грузим, только когда карточка попала на экран
-export function ProjectCard({ card, sizeBytes, selected, client, background, onSelect, onOpen }: Props) {
-  const ref = useRef<HTMLButtonElement>(null);
-  const [visible, setVisible] = useState(false);
-  useEffect(() => {
-    const el = ref.current;
-    if (!el || typeof IntersectionObserver === "undefined") {
-      setVisible(true);
-      return;
-    }
-    const observer = new IntersectionObserver((entries) => {
-      if (entries.some((e) => e.isIntersecting)) {
-        setVisible(true);
-        observer.disconnect();
-      }
-    });
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, []);
-  const cover = useCoverUrl(client, background, card.project_id, card.cover, visible);
+// Карточка постоянного проекта и число его серий.
+export function ProjectCard({ card, sizeBytes, selected, onSelect, onOpen }: Props) {
 
   return (
     <button
-      ref={ref}
       type="button"
       className="sb-card"
       aria-pressed={selected}
@@ -56,12 +36,6 @@ export function ProjectCard({ card, sizeBytes, selected, client, background, onS
         }
       }}
     >
-      <div className="sb-cover">{cover ? (
-          // eslint-disable-next-line @next/next/no-img-element -- адрес с токеном, оптимизатор Next не нужен
-          <img src={cover} alt="" loading="lazy" />
-        ) : (
-          T.noCover
-        )}</div>
       <div className="sb-card-title">{card.title}</div>
       <div className="sb-muted">{cardSubtitle(card, sizeBytes)}</div>
       <div className="sb-muted">{cardModified(card)}</div>

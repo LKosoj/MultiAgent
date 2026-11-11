@@ -1,13 +1,13 @@
 name: storybook_audio_subtitle_tool
-description: "Creates first-class subtitle/audio planning artifacts for a storybook project without calling external TTS"
+description: "Creates series subtitle/audio artifacts from retained measured speech without calling TTS again"
 category: "storybook"
 source_type: custom_function
 implementation_source: custom_tools.storybook.audio_subtitle.storybook_audio_subtitle_tool
 parameters:
-  - name: narration_path
+  - name: series_id
     type: str
-    description: "Existing reader audio to copy unchanged; timing requires manual alignment"
-    required: false
+    description: "Series identifier within the project"
+    required: true
   - name: session_id
     type: str
     description: "Execution trace/session identifier"
@@ -23,10 +23,6 @@ parameters:
   - name: enable
     type: bool
     description: "If true, writes subtitle and audio planning artifacts; if false, skips execution"
-    required: false
-  - name: allow_missing_subtitles
-    type: bool
-    description: "If false (default), zero subtitle cues is a hard error; if true, an empty cue set succeeds with a no_subtitle_cues warning"
     required: false
   - name: generate_subtitles
     type: bool

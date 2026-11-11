@@ -1156,12 +1156,16 @@ def _merge_music_status(audio_manifest_path: Path, music_manifest: Dict[str, Any
     tracks = audio_manifest.get("audio_tracks")
     if not isinstance(tracks, list):
         tracks = []
+    previous = next((existing for existing in tracks if isinstance(existing, dict) and track
+                     and existing.get("role") == "music" and existing.get("path") == track.get("path")), None)
     tracks = [
         existing
         for existing in tracks
         if not (isinstance(existing, dict) and existing.get("role") == "music" and existing.get("provider") == music_manifest.get("provider"))
     ]
     if track:
+        if previous:
+            track = {**track, **{field: previous[field] for field in ("level", "enabled") if field in previous}}
         tracks.append(track)
     audio_manifest["audio_tracks"] = tracks
     audio_manifest["music_status"] = music_manifest.get("status")

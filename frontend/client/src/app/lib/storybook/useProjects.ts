@@ -11,14 +11,12 @@ import {
   type ProjectCard,
   type ProjectsGetResult,
 } from "./projects";
-import { projectStatusBrief, type ProjectStatusBrief } from "./status";
 import { classifyStorybookError, type ClassifiedError } from "./uiErrors";
 
 export type ListState = "idle" | "loading" | "ready" | "error";
 
 export type ProjectExtra = {
   details: ProjectsGetResult["details"] | null;
-  brief: ProjectStatusBrief | null;
 };
 
 export type ProjectsApi = {
@@ -113,16 +111,14 @@ export const useProjects = ({ client, background, enabled }: Args): ProjectsApi 
       const put = (patch: Partial<ProjectExtra>) => {
         if (!alive.current || mine !== epoch.current) return;
         setExtras((prev) => {
-          const old = prev.get(id) ?? { details: null, brief: null };
+          const old = prev.get(id) ?? { details: null };
           return new Map(prev).set(id, { ...old, ...patch });
         });
       };
       projectsGet(client, { project_id: id })
         .then((r) => put({ details: r.details }))
         .catch(() => extraRequested.current.delete(id));
-      projectStatusBrief(client, { project_id: id, surface: "react" })
-        .then((r) => put({ brief: r }))
-        .catch(() => undefined);
+
     },
     [client, enabled],
   );

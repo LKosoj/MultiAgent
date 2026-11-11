@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+
 
 from custom_tools.storybook.studio import project_store
 from StoryBookManager.core.project_manager import Project, ProjectManager
@@ -22,8 +24,7 @@ def pm(tmp_path):
 
 def make(pm, name="alpha"):
     base = pm.projects_dir / name
-    base.mkdir()
-    (base / "00_brief.json").write_text(json.dumps({"title": "Альфа"}), encoding="utf-8")
+    make_series_project(pm.projects_dir, name)
     (base / "data.txt").write_text("x")
     return base
 

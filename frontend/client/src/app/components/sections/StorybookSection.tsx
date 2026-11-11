@@ -22,11 +22,16 @@ import { StorybookNav } from "./storybook/StorybookNav";
 import { StorybookOverviewTab } from "./storybook/StorybookOverviewTab";
 import { StorybookBlockoutTab } from "./storybook/blockout/StorybookBlockoutTab";
 import { StorybookFilesTab } from "./storybook/files/StorybookFilesTab";
+import { FilmReview } from "./storybook/film/FilmReview";
 import { StorybookFilmTab } from "./storybook/film/StorybookFilmTab";
 import { StorybookSettingsTab } from "./storybook/settings/StorybookSettingsTab";
 import { StorybookGenerationTab } from "./storybook/generation/StorybookGenerationTab";
 import { StorybookShotsTab } from "./storybook/shots/StorybookShotsTab";
 import { StorybookProjectsTab, type ProjectsCommand } from "./storybook/StorybookProjectsTab";
+import { SeriesSettings } from "./storybook/SeriesSettings";
+import { SeriesSounds } from "./storybook/SeriesSounds";
+import { SeriesSpeech } from "./storybook/SeriesSpeech";
+import { SeriesList } from "./storybook/SeriesList";
 import { StorybookTopBar } from "./storybook/StorybookTopBar";
 
 export type SectionMode = "no_access" | "dormant" | "live";
@@ -61,7 +66,10 @@ export function StorybookSection(props: Props) {
 function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest }: Props) {
   const { client, resetClient, background, runUser } = useStorybookClient(runServiceAction, backendUrl);
   const navApi = useStorybookNav();
+  const [selection, setSelection] = useState<{ projectId: string; seriesId: string } | null>(null);
   const { nav } = navApi;
+  const seriesId = selection?.projectId === nav.projectId ? selection.seriesId : undefined;
+  const { client: seriesClient, resetClient: resetSeriesClient } = useStorybookClient(runServiceAction, backendUrl, seriesId);
   const rootRef = useRef<HTMLDivElement>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -72,9 +80,10 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
   // ожидание правки картинки ИИ: один объект на проект, переживает смену вкладок
   // (при смене проекта вкладки пересоздаются по key, старое ожидание обрывается)
   const editJobsRef = useRef<{ id: string | null; jobs: ReturnType<typeof createEditJobs> } | null>(null);
-  if (!editJobsRef.current || editJobsRef.current.id !== nav.projectId) {
+  const editScope = `${nav.projectId}:${seriesId}`;
+  if (!editJobsRef.current || editJobsRef.current.id !== editScope) {
     editJobsRef.current?.jobs.dispose();
-    editJobsRef.current = { id: nav.projectId, jobs: createEditJobs() };
+    editJobsRef.current = { id: editScope, jobs: createEditJobs() };
   }
   const editJobs = editJobsRef.current.jobs;
 
@@ -99,13 +108,15 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
   }, [listState, list, reconcile]);
 
   const status = useProjectStatus({
-    client,
+    client: seriesClient,
+    scopeId: seriesId,
     projectId: nav.projectId,
     mode: nav.screen === "overview" ? "full" : "brief",
-    enabled: active && nav.projectId !== null,
+    enabled: active && nav.projectId !== null && !!seriesId,
   });
 
-  const { openProject, clearProject } = navApi;
+  const { openProject: navigateToProject, clearProject } = navApi;
+  const openProject = useCallback((id: string) => { setSelection(null); navigateToProject(id); }, [navigateToProject]);
   const lastOpen = useRef(0);
   useEffect(() => {
     if (openRequest && openRequest.n !== lastOpen.current) {
@@ -164,14 +175,14 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
       const id = nav.projectId;
       if (!id) return;
       try {
-        await runUser(() => runSetPause(client, { project_id: id, paused: action === "pause" }));
+        await runUser(() => runSetPause(seriesClient, { project_id: id, paused: action === "pause" }));
         say(action === "pause" ? toasts.pauseRequested : toasts.resumed, "success");
       } catch (err) {
         say(classifyStorybookError(err).text, "error");
       }
       status.refresh();
     },
-    [nav.projectId, client, runUser, say, status],
+    [nav.projectId, seriesClient, runUser, say, status],
   );
 
   // Стоп: окно подтверждения в верхней полосе, здесь только вызов
@@ -179,14 +190,14 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
     const id = nav.projectId;
     if (!id) return null;
     try {
-      await runUser(() => runCancel(client, { project_id: id }));
+      await runUser(() => runCancel(seriesClient, { project_id: id }));
     } catch (err) {
       return classifyStorybookError(err).text;
     }
     say(toasts.stopRequested, "success");
     status.refresh();
     return null;
-  }, [nav.projectId, client, runUser, say, status]);
+  }, [nav.projectId, seriesClient, runUser, say, status]);
 
   const onShortcut = useCallback(
     (action: ShortcutAction) => {
@@ -200,7 +211,7 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
         case "refresh":
           refresh();
           break;
-        case "create_prompt":
+        case "create_project":
         case "focus_search":
           commandSeq.current += 1;
           setCommand({ type: action.type, n: commandSeq.current });
@@ -235,6 +246,7 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
     <div className="sb-root" ref={rootRef} data-sb-screen={screen}>
       <StorybookTopBar
         projectId={nav.projectId}
+        seriesId={seriesId}
         brief={status.brief}
         offline={offline}
         onOpenPalette={() => setPaletteOpen(true)}
@@ -252,7 +264,10 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
           onBlocked={(hint) => say(hint, "info")}
         />
         <div className="sb-screen">
-          {screen === "projects" ? (
+          {seriesId && nav.projectId && <button type="button" onClick={() => { setSelection(null); navApi.goTo("overview"); }}>К сериям проекта</button>}
+          {nav.projectId && !seriesId && screen !== "projects" && screen !== "settings" ? (
+            <SeriesList key={`${nav.projectId}:${seriesId}`} client={client} projectId={nav.projectId} onOpen={(id) => { setSelection({ projectId: nav.projectId!, seriesId: id }); navApi.goTo("overview"); }} />
+          ) : screen === "projects" ? (
             <StorybookProjectsTab
               projects={projects}
               actions={actions}
@@ -266,6 +281,9 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
               onRefresh={refresh}
             />
           ) : screen === "overview" && nav.projectId ? (
+            <>
+            <SeriesSettings key={`${nav.projectId}:${seriesId}:settings`} client={client} projectId={nav.projectId} seriesId={seriesId!} />
+            <SeriesSpeech key={`${nav.projectId}:${seriesId}`} client={seriesClient} projectId={nav.projectId} />
             <StorybookOverviewTab
               api={status}
               onTarget={goTarget}
@@ -274,12 +292,14 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
               onBackToProjects={navApi.clearProject}
               onRefresh={refresh}
             />
+            </>
           ) : screen === "shots" && nav.projectId ? (
             <StorybookShotsTab
+              seriesId={seriesId!}
               editJobs={editJobs}
-              key={nav.projectId}
+              key={`${nav.projectId}:${seriesId}`}
               refreshTick={refreshTick}
-              client={client}
+              client={seriesClient}
               background={background}
               runUser={runUser}
               projectId={nav.projectId}
@@ -289,13 +309,14 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
               say={say}
               onGoGeneration={() => navApi.goTo("generation")}
               onGenerateShots={(keys) => navApi.applyTarget({ screen: "generation", mode: "regenerate_shots", shot_keys: keys })}
-              onResetClient={resetClient}
+              onResetClient={resetSeriesClient}
             />
           ) : screen === "generation" && nav.projectId ? (
             <StorybookGenerationTab
-              key={nav.projectId}
+              seriesId={seriesId!}
+              key={`${nav.projectId}:${seriesId}`}
               refreshTick={refreshTick}
-              client={client}
+              client={seriesClient}
               runUser={runUser}
               projectId={nav.projectId}
               intent={nav.intent}
@@ -305,10 +326,13 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
               onOpenBlockout={() => navApi.goTo("blockout")}
             />
           ) : screen === "film" && nav.projectId ? (
+            <>
+            <SeriesSounds key={`${nav.projectId}:${seriesId}:sounds`} client={seriesClient} projectId={nav.projectId} />
+            <FilmReview key={`${nav.projectId}:${seriesId}:review`} client={client} projectId={nav.projectId} seriesId={seriesId!} refreshTick={refreshTick} runState={status.brief?.run.state} />
             <StorybookFilmTab
-              key={nav.projectId}
+              key={`${nav.projectId}:${seriesId}:film`}
               refreshTick={refreshTick}
-              client={client}
+              client={seriesClient}
               background={background}
               runUser={runUser}
               projectId={nav.projectId}
@@ -322,11 +346,12 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
               onOpenFiles={() => navApi.goTo("files")}
               onRunStarted={status.refresh}
             />
+            </>
           ) : screen === "blockout" && nav.projectId ? (
             <StorybookBlockoutTab
-              key={nav.projectId}
+              key={`${nav.projectId}:${seriesId}`}
               refreshTick={refreshTick}
-              client={client}
+              client={seriesClient}
               background={background}
               runUser={runUser}
               projectId={nav.projectId}
@@ -340,8 +365,8 @@ function LiveSection({ runServiceAction, backendUrl, active, notify, openRequest
           ) : screen === "files" && nav.projectId ? (
             <StorybookFilesTab
               editJobs={editJobs}
-              key={nav.projectId}
-              client={client}
+              key={`${nav.projectId}:${seriesId}`}
+              client={seriesClient}
               background={background}
               runUser={runUser}
               projectId={nav.projectId}

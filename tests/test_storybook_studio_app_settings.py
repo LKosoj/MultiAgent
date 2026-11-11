@@ -7,6 +7,8 @@ import threading
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+
 from custom_tools.storybook.project_paths import acquire_storybook_project_lock, release_storybook_project_lock
 from custom_tools.storybook.studio import app_settings as mod
 from custom_tools.storybook.studio import capabilities as caps
@@ -141,7 +143,7 @@ def test_update_projects_directory_rules(cfg):
     target = tmp / "newroot"
     target.mkdir()
     handle = None
-    (tmp / "projects" / "alpha").mkdir()
+    make_series_project(tmp / "projects", "alpha")
     handle = acquire_storybook_project_lock("alpha")
     try:
         err(invoke("app_settings_update", {"projects_directory": str(target)}), "locked")

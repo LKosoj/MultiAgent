@@ -31,6 +31,7 @@ export type StorybookClientOptions = {
   apiBase: string; // например "http://localhost:8000" (без /agent)
   timeoutMs?: number;
   now?: () => number;
+  seriesId?: string;
 };
 
 export type ThumbSize = 128 | 256 | 512;
@@ -70,7 +71,8 @@ export const createStorybookClient = (
     payload: Record<string, unknown> = {},
     callOptions?: { timeoutMs?: number },
   ) => {
-    const raw = await runServiceAction(`storybook.${id}`, payload, {
+    const scopedPayload = options.seriesId && typeof payload.project_id === "string" ? { ...payload, series_id: options.seriesId } : payload;
+    const raw = await runServiceAction(`storybook.${id}`, scopedPayload, {
       timeoutMs: callOptions?.timeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     });
     if (!isRecord(raw) || typeof raw.status !== "string") {
@@ -108,7 +110,8 @@ export const createStorybookClient = (
   const buildUrl = (projectId: string, route: string, relPath: string, extra = ""): string | null => {
     const entry = tokens.get(projectId);
     if (!entry || entry.expMs <= now()) return null;
-    const base = `${apiBase}/v1/storybook/projects/${encodeURIComponent(projectId)}/${route}`;
+    const series = options.seriesId ? `/series/${encodeURIComponent(options.seriesId)}` : "";
+    const base = `${apiBase}/v1/storybook/projects/${encodeURIComponent(projectId)}${series}/${route}`;
     return `${base}?path=${encodeURIComponent(relPath)}${extra}&t=${encodeURIComponent(entry.token)}`;
   };
 

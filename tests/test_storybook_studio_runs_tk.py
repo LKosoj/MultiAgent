@@ -8,7 +8,8 @@ import pytest
 
 from custom_tools.storybook.studio import run_control
 from StoryBookManager.core.pipeline_runner import PipelineRunner
-from tests.studio_run_fakes import FakeEngine
+from tests.studio_run_fakes import FakeEngine, make_series_project
+from custom_tools.storybook.project_paths import series_scope
 from workflow.models import StepResult, StepStatus, WorkflowResult, WorkflowStatus
 
 
@@ -38,12 +39,12 @@ class TkEngine(FakeEngine):
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    project = tmp_path / "p"
-    project.mkdir()
+    project = make_series_project(tmp_path, "p")
     monkeypatch.setattr(PipelineRunner, "_initialize_engine", lambda self: None)
     obj = PipelineRunner()
     obj.engine = TkEngine(tmp_path)
-    return obj, project
+    with series_scope("p", "main"):
+        yield obj, project
 
 
 def _definition(*ids):

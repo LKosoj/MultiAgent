@@ -16,7 +16,7 @@ import { classifyStorybookError, type ClassifiedError } from "./uiErrors";
 
 export type StatusMode = "full" | "brief";
 
-type Data = { projectId: string; status: ProjectStatus | null; brief: ProjectStatusBrief | null };
+type Data = { scopeId: string; projectId: string; status: ProjectStatus | null; brief: ProjectStatusBrief | null };
 
 export type ProjectStatusApi = {
   status: ProjectStatus | null;
@@ -28,11 +28,11 @@ export type ProjectStatusApi = {
   refresh: () => void;
 };
 
-type Args = { client: StorybookClient; projectId: string | null; mode: StatusMode; enabled: boolean };
+type Args = { scopeId?: string; client: StorybookClient; projectId: string | null; mode: StatusMode; enabled: boolean };
 
-export const useProjectStatus = ({ client, projectId, mode, enabled }: Args): ProjectStatusApi => {
+export const useProjectStatus = ({ client, projectId, mode, enabled, scopeId = "" }: Args): ProjectStatusApi => {
   const [data, setData] = useState<Data | null>(null);
-  const [error, setError] = useState<{ projectId: string; value: ClassifiedError } | null>(null);
+  const [error, setError] = useState<{ scopeId: string; projectId: string; value: ClassifiedError } | null>(null);
   const pollerRef = useRef<StatusPoller | null>(null);
 
   useEffect(() => {
@@ -47,10 +47,10 @@ export const useProjectStatus = ({ client, projectId, mode, enabled }: Args): Pr
         statusPollIntervalMs(d ? ("active_run" in d ? d.active_run.state : d.run.state) : undefined),
       onData: (d) => {
         setError(null);
-        if ("active_run" in d) setData({ projectId: id, status: d, brief: briefFromStatus(d) });
-        else setData((prev) => ({ projectId: id, status: prev?.projectId === id ? prev.status : null, brief: d }));
+        if ("active_run" in d) setData({ scopeId, projectId: id, status: d, brief: briefFromStatus(d) });
+        else setData((prev) => ({ scopeId, projectId: id, status: prev?.projectId === id && prev.scopeId === scopeId ? prev.status : null, brief: d }));
       },
-      onError: (err) => setError({ projectId: id, value: classifyStorybookError(err) }),
+      onError: (err) => setError({ scopeId, projectId: id, value: classifyStorybookError(err) }),
       isHidden: () => typeof document !== "undefined" && document.hidden,
     });
     pollerRef.current = poller;
@@ -64,12 +64,12 @@ export const useProjectStatus = ({ client, projectId, mode, enabled }: Args): Pr
       poller.stop();
       if (pollerRef.current === poller) pollerRef.current = null;
     };
-  }, [client, projectId, mode, enabled]);
+  }, [client, projectId, mode, enabled, scopeId]);
 
   const refresh = useCallback(() => pollerRef.current?.refreshNow(), []);
 
-  const mine = data && data.projectId === projectId ? data : null;
-  const myError = error && error.projectId === projectId ? error.value : null;
+  const mine = data && data.projectId === projectId && data.scopeId === scopeId ? data : null;
+  const myError = error && error.projectId === projectId && error.scopeId === scopeId ? error.value : null;
   const hasData = mode === "full" ? !!mine?.status : !!mine?.brief;
   const state: ProjectStatusApi["state"] =
     !enabled || !projectId ? "idle" : hasData ? "ready" : myError ? "error" : "loading";

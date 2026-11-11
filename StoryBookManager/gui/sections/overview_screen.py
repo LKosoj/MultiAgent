@@ -113,7 +113,7 @@ class OverviewScreen(ttk.Frame, SectionAdapter):
         head.columnconfigure(0, weight=1)
         ttk.Label(head, text=O.TXT_TITLE, style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         if title:
-            ttk.Label(head, text=title, style="Subtitle.TLabel").grid(row=1, column=0, sticky="w")
+            ttk.Label(head, text=f"Серия: {title}", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Button(head, text=O.TXT_REFRESH, command=self._refresh).grid(row=0, column=1, rowspan=2, sticky="e")
 
     def _centered(self, text: str, button: Optional[tuple] = None) -> None:

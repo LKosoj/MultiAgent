@@ -9,8 +9,8 @@ from StoryBookManager.gui.shell.toast_model import ToastModel
 
 
 class TestSections(unittest.TestCase):
-    def test_eight_sections_and_landing(self):
-        self.assertEqual(len(sections.SECTIONS), 8)
+    def test_sections_and_landing(self):
+        self.assertEqual(len(sections.SECTIONS), 9)
         self.assertEqual(sections.LANDING_AFTER_OPEN, "overview")
         self.assertEqual(sections.section_by_number(1).id, "projects")
         self.assertFalse(sections.section_by_id("projects").needs_project)

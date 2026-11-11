@@ -1,5 +1,7 @@
 import json
+import contextvars
 import os
+from pathlib import Path
 import logging
 import re
 import random
@@ -306,6 +308,8 @@ def screenplay_shots_generator_tool(
     
     # Пути к файлам (M-23: единый резолвер, как в audio_subtitle/montage)
     base_dir = str(safe_storybook_project_dir(project_id))
+    from .video_plan import _load_speech_for_planning
+    speech_data = _load_speech_for_planning(project_id, Path(base_dir))
     screenplay_path = f"{base_dir}/91_screenplay/screenplay.json"
     characters_path = f"{base_dir}/20_bible/characters.json"
     locations_path = f"{base_dir}/20_bible/locations.json"
@@ -963,6 +967,11 @@ def screenplay_shots_generator_tool(
                 previous_end_llm_result = None
                 previous_end_shot_item = None
 
+            if "face_visibility_relative" in shot:
+                for shot_item in (start_shot_item, end_shot_item):
+                    if shot_item is not None:
+                        shot_item["face_visibility_relative"] = shot["face_visibility_relative"]
+
             _checkpoint_partial_progress(
                 scene_number=scene_number,
                 shot_number=shot_number,
@@ -975,7 +984,7 @@ def screenplay_shots_generator_tool(
     # Параллельная обработка сцен
     max_workers = min(5, len(screenplay_scenes)) if screenplay_scenes else 1
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_process_scene_worker, scene): scene for scene in screenplay_scenes}
+        futures = {executor.submit(contextvars.copy_context().run, _process_scene_worker, scene): scene for scene in screenplay_scenes}
         for fut in as_completed(futures):
             try:
                 res = fut.result()
@@ -1034,6 +1043,15 @@ def screenplay_shots_generator_tool(
         inputs_hash=inputs_hash,
     )
 
+    character_names = None
+    if speech_data is not None:
+        from .project_paths import current_series_scope
+        scope = current_series_scope()
+        if scope and scope[0] == project_id:
+            from .studio.series import resolve_snapshot
+            characters = resolve_snapshot(*scope).get("characters", {})
+            character_names = {key: value["data"].get("name") for key, value in characters.items()}
+
     logger.info("🈯 Shots prompts already generated on language: %s", language)
 
     # Сохраняем shots.json (merge superset при partial/resume, иначе перезапись).
@@ -1045,7 +1063,7 @@ def screenplay_shots_generator_tool(
         image_style_catalog=image_style_catalog,
         manual_overrides=manual_overrides, effective_durations=effective_durations,
         shot_keys=selected_shot_keys,
-        duration_report=final_duration_report,
+        duration_report=final_duration_report, measured_speech=speech_data, character_names=character_names,
     )
     shots_items = shots_data["items"]
     total_shots = len(shots_items)
@@ -1567,6 +1585,8 @@ def _merge_write_shots(
     duration_report: Optional[Dict[str, Any]] = None,
     image_style_catalog: Optional[Dict[str, Any]] = None,
     shot_keys: Optional[set] = None,
+    measured_speech: Optional[Dict[str, Any]] = None,
+    character_names: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """Атомарная кросс-процессная запись shots.json (M-7/H-4).
 
@@ -1618,6 +1638,11 @@ def _merge_write_shots(
                         duration_report["changed"] = changed
                         duration_report["warnings"] = norm_warnings
                         duration_report["affected"] = affected
+
+                if measured_speech is not None:
+                    from .shot_speech_timing import apply_measured_shot_timing
+                    items = apply_measured_shot_timing(items, measured_speech, character_names)
+                    shots_data["items"] = items
 
                 if image_style_catalog:
                     style_path = os.path.join(os.path.dirname(directory), "30_style", "image_styles.json")

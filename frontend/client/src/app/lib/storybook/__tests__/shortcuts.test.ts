@@ -48,8 +48,8 @@ describe("matchShortcut", () => {
   });
 
   it("Alt+N только на «Проектах», работает и на русской раскладке", () => {
-    expect(matchShortcut(ev({ altKey: true, key: "n", code: "KeyN" }), ctx())).toEqual({ type: "create_prompt" });
-    expect(matchShortcut(ev({ altKey: true, key: "т", code: "KeyN" }), ctx())).toEqual({ type: "create_prompt" });
+    expect(matchShortcut(ev({ altKey: true, key: "n", code: "KeyN" }), ctx())).toEqual({ type: "create_project" });
+    expect(matchShortcut(ev({ altKey: true, key: "т", code: "KeyN" }), ctx())).toEqual({ type: "create_project" });
     expect(matchShortcut(ev({ altKey: true, key: "n", code: "KeyN" }), ctx({ screen: "overview" }))).toBeNull();
   });
 

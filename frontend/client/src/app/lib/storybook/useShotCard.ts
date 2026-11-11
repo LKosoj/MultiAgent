@@ -57,6 +57,7 @@ type Args = {
   client: StorybookClient;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  storageId?: string;
   shotKey: string | null;
   enabled: boolean;
   say: Say;
@@ -75,7 +76,7 @@ const sessionStorageOrNull = (): StorageLike | null => {
   }
 };
 
-export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say, onSaved }: Args): ShotCardApi => {
+export const useShotCard = ({ client, runUser, projectId, storageId = projectId, shotKey, enabled, say, onSaved }: Args): ShotCardApi => {
   const [loaded, setLoaded] = useState<Loaded | null>(null);
   const [status, setStatus] = useState<CardStatus>("idle");
   const [error, setError] = useState<string | null>(null);
@@ -132,7 +133,7 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
           nextForm = reapplyDraft(fresh, opts.override.changes);
           if (opts.override.note !== null) nextNote = opts.override.note;
         } else if (opts.restoreDraft) {
-          const draft = loadDraft(sessionStorageOrNull(), projectId, key);
+          const draft = loadDraft(sessionStorageOrNull(), storageId, key);
           if (draft) {
             nextForm = { ...nextForm, ...draft.changes };
             if (draft.note !== null) nextNote = draft.note;
@@ -153,7 +154,7 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
         setStatus("error");
       }
     },
-    [client, projectId, runUser, gate],
+    [client, projectId, storageId, runUser, gate],
   );
 
   // смена шота: небольшая задержка, чтобы листание стрелками не слало запрос на каждый шаг
@@ -177,9 +178,9 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
     if (!d) return;
     draftRef.current = null;
     const storage = sessionStorageOrNull();
-    if (d.dirty) saveDraft(storage, projectId, d.key, { changes: d.changes, note: d.note, baseDigest: d.baseDigest });
-    else clearDraft(storage, projectId, d.key);
-  }, [projectId]);
+    if (d.dirty) saveDraft(storage, storageId, d.key, { changes: d.changes, note: d.note, baseDigest: d.baseDigest });
+    else clearDraft(storage, storageId, d.key);
+  }, [storageId]);
 
   const currentKey = current?.key ?? null;
   const baseDigest = current?.baseDigest ?? null;
@@ -236,8 +237,8 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
     setNoteState(loaded.entry.note);
     setDraftRestored(false);
     draftRef.current = null;
-    clearDraft(sessionStorageOrNull(), projectId, loaded.key);
-  }, [loaded, projectId]);
+    clearDraft(sessionStorageOrNull(), storageId, loaded.key);
+  }, [loaded, storageId]);
 
   const save = useCallback(async (): Promise<boolean> => {
     if (!current || !form || saving) return false;
@@ -284,14 +285,14 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
     }
     if (!alive.current) return true;
     setSaving(false);
-    clearDraft(sessionStorageOrNull(), projectId, key);
+    clearDraft(sessionStorageOrNull(), storageId, key);
     draftRef.current = null;
     sayRef.current(SHOT_TEXTS.saved_toast, "success");
     setEffectsNote(serverNote);
     await fetchAndApply(key, gate.next());
     onSavedRef.current?.();
     return true;
-  }, [current, form, note, saving, runUser, client, projectId, fetchAndApply, gate]);
+  }, [current, form, note, saving, runUser, client, projectId, storageId, fetchAndApply, gate]);
 
   const resolveConflict = useCallback(
     async (choice: "refresh" | "keep") => {
@@ -300,14 +301,14 @@ export const useShotCard = ({ client, runUser, projectId, shotKey, enabled, say,
       setConflict(null);
       if (!key) return;
       if (choice === "refresh" || !c) {
-        clearDraft(sessionStorageOrNull(), projectId, key);
+        clearDraft(sessionStorageOrNull(), storageId, key);
         draftRef.current = null;
         await fetchAndApply(key, gate.next());
       } else {
         await fetchAndApply(key, gate.next(), { override: c.mine });
       }
     },
-    [conflict, shotKey, projectId, fetchAndApply, gate],
+    [conflict, shotKey, projectId, storageId, fetchAndApply, gate],
   );
 
   return {

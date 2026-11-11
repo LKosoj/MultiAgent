@@ -9,7 +9,7 @@ import pytest
 
 from custom_tools.storybook.studio import run_exec, run_launchers
 from custom_tools.storybook.studio.errors import StudioError
-from tests.studio_run_fakes import FakeEngine, make_plan
+from tests.studio_run_fakes import FakeEngine, make_plan, make_series_project
 
 
 class _Store:
@@ -52,7 +52,7 @@ def test_start_backend_passes_plan_and_run_id(backend):
     assert store.created[0][0] == "run-1" and store.created[0][3] == "agui"
     call = manager.started[0]
     assert call["workflow_name"] == "storybook_pipeline" and call["run_id"] == "run-1"
-    assert call["parameters"] == {"project_id": "p", "studio_plan": plan, "studio_run_id": "run-1"}
+    assert call["parameters"] == {"project_id": "p", "series_id": "main", "studio_plan": plan, "studio_run_id": "run-1"}
     assert call["owner"] is owner and call["use_enhanced"] is True
 
 
@@ -78,8 +78,7 @@ def test_unknown_launcher_is_invalid():
 def test_execute_plan_raw_with_held_lock_returns_workflow_result(tmp_path, monkeypatch):
     # так воркер бэкенда вызывает прогон: замок проекта уже взят снаружи
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    project = tmp_path / "p"
-    project.mkdir()
+    project = make_series_project(tmp_path, "p")
     (project / "00_brief.json").write_text(json.dumps({"title": "t"}))
     engine = FakeEngine(tmp_path)
     plan = make_plan("p", ["brief_from_prompt", "init_project"])
@@ -120,7 +119,8 @@ def test_web_worker_runs_studio_plan_instead_of_yaml(tmp_path, monkeypatch):
     real = run_control.acquire_lock_with_retries
     monkeypatch.setattr(run_control, "acquire_lock_with_retries", lambda pid: taken.append(pid) or real(pid))
     manager.engine = _Engine()
-    plan = {"project_id": "web-project", "steps_to_run": ["x"]}
+    make_series_project(tmp_path, "web-project")
+    plan = {"project_id": "web-project", "series_id": "main", "steps_to_run": ["x"]}
     manager._execute_workflow_in_context(
         "run-id", tmp_path / "storybook.yaml",
         {"project_id": "web-project", "studio_plan": plan, "studio_run_id": "run-9"}, "session-id")
@@ -136,7 +136,7 @@ def test_start_local_does_not_leak_lock_when_engine_fails(tmp_path, monkeypatch)
     from custom_tools.storybook.studio import run_control
 
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "p").mkdir()
+    project = make_series_project(tmp_path, "p")
 
     def broken():
         raise RuntimeError("движок не поднялся")
@@ -144,4 +144,4 @@ def test_start_local_does_not_leak_lock_when_engine_fails(tmp_path, monkeypatch)
     monkeypatch.setattr(run_exec, "get_engine", broken)
     with pytest.raises(RuntimeError):
         run_launchers.start_local("p", make_plan("p", ["brief_from_prompt"]), "tk-1")
-    assert run_control.probe_lock(tmp_path / "p") is False
+    assert run_control.probe_lock(project) is False

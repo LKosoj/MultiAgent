@@ -41,6 +41,7 @@ import { Skeleton } from "../Skeleton";
 import { ImageEditDialog } from "../imagetools/ImageEditDialog";
 import { ConflictDialog } from "./ConflictDialog";
 import { RegenerateDialog } from "./RegenerateDialog";
+import { ShotSpeech } from "./ShotSpeech";
 import { ShotCard } from "./ShotCard";
 import { ShotViewer } from "./ShotViewer";
 import { ShotsFilterBar } from "./ShotsFilterBar";
@@ -56,6 +57,7 @@ type Props = {
   background: BackgroundQueue;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  seriesId: string;
   intent: NavIntent | null;
   runState: string | undefined;
   active: boolean;
@@ -71,9 +73,9 @@ type Props = {
 const LETTER: Record<ReviewStatus, string> = { pending: "", approved: "a", redo: "r", rejected: "x" };
 
 // Экран «Кадры»: слева список шотов, справа открытый шот
-export function StorybookShotsTab({ editJobs, client, background, runUser, projectId, intent, runState, active, refreshTick, say, onGoGeneration, onGenerateShots, onResetClient }: Props) {
+export function StorybookShotsTab({ editJobs, client, background, runUser, projectId, seriesId, intent, runState, active, refreshTick, say, onGoGeneration, onGenerateShots, onResetClient }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
-  const list = useShotsList({ client, background, runUser, projectId, enabled: active, runState, intent });
+  const list = useShotsList({ client, background, runUser, projectId, storageId: `${projectId}:${seriesId}`, enabled: active, runState, intent });
   const media = useShotMedia({ client, background, projectId, enabled: active });
   const [selectedKey, setSelectedKey] = useState<string | null>(list.savedSelected);
   const [marked, setMarked] = useState<ReadonlySet<string>>(new Set());
@@ -87,7 +89,7 @@ export function StorybookShotsTab({ editJobs, client, background, runUser, proje
   });
 
   const reloadList = useCallback(() => void listRef.current.reload({ silent: true }), []);
-  const card = useShotCard({ client, runUser, projectId, shotKey: selectedKey, enabled: active, say, onSaved: reloadList });
+  const card = useShotCard({ client, runUser, projectId, storageId: `${projectId}:${seriesId}`, shotKey: selectedKey, enabled: active, say, onSaved: reloadList });
   const cardRefreshRef = useRef(card);
   cardRefreshRef.current = card;
   useRefreshTick(refreshTick, () => {
@@ -477,6 +479,8 @@ export function StorybookShotsTab({ editJobs, client, background, runUser, proje
         </div>
         <div className="sb-shots-right">
           {selectedKey ? (
+            <>
+            <ShotSpeech client={client} projectId={projectId} shotKey={selectedKey} />
             <ShotCard
               api={card}
               review={review}
@@ -491,6 +495,7 @@ export function StorybookShotsTab({ editJobs, client, background, runUser, proje
               edited={edited}
               onRetry={() => void card.reload()}
             />
+            </>
           ) : null}
         </div>
       </div>

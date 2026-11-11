@@ -39,6 +39,17 @@ def bible_builder_tool(session_id: str, project_id: str, language: str = "ru") -
         if any(location.get("_passport_version") != _LOCATION_PASSPORT_VERSION for location in previous_locations):
             sections_to_generate.append("locations")
 
+    marker = f"{out_dir}/.shared_generation_complete"
+    shared_canon = {}
+    for key in ("characters", "locations"):
+        if os.path.exists(canon_paths[key]):
+            with open(canon_paths[key], "r", encoding="utf-8") as f:
+                shared_canon[key] = [item for item in json.load(f) if item.get("_shared_id")]
+    if any(shared_canon.values()) and not os.path.exists(marker):
+        for key in ("characters", "locations"):
+            if key not in sections_to_generate:
+                sections_to_generate.append(key)
+
     # Проверяем, существуют ли УЖЕ ВСЕ основные файлы
     if not sections_to_generate:
         logger.info(f"📚 Библия персонажей уже существует (все файлы найдены), пропускаем генерацию")
@@ -164,8 +175,16 @@ def bible_builder_tool(session_id: str, project_id: str, language: str = "ru") -
                 }
                 for location in data.get(key, [])
             ]
+        entries = data.get(key, [])
+        if key in shared_canon and shared_canon[key]:
+            shared = shared_canon[key]
+            names = {str(item.get("name", "")).casefold() for item in shared}
+            entries = shared + [item for item in entries if str(item.get("name", "")).casefold() not in names]
         with open(canon_paths[key], "w", encoding="utf-8") as f:
-            json.dump(data.get(key, []), f, ensure_ascii=False, indent=2)
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+    if any(shared_canon.values()):
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("done")
     # Референсы могут быть предзагружены пользователем — здесь только гарантируем каталоги
     os.makedirs(f"{out_dir}/references/characters", exist_ok=True)
     os.makedirs(f"{out_dir}/references/locations", exist_ok=True)

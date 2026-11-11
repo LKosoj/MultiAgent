@@ -1,4 +1,5 @@
 import importlib
+import json
 import sys
 import types
 
@@ -20,8 +21,10 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("AG_UI_USER_TOKEN", "user-tok")
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path / "projects"))
     monkeypatch.setenv("STORYBOOK_MEDIA_SIGNING_KEY", "test-key")
-    proj = tmp_path / "projects" / "demo"
+    project = tmp_path / "projects" / "demo"
+    proj = project / "shared"
     proj.mkdir(parents=True)
+    (project / "project.json").write_text(json.dumps({"format": "storybook-series-v1"}))
     Image.new("RGB", (600, 400), (10, 120, 10)).save(proj / "a.png")
     (proj / "data.bin").write_bytes(bytes(range(256)) * 400)
     (proj / "clip.mp3").write_bytes(bytes(range(256)) * 400)
@@ -52,7 +55,8 @@ def env(tmp_path, monkeypatch):
 
 
 def media(client, path, project="demo", **kw):
-    return client.get(f"/v1/storybook/projects/{project}/media", params={"path": path}, **kw)
+    relative = path if path.startswith(".studio/") or path.startswith("../") or path.startswith("/") else f"shared/{path}"
+    return client.get(f"/v1/storybook/projects/{project}/media", params={"path": relative}, **kw)
 
 
 def test_auth_matrix(env):
@@ -68,13 +72,13 @@ def test_auth_matrix(env):
 def test_project_token(env):
     client, _ = env
     token = issue_media_token("demo")["token"]
-    assert client.get("/v1/storybook/projects/demo/media", params={"path": "a.png", "t": token}).status_code == 200
+    assert client.get("/v1/storybook/projects/demo/media", params={"path": "shared/a.png", "t": token}).status_code == 200
     other = issue_media_token("other")["token"]
-    assert client.get("/v1/storybook/projects/demo/media", params={"path": "a.png", "t": other}).status_code == 401
+    assert client.get("/v1/storybook/projects/demo/media", params={"path": "shared/a.png", "t": other}).status_code == 401
     expired = issue_media_token("demo", now=1)["token"]
-    assert client.get("/v1/storybook/projects/demo/media", params={"path": "a.png", "t": expired}).status_code == 401
+    assert client.get("/v1/storybook/projects/demo/media", params={"path": "shared/a.png", "t": expired}).status_code == 401
     forged = token[:-4] + "0000"
-    assert client.get("/v1/storybook/projects/demo/media", params={"path": "a.png", "t": forged}).status_code == 401
+    assert client.get("/v1/storybook/projects/demo/media", params={"path": "shared/a.png", "t": forged}).status_code == 401
 
 
 def test_disabled_mode_needs_no_token(env, monkeypatch):
@@ -111,11 +115,11 @@ def test_extension_whitelist_and_missing(env):
 
 def test_export_zip_only_from_exports_as_attachment(env):
     client, proj = env
-    (proj / ".studio" / "exports").mkdir(parents=True)
-    (proj / ".studio" / "exports" / "demo.zip").write_bytes(b"PK\x03\x04zip")
+    (proj.parent / ".studio" / "exports").mkdir(parents=True)
+    (proj.parent / ".studio" / "exports" / "demo.zip").write_bytes(b"PK\x03\x04zip")
     (proj / "other.zip").write_bytes(b"PK\x03\x04zip")
-    (proj / ".studio" / "exports" / "sub").mkdir()
-    (proj / ".studio" / "exports" / "sub" / "deep.zip").write_bytes(b"PK")
+    (proj.parent / ".studio" / "exports" / "sub").mkdir()
+    (proj.parent / ".studio" / "exports" / "sub" / "deep.zip").write_bytes(b"PK")
     ok = media(client, ".studio/exports/demo.zip", headers=ADMIN)
     assert ok.status_code == 200 and ok.headers["content-type"] == "application/zip"
     assert ok.headers["content-disposition"].startswith("attachment")
@@ -138,14 +142,15 @@ def test_range_requests(env):
 
 
 def thumb(client, path, **params):
-    return client.get("/v1/storybook/projects/demo/thumb", params={"path": path, **params}, headers=ADMIN)
+    relative = path if path.startswith("../") else f"shared/{path}"
+    return client.get("/v1/storybook/projects/demo/thumb", params={"path": relative, **params}, headers=ADMIN)
 
 
 def test_thumb_png_cached(env):
     client, proj = env
     first = thumb(client, "a.png", size=128)
     assert first.status_code == 200 and first.headers["content-type"] == "image/jpeg"
-    cached = list((proj / ".studio" / "thumbs").glob("*.jpg"))
+    cached = list((proj.parent / ".studio" / "thumbs").glob("*.jpg"))
     assert len(cached) == 1
     mtime = cached[0].stat().st_mtime_ns
     assert thumb(client, "a.png", size=128).status_code == 200
@@ -157,7 +162,7 @@ def test_thumb_bad_size_and_placeholder(env):
     assert thumb(client, "a.png", size=300).status_code == 400
     broken = thumb(client, "bad.png", size=128)
     assert broken.status_code == 200 and broken.headers["x-studio-placeholder"] == "1"
-    assert not (proj / ".studio").exists()
+    assert not (proj.parent / ".studio").exists()
     assert thumb(client, "../x.png", size=128).status_code == 403
     assert client.get("/v1/storybook/projects/demo/thumb", params={"path": "a.png"}).status_code == 401
 
@@ -180,7 +185,7 @@ def test_thumb_video(env):
 
 def test_export_zip_symlinks_are_not_followed_out_of_exports(env):
     client, proj = env
-    exports = proj / ".studio" / "exports"
+    exports = proj.parent / ".studio" / "exports"
     exports.mkdir(parents=True)
     (proj / "story.json").write_text("{}", encoding="utf-8")
     (proj / "other.zip").write_bytes(b"PK\x03\x04zip")
@@ -188,3 +193,20 @@ def test_export_zip_symlinks_are_not_followed_out_of_exports(env):
     (exports / "to_other.zip").symlink_to(proj / "other.zip")
     assert media(client, ".studio/exports/to_json.zip", headers=ADMIN).status_code == 403
     assert media(client, ".studio/exports/to_other.zip", headers=ADMIN).status_code == 403
+
+
+def test_series_route_isolates_tokens_and_paths(env):
+    client, shared = env
+    project = shared.parent
+    for series in ('one', 'two'):
+        directory = project / 'series' / series
+        directory.mkdir(parents=True)
+        (directory / 'series.json').write_text('{}')
+        (directory / 'a.png').write_bytes(series.encode())
+    token = issue_media_token('demo', series_id='one')['token']
+    url = '/v1/storybook/projects/demo/series/one/media'
+    assert client.get(url, params={'path': 'a.png', 't': token}).content == b'one'
+    assert client.get('/v1/storybook/projects/demo/series/two/media', params={'path': 'a.png', 't': token}).status_code == 401
+    assert client.get(url, params={'path': '../two/a.png', 't': token}).status_code == 403
+    project_token = issue_media_token('demo')['token']
+    assert client.get(url, params={'path': 'a.png', 't': project_token}).status_code == 401

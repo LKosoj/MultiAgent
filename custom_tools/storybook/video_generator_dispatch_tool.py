@@ -108,6 +108,16 @@ def video_generator_dispatch_tool(
                        f"Неизвестный провайдер видео: {provider or '(пусто)'}. "
                        f"Доступны: {', '.join(video_run_config.PROVIDER_TOOLS)}.")
 
+    if project_id and _as_bool(enable) and provider not in BUDGET_PROVIDERS:
+        from .video_plan import _load_speech_for_planning, _require_current_video_plan
+        import json
+        base = _project_dir(project_id)
+        speech = _load_speech_for_planning(project_id, base)
+        shots_path = base / "97_shots/shots.json"
+        if shots_path.is_file():
+            shots = json.loads(shots_path.read_text(encoding="utf-8"))
+            _require_current_video_plan(project_id, base, speech, shots.get("items", []) if isinstance(shots, dict) else shots, shot_keys)
+
     if provider not in BUDGET_PROVIDERS:
         stored = video_run_config.stored_budget_rub_at(_project_dir(project_id)) if project_id else None
         if (stored if stored is not None else _budget(budget_rub)) > 0:

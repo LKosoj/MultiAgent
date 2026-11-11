@@ -145,3 +145,48 @@ def test_race_four_threads_budget_for_two(project, monkeypatch):
     [t.start() for t in threads]
     [t.join() for t in threads]
     assert sorted(outcomes) == ["ok", "ok", "stopped", "stopped"]
+
+
+def test_series_budget_uses_project_fallback(tmp_path, monkeypatch):
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    from custom_tools.storybook import video_run_config
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title': 'World', 'description': 'A shared world', 'genre': 'fairy', 'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'Series', 'source_material': '', 'participant_ids': [], 'settings': {}})['series_id']
+    video_run_config.set_run_budget_fallback(pid, 5)
+    monkeypatch.setenv('ROUTERAI_VIDEO_COST_RUB', '10')
+    monkeypatch.setenv('STORYBOOK_VIDEO_PRICING_PATH', str(tmp_path / 'missing.yaml'))
+    with series_scope(pid, sid):
+        base = tmp_path / pid / 'series' / sid
+        assert vb.current_budget_rub(base) == 5
+        with pytest.raises(vb.BudgetExceededError, match='Бюджет'):
+            with reserve(base):
+                pytest.fail('reservation should be blocked before submission')
+    video_run_config.set_run_budget_fallback(pid, 0)
+
+
+def test_series_reference_submission_obeys_dispatch_budget(tmp_path, monkeypatch):
+    from PIL import Image
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    from custom_tools.storybook import video_plan
+    from custom_tools.storybook.video_generator_aitunnel_jobs import _ProviderJobStore
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    monkeypatch.setenv('ROUTERAI_VIDEO_COST_RUB', '10')
+    monkeypatch.setenv('STORYBOOK_VIDEO_PRICING_PATH', str(tmp_path / 'missing.yaml'))
+    pid = invoke('projects_create', {'title':'World', 'description':'A shared world', 'genre':'fairy', 'target_age':'all'})['project_id']
+    sid = invoke('series_create', {'project_id':pid, 'title':'Series', 'source_material':'', 'participant_ids':[], 'settings':{}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    (base / '97_shots').mkdir(exist_ok=True)
+    image = base / 'hero.png'
+    Image.new('RGB', (16, 16)).save(image)
+    item = dict(scene_number=1, shot_number=1, video_prompt='Run', duration_s=5,
+                reference_image_paths=[str(image)], video_path=str(base / 'video.mp4'))
+    store = _ProviderJobStore(str(base / '97_shots/provider_jobs.json'), provider_name='routerai')
+    cfg.set_run_budget_fallback(pid, 5)
+    monkeypatch.setattr(video_plan.requests, 'post', lambda *a, **k: pytest.fail('budget must block paid submission'))
+    with series_scope(pid, sid), pytest.raises(vb.BudgetExceededError):
+        video_plan.generate_reference_video(item, 'key', 'm', None, store,
+            {'m': {'supports_image_references': True, 'supported_durations': [5]}})
+    cfg.set_run_budget_fallback(pid, 0)

@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook import project_paths
 from custom_tools.storybook.studio import _blockout_state as S
 from custom_tools.storybook.studio import capabilities as caps
@@ -25,16 +27,17 @@ def env(tmp_path, monkeypatch):
     mod("shots")._CACHE.clear()
     fake_tools(monkeypatch)
     runs = FakeRuns(monkeypatch)
-    yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
+    with series_scope(PID, "main"):
+        yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
     mod("blockout").reset_caches()
 
 
 def digest_of(key="1-1"):
-    return caps.invoke("blockout_detail", {"project_id": PID, "shot_key": key})["digest"]
+    return caps.invoke("blockout_detail", {"project_id": PID, "series_id": "main", "shot_key": key})["digest"]
 
 
 def set_duration(seconds, digest=None, key="1-1"):
-    return caps.invoke("blockout_set_duration", {"project_id": PID, "shot_key": key, "seconds": seconds,
+    return caps.invoke("blockout_set_duration", {"project_id": PID, "series_id": "main", "shot_key": key, "seconds": seconds,
                                                  "base_digest": digest or digest_of(key)})
 
 
@@ -63,9 +66,9 @@ def test_set_duration_checks(env):
     assert set_duration(7)["error"]["code"] == "invalid_argument"
     assert set_duration(5, digest="stale")["error"]["code"] == "conflict"
     assert set_duration(5, key="9-9", digest="x")["error"]["code"] == "not_found"
-    bad = caps.invoke("blockout_set_duration", {"project_id": PID, "shot_key": "1-1", "seconds": True, "base_digest": "x"})
+    bad = caps.invoke("blockout_set_duration", {"project_id": PID, "series_id": "main", "shot_key": "1-1", "seconds": True, "base_digest": "x"})
     assert bad["error"]["code"] == "invalid_argument"
-    bad = caps.invoke("blockout_set_duration", {"project_id": PID, "shot_key": "1-1", "seconds": 5, "base_digest": ""})
+    bad = caps.invoke("blockout_set_duration", {"project_id": PID, "series_id": "main", "shot_key": "1-1", "seconds": 5, "base_digest": ""})
     assert bad["error"]["code"] == "invalid_argument"
     assert pair(env)["start"]["duration_s"] == 5
 
@@ -126,7 +129,7 @@ def test_set_duration_delegates_to_shots(env):
 # --- «оставить как есть» ---
 
 def leave(keys):
-    return caps.invoke("blockout_leave_as_is", {"project_id": PID, "shot_keys": keys})
+    return caps.invoke("blockout_leave_as_is", {"project_id": PID, "series_id": "main", "shot_keys": keys})
 
 
 def manifest_file(env, scene=1, shot=1):
@@ -147,7 +150,7 @@ def test_leave_as_is_writes_only_ack(env):
     before.pop("p10_acknowledged")
     assert after == before and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", stamp)
     assert manifest_file(env, 1, 2).read_bytes() == before_other
-    state = caps.invoke("blockout_state", {"project_id": PID})
+    state = caps.invoke("blockout_state", {"project_id": PID, "series_id": "main"})
     assert {r["key"]: r["p10"] for r in state["shots"]}["1-1"] is False
     again = leave(["1-1"])
     assert again["changed"] == [] and again["skipped"] == [{"key": "1-1", "reason": "already_acknowledged"}]
@@ -168,7 +171,6 @@ def test_leave_as_is_locked_while_project_busy(env):
         assert r["error"]["code"] == "locked"
     finally:
         project_paths.release_storybook_project_lock(other)
-        other.close()
     assert read_json(manifest_file(env))["p10_acknowledged"] is None
     assert leave(["1-1"])["changed"] == ["1-1"]  # замок после отказа не остался занятым
 
@@ -184,6 +186,5 @@ def test_leave_as_is_releases_lock_on_error(env):
     handle = project_paths.acquire_storybook_project_lock(PID)
     assert handle is not None  # замок снят
     project_paths.release_storybook_project_lock(handle)
-    handle.close()
     assert read_json(manifest_file(env))["p10_acknowledged"] is None
     assert not list(env.root.rglob("*.tmp"))

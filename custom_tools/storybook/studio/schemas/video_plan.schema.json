@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "План видео",
+  "type": "object",
+  "required": ["source_hash", "units", "decisions"],
+  "properties": {
+    "source_hash": {"title": "Отпечаток входа", "type": "string"},
+    "units": {"title": "Видеоклипы", "type": "array", "items": {"type": "object"}},
+    "decisions": {"title": "Способы генерации", "type": "array", "items": {"type": "object"}},
+    "shot_intervals": {
+      "title": "Время кадров и реплик",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["shot_key", "start_s", "end_s", "speaker_schedule"],
+        "properties": {
+          "shot_key": {"type": "string"},
+          "start_s": {"type": ["number", "null"], "minimum": 0},
+          "end_s": {"type": ["number", "null"], "minimum": 0},
+          "speaker_schedule": {"type": "array", "items": {"type": "object"}}
+        }
+      }
+    }
+  }
+}

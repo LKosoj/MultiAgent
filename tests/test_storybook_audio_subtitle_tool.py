@@ -1,218 +1,66 @@
 import json
-from pathlib import Path
 
-from custom_tools.storybook import audio_subtitle
 from custom_tools.storybook.audio_subtitle import storybook_audio_subtitle_tool
+from custom_tools.storybook.studio import series
 
 
-def _write_json(path: Path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+def _setup(tmp_path, monkeypatch, speech):
+    monkeypatch.setattr(series, 'series_dir', lambda p, s: tmp_path)
+    root = tmp_path / '98_audio'
+    root.mkdir(exist_ok=True)
+    (root / 'speech.json').write_text(json.dumps(speech, ensure_ascii=False))
+    return root
 
 
-def test_storybook_audio_subtitle_writes_srt_manifest_and_cue_sheet(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_audio"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_json(
-        base / "97_shots" / "shots.json",
-        {
-            "items": [
-                {
-                    "scene_number": 1,
-                    "shot_number": 1,
-                    "shot_type": "start",
-                    "timing": "00:00 - 00:03",
-                    "initial_state_summary": "fallback text",
-                },
-                {
-                    "scene_number": 1,
-                    "shot_number": 2,
-                    "shot_type": "start",
-                    "initial_state_summary": "fallback second",
-                },
-            ]
-        },
-    )
-    _write_json(
-        base / "91_screenplay" / "screenplay.json",
-        {
-            "screenplay": [
-                {
-                    "scene_number": 1,
-                    "action": "Scene action",
-                    "storyboard": [
-                        {"shot_number": 1, "description": "Первый титр"},
-                        {"shot_number": 2, "description": "Второй титр", "timing": "3s"},
-                    ],
-                }
-            ]
-        },
-    )
-
-    result = storybook_audio_subtitle_tool("sess", project_id, language="ru")
-
-    assert result["status"] == "success"
-    subtitles = base / "98_audio" / "subtitles.srt"
-    manifest = json.loads((base / "98_audio" / "audio_manifest.json").read_text(encoding="utf-8"))
-    cue_sheet = json.loads((base / "98_audio" / "cue_sheet.json").read_text(encoding="utf-8"))
-    srt_text = subtitles.read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:03,000" in srt_text
-    assert "00:00:03,000 --> 00:00:06,000" in srt_text
-    assert "Первый титр" in srt_text
-    assert "Второй титр" in srt_text
-    assert manifest["tts_status"] == "unavailable"
-    assert manifest["audio_tracks"] == []
-    assert cue_sheet["cue_count"] == 2
-
-
-def test_storybook_audio_subtitle_uses_shot_text_without_screenplay(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_no_screenplay"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_json(
-        base / "97_shots" / "shots.json",
-        {
-            "items": [
-                {
-                    "scene_number": 1,
-                    "shot_number": 1,
-                    "timing": {"start": 0, "end": 2.5},
-                    "subtitle": "Shot subtitle",
-                }
-            ]
-        },
-    )
-
-    result = storybook_audio_subtitle_tool("sess", project_id)
-
-    assert result["status"] == "success"
-    srt_text = (base / "98_audio" / "subtitles.srt").read_text(encoding="utf-8")
-    assert "00:00:00,000 --> 00:00:02,500" in srt_text
-    assert "Shot subtitle" in srt_text
-
-
-def test_storybook_audio_subtitle_rejects_project_id_path_traversal(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    result = storybook_audio_subtitle_tool("sess", "../outside")
-
-    assert result["status"] == "error"
-    assert "project_id must be a safe path segment" in result["message"]
-
-
-def _write_shots_without_cues(base: Path):
-    # Valid shots.json (so there is no read error) but nothing produces a cue:
-    # no timing and no text -> every item is skipped -> zero cues.
-    _write_json(base / "97_shots" / "shots.json", {"items": [{"scene_number": 1, "shot_number": 1}]})
-
-
-def test_storybook_audio_subtitle_errors_on_zero_cues(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_zero_cues"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_shots_without_cues(base)
-
-    result = storybook_audio_subtitle_tool("sess", project_id)
-
-    assert result["status"] == "error"
-    assert result["cue_count"] == 0
-    assert result["error"] == result["message"]
-
-
-def test_storybook_audio_subtitle_allow_missing_subtitles_returns_success(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_allow_missing"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_shots_without_cues(base)
-
-    result = storybook_audio_subtitle_tool("sess", project_id, allow_missing_subtitles=True)
-
-    assert result["status"] == "success"
-    assert result["cue_count"] == 0
-    assert "no_subtitle_cues" in result["warnings"]
-    cue_sheet = json.loads((base / "98_audio" / "cue_sheet.json").read_text(encoding="utf-8"))
-    assert cue_sheet["cue_count"] == 0
-    assert "no_subtitle_cues" in cue_sheet["warnings"]
-
-
-def test_storybook_audio_subtitle_error_result_has_required_output_keys(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-
-    result = storybook_audio_subtitle_tool("sess", "../outside")
-
-    assert result["status"] == "error"
-    for key in ("subtitles_path", "audio_manifest_path", "cue_sheet_path"):
-        assert key in result
-        assert result[key] == ""
-
-
-def test_storybook_audio_subtitle_writes_are_atomic(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_atomic"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_json(
-        base / "97_shots" / "shots.json",
-        {"items": [{"scene_number": 1, "shot_number": 1, "timing": "00:00 - 00:03", "subtitle": "Cue"}]},
-    )
-
-    replaced = []
-    real_replace = audio_subtitle.os.replace
-
-    def spy_replace(src, dst):
-        replaced.append(str(dst))
-        return real_replace(src, dst)
-
-    monkeypatch.setattr(audio_subtitle.os, "replace", spy_replace)
-
-    result = storybook_audio_subtitle_tool("sess", project_id)
-
-    assert result["status"] == "success"
-    assert any(dst.endswith("subtitles.srt") for dst in replaced)
-    assert any(dst.endswith("cue_sheet.json") for dst in replaced)
-    assert any(dst.endswith("audio_manifest.json") for dst in replaced)
-    assert list((base / "98_audio").glob(".*.tmp")) == []
-
-
-def test_storybook_audio_subtitle_cue_sheet_exposes_join_keys_for_montage(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    project_id = "proj_join_keys"
-    base = tmp_path / "plots" / "storybooks" / project_id
-    _write_json(
-        base / "97_shots" / "shots.json",
-        {
-            "items": [
-                {"scene_number": 1, "shot_number": 1, "timing": "00:00 - 00:03", "subtitle": "First"},
-                {"scene_number": 2, "shot_number": 1, "timing": {"start": 3, "end": 6}, "subtitle": "Second"},
-            ]
-        },
-    )
-
-    result = storybook_audio_subtitle_tool("sess", project_id)
-
-    assert result["status"] == "success"
-    cue_sheet = json.loads((base / "98_audio" / "cue_sheet.json").read_text(encoding="utf-8"))
-    assert cue_sheet["timeline"] == "planned"
-    assert cue_sheet["cue_count"] == 2
-    for cue in cue_sheet["cues"]:
-        for key in ("scene_number", "shot_number", "text", "text_source"):
-            assert key in cue
-
-def test_audio_subtitle_registers_supplied_narration(tmp_path, monkeypatch):
-    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
-    base = tmp_path / 'p'
-    _write_json(base / '97_shots/shots.json', {'items': [{'scene_number': 1, 'shot_number': 1, 'timing': '3s', 'narration': 'Supplied poem'}]})
-    source = tmp_path / 'reader.mp3'
-    source.write_bytes(b'original-reader-audio')
-    result = storybook_audio_subtitle_tool('s', 'p', narration_path=str(source))
+def test_measured_subtitles_and_speech_track(tmp_path, monkeypatch):
+    root = _setup(tmp_path, monkeypatch, {'status': 'success', 'duration': 4, 'audio_path': 'speech/a.wav', 'lines': [
+        {'id': 'a', 'scene_number': 1, 'shot_number': 2, 'text': 'Привет!', 'start': 1.25, 'end': 2.5}]})
+    (root / 'audio_manifest.json').write_text(json.dumps({'audio_tracks': [{'role':'music','path':'music.mp3'}]}))
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e')
     assert result['status'] == 'success'
-    manifest = json.loads((base / '98_audio/audio_manifest.json').read_text())
-    track = manifest['audio_tracks'][0]
-    assert track['role'] == 'narration'
-    assert Path(track['path']).read_bytes() == source.read_bytes()
-    assert manifest['narration_timing'] == 'manual_alignment_required'
+    assert '00:00:01,250 --> 00:00:02,500\nПривет!' in (root / 'subtitles.srt').read_text()
+    cues = json.loads((root / 'cue_sheet.json').read_text())
+    assert cues['timeline'] == 'measured' and cues['cues'][0]['shot_number'] == 2
+    tracks = json.loads((root / 'audio_manifest.json').read_text())['audio_tracks']
+    assert tracks[0]['path'] == 'speech/a.wav' and tracks[1]['role'] == 'music'
 
-def test_explicit_silent_shot_never_uses_visual_description_as_subtitle():
-    lookup = audio_subtitle._build_screenplay_lookup({'screenplay': [{'scene_number': 1, 'voiceover': 'Original poem', 'storyboard': [{'shot_number': 1, 'voiceover': '', 'description': 'The boy silently blocks the window'}]}]})
-    text, _ = audio_subtitle._resolve_cue_text({'scene_number': 1, 'shot_number': 1}, lookup)
-    assert text == ''
+
+def test_silent_series_is_valid_without_calls(tmp_path, monkeypatch):
+    root = _setup(tmp_path, monkeypatch, {'status':'silent', 'duration':0, 'audio_path':None, 'lines':[]})
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e')
+    assert result['status'] == 'success' and result['cue_count'] == 0
+    assert json.loads((root / 'audio_manifest.json').read_text())['audio_tracks'] == []
+
+
+def test_subtitles_can_be_disabled_without_removing_audio(tmp_path, monkeypatch):
+    root = _setup(tmp_path, monkeypatch, {'status':'success', 'duration':2, 'audio_path':'a.mp3', 'lines':[]})
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e', generate_subtitles=False)
+    assert result['status'] == 'success' and not (root / 'subtitles.srt').exists()
+    assert json.loads((root / 'audio_manifest.json').read_text())['audio_tracks'][0]['path'] == 'a.mp3'
+
+
+def test_missing_measured_speech_returns_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(series, 'series_dir', lambda p, s: tmp_path)
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e')
+    assert result['status'] == 'error' and result['audio_manifest_path']
+
+
+def test_invalid_series_cannot_escape_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    result = storybook_audio_subtitle_tool('s', '../outside', series_id='e')
+    assert result['status'] == 'error'
+
+
+def test_disabled_step_does_not_require_speech(tmp_path, monkeypatch):
+    monkeypatch.setattr(series, 'series_dir', lambda p, s: tmp_path)
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e', enable=False)
+    assert result['status'] == 'skipped' and not (tmp_path / '98_audio').exists()
+
+
+def test_stale_speech_error_includes_all_required_output_paths(tmp_path, monkeypatch):
+    root = _setup(tmp_path, monkeypatch, {'status': 'stale'})
+    result = storybook_audio_subtitle_tool('s', 'p', series_id='e')
+    assert result['status'] == 'error'
+    assert result['subtitles_path'] == str(root / 'subtitles.srt')
+    assert result['audio_manifest_path'] == str(root / 'audio_manifest.json')
+    assert result['cue_sheet_path'] == str(root / 'cue_sheet.json')

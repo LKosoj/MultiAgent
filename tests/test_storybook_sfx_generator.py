@@ -15,7 +15,9 @@ def _write(path, value):
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
-    monkeypatch.setattr(sfx, "_safe_project_dir", lambda project_id: tmp_path)
+    from custom_tools.storybook.studio import series
+    monkeypatch.setattr(series, "series_dir", lambda project_id, series_id: tmp_path)
+    _write(tmp_path / "98_audio/speech.json", {"status": "success", "lines": [{"id": "l1", "scene_number": 1, "start": 0}, {"id": "l2", "scene_number": 2, "start": 0}], "words": []})
     monkeypatch.setattr(sfx, "_load_env_file", lambda: None)
     monkeypatch.setenv("OPENAI_API_BASE_DB", "https://gateway.example/v1/")
     monkeypatch.setenv("OPENAI_API_KEY_DB", "gateway-key")
@@ -37,8 +39,8 @@ def test_generates_mp3_with_optional_duration_and_reuses_it(project, monkeypatch
         return SimpleNamespace(content=b"mp3-bytes", headers={"Content-Type": "audio/mpeg"}, raise_for_status=lambda: None)
 
     monkeypatch.setattr(sfx.requests, "post", post)
-    assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "success"
-    assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "success"
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "success"
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "success"
     assert len(calls) == 1
     url, options = calls[0]
     assert url == "https://gateway.example/v1/audio/speech"
@@ -71,7 +73,7 @@ def test_changed_description_regenerates_and_replaces_manifest_entry(project, mo
     monkeypatch.setattr(sfx, "_generate_mp3", generate)
     for prompt in ["wind", "birds"]:
         _write(project / "91_screenplay/screenplay.json", {"screenplay": [{"scene_number": 1, "sfx": {"prompt": prompt}}]})
-        assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "success"
+        assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "success"
     assert len(calls) == 2
     tracks = json.loads((project / "98_audio/audio_manifest.json").read_text())["audio_tracks"]
     assert len(tracks) == 1 and tracks[0]["prompt"] == "birds"
@@ -83,7 +85,7 @@ def test_invalid_audio_is_not_cached(project, monkeypatch, content, content_type
     monkeypatch.setattr(sfx.requests, "post", lambda *a, **kw: SimpleNamespace(
         content=content, headers={"Content-Type": content_type}, raise_for_status=lambda: None,
     ))
-    result = sfx.storybook_sfx_generator_tool("session", "project")
+    result = sfx.storybook_sfx_generator_tool("session", "project", series_id="series")
     assert result["status"] == "error"
     assert not list(project.rglob("*.mp3"))
     assert json.loads((project / "98_audio/audio_manifest.json").read_text())["sfx_status"] == "error"
@@ -92,7 +94,7 @@ def test_invalid_audio_is_not_cached(project, monkeypatch, content, content_type
 def test_silent_scene_does_not_call_model(project, monkeypatch):
     _write(project / "91_screenplay/screenplay.json", {"screenplay": [{"scene_number": 1, "sfx": None}]})
     monkeypatch.setattr(sfx.requests, "post", lambda *a, **kw: pytest.fail("Silent scenes must not generate audio"))
-    assert sfx.storybook_sfx_generator_tool("session", "project")["track_count"] == 0
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["track_count"] == 0
 
 
 @pytest.mark.parametrize("duration", [0, -1, "NaN"])
@@ -101,7 +103,7 @@ def test_invalid_duration_does_not_call_model(project, monkeypatch, duration):
         "scene_number": 1, "sfx": {"prompt": "wind", "duration": duration},
     }]})
     monkeypatch.setattr(sfx.requests, "post", lambda *a, **kw: pytest.fail("Invalid duration must not reach the provider"))
-    assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "error"
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "error"
 
 
 def test_retry_reuses_sfx_completed_before_failure(project, monkeypatch):
@@ -118,8 +120,8 @@ def test_retry_reuses_sfx_completed_before_failure(project, monkeypatch):
         path.write_bytes(b"mp3")
 
     monkeypatch.setattr(sfx, "_generate_mp3", generate)
-    assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "error"
-    assert sfx.storybook_sfx_generator_tool("session", "project")["status"] == "success"
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "error"
+    assert sfx.storybook_sfx_generator_tool("session", "project", series_id="series")["status"] == "success"
     assert calls == ["wind", "birds", "birds"]
 
 
@@ -149,7 +151,7 @@ def test_sfx_is_exported_on_separate_final_cut_lane(tmp_path, monkeypatch):
     assert asset.find("media-rep").get("src") == effect.as_uri()
 
 
-def test_montage_passes_sfx_only_to_xml(tmp_path, monkeypatch):
+def test_montage_passes_sfx_to_mp4_and_editable_xml(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     base = tmp_path / "plots/storybooks/project"
     video = base / "97_shots/video.mp4"
@@ -167,9 +169,12 @@ def test_montage_passes_sfx_only_to_xml(tmp_path, monkeypatch):
     monkeypatch.setattr(montage, "_write_fcpxml", lambda *args: exported.extend(args[3]))
     monkeypatch.setattr(montage, "_find_executable", lambda name: name)
     monkeypatch.setattr(montage, "_probe_media", lambda path: {
-        "format": {"format_name": "mp4", "duration": "4"}, "streams": [{"codec_type": "video"}],
+        "format": {"format_name": "mp4", "duration": "4"},
+        "streams": [{"codec_type": "video"}, {"codec_type": "audio", "start_time": "0", "duration": "4"}],
     })
-    monkeypatch.setattr(montage, "_run_command", lambda *a, **kw: {"returncode": 0, "stderr": ""})
+    monkeypatch.setattr(montage, "_run_command", lambda *a, **kw: {
+        "returncode": 0, "stderr": "mean_volume: -20.0 dB",
+    })
 
     def render(**kwargs):
         rendered.extend(kwargs["audio_tracks"])
@@ -179,5 +184,22 @@ def test_montage_passes_sfx_only_to_xml(tmp_path, monkeypatch):
     monkeypatch.setattr(montage, "_render_final_video", render)
     result = montage.montage_assembler_tool("session", "project")
     assert result["status"] == "success", result
-    assert rendered == []
+    assert len(rendered) == 1 and rendered[0]["role"] == "sfx"
     assert len(exported) == 1 and exported[0]["scene_number"] == 1
+
+
+def test_failed_sfx_step_preserves_all_existing_tracks(project, monkeypatch):
+    _write(project / '91_screenplay/screenplay.json', {'screenplay': []})
+    _write(project / '98_audio/speech.json', {'status': 'stale'})
+    tracks = [{'role': 'sfx', 'id': 'x', 'path': 'sfx/a.mp3', 'level': .2,
+               'offset_seconds': 3., 'enabled': False, 'edited': True},
+              {'role': 'music', 'path': 'music.mp3'}]
+    _write(project / '98_audio/audio_manifest.json', {'audio_tracks': tracks})
+    _write(project / '98_audio/sfx_manifest.json', {'audio_tracks': [tracks[0]]})
+    monkeypatch.setattr(sfx, '_generate_mp3', lambda *args: pytest.fail('must not generate'))
+    result = sfx.storybook_sfx_generator_tool('s', 'p', series_id='series')
+    manifest = json.loads((project / '98_audio/audio_manifest.json').read_text())
+    assert result['status'] == 'error'
+    assert manifest['audio_tracks'] == tracks
+    assert manifest['sfx_status'] == 'error'
+    assert json.loads((project / '98_audio/sfx_manifest.json').read_text())['audio_tracks'] == [tracks[0]]

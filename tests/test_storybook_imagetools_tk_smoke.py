@@ -198,9 +198,11 @@ def make_files_screen(root, projects, **kw):
     from StoryBookManager.gui.screens.files_screen import FilesScreen
 
     make_project(projects, **kw)
-    screen = FilesScreen(root, bridge_for(root))
+    bridge = bridge_for(root)
+    bridge.set_series(PID, "main")
+    screen = FilesScreen(root, bridge)
     screen.pack(fill="both", expand=True)
-    screen.load_project(SimpleNamespace(project_id=PID))
+    screen.load_project(SimpleNamespace(project_id=PID, series_id="main"))
     pump(root, 0.5)
     return screen
 
@@ -244,7 +246,7 @@ def test_illustrations_empty_and_search(root, projects):
     assert gallery.canvas.has_image and "Размеры: 8 × 6" in gallery.info.get()
     assert gallery.info.get().startswith("Файл: img_000.png")
     # пустая папка
-    for path in (projects / PID / "50_images").rglob("*.png"):
+    for path in (projects / PID / "series" / "main" / "50_images").rglob("*.png"):
         path.unlink()
     gallery.reload()
     pump(root, until=lambda: gallery.message.get() == IT["gallery_empty"])
@@ -264,7 +266,7 @@ def test_illustration_edit_end_to_end(root, projects, monkeypatch):
     gallery.tree.selection_set(first)
     pump(root, 0.3)
     assert str(gallery.edit_btn["state"]) == "normal"
-    before = (projects / PID / first).read_bytes()
+    before = (projects / PID / "series" / "main" / first).read_bytes()
     gallery.open_edit()
     dialog = next(w for w in gallery.winfo_children() if isinstance(w, tk.Toplevel))
     pump(root, until=lambda: dialog.preview is not None)
@@ -275,10 +277,10 @@ def test_illustration_edit_end_to_end(root, projects, monkeypatch):
     pump(root, until=lambda: not gallery.edit_ctl.is_running() and state["calls"] and gallery.state == "ready",
          timeout=30)
     pump(root, 0.5)
-    assert (projects / PID / first).read_bytes() != before
+    assert (projects / PID / "series" / "main" / first).read_bytes() != before
     assert state["calls"][0]["prompt"] == f"EN:{PROMPT}"
     assert gallery.status.get() == "" and "Размеры: 16 × 12" in gallery.info.get()
-    backups = list((projects / PID / ".studio" / "image_edit_backups").glob("*"))
+    backups = list((projects / PID / "series" / "main" / ".studio" / "image_edit_backups").glob("*"))
     assert len(backups) == 1
     gallery.reload()
     pump(root, until=lambda: gallery.state == "ready")
@@ -412,7 +414,7 @@ def test_gallery_shutdown_closes_edit_and_runner_and_project_change_reopens(root
     closed_runner = gallery.runner
     gallery.shutdown()
     assert gallery.edit_ctl.closed and closed_runner._closed
-    screen.load_project(SimpleNamespace(project_id=PID))   # смена проекта: старый опрос закрыт, новый готов
+    screen.load_project(SimpleNamespace(project_id=PID, series_id="main"))   # смена проекта: старый опрос закрыт, новый готов
     assert gallery.runner is not closed_runner and not gallery.runner._closed and not gallery.edit_ctl.closed
 
 

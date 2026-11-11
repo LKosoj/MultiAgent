@@ -121,7 +121,10 @@ def current_budget_rub(project_dir: Path, fallback_budget_rub: float = 0.0) -> f
         fallback = 0.0
     if fallback > 0:
         return fallback
-    return video_run_config.budget_fallback(project_dir.name)
+    from .project_paths import current_series_scope, safe_storybook_project_dir
+    scope = current_series_scope()
+    project_id = scope[0] if scope and safe_storybook_project_dir(scope[0]) == project_dir.resolve() else project_dir.name
+    return video_run_config.budget_fallback(project_id)
 
 
 def _money(value: float) -> str:

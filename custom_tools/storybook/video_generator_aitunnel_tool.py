@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import contextvars
 import threading
 import time
 from contextlib import nullcontext
@@ -220,6 +221,9 @@ def video_generator_aitunnel_tool(
         logger.warning("⚠️ Список items пуст")
         return _error_result("Список items пуст")
     if project_dir and enable:
+        from .video_plan import _load_speech_for_planning, _require_current_video_plan
+        speech = _load_speech_for_planning(project_id, project_dir)
+        _require_current_video_plan(project_id, project_dir, speech, items_list, shot_keys)
         from .continuity_review import require_continuity_acceptance
         require_continuity_acceptance(project_dir, 'images')
 
@@ -391,7 +395,7 @@ def video_generator_aitunnel_tool(
                 provider_name=_provider_name)
             future_to_item = {
                 executor.submit(
-                    generate_with_model_fallback,
+                    contextvars.copy_context().run, generate_with_model_fallback,
                     _generate_single_video_aitunnel,
                     item,
                     generation_params,

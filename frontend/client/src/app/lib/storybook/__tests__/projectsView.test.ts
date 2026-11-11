@@ -17,14 +17,8 @@ const card = (id: string, over: Partial<ProjectCard> = {}): ProjectCard => ({
   description: "",
   language: "ru",
   state: "ready",
-  stage: { id: "story", title: "Сюжет", index: 1, source: "artifacts" },
   busy: false,
-  pages_count: 4,
-  characters_count: 2,
-  has_pdf: false,
-  has_final_video: false,
-  cover: null,
-  created: "2026-10-01T10:00:00",
+  series_count: 4,
   modified: "2026-10-27T10:00:00",
   ...over,
 });
@@ -40,9 +34,9 @@ describe("filterProjects", () => {
 });
 
 describe("sortProjects", () => {
-  const a = card("a", { title: "Бобёр", modified: "2026-10-01T00:00:00", stage: { id: "x", title: "Книга", index: 2, source: "" } });
-  const b = card("b", { title: "Ёж", modified: "2026-10-20T00:00:00", stage: { id: "x", title: "Видео", index: 6, source: "" } });
-  const c = card("c", { title: "Аист", modified: "2026-10-10T00:00:00", stage: { id: "x", title: "Книга", index: 2, source: "" } });
+  const a = card("a", { title: "Бобёр", modified: "2026-10-01T00:00:00", series_count: 2 });
+  const b = card("b", { title: "Ёж", modified: "2026-10-20T00:00:00", series_count: 6 });
+  const c = card("c", { title: "Аист", modified: "2026-10-10T00:00:00", series_count: 2 });
   const list = [a, b, c];
 
   it("по изменению: новые первыми", () => {
@@ -51,8 +45,8 @@ describe("sortProjects", () => {
   it("по названию", () => {
     expect(sortProjects(list, "name").map((p) => p.project_id)).toEqual(["c", "a", "b"]);
   });
-  it("по этапу: дальше всех первыми, при равенстве по названию", () => {
-    expect(sortProjects(list, "stage").map((p) => p.project_id)).toEqual(["b", "c", "a"]);
+  it("по числу серий, при равенстве по названию", () => {
+    expect(sortProjects(list, "series").map((p) => p.project_id)).toEqual(["b", "c", "a"]);
   });
   it("по размеру: неизвестный в конце, порядок стабилен", () => {
     const sizes = new Map([["a", 10], ["b", 500]]);
@@ -76,7 +70,7 @@ describe("доступность действий", () => {
 
 describe("подписи карточки", () => {
   it("размер: тире, пока не посчитан", () => {
-    expect(cardSubtitle(card("x"))).toBe("Этап: Сюжет · 4 стр. · —");
+    expect(cardSubtitle(card("x"))).toBe("Серий: 4 · —");
     expect(cardSubtitle(card("x"), 8 * 1024 * 1024)).toContain("8.0");
     expect(cardModified(card("x"))).toBe("Изменён 27.10.2026");
   });

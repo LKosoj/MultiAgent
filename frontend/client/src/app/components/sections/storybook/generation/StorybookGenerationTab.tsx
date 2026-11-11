@@ -31,6 +31,7 @@ type Props = {
   client: StorybookClient;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  seriesId: string;
   intent: IntentLike;
   active: boolean;
   refreshTick: number;
@@ -50,9 +51,9 @@ const TABS: { id: Tab; text: "tab_settings" | "tab_summary" | "tab_progress" | "
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : []);
 
 // Экран «Генерация»: режим и настройки слева, ход прогона, шаги и журнал справа
-export function StorybookGenerationTab({ client, runUser, projectId, intent, active, refreshTick, isAdmin, say, onOpenBlockout }: Props) {
+export function StorybookGenerationTab({ client, runUser, projectId, seriesId, intent, active, refreshTick, isAdmin, say, onOpenBlockout }: Props) {
   const runApi = useRunStatus({ client, projectId, enabled: active });
-  const settings = useRunSettings({ client, runUser, projectId, enabled: active });
+  const settings = useRunSettings({ client, runUser, projectId, storageId: `${projectId}:${seriesId}`, enabled: active });
   // F5: статус прогона перечитываем всегда, настройки - только если форма не тронута
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
@@ -66,6 +67,7 @@ export function StorybookGenerationTab({ client, runUser, projectId, intent, act
     client,
     runUser,
     projectId,
+    storageId: `${projectId}:${seriesId}`,
     enabled: active,
     isAdmin,
     say,

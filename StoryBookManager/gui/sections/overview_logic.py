@@ -13,8 +13,8 @@ from typing import List, Optional, Tuple
 from StoryBookManager.gui.sections.projects_logic import format_bytes, format_datetime
 from StoryBookManager.gui.shell.run_status import TONE_BY_STATE, format_rub
 
-TXT_TITLE = "Обзор проекта"
-TXT_LOADING = "Загрузка состояния проекта…"
+TXT_TITLE = "Обзор серии"
+TXT_LOADING = "Загрузка состояния серии…"
 TXT_NO_PROJECT = "Сначала выберите проект"
 TXT_TO_PROJECTS = "К списку проектов"
 TXT_REFRESH = "Обновить"
@@ -34,13 +34,13 @@ TXT_WARNINGS = "Предупреждения по отчётам"
 TXT_NO_REPORTS = "Отчётов пока нет"
 TXT_LAST_RUN = "Последний прогон"
 TXT_NO_RUNS = "Прогонов пока не было"
-TXT_EMPTY = "Проект ещё не запускался. Настройте запуск и оцените стоимость."
+TXT_EMPTY = "Серия ещё не запускалась. Настройте запуск и оцените стоимость."
 TXT_GO_GENERATION = "Перейти в Генерацию"
 TXT_NO_STALE = "нет данных об устаревании"
 TXT_ASSUMED = "Часть суммы - по допущению (нет записанной валюты)"
 TXT_OTHER_CURRENCY = "+ в другой валюте"
 TXT_LOW_CONFIDENCE = "Восстановлено по косвенным признакам"
-TXT_GONE = "Проект не найден — возможно, его удалили"
+TXT_GONE = "Серия не найдена — возможно, её удалили"
 DASH = "—"
 
 RUN_RESULT = {
@@ -142,7 +142,7 @@ def loading_view() -> OverviewView:
 
 def error_text(error: Optional[dict]) -> str:
     reason = str((error or {}).get("message") or "ошибка").rstrip(".")
-    return f"Не удалось прочитать состояние проекта: {reason}."
+    return f"Не удалось прочитать состояние серии: {reason}."
 
 
 def with_error(previous: Optional[OverviewView], error: Optional[dict]) -> OverviewView:

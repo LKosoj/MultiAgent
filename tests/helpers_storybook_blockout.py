@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from custom_tools.storybook.studio import _blockout_state as S
+from tests.studio_run_fakes import make_series_project
 
 PID = "demo"
 PKG = "custom_tools.storybook.studio"
@@ -35,7 +36,7 @@ def shot_item(scene, shot, phase, duration=5, **extra):
         "scene_number": scene, "shot_number": shot, "shot_type": phase, "timing": "00:05",
         "english_prompt": f"prompt {phase} {scene}-{shot}", "negative_prompt": "neg",
         "video_prompt": "move" if phase == "start" else "",
-        "output_path": f"plots/storybooks/{PID}/97_shots/scene_{scene:02d}_shot_{shot:02d}/"
+        "output_path": f"plots/storybooks/{PID}/series/main/97_shots/scene_{scene:02d}_shot_{shot:02d}/"
                        f"img_final_{phase}_{scene:02d}_{shot:02d}.png",
         "image_path": None, "reference_image_paths": [], "width": 64, "height": 64, "seed": 1,
     }
@@ -59,7 +60,7 @@ def manifest_for(chain_id, **over):
 
 def build_project(root: Path, *, manifests=True, brief=None, built=True, shots=True) -> Path:
     """Проект-образец. Все манифесты свежие, картинок кадров нет (P10 выключен)."""
-    root.mkdir(parents=True, exist_ok=True)
+    root = make_series_project(root.parent, root.name)
     items = []
     if shots:
         for chain_id, (scene, numbers) in LAYOUT.items():

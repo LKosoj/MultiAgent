@@ -27,6 +27,8 @@ from typing import Any
 
 import yaml
 
+from custom_tools.storybook.project_paths import storybook_projects_root
+
 from .capabilities import capability
 from .errors import StudioError, success
 from .labels import step_title
@@ -55,15 +57,15 @@ STAGES: tuple[tuple[str, str, tuple[str, ...]], ...] = (
     ("story", "Сюжет", ("brief_from_prompt", "init_project", "story_planner", "bible_builder",
                         "style_keeper", "story_writer", "story_editor", "prompt_engineer")),
     ("book", "Книга", ("items_builder", "artist_batch", "assemble_md", "md_to_pdf")),
-    ("screenplay", "Сценарий и кадры", ("screenplay_generator", "storybook_continuity_plan",
-                                        "screenplay_shots_generator", "shots_prompt_qa")),
+    ("screenplay", "Сценарий, речь и кадры", ("screenplay_generator", "storybook_continuity_plan",
+                                              "storybook_speech", "screenplay_shots_generator", "shots_prompt_qa")),
     ("blockout", "Болванка", ("blockout_scene_builder", "blockout_renderer", "blockout_preview")),
     ("images", "Картинки", ("character_reference_states", "storybook_video_plan",
                             "background_reference_plan", "background_references",
                             "artist_batch_shots", "storybook_continuity_images_review")),
     ("video", "Видео", ("storybook_video_preflight", "storybook_video_delivery_promise",
                         "video_generator", "storybook_continuity_videos_review")),
-    ("sound", "Звук", ("storybook_audio_subtitle", "music_planner", "storybook_music_generator",
+    ("sound", "Музыка и субтитры", ("storybook_audio_subtitle", "music_planner", "storybook_music_generator",
                        "storybook_sfx_generator")),
     ("montage", "Монтаж", ("storybook_photo_montage", "montage_assembler",
                            "storybook_video_decision_log")),
@@ -90,12 +92,13 @@ STEP_MARKERS: dict[str, tuple[str, ...]] = {
     "story_writer": ("20_story/story.json",),
     "story_editor": ("20_story/story.json",),
     "prompt_engineer": ("40_prompts",),
-    "items_builder": ("40_prompts",),
+    "items_builder": ("50_items/items.json",),
     "artist_batch": ("50_images",),
     "assemble_md": ("90_md/book.md",),
     "md_to_pdf": ("95_pdf/book.pdf",),
     "screenplay_generator": ("91_screenplay/screenplay.json",),
     "storybook_continuity_plan": ("20_bible/continuity_plan.json",),
+    "storybook_speech": ("98_audio/speech.json",),
     "screenplay_shots_generator": ("97_shots/shots.json",),
     "shots_prompt_qa": ("97_shots/shots.json",),
     "blockout_scene_builder": ("93_blockout/chains.json", "93_blockout/scene_spec.json",
@@ -116,7 +119,7 @@ STEP_MARKERS: dict[str, tuple[str, ...]] = {
                                  "98_audio/cue_sheet.json"),
     "music_planner": ("98_audio/music_plan.json",),
     "storybook_music_generator": ("98_audio/audio_manifest.json", "98_audio/music_manifest.json"),
-    "storybook_sfx_generator": ("98_audio/sfx_manifest.json",),
+    "storybook_sfx_generator": ("98_audio/sfx_manifest.json", "98_audio/audio_manifest.json"),
     "storybook_photo_montage": ("99_final/photo_video.mp4",),
     "montage_assembler": ("99_final/final_video.mp4", "99_final/timeline.fcpxml",
                           "99_final/subtitles.srt", "99_final/manifest.json",
@@ -1098,6 +1101,16 @@ def _project_runs(conn: sqlite3.Connection, project_id: str, step_ids: list[str]
         incomplete = True
         if extend_budget is not None:
             extend_budget()  # остальное чтение (шаги найденных прогонов) получает свежий бюджет
+    from custom_tools.storybook.project_paths import current_series_scope
+    scope = current_series_scope()
+    if scope and scope[0] == project_id:
+        for wid, stamp in list(found.items()):
+            row = conn.execute(
+                "SELECT CASE WHEN json_valid(context) THEN json_extract(context, '$.variables.project_id') END, "
+                "CASE WHEN json_valid(context) THEN json_extract(context, '$.variables.series_id') END "
+                "FROM workflow_checkpoints WHERE workflow_id = ? AND timestamp = ?", (wid, stamp)).fetchone()
+            if not row or tuple(row) != (project_id, scope[1]):
+                found.pop(wid)
     ordered = sorted(found.items(), key=lambda kv: kv[1], reverse=True)[:_DB_MAX_RUNS]
 
     runs = []
@@ -1170,7 +1183,8 @@ def _summarize_runs(runs: list[dict], incomplete: bool = False) -> dict:
 def _read_runs_db(project_id: str, step_ids: list[str], flag_names: list[str],
                   locked: bool, allow_connect: bool = True, projects_dir: Path | None = None) -> dict:
     path = _db_path()
-    key = (str(path.resolve()) if path.exists() else str(path), project_id)
+    from custom_tools.storybook.project_paths import current_series_scope
+    key = (str(path.resolve()) if path.exists() else str(path), project_id, current_series_scope())
     ttl = _DB_TTL_ACTIVE_SEC if locked else _DB_TTL_IDLE_SEC
     with _LOCK:
         hit = _DB_CACHE.get(key)
@@ -1760,11 +1774,11 @@ def _collect(project_id: str, root: Path, surface: str, refresh: bool, full: boo
     control = _read_studio_json(control_path) if control_exists else {}
 
     cached_db = _read_runs_db(project_id, step_ids, flag_names, locked, allow_connect=False,
-                                projects_dir=root.parent)
+                                projects_dir=storybook_projects_root())
     cached_latest = cached_db.get("latest") if cached_db.get("available") else None
     unfinished = bool(cached_latest and cached_latest["status"] in ("running", "paused"))
     read_db = full or locked or unfinished or control_exists
-    db = _read_runs_db(project_id, step_ids, flag_names, locked, projects_dir=root.parent) if read_db else cached_db
+    db = _read_runs_db(project_id, step_ids, flag_names, locked, projects_dir=storybook_projects_root()) if read_db else cached_db
 
     hooks, hook_errors = _hooks_data(project_id, locked) if full else ({
         "warnings": None, "stale_keys": None, "stale_count": None, "review": None,

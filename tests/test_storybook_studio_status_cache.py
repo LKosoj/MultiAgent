@@ -12,6 +12,7 @@ import time
 import pytest
 
 from custom_tools.storybook.studio import capabilities as caps
+from custom_tools.storybook.project_paths import series_scope
 from tests._storybook_status_fixture import (  # noqa: F401
     PROJECT_ID, _fresh_status_cache, status, hold_lock, make_db, make_env, make_final, make_provider_jobs,
     make_shots, write_run_file,
@@ -28,11 +29,12 @@ def project(tmp_path, monkeypatch):
     make_final(project)
     for step in ("story_planner", "init_project", "artist_batch_shots"):
         write_run_file(project, step)
-    return project
+    with series_scope(PROJECT_ID, "main"):
+        yield project
 
 
 def call(name="project_status", **kw):
-    return caps.invoke(name, {"project_id": PROJECT_ID, **kw})
+    return caps.invoke(name, {"project_id": PROJECT_ID, "series_id": "main", **kw})
 
 
 def count(monkeypatch, name):

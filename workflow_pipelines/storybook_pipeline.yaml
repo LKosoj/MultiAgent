@@ -8,6 +8,7 @@ pipeline:
 inputs:
   task: 'Книга о храбром коте-рыцаре в сияющих доспехах, который защищает своё королевство от злого волшебника. Дружелюбная сказка с приключениями для детей 6-8 лет. Главные герои: кот-рыцарь и принцесса. Антогонисты: злой волшебник.'
   project_id: storybook_project
+  series_id: ''
   pages_min: 1
   pages_max: 2
   words_per_page_min: 200
@@ -32,7 +33,6 @@ inputs:
   generate_music: true
   generate_sfx: true
   generate_subtitles: true
-  narration_path: ''
   video_provider: ''       # '' = настройка проекта (run_settings.json) / STORYBOOK_VIDEO_PROVIDER / routerai
   budget_rub: 0            # денежный бюджет на платную отправку видео; 0 = без ограничения
   style_profile: ''        # '' = как в окружении (STORYBOOK_STYLE_PROFILE / default)
@@ -220,6 +220,28 @@ steps:
     enable: '{generate_screenplay}'
   depends_on:
   - screenplay_generator
+- id: storybook_speech
+  step_type: tool
+  task: Generate and retain original speech and measured word and line timing for the series
+  timeout: 86400
+  metadata:
+    retryable: false
+    output_artifacts:
+    - 98_audio/speech.json
+  tool_name: storybook_speech_tool
+  output_schema: json_object
+  output_schema_requirements:
+    required:
+    - status
+    - speech_path
+  tool_params:
+    session_id: '{session_id}'
+    project_id: '{project_id}'
+    series_id: '{series_id}'
+    language: '{language}'
+    enable: '{generate_screenplay}'
+  depends_on:
+  - screenplay_generator
 - id: screenplay_shots_generator
   step_type: tool
   task: Generate shots JSON for storyboard frames
@@ -237,6 +259,7 @@ steps:
     #enable: false
   depends_on:
   - storybook_continuity_plan
+  - storybook_speech
 - id: shots_prompt_qa
   step_type: tool
   task: LLM validate+repair shots prompts vs screenplay BEFORE generating shot images
@@ -516,8 +539,8 @@ steps:
   tool_params:
     session_id: '{session_id}'
     project_id: '{project_id}'
+    series_id: '{series_id}'
     language: '{language}'
-    narration_path: '{narration_path}'
     generate_subtitles: '{generate_subtitles}'
     enable: '{generate_screenplay}'
   depends_on:
@@ -586,6 +609,7 @@ steps:
   tool_params:
     session_id: '{session_id}'
     project_id: '{project_id}'
+    series_id: '{series_id}'
     language: '{language}'
     enable: '{generate_sfx}'
   depends_on:

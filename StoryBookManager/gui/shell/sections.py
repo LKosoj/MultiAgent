@@ -17,6 +17,7 @@ class Section:
 
 SECTIONS = (
     Section("projects", 1, "Проекты", False),
+    Section("series", 9, "Проект и серии", False),
     Section("overview", 2, "Обзор", True, NEED_PROJECT_HINT),
     Section("shots", 3, "Кадры", True, NEED_PROJECT_HINT),
     Section("generation", 4, "Генерация", True, NEED_PROJECT_HINT),

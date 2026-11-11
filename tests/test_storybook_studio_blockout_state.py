@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import _blockout_state as S
 from custom_tools.storybook.studio import capabilities as caps
 from custom_tools.storybook.studio.errors import StudioError
@@ -22,12 +24,13 @@ def env(tmp_path, monkeypatch):
     mod("blockout").reset_caches()
     fake_tools(monkeypatch)
     runs = FakeRuns(monkeypatch)
-    yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
+    with series_scope(PID, "main"):
+        yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
     mod("blockout").reset_caches()
 
 
 def state():
-    result = caps.invoke("blockout_state", {"project_id": PID})
+    result = caps.invoke("blockout_state", {"project_id": PID, "series_id": "main"})
     assert result["status"] == "success", result
     return result
 
@@ -119,11 +122,11 @@ def test_broken_json_is_warning(env, rel):
 
 def test_empty_states(env, tmp_path):
     build_project(tmp_path / "bare", built=False)
-    assert caps.invoke("blockout_state", {"project_id": "bare"})["empty_reason"] == "not_built"
+    assert caps.invoke("blockout_state", {"project_id": "bare", "series_id": "main"})["empty_reason"] == "not_built"
     build_project(tmp_path / "noshots", shots=False, built=False)
-    r = caps.invoke("blockout_state", {"project_id": "noshots"})
+    r = caps.invoke("blockout_state", {"project_id": "noshots", "series_id": "main"})
     assert r["empty_reason"] == "no_shots" and r["shots"] == []
-    assert caps.invoke("blockout_state", {"project_id": "nope"})["error"]["code"] == "not_found"
+    assert caps.invoke("blockout_state", {"project_id": "nope", "series_id": "main"})["error"]["code"] == "not_found"
 
 
 def test_duration_sources(env):
@@ -248,7 +251,7 @@ def test_settings_hook_is_used_by_run_plan(env):
 # --- подробности ---
 
 def detail(**payload):
-    return caps.invoke("blockout_detail", {"project_id": PID, **payload})
+    return caps.invoke("blockout_detail", {"project_id": PID, "series_id": "main", **payload})
 
 
 def test_detail_shot(env):
@@ -354,7 +357,7 @@ def test_chains_json_wrong_shape_is_skipped_with_warning(env):
 def test_parse_key_rejects_non_ascii_digits(env):
     assert S.parse_key("²-1") is None and S.parse_key("١-1") is None
     assert S.parse_key("2-3") == (2, 3) and S.parse_key("02-03") == (2, 3)
-    r = caps.invoke("blockout_detail", {"project_id": PID, "shot_key": "²-1"})
+    r = caps.invoke("blockout_detail", {"project_id": PID, "series_id": "main", "shot_key": "²-1"})
     assert r["error"]["code"] == "invalid_argument"
 
 

@@ -95,7 +95,7 @@ class FakeEngine:
 
 
 def make_plan(project_id, steps, mode="from_step", **extra):
-    plan = {"version": 1, "mode": mode, "project_id": project_id, "pipeline_hash": "", "steps_to_run": list(steps),
+    plan = {"version": 1, "mode": mode, "project_id": project_id, "series_id": "main", "pipeline_hash": "", "steps_to_run": list(steps),
             "skip_steps": [], "gated_off": [], "start_step": steps[0] if steps else None,
             "source_workflow_id": None, "workflow_id": f"sbm_partial_{project_id}_abcdef12", "inputs": {},
             "input_sources": {}, "step_params": {}, "scope": {"shot_keys": [], "kinds": []},
@@ -103,3 +103,15 @@ def make_plan(project_id, steps, mode="from_step", **extra):
             "estimate": None}
     plan.update(extra)
     return plan
+
+
+def make_series_project(root, project_id="demo"):
+    """Создать проект и пустую серию для проверок Studio."""
+    project = root / project_id
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "project.json").write_text(json.dumps({"format": "storybook-series-v1", "project_id": project_id, "title": project_id, "resources": {}}), encoding="utf-8")
+    (project / "shared").mkdir(exist_ok=True)
+    series = project / "series" / "main"
+    series.mkdir(parents=True, exist_ok=True)
+    (series / "series.json").write_text(json.dumps({"series_id": "main", "title": "Main", "snapshot": {}}), encoding="utf-8")
+    return series

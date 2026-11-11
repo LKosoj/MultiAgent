@@ -1,27 +1,14 @@
 // Обёртки возможностей модуля projects (проекты storybook).
 import { StudioError, type StorybookClient } from "./client";
 
-export type ProjectStage = {
-  id: string; // brief ... film, либо empty
-  title: string;
-  index: number; // 0 - пусто, 1..11 - этапы по порядку
-  source: string; // "artifacts": грубая оценка по файлам
-};
-
 export type ProjectCard = {
   project_id: string;
   title: string;
   description: string;
   language: string;
   state: "ready" | "creating" | "empty";
-  stage: ProjectStage;
-  busy: boolean; // идёт прогон
-  pages_count: number;
-  characters_count: number;
-  has_pdf: boolean;
-  has_final_video: boolean;
-  cover: string | null; // путь внутри проекта для c.thumbUrl()
-  created: string; // ISO, локальное время
+  series_count: number;
+  busy: boolean;
   modified: string;
 };
 
@@ -33,13 +20,10 @@ export type ProjectsListResult = {
 };
 
 export type ProjectDetails = {
-  genre: string;
-  target_age: string;
-  description_full: string;
-  main_characters: string[];
-  pages_min: number | null;
-  pages_max: number | null;
-  shots_total: number | null;
+  title: string;
+  description: string;
+  language: string;
+  resources?: Record<string, Record<string, string>>;
 };
 
 export type ProjectsGetResult = { project: ProjectCard; details: ProjectDetails };

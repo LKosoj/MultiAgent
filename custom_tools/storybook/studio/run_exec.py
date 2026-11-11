@@ -100,6 +100,12 @@ class RunSession:
         self.log: Optional[run_logs.RunLog] = None
         self.step_log: Optional[StepRunLog] = None
         self._artifacts: dict[str, list[str]] = {}
+        self._stale_prepared: dict[str, list[str]] = {}
+        self._stale_completed: set[str] = set()
+        self._stale_archived_paths: set[str] = set()
+        self._stale_inplace: dict[str, dict[str, tuple[int, int]]] = {}
+        self._stale_inputs_ok: dict[str, bool] = {}
+        self._series_revision = None
 
     # ---- начало и конец
     def begin(self) -> None:
@@ -107,6 +113,9 @@ class RunSession:
         self.step_log = StepRunLog(self.root, self.run_id, self.workflow_id)
         self.log = run_logs.RunLog(self.root, self.run_id)
         self._artifacts = run_plan.step_output_artifacts()
+        from .series import _read
+        series = _read(self.root / "series.json")
+        self._series_revision = {key: copy.deepcopy(series.get(key)) for key in ("source_material", "participant_ids", "settings", "snapshot", "input_revision", "sound_revision")}
         self._archive_overwritten()
         now = time.time()
         run_control.write_active(self.root, {
@@ -165,8 +174,256 @@ class RunSession:
         self._touch(**self._progress_fields(f"Шаг '{step.id}' выполняется"))
         self._notify(message=f"Шаг '{step.id}' выполняется", step_id=step.id, step_status="running")
 
+    def _prepare_stale_step(self, step_id: str) -> None:
+        markers = self.plan.get("stale_steps", {}).get(step_id, [])
+        if not markers:
+            return
+        from . import artifacts
+        from .series import _read
+        from .project_store import write_json_atomic
+        series_path = self.root / "series.json"
+        series = _read(series_path)
+        confirmations = series.setdefault("stale_confirmations", {})
+        try:
+            self._stale_inputs_ok[step_id] = self._stale_inputs_ready(step_id, markers, series)
+        except Exception as exc:
+            logger.warning("Не удалось проверить актуальность входов шага %s: %s", step_id, exc)
+            self._stale_inputs_ok[step_id] = False
+        outputs, pipeline_steps = run_plan._active_outputs(self.root, self.plan.get("inputs"))
+        for marker in markers:
+            revision = {key: value for key, value in (self._series_revision or {}).items()
+                        if key != "sound_revision" or marker.startswith("99_final") or marker.startswith("98_audio/previews")}
+            entry = confirmations.get(marker)
+            if not isinstance(entry, dict) or entry.get("revision") != revision:
+                entry = {"revision": revision, "steps": [], "requirements": []}
+                confirmations[marker] = entry
+            entry["steps"] = [step for step in entry.get("steps", [])
+                              if step != step_id and step_id not in run_plan.step_ancestors(step, pipeline_steps)]
+            entry["requirements"] = list(dict.fromkeys(entry.get("requirements", []) + self.plan.get("stale_requirements", {}).get(marker, [])))
+            expected = entry.setdefault("expected", {}).setdefault(step_id, [])
+            for rel in outputs.get(step_id, []):
+                if (self.root / rel).is_file() and run_plan._overlaps(marker, rel) and rel not in expected:
+                    expected.append(rel)
+        write_json_atomic(series_path, series)
+        prepared = []
+        inplace = {}
+        if step_id == "artist_batch" and "50_images" in markers:
+            import json
+            from .image_edit import _backup_illustration
+            images = (self.root / "50_images").resolve()
+            try:
+                items = json.loads((self.root / "50_items/items.json").read_text(encoding="utf-8"))
+                targets = [(Path(item["output_path"]) if Path(item["output_path"]).is_absolute()
+                            else self.root / item["output_path"]).resolve()
+                           for item in items.get("items", []) if item.get("output_path")]
+            except (OSError, ValueError, TypeError, KeyError):
+                targets = [path.resolve() for path in images.rglob("*") if path.is_file()]
+            for path in dict.fromkeys(targets):
+                if not path.is_relative_to(images) or not path.is_file():
+                    continue
+                _backup_illustration(self.plan["project_id"], path)
+                rel = path.relative_to(self.root).as_posix()
+                entry = confirmations["50_images"]
+                expected = entry.setdefault("expected", {}).setdefault(step_id, [])
+                if rel not in expected:
+                    expected.append(rel)
+                write_json_atomic(series_path, series)
+                path.unlink()
+                self._stale_archived_paths.add(rel)
+                prepared.append(rel)
+        if step_id == "storybook_sfx_generator":
+            rel = "98_audio/sfx_manifest.json"
+            path = self.root / rel
+            if path.is_file() and any(rel == marker or rel.startswith(marker + "/") for marker in markers):
+                artifacts._snapshot(self.plan["project_id"], "sfx_manifest", path.read_bytes(), "external")
+                stat = path.stat()
+                inplace[rel] = (stat.st_mtime_ns, stat.st_size)
+                prepared.append(rel)
+        if step_id == "bible_builder":
+            for key in ("characters", "locations"):
+                spec = artifacts.ARTIFACTS[key]
+                rel = spec.path
+                path = self.root / rel
+                if (any(rel == marker or rel.startswith(marker + "/") for marker in markers)
+                        and path.is_file() and rel not in self._stale_archived_paths):
+                    artifacts._snapshot(self.plan["project_id"], key, path.read_bytes(), "external")
+                    path.unlink()
+                    self._stale_archived_paths.add(rel)
+                    prepared.append(rel)
+            if prepared:
+                (self.root / "20_bible/.shared_generation_complete").unlink(missing_ok=True)
+                from .series import materialize_snapshot
+                materialize_snapshot(self.plan["project_id"], self.plan["series_id"])
+        for spec in artifacts.ARTIFACTS.values():
+            if step_id not in spec.writers or spec.key in ("brief", "characters", "locations"):
+                continue
+            rel = spec.path
+            if not any(rel == marker or rel.startswith(marker + "/") for marker in markers):
+                continue
+            path = self.root / rel
+            if step_id == "style_keeper" and (self._series_revision or {}).get("snapshot", {}).get("style"):
+                if path.is_file():
+                    prepared.append(rel)
+                continue
+            if rel in self._stale_archived_paths:
+                if path.is_file():
+                    stat = path.stat()
+                    inplace[rel] = (stat.st_mtime_ns, stat.st_size)
+                prepared.append(rel)
+            elif path.is_file():
+                artifacts._snapshot(self.plan["project_id"], spec.key, path.read_bytes(), "external")
+                # Эти шаги меняют существующий вход, а не создают его с нуля.
+                if step_id not in ("shots_prompt_qa", "story_editor", "video_generator", "artist_batch_shots",
+                                   "storybook_sfx_generator", "storybook_music_generator", "storybook_audio_subtitle"):
+                    path.unlink()
+                else:
+                    stat = path.stat()
+                    inplace[rel] = (stat.st_mtime_ns, stat.st_size)
+                self._stale_archived_paths.add(rel)
+                prepared.append(rel)
+        # Для остальных JSON-выходов использовать ту же историю артефактов.
+        active_outputs, _ = run_plan._active_outputs(self.root, self.plan.get("inputs"))
+        registered = {spec.path for spec in artifacts.ARTIFACTS.values()}
+        for rel in active_outputs.get(step_id, []):
+            path = self.root / rel
+            if (rel in registered or rel == "98_audio/speech.json" or rel.startswith("99_final/")
+                    or not rel.endswith(".json") or not path.is_file()
+                    or not any(rel == marker or rel.startswith(marker + "/") for marker in markers)):
+                continue
+            if rel not in self._stale_archived_paths:
+                artifacts._snapshot(self.plan["project_id"], rel.replace("/", "_"), path.read_bytes(), "external")
+                self._stale_archived_paths.add(rel)
+            stat = path.stat()
+            inplace[rel] = (stat.st_mtime_ns, stat.st_size)
+            prepared.append(rel)
+        if step_id in ("montage_assembler", "storybook_photo_montage"):
+            from . import shot_versions
+            targets = [rel for rel in self._artifacts.get(step_id, [])
+                       if rel.startswith("99_final/") and (self.root / rel).is_file()
+                       and rel not in self._stale_archived_paths]
+            op = shot_versions.plan_area_op(self.plan["project_id"], "99_final", targets,
+                                            reason="film", run_id=self.run_id, dedupe=False)
+            if op:
+                shot_versions.apply_op(self.plan["project_id"], op)
+                for rel in targets:
+                    (self.root / rel).unlink()
+                    self._stale_archived_paths.add(rel)
+                    prepared.append(rel)
+        for marker in markers:
+            entry = confirmations.get(marker, {})
+            for rel in entry.get("expected", {}).get(step_id, []):
+                if rel not in prepared and not (self.root / rel).exists():
+                    prepared.append(rel)
+        self._stale_prepared[step_id] = prepared
+        self._stale_inplace[step_id] = inplace
+
+    def _stale_inputs_ready(self, step_id: str, own_markers: list[str], series: dict) -> bool:
+        outputs, steps = run_plan._active_outputs(self.root, self.plan.get("inputs"))
+        ancestors = run_plan.step_ancestors(step_id, steps)
+        info = run_plan.stale_results_for_plan(self.plan["project_id"], sorted(ancestors), inputs=self.plan.get("inputs"))
+        own_outputs = outputs.get(step_id) or run_plan.step_output_artifacts().get(step_id, [])
+        confirmations = series.get("stale_confirmations", {})
+        for marker in info["affected_results"]:
+            need = [step for step in info["stale_requirements"].get(marker, []) if step in ancestors]
+            upstream_paths = [rel for ancestor in need for rel in outputs.get(ancestor, [])
+                              if run_plan._overlaps(marker, rel) and (self.root / rel).exists()]
+            # Несозданный чужой выход и общий файл редактора не делают
+            # собственную отметку зависимостью самой от себя.
+            if marker in own_markers and (not need or (upstream_paths and all(rel in own_outputs for rel in upstream_paths))):
+                continue
+            revision = {key: value for key, value in (self._series_revision or {}).items()
+                        if key != "sound_revision" or marker.startswith("99_final") or marker.startswith("98_audio/previews")}
+            entry = confirmations.get(marker, {})
+            if (not need or entry.get("revision") != revision
+                    or not all(step in entry.get("steps", []) for step in need)):
+                return False
+        return True
+
+    def _complete_stale_step(self, step_id: str, status: str) -> None:
+        prepared = self._stale_prepared.get(step_id, [])
+        if step_id == "storybook_speech" and status == "completed":
+            import json
+            try:
+                speech = json.loads((self.root / "98_audio/speech.json").read_text(encoding="utf-8"))
+                if speech.get("status") in ("success", "silent"):
+                    prepared = ["98_audio/speech.json"]
+            except (OSError, ValueError):
+                pass
+        if status != "completed" or not prepared or not all((self.root / rel).is_file() for rel in prepared):
+            return
+        for rel, previous in self._stale_inplace.get(step_id, {}).items():
+            stat = (self.root / rel).stat()
+            if (stat.st_mtime_ns, stat.st_size) == previous:
+                return
+        self._stale_completed.add(step_id)
+        from .series import _read
+        from .project_store import write_json_atomic
+        path = self.root / "series.json"
+        series = _read(path)
+        if any(series.get(key) != value for key, value in (self._series_revision or {}).items()
+               if key != "sound_revision" or step_id == "montage_assembler"):
+            if step_id == "storybook_speech":
+                speech_path = self.root / "98_audio/speech.json"
+                try:
+                    speech = json.loads(speech_path.read_text(encoding="utf-8"))
+                    speech["status"] = "stale"
+                    write_json_atomic(speech_path, speech)
+                except (OSError, ValueError):
+                    pass
+            return
+        if not self._stale_inputs_ok.get(step_id, False):
+            return
+        confirmations = series.setdefault("stale_confirmations", {})
+        for marker in self.plan.get("stale_steps", {}).get(step_id, []):
+            revision = {key: value for key, value in (self._series_revision or {}).items()
+                        if key != "sound_revision" or marker.startswith("99_final") or marker.startswith("98_audio/previews")}
+            entry = confirmations.get(marker)
+            if not isinstance(entry, dict) or entry.get("revision") != revision:
+                entry = {"revision": revision, "steps": []}
+                confirmations[marker] = entry
+            if step_id not in entry["steps"]:
+                entry["steps"].append(step_id)
+        write_json_atomic(path, series)
+
+    def _finalize_stale(self) -> None:
+        from .series import _read
+        from .project_store import write_json_atomic
+        path = self.root / "series.json"
+        series = _read(path)
+        confirmations = series.get("stale_confirmations", {})
+        requirements = self.plan.get("stale_requirements", {})
+        stale = list(series.get("stale_results", []))
+        for marker in list(stale):
+            if marker.startswith("99_final"):
+                continue
+            revision = {key: value for key, value in (self._series_revision or {}).items()
+                        if key != "sound_revision" or marker.startswith("98_audio/previews")}
+            entry = confirmations.get(marker, {})
+            if (all(series.get(key) == value for key, value in revision.items())
+                    and entry.get("revision") == revision and requirements.get(marker)
+                    and all(step in entry.get("steps", []) for step in requirements[marker])):
+                stale.remove(marker)
+                confirmations.pop(marker, None)
+        series["stale_results"] = stale
+        write_json_atomic(path, series)
+        for marker in list(stale):
+            if not marker.startswith("99_final"):
+                continue
+            entry = confirmations.get(marker, {})
+            if (all(series.get(key) == value for key, value in (self._series_revision or {}).items())
+                    and entry.get("revision") == (self._series_revision or {}) and requirements.get(marker)
+                    and all(step in entry.get("steps", []) for step in requirements[marker])):
+                if run_plan.stale_upstream_for_step(self.plan["project_id"], "montage_assembler", inputs=self.plan.get("inputs")):
+                    confirmations.pop(marker, None)
+                else:
+                    stale.remove(marker)
+                    confirmations.pop(marker, None)
+        series["stale_results"] = stale
+        write_json_atomic(path, series)
+
     def step_finished(self, step, result) -> None:
         status = _status_str(result) or "completed"
+        self._complete_stale_step(step.id, status)
         if step.id in self.running:
             self.running.remove(step.id)
         self.finished.add(step.id)
@@ -293,6 +550,8 @@ class RunSession:
         else:
             state, outcome = "failed", "failed"
             message = str(getattr(result, "error", None) or f"Прогон завершился со статусом {status}")
+        if state == "completed":
+            self._finalize_stale()
         fields = self._progress_fields(message)
         fields.update(running=[], step_id=None)
         if state == "completed":
@@ -360,6 +619,7 @@ def _install_hooks(engine) -> None:
             from workflow.models import StepResult, StepStatus
             return StepResult(step_id=step.id, status=getattr(StepStatus, "SKIPPED", StepStatus.PENDING),
                               error="Прогон остановлен")
+        session._prepare_stale_step(step.id)
         _safe(session.step_started, step, context)
         try:
             result = await original_start(*args, **kwargs)
@@ -471,6 +731,7 @@ def _build_context(engine, plan: dict, prepared: dict):
     if plan["mode"] == "single_step":
         metadata["single_step_rerun"] = plan.get("start_step")
     variables["project_id"] = project_id
+    variables["series_id"] = plan["series_id"]
     return WorkflowContext(workflow_id=plan["workflow_id"], session_id=project_id, variables=variables,
                            step_outputs=outputs, metadata=metadata)
 
@@ -489,7 +750,7 @@ def _env(values: dict):
                 os.environ[key] = old
 
 
-async def execute_plan_raw(engine, plan: dict, *, run_id: Optional[str] = None, surface: str = "react",
+async def _execute_plan_raw(engine, plan: dict, *, run_id: Optional[str] = None, surface: str = "react",
                            launcher: str = "backend", progress_callback: Optional[Callable] = None,
                            lock_held: bool = False, poll_s: Optional[float] = None,
                            heartbeat_s: Optional[float] = None):
@@ -514,6 +775,8 @@ async def execute_plan_raw(engine, plan: dict, *, run_id: Optional[str] = None, 
     error: BaseException | None = None
     monitor_task = None
     try:
+        from .series import materialize_snapshot
+        materialize_snapshot(project_id, plan["series_id"])
         session.begin()
         prepared = _prepare(plan, project_id, surface)
         if prepared.get("regen_id"):
@@ -550,6 +813,11 @@ async def execute_plan_raw(engine, plan: dict, *, run_id: Optional[str] = None, 
                     session.log.close()
                 if handle is not None:
                     run_control.release_lock(handle)
+
+
+async def execute_plan_raw(engine, plan: dict, **kwargs):
+    with project_paths.series_scope(plan["project_id"], plan["series_id"]):
+        return await _execute_plan_raw(engine, plan, **kwargs)
 
 
 def _finish(plan: dict, project_id: str, prepared: dict, since_ts: float, outcome: str) -> None:

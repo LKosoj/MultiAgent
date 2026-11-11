@@ -1,3 +1,4 @@
+from tests.studio_run_fakes import make_series_project
 import sys
 
 import pytest
@@ -66,11 +67,12 @@ def test_invoke_argument_checks_and_results(isolated, tmp_path, monkeypatch):
     def denied():
         raise PermissionError("нет прав")
 
-    ok = caps.invoke("needs_project", {"project_id": " demo ", "__request_id": "r1"})
-    assert ok == {"status": "success", "pid": "demo", "n": 0}
-    assert caps.invoke("needs_project", {"project_id": "../x"})["error"]["code"] == "invalid_argument"
+    make_series_project(tmp_path)
+    ok = caps.invoke("needs_project", {"project_id": " demo ", "series_id": "main", "__request_id": "r1"})
+    assert ok == {"status": "success", "pid": "demo", "project_id": "demo", "series_id": "main", "n": 0}
+    assert caps.invoke("needs_project", {"project_id": "../x", "series_id": "main"})["error"]["code"] == "invalid_argument"
     assert caps.invoke("needs_project", {})["error"]["code"] == "invalid_argument"
-    assert caps.invoke("needs_project", {"project_id": "a", "zzz": 1})["error"]["code"] == "invalid_argument"
+    assert caps.invoke("needs_project", {"project_id": "a", "series_id": "main", "zzz": 1})["error"]["code"] == "invalid_argument"
     assert caps.invoke("nope")["error"]["code"] == "unknown_capability"
     assert caps.invoke("not_dict")["error"]["code"] == "invalid_result"
     internal = caps.invoke("boom")

@@ -548,3 +548,21 @@ def test_mm_does_not_log_signed_download_url(tmp_path, monkeypatch, caplog):
     text = "\n".join(record.getMessage() for record in caplog.records)
     assert "token=SECRET" not in text
     assert "cdn.example.com" in text
+
+
+def test_mm_series_reference_plan_stops_before_submission(tmp_path, monkeypatch):
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title':'World', 'description':'A shared world', 'genre':'fairy', 'target_age':'all'})['project_id']
+    sid = invoke('series_create', {'project_id':pid, 'title':'Series', 'source_material':'', 'participant_ids':[], 'settings':{}})['series_id']
+    shots = tmp_path / pid / 'series' / sid / '97_shots'
+    shots.mkdir(exist_ok=True)
+    item = _make_item(shots, 1)
+    (shots / 'shots.json').write_text(json.dumps({'items':[item]}))
+    (shots / 'video_plan.json').write_text(json.dumps({'units':[dict(shot_keys=['1-1'], duration_s=6,
+        video_path=item['video_path'], video_prompt='speak', reference_image_paths=['ref.png'], resolution='480p')]}))
+    monkeypatch.setattr(mm_module.requests, 'request', lambda *a, **k: (_ for _ in ()).throw(AssertionError('paid request')))
+    with series_scope(pid, sid):
+        result = mm_module.video_generator_mm_tool('s', pid, enable=True)
+    assert result['status'] == 'error' and 'референсы' in result['message']

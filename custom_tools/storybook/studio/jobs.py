@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -66,12 +67,17 @@ def start_job(root: Path, kind: str, project_id: str | None,
         "progress": {"current": 0, "total": 0, "message": "В очереди"},
         "pid": os.getpid(), "created_at": stamp, "updated_at": stamp,
     }
+    from custom_tools.storybook.project_paths import current_series_scope
+    scope = current_series_scope()
+    if scope and scope[0] == project_id:
+        record["series_id"] = scope[1]
+    context = contextvars.copy_context()
     # сначала _active, потом файл: иначе read_job между ними увидит «running» без живого потока
     with _active_lock:
         _active.add(job_id)
     try:
         _write(root, record)
-        threading.Thread(target=_run, args=(Path(root), record, func), name=f"studio-job-{job_id[:6]}",
+        threading.Thread(target=context.run, args=(_run, Path(root), record, func), name=f"studio-job-{job_id[:6]}",
                          daemon=True).start()
     except BaseException:
         with _active_lock:

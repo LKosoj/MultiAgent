@@ -21,7 +21,6 @@ import { Banner } from "./Banner";
 import { BackupsDialog } from "./BackupsDialog";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { CreateByFormDialog } from "./CreateByFormDialog";
-import { CreateFromPromptDialog } from "./CreateFromPromptDialog";
 import { NoAccess } from "./NoAccess";
 import { ProjectCard } from "./ProjectCard";
 import { focusedCardId, gridBaseId } from "../../../lib/storybook/gridFocus";
@@ -30,10 +29,9 @@ import { RenameDialog } from "./RenameDialog";
 import { Skeleton } from "./Skeleton";
 
 // Команда от горячих клавиш: номер нужен, чтобы повторная команда срабатывала снова
-export type ProjectsCommand = { type: "create_prompt" | "focus_search"; n: number } | null;
+export type ProjectsCommand = { type: "create_project" | "focus_search"; n: number } | null;
 
 type Dialog =
-  | { kind: "prompt" }
   | { kind: "form" }
   | { kind: "rename"; id: string }
   | { kind: "backups"; id: string | null }
@@ -79,7 +77,7 @@ export function StorybookProjectsTab({
   useEffect(() => {
     if (!command || command.n === handled.current) return;
     handled.current = command.n;
-    if (command.type === "create_prompt") setDialog({ kind: "prompt" });
+    if (command.type === "create_project") setDialog({ kind: "form" });
     else searchRef.current?.focus();
   }, [command]);
 
@@ -154,10 +152,7 @@ export function StorybookProjectsTab({
       <div className="sb-row" style={{ justifyContent: "space-between" }}>
         <h2 className="sb-title">{T.projectsTitle}</h2>
         <div className="sb-row">
-          <button type="button" className="button" onClick={() => setDialog({ kind: "prompt" })} title="Alt+N">
-            {T.createFromPrompt}
-          </button>
-          <button type="button" className="button secondary" onClick={() => setDialog({ kind: "form" })}>
+          <button type="button" className="button" onClick={() => setDialog({ kind: "form" })} title="Alt+N">
             {T.createByForm}
           </button>
           <button type="button" className="button ghost" onClick={refreshAll} title="F5">
@@ -233,8 +228,8 @@ export function StorybookProjectsTab({
             {projects.projects.length === 0 ? (
               <div className="sb-empty">
                 <p>{T.emptyProjects}</p>
-                <button type="button" className="button" onClick={() => setDialog({ kind: "prompt" })}>
-                  {T.createFromPrompt}
+                <button type="button" className="button" onClick={() => setDialog({ kind: "form" })}>
+                  {T.createByForm}
                 </button>
               </div>
             ) : visible.length === 0 ? (
@@ -281,13 +276,6 @@ export function StorybookProjectsTab({
         </div>
       )}
 
-      {dialog?.kind === "prompt" ? (
-        <CreateFromPromptDialog
-          progress={"create_from_prompt" in actions.active ? actions.active.create_from_prompt || "" : null}
-          onSubmit={actions.createFromPrompt}
-          onClose={() => setDialog(null)}
-        />
-      ) : null}
       {dialog?.kind === "form" ? (
         <CreateByFormDialog onSubmit={actions.createByForm} suggestId={actions.suggestId} onClose={() => setDialog(null)} />
       ) : null}

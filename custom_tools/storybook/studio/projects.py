@@ -132,52 +132,7 @@ def _prompt_hint(prompt: str) -> str:
 def projects_create_from_prompt(*, prompt: str, id_hint: str = "", language: str = "ru", pages_min: int = 9,
                                 pages_max: int = 12, words_per_page_min: int = 400,
                                 words_per_page_max: int = 450) -> dict:
-    if not isinstance(prompt, str) or not 10 <= len(prompt.strip()) <= 8000:
-        raise StudioError("invalid_argument", "Поле «Промпт» должно содержать от 10 до 8000 символов")
-    prompt = prompt.strip()
-    if language not in ("ru", "en"):
-        raise StudioError("invalid_argument", "Поле «Язык» должно быть «ru» или «en»")
-    numbers = project_store.validate_new_project(
-        title="--", description="-" * 10, genre="-", target_age="-", language=language, pages_min=pages_min,
-        pages_max=pages_max, words_per_page_min=words_per_page_min, words_per_page_max=words_per_page_max,
-    )
-    root = _root()
-    hint = id_hint if isinstance(id_hint, str) and id_hint.strip() else _prompt_hint(prompt)
-    project_id = project_store.suggest_project_id(hint, root, reserve=True)
-
-    def work(progress) -> dict:
-        project_dir = root / project_id
-        progress(0, 2, "Языковая модель составляет бриф")
-        try:
-            from custom_tools.storybook.brief_from_prompt import brief_from_prompt_tool
-            from custom_tools.storybook.project_init import project_init_tool
-
-            brief = brief_from_prompt_tool(
-                "studio_create", project_id, prompt, numbers["pages_min"], numbers["pages_max"],
-                numbers["words_per_page_min"], numbers["words_per_page_max"], numbers["language"],
-            )
-        except Exception as exc:
-            logger.warning("projects_create_from_prompt: бриф не получен: %s", exc)
-            _drop_if_empty(project_dir)
-            raise StudioError("unavailable", "Не удалось связаться с моделью. Проверьте ключи и повторите.") from exc
-        progress(1, 2, "Создание папок проекта")
-        try:
-            project_init_tool("studio_create", project_id, brief)
-        except Exception as exc:
-            logger.warning("projects_create_from_prompt: проект не создан: %s", exc)
-            _drop_if_empty(project_dir)
-            raise StudioError("internal", "Не удалось создать проект") from exc
-        project_store.invalidate_size_cache()
-        card = _card(project_dir)
-        progress(2, 2, "Готово")
-        return {"project_id": project_id, "title": card["title"], "project": card}
-
-    try:
-        job_id = jobs.start_job(root, KIND_CREATE, project_id, work)
-    except BaseException:
-        _drop_if_empty(root / project_id)
-        raise
-    return success(project_id=project_id, job_id=job_id)
+    raise StudioError("unsupported", "Создайте проект и добавьте материал при создании серии")
 
 
 def _drop_if_empty(project_dir: Path) -> None:
@@ -257,7 +212,7 @@ def projects_backup_create(project_id: str, *, note: str = "") -> dict:
     return success(job_id=jobs.start_job(root, "backup", project_id, work), consistent=consistent)
 
 
-@capability("projects_backup_restore", title="Восстановить проект из бэкапа", access="write")
+@capability("projects_backup_restore", title="Восстановить проект из бэкапа", access="write", project_scoped=False)
 def projects_backup_restore(project_id: str, *, backup_id: str, confirm: bool = False) -> dict:
     _require_confirm(confirm)
     root, backup_dir, limit = _root(), _backup_dir(), _max_backups()
@@ -290,3 +245,14 @@ def projects_export(project_id: str) -> dict:
 @capability("projects_job_status", title="Состояние фонового задания", access="read", project_scoped=False)
 def projects_job_status(*, job_id: str) -> dict:
     return success(**jobs.read_job(_root(), job_id))
+
+
+@capability("projects_update", title="Изменить проект", access="write")
+def projects_update(project_id: str, title: str, description: str, language: str, defaults: dict) -> dict:
+    if not isinstance(title, str) or not title.strip() or not isinstance(description, str) or not isinstance(language, str) or not isinstance(defaults, dict):
+        raise StudioError("invalid_argument", "Проверьте данные проекта")
+    path = _existing(project_id) / "project.json"
+    data = project_store._read_json(path)
+    data.update(title=title.strip(), description=description, language=language, defaults=defaults)
+    project_store.write_json_atomic(path, data)
+    return success(project_id=project_id, project=data)

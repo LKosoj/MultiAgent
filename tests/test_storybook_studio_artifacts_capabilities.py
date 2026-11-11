@@ -2,6 +2,8 @@
 
 import inspect
 
+from tests.studio_run_fakes import make_series_project
+
 from custom_tools.storybook.studio import capabilities as caps
 
 EXPECTED = {
@@ -29,9 +31,9 @@ def test_seven_capabilities_with_access():
 
 def test_invoke_rejects_extra_and_missing_arguments(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
-    extra = caps.invoke("artifact_read", {"project_id": "demo", "key": "brief", "force": True})
+    make_series_project(tmp_path)
+    extra = caps.invoke("artifact_read", {"project_id": "demo", "series_id": "main", "key": "brief", "force": True})
     assert extra["error"]["code"] == "invalid_argument" and "force" in extra["error"]["message"]
     # base_digest обязателен: null надо передавать явно
-    missing = caps.invoke("artifact_save", {"project_id": "demo", "key": "brief", "content": {}})
+    missing = caps.invoke("artifact_save", {"project_id": "demo", "series_id": "main", "key": "brief", "content": {}})
     assert missing["error"]["code"] == "invalid_argument" and "base_digest" in missing["error"]["message"]

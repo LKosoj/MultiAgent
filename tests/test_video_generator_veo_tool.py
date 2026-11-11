@@ -595,3 +595,21 @@ def test_veo_polling_times_out_after_deadline(tmp_path, monkeypatch, caplog):
     assert result["stats"] == {"total": 1, "successful": 0, "failed": 1}
     assert "время ожидания" in result["results"][0]["error"]
     assert "Veo started" in caplog.text
+
+
+def test_veo_series_reference_plan_stops_before_submission(tmp_path, monkeypatch):
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title':'World', 'description':'A shared world', 'genre':'fairy', 'target_age':'all'})['project_id']
+    sid = invoke('series_create', {'project_id':pid, 'title':'Series', 'source_material':'', 'participant_ids':[], 'settings':{}})['series_id']
+    shots = tmp_path / pid / 'series' / sid / '97_shots'
+    shots.mkdir(exist_ok=True)
+    item = dict(scene_number=1, shot_number=1, shot_type='start', timing='00:06', video_prompt='Speak', video_path=str(shots / 'video.mp4'))
+    (shots / 'shots.json').write_text(json.dumps({'items':[item]}))
+    (shots / 'video_plan.json').write_text(json.dumps({'units':[dict(shot_keys=['1-1'], duration_s=6,
+        video_path=item['video_path'], video_prompt='speak', reference_image_paths=['ref.png'], resolution='480p')]}))
+    monkeypatch.setattr(veo_module.genai, 'Client', lambda *a, **k: (_ for _ in ()).throw(AssertionError('paid request')))
+    with series_scope(pid, sid):
+        result = veo_module.video_generator_veo_tool('s', pid, enable=True)
+    assert result['status'] == 'error' and 'референсы' in result['message']

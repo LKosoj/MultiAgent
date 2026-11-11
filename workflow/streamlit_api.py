@@ -1116,6 +1116,7 @@ class WorkflowManager:
             reserved_workflow_name
         )
         project_lock = None
+        storybook_series_context = None
         with _GLOBAL_WORKFLOW_RUNS_LOCK:
             preexisting_run = self.active_runs.get(run_id)
             if (
@@ -1166,13 +1167,15 @@ class WorkflowManager:
                     f"Loaded workflow does not match reservation for run_id {run_id}"
                 )
             if workflow_def.name == "storybook_pipeline":
-                from custom_tools.storybook.project_paths import acquire_storybook_project_lock
+                from custom_tools.storybook.project_paths import acquire_storybook_project_lock, series_scope
 
-                project_id = (
-                    parameters["project_id"]
-                    if "project_id" in parameters
-                    else workflow_def.inputs.get("project_id")
-                )
+                from custom_tools.storybook.project_paths import require_safe_storybook_project_id
+                project_id = require_safe_storybook_project_id(parameters.get("project_id"))
+                studio_plan = parameters.get("studio_plan") or {}
+                series_id = parameters.get("series_id") or studio_plan.get("series_id")
+                scope = series_scope(project_id, series_id)
+                scope.__enter__()
+                storybook_series_context = scope
                 if parameters.get("studio_plan"):
                     # пробы статуса берут замок на миг: пара повторов вместо ложного «занят»
                     from custom_tools.storybook.studio.run_control import acquire_lock_with_retries
@@ -1181,6 +1184,8 @@ class WorkflowManager:
                     project_lock = acquire_storybook_project_lock(project_id)
                 if project_lock is None:
                     raise WorkflowExecutionError("Storybook project is already running")
+                from custom_tools.storybook.studio.series import materialize_snapshot
+                materialize_snapshot(project_id, series_id)
 
             # Инициализируем статус выполнения и пишем метаданные в одном блоке под локом
             with _GLOBAL_WORKFLOW_RUNS_LOCK:
@@ -1614,7 +1619,11 @@ class WorkflowManager:
         finally:
             from custom_tools.storybook.project_paths import release_storybook_project_lock
 
-            release_storybook_project_lock(project_lock)
+            try:
+                release_storybook_project_lock(project_lock)
+            finally:
+                if storybook_series_context is not None:
+                    storybook_series_context.__exit__(None, None, None)
 
     def _notify_progress(self, run_id: str, event_type: str, data: Dict[str, Any]):
         """Уведомление о прогрессе выполнения workflow"""

@@ -1,4 +1,5 @@
 """Visual continuity acceptance using the existing labeled-image QA renderer."""
+import contextvars
 import json
 import math
 import subprocess
@@ -34,6 +35,29 @@ def _file_hash(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _character_masters(base, frames):
+    from .background_references import _reference_path
+    masters = {}
+    for item in frames:
+        for character in item.get('characters') or []:
+            if character.get('reference_image_path'):
+                path = str(_reference_path(base, character['reference_image_path']))
+                masters[path] = character.get('name') or 'character'
+        for name, state in (item.get('character_reference_states') or {}).items():
+            if state.get('reference_image_path'):
+                path = str(_reference_path(base, state['reference_image_path']))
+                masters[path] = name
+    return masters
+
+
+def _project_id(base):
+    from .project_paths import current_series_scope
+    scope = current_series_scope()
+    if scope and safe_storybook_project_dir(scope[0]) == Path(base).resolve():
+        return scope[0]
+    return Path(base).name
+
+
 def _tasks(base, kind):
     plan = validate_current_continuity(base)
     if not plan:
@@ -46,7 +70,7 @@ def _tasks(base, kind):
     directions = {(item['scene_number'], item['shot_number']): item.get('video_prompt')
                   for item in items if item.get('shot_type', 'start') == 'start'}
     from .video_plan import select_image_items
-    render_items = bind_continuity_to_items(base, select_image_items(base.name, source))
+    render_items = bind_continuity_to_items(base, select_image_items(_project_id(base), source))
     if kind == 'images':
         selected = [item for item in render_items if item['_continuity'].get(item.get('shot_type', 'start'))]
         selected.sort(key=lambda i: (i['scene_number'], i['shot_number'], i.get('shot_type') != 'start'))
@@ -54,7 +78,7 @@ def _tasks(base, kind):
     else:
         from .video_plan import apply_video_plan
         starts = [item for item in items if item.get('shot_type', 'start') == 'start']
-        groups = [[item] for item in apply_video_plan(base.name, starts)
+        groups = [[item] for item in apply_video_plan(_project_id(base), starts)
                   if unit_continuity_hash(base, item.get('covered_shot_keys') or [f"{item['scene_number']}-{item['shot_number']}"])]
     tasks = []
     for group in groups:
@@ -86,7 +110,8 @@ def _tasks(base, kind):
                 contexts[-1]['time_s'] = offsets[f"{item['scene_number']}-{item['shot_number']}"][phase != 'start']
         masters = {entity['reference_path'] for item in frames for context in item['_continuity'].values()
                    for entity in context.get('entities', []) if entity.get('reference_path')}
-        hashes = {path: _file_hash(path) for path in set(media) | anchors | masters}
+        character_masters = _character_masters(base, frames)
+        hashes = {path: _file_hash(path) for path in set(media) | anchors | masters | set(character_masters)}
         events = []
         if offsets:
             events = sorted({offsets[f'{scene}-{shot}'][phase == 'end']
@@ -97,6 +122,8 @@ def _tasks(base, kind):
         signature_parts = [_REVIEW_VERSION, kind, contexts, hashes,
                            [item.get('video_prompt') for item in group] if kind == 'videos' else
                            [item.get('english_prompt') for item in group]]
+        if character_masters:
+            signature_parts.append('character_identity_v1')
         if events:
             signature_parts.append(events)
         if kind == 'videos':
@@ -105,7 +132,7 @@ def _tasks(base, kind):
         tasks.append({'id': '|'.join(sorted(keys)), 'input_hash': signature, 'group': group, 'kind': kind,
                       'state_hash': unit_continuity_hash(base, sorted(keys)),
                       'frames': frames, 'media': media, 'anchors': sorted(anchors),
-                      'masters': sorted(masters), 'contexts': contexts,
+                      'masters': sorted(masters), 'character_base': str(base), 'contexts': contexts,
                       **({'events': events, 'planned_duration': cursor} if kind == 'videos' else {})})
     return tasks
 
@@ -165,6 +192,9 @@ def _audit(task, pictures, chunk_number):
     master_images = [{'scene_number': 'LANDMARK', 'shot_number': master_roles.get(path, n),
                       'shot_type': 'object construction only', 'output_path': path}
                      for n, path in enumerate(task['masters'], 1)]
+    character_images = [{'scene_number': 'CHARACTER', 'shot_number': name,
+                         'shot_type': 'character identity and appearance reference', 'output_path': path}
+                        for path, name in _character_masters(Path(task['character_base']), task['frames']).items()] if task.get('character_base') else []
     request = {'prompt': json.dumps({'kind': task['kind'], 'expected_frames': task['contexts'], 'chunk': chunk_number,
                            'prior_findings': [dict(index=index, finding=finding)
                                               for index, finding in enumerate(task.get('prior_findings', []))],
@@ -174,7 +204,7 @@ def _audit(task, pictures, chunk_number):
                                'final_sample_time_s': task.get('final_sample_time_s')}
                               if task['kind'] == 'videos' else {})}, ensure_ascii=False)}
     content = [{'type': 'text', 'text': request['prompt']}]
-    for picture in master_images + pictures:
+    for picture in master_images + character_images + pictures:
         if not Path(picture['output_path']).is_file():
             continue
         with Image.open(picture['output_path']) as source:
@@ -190,7 +220,7 @@ def _audit(task, pictures, chunk_number):
         model=model_ultimate, max_tokens=32768, temperature=0.1, response_format={'type': 'json_object'},
         **request,
         system_prompt=(
-            'Inspect actual labeled pixels against their own phase and the shared object identities. '
+            'Inspect actual labeled pixels against their own phase and the shared object identities. Compare character identity with the labeled CHARACTER references; the current scene determines clothing changes and framing. '
             'source_shot describes the whole source action; registered continuity defines physical START/END states. '
             'Re-evaluate every prior finding against current source_shot, registered continuity and pixels. '
             'Prior findings marked source=video are hypotheses from a generated clip, not observations of this source image; '
@@ -327,7 +357,7 @@ def _repair_media(base, tasks, kind, session_id):
                         fully_localized = False
             affected.update(task['id'].split('|') if not located or any(v['uncertain'] for v in verdicts) else located)
         shots = json.loads((base / '97_shots/shots.json').read_text())
-        frames = select_image_items(base.name, shots['items'])
+        frames = select_image_items(_project_id(base), shots['items'])
         while True:
             changed = {str(Path(item['output_path']).resolve()) for item in frames
                        if f"{item['scene_number']}-{item['shot_number']}" in affected}
@@ -380,14 +410,14 @@ def _repair_media(base, tasks, kind, session_id):
                 for item in task['group']:
                     if f"{item['scene_number']}-{item['shot_number']}" in affected:
                         Path(item['output_path']).with_suffix('.continuity.json').unlink(missing_ok=True)
-            shots_prompt_qa_tool(session_id=session_id, project_id=base.name, shot_keys=keys,
+            shots_prompt_qa_tool(session_id=session_id, project_id=_project_id(base), shot_keys=keys,
                                  enable=True, force=True, global_max_repairs=0)
             shots = json.loads((base / '97_shots/shots.json').read_text())
-            selected = [item for item in select_image_items(base.name, shots['items'])
+            selected = [item for item in select_image_items(_project_id(base), shots['items'])
                         if f"{item['scene_number']}-{item['shot_number']}" in keys]
             incoming = dict(shots, items=selected, scope_shot_keys=keys)
-            planned = storybook_background_plan_tool(session_id, base.name, incoming, language=language)
-            rendered = storybook_background_references_tool(session_id, base.name, planned, language=language)
+            planned = storybook_background_plan_tool(session_id, _project_id(base), incoming, language=language)
+            rendered = storybook_background_references_tool(session_id, _project_id(base), planned, language=language)
         locked_by_frame = {}
         for item in rendered['items']:
             frame_key = f"{item['scene_number']}:{item['shot_number']}:{item.get('shot_type', 'start')}"
@@ -505,7 +535,7 @@ def _repair_media(base, tasks, kind, session_id):
     _write(shots_path, shots)
     if plan_path.is_file():
         _write(plan_path, plan)
-    generate(session_id=session_id, project_id=base.name, shot_keys=generation_keys, enable=True,
+    generate(session_id=session_id, project_id=_project_id(base), shot_keys=generation_keys, enable=True,
              max_concurrency=4, seed=shots.get('seed'), language=language, skip_prompt_enhancement=True)
 
 
@@ -647,7 +677,7 @@ def _review(session_id, project_id, kind, enable, repair=True, review_findings=N
                                     'verdicts': verdicts, 'session_id': session_id}
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        for signature, record in executor.map(inspect, tasks):
+        for signature, record in (future.result() for future in [executor.submit(contextvars.copy_context().run, inspect, task) for task in tasks]):
             report['tasks'][signature] = record
             _write(path, report)
     if kind == 'images':

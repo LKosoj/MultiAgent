@@ -26,13 +26,17 @@ INVENTORY_LIMIT = 2000
 LIST_WIDTH = 280
 
 
-def resolve_abs(project_id: Optional[str], rel: str) -> Optional[str]:
+def resolve_abs(project_id: Optional[str], rel: str, series_id=None) -> Optional[str]:
     """Полный путь файла проекта; None, если путь не из проекта."""
     if not project_id or not rel:
         return None
     try:
         from custom_tools.storybook.studio.paths import resolve_in_project
 
+        if series_id:
+            from custom_tools.storybook.project_paths import series_scope
+            with series_scope(project_id, series_id):
+                return str(resolve_in_project(project_id, rel))
         return str(resolve_in_project(project_id, rel))
     except Exception:
         return None
@@ -187,7 +191,7 @@ class GalleryView(ttk.Frame):
     def _show_current(self) -> None:
         item = self.by_path.get(self.current or "")
         if item:
-            self.canvas.load(resolve_abs(self.get_project_id(), item["path"]), TK_ONLY["image_load_failed"])
+            self.canvas.load(resolve_abs(self.get_project_id(), item["path"], self.bridge._scope[1]), TK_ONLY["image_load_failed"])
         else:
             self.canvas.load(None, TK_ONLY["gallery_pick"])
         self._show_info()
@@ -227,7 +231,7 @@ class GalleryView(ttk.Frame):
             notify.warning(IT["edit_not_supported"])
             return
         target = {"path": item["path"], "name": item["name"], "shot_key": "", "part": ""}
-        ImageEditDialog(self, self.edit_ctl, target, resolve_abs(self.get_project_id(), item["path"]),
+        ImageEditDialog(self, self.edit_ctl, target, resolve_abs(self.get_project_id(), item["path"], self.bridge._scope[1]),
                         on_done=self._edit_done, on_status=self._edit_status)
         self._sync_edit()
 

@@ -12,6 +12,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities as caps
 
 PID = "demo"
@@ -30,7 +33,7 @@ def art():
 
 
 def call(cap, **payload):
-    return caps.invoke(cap, {"project_id": PID, **payload})
+    return caps.invoke(cap, {"project_id": PID, "series_id": "main", **payload})
 
 
 def item(scene, shot, phase, **extra):
@@ -73,13 +76,13 @@ def write_items(root, doc):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / PID
-    root.mkdir()
+    root = make_series_project(tmp_path, PID)
     build(root)
     s = shots()
     s._CACHE.clear()
     fpm()._STORE_CACHE.clear()
-    return root
+    with series_scope(PID, "main"):
+        yield root
 
 
 def by_key(result):
@@ -302,11 +305,11 @@ def test_project_copy_stays_fresh(project, tmp_path, monkeypatch):
     write_items(project, doc)
     adopt()
     copy_root = tmp_path / "demo2"
-    shutil.copytree(project, copy_root)
+    shutil.copytree(project.parents[1], copy_root)
     for f in copy_root.rglob("*"):
         if f.is_file():
             bump(f, 3)  # mtime всех файлов другой, но одинаково
-    res = caps.invoke("shots_list", {"project_id": "demo2"})
+    res = caps.invoke("shots_list", {"project_id": "demo2", "series_id": "main"})
     assert {r["freshness"] for r in res["items"]} == {"fresh"}
 
 
@@ -650,7 +653,7 @@ def test_update_parallel_different_shots(project):
     out = {}
 
     def run(key, digest):
-        out[key] = caps.invoke("shot_update", {"project_id": PID, "shot_key": key,
+        out[key] = caps.invoke("shot_update", {"project_id": PID, "series_id": "main", "shot_key": key,
                                                 "changes": {"start_prompt": "p" + key}, "base_digest": digest})
 
     threads = [threading.Thread(target=run, args=("1-1", d1)), threading.Thread(target=run, args=("2-3", d2))]

@@ -1,4 +1,5 @@
 """Shared story objects, their physical states and cross-scene frame bindings."""
+import contextvars
 import copy
 import hashlib
 import json
@@ -579,7 +580,7 @@ def ensure_landmark_references(base, session_id, seed):
         entity['reference_path'] = str(target.resolve())
 
     with ThreadPoolExecutor(max_workers=4) as executor:
-        list(executor.map(render, [entity for entity in plan['entities'] if entity['kind'] == 'landmark']))
+        list((future.result() for future in [executor.submit(contextvars.copy_context().run, render, entity) for entity in plan['entities'] if entity['kind'] == 'landmark']))
     _write(base / '20_bible/continuity_plan.json', plan)
 
 

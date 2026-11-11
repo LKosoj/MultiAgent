@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities as caps
 from custom_tools.storybook.studio.errors import StudioError
 from tests.helpers_storybook_blockout import (
@@ -20,7 +22,8 @@ def env(tmp_path, monkeypatch):
     mod("blockout").reset_caches()
     fake_tools(monkeypatch)
     runs = FakeRuns(monkeypatch)
-    yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
+    with series_scope(PID, "main"):
+        yield SimpleNamespace(root=root, runs=runs, mp=monkeypatch)
     mod("blockout").reset_caches()
 
 
@@ -32,11 +35,11 @@ def add_review_hook(env):
 
 
 def plan(action, **payload):
-    return caps.invoke("blockout_plan", {"project_id": PID, "action": action, **payload})
+    return caps.invoke("blockout_plan", {"project_id": PID, "series_id": "main", "action": action, **payload})
 
 
 def run(action, **payload):
-    return caps.invoke("blockout_run", {"project_id": PID, "action": action, **payload})
+    return caps.invoke("blockout_run", {"project_id": PID, "series_id": "main", "action": action, **payload})
 
 
 def last_plan(env):

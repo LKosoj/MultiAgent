@@ -7,18 +7,19 @@ import pytest
 
 from custom_tools.storybook.studio import run_exec
 from custom_tools.storybook.studio.errors import StudioError
-from tests.studio_run_fakes import FakeEngine, make_plan
+from tests.studio_run_fakes import FakeEngine, make_plan, make_series_project
+from custom_tools.storybook.project_paths import series_scope
 from tests.test_storybook_studio_shots import PID, build
 
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / PID
-    root.mkdir()
+    root = make_series_project(tmp_path, PID)
     build(root)
     importlib.import_module("custom_tools.storybook.studio.shots")._CACHE.clear()
-    return root
+    with series_scope(PID, "main"):
+        yield root
 
 
 def rg():

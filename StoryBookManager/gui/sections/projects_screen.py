@@ -17,7 +17,6 @@ from StoryBookManager.gui.shell import notify
 from StoryBookManager.gui.shell.adapters import SectionAdapter
 from StoryBookManager.gui.shell.dialogs import ConfirmDialog, show_details
 from StoryBookManager.gui.shell.external import open_external
-from StoryBookManager.gui.shell.run_status import spend_text
 from StoryBookManager.gui.shell.widgets import Tooltip, WrapRow
 from StoryBookManager.gui.theme_tokens import COLORS, PAD_BLOCK, PAD_INLINE, PAD_PANEL, px
 
@@ -61,10 +60,7 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         ttk.Label(head, text=L.TXT_TITLE, style="PanelTitle.TLabel").grid(row=0, column=0, sticky="w")
         bar = WrapRow(head)
         bar.grid(row=1, column=0, sticky="ew", pady=(px(PAD_INLINE), 0))
-        self.btn_prompt = ttk.Button(bar, text=L.TXT_CREATE_PROMPT, style="Accent.TButton",
-                                     command=self.create_new_project)
-        for button in (self.btn_prompt,
-                       ttk.Button(bar, text=L.TXT_CREATE_FORM, command=self.create_by_form),
+        for button in (ttk.Button(bar, text=L.TXT_CREATE_FORM, style="Accent.TButton", command=self.create_by_form),
                        ttk.Button(bar, text=L.TXT_REFRESH, command=self.refresh_projects),
                        ttk.Button(bar, text=L.TXT_ALL_BACKUPS, command=lambda: self.open_backups(None))):
             bar.add(button)
@@ -100,14 +96,14 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         self.list_box.rowconfigure(0, weight=1)
         style = ttk.Style()
         style.configure("Projects.Treeview", rowheight=px(THUMB_PX + 4))
-        self.tree = ttk.Treeview(self.list_box, style="Projects.Treeview", columns=("stage", "modified", "size"),
+        self.tree = ttk.Treeview(self.list_box, style="Projects.Treeview", columns=("series", "modified", "size"),
                                  selectmode="browse", height=6)
         self.tree.heading("#0", text="Название")
-        self.tree.heading("stage", text="Этап")
+        self.tree.heading("series", text="Серий")
         self.tree.heading("modified", text="Изменён")
         self.tree.heading("size", text="Размер")
         self.tree.column("#0", width=px(260), stretch=True)
-        self.tree.column("stage", width=px(150), stretch=False)
+        self.tree.column("series", width=px(150), stretch=False)
         self.tree.column("modified", width=px(100), stretch=False)
         self.tree.column("size", width=px(80), anchor="e", stretch=False)
         self.tree.tag_configure("muted", foreground=COLORS["text_muted"])
@@ -126,9 +122,7 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         self.state_actions = WrapRow(self.state_box)
         self.state_actions.pack(fill="x", pady=(px(PAD_INLINE), 0))
         self._state_buttons = {
-            "prompt": ttk.Button(self.state_actions, text=L.TXT_CREATE_PROMPT, style="Accent.TButton",
-                                 command=self.create_new_project),
-            "form": ttk.Button(self.state_actions, text=L.TXT_CREATE_FORM, command=self.create_by_form),
+            "form": ttk.Button(self.state_actions, text=L.TXT_CREATE_FORM, style="Accent.TButton", command=self.create_by_form),
             "reset": ttk.Button(self.state_actions, text=L.TXT_RESET_SEARCH, command=self._reset_search),
             "retry": ttk.Button(self.state_actions, text=L.TXT_RETRY, command=self.refresh_projects),
             "details": ttk.Button(self.state_actions, text=L.TXT_DETAILS, command=self._show_error_details),
@@ -210,30 +204,7 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         self.ctl.refresh()
 
     def create_new_project(self) -> None:
-        dialog_ref = []
-
-        def submit(params: dict) -> None:
-            dlg = dialog_ref[0]
-            dlg.show_error("")
-            dlg.set_busy(True, L.TXT_CREATING_PROGRESS)
-
-            def done(ok: bool, error: str, result: dict) -> None:
-                if not self._alive(dlg):
-                    if ok:
-                        self._created(result)
-                    return
-                if ok:
-                    dlg.closable = True
-                    dlg.close()
-                    self._created(result)
-                else:
-                    dlg.set_busy(False)
-                    dlg.show_error(error)
-
-            self.ctl.create_from_prompt(params, progress=lambda t: self._alive(dlg) and dlg.set_busy(True, t),
-                                        done=done)
-
-        dialog_ref.append(D.CreateFromPromptDialog(self, submit))
+        self.create_by_form()
 
     def _created(self, result: dict) -> None:
         notify.success(L.TOAST_CREATED)
@@ -354,7 +325,7 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
             self.state_box.place_forget()
         for row in rows if state.kind == "rows" else ():
             self.tree.insert("", "end", iid=row.project_id, text=row.title, tags=row.tags,
-                             values=(row.stage, row.modified, row.size))
+                             values=(row.series, row.modified, row.size))
             self._load_thumb(row.project_id)
         if self.selected_id and self.tree.exists(self.selected_id):
             self.tree.selection_set(self.selected_id)
@@ -369,7 +340,7 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         if card is None:
             return
         row = L.row_for(card, self.ctl.sizes.sizes.get(project_id), self.ctl.job_text.get(project_id, ""))
-        self.tree.item(project_id, tags=row.tags, values=(row.stage, row.modified, row.size))
+        self.tree.item(project_id, tags=row.tags, values=(row.series, row.modified, row.size))
         if project_id == self.selected_id:
             self._update_details()
 
@@ -459,19 +430,18 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
             self.d_spend.set("")
             self.d_hint.set("")
             self._details_for = None
+            self._details_token += 1
             for button in self.actions.values():
                 button.state(["disabled"])
             self.link.state(["disabled"])
             return
         project_id = card["project_id"]
         self.d_title.set(card.get("title") or project_id)
-        stage = (card.get("stage") or {}).get("title") or "—"
         size = self.ctl.sizes.sizes.get(project_id)
         size_text = L.format_bytes(size) if size is not None else (
             L.TXT_COUNTING_SIZES if self.ctl.sizes.remaining else "—")
-        lines = [f"Этап: {stage}", f"Изменён: {L.format_date(card.get('modified'))}",
-                 f"{L.TXT_SIZE}: {size_text}",
-                 f"Страниц: {card.get('pages_count', 0)}, героев: {card.get('characters_count', 0)}"]
+        lines = [f"Серий: {card.get('series_count', 0)}", f"Язык: {card.get('language') or '—'}",
+                 f"Изменён: {L.format_date(card.get('modified'))}", f"{L.TXT_SIZE}: {size_text}"]
         if card.get("description"):
             lines.append(card["description"])
         self.d_info.set("\n".join(lines))
@@ -491,8 +461,11 @@ class ProjectsScreen(ttk.Frame, SectionAdapter):
         self.d_spend.set("")
 
         def got(details, brief) -> None:
-            if token == self._details_token:
-                self.d_spend.set(spend_text((brief or {}).get("spend")))
+            if token == self._details_token and details is not None:
+                resources = details.get("resources", {})
+                counts = (("Герои", "characters"), ("Места", "locations"), ("Предметы", "items"),
+                          ("Стили", "style"), ("Рассказчики", "narrators"))
+                self.d_spend.set(" · ".join(f"{label}: {len(resources.get(key, {}))}" for label, key in counts))
 
         self.ctl.load_details(project_id, got)
 

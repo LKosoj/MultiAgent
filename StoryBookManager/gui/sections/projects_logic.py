@@ -15,14 +15,14 @@ NBSP = " "
 # --- Тексты (TXT_*) ------------------------------------------------------------
 TXT_TITLE = "Проекты сказок"
 TXT_CREATE_PROMPT = "Создать из промпта"
-TXT_CREATE_FORM = "Создать по форме"
+TXT_CREATE_FORM = "Создать проект"
 TXT_REFRESH = "Обновить"
 TXT_ALL_BACKUPS = "Бэкапы всех проектов"
 TXT_SEARCH = "Поиск"
 TXT_SEARCH_HINT = "Название или id проекта"
 TXT_SORT = "Сортировка"
 TXT_LOADING = "Загрузка проектов…"
-TXT_EMPTY = "Проектов пока нет. Опишите идею сказки, и система создаст первый проект."
+TXT_EMPTY = "Проектов пока нет. Создайте проект и опишите его мир."
 TXT_RESET_SEARCH = "Сбросить поиск"
 TXT_RETRY = "Повторить"
 TXT_DETAILS = "Подробности"
@@ -57,9 +57,9 @@ TXT_PAGES_MIN = "Страниц от"
 TXT_PAGES_MAX = "Страниц до"
 TXT_WORDS_MIN = "Слов на страницу от"
 TXT_WORDS_MAX = "Слов на страницу до"
-TXT_FORM_TITLE = "Создать по форме"
+TXT_FORM_TITLE = "Создать проект"
 TXT_FIELD_TITLE = "Название"
-TXT_FIELD_DESCRIPTION = "Описание"
+TXT_FIELD_DESCRIPTION = "Описание мира"
 TXT_FIELD_GENRE = "Жанр"
 TXT_FIELD_AGE = "Возраст читателя"
 TXT_ID_LABEL = "Идентификатор проекта"
@@ -102,7 +102,6 @@ SORTS: Tuple[Tuple[str, str], ...] = (
     ("modified", "Изменён"),
     ("name", "Название"),
     ("size", "Размер"),
-    ("stage", "Этап"),
 )
 SORT_LABELS = {value: label for value, label in SORTS}
 DEFAULT_SORT = "modified"
@@ -264,27 +263,25 @@ def gate_copy(card: dict, job_running: bool = False) -> Gate:
 class RowModel:
     project_id: str
     title: str
-    stage: str
+    series: str
     modified: str
     size: str
     tags: Tuple[str, ...] = ()
 
 
 def row_for(card: dict, size: Optional[int], job_text: str = "") -> RowModel:
-    stage = (card.get("stage") or {}).get("title") or "—"
+    series = str(card.get("series_count", 0))
     tags: List[str] = []
     if is_creating(card):
-        stage, tags = TXT_CREATING, ["muted"]
+        series, tags = TXT_CREATING, ["muted"]
     elif job_text:
-        stage = job_text
+        series = job_text
     elif card.get("busy"):
-        stage = f"{stage} · {TXT_RUN_BADGE}"
+        series = f"{series} · {TXT_RUN_BADGE}"
         tags.append("busy")
-    elif card.get("state") == "empty":
-        stage = f"{stage} · {TXT_EMPTY_BADGE}"
     return RowModel(
         project_id=str(card.get("project_id", "")), title=str(card.get("title") or card.get("project_id", "")),
-        stage=stage, modified=format_date(card.get("modified")),
+        series=series, modified=format_date(card.get("modified")),
         size=format_bytes(size) if size is not None else "—", tags=tuple(tags))
 
 
@@ -302,7 +299,7 @@ def list_state(*, loading: bool, error: Optional[dict], total: int, shown: int, 
     if loading:
         return ListState("loading", TXT_LOADING)
     if total == 0:
-        return ListState("empty", TXT_EMPTY, ("prompt", "form"))
+        return ListState("empty", TXT_EMPTY, ("form",))
     if shown == 0:
         return ListState("nothing", text_nothing_found(query.strip()), ("reset",))
     return ListState("rows")

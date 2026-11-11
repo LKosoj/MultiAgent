@@ -4034,6 +4034,7 @@ def handle_service_action(
         inventory = storybook_project_inventory(
             project_id=project_id,
             max_items=max(1, min(max_items, 100)),
+            **({"series_id": payload["series_id"]} if payload.get("series_id") else {}),
         )
         return _redact_payload({"inventory": _serialize(inventory)})
     if action == "workflows.generate_report":

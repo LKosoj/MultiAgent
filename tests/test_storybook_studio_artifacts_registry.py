@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook import video_contract
 from custom_tools.storybook.storybook_surface import JSON_ARTIFACTS
 from custom_tools.storybook.studio import artifacts as art
@@ -14,25 +17,26 @@ from custom_tools.storybook.studio import labels, schemas
 
 FIXTURES = Path(__file__).parent / "fixtures" / "storybook_artifacts"
 READ_ONLY = {"chains", "provider_jobs", "final_manifest", "asset_manifest", "edit_decisions",
-             "render_report", "final_review"}
+             "render_report", "final_review", "video_plan"}
 
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
-    return tmp_path / "demo"
+    series = make_series_project(tmp_path)
+    with series_scope("demo", "main"):
+        yield series
 
 
 def _list(project_id="demo"):
-    result = caps.invoke("artifacts_list", {"project_id": project_id})
+    result = caps.invoke("artifacts_list", {"project_id": project_id, "series_id": "main"})
     assert result["status"] == "success", result
     return {item["artifact_key"]: item for item in result["items"]}, result
 
 
 def test_registry_matches_surface_paths_and_fixtures():
     assert list(art.ARTIFACTS) == list(JSON_ARTIFACTS)
-    assert len(art.ARTIFACTS) == 22
+    assert len(art.ARTIFACTS) == 23
     for key, spec in art.ARTIFACTS.items():
         assert spec.title and spec.path == JSON_ARTIFACTS[key]
         fixture = json.loads((FIXTURES / f"{key}.json").read_text(encoding="utf-8"))
@@ -59,7 +63,7 @@ def test_read_only_set_and_reasons():
 
 def test_empty_project_all_missing(project):
     items, result = _list()
-    assert len(items) == 22
+    assert len(items) == 23
     assert result["run"] == {"active": False, "current_steps": None}
     for item in items.values():
         assert item["status"] == "missing" and not item["exists"] and item["history_count"] == 0
@@ -93,7 +97,7 @@ def test_history_count_grows_after_saves(project):
     digest = None
     for idx in range(3):
         brief["pages_max"] = 3 + idx
-        saved = caps.invoke("artifact_save", {"project_id": "demo", "key": "brief", "base_digest": digest,
+        saved = caps.invoke("artifact_save", {"project_id": "demo", "series_id": "main", "key": "brief", "base_digest": digest,
                                               "content": dict(brief)})
         assert saved["status"] == "success", saved
         digest = saved["digest"]
@@ -122,4 +126,4 @@ def test_supersedes_point_to_real_legacy_ids():
 
 
 def test_unknown_project(project):
-    assert caps.invoke("artifacts_list", {"project_id": "ghost"})["error"]["code"] == "not_found"
+    assert caps.invoke("artifacts_list", {"project_id": "ghost", "series_id": "main"})["error"]["code"] == "not_found"
