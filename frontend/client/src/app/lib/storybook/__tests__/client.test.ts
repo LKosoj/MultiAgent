@@ -19,6 +19,19 @@ describe("storybook client", () => {
     expect(transport).toHaveBeenCalledWith("storybook.media_token", { project_id: "p" }, { timeoutMs: 20000 });
   });
 
+  it("передаёт серию операциям и использует её адрес медиа", async () => {
+    const transport = vi.fn().mockResolvedValue(tokenReply(Date.now() / 1000 + 3600));
+    const client = createStorybookClient(transport, { apiBase: "http://h", seriesId: "s 1" });
+    await client.call("media_timeline", { project_id: "p" });
+    await client.call("run_steps_get");
+    expect(transport).toHaveBeenCalledWith("storybook.run_steps_get", {}, { timeoutMs: 20000 });
+    await client.ensureMediaToken("p");
+    expect(transport).toHaveBeenCalledWith("storybook.media_timeline", { project_id: "p", series_id: "s 1" }, { timeoutMs: 20000 });
+    expect(transport).toHaveBeenCalledWith("storybook.media_token", { project_id: "p", series_id: "s 1" }, { timeoutMs: 20000 });
+    expect(client.mediaUrl("p", "a.mp4")).toBe("http://h/v1/storybook/projects/p/series/s%201/media?path=a.mp4&t=tok");
+    expect(client.thumbUrl("p", "a.png", 128)).toBe("http://h/v1/storybook/projects/p/series/s%201/thumb?path=a.png&size=128&t=tok");
+  });
+
   it("status:error превращает в StudioError с кодом", async () => {
     const transport = vi.fn().mockResolvedValue({
       status: "error",

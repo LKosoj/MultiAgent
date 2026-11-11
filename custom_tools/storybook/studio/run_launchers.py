@@ -76,7 +76,7 @@ def start_backend(project_id: str, plan: dict, run_id: str) -> None:
     service._agui_event_store().create_run(run_id, session_id, principal, run_kind="agui")
     service._wf_manager().start_workflow(
         workflow_name=WORKFLOW_NAME,
-        parameters={"project_id": project_id, "studio_plan": plan, "studio_run_id": run_id},
+        parameters={"project_id": project_id, "series_id": plan["series_id"], "studio_plan": plan, "studio_run_id": run_id},
         session_id=session_id, client_id=owner.quota_identity, use_enhanced=True,
         enable_telemetry=False, run_id=run_id, owner=owner)
 

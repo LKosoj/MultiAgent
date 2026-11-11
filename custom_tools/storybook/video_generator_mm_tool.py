@@ -1,4 +1,5 @@
 import os
+import contextvars
 import json
 import logging
 import time
@@ -144,7 +145,9 @@ def video_generator_mm_tool(
         logger.error("❌ project_id обязателен для чтения shots.json")
         return {"status": "error", "message": "project_id обязателен", "results": []}
     
-    shots_file_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
+    from .project_paths import safe_storybook_project_dir
+    project_dir = safe_storybook_project_dir(project_id)
+    shots_file_path = str(project_dir / "97_shots/shots.json")
     
     # Проверяем, существует ли файл shots.json
     if not os.path.exists(shots_file_path):
@@ -173,6 +176,12 @@ def video_generator_mm_tool(
         logger.warning("⚠️ Список items в shots.json пуст")
         return {"status": "success", "message": "Список items в shots.json пуст", "results": []}
     
+    if enable and (project_dir / "97_shots/video_plan.json").is_file():
+        from .video_plan import apply_video_plan
+        planned_items = apply_video_plan(project_id, items_list)
+        if any(item.get("video_mode") == "references" for item in planned_items):
+            return {"status": "error", "message": "Этот провайдер пока не передаёт исходную речь и референсы; генерация остановлена.", "results": []}
+
     # ЭТАП 1: Обновляем описания изображений
     logger.info("📝 Этап 1: Анализ и обновление описаний изображений")
     descriptions_updated = update_shots_with_descriptions(shots_file_path, items_list, force_update_prompts, skip_prompt_enhancement)
@@ -206,7 +215,7 @@ def video_generator_mm_tool(
 
     try:
         job_store = _ProviderJobStore(
-            f"plots/storybooks/{project_id}/97_shots/provider_jobs.json",
+            str(project_dir / "97_shots/provider_jobs.json"),
             provider_name=_MM_PROVIDER_NAME,
         )
     except Exception as e:
@@ -330,7 +339,7 @@ def video_generator_mm_tool(
         with ThreadPoolExecutor(max_workers=len(batch_items)) as executor:
             # Создаем задачи для текущего пакета
             future_to_item = {
-                executor.submit(_generate_single_video_mm, item, session_id, seed, language, job_store, api_key): item
+                executor.submit(contextvars.copy_context().run, _generate_single_video_mm, item, session_id, seed, language, job_store, api_key): item
                 for item in batch_items
             }
             
@@ -404,6 +413,8 @@ def _generate_single_video_mm(
     """
     Генерирует одно видео из изображений (start и опционально end) с использованием MiniMax API.
     """
+    if item.get("video_mode") == "references":
+        return {"success": False, "error": "Передача референсов и речи этим провайдером не реализована"}
     start_image = item.get("start_image")
     end_image = item.get("end_image")
     video_path = item.get("video_path")

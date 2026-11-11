@@ -50,7 +50,7 @@ describe("StorybookOverviewTab", () => {
   it("данные: этапы, шаги, счётчики и блоки", () => {
     const status = sample();
     const html = render(api({ status, state: "ready" }));
-    expect(html).toContain("Обзор проекта");
+    expect(html).toContain("Обзор серии");
     expect(html).toContain("Следующее действие");
     expect(html).toContain("Шаги пайплайна");
     expect(html).toContain("Последний прогон");

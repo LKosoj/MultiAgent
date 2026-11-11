@@ -8,6 +8,8 @@ import pytest
 
 from custom_tools.storybook.studio import capabilities as caps
 from tests.test_storybook_studio_shots import PID, build
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
 
 REV = "custom_tools.storybook.studio.review"
 
@@ -21,7 +23,7 @@ def rg():
 
 
 def call(cap, **payload):
-    return caps.invoke(cap, {"project_id": PID, **payload})
+    return caps.invoke(cap, {"project_id": PID, "series_id": "main", **payload})
 
 
 def bad(cap, **payload):
@@ -49,11 +51,11 @@ def fin(regen_id):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / PID
-    root.mkdir()
+    root = make_series_project(tmp_path, PID)
     build(root)
     importlib.import_module("custom_tools.storybook.studio.shots")._CACHE.clear()
-    return root
+    with series_scope(PID, "main"):
+        yield root
 
 
 def test_registered_admin_only():

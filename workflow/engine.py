@@ -8,6 +8,7 @@ retry логикой и управлением ресурсами.
 """
 
 import asyncio
+import contextvars
 import inspect
 import json
 import logging
@@ -1674,7 +1675,7 @@ class WorkflowEngine(DynamicAgentSystem):
         
         # Выполняем в thread pool текущего event loop
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _execute_tool_sync)
+        result = await loop.run_in_executor(None, contextvars.copy_context().run, _execute_tool_sync)
 
         return result
 

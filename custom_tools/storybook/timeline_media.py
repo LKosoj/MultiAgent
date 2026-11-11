@@ -1,6 +1,7 @@
 """Shared media handling for editable FCPXML timelines and ffmpeg assembly."""
 import hashlib
 import json
+import math
 import shutil
 import subprocess
 import tempfile
@@ -74,6 +75,8 @@ def _audio_segments(base, items, total):
     segments, probes = [], {}
 
     def add(track, offset, duration):
+        track = dict(track)
+        track.setdefault("level", 0.08 if track.get("role") == "music" else 1)
         path = Path(track["path"])
         if not path.is_absolute():
             path = audio_dir / path
@@ -97,15 +100,22 @@ def _audio_segments(base, items, total):
 
     mapping = plan.get("scene_mapping") or {}
     planned_music = bool(mapping and music)
+    music_controls = {
+        str((audio_dir / track["path"]).resolve()): track
+        for track in manifest.get("audio_tracks") or []
+        if isinstance(track, dict) and track.get("role") == "music" and track.get("path")
+    }
     for raw in manifest.get("audio_tracks") or []:
         track = {"path": raw, "role": "audio"} if isinstance(raw, str) else raw
+        if not track.get("enabled", True):
+            continue
         if planned_music and track.get("role") == "music":
             continue
         scene = scenes.get(str(track.get("scene_number")))
         if track.get("scene_number") is not None and scene is None:
             continue
-        offset = float(track.get("offset_seconds") or (scene["start"] if scene else 0))
-        length = float(track.get("duration_seconds") or (scene["duration"] if scene else total - offset))
+        offset = float(track.get("offset_seconds", scene["start"] if scene else 0))
+        length = float(track.get("duration_seconds", scene["duration"] if scene else total - offset))
         add(track, offset, length)
     if planned_music:
         for scene_id, scene in scenes.items():
@@ -116,7 +126,10 @@ def _audio_segments(base, items, total):
             if entry is None:
                 raise ValueError(f"Missing mapped music asset: {music_id}")
             track = {"path": entry} if isinstance(entry, str) else entry
-            add(dict(track, role="music"), scene["start"], scene["duration"])
+            track = dict(track, **{key: value for key, value in music_controls.get(
+                str((audio_dir / track["path"]).resolve()), {}).items() if key in ("level", "enabled")})
+            if track.get("enabled", True):
+                add(dict(track, role="music"), scene["start"], scene["duration"])
     return segments
 
 
@@ -128,10 +141,10 @@ def decorate_timeline(root, path, project_id, items):
     visual_clips = [c for c in sequence.find("spine") if c.tag in {"video", "asset-clip"}]
     first = visual_clips[0] if visual_clips else None
     source_durations = {}
-    jobs = _read_json(base / "97_shots/provider_jobs.json", {}).get("jobs", [])
-    providers = {Path(job["output_path"]).resolve(): job.get("provider") for job in jobs
-                 if job.get("status") == "downloaded" and job.get("output_path")}
     resources_by_id = {a.get("id"): a for a in resources.findall("asset")}
+    plan = _read_json(base / "97_shots/video_plan.json", {})
+    speech_videos = {Path(unit["video_path"]).resolve() for unit in plan.get("units", [])
+                     if unit.get("speech_source_path") and unit.get("video_path")}
     for fmt in resources.findall("format"):
         fmt.set("width", str(items[0].get("width") or 1920))
         fmt.set("height", str(items[0].get("height") or 1088))
@@ -162,12 +175,13 @@ def decorate_timeline(root, path, project_id, items):
         conform = clip.find("conform-rate")
         if conform is not None:
             conform.attrib.pop("srcFrameRate", None)
-        # Video providers receive generate_audio=false; ignore audio returned despite it.
-        if providers.get(_media_path(resources_by_id[clip.get("ref")])) in {"routerai", "aitunnel"}:
+        # The final soundtrack uses separately selected audio tracks.
+        source = resources_by_id[clip.get("ref")]
+        if clip.tag == "asset-clip" and source.get("hasVideo") == "1":
             clip.set("srcEnable", "video")
         actual = source_durations.get(clip.get("ref"))
         planned = _seconds(clip.get("duration"))
-        if actual is not None and abs(actual - planned) > 0.001:
+        if actual is not None and abs(actual - planned) > 0.001 and _media_path(source).resolve() not in speech_videos:
             mapping = ET.SubElement(clip, "timeMap")
             ET.SubElement(mapping, "timept", time="0s", value="0s", interp="linear")
             ET.SubElement(mapping, "timept", time=_time(planned), value=_time(actual), interp="linear")
@@ -195,6 +209,13 @@ def decorate_timeline(root, path, project_id, items):
             clip = ET.Element("asset-clip", ref=assets[key], name=Path(track["path"]).stem,
                               lane=lanes[key], offset=_time(local_offset), start=_time(track["source_start"]),
                               duration=_time(track["duration"]), audioRole=role)
+            level = float(track.get("level", 1))
+            if not 0 <= level <= 1:
+                raise ValueError("Audio level must be between 0 and 1")
+            if level != 1:
+                ET.SubElement(clip, "adjust-volume", amount=f"{20 * math.log10(level):.6f}dB" if level else "-96dB")
+            if not level:
+                clip.set("enabled", "0")
             before = next((index for index, child in enumerate(anchor)
                            if child.tag in {"keyword", "marker", "rating"}), len(anchor))
             anchor.insert(before, clip)
@@ -253,7 +274,7 @@ def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg", path_map=None
             group.extend(spine[index + 1:index + 3])
         groups.append(group)
         index += len(group)
-    sounds = [c for c in root.findall(".//asset-clip") if c.get("audioRole")]
+    sounds = [c for c in root.findall(".//asset-clip") if c.get("audioRole") and c.get("enabled") != "0"]
     sounds.extend(c for c in spine if c.tag == "asset-clip" and not c.get("audioRole")
                   and c.get("srcEnable") != "video"
                   and resources[c.get("ref")].get("hasAudio") == "1")
@@ -315,8 +336,14 @@ def render_fcpxml(timeline_path, output_path, ffmpeg_bin="ffmpeg", path_map=None
             if parent.tag in {"video", "asset-clip"}:
                 offset = _seconds(parent.get("offset", "0s")) + (offset - _seconds(parent.get("start", "0s"))) / _retime_ratio(parent)
             retime = _retime_ratio(clip)
+            adjustment = clip.find("adjust-volume")
+            volume = ""
+            if adjustment is not None:
+                decibels = float(adjustment.get("amount", "0dB").removesuffix("dB"))
+                volume = f"volume={decibels}dB,"
             filters.append(f"[{n}:a]atrim=start={_seconds(clip.get('start', '0s'))}:duration={_seconds(clip.get('duration')) * retime},"
                            f"asetpts=PTS-STARTPTS,atempo={retime},aresample=48000,aformat=channel_layouts=stereo,"
+                           f"{volume}"
                            f"adelay={round(offset*1000)}:all=1,"
                            f"apad=whole_dur={duration}[a{n}]")
         command += ["-map", "0:v", "-c:v", "copy"]

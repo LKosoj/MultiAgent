@@ -1,4 +1,5 @@
 import os
+import contextvars
 import re
 import json
 import logging
@@ -192,7 +193,7 @@ def _iter_visible_text_sources(item: Dict[str, Any]) -> List[Tuple[str, str, str
 
 
 def _build_reference_fidelity_block() -> str:
-    return "Preserve character identity, canonical location features and art style from reference images. Explicit scene instructions take priority for camera viewpoint, framing, lens, composition, art style, actions, poses, hand assignments, wardrobe changes, prop states, weather, lighting and palette. References do not lock the shot crop or limb pose; left and right mean the character's own anatomical sides. References may show a different moment; do not copy obsolete states or objects absent from the scene. No generic substitutes, no extra background characters."
+    return "Preserve character identity, canonical location features and art style from reference images. From a character sheet use the view suited to the shot: facial features for close-ups, full-body silhouette and proportions for wide shots, and the appropriate side for the camera. Never reproduce sheet grids, labels or multiple views in the scene. Explicit scene instructions take priority for camera viewpoint, framing, lens, composition, art style, actions, poses, hand assignments, wardrobe changes, prop states, weather, lighting and palette. References do not lock the shot crop or limb pose; left and right mean the character's own anatomical sides. References may show a different moment; do not copy obsolete states or objects absent from the scene. No generic substitutes, no extra background characters."
 
 
 def _build_single_illustration_block() -> str:
@@ -2139,7 +2140,7 @@ def _preprocess_canon_references(
         else:
             # Параллельное выполнение
             with ThreadPoolExecutor(max_workers=max_concurrency) as executor:
-                future_to_task = {executor.submit(_canon_worker, task): task for task in canon_tasks}
+                future_to_task = {executor.submit(contextvars.copy_context().run, _canon_worker, task): task for task in canon_tasks}
                 
                 for future in as_completed(future_to_task):
                     try:
@@ -2824,7 +2825,7 @@ def artist_agent_batch_edit_tool(
                 with ThreadPoolExecutor(max_workers=scenes_max_concurrency) as executor:
                     # Отправляем каждую сцену как отдельную задачу
                     future_to_scene = {
-                        executor.submit(_process_scene_sequentially, scene): i 
+                        executor.submit(contextvars.copy_context().run, _process_scene_sequentially, scene): i
                         for i, scene in enumerate(video_scenes)
                     }
                     
@@ -2869,7 +2870,7 @@ def artist_agent_batch_edit_tool(
                 with ThreadPoolExecutor(max_workers=illustrations_max_concurrency) as executor:
                     # Отправляем все иллюстрации в очередь
                     future_to_item = {
-                        executor.submit(_worker, item["original_index"], item, seed): item["original_index"]
+                        executor.submit(contextvars.copy_context().run, _worker, item["original_index"], item, seed): item["original_index"]
                         for item in illustration_items
                     }
                     

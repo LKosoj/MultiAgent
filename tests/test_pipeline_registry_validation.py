@@ -118,7 +118,7 @@ _GOOD_PAYLOADS: list[tuple[str, dict]] = [
     ("step_results_demo", {"topic": "AI", "session_id": "s1"}),
     (
         "storybook_pipeline",
-        {"task": "Сказка про кота", "pages_min": 1, "pages_max": 3},
+        {"task": "Сказка про кота", "project_id": "world", "series_id": "first", "pages_min": 1, "pages_max": 3},
     ),
     (
         "tool_demo",
@@ -166,15 +166,19 @@ def test_text_to_sql_valid_payload_dumps_required_fields() -> None:
     assert dumped["max_rows"] == 50
 
 
-def test_storybook_validator_requires_task_but_uses_yaml_defaults_for_other_inputs() -> None:
+def test_storybook_validator_requires_task_project_and_series_but_uses_yaml_defaults_for_settings() -> None:
     model = PIPELINE_VALIDATORS["storybook_pipeline"]
     expected_inputs = _yaml_inputs("storybook_pipeline")
 
-    dumped = model.model_validate({"task": "Сказка про кота"}).model_dump()
+    dumped = model.model_validate({"task": "Сказка про кота", "project_id": "world", "series_id": "first"}).model_dump()
 
     for key, value in expected_inputs.items():
         if key == "task":
             assert dumped[key] == "Сказка про кота"
+        elif key == "project_id":
+            assert dumped[key] == "world"
+        elif key == "series_id":
+            assert dumped[key] == "first"
         else:
             assert dumped[key] == value
 
@@ -182,8 +186,8 @@ def test_storybook_validator_requires_task_but_uses_yaml_defaults_for_other_inpu
 def test_storybook_validator_normalizes_sample_shot_key() -> None:
     model = PIPELINE_VALIDATORS["storybook_pipeline"]
 
-    blank = model.model_validate({"task": "Сказка", "sample_shot_key": "   "})
-    selected = model.model_validate({"task": "Сказка", "sample_shot_key": " 1-2 "})
+    blank = model.model_validate({"task": "Сказка", "project_id": "world", "series_id": "first", "sample_shot_key": "   "})
+    selected = model.model_validate({"task": "Сказка", "project_id": "world", "series_id": "first", "sample_shot_key": " 1-2 "})
 
     assert blank.sample_shot_key == ""
     assert selected.sample_shot_key == "1-2"
@@ -193,12 +197,14 @@ def test_storybook_validator_rejects_inverted_ranges() -> None:
     model = PIPELINE_VALIDATORS["storybook_pipeline"]
 
     with pytest.raises(ValidationError, match="pages_max"):
-        model.model_validate({"task": "Сказка", "pages_min": 5, "pages_max": 4})
+        model.model_validate({"task": "Сказка", "project_id": "world", "series_id": "first", "pages_min": 5, "pages_max": 4})
 
     with pytest.raises(ValidationError, match="words_per_page_max"):
         model.model_validate(
             {
                 "task": "Сказка",
+                "project_id": "world",
+                "series_id": "first",
                 "words_per_page_min": 300,
                 "words_per_page_max": 100,
             }
@@ -261,7 +267,7 @@ def test_storybook_validator_reads_yaml_defaults_after_file_change(tmp_path, mon
     model = PIPELINE_VALIDATORS["storybook_pipeline"]
 
     write_storybook_yaml(1)
-    assert model.model_validate({"task": "Сказка"}).pages_min == 1
+    assert model.model_validate({"task": "Сказка", "project_id": "world", "series_id": "first"}).pages_min == 1
 
     write_storybook_yaml(3)
-    assert model.model_validate({"task": "Сказка"}).pages_min == 3
+    assert model.model_validate({"task": "Сказка", "project_id": "world", "series_id": "first"}).pages_min == 3

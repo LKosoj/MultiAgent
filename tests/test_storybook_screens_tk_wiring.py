@@ -49,7 +49,9 @@ def _child() -> int:
         root.geometry("1280x800+0+0")
         root.update()
         app.bridge.call = FakeBridge(tmp, state).call
-        app.on_project_selected(app.project_manager.load_project(PID))
+        project = app.project_manager.load_project(PID)
+        app.on_project_selected(project)
+        app.on_series_selected(project, {"series_id": "episode", "title": "Episode"})
         _pump(root, 1.0)
 
         names = {}
@@ -201,7 +203,9 @@ def _scenarios() -> int:
         bridge = Bridge(tmp, state)
         bridge.env_default = True
         app.bridge.call = bridge.call
-        app.on_project_selected(app.project_manager.load_project(PID))
+        project = app.project_manager.load_project(PID)
+        app.on_project_selected(project)
+        app.on_series_selected(project, {"series_id": "episode", "title": "Episode"})
         _pump(root, 1.0)
         files = app.editor_panel
         files.ask_choice = lambda title, body, buttons, default="": "stay"

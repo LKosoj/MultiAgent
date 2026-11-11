@@ -95,8 +95,9 @@ ARTIFACTS: dict[str, ArtifactSpec] = {
         _spec("style_images", "Стиль изображений", "object", ("style_keeper",), careful=True),
         _spec("screenplay", "Сценарий", "object", ("screenplay_generator",), careful=True),
         _spec("shots", "Шоты", "object",
-              ("screenplay_shots_generator", "video_generator", "artist_batch_shots"),
+              ("screenplay_shots_generator", "shots_prompt_qa", "video_generator", "artist_batch_shots"),
               careful=True, merge_safe=True),
+        _spec("video_plan", "План видео", "object", ("storybook_video_plan",), reason=_REASON_REDO),
         _spec("provider_jobs", "Задачи провайдера", "object", ("video_generator",), reason=_REASON_JOBS),
         _spec("chains", "Цепочки болванки", "object", ("blockout_scene_builder",),
               reason="Файл только пишется шагом и нигде не читается как вход, правка ничего не изменит."),
@@ -461,8 +462,8 @@ def _remember_snapshot(project_id: str, key: str, digest: str | None, content: A
     import copy
 
     with _SNAPSHOTS_GUARD:
-        _SNAPSHOTS[(project_id, key, digest)] = copy.deepcopy(content)
-        _SNAPSHOTS.move_to_end((project_id, key, digest))
+        _SNAPSHOTS[(str(project_dir(project_id)), key, digest)] = copy.deepcopy(content)
+        _SNAPSHOTS.move_to_end((str(project_dir(project_id)), key, digest))
         while len(_SNAPSHOTS) > _SNAPSHOT_CACHE_SIZE:
             _SNAPSHOTS.popitem(last=False)
 
@@ -471,9 +472,9 @@ def _recall_snapshot(project_id: str, key: str, digest: str | None) -> Any:
     import copy
 
     with _SNAPSHOTS_GUARD:
-        value = _SNAPSHOTS.get((project_id, key, digest))
+        value = _SNAPSHOTS.get((str(project_dir(project_id)), key, digest))
         if value is not None:
-            _SNAPSHOTS.move_to_end((project_id, key, digest))
+            _SNAPSHOTS.move_to_end((str(project_dir(project_id)), key, digest))
             return copy.deepcopy(value)
     return None
 
@@ -726,6 +727,20 @@ def _decode_input(spec: ArtifactSpec, content: Any, text: str | None) -> Any:
     return value
 
 
+def _invalidate_screenplay_speech(project_id: str) -> None:
+    from .series import mark_series_stale
+    from .project_store import write_json_atomic
+    root = project_dir(project_id)
+    if not (root / "series.json").is_file():
+        return
+    speech_path = root / "98_audio/speech.json"
+    if speech_path.is_file():
+        speech = json.loads(speech_path.read_text(encoding="utf-8"))
+        speech["status"] = "stale"
+        write_json_atomic(speech_path, speech)
+    mark_series_stale(root, ["98_audio/speech.json", "97_shots", "98_audio/audio_manifest.json", "99_final"])
+
+
 @capability("artifact_save", title="Сохранить артефакт", access="write", supersedes=("artifact_edit",))
 def artifact_save(project_id: str, key: str, base_digest: str | None, content: Any = None,
                   text: str | None = None, allow_invalid: bool = False) -> dict:
@@ -745,6 +760,8 @@ def artifact_save(project_id: str, key: str, base_digest: str | None, content: A
     else:
         version_id = _write_plain(project_id, spec, _dump(value), base_digest, "save")
         done = {"digest": obj_digest(value), "version_id": version_id, "merged": False, "external_changes": False}
+    if key == "screenplay" and done["digest"] != base_digest:
+        _invalidate_screenplay_speech(project_id)
     return success(saved=True, previous_digest=base_digest, validation=_validation_block(findings),
                    warnings=warnings, **done)
 
@@ -917,6 +934,8 @@ def artifact_restore(project_id: str, key: str, version_id: str, base_digest: st
         snap: dict[str, str | None] = {}
         # снимок текущего файла: откат сам обратим
         _commit(path, old_raw, lambda: snap.update(id=_snapshot(project_id, spec.key, raw, "restore")))
+    if key == "screenplay" and file_digest(old_raw) != current:
+        _invalidate_screenplay_speech(project_id)
     return success(saved=True, digest=file_digest(old_raw), previous_digest=base_digest,
                    version_id=snap.get("id"), restored_from=version_id, merged=False, external_changes=False,
                    validation=_validation_block(findings), warnings=warnings)

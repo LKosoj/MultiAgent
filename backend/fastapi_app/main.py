@@ -396,6 +396,26 @@ async def storybook_thumb(
     return FileResponse(source, media_type="image/jpeg", headers=_MEDIA_HEADERS)
 
 
+@app.get("/v1/storybook/projects/{project_id}/series/{series_id}/media", name="v1_storybook_series_media")
+async def storybook_series_media(project_id: str, series_id: str, request: Request, path: str, t: str | None = None) -> FileResponse:
+    from backend.fastapi_app.agui import _storybook_media as media
+    media.authorize_media_request(request, project_id, t, series_id)
+    target, mime = media.locate_media_file(project_id, path, series_id)
+    return FileResponse(target, media_type=mime, headers=_MEDIA_HEADERS)
+
+
+@app.get("/v1/storybook/projects/{project_id}/series/{series_id}/thumb", name="v1_storybook_series_thumb")
+async def storybook_series_thumb(project_id: str, series_id: str, request: Request, path: str, size: int = 256, t: str | None = None) -> Response:
+    from backend.fastapi_app.agui import _storybook_media as media
+    media.authorize_media_request(request, project_id, t, series_id)
+    if size not in _THUMB_SIZES:
+        raise HTTPException(status_code=400, detail="unsupported thumbnail size")
+    source, placeholder = await asyncio.to_thread(media.make_thumb_response_source, project_id, path, size, series_id)
+    if placeholder:
+        return Response(content=source, media_type="image/jpeg", headers={**_MEDIA_HEADERS, "X-Studio-Placeholder": "1"})
+    return FileResponse(source, media_type="image/jpeg", headers=_MEDIA_HEADERS)
+
+
 @app.post("/agent")
 async def agent_endpoint(input_data: RunAgentInput, request: Request) -> StreamingResponse:
     principal = authenticate_request(request)

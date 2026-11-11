@@ -241,14 +241,11 @@ class StepResultsDemoRequest(_BasePipelineRequest):
 
 
 class StorybookPipelineRequest(_BasePipelineRequest):
-    """storybook_pipeline.yaml: ``task`` обязателен, прочие defaults берутся из YAML."""
+    """storybook_pipeline.yaml: материал и серия обязательны; настройки берутся из YAML."""
 
     task: str = Field(..., min_length=1)
-    project_id: str = Field(
-        default_factory=lambda: _storybook_default_str("project_id"),
-        min_length=1,
-        validate_default=True,
-    )
+    series_id: str = Field(..., min_length=1)
+    project_id: str = Field(..., min_length=1)
     pages_min: int = Field(
         default_factory=lambda: _storybook_default_int("pages_min"),
         ge=1,
@@ -355,10 +352,6 @@ class StorybookPipelineRequest(_BasePipelineRequest):
         default_factory=lambda: _storybook_default_bool("generate_subtitles"),
         validate_default=True,
     )
-    narration_path: str = Field(
-        default_factory=lambda: _storybook_default_str("narration_path", allow_empty=True),
-        validate_default=True,
-    )
     video_provider: str = Field(
         default_factory=lambda: _storybook_default_str("video_provider", allow_empty=True),
         validate_default=True,
@@ -387,7 +380,7 @@ class StorybookPipelineRequest(_BasePipelineRequest):
     def _v_task(cls, v: Any) -> str:
         return _require_non_empty_string(v, "task")
 
-    @field_validator("project_id", mode="before")
+    @field_validator("project_id", "series_id", mode="before")
     @classmethod
     def _v_project_id(cls, v: Any) -> str:
         return require_safe_storybook_project_id(v)

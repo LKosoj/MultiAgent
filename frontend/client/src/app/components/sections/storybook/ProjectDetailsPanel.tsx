@@ -2,7 +2,7 @@
 
 import React from "react";
 
-import { formatBytes, formatDateTimeAny, formatRub } from "../../../lib/storybook/format";
+import { formatBytes, formatDateTimeAny } from "../../../lib/storybook/format";
 import type { StorybookClient } from "../../../lib/storybook/client";
 import type { ProjectCard } from "../../../lib/storybook/projects";
 import { canDelete, canRename } from "../../../lib/storybook/projectsView";
@@ -37,7 +37,6 @@ export function ProjectDetailsPanel(p: Props) {
   }
   const gate = canDelete(card);
   const d = extra?.details;
-  const brief = extra?.brief;
   const exportLink =
     p.lastExport && p.lastExport.projectId === card.project_id ? p.client.mediaUrl(card.project_id, p.lastExport.path) : null;
   const gated = (allowed: boolean, reason: string | null, action: () => void) => ({
@@ -53,25 +52,15 @@ export function ProjectDetailsPanel(p: Props) {
         <dt>{T.fId}</dt>
         <dd>{card.project_id}</dd>
         <dt>{T.fDescription}</dt>
-        <dd>{d?.description_full || card.description || "—"}</dd>
-        <dt>{T.fCharacters}</dt>
-        <dd>{d && d.main_characters.length ? d.main_characters.join(", ") : String(card.characters_count)}</dd>
-        <dt>{T.fPages}</dt>
-        <dd>{card.pages_count}</dd>
-        <dt>{T.fShots}</dt>
-        <dd>{d?.shots_total ?? "—"}</dd>
-        <dt>{T.fShotsReady}</dt>
-        <dd>{T.fShotsSeeOverview}</dd>
-        <dt>{T.fSpend}</dt>
-        <dd>{brief ? formatRub(brief.spend.total) : "—"}</dd>
-        <dt>{T.fFinal}</dt>
-        <dd>{card.has_final_video ? T.yes : T.no}</dd>
-        <dt>{T.fCreated}</dt>
-        <dd>{formatDateTimeAny(card.created)}</dd>
+        <dd>{d?.description || card.description || "—"}</dd>
+        <dt>Серий</dt>
+        <dd>{card.series_count}</dd>
+        <dt>Общие герои</dt>
+        <dd>{Object.keys(d?.resources?.characters ?? {}).join(", ") || "—"}</dd>
+        <dt>Общие места</dt>
+        <dd>{Object.keys(d?.resources?.locations ?? {}).join(", ") || "—"}</dd>
         <dt>{T.fModified}</dt>
         <dd>{formatDateTimeAny(card.modified)}</dd>
-        <dt>{T.stagePrefix.replace(":", "")}</dt>
-        <dd>{card.stage.title}</dd>
         <dt>{T.backupSize}</dt>
         <dd>{p.sizeBytes === undefined ? "—" : formatBytes(p.sizeBytes)}</dd>
       </dl>

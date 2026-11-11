@@ -6,6 +6,7 @@ import type { ProjectCard } from "../../../lib/storybook/projects";
 import type { ProjectActionsApi } from "../../../lib/storybook/useProjectActions";
 import type { ProjectsApi } from "../../../lib/storybook/useProjects";
 import { createBackgroundQueue } from "../../../lib/storybook/backgroundQueue";
+import { ProjectDetailsPanel } from "../storybook/ProjectDetailsPanel";
 import { StorybookProjectsTab } from "../storybook/StorybookProjectsTab";
 
 const card = (id: string, extra: Partial<ProjectCard> = {}): ProjectCard => ({
@@ -14,14 +15,8 @@ const card = (id: string, extra: Partial<ProjectCard> = {}): ProjectCard => ({
   description: "",
   language: "ru",
   state: "ready",
-  stage: { id: "brief", title: "Бриф", index: 1, source: "db" },
   busy: false,
-  pages_count: 9,
-  characters_count: 2,
-  has_pdf: false,
-  has_final_video: false,
-  cover: null,
-  created: "2026-11-01T10:00:00",
+  series_count: 4,
   modified: "2026-11-02T10:00:00",
   ...extra,
 });
@@ -75,6 +70,9 @@ describe("StorybookProjectsTab", () => {
   it("пустой список: подсказка и кнопка создания", () => {
     const html = render(projects({}));
     expect(html).toContain("Проектов пока нет");
+    expect(html).toContain("Создать проект");
+    expect(html).toContain("добавьте в него серию");
+    expect(html).not.toContain("Создать из промпта");
   });
   it("папка не найдена: текст с путём и кнопка настроек", () => {
     const html = render(projects({ state: "error", error: { kind: "not_found", text: "x" } }));
@@ -84,6 +82,19 @@ describe("StorybookProjectsTab", () => {
   it("нет прав: единый текст", () => {
     const html = render(projects({ state: "error", error: { kind: "forbidden", text: "x" } }));
     expect(html).toContain("Недостаточно прав");
+  });
+  it("отображает ответ API постоянного проекта и его общие ресурсы", () => {
+    const html = renderToStaticMarkup(React.createElement(ProjectDetailsPanel, {
+      card: card("p", { series_count: 2 }),
+      extra: { details: { title: "Мир", description: "Описание мира", language: "ru", resources: { characters: { fox: "v1" }, locations: { forest: "v1" } } } },
+      sizeBytes: undefined, client, active: {}, lastExport: null,
+      onOpen: () => {}, onDuplicate: () => {}, onRename: () => {}, onBackups: () => {}, onExport: () => {}, onRemove: () => {},
+    }));
+    expect(html).toContain("Серий");
+    expect(html).toContain("fox");
+    expect(html).toContain("forest");
+    expect(html).not.toContain("undefined");
+    expect(html).not.toContain("Финальное видео");
   });
   it("карточки и выбранный проект в правой панели", () => {
     const html = render(projects({ projects: [card("a"), card("b", { busy: true })] }), "b");

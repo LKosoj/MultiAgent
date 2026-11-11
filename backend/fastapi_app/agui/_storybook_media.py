@@ -15,10 +15,10 @@ _STATUS_BY_CODE = {
 }
 
 
-def authorize_media_request(request: Request, project_id: str, token: str | None) -> None:
+def authorize_media_request(request: Request, project_id: str, token: str | None, series_id: str | None = None) -> None:
     from custom_tools.storybook.studio.media_tokens import verify_media_token
 
-    if token and verify_media_token(project_id, token):
+    if token and verify_media_token(project_id, token, series_id=series_id):
         return
     principal = authenticate_request(request)  # 401/403 как у остальных маршрутов
     if not principal.has_role("admin"):
@@ -40,13 +40,20 @@ def _is_export_zip(project_id: str, target: Path) -> bool:
     return target.suffix.lower() == ".zip" and target.parent == exports
 
 
-def locate_media_file(project_id: str, path: str) -> tuple[Path, str]:
+def locate_media_file(project_id: str, path: str, series_id: str | None = None) -> tuple[Path, str]:
     """Путь к файлу проекта и его MIME; расширение вне белого списка запрещено."""
     from custom_tools.storybook.studio.errors import StudioError
     from custom_tools.storybook.studio.paths import MEDIA_EXTENSIONS, resolve_in_project
 
+    from custom_tools.storybook.studio.series import _project
+    from custom_tools.storybook.project_paths import series_scope
+    from contextlib import nullcontext
     try:
-        target = resolve_in_project(project_id, path)
+        _project(project_id)
+        if series_id is None and not (path.startswith("shared/") or path.startswith(".studio/exports/")):
+            raise StudioError("forbidden_path", "Файл не относится к общим ресурсам")
+        with series_scope(project_id, series_id) if series_id is not None else nullcontext():
+            target = resolve_in_project(project_id, path)
     except StudioError as exc:
         _raise_http(exc)
     mime = MEDIA_EXTENSIONS.get(target.suffix.lower())
@@ -57,12 +64,16 @@ def locate_media_file(project_id: str, path: str) -> tuple[Path, str]:
     return target, mime
 
 
-def make_thumb_response_source(project_id: str, path: str, size: int):
+def make_thumb_response_source(project_id: str, path: str, size: int, series_id: str | None = None):
     """Миниатюра в потоке-воркере: (путь к jpeg | байты заглушки, признак заглушки)."""
     from custom_tools.storybook.studio.errors import StudioError
     from custom_tools.storybook.studio.thumbs import make_thumb
 
+    from custom_tools.storybook.project_paths import series_scope
+    from contextlib import nullcontext
     try:
-        return make_thumb(project_id, path, size)
+        locate_media_file(project_id, path, series_id)
+        with series_scope(project_id, series_id) if series_id is not None else nullcontext():
+            return make_thumb(project_id, path, size)
     except StudioError as exc:
         _raise_http(exc)

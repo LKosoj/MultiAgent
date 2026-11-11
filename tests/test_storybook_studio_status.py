@@ -15,7 +15,9 @@ from custom_tools.storybook.project_paths import (
     acquire_storybook_project_lock,
     release_storybook_project_lock,
 )
-from custom_tools.storybook.studio import capabilities as caps
+from custom_tools.storybook.studio import capabilities as caps, labels
+from custom_tools.storybook.project_paths import series_scope
+from tests.studio_run_fakes import make_series_project
 from tests._storybook_status_fixture import (  # noqa: F401  (autouse-фикстура сброса кэша)
     PROJECT_ID, _fresh_status_cache, status, db_step, hold_lock, list_tree, make_db, make_env, make_final,
     make_provider_jobs, make_shots, touch, write_run_file,
@@ -26,7 +28,9 @@ HOOK_MODULES = ("reports", "shots", "review", "runs")
 
 @pytest.fixture
 def project(tmp_path, monkeypatch):
-    return make_env(tmp_path, monkeypatch)
+    project = make_env(tmp_path, monkeypatch)
+    with series_scope(PROJECT_ID, "main"):
+        yield project
 
 
 @pytest.fixture
@@ -37,7 +41,7 @@ def no_hooks(monkeypatch):
 
 
 def call(**kw):
-    return caps.invoke("project_status", {"project_id": PROJECT_ID, **kw})
+    return caps.invoke("project_status", {"project_id": PROJECT_ID, "series_id": "main", **kw})
 
 
 def steps_of(result):
@@ -61,7 +65,7 @@ def test_empty_project(project, no_hooks):
     before = list_tree(project)
     result = call()
     assert result["status"] == "success"
-    assert [s["order"] for s in result["steps"]] == list(range(1, 37))
+    assert [s["order"] for s in result["steps"]] == list(range(1, len(result["steps"]) + 1))
     assert all(s["state"] in ("not_run", "skipped") for s in result["steps"])
     assert result["next_action"]["code"] == "empty_project"
     assert result["sources"]["runs_db"] == "no_file"
@@ -139,6 +143,7 @@ def test_db_and_run_file_conflict_latest_finished_wins(project, no_hooks, tmp_pa
     write_run_file(project, "story_planner", start=base, end=base + timedelta(seconds=30))
     make_db(tmp_path / "workflow_state.db", [{
         "workflow_id": "sbm_demo_ab12cd34", "status": "failed", "current_step": "story_planner",
+        "context": {"variables": {"project_id": "demo", "series_id": "main"}},
         "step_results": {"story_planner": db_step("failed", base + timedelta(hours=1),
                                                    base + timedelta(hours=1, seconds=20), "сбой БД")},
     }])
@@ -220,7 +225,7 @@ def test_flag_priority_settings_db_brief_default(project, no_hooks, tmp_path):
     status._reset_cache_for_tests()
     make_db(tmp_path / "workflow_state.db", [{
         "workflow_id": "sbm_demo_ab12cd34", "status": "completed",
-        "context": {"variables": {"project_id": "demo", "generate_blockout": True}}}])
+        "context": {"variables": {"project_id": "demo", "series_id": "main", "generate_blockout": True}}}])
     assert call()["flags"]["generate_blockout"] == {"value": True, "source": "db"}
     status._reset_cache_for_tests()
     touch(project, ".studio/run_settings.json", json.dumps({"generate_blockout": False}).encode())
@@ -277,7 +282,7 @@ def test_outdated_hint_ignores_artifacts_only_dependency(project, no_hooks):
 def test_every_step_in_exactly_one_stage():
     ids = [s["id"] for s in status._load_pipeline()["steps"]]
     members = [m for _sid, _title, group in status.STAGES for m in group]
-    assert sorted(members) == sorted(ids) and len(members) == len(set(members)) == 36
+    assert sorted(members) == sorted(ids) and len(members) == len(set(members)) == len(ids)
 
 
 def test_step_markers_cover_runner_artifacts():
@@ -451,6 +456,7 @@ def test_lock_probe_does_not_create_file_or_disturb_holder(project, no_hooks):
 
 def _run_row(wid, run_status, step, steps=None, **extra):
     return {"workflow_id": wid, "status": run_status, "current_step": step,
+            "context": {"variables": {"project_id": "demo", "series_id": "main"}},
             "step_results": steps or {}, **extra}
 
 
@@ -519,20 +525,20 @@ def test_run_text_surface_variants(project, no_hooks, monkeypatch):
         same = call(surface="tk")["active_run"]["text"]
         other = call(surface="react")["active_run"]["text"]
         unknown = call()["active_run"]["text"]
-    assert same == "Идёт: шаг 3 из 36 «План истории», 41 %"
-    assert other == "Идёт в другом приложении (Tk), шаг 3 из 36"
+    assert same == f"Идёт: шаг 3 из {len(labels.STEP_LABELS)} «План истории», 41 %"
+    assert other == f"Идёт в другом приложении (Tk), шаг 3 из {len(labels.STEP_LABELS)}"
     assert unknown == same
 
 
 def test_db_finds_both_id_kinds_and_exact_match_only(project, no_hooks, tmp_path):
-    ctx = {"variables": {"project_id": "demo"}}
+    ctx = {"variables": {"project_id": "demo", "series_id": "main"}}
     rows = [
         _run_row("sbm_demo_ab12cd34", "failed", "a"),
         _run_row("sbm_partial_demo_ab12cd34", "failed", "a"),
         _run_row("workflow_20261101_154134_359ed893", "failed", "a", context=ctx),
-        _run_row("sbm_demo_2_ab12cd34", "failed", "a"),
-        _run_row("sbm_de_o_ab12cd34", "failed", "a"),
-        _run_row("sbm_de%_ab12cd34", "failed", "a"),
+        _run_row("sbm_demo_2_ab12cd34", "failed", "a", context={"variables": {"project_id": "other", "series_id": "main"}}),
+        _run_row("sbm_de_o_ab12cd34", "failed", "a", context={"variables": {"project_id": "other", "series_id": "main"}}),
+        _run_row("sbm_de%_ab12cd34", "failed", "a", context={"variables": {"project_id": "other", "series_id": "main"}}),
         _run_row("workflow_other", "failed", "a", context={"variables": {"project_id": "demo_2"}}),
     ]
     make_db(tmp_path / "workflow_state.db", rows)
@@ -557,7 +563,7 @@ def test_response_has_no_context_or_outputs(project, no_hooks, tmp_path):
     make_db(tmp_path / "workflow_state.db", [_run_row(
         "sbm_demo_ab12cd34", "failed", "story_planner",
         {"story_planner": db_step("failed", base, base + timedelta(seconds=5), "упал")},
-        context={"variables": {"project_id": "demo"}, "api_key": "SECRET-TOKEN-123"})])
+        context={"variables": {"project_id": "demo", "series_id": "main"}, "api_key": "SECRET-TOKEN-123"})])
     text = json.dumps(call(), ensure_ascii=False)
     assert "SECRET-TOKEN-123" not in text and "не должен попасть" not in text
 
@@ -705,17 +711,17 @@ def test_contract(project, no_hooks):
     assert reg["project_status"].access == "read" and reg["project_status_brief"].access == "read"
     make_shots(project, 1, 1)
     json.dumps(call())
-    json.dumps(caps.invoke("project_status_brief", {"project_id": PROJECT_ID}))
-    assert caps.invoke("project_status", {"project_id": ".."})["error"]["code"] == "invalid_argument"
-    assert caps.invoke("project_status", {"project_id": "ghost"})["error"]["code"] == "not_found"
+    json.dumps(caps.invoke("project_status_brief", {"project_id": PROJECT_ID, "series_id": "main"}))
+    assert caps.invoke("project_status", {"project_id": "..", "series_id": "main"})["error"]["code"] == "invalid_argument"
+    assert caps.invoke("project_status", {"project_id": "ghost", "series_id": "main"})["error"]["code"] == "not_found"
     assert call(surface="web")["error"]["code"] == "invalid_argument"
-    assert caps.invoke("project_status_brief", {"project_id": PROJECT_ID,
+    assert caps.invoke("project_status_brief", {"project_id": PROJECT_ID, "series_id": "main",
                                                 "surface": 1})["error"]["code"] == "invalid_argument"
 
 
 def test_brief_shape(project, no_hooks):
     touch(project, "00_brief.json", json.dumps({"title": "Снег"}, ensure_ascii=False).encode())
-    brief = caps.invoke("project_status_brief", {"project_id": PROJECT_ID})
+    brief = caps.invoke("project_status_brief", {"project_id": PROJECT_ID, "series_id": "main"})
     assert brief["project"] == {"id": "demo", "title": "Снег"}
     assert brief["run"]["state"] == "idle" and brief["spend"]["total"] == 0
     assert brief["final_video_exists"] is False and brief["failed_step"] is None
@@ -734,7 +740,7 @@ def test_context_query_timeout_keeps_first_query_results(project, no_hooks, tmp_
     import sqlite3
     make_db(tmp_path / "workflow_state.db", [
         _run_row("sbm_demo_ab12cd34", "failed", "story_planner"),
-        _run_row("workflow_x", "failed", "a", context={"variables": {"project_id": "demo"}}),
+        _run_row("workflow_x", "failed", "a", context={"variables": {"project_id": "demo", "series_id": "main"}}),
     ])
     real_connect = sqlite3.connect
 
@@ -757,7 +763,7 @@ def test_context_query_timeout_keeps_first_query_results(project, no_hooks, tmp_
 
 
 def test_context_query_looks_only_at_latest_rows(project, no_hooks, tmp_path, monkeypatch):
-    ctx = {"variables": {"project_id": "demo"}}
+    ctx = {"variables": {"project_id": "demo", "series_id": "main"}}
     make_db(tmp_path / "workflow_state.db", [
         _run_row("workflow_old", "failed", "a", context=ctx, timestamp="2026-11-01T10:00:00"),
         _run_row("workflow_new", "failed", "a", context=ctx, timestamp="2026-11-02T10:00:00"),
@@ -771,7 +777,7 @@ def test_context_query_looks_only_at_latest_rows(project, no_hooks, tmp_path, mo
 
 
 def test_context_window_not_full_is_complete(project, no_hooks, tmp_path, monkeypatch):
-    ctx = {"variables": {"project_id": "demo"}}
+    ctx = {"variables": {"project_id": "demo", "series_id": "main"}}
     make_db(tmp_path / "workflow_state.db", [
         _run_row("workflow_new", "failed", "a", context=ctx, timestamp="2026-11-02T10:00:00")])
     monkeypatch.setattr(status, "_DB_CONTEXT_ROWS", 5)
@@ -780,7 +786,7 @@ def test_context_window_not_full_is_complete(project, no_hooks, tmp_path, monkey
 
 
 def test_context_window_exactly_full_is_complete(project, no_hooks, tmp_path, monkeypatch):
-    ctx = {"variables": {"project_id": "demo"}}
+    ctx = {"variables": {"project_id": "demo", "series_id": "main"}}
     make_db(tmp_path / "workflow_state.db", [
         _run_row("workflow_new", "failed", "a", context=ctx, timestamp="2026-11-02T10:00:00")])
     monkeypatch.setattr(status, "_DB_CONTEXT_ROWS", 1)
@@ -792,13 +798,13 @@ def test_context_window_exactly_full_is_complete(project, no_hooks, tmp_path, mo
 @pytest.mark.parametrize("ctx_project,owner", [("demo", "demo"), ("partial_demo", "partial_demo"),
                                                (None, None)])
 def test_partial_prefix_ambiguity(project, no_hooks, tmp_path, ctx_project, owner):
-    (project.parent / "partial_demo").mkdir()
-    context = {"variables": {"project_id": ctx_project}} if ctx_project else {}
+    make_series_project(project.parents[2], "partial_demo")
+    context = {"variables": {"project_id": ctx_project, "series_id": "main"}} if ctx_project else {}
     make_db(tmp_path / "workflow_state.db", [
         _run_row("sbm_partial_demo_ab12cd34", "failed", "a", context=context)])
     for pid in ("demo", "partial_demo"):
         status._reset_cache_for_tests()
-        runs = caps.invoke("project_status", {"project_id": pid})["incomplete_runs"]
+        runs = caps.invoke("project_status", {"project_id": pid, "series_id": "main"})["incomplete_runs"]
         assert (runs == ["sbm_partial_demo_ab12cd34"]) is (pid == owner), pid
 
 

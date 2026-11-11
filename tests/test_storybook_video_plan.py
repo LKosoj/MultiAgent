@@ -592,3 +592,207 @@ def test_empty_shot_unit_gets_no_style_image_with_hero(project, monkeypatch):
     assert units[('1-3',)]['style_reference_path'] is None
     assert style not in units[('1-3',)]['reference_image_paths']
     assert str(base / 'hero.png') not in units[('1-3',)]['reference_image_paths']
+
+
+def test_visible_speech_forces_references_only_for_overlapping_face():
+    lines = [dict(id='a', speaker_id='alice', kind='on_screen', start=1, end=3),
+             dict(id='b', speaker_id='bob', kind='off_screen', start=3, end=4)]
+    shot = dict(start_s=0, end_s=5, face_visibility=[
+        dict(speaker_id='alice', start_s=2, end_s=4),
+        dict(speaker_id='bob', start_s=0, end_s=5)])
+    assert vp.visible_speech_lines(shot, lines) == ['a']
+    shot['face_visibility'][0]['start_s'] = 3
+    assert vp.visible_speech_lines(shot, lines) == []
+
+
+def test_reference_request_includes_speech_and_hashes_it(project):
+    base, _ = project
+    ref = base / 'hero.png'
+    Image.new('RGB', (32, 24), 'red').save(ref)
+    audio = base / 'clip.wav'
+    audio.write_bytes(b'first-audio')
+    item = dict(duration_s=4, video_prompt='Speak', reference_image_paths=[str(ref)],
+                speech_audio_path=str(audio), speaker_schedule=[dict(speaker_id='a', start=0, end=2)])
+    payload, _ = vp.reference_request(item, 'model', None)
+    assert payload['generate_audio'] is True
+    assert payload['input_references'][-1]['type'] == 'audio_url'
+    assert 'frame_images' not in payload
+    old = vp.reference_input_hash(item, 'model', None)
+    audio.write_bytes(b'second-audio')
+    assert vp.reference_input_hash(item, 'model', None) != old
+
+
+def test_method_uses_speech_before_model_choice(monkeypatch):
+    item = dict(start_s=1, end_s=5, face_visibility=[dict(speaker_id='alice', start_s=2, end_s=4)])
+    speech = dict(lines=[dict(id='a', speaker_id='alice', kind='on_screen', start=2, end=3)])
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: pytest.fail('model choice must be bypassed'))
+    result = vp._choose_with_speech(item, speech, {})
+    assert result['method'] == 'references'
+    assert result['reason'] == 'visible_speech'
+    assert result['line_ids'] == ['a']
+
+
+def test_planning_forces_visible_speech_and_carries_audio(project, monkeypatch):
+    base, items, _ = planning_setup(project, monkeypatch)
+    (base / '98_audio').mkdir()
+    (base / '98_audio/speech.json').write_text(json.dumps({
+        'status': 'success', 'audio_path': 'speech.wav', 'lines': [dict(id='l1', speaker_id='hero', kind='on_screen', start=2.5, end=4)]}))
+    for item in items:
+        n = item['shot_number']
+        item['start_s'], item['end_s'] = {1: (0, 2), 2: (2, 6), 3: (6, 9)}[n]
+        item['face_visibility'] = [dict(speaker_id='hero', start_s=2, end_s=6)] if n == 2 else []
+    chosen = []
+    def choose(state):
+        chosen.append(state['current']['shot_key'])
+        return {'method': 'keyframes', 'continuity': 'new'}
+    monkeypatch.setattr(vp, 'choose_video_method', choose)
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    plan = json.loads((base / '97_shots/video_plan.json').read_text())
+    assert chosen == ['1-1', '1-3']
+    assert plan['units'][0]['shot_keys'] == ['1-2']
+    assert plan['decisions'][1]['reason'] == 'visible_speech'
+    rendered = vp.apply_video_plan('test', items)
+    clip = next(i for i in rendered if i.get('video_mode') == 'references')
+    assert clip['speech_source_path'].endswith('98_audio/speech.wav')
+    assert clip['speaker_schedule'] == [dict(line_id='l1', speaker_id='hero', kind='on_screen', start=0.5, end=2)]
+
+
+def test_references_keep_default_hero_when_other_has_state(project):
+    base, _ = project
+    item = {'characters': [{'name': 'A', 'reference_image_path': 'a.png'},
+                           {'name': 'B', 'reference_image_path': 'b.png'}],
+            'character_reference_states': {'A': {'reference_image_path': 'a-coat.png'}}}
+    paths = vp._references(base, item)
+    assert 'a-coat.png' in paths
+    assert 'b.png' in paths
+    assert 'a.png' not in paths
+
+
+def test_reference_roles_distinguish_state_and_location(project):
+    base, _ = project
+    item = {'characters': [{'name': 'A', 'reference_image_path': '/references/characters/a.png'},
+                           {'name': 'B', 'reference_image_path': '/references/characters/b.png'}],
+            'character_reference_states': {'A': {'reference_image_path': '/references/characters/a-coat.png'}},
+            'locations': [{'name': 'room', 'reference_image_path': '/references/locations/room.png'}]}
+    refs = vp._references(base, item)
+    roles = vp._reference_roles(base, [item], refs)
+    assert [(r['subject'], r['role']) for r in roles] == [
+        ('A', 'character_state'), ('B', 'character_appearance'), ('room', 'location')]
+
+
+def test_video_planning_workers_keep_series_scope(tmp_path, monkeypatch):
+    from custom_tools.storybook.project_paths import series_scope, safe_storybook_project_dir
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    project = invoke('projects_create', {'title': 'World', 'description': 'A shared world', 'genre': 'fairy', 'target_age': 'all'})['project_id']
+    series = invoke('series_create', {'project_id': project, 'title': 'Story', 'source_material': '', 'participant_ids': [], 'settings': {}})['series_id']
+    base = tmp_path / project / 'series' / series
+    (base / '97_shots').mkdir(exist_ok=True)
+    (base / '98_audio').mkdir(exist_ok=True)
+    (base / '98_audio/speech.json').write_text(json.dumps({'status': 'silent', 'lines': [], 'words': []}))
+    (base / '91_screenplay').mkdir(exist_ok=True)
+    (base / '91_screenplay/screenplay.json').write_text(json.dumps({'screenplay': []}))
+    items = [dict(scene_number=1, shot_number=1, shot_type=phase, duration_s=4,
+                  video_path=str(base / 'clip.mp4'), video_prompt='Run', width=1920, height=1088)
+             for phase in ('start', 'end')]
+    planning_setup((base, items), monkeypatch)
+    seen = []
+    def choose(state):
+        seen.append(safe_storybook_project_dir(project))
+        return {'method': 'keyframes', 'continuity': 'new'}
+    monkeypatch.setattr(vp, 'choose_video_method', choose)
+    with series_scope(project, series):
+        vp.storybook_video_plan_tool('session', project, shots_data={'items': items})
+    assert seen == [base]
+    assert (base / '97_shots/video_plan.json').exists()
+    assert not (tmp_path / project / '97_shots/video_plan.json').exists()
+
+
+def test_plan_splits_long_visible_speech_without_new_shot_keys(project, monkeypatch):
+    from custom_tools.storybook import video_generator_common
+    base, items, _ = planning_setup(project, monkeypatch)
+    monkeypatch.setattr(video_generator_common, '_get_routerai_video_models', lambda: {
+        'alibaba/wan-3.0': {'supports_image_references': True, 'supported_durations': [5], 'max_image_references': 10}})
+    (base / '98_audio').mkdir()
+    (base / '98_audio/speech.json').write_text(json.dumps({'status': 'success', 'audio_path': 'speech.wav',
+        'lines': [dict(id='l', speaker_id='hero', kind='on_screen', start=2, end=9)],
+        'words': [dict(start=2, end=4), dict(start=4.5, end=6), dict(start=6.5, end=9)]}))
+    for item in items:
+        n = item['shot_number']
+        start, end = {1: (0, 2), 2: (2, 10), 3: (10, 13)}[n]
+        item.update(start_s=start, end_s=end, duration_s=end-start,
+                    face_visibility=[dict(speaker_id='hero', start_s=start, end_s=end)] if n == 2 else [])
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'keyframes', 'continuity': 'new'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    unit = json.loads((base / '97_shots/video_plan.json').read_text())['units'][0]
+    assert unit['shot_keys'] == ['1-2']
+    assert unit['speech_parts'][0][0] == 2 and unit['speech_parts'][-1][1] == 10
+    assert all(end-start <= 5 for start, end in unit['speech_parts'])
+    assert len([i for i in vp.apply_video_plan('test', items) if i.get('video_mode') == 'references']) == 1
+
+
+def test_real_speech_manifest_flows_into_video_plan(project, monkeypatch):
+    import io
+    import wave
+    from custom_tools.storybook import speech
+    from custom_tools.storybook.shot_speech_timing import apply_measured_shot_timing
+    base, items, _ = planning_setup(project, monkeypatch)
+    buffer = io.BytesIO()
+    with wave.open(buffer, 'wb') as wav:
+        wav.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(b'\x00\x00' * 8000 * 9)
+    monkeypatch.setattr(speech, '_synthesize', lambda _: buffer.getvalue())
+    monkeypatch.setattr(speech, '_transcribe', lambda *args: [{'text': 'Привет', 'start': 2.5, 'end': 4.0}])
+    speech.prepare_speech(base, 'test', 'series', [dict(
+        id='l1', scene_number=1, shot_number=2, speaker_id='hero', kind='on_screen',
+        text='Привет', voice='test')], 'ru')
+    for item in items:
+        item['face_visibility_relative'] = ([dict(speaker_id='hero', start_fraction=0, end_fraction=1)]
+                                            if item['shot_number'] == 2 else [])
+    items = apply_measured_shot_timing(items, json.loads((base / '98_audio/speech.json').read_text()))
+    monkeypatch.setattr(vp, 'choose_video_method', lambda state: {'method': 'keyframes', 'continuity': 'new'})
+    vp.storybook_video_plan_tool('s', 'test', shots_data={'items': items})
+    clip = next(i for i in vp.apply_video_plan('test', items) if i.get('video_mode') == 'references')
+    assert clip['speaker_schedule'][0]['line_id'] == 'l1'
+    for ref in clip['reference_image_paths']:
+        Image.new('RGB', (16, 16)).save(ref)
+    payload, _ = vp.reference_request(clip, 'alibaba/wan-3.0', None)
+    assert [entry['type'] for entry in payload['input_references']][-1] == 'audio_url'
+
+
+def test_speaker_switch_one_clip_preserves_schedule_and_audio(project):
+    import base64
+    base, _ = project
+    image = base / 'both.png'
+    Image.new('RGB', (16, 16)).save(image)
+    audio = base / 'speech.wav'
+    audio.write_bytes(b'the-original-clip')
+    lines = [dict(id='a', speaker_id='alice', kind='on_screen', start=.3, end=1),
+             dict(id='b', speaker_id='bob', kind='on_screen', start=1.5, end=2.5)]
+    shot = dict(scene_number=1, shot_number=1, start_s=0, end_s=3, duration_s=3,
+                face_visibility=[dict(speaker_id='alice', start_s=0, end_s=3), dict(speaker_id='bob', start_s=0, end_s=3)],
+                video_prompt='A conversation', reference_image_paths=[str(image)], speech_audio_path=str(audio),
+                speaker_schedule=lines)
+    assert vp._choose_with_speech(shot, {'lines': lines}, {})['line_ids'] == ['a', 'b']
+    body, _ = vp.reference_request(shot, 'model', None)
+    assert 'alice' in body['prompt'] and 'bob' in body['prompt']
+    assert base64.b64decode(body['input_references'][-1]['audio_url']['url'].split(',')[1]) == audio.read_bytes()
+    assert 'frame_images' not in body
+
+
+def test_fingerprint_changes_with_series_settings(tmp_path, monkeypatch):
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    monkeypatch.setenv('STORYBOOK_PROJECTS_DIR', str(tmp_path))
+    pid = invoke('projects_create', {'title':'World', 'description':'A shared world', 'genre':'fairy', 'target_age':'all'})['project_id']
+    sid = invoke('series_create', {'project_id':pid, 'title':'Series', 'source_material':'', 'participant_ids':[], 'settings':{}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    settings = base / '.studio/run_settings.json'
+    settings.parent.mkdir(exist_ok=True)
+    settings.write_text(json.dumps({'video': {'provider':'routerai', 'model':'first'}}))
+    item = dict(scene_number=1, shot_number=1, shot_type='start', duration_s=2)
+    with series_scope(pid, sid):
+        first = vp._fingerprint([item], base=base, project_id=pid)
+        settings.write_text(json.dumps({'video': {'provider':'routerai', 'model':'second'}}))
+        second = vp._fingerprint([item], base=base, project_id=pid)
+    assert first != second

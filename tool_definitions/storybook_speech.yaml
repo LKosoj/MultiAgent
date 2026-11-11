@@ -1,0 +1,26 @@
+name: storybook_speech_tool
+description: Generate original series speech and retain measured word and line timing without resynthesizing unchanged paid audio
+category: storybook
+source_type: custom_function
+implementation_source: custom_tools.storybook.speech.storybook_speech_tool
+parameters:
+  - name: session_id
+    type: str
+    description: Execution trace identifier
+    required: true
+  - name: project_id
+    type: str
+    description: Persistent project identifier
+    required: true
+  - name: series_id
+    type: str
+    description: Series identifier within the project
+    required: true
+  - name: language
+    type: str
+    description: Series speech language
+    required: false
+  - name: enable
+    type: bool
+    description: Generate speech and measured timing when enabled
+    required: false

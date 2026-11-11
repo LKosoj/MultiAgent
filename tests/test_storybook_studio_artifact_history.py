@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.project_paths import acquire_storybook_project_lock, release_storybook_project_lock
 from custom_tools.storybook.studio import artifacts as art
 from custom_tools.storybook.studio import capabilities as caps
@@ -24,12 +27,13 @@ def _fixture(key):
 def project(tmp_path, monkeypatch):
     art._SNAPSHOTS.clear()
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
-    return tmp_path / "demo"
+    series = make_series_project(tmp_path)
+    with series_scope("demo", "main"):
+        yield series
 
 
 def _call(cap, **payload):
-    return caps.invoke(cap, {"project_id": "demo", **payload})
+    return caps.invoke(cap, {"project_id": "demo", "series_id": "main", **payload})
 
 
 def _path(project, key):

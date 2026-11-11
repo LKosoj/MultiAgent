@@ -20,7 +20,7 @@ export type StorybookClientApi = {
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
 };
 
-export const useStorybookClient = (runServiceAction: RunServiceAction, backendUrl: string): StorybookClientApi => {
+export const useStorybookClient = (runServiceAction: RunServiceAction, backendUrl: string, seriesId?: string): StorybookClientApi => {
   const [epoch, setEpoch] = useState(0);
   const actionRef = useRef(runServiceAction);
   useEffect(() => {
@@ -34,10 +34,10 @@ export const useStorybookClient = (runServiceAction: RunServiceAction, backendUr
       return createStorybookClient(
         // trackPending:false - опрос не должен делать всё приложение «занятым»
         (action, payload, opts) => actionRef.current(action, payload, { ...opts, trackPending: false }),
-        { apiBase: apiBaseFromAgentUrl(backendUrl) },
+        { apiBase: apiBaseFromAgentUrl(backendUrl), seriesId },
       );
     },
-    [backendUrl, epoch],
+    [backendUrl, epoch, seriesId],
   );
 
   const resetClient = useCallback(() => setEpoch((n) => n + 1), []);

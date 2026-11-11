@@ -11,6 +11,7 @@ import { RunIndicator } from "./RunIndicator";
 
 type Props = {
   projectId: string | null;
+  seriesId?: string;
   brief: ProjectStatusBrief | null;
   offline: boolean;
   onOpenPalette: () => void;
@@ -26,6 +27,7 @@ type Props = {
 // Верхняя полоса: проект, этап, прогон, траты, Пауза/Стоп. Без проекта не показывается.
 export function StorybookTopBar({
   projectId,
+  seriesId,
   brief,
   offline,
   onOpenPalette,
@@ -39,7 +41,7 @@ export function StorybookTopBar({
   const [busy, setBusy] = useState(false);
   const [stopError, setStopError] = useState<string | null>(null);
   if (!projectId) return null;
-  const title = brief?.project.title || projectId;
+  const title = brief?.project.title || seriesId || projectId;
   const view = runControlView(brief?.run.state);
   // в кратком статусе нет флага resumable: продолжать есть что, если прогон прерван или известен упавший шаг
   const resumable = brief?.run.state === "interrupted" || !!brief?.failed_step;
@@ -64,7 +66,7 @@ export function StorybookTopBar({
   return (
     <div className="sb-top" role="region" aria-label="Состояние проекта">
       <button type="button" className="button ghost" onClick={onOpenProjects} title={T.linkProjects}>
-        {T.topProject} {title}
+        {seriesId ? "Серия:" : T.topProject} {title}
       </button>
       <button type="button" className="button ghost" onClick={onOpenPalette} title={T.paletteButton} aria-label={T.paletteButton}>
         ⌕

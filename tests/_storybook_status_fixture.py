@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from custom_tools.storybook.studio import capabilities
+from tests.studio_run_fakes import make_series_project
 
 PROJECT_ID = "demo"
 
@@ -66,8 +67,7 @@ def _fresh_status_cache():
 def make_env(tmp_path: Path, monkeypatch) -> Path:
     """Корень проектов и путь к базе прогонов (файла базы ещё нет). -> папка проекта demo."""
     root = tmp_path / "plots" / "storybooks"
-    project = root / PROJECT_ID
-    project.mkdir(parents=True)
+    project = make_series_project(root, PROJECT_ID)
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(root))
     monkeypatch.setenv("STORYBOOK_WORKFLOW_DB", str(tmp_path / "workflow_state.db"))
     return project
@@ -117,7 +117,7 @@ def make_shots(project: Path, n_scenes: int = 2, per_scene: int = 2, with_images
     """shots.json из пар start/end и файлы-заглушки у первых with_images/with_videos шотов."""
     items, keys = [], []
     index = 0
-    prefix = f"plots/storybooks/{project.name}" if relative_paths else str(project)
+    prefix = f"plots/storybooks/{PROJECT_ID}/series/main" if relative_paths else str(project)
     total = n_scenes * per_scene
     with_images = total if with_images is None else with_images
     with_videos = total if with_videos is None else with_videos

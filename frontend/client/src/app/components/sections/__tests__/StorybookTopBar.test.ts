@@ -25,6 +25,10 @@ describe("StorybookTopBar", () => {
     expect(html).toMatch(/disabled=""[^>]*>Пауза</);
     expect(html).toMatch(/disabled=""[^>]*>Стоп</);
   });
+  it("показывает выбранную серию", () => {
+    const html = renderToStaticMarkup(React.createElement(StorybookTopBar, { ...props, projectId: "p1", seriesId: "s1" }));
+    expect(html).toContain("Серия: s1");
+  });
   it("«Запустить заново» отключена, пока прогона нет", () => {
     const html = renderToStaticMarkup(React.createElement(StorybookTopBar, { ...props, projectId: "p1" }));
     expect(html).toMatch(/disabled=""[^>]*title="Прогон ещё не запускался"[^>]*>Запустить заново</);

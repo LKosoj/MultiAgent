@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from custom_tools.storybook import project_paths
-from custom_tools.storybook.studio.project_store import is_service_dir
+from custom_tools.storybook.studio.project_store import is_service_dir, is_series_project
 
 
 def _has_shot_video(project_path: Path) -> bool:
@@ -29,6 +29,7 @@ JSON_ARTIFACTS = {
     "style_images": "30_style/style_images.json",
     "screenplay": "91_screenplay/screenplay.json",
     "shots": "97_shots/shots.json",
+    "video_plan": "97_shots/video_plan.json",
     "provider_jobs": "97_shots/provider_jobs.json",
     "chains": "93_blockout/chains.json",
     "scene_spec": "93_blockout/scene_spec.json",
@@ -57,7 +58,8 @@ VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".ogg"}
 
 
-def storybook_project_inventory(project_id: str | None = None, max_items: int = 20) -> dict[str, Any]:
+def storybook_project_inventory(project_id: str | None = None, max_items: int = 20,
+                                series_id: str | None = None) -> dict[str, Any]:
     """Return a read-only inventory shared by StoryBookManager, React, and Streamlit."""
     projects_dir = project_paths.storybook_projects_root()
     projects = [_project_preview(path, include_size=False) for path in _iter_projects(projects_dir)]
@@ -70,10 +72,17 @@ def storybook_project_inventory(project_id: str | None = None, max_items: int = 
         "selected_project": None,
     }
 
-    selected_path = project_paths.safe_storybook_project_dir(project_id, must_exist=True) if project_id else None
+    selected_path = None
+    if project_id:
+        project_id = project_paths.require_safe_storybook_project_id(project_id)
+        from custom_tools.storybook.studio.project_store import _project_path
+        selected_path = _project_path(projects_dir, project_id)
+        if series_id:
+            from custom_tools.storybook.studio.series import series_dir
+            selected_path = series_dir(project_id, series_id)
     if selected_path is not None:
         payload["selected_project"] = {
-            "preview": _project_preview(selected_path, include_size=True),
+            "preview": _project_preview(selected_path, include_size=True, project_id=project_id),
             "artifacts": _artifact_inventory(selected_path),
             "media": _media_inventory(selected_path, max_items=max_items),
         }
@@ -83,13 +92,14 @@ def storybook_project_inventory(project_id: str | None = None, max_items: int = 
 def _iter_projects(projects_dir: Path) -> list[Path]:
     if not projects_dir.exists():
         return []
-    projects = [path for path in projects_dir.iterdir() if path.is_dir() and not is_service_dir(path.name)]
+    projects = [path for path in projects_dir.iterdir() if path.is_dir() and not is_service_dir(path.name)
+                and is_series_project(path)]
     projects.sort(key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
     return projects
 
 
-def _project_preview(project_path: Path, include_size: bool) -> dict[str, Any]:
-    brief = _read_json(project_path / "00_brief.json") or {}
+def _project_preview(project_path: Path, include_size: bool, project_id: str | None = None) -> dict[str, Any]:
+    brief = _read_json(project_path / ("project.json" if (project_path / "project.json").is_file() else "00_brief.json")) or {}
     story = _read_json(project_path / "20_story" / "story.json") or {}
     images_dir = project_path / "50_images"
     thumbnail = None
@@ -99,7 +109,7 @@ def _project_preview(project_path: Path, include_size: bool) -> dict[str, Any]:
             thumbnail = _relative_path(project_path, first_image)
 
     return {
-        "project_id": project_path.name,
+        "project_id": project_id or project_path.name,
         "name": str(brief.get("title") or project_path.name),
         "description": str(brief.get("description") or "")[:200],
         "language": brief.get("language"),

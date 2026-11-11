@@ -53,6 +53,7 @@ type Args = {
   background: BackgroundQueue;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  storageId?: string;
   enabled: boolean;
   runState: string | undefined;
   intent: NavIntent | null;
@@ -68,10 +69,10 @@ const browserStorage = (): StorageLike | null => {
   }
 };
 
-export const useShotsList = ({ client, background, runUser, projectId, enabled, runState, intent }: Args): ShotsListApi => {
+export const useShotsList = ({ client, background, runUser, projectId, storageId = projectId, enabled, runState, intent }: Args): ShotsListApi => {
   // начальные фильтры: переход из «Обзора» важнее сохранённых
   const [initial] = useState(() => {
-    const prefs = loadPrefs(browserStorage(), projectId);
+    const prefs = loadPrefs(browserStorage(), storageId);
     const fromIntent = intent && intent.filter !== undefined && intent.shotKey == null;
     const reset = intent && intent.shotKey != null;
     return {
@@ -110,8 +111,8 @@ export const useShotsList = ({ client, background, runUser, projectId, enabled, 
 
   // настройки экрана запоминаем
   useEffect(() => {
-    savePrefs(browserStorage(), projectId, { filters: { ...filters, predicate: null }, mode, selected });
-  }, [projectId, filters, mode, selected]);
+    savePrefs(browserStorage(), storageId, { filters: { ...filters, predicate: null }, mode, selected });
+  }, [storageId, filters, mode, selected]);
 
   const fetchPage = useCallback(
     (offset: number, f: ShotsUiFilters) =>

@@ -3,6 +3,7 @@ import json
 import pytest
 
 from custom_tools.storybook import project_paths, storybook_surface
+from tests.studio_run_fakes import make_series_project
 
 
 def test_storybook_projects_root_prefers_env_over_cwd(tmp_path, monkeypatch):
@@ -47,7 +48,7 @@ def test_safe_storybook_project_dir_rejects_unsafe_project_id(tmp_path, monkeypa
 
 def test_storybook_project_inventory_lists_projects_artifacts_and_media(tmp_path, monkeypatch):
     projects_dir = tmp_path / "storybooks"
-    project_dir = projects_dir / "demo"
+    project_dir = make_series_project(projects_dir)
     (project_dir / "20_story").mkdir(parents=True)
     (project_dir / "50_images" / "page_1").mkdir(parents=True)
     (project_dir / "97_shots" / "scene_1").mkdir(parents=True)
@@ -75,7 +76,7 @@ def test_storybook_project_inventory_lists_projects_artifacts_and_media(tmp_path
 
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_dir))
 
-    result = storybook_surface.storybook_project_inventory("demo")
+    result = storybook_surface.storybook_project_inventory("demo", series_id="main")
 
     assert result["projects_count"] == 1
     assert result["projects"][0]["project_id"] == "demo"
@@ -104,7 +105,7 @@ def test_storybook_project_inventory_rejects_path_escape(tmp_path, monkeypatch):
 def test_json_artifacts_registers_blockout_files(tmp_path, monkeypatch):
     """ТЗ раздел 18.9: серверный реестр видит chains/scene_spec/asset_map."""
     projects_dir = tmp_path / "storybooks"
-    project_dir = projects_dir / "demo"
+    project_dir = make_series_project(projects_dir)
     (project_dir / "93_blockout").mkdir(parents=True)
     (project_dir / "93_blockout" / "chains.json").write_text("{}", encoding="utf-8")
     (project_dir / "93_blockout" / "scene_spec.json").write_text("{}", encoding="utf-8")
@@ -112,7 +113,7 @@ def test_json_artifacts_registers_blockout_files(tmp_path, monkeypatch):
 
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_dir))
 
-    result = storybook_surface.storybook_project_inventory("demo")
+    result = storybook_surface.storybook_project_inventory("demo", series_id="main")
 
     artifacts = result["selected_project"]["artifacts"]
     assert artifacts["chains"]["path"] == "93_blockout/chains.json"
@@ -126,7 +127,7 @@ def test_media_inventory_sees_blockout_preview_but_not_frames(tmp_path, monkeypa
     93_blockout — иначе рекурсивный rglob('*') обойдёт тысячи файлов frames/
     на каждый inventory-запрос."""
     projects_dir = tmp_path / "storybooks"
-    project_dir = projects_dir / "demo"
+    project_dir = make_series_project(projects_dir)
     preview_dir = project_dir / "93_blockout" / "preview"
     preview_dir.mkdir(parents=True)
     (preview_dir / "blockout_all.mp4").write_bytes(b"mp4")
@@ -141,7 +142,7 @@ def test_media_inventory_sees_blockout_preview_but_not_frames(tmp_path, monkeypa
 
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(projects_dir))
 
-    result = storybook_surface.storybook_project_inventory("demo")
+    result = storybook_surface.storybook_project_inventory("demo", series_id="main")
 
     media = result["selected_project"]["media"]
     paths = {item["path"] for item in media["items"]}

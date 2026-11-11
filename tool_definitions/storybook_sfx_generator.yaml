@@ -4,6 +4,10 @@ category: storybook
 source_type: custom_function
 implementation_source: custom_tools.storybook.sfx_generator.storybook_sfx_generator_tool
 parameters:
+  - name: series_id
+    type: str
+    description: Series identifier within the project
+    required: true
   - name: session_id
     type: str
     description: "Execution session identifier"

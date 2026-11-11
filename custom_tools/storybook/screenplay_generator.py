@@ -201,7 +201,7 @@ def _generate_storyboard_for_scene_llm(
 - Ты НЕ меняешь concept/characters/world_description/director_notes.
 - Ты НЕ меняешь action/dialogue/camera/sound/transition сцен.
 - Ты меняешь ТОЛЬКО storyboard у target-сцены (по номеру scene_number).
-- Если у сцены есть voiceover, распредели его дословно между кадрами в поле voiceover без повторов и пропусков. Для кадра без речи voiceover="". Описание видимого действия остаётся в description.
+- Если у сцены есть voiceover, распредели его дословно между кадрами в поле voiceover без повторов и пропусков. Для кадра без речи voiceover="". Каждой части дай уникальный voiceover_id и voiceover_order — её место среди всех частей voiceover и dialogue сцены; в dialogue_ids кадра перечисли id принадлежащих ему реплик. В pause_before/pause_after укажи только нужные паузы в секундах. Описание видимого действия остаётся в description.
 - storyboard.description — детализация action этой сцены:
   - МОЖНО добавлять локальные детали реализации (механика/реквизит/микроблокинг, напр. ремень/верёвка/как удерживается герой),
     если это НЕ меняет причинно-следственный смысл и не вводит новый сюжетный бит.
@@ -217,11 +217,12 @@ def _generate_storyboard_for_scene_llm(
   `location_canon_name` (override) — и оно ДОЛЖНО быть СТРОГО из списка BIBLE_LOCATION_NAMES.
 - Запрещено писать в `location_canon_name` варианты с "ИНТ/ЭКСТ", временем суток, слэшами или комбинированные заголовки.
 
+Для каждого кадра укажи face_visibility_relative: список лиц видимых персонажей со стабильными speaker_id и start_fraction/end_fraction от 0 до 1 относительно начала и конца кадра. Для отсутствия лиц верни пустой список; не считай присутствие персонажа видимостью лица. Укажи привязку реплик к shot_number.
 Выход: Верни JSON:
 {
   "scene_number": 1,
   "storyboard": [
-    { "shot_number": 1, "camera_plan": "EXTREME CLOSE-UP", "description": "конкретно что видно в кадре", "voiceover": "дословный закадровый текст этого кадра или пустая строка", "timing": "00:02", "location_canon_name": "optional override from BIBLE_LOCATION_NAMES" }
+    { "face_visibility_relative": [], "dialogue_ids": [], "voiceover_id": "scene1-voice1", "voiceover_order": 1, "pause_before": 0, "pause_after": 0, "shot_number": 1, "camera_plan": "EXTREME CLOSE-UP", "description": "конкретно что видно в кадре", "voiceover": "дословный закадровый текст этого кадра или пустая строка", "timing": "00:02", "location_canon_name": "optional override from BIBLE_LOCATION_NAMES" }
   ],
   "added_mechanics": ["если добавил детали реализации (верёвка/ремень/т.п.), перечисли коротко"],
   "notes": ["коротко: почему детали совместимы с action"]
@@ -295,6 +296,55 @@ def _reconcile_scene_action_and_storyboard_llm(
         raise ValueError("Scene reconciliation must return nonempty scene_continuity_facts")
     return data
 
+def _ensure_speech_ids(screenplay):
+    """Assign identifiers once; subsequent edits preserve existing identifiers."""
+    import uuid
+    for scene in screenplay.get('screenplay', []):
+        if scene.get('voiceover') and not scene.get('voiceover_id'):
+            scene['voiceover_id'] = uuid.uuid4().hex
+        for shot in scene.get('storyboard', []):
+            if shot.get('voiceover') and not shot.get('voiceover_id'):
+                shot['voiceover_id'] = uuid.uuid4().hex
+        for line in scene.get('dialogue', []):
+            if line.get('line') and not line.get('id'):
+                line['id'] = uuid.uuid4().hex
+
+
+def _merge_checked_scenes(original, checked):
+    """Apply checked scene fields without losing omitted shots or speech metadata."""
+    by_number = {scene.get('scene_number'): scene for scene in checked if isinstance(scene, dict)}
+    merged = []
+    for scene in original:
+        if not isinstance(scene, dict):
+            continue
+        update = by_number.get(scene.get('scene_number'))
+        if not update:
+            merged.append(scene)
+            continue
+        result = {**scene, **{key: value for key, value in update.items() if key not in ('dialogue', 'storyboard')}}
+        for field, key in (('dialogue', 'id'), ('storyboard', 'shot_number')):
+            source, changes = scene.get(field), update.get(field)
+            if not isinstance(source, list) or not isinstance(changes, list):
+                continue
+            by_key = {entry.get(key): entry for entry in changes if isinstance(entry, dict) and entry.get(key) is not None}
+            combined = []
+            used = set()
+            for index, entry in enumerate(source):
+                if not isinstance(entry, dict):
+                    combined.append(entry)
+                    continue
+                revised = by_key.get(entry.get(key)) if entry.get(key) is not None else None
+                if revised is None and index < len(changes) and isinstance(changes[index], dict) and changes[index].get(key) is None:
+                    revised = changes[index]
+                if revised is not None:
+                    used.add(id(revised))
+                combined.append({**entry, **(revised or {})})
+            combined.extend(entry for entry in changes if id(entry) not in used)
+            result[field] = combined
+        merged.append(result)
+    return merged
+
+
 def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[str, Any]:
     """
     Сжимает screenplay для проверки смыслового соответствия (alignment) без потери ключевых смысловых сигналов.
@@ -356,8 +406,9 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
                 "sound": _clip(sc.get("sound", ""), 800),
                 "transition": _clip(sc.get("transition", ""), 120),
             }
-            if "voiceover" in sc:
-                compact_sc["voiceover"] = sc["voiceover"]
+            for field in ("voiceover", "voiceover_id", "voiceover_order", "pause_before", "pause_after", "silence_duration"):
+                if field in sc:
+                    compact_sc[field] = sc[field]
             # dialogue
             dlg = sc.get("dialogue")
             if isinstance(dlg, list):
@@ -368,10 +419,13 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
                     compact_dlg.append(
                         {
                             "character": d.get("character", ""),
-                            "line": _clip(d.get("line", ""), 300),
+                            "line": d.get("line", ""),
                             "direction": _clip(d.get("direction", ""), 200),
                         }
                     )
+                    for field in ("id", "order", "shot_number", "speaker_id", "kind", "pause_before", "pause_after"):
+                        if field in d:
+                            compact_dlg[-1][field] = d[field]
                 compact_sc["dialogue"] = compact_dlg
             else:
                 compact_sc["dialogue"] = []
@@ -380,7 +434,7 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
             sb = sc.get("storyboard")
             if isinstance(sb, list):
                 compact_sb = []
-                for sh in sb[:8]:  # не больше 8 кадров на сцену для проверки
+                for sh in sb:
                     if not isinstance(sh, dict):
                         continue
                     compact_sb.append(
@@ -391,8 +445,9 @@ def _compact_screenplay_for_alignment(screenplay_json: Dict[str, Any]) -> Dict[s
                             "timing": sh.get("timing", ""),
                         }
                     )
-                    if "voiceover" in sh:
-                        compact_sb[-1]["voiceover"] = sh["voiceover"]
+                    for field in ("voiceover", "voiceover_id", "voiceover_order", "pause_before", "pause_after", "dialogue_ids", "face_visibility_relative"):
+                        if field in sh:
+                            compact_sb[-1][field] = sh[field]
                 compact_sc["storyboard"] = compact_sb
             else:
                 compact_sc["storyboard"] = []
@@ -916,6 +971,10 @@ SFX: Отдельно заполни поле sfx для генерации зв
 8.  Работа с целевой аудиторией: Как сценарий адаптирован для выбранной аудитории? Будет ли он интересен и понятен другим зрителям? За счет чего?
 9.  Обоснование качества (Ключевой пункт!): Объясни, почему получившийся сценарий является качественным с точки зрения логики повествования (причинно-следственные связи), эмоционального воздействия и драматургической герметичности. Докажи с примерами из сценария (сцены X-Y), что история работает как единый, целостный механизм, где нет ничего лишнего.
 
+Для sfx указывай отдельные события действия или атмосферы; в сцене без нужных звуков sfx — пустой список. Для каждого события укажи id, действие, shot_number и при привязке к реплике line_id; не выдумывай секунды начала. Описывай эффекты без речи и музыки.
+
+В каждой сцене дай каждой реплике неизменяемый уникальный id и order по порядку звучания вместе с voiceover; shot_number связывает реплику с кадром. pause_before и pause_after — осмысленные паузы в секундах, silence_duration — длительность немой сцены. Текст реплик не подменяй указаниями подачи.
+
 Верни результат в формате JSON со следующими полями (без дополнительных ключей):
 {
   "concept": {
@@ -948,11 +1007,14 @@ SFX: Отдельно заполни поле sfx для генерации зв
       "action": "Описание действия",
       "characters": ["Список персонажей"],
       "voiceover": "Дословный закадровый текст сцены, если он предусмотрен заданием, иначе пустая строка",
+      "voiceover_id": "scene1-narrator", "voiceover_order": 1,
+      "silence_duration": 0,
       "dialogue": [
         {
+          "id": "scene1-line1", "order": 2, "shot_number": 1,
           "character": "Имя персонажа",
           "line": "Текст реплики",
-          "direction": "Указание интонации"
+          "direction": "Указание интонации", "pause_before": 0, "pause_after": 0
         }
       ],
       "storyboard": [
@@ -967,7 +1029,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
       ],
       "camera": "Описание движения камеры",
       "sound": "Звуковые эффекты и музыка",
-      "sfx": {"prompt": "Звуки сцены по порядку, без музыки и речи"},
+      "sfx": [{"id": "scene1-effect1", "kind": "action", "action_id": "описание действия", "shot_number": 1, "line_id": "scene1-line1", "prompt": "один звук без музыки и речи", "duration": 1, "level": 0.4}],
       "transition": "Переход"
     }
   ],
@@ -1059,7 +1121,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
         ).get("screenplay_json")
         if not isinstance(checked, dict) or not checked.get("screenplay"):
             raise ValueError("screenplay_generator: проверка исходного сценария не вернула сцены")
-        screenplay_data["screenplay"] = checked["screenplay"]
+        screenplay_data["screenplay"] = _merge_checked_scenes(screenplay_data["screenplay"], checked["screenplay"])
     if str(brief_data.get("language") or "ru").lower().startswith("ru"):
         _repair_mixed_script_fields(screenplay_data)
 
@@ -1132,7 +1194,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
             screenplay_outline=outline,
             scene=sc,
         )
-        reconciled.append(reconciled_scene if isinstance(reconciled_scene, dict) else sc)
+        reconciled.append(_merge_checked_scenes([sc], [reconciled_scene])[0] if isinstance(reconciled_scene, dict) else sc)
     screenplay_data["screenplay"] = reconciled
 
     try:
@@ -1189,7 +1251,7 @@ SFX: Отдельно заполни поле sfx для генерации зв
             # Чтобы не терять богатые разделы (director_notes, animation и т.п.),
             # мы применяем правки ТОЛЬКО к сценам (и, опционально, к мировому описанию),
             # сохраняя остальную структуру "как сгенерировано".
-            screenplay_data["screenplay"] = repaired.get("screenplay")
+            screenplay_data["screenplay"] = _merge_checked_scenes(screenplay_data["screenplay"], repaired.get("screenplay"))
             if isinstance(repaired.get("world_description"), str) and repaired.get("world_description").strip():
                 screenplay_data["world_description"] = repaired.get("world_description")
 
@@ -1214,6 +1276,8 @@ SFX: Отдельно заполни поле sfx для генерации зв
         _repair_mixed_script_fields(screenplay_data)
 
     _refresh_location_bindings(screenplay_data, bible_data.get("locations", []))
+
+    _ensure_speech_ids(screenplay_data)
 
     # M-7: атомарная кросс-процессная запись финального сценария (flock + tmp + os.replace).
     # flock на sidecar `{path}.lock` (НЕ подменяется): флок на самом screenplay_path

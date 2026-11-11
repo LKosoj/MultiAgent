@@ -16,7 +16,7 @@ def test_bible_builder_partial_rebuild_preserves_existing_outputs(tmp_path, monk
     (base / "00_brief.json").write_text(
         json.dumps({"storybook_prompt": "Neutral brief"}), encoding="utf-8"
     )
-    characters_bytes = b'{"accepted":"characters"}\n'
+    characters_bytes = b'[{"name":"accepted character"}]\n'
     rules_bytes = b'[{"rule":"accepted rules"}]\n'
     (bible / "characters.json").write_bytes(characters_bytes)
     (bible / "consistency_rules.json").write_bytes(rules_bytes)

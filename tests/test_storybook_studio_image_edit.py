@@ -13,6 +13,8 @@ from PIL import Image
 
 from custom_tools.storybook.studio import capabilities as caps
 from tests.test_storybook_studio_shots import PID, build
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
 
 IE = "custom_tools.storybook.studio.image_edit"
 PROMPT = "сделай небо розовым"
@@ -29,7 +31,7 @@ def png(color=(200, 10, 10)) -> bytes:
 
 
 def call(cap, **payload):
-    return caps.invoke(cap, {"project_id": PID, **payload})
+    return caps.invoke(cap, {"project_id": PID, "series_id": "main", **payload})
 
 
 def bad(cap, **payload):
@@ -45,8 +47,7 @@ def reason(err):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / PID
-    root.mkdir()
+    root = make_series_project(tmp_path, PID)
     build(root)
     (root / "50_images" / "page_001").mkdir(parents=True)
     (root / "50_images" / "page_001" / "a.png").write_bytes(png())
@@ -58,7 +59,8 @@ def project(tmp_path, monkeypatch):
     (root / "20_bible" / "ref.png").write_bytes(png())
     importlib.import_module("custom_tools.storybook.studio.shots")._CACHE.clear()
     importlib.import_module("custom_tools.storybook.studio._shots_fp")._STORE_CACHE.clear()
-    return root
+    with series_scope(PID, "main"):
+        yield root
 
 
 @pytest.fixture
@@ -483,7 +485,7 @@ def test_locked_project_start(project, price, tool):
     finally:
         rg().release_lock(handle)
     assert tool["calls"] == []
-    jobs_dir = project.parent / ".studio_jobs"
+    jobs_dir = project.parents[2] / ".studio_jobs"
     assert not jobs_dir.exists() or not list(jobs_dir.glob("*.json"))
 
 

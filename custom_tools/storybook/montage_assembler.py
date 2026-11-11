@@ -142,8 +142,8 @@ def montage_assembler_tool(
         else:
             warnings.append(message)
 
-    render_tracks = [track for track in audio_artifacts["audio_tracks"] if track["role"] != "sfx"]
-    sfx_tracks = [track for track in audio_artifacts["audio_tracks"] if track["role"] == "sfx"]
+    render_tracks = [track for track in audio_artifacts["audio_tracks"] if track.get("enabled", True)]
+    sfx_tracks = [track for track in render_tracks if track["role"] == "sfx"]
     usable_audio_tracks = [track for track in render_tracks if track["exists"]]
     audio_required = _audio_required({**audio_artifacts, "audio_tracks": render_tracks})
     if not usable_audio_tracks and audio_required and not allow_missing_audio:
@@ -473,6 +473,9 @@ def _extract_audio_tracks(manifest: Dict[str, Any], audio_dir: Path) -> List[Dic
         track_path, path_allowed = _resolve_audio_path(str(path), audio_dir)
         tracks.append(
             {
+                **({key: track[key] for key in ("offset_seconds", "duration_seconds", "source_start_seconds",
+                                               "level", "enabled", "event_id") if key in track}
+                   if isinstance(track, dict) else {}),
                 "index": index,
                 "role": role,
                 "scene_number": track.get("scene_number") if isinstance(track, dict) else None,

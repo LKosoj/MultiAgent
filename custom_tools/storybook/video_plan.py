@@ -1,8 +1,13 @@
 """Choose video generation per continuous fragment; keep image storyboards intact."""
+import contextvars
 import hashlib
+import io
 import json
+import math
 import os
 import shutil
+import subprocess
+import wave
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -13,6 +18,133 @@ from .project_paths import safe_storybook_project_dir
 from .video_budget import reserve_budget
 from .video_generator_common import parse_duration_seconds_from_timing
 from .video_prompt_rules import VIDEO_PROMPT_RULES, finalize_video_prompt
+
+
+def _load_speech_for_planning(project_id, base):
+    """Require the existing speech result for a public series before planning."""
+    from .project_paths import current_series_scope
+    scope = current_series_scope()
+    public_series = bool(scope and scope[0] == project_id)
+    if not public_series and (base / 'project.json').is_file():
+        project = json.loads((base / 'project.json').read_text(encoding='utf-8'))
+        if project.get('format') == 'storybook-series-v1':
+            raise ValueError('Выберите серию перед подготовкой кадров и видео')
+    path = base / '98_audio/speech.json'
+    if not path.is_file():
+        if public_series:
+            raise ValueError('Речь серии не подготовлена: сначала подготовьте речь')
+        return None
+    try:
+        speech = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise ValueError('Речь серии не читается: подготовьте речь заново') from exc
+    if not isinstance(speech, dict) or speech.get('status') not in ('success', 'silent'):
+        raise ValueError('Речь устарела: подготовьте речь заново')
+    if public_series:
+        lines, words = speech.get('lines'), speech.get('words')
+        if not isinstance(lines, list) or not isinstance(words, list):
+            raise ValueError('Речь серии не готова: подготовьте речь заново')
+        try:
+            from .speech import screenplay_lines
+            from .studio.series import resolve_snapshot
+            from .studio.errors import StudioError
+            screenplay = json.loads((base / '91_screenplay/screenplay.json').read_text(encoding='utf-8'))
+            if not isinstance(screenplay, dict) or not isinstance(screenplay.get('screenplay'), list):
+                raise ValueError('Неверный сценарий')
+            if any(not isinstance(scene, dict) or 'scene_number' not in scene for scene in screenplay['screenplay']):
+                raise ValueError('Неверная сцена')
+            snapshot = resolve_snapshot(*scope)
+            if not isinstance(snapshot, dict):
+                raise ValueError('Неверный снимок серии')
+            script_lines = screenplay_lines(screenplay, snapshot)
+            if speech['status'] == 'silent' and (lines or words or script_lines):
+                raise ValueError('Сценарий содержит речь')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError, StudioError) as exc:
+            raise ValueError('Речь серии не соответствует сценарию: подготовьте речь заново') from exc
+        if speech['status'] == 'success':
+            duration = speech.get('duration')
+            def valid_time(value):
+                return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            if not valid_time(duration) or duration <= 0:
+                raise ValueError('Речь серии не готова: подготовьте речь заново')
+            def valid_interval(item, allow_equal=False):
+                if not isinstance(item, dict):
+                    return False
+                start, end = item.get('start'), item.get('end')
+                return (valid_time(start) and valid_time(end) and 0 <= start <= end <= duration
+                        and (allow_equal or start < end))
+            valid_lines = all(valid_interval(line) and isinstance(line.get('id'), str) and line['id']
+                              and isinstance(line.get('speaker_id'), str) and line['speaker_id']
+                              and line.get('kind') in ('on_screen', 'off_screen', 'narrator')
+                              and isinstance(line.get('scene_number'), int) and not isinstance(line['scene_number'], bool)
+                              and isinstance(line.get('shot_number'), int) and not isinstance(line['shot_number'], bool)
+                              for line in lines)
+            valid_words = all(valid_interval(word, allow_equal=True) and isinstance(word.get('text'), str)
+                              and isinstance(word.get('line_id'), str) for word in words)
+            audio = speech.get('audio_path')
+            if not lines or not words or not valid_lines or not valid_words or not isinstance(audio, str) or not audio or not (base / '98_audio' / audio).is_file():
+                raise ValueError('Речь серии не готова: подготовьте речь заново')
+    return speech
+
+
+def _require_current_video_plan(project_id, base, speech, items, shot_keys=None):
+    """Reject stale speech-dependent plans before a paid video submission."""
+    from .project_paths import current_series_scope
+    scope = current_series_scope()
+    if not scope or scope[0] != project_id or not speech:
+        return
+    path = base / '97_shots/video_plan.json'
+    try:
+        selected = set(shot_keys) if shot_keys is not None else {_key(item) for item in _starts(items)}
+        plan = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+        units = plan.get('units', [])
+        if not isinstance(units, list):
+            raise ValueError('invalid units')
+
+        def carries_speech(item):
+            return bool(item.get('speech_source_path') or item.get('speech_audio_path') or item.get('speaker_schedule'))
+
+        if speech.get('status') == 'silent':
+            if any(carries_speech(unit) and selected.intersection(unit.get('shot_keys', [])) for unit in units):
+                raise ValueError('speech unit in silent series')
+            if any(_key(item) in selected and carries_speech(item) and
+                   (item.get('video_mode') == 'references' or any(_key(item) in unit.get('shot_keys', []) for unit in units))
+                   for item in _starts(items)):
+                raise ValueError('speech item in silent series')
+            return
+        expected = _shot_intervals(items, speech)
+        stored = {entry['shot_key']: entry for entry in plan['shot_intervals']}
+        for item, interval in zip(_starts(items), expected):
+            key = _key(item)
+            if key not in selected:
+                continue
+            if interval['start_s'] is None or interval['end_s'] is None or stored.get(key) != interval:
+                raise ValueError('outdated shot timing')
+            matching = [unit for unit in units if key in unit.get('shot_keys', [])]
+            if item.get('speech_audio_path') and (matching or item.get('video_mode') == 'references'):
+                raise ValueError('unexpected speech audio override')
+            overlapping = [line for line in speech['lines'] if line['kind'] == 'on_screen'
+                           and line['start'] < item['end_s'] and line['end'] > item['start_s']]
+            if overlapping and not isinstance(item.get('face_visibility'), list):
+                raise ValueError('missing face visibility')
+            visible = visible_speech_lines(item, overlapping) if overlapping else []
+            speech_units = [unit for unit in matching if carries_speech(unit)]
+            raw_speech = (item.get('video_mode') == 'references' or matching) and carries_speech(item)
+            if speech_units or raw_speech:
+                if len(matching) != 1 or len(speech_units) != 1 or not visible:
+                    raise ValueError('outdated speech reference unit')
+                unit = speech_units[0]
+                audio = (base / '98_audio' / speech['audio_path']).resolve()
+                if (unit.get('shot_keys') != [key] or not unit.get('reference_image_paths')
+                        or not unit.get('speech_source_path')
+                        or Path(unit['speech_source_path']).resolve() != audio
+                        or unit.get('speaker_schedule') != interval['speaker_schedule']
+                        or unit.get('start_s') != item['start_s'] or unit.get('end_s') != item['end_s']):
+                    raise ValueError('outdated speech reference unit')
+            elif visible:
+                raise ValueError('missing reference unit')
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ValueError('План видео устарел: перепланируйте видео после подготовки речи') from exc
 
 
 def _key(item):
@@ -31,7 +163,59 @@ def _starts(items):
     return [i for i in items if i.get('shot_type', 'start') == 'start']
 
 
-def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
+def _shot_intervals(items, speech):
+    result = []
+    for item in _starts(items):
+        start, end = item.get('start_s'), item.get('end_s')
+        schedule = []
+        if start is not None and end is not None:
+            schedule = [dict(line_id=line['id'], speaker_id=line['speaker_id'], kind=line['kind'],
+                             start=max(line['start'], start) - start, end=min(line['end'], end) - start)
+                        for line in (speech or {}).get('lines', []) if line['start'] < end and line['end'] > start]
+        result.append(dict(shot_key=_key(item), start_s=start, end_s=end, speaker_schedule=schedule))
+    return result
+
+
+def visible_speech_lines(item, lines):
+    """Return IDs of lines whose speaker's face is visible during the line."""
+    start, end = item['start_s'], item['end_s']
+    return [line['id'] for line in lines if line.get('kind') == 'on_screen'
+            and any(face['speaker_id'] == line['speaker_id']
+                    and max(start, line['start'], face['start_s'])
+                    < min(end, line['end'], face['end_s'])
+                    for face in item['face_visibility'])]
+
+
+def _choose_with_speech(item, speech, state):
+    lines = speech.get('lines', [])
+    overlapping = [line for line in lines if line.get('kind') == 'on_screen'
+                   and line['start'] < item['end_s'] and line['end'] > item['start_s']]
+    if overlapping and 'face_visibility' not in item:
+        raise ValueError(f"Face visibility is missing for shot {_key(item)}")
+    visible = visible_speech_lines(item, overlapping) if overlapping else []
+    if visible:
+        return {'method': 'references', 'continuity': 'new',
+                'reason': 'visible_speech', 'line_ids': visible}
+    return choose_video_method(state)
+
+
+def _speech_fragment(item):
+    if item.get('speech_audio_path'):
+        return Path(item['speech_audio_path']).read_bytes()
+    if not item.get('speech_source_path'):
+        return None
+    result = subprocess.run(['ffmpeg', '-v', 'error', '-ss', str(item['start_s']),
+                             '-i', item['speech_source_path'], '-t', str(item['duration_s']),
+                             '-vn', '-ac', '1', '-ar', '24000', '-f', 's16le', 'pipe:1'],
+                            check=True, capture_output=True)
+    output = io.BytesIO()
+    with wave.open(output, 'wb') as wav:
+        wav.setparams((1, 2, 24000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(result.stdout)
+    return output.getvalue()
+
+
+def _fingerprint(items, language='ru', catalog=None, seed=None, base=None, speech=None, project_id=None):
     from .video_contract import _active_video_tool_name
     from .style_keeper import _STYLE_REFERENCE_INSTRUCTION
     from .background_references import _reference_path
@@ -39,7 +223,7 @@ def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
     assets = {str(_reference_path(base, entry['reference_image_path']))
               for item in items for field in ('characters', 'locations') for entry in item.get(field) or []
               if base is not None and entry.get('reference_image_path')}
-    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'language': language, 'reference_prompt_version': 9,
+    return _digest({'items': [_planning_shot(i) for i in _starts(items)], 'speech': speech, 'language': language, 'reference_prompt_version': 9,
                     'styles': {key: style['prompt'] for key, style in (catalog or {}).get('styles', {}).items()},
                     'style_image_model': os.getenv('IMG2IMG_MODEL') or os.getenv('VSEGPT_IMG2IMG_MODEL'), 'seed': seed,
                     'style_reference_instruction': _STYLE_REFERENCE_INSTRUCTION,
@@ -47,9 +231,9 @@ def _fingerprint(items, language='ru', catalog=None, seed=None, base=None):
                                              item.get('characters'), item.get('locations')) for item in items],
                     'style_source_images': {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                                             if Path(path).is_file() else None for path in assets},
-                    'model': video_run_config.video_setting('VIDEO_MODEL', prefix.lower(), base.name if base else None) or None,
+                    'model': video_run_config.video_setting('VIDEO_MODEL', prefix.lower(), project_id if project_id else (base.name if base else None)) or None,
                     'provider_tool': _active_video_tool_name(),
-                    'resolution': video_run_config.video_setting('RESOLUTION', prefix.lower(), base.name if base else None) or None})
+                    'resolution': video_run_config.video_setting('RESOLUTION', prefix.lower(), project_id if project_id else (base.name if base else None)) or None})
 
 
 def apply_video_plan(project_id, items):
@@ -86,6 +270,9 @@ def apply_video_plan(project_id, items):
                     covered_shot_keys=keys, start_image=None, end_image=None,
                     voiceover='\n'.join(str(starts[k].get('voiceover') or '').strip()
                                         for k in keys if starts[k].get('voiceover')))
+        for field in ('start_s', 'end_s', 'speech_source_path', 'speaker_schedule', 'video_duration_s', 'speech_parts', 'speech_supported_durations'):
+            if field in unit:
+                item[field] = unit[field]
         replacements[keys[0]] = item
         covered.update(keys)
     result = []
@@ -107,10 +294,14 @@ def reference_request(item, model, seed, provider_name='routerai'):
     paths = item['reference_image_paths']
     hashes = [hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths]
     payload = {'model': model, 'prompt': item['video_prompt'],
-               'duration': int(round(_duration(item))),
+               'duration': item.get('video_duration_s') or (math.ceil(_duration(item)) if item.get('speech_source_path') else int(round(_duration(item)))),
                'resolution': item.get('video_resolution') or video_run_config.video_setting('RESOLUTION', provider_name) or '480p',
                'aspect_ratio': _infer_aspect_ratio(int(item.get('width') or 1920), int(item.get('height') or 1088)),
-               'generate_audio': False}
+               'generate_audio': bool(item.get('speech_audio_path') or item.get('speech_source_path'))}
+    if item.get('speaker_schedule'):
+        payload['prompt'] += ('\nSpeaker schedule (seconds from clip start): '
+                              + json.dumps(item['speaker_schedule'], ensure_ascii=False)
+                              + '. On-screen speakers speak at their scheduled times; off-screen and narrator voices stay off-screen. Other visible characters remain silent.')
     selected_seed = item['video_seed'] if 'video_seed' in item else seed
     if selected_seed is not None:
         payload['seed'] = selected_seed
@@ -128,6 +319,12 @@ def reference_request(item, model, seed, provider_name='routerai'):
             mime = 'image/png'
         images.append({'type': 'image_url', 'image_url': {
             'url': f'data:{mime};base64,' + base64.b64encode(data).decode()}})
+    audio = _speech_fragment(item)
+    if audio is not None:
+        identity['speech_hash'] = hashlib.sha256(audio).hexdigest()
+        identity['speaker_schedule'] = item.get('speaker_schedule', [])
+        images.append({'type': 'audio_url', 'audio_url': {
+            'url': 'data:audio/wav;base64,' + base64.b64encode(audio).decode()}})
     payload['input_references'] = images
     return payload, identity
 
@@ -136,10 +333,41 @@ def reference_input_hash(item, model, seed, provider_name='routerai'):
     return _digest(reference_request(item, model, seed, provider_name)[1])
 
 
+def _reference_job_key(item):
+    suffix = item.get('part_index')
+    return _key(item) if suffix is None else f"{_key(item)}:part:{suffix}"
+
+
+def _part_items(item, durations):
+    parts = []
+    for index, (start, end) in enumerate(item['speech_parts']):
+        options = [value for value in durations if value >= end - start]
+        if not options:
+            raise ValueError('Speech part exceeds supported video duration')
+        relative_start = start - item['start_s']
+        relative_end = end - item['start_s']
+        schedule = [dict(line, start=max(line['start'], relative_start) - relative_start,
+                         end=min(line['end'], relative_end) - relative_start)
+                    for line in item['speaker_schedule']
+                    if line['start'] < relative_end and line['end'] > relative_start]
+        path = Path(item['video_path'])
+        part = dict(item, part_index=index, start_s=start, end_s=end, duration_s=end - start,
+                    video_duration_s=min(options), speaker_schedule=schedule,
+                    video_path=str(path.with_name(f'{path.stem}_part_{index:03d}{path.suffix}')))
+        part.pop('speech_parts', None)
+        parts.append(part)
+    return parts
+
+
 def trusted_reference_output(item, store, model, seed):
     if not store or not Path(item['video_path']).is_file():
         return False
-    job = store.find_current_job(_key(item), reference_input_hash(item, model, seed, store.provider_name))
+    if item.get('speech_parts'):
+        parts = _part_items(item, item['speech_supported_durations'])
+        return all(trusted_reference_output(part, store, model, seed)
+                   and Path(part['video_path']).stat().st_mtime_ns <= Path(item['video_path']).stat().st_mtime_ns
+                   for part in parts)
+    job = store.find_current_job(_reference_job_key(item), reference_input_hash(item, model, seed, store.provider_name))
     return bool(job and job.get('status') == 'downloaded')
 
 
@@ -154,12 +382,41 @@ def generate_reference_video(item, api_key, model, seed, store, model_catalog,
     config = model_catalog[model]
     if not config.get('supports_image_references'):
         raise ValueError('The selected model does not support reference images')
+    if item.get('speech_parts'):
+        if trusted_reference_output(item, store, model, seed):
+            return dict(success=True, video_path=item['video_path'], scene_number=item['scene_number'],
+                        shot_number=item['shot_number'], model=model, error=None)
+        parts = _part_items(item, item['speech_supported_durations'])
+        for part in parts:
+            result = generate_reference_video(part, api_key, model, seed, store, model_catalog,
+                                              deadline, started_at, remaining, workers, provider_name)
+            if not result['success']:
+                return result
+        command = ['ffmpeg', '-v', 'error', '-y']
+        for part in parts:
+            command += ['-i', part['video_path']]
+        filters = [f"[{index}:v]trim=duration={part['duration_s']},setpts=PTS-STARTPTS[v{index}]"
+                   for index, part in enumerate(parts)]
+        filters.append(''.join(f'[v{index}]' for index in range(len(parts)))
+                       + f'concat=n={len(parts)}:v=1:a=0[out]')
+        output = Path(item['video_path'])
+        temporary = output.with_name(output.stem + '.assembling' + output.suffix)
+        subprocess.run(command + ['-filter_complex', ';'.join(filters), '-map', '[out]',
+                                  '-an', str(temporary)], check=True, capture_output=True)
+        os.replace(temporary, output)
+        return dict(success=True, video_path=str(output), scene_number=item['scene_number'],
+                    shot_number=item['shot_number'], model=model, error=None)
+    if item.get('speech_source_path'):
+        durations = [value for value in config['supported_durations'] if value >= _duration(item)]
+        if not durations:
+            raise ValueError('Speech fragment exceeds supported video duration; split at a natural pause')
+        item = dict(item, video_duration_s=min(durations))
     payload, identity = reference_request(item, model, seed, provider_name)
     if payload['duration'] not in config['supported_durations']:
         raise ValueError('Reference fragment duration is unsupported')
     if config.get('max_image_references') is not None and len(item['reference_image_paths']) > config['max_image_references']:
         raise ValueError('Too many reference images')
-    key, input_hash = _key(item), _digest(identity)
+    key, input_hash = _reference_job_key(item), _digest(identity)
     output = item['video_path']
     result = dict(success=True, video_path=output, scene_number=item['scene_number'],
                   shot_number=item['shot_number'], model=model, error=None)
@@ -250,15 +507,36 @@ def choose_video_method(state):
 
 def _references(base, item):
     from .background_references import _reference_path
-    paths = [s['reference_image_path'] for s in (item.get('character_reference_states') or {}).values()]
-    if not paths:
-        paths = [c['reference_image_path'] for c in (item.get('characters') or []) if c.get('reference_image_path')]
+    states = item.get('character_reference_states') or {}
+    paths = [states.get(c.get('name'), {}).get('reference_image_path') or c.get('reference_image_path')
+             for c in item.get('characters') or []]
+    paths += [state.get('reference_image_path') for name, state in states.items()
+              if name not in {c.get('name') for c in item.get('characters') or []}]
+    paths = [path for path in paths if path]
     paths += [str(_reference_path(base, c['reference_image_path']))
               for c in (item.get('locations') or []) if c.get('reference_image_path')]
     for phase in ('start', 'end'):
         context = (item.get('_continuity') or {}).get(phase) or {}
         paths += [str(_reference_path(base, p)) for p in context.get('landmark_reference_paths', [])]
     return list(dict.fromkeys(str(_reference_path(base, p)) for p in paths))
+
+
+def _reference_roles(base, items, refs):
+    from .background_references import _reference_path
+    roles = {}
+    for item in items:
+        for field, role in [('characters', 'character_appearance'), ('locations', 'location')]:
+            for entity in item.get(field) or []:
+                if entity.get('reference_image_path'):
+                    path = str(_reference_path(base, entity['reference_image_path']))
+                    roles[path] = (entity.get('name'), role)
+        for name, state in (item.get('character_reference_states') or {}).items():
+            if state.get('reference_image_path'):
+                path = str(_reference_path(base, state['reference_image_path']))
+                roles[path] = (name, 'character_state')
+    return [dict(image=index, subject=roles.get(path, (None, 'continuity'))[0],
+                 role=roles.get(path, (None, 'continuity'))[1])
+            for index, path in enumerate(refs, 1)]
 
 
 def _phase(spec):
@@ -278,7 +556,8 @@ def _planning_shot(item):
                 locations=[{k: l.get(k) for k in ('name', 'reference_image_path')} for l in item.get('locations', [])],
                 character_reference_states={name: {k: s.get(k) for k in ('state_id', 'reference_image_path')}
                                             for name, s in (item.get('character_reference_states') or {}).items()},
-                style_id=item.get('style_id'))
+                style_id=item.get('style_id'), start_s=item.get('start_s'), end_s=item.get('end_s'),
+                face_visibility=item.get('face_visibility'))
     if item.get('_continuity') is not None:
         result['continuity'] = item['_continuity']
     return result
@@ -299,7 +578,9 @@ def _action_groups(items, choices, positions=None):
         if choice['method'] != 'references':
             continue
         previous = items[position - 1] if position else None
-        join = (previous is not None and choices[_key(previous)]['method'] == 'references'
+        join = (previous is not None and choice.get('reason') != 'visible_speech'
+                and choices[_key(previous)].get('reason') != 'visible_speech'
+                and choices[_key(previous)]['method'] == 'references'
                 and (positions is None or positions[_key(previous)] + 1 == positions[_key(item)])
                 and choice['continuity'] == 'continue' and previous['scene_number'] == item['scene_number']
                 and _compatible(previous, item)
@@ -446,7 +727,7 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        'do not restore outdated actions from source descriptions. Current physical continuity '
                        'and recorded continuity events still govern any necessary correction. '
                        'Treat must_not_show as phase-scoped constraints, not blanket prohibitions for the whole clip. '
-                       'Character references define appearance only; location references define materials and architecture. '
+                       'Character references define appearance only; choose facial detail or full-body silhouette according to framing and the relevant view for the camera. Location references define materials and architecture. '
                        'landmark_image_roles assigns each numbered image to one named object construction only. '
                        'Other objects in its background are not authoritative: use their own masters. '
                        'Current continuity states govern changeable contents, fuel, damage and staging. '
@@ -468,8 +749,10 @@ def prepare_reference_prompt(base, group, state, refs, language='ru', final_imag
                        'state when incidental pose prose conflicts with it. '
                        'Do not invent fixed-duration holds. Preserve clothing and character order. '
                        'Reference sheets supply identity, not a multi-panel output. Do not invent events, '
-                       'paste the film bible, generate a new style, or include narration, dialogue, '
-                       'subtitles or audio instructions. Sound is assembled separately. Return JSON video_prompt.\n'
+                       'paste the film bible, generate a new style, or include narration or subtitles. '
+                       + ('Describe visible speakers according to the supplied schedule. '
+                          if state.get('speaker_schedule') else 'Do not include dialogue or audio instructions. ')
+                       + 'Sound is assembled separately. Return JSON video_prompt.\n'
                        + VIDEO_PROMPT_RULES
                        + '- Here the main event is the one continuous action across the supplied shots; '
                          'keep every required event at its supplied time.\n'),
@@ -506,6 +789,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
     from .video_contract import _active_video_tool_name
     from .style_keeper import ensure_image_style_catalog, ensure_video_style_references, resolve_image_style_id
     base = safe_storybook_project_dir(project_id)
+    speech = _load_speech_for_planning(project_id, base)
     shots = shots_data or json.loads((base / '97_shots/shots.json').read_text())
     if isinstance(shots, str):
         shots = json.loads(shots)
@@ -529,7 +813,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
             catalog.setdefault('frame_bindings', {}).update(bindings)
             catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2), encoding='utf-8')
     target = base / '97_shots/video_plan.json'
-    source_hash = _fingerprint(items, language, catalog, shots.get('seed'), base)
+    source_hash = _fingerprint(items, language, catalog, shots.get('seed'), base, speech, project_id)
     previous_plan = json.loads(target.read_text()) if target.is_file() else {}
     scope = set(shot_keys) if shot_keys is not None else {_key(i) for i in _starts(items)}
     known_keys = {_key(i) for i in _starts(items)}
@@ -546,6 +830,10 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
         return [i for i in select_image_items(project_id, items) if _key(i) in scope]
 
     if target.is_file() and json.loads(target.read_text()).get('source_hash') == source_hash:
+        intervals = _shot_intervals(items, speech)
+        if previous_plan.get('shot_intervals') != intervals:
+            previous_plan['shot_intervals'] = intervals
+            target.write_text(json.dumps(previous_plan, ensure_ascii=False, indent=2))
         cached_styles = {unit['style_id'] for unit in previous_plan.get('units', [])
                          if set(unit['shot_keys']) & scope and unit.get('style_id')}
         if cached_styles:
@@ -565,12 +853,13 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
 
     def classify(index):
         original_index = positions[_key(starts[index])]
-        return choose_video_method(dict(current=_planning_shot(starts[index]),
+        state = dict(current=_planning_shot(starts[index]),
             previous=_planning_shot(all_starts[original_index - 1]) if original_index else None,
-            next=_planning_shot(all_starts[original_index + 1]) if original_index + 1 < len(all_starts) else None))
+            next=_planning_shot(all_starts[original_index + 1]) if original_index + 1 < len(all_starts) else None)
+        return _choose_with_speech(starts[index], speech, state) if speech else choose_video_method(state)
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        choices = dict(zip((_key(i) for i in starts), pool.map(classify, range(len(starts)))))
+        choices = dict(zip((_key(i) for i in starts), (future.result() for future in [pool.submit(contextvars.copy_context().run, classify, i) for i in range(len(starts))])))
     groups = _action_groups(starts, choices, positions)
     if groups and not config.get('supports_image_references'):
         raise ValueError(f'Model {model} does not support reference videos required by action shots')
@@ -604,7 +893,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                     'Do not merge across the interruption; this only links continuity references.'),
                     'criteria': {'new': 'Independent action', **{key: f'Resume action ending at {key}' for key in candidates}}}})
             resumed = candidates.get(answer['resume'])
-        chunks = _split_action(group, config)
+        chunks = [group] if choices[_key(group[0])].get('reason') == 'visible_speech' else _split_action(group, config)
         planned = []
         for number, chunk in enumerate(chunks):
             initial = boundary(chunks[number - 1][-1], 'end') if number else boundary(chunk[0], 'start')
@@ -622,14 +911,7 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 state_shots.append(summary)
             state = {'duration_s': offset, 'shots': state_shots,
                      'opening': state_shots[0]['opening'], 'ending': state_shots[-1]['ending']}
-            from .background_references import _reference_path
-            roles = {str(_reference_path(base, c['reference_image_path'])): c['name']
-                     for item in chunk for c in item.get('characters', []) + item.get('locations', [])
-                     if c.get('reference_image_path')}
-            for item in chunk:
-                for name, variant in (item.get('character_reference_states') or {}).items():
-                    roles[str(_reference_path(base, variant['reference_image_path']))] = name
-            state['reference_images'] = [{'image': n, 'subject': roles.get(path)} for n, path in enumerate(refs, 1)]
+            state['reference_images'] = _reference_roles(base, chunk, refs)
             style_id = chunk[0]['style_id']
             # Эталон стиля нарисован с героем: в пустой план он подмешал бы персонажа.
             has_characters = any(item.get('characters') or item.get('character_reference_states') for item in chunk)
@@ -637,9 +919,20 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
             required = set(refs) | {initial, final} | ({style_image} if style_image else set()) | ({continuity} if continuity else set())
             if config.get('max_image_references') is not None and len(required) > config['max_image_references']:
                 raise ValueError(f'Too many references for action {_key(chunk[0])}')
+            if choices[_key(chunk[0])].get('reason') == 'visible_speech':
+                state['speaker_schedule'] = True
             prompt, refs = prepare_reference_prompt(base, chunk, state, refs, language,
                 final_image=final, initial_image=initial, continuity_image=continuity, style_image=style_image)
             keys = [_key(i) for i in chunk]
+            if choices[keys[0]].get('reason') == 'visible_speech':
+                clip = chunk[0]
+                schedule = [dict(line_id=line['id'], speaker_id=line['speaker_id'], kind=line['kind'],
+                                 start=max(line['start'], clip['start_s']) - clip['start_s'],
+                                 end=min(line['end'], clip['end_s']) - clip['start_s'])
+                            for line in speech['lines']
+                            if line['start'] < clip['end_s'] and line['end'] > clip['start_s']]
+            else:
+                schedule = []
             path = base / '97_shots/video_units' / f'{keys[0]}_{keys[-1]}.mp4'
             path.parent.mkdir(parents=True, exist_ok=True)
             planned.append(dict(shot_keys=keys, duration_s=offset, video_path=str(path), video_prompt=prompt,
@@ -647,6 +940,17 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
                 style_id=style_id, style_reference_path=style_image,
                 continues_from_shot=_key(chunks[number - 1][-1]) if number else (_key(resumed) if resumed is not None else None),
                 seed=shots.get('seed'), model=model, resolution=video_run_config.video_setting('RESOLUTION', prefix.lower(), project_id) or '480p'))
+            if schedule:
+                supported = [value for value in config['supported_durations'] if value >= offset]
+                if not supported:
+                    from .shot_speech_timing import split_speech_interval
+                    planned[-1]['speech_supported_durations'] = config['supported_durations']
+                    planned[-1]['speech_parts'] = split_speech_interval(
+                        chunk[0]['start_s'], chunk[0]['end_s'], speech.get('words', []),
+                        max(config['supported_durations']))
+                planned[-1].update(video_duration_s=min(supported) if supported else None, start_s=chunk[0]['start_s'], end_s=chunk[0]['end_s'],
+                                   speech_source_path=str((base / '98_audio' / speech['audio_path']).resolve()),
+                                   speaker_schedule=schedule)
             from .continuity import unit_continuity_hash
             continuity_hash = unit_continuity_hash(base, keys)
             if continuity_hash is not None:
@@ -654,13 +958,13 @@ def storybook_video_plan_tool(session_id: str, project_id: str, enable: bool = T
         return planned
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        units = [unit for planned in pool.map(plan, enumerate(groups)) for unit in planned]
+        units = [unit for planned in (future.result() for future in [pool.submit(contextvars.copy_context().run, plan, entry) for entry in enumerate(groups)]) for unit in planned]
     decisions = [dict(shot_keys=[_key(item)], **choices[_key(item)]) for item in starts]
     if shot_keys is not None:
         units = [u for u in previous_plan.get('units', []) if not set(u['shot_keys']) & scope] + units
         decisions = [d for d in previous_plan.get('decisions', []) if not set(d['shot_keys']) & scope] + decisions
         units.sort(key=lambda u: positions[u['shot_keys'][0]])
-    target.write_text(json.dumps({'source_hash': source_hash, 'units': units, 'decisions': decisions},
+    target.write_text(json.dumps({'source_hash': source_hash, 'units': units, 'decisions': decisions, 'shot_intervals': _shot_intervals(items, speech)},
                                  ensure_ascii=False, indent=2))
     return dict(shots, status='success', video_plan_path=str(target), cached=False,
                 scope_shot_keys=sorted(scope) if shot_keys is not None else None,

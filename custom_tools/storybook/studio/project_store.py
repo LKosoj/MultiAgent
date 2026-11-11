@@ -111,7 +111,14 @@ def _project_path(root: Path, project_id: str) -> Path:
         path.resolve().relative_to(root.resolve())
     except ValueError as exc:
         raise StudioError("forbidden_path", "Проект вне папки проектов") from exc
+    if not is_series_project(path):
+        raise StudioError("not_found", f"Проект не найден: {pid}")
     return path
+
+
+def is_series_project(path: Path) -> bool:
+    data = _read_json(path / "project.json")
+    return isinstance(data, dict) and data.get("format") == "storybook-series-v1"
 
 
 def _inside(path: Path, base: Path) -> bool:
@@ -157,6 +164,9 @@ def unlock(handle) -> None:
 
 def is_busy(project_dir: Path) -> bool:
     """Идёт прогон: файл блокировки есть и взять его не удалось."""
+    if is_series_project(project_dir) and any(is_busy(path) for path in (project_dir / "series").glob("*")
+                                              if path.is_dir() and not path.is_symlink()):
+        return True
     if not (project_dir / LOCK_NAME).exists():
         return False
     try:
@@ -173,6 +183,10 @@ def _lock_or_raise(project_dir: Path):
     handle = try_lock(project_dir)
     if handle is None:
         raise StudioError("locked", "С этим проектом уже работает другое приложение или прогон. Дождитесь завершения.")
+    if is_series_project(project_dir) and any(is_busy(path) for path in (project_dir / "series").glob("*")
+                                              if path.is_dir() and not path.is_symlink()):
+        unlock(handle)
+        raise StudioError("locked", "В проекте идёт прогон серии. Дождитесь завершения.")
     return handle
 
 
@@ -191,7 +205,8 @@ def list_project_dirs(root: Path) -> list[Path]:
                 continue
         except OSError:
             continue
-        result.append(item)
+        if is_series_project(item):
+            result.append(item)
     return result
 
 
@@ -302,53 +317,17 @@ def modified_time(project_dir: Path) -> float:
 
 
 def build_card(project_dir: Path, *, creating: bool = False) -> dict:
-    project_id = project_dir.name
-    brief = _read_json(project_dir / "00_brief.json")
-    brief = brief if isinstance(brief, dict) else {}
-    story = _read_json(project_dir / "20_story" / "story.json")
-    pages = story.get("pages") if isinstance(story, dict) else None
-    characters = brief.get("main_characters")
-    images_cover = _images_cover(project_dir)
-    cover = images_cover or pick_cover(project_dir)
-    has_brief = (project_dir / "00_brief.json").is_file()
-    state = "creating" if creating else ("ready" if has_brief else "empty")
-    try:
-        created = _iso(project_dir.stat().st_ctime)
-    except OSError:
-        created = ""
-    return {
-        "project_id": project_id,
-        "title": str(brief.get("title") or project_id),
-        "description": str(brief.get("description") or "")[:200],
-        "language": str(brief.get("language") or ""),
-        "state": state,
-        "stage": detect_stage(project_dir, images_cover is not None),
-        "busy": is_busy(project_dir),
-        "pages_count": len(pages) if isinstance(pages, list) else 0,
-        "characters_count": len(characters) if isinstance(characters, list) else 0,
-        "has_pdf": (project_dir / "95_pdf" / "book.pdf").is_file(),
-        "has_final_video": (project_dir / "99_final" / "final_video.mp4").is_file(),
-        "cover": cover,
-        "created": created,
-        "modified": _iso(modified_time(project_dir)),
-    }
+    data = _read_json(project_dir / "project.json") or {}
+    series_root = project_dir / "series"
+    count = sum(1 for item in series_root.iterdir() if item.is_dir() and (item / "series.json").is_file()) if series_root.is_dir() else 0
+    return {"project_id": project_dir.name, "title": data.get("title", project_dir.name),
+            "description": data.get("description", ""), "language": data.get("language", ""),
+            "series_count": count, "state": "ready", "stage": {"index": 0, "id": "project"},
+            "busy": is_busy(project_dir), "modified": _iso(modified_time(project_dir))}
 
 
 def project_details(project_dir: Path) -> dict:
-    brief = _read_json(project_dir / "00_brief.json")
-    brief = brief if isinstance(brief, dict) else {}
-    shots = _read_json(project_dir / "97_shots" / "shots.json")
-    items = shots.get("items") if isinstance(shots, dict) else None
-    characters = brief.get("main_characters")
-    return {
-        "genre": str(brief.get("genre") or ""),
-        "target_age": str(brief.get("target_age") or ""),
-        "description_full": str(brief.get("description") or "")[:2000],
-        "main_characters": [str(x) for x in characters] if isinstance(characters, list) else [],
-        "pages_min": brief.get("pages_min"),
-        "pages_max": brief.get("pages_max"),
-        "shots_total": len(items) if isinstance(items, list) else None,
-    }
+    return _read_json(project_dir / "project.json") or {}
 
 
 # ---------------------------------------------------------------- размер
@@ -482,28 +461,16 @@ def create_project(root: Path, *, title, description, genre, target_age, languag
     project_id = suggest_project_id(id_hint or values["title"], root, reserve=True)
     project_path = root / project_id
     try:
-        for relative in PROJECT_STRUCTURE:
-            (project_path / relative).mkdir(parents=True, exist_ok=True)
-        brief = {
-            "title": values["title"],
-            "genre": values["genre"],
-            "target_age": values["target_age"],
-            "language": values["language"],
-            "description": values["description"],
-            "main_characters": [],
-            "main_locations": [],
-            "pages_min": values["pages_min"],
-            "pages_max": values["pages_max"],
-            "words_per_page_min": values["words_per_page_min"],
-            "words_per_page_max": values["words_per_page_max"],
-            "moral": "",
-            "storybook_prompt": (
-                f"Название: {values['title']}\nЖанр: {values['genre']}\n"
-                f"Возраст: {values['target_age']}\nОписание: {values['description']}"
-            ),
-            "seed": random.randint(1, 1000000),
-        }
-        write_json_atomic(project_path / "00_brief.json", brief)
+        (project_path / "shared").mkdir()
+        (project_path / "series").mkdir()
+        write_json_atomic(project_path / "project.json", {
+            "format": "storybook-series-v1", "project_id": project_id,
+            "title": values["title"], "description": values["description"],
+            "genre": values["genre"], "target_age": values["target_age"],
+            "language": values["language"], "defaults": {key: values[key] for key in
+                ("pages_min", "pages_max", "words_per_page_min", "words_per_page_max")},
+            "resources": {},
+        })
     except BaseException:
         shutil.rmtree(project_path, ignore_errors=True)
         raise
@@ -517,7 +484,7 @@ def rename_project(root: Path, project_id: str, title: str) -> str:
     if not isinstance(title, str) or not 2 <= len(title.strip()) <= 120:
         raise StudioError("invalid_argument", "Поле «Название» должно содержать от 2 до 120 символов")
     path = _project_path(root, project_id)
-    brief_path = path / "00_brief.json"
+    brief_path = path / "project.json"
     brief = _read_json(brief_path)
     if not isinstance(brief, dict):
         raise StudioError("not_found", "У проекта нет брифа")
@@ -771,6 +738,8 @@ def restore_backup(root: Path, backup_dir: Path, project_id: str, backup_id: str
             raise
         try:
             if exists:
+                # Сохраняем тот же заблокированный файл при смене каталога.
+                os.link(current / LOCK_NAME, staging / LOCK_NAME)
                 os.rename(current, old)
             try:
                 os.rename(staging, current)
@@ -798,9 +767,9 @@ def delete_project(root: Path, backup_dir: Path, project_id: str, *, max_backups
     try:
         backup = create_backup(root, backup_dir, project_id, reason="before_delete",
                                max_backups=max_backups, progress=progress, locked=True)
+        shutil.rmtree(path)
     finally:
         unlock(handle)
-    shutil.rmtree(path)
     invalidate_size_cache()
     logger.info("Проект %s удалён", project_id)
     return {"project_id": project_id, "backup_id": backup["backup_id"],
@@ -814,10 +783,11 @@ def duplicate_project(root: Path, project_id: str, new_id: str, progress: Progre
     staging = root / _tmp_name("dup", new_id)
     try:
         _copy_tree(path, staging, progress, "Копирование проекта")
-        brief_path = staging / "00_brief.json"
+        brief_path = staging / "project.json"
         brief = _read_json(brief_path)
         if isinstance(brief, dict):
             brief["title"] = f"{brief.get('title') or project_id} (копия)"
+            brief["project_id"] = new_id
             write_json_atomic(brief_path, brief)
         os.rmdir(root / new_id)  # снять резерв и поставить копию на его место
         os.rename(staging, root / new_id)

@@ -5,6 +5,9 @@ import threading
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.project_paths import acquire_storybook_project_lock, release_storybook_project_lock
 from custom_tools.storybook.studio import run_settings as rs
 from custom_tools.storybook.studio.capabilities import invoke
@@ -20,9 +23,9 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUTERAI_VIDEO_MODEL", "m0")
     monkeypatch.setenv("SUNO_COOKIE", "c")
     monkeypatch.setenv("STORYBOOK_VIDEO_PRICING_PATH", str(tmp_path / "none.yaml"))
-    base = tmp_path / "demo"
-    base.mkdir()
-    return base
+    base = make_series_project(tmp_path)
+    with series_scope("demo", "main"):
+        yield base
 
 
 def ok(result):
@@ -62,7 +65,7 @@ def test_capabilities_registered_with_expected_access():
 def test_get_for_project_without_file(project, monkeypatch):
     monkeypatch.setenv("STORYBOOK_VIDEO_PROVIDER", "aitunnel")
     monkeypatch.setenv("ROUTERAI_RESOLUTION", "720p")
-    result = ok(invoke("run_settings_get", {"project_id": "demo"}))
+    result = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
     assert result["settings"] == rs.default_settings()
     eff = result["effective"]
     assert eff["video.provider"] == {"value": "aitunnel", "source": "env"}
@@ -86,7 +89,7 @@ def test_env_defaults_and_null_means_default(project, monkeypatch):
 def test_broken_json_is_reported_not_raised(project):
     (project / ".studio").mkdir()
     (project / ".studio" / "run_settings.json").write_text("{ oops")
-    result = ok(invoke("run_settings_get", {"project_id": "demo"}))
+    result = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
     assert result["settings"] == rs.default_settings()
     assert "settings_unreadable" in codes(result["issues"], "warning")
 
@@ -120,7 +123,7 @@ def test_unknown_field_is_error_on_save_but_warning_on_read(project):
     bad["video"]["extra"] = 2
     assert codes(rs.validate(bad, "demo", strict=True), "error") == {"unknown_field"}
     assert codes(rs.validate(bad, "demo", strict=False), "warning") >= {"unknown_field"}
-    err(invoke("run_settings_save", {"project_id": "demo", "settings": bad}), "invalid_argument")
+    err(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": bad}), "invalid_argument")
 
 
 @pytest.mark.parametrize("path", ["../outside.mp3", "/etc/passwd.mp3", "98_audio/missing.mp3", "98_audio/voice.txt"])
@@ -167,40 +170,40 @@ def test_environment_problems_block_run_not_save(project, monkeypatch):
     run_only = [i for i in issues if i["code"] in {"video_provider_not_configured", "music_cookie_missing"}]
     assert {i["code"] for i in run_only} == {"video_provider_not_configured", "music_cookie_missing"}
     assert all(i["scope"] == "run" for i in run_only)
-    ok(invoke("run_settings_save", {"project_id": "demo", "settings": settings()}))
+    ok(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings()}))
     with pytest.raises(Exception):
         rs.settings_to_inputs("demo")  # запуск с такими настройками блокируется
 
 
 def test_save_roundtrip_atomic_and_digest(project):
-    first = ok(invoke("run_settings_get", {"project_id": "demo"}))
+    first = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
     s = settings(video={"provider": "aitunnel", "retry_cycles": 2}, budget_rub=None)
-    saved = ok(invoke("run_settings_save", {"project_id": "demo", "settings": s, "expected_digest": first["digest"]}))
+    saved = ok(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": s, "expected_digest": first["digest"]}))
     path = project / ".studio" / "run_settings.json"
     assert json.loads(path.read_text()) == saved["settings"]
     assert saved["settings"]["video"]["provider"] == "aitunnel"
-    again = ok(invoke("run_settings_get", {"project_id": "demo"}))
+    again = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
     assert again["digest"] == saved["digest"] != first["digest"]
     assert not list((project / ".studio").glob("*.tmp"))
 
 
 def test_save_conflict_on_stale_digest(project):
-    first = ok(invoke("run_settings_get", {"project_id": "demo"}))
-    ok(invoke("run_settings_save", {"project_id": "demo", "settings": settings(budget_rub=None, video={"retry_cycles": 1}),
+    first = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
+    ok(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(budget_rub=None, video={"retry_cycles": 1}),
                                     "expected_digest": first["digest"]}))
-    err(invoke("run_settings_save", {"project_id": "demo", "settings": settings(video={"retry_cycles": 2}),
+    err(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(video={"retry_cycles": 2}),
                                      "expected_digest": first["digest"]}), "conflict")
-    err(invoke("run_settings_save", {"project_id": "demo", "settings": settings(video={"retry_cycles": 2})}), "conflict")
+    err(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(video={"retry_cycles": 2})}), "conflict")
 
 
 def test_parallel_saves_leave_valid_file(project):
-    start = ok(invoke("run_settings_get", {"project_id": "demo"}))["digest"]
+    start = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))["digest"]
     barrier = threading.Barrier(2)
     results = []
 
     def worker(n):
         barrier.wait(timeout=5)
-        results.append(invoke("run_settings_save", {"project_id": "demo", "expected_digest": start,
+        results.append(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "expected_digest": start,
                                                     "settings": settings(video={"retry_cycles": n})}))
 
     threads = [threading.Thread(target=worker, args=(n,)) for n in (1, 2)]
@@ -213,15 +216,15 @@ def test_parallel_saves_leave_valid_file(project):
 
 def test_during_run_only_budget_can_change(project, monkeypatch):
     monkeypatch.setenv("ROUTERAI_VIDEO_COST_RUB", "10")
-    first = ok(invoke("run_settings_get", {"project_id": "demo"}))
-    saved = ok(invoke("run_settings_save", {"project_id": "demo", "settings": settings(budget_rub=50),
+    first = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
+    saved = ok(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(budget_rub=50),
                                             "expected_digest": first["digest"]}))
     handle = acquire_storybook_project_lock("demo")
     try:
-        assert ok(invoke("run_settings_get", {"project_id": "demo"}))["run_active"] is True
-        err(invoke("run_settings_save", {"project_id": "demo", "settings": settings(budget_rub=50, video={"retry_cycles": 1}),
+        assert ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))["run_active"] is True
+        err(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(budget_rub=50, video={"retry_cycles": 1}),
                                          "expected_digest": saved["digest"]}), "locked")
-        changed = ok(invoke("run_settings_save", {"project_id": "demo", "settings": settings(budget_rub=80),
+        changed = ok(invoke("run_settings_save", {"project_id": "demo", "series_id": "main", "settings": settings(budget_rub=80),
                                                   "expected_digest": saved["digest"]}))
         assert changed["settings"]["budget_rub"] == 80
     finally:
@@ -229,7 +232,7 @@ def test_during_run_only_budget_can_change(project, monkeypatch):
 
 
 def test_unknown_project_is_not_found():
-    err(invoke("run_settings_get", {"project_id": "no_such"}), "not_found")
+    err(invoke("run_settings_get", {"project_id": "no_such", "series_id": "main"}), "not_found")
 
 
 def test_style_catalog_and_provider_catalog_capabilities(project):
@@ -244,7 +247,7 @@ def test_style_catalog_and_provider_catalog_capabilities(project):
 def test_non_string_provider_gives_invalid_type_and_get_survives(project, bad):
     (project / ".studio").mkdir()
     (project / ".studio" / "run_settings.json").write_text(json.dumps({"video": {"provider": bad}}))
-    result = ok(invoke("run_settings_get", {"project_id": "demo"}))
+    result = ok(invoke("run_settings_get", {"project_id": "demo", "series_id": "main"}))
     assert result["effective"]["video.provider"]["value"] == "routerai"
     assert any(i["code"] == "invalid_type" and i["field"] == "video.provider" for i in result["issues"])
     assert any(i["field"] == "video.provider" for i in rs.validate(settings(video={"provider": bad}), "demo"))
@@ -259,5 +262,5 @@ def test_preflight_summary_uses_unsaved_provider_for_readiness(project, monkeypa
         return {"ready": True, "blocking_reasons": [], "warnings": [], "errors": [], "video": {}}
 
     monkeypatch.setattr(video_contract, "storybook_video_music_readiness", fake)
-    ok(invoke("run_preflight_summary", {"project_id": "demo", "settings": settings(video={"provider": "aitunnel"})}))
+    ok(invoke("run_preflight_summary", {"project_id": "demo", "series_id": "main", "settings": settings(video={"provider": "aitunnel"})}))
     assert seen["video_provider"] == "aitunnel"

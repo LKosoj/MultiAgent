@@ -252,3 +252,33 @@ def test_render_uses_color_matched_video_and_final_filter(tmp_path, monkeypatch)
     with Image.open(frame) as image:
         r, g, b = image.convert("RGB").getpixel((80, 48))
         assert b > 200 and r < 50
+
+
+def test_speech_clip_is_trimmed_without_retime_or_embedded_audio(tmp_path, monkeypatch):
+    from custom_tools.storybook.timeline_media import render_fcpxml
+    base, items = _project(tmp_path, monkeypatch)
+    source = base / 'speech-source.mp4'
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=red:s=160x96:r=24:d=7.4',
+                    '-f', 'lavfi', '-i', 'color=blue:s=160x96:r=24:d=0.6', '-f', 'lavfi', '-i',
+                    'sine=frequency=440:duration=8', '-filter_complex_threads', '1', '-filter_complex',
+                    '[0:v][1:v]concat=n=2:v=1:a=0[v]', '-map', '[v]', '-map', '2:a', '-c:v', 'libx264',
+                    '-threads', '1', '-c:a', 'aac', str(source)], check=True)
+    items = [dict(item, video_path=str(source), duration_s=7.3) for item in items[:2]]
+    (base / '98_audio/audio_manifest.json').write_text(json.dumps({'audio_tracks': []}))
+    (base / '97_shots/video_plan.json').write_text(json.dumps({'units': [dict(
+        shot_keys=['1-1'], duration_s=7.3, video_path=str(source), speech_source_path='speech.wav',
+        video_prompt='speak', reference_image_paths=[], resolution='480p')]}))
+    timeline = base / '97_shots/one.fcpxml'
+    fg._generate_fcpxml('test', items, str(timeline))
+    clip = ET.parse(timeline).find('.//spine/asset-clip')
+    assert clip.find('timeMap') is None
+    assert clip.get('srcEnable') == 'video'
+    output = base / '99_final/one.mp4'
+    render_fcpxml(timeline, output)
+    info = json.loads(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type',
+                                               '-of', 'json', str(output)]))
+    assert [stream['codec_type'] for stream in info['streams']] == ['video']
+    frame = tmp_path / 'marker.png'
+    subprocess.run(['ffmpeg', '-v', 'error', '-ss', '6.95', '-i', str(output), '-frames:v', '1', str(frame)], check=True)
+    red, _, blue = Image.open(frame).convert('RGB').getpixel((80, 48))
+    assert red > blue

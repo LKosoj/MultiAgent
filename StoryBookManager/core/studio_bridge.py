@@ -12,7 +12,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
-from custom_tools.storybook.studio.capabilities import invoke, registry
+from custom_tools.storybook.studio.capabilities import invoke, registry, find
 from custom_tools.storybook.studio.errors import error_result
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,20 @@ class StudioBridge:
         self._inflight = 0
         self._polling = False
         self._closed = False
+        self._scope = (None, None)
+        self._scope_generation = 0
+
+    def set_series(self, project_id, series_id):
+        self._scope = (project_id, series_id)
+        self._scope_generation += 1
+
+    def scoped_payload(self, capability_id, payload):
+        args = dict(payload or {})
+        cap = find(capability_id)
+        if cap and cap.project_scoped and cap.module not in ("projects", "series", "core", "speech", "app_settings"):
+            if args.get("project_id") == self._scope[0] and self._scope[1]:
+                args.setdefault("series_id", self._scope[1])
+        return args
 
     def call(self, capability_id: str, payload: dict | None = None, *,
              on_success: Callback | None = None, on_error: Callback | None = None,
@@ -45,8 +59,17 @@ class StudioBridge:
             self._inflight += 1
             start_polling = not self._polling
             self._polling = True
-        self._executor.submit(self._run, job, capability_id, dict(payload or {}),
-                              on_success, on_error, latest_only_key)
+        args = self.scoped_payload(capability_id, payload)
+        cap = find(capability_id)
+        scoped_film = cap and cap.project_scoped and cap.module not in ("projects", "series", "core", "speech", "app_settings")
+        scope = (args.get("project_id"), args.get("series_id")) if scoped_film and args.get("series_id") and "series_id" not in (payload or {}) else None
+        generation = self._scope_generation
+        def guarded(callback):
+            if callback is None:
+                return None
+            return lambda result: callback(result) if scope is None or (scope == self._scope and generation == self._scope_generation) else None
+        self._executor.submit(self._run, job, capability_id, args,
+                              guarded(on_success), guarded(on_error), latest_only_key)
         if start_polling:
             self._schedule()
         return job

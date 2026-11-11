@@ -394,6 +394,7 @@ def test_final_review_each_failed_check(proj):
 def test_final_review_passed_and_failed_without_details(proj):
     S.write_json(proj, "final_review", S.final_review())
     assert codes(proj, "final_review") == ["final_review_passed"]
+    assert "Техническая проверка" in fs(proj, "final_review")[0].message
     S.write_json(proj, "final_review", S.final_review(passed=False, checks={}))
     assert codes(proj, "final_review") == ["final_review_failed"]
 

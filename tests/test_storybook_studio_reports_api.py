@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities as caps
 from custom_tools.storybook.studio import reports
 from custom_tools.storybook.studio.errors import StudioError
@@ -15,9 +18,8 @@ from tests import storybook_report_samples as S
 @pytest.fixture
 def proj(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
+    p = make_series_project(tmp_path)
     reports._clear_cache()
-    p = tmp_path / "demo"
     S.write_json(p, "provider_jobs", S.provider_jobs([
         S.provider_job("2-3", "failed", error="timeout"), S.provider_job("10-1", "failed", error="e"),
         S.provider_job("9-6", "stale"), S.provider_job("1-1", "running")]))
@@ -26,13 +28,14 @@ def proj(tmp_path, monkeypatch):
                                                    S.violation("2:3:end", "по кадру")], uncertain=["сомнение"])]))
     S.write_json(p, "shots_prompt_qa", S.qa_report(rendered_image_findings=[
         {"scene_number": 2, "shot_number": 3, "shot_type": "start", "observed": "o", "required": "r"}]))
-    yield p
+    with series_scope("demo", "main"):
+        yield p
     reports._clear_cache()
 
 
 def call(cap, **payload):
     """Возможность через реестр (reports_for_shot)."""
-    return caps.invoke(cap, {"project_id": "demo", **payload})
+    return caps.invoke(cap, {"project_id": "demo", "series_id": "main", **payload})
 
 
 def findings(project_id="demo", **payload):

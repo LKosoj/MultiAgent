@@ -63,11 +63,13 @@ def step_output_artifacts(workflow_def=None) -> dict[str, list[str]]:
         "story_writer": ["20_story/story.json"],
         "story_editor": ["20_story/story.json"],
         "prompt_engineer": ["40_prompts"],
-        "items_builder": ["40_prompts"],
+        "items_builder": ["50_items/items.json"],
         "artist_batch": ["50_images"],
         "assemble_md": ["90_md/book.md"],
         "md_to_pdf": ["95_pdf/book.pdf"],
         "screenplay_generator": ["91_screenplay/screenplay.json"],
+        "storybook_speech": ["98_audio/speech.json"],
+        "storybook_video_plan": ["97_shots/video_plan.json"],
         "screenplay_shots_generator": ["97_shots/shots.json"],
         "blockout_scene_builder": ["93_blockout/chains.json", "93_blockout/scene_spec.json",
                                    "93_blockout/asset_map.json", "93_blockout/report.json"],
@@ -82,7 +84,10 @@ def step_output_artifacts(workflow_def=None) -> dict[str, list[str]]:
         "video_generator": [JOBS_REL],
         "storybook_audio_subtitle": ["98_audio/subtitles.srt", "98_audio/audio_manifest.json",
                                      "98_audio/cue_sheet.json"],
+        "music_planner": ["98_audio/music_plan.json"],
         "storybook_music_generator": ["98_audio/audio_manifest.json", "98_audio/music_manifest.json"],
+        "storybook_sfx_generator": ["98_audio/sfx_manifest.json", "98_audio/audio_manifest.json"],
+        "storybook_photo_montage": ["99_final/photo_video.mp4"],
         "montage_assembler": ["99_final/final_video.mp4", "99_final/timeline.fcpxml", "99_final/subtitles.srt",
                               "99_final/manifest.json", "99_final/final_review.json"],
         "storybook_video_decision_log": ["96_video_contract/decision_log.json"],
@@ -93,6 +98,113 @@ def step_output_artifacts(workflow_def=None) -> dict[str, list[str]]:
             if override:
                 artifacts[step.id] = list(override)
     return artifacts
+
+
+def _overlaps(marker: str, item: str) -> bool:
+    return item == marker or item.startswith(marker + "/") or marker.startswith(item + "/")
+
+
+def _active_outputs(root: Path, inputs: dict | None = None) -> tuple[dict, list]:
+    status = _studio("status")
+    pipeline = status._load_pipeline()
+    values = dict(pipeline["inputs"])
+    values.update(_read_brief(root))
+    try:
+        data = json.loads((root / "series.json").read_text(encoding="utf-8"))
+        values.update(data.get("settings") or {})
+    except (OSError, ValueError):
+        pass
+    from custom_tools.storybook.project_paths import current_series_scope
+    scope = current_series_scope()
+    if scope:
+        try:
+            values.update(_studio("run_settings").settings_to_inputs(scope[0]))
+        except StudioError:
+            pass
+    values.update(inputs or {})
+    flags = {name: value for name, value in values.items() if isinstance(value, bool)}
+    markers = status.STEP_MARKERS
+    fallback = step_output_artifacts()
+    outputs = {}
+    for step in pipeline["steps"]:
+        condition = step.get("condition") or ""
+        # Шаги с условием от результата другого шага (например, редактор)
+        # учитываются по факту запуска, а не как обязательные всегда.
+        if re.search(r"\{[A-Za-z_][A-Za-z0-9_]*\.", condition):
+            continue
+        if not _gate_state(step, flags):
+            continue
+        paths = step.get("output_artifacts") or markers.get(step["id"]) or fallback.get(step["id"], [])
+        outputs[step["id"]] = list(paths)
+    outputs["items_builder"] = ["50_items/items.json"]
+    outputs["storybook_sfx_generator"] = ["98_audio/sfx_manifest.json", "98_audio/audio_manifest.json"] if "storybook_sfx_generator" in outputs else []
+    return outputs, pipeline["steps"]
+
+
+def stale_results_for_plan(project_id: str, steps: list[str], *, inputs: dict | None = None,
+                           explicit_step: str | None = None) -> dict:
+    from .paths import project_dir
+    root = project_dir(project_id)
+    try:
+        data = json.loads((root / "series.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    stale = list(data.get("stale_results", []))
+    try:
+        speech = json.loads((root / "98_audio/speech.json").read_text(encoding="utf-8"))
+        if speech.get("status") == "stale" and "98_audio/speech.json" not in stale:
+            stale.append("98_audio/speech.json")
+    except (OSError, ValueError):
+        pass
+    outputs, _ = _active_outputs(root, inputs)
+    # Явно вызванный условный шаг тоже является производителем.
+    fallback = step_output_artifacts()
+    for step in steps:
+        if step not in outputs and step in fallback and step == explicit_step and step == "story_editor":
+            outputs[step] = fallback[step]
+    by_step = {step: [marker for marker in stale if any(_overlaps(marker, item) for item in outputs.get(step, []))]
+               for step in steps}
+    by_step = {step: markers for step, markers in by_step.items() if markers}
+    affected = [marker for marker in stale if any(marker in markers for markers in by_step.values())]
+    requirements = {marker: [step for step, paths in outputs.items()
+                             if any(_overlaps(marker, item) and (root / item).exists() for item in paths)]
+                    for marker in affected}
+    for marker in affected:
+        entry = data.get("stale_confirmations", {}).get(marker, {})
+        revision = entry.get("revision", {}) if isinstance(entry, dict) else {}
+        if revision and all(data.get(key) == value for key, value in revision.items()):
+            for step in entry.get("requirements", []):
+                if (step in outputs or step == "story_editor") and step not in requirements[marker]:
+                    requirements[marker].append(step)
+    return {"affected_results": affected, "stale_steps": by_step, "stale_requirements": requirements}
+
+
+def step_ancestors(step_id: str, steps: list[dict]) -> set[str]:
+    step_map = {step["id"]: step for step in steps}
+    dependencies: set[str] = set()
+    def walk(current):
+        for dependency in step_map.get(current, {}).get("depends_on", []):
+            if dependency not in dependencies:
+                dependencies.add(dependency)
+                walk(dependency)
+    walk(step_id)
+    return dependencies
+
+
+def stale_upstream_for_step(project_id: str, step_id: str, *, inputs: dict | None = None) -> list[str]:
+    """Устаревшие выходы зависимостей шага для плана и принятия фильма."""
+    from .paths import project_dir
+    root = project_dir(project_id)
+    outputs, steps = _active_outputs(root, inputs)
+    dependencies = step_ancestors(step_id, steps)
+    try:
+        data = json.loads((root / "series.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    stale = data.get("stale_results", [])
+    return [marker for marker in stale
+            if not (step_id == "montage_assembler" and (marker == "99_final" or marker.startswith("99_final/")))
+            and any(_overlaps(marker, item) for dependency in dependencies for item in outputs.get(dependency, []))]
 
 
 def _read_brief(project_path: Optional[Path]) -> dict:
@@ -242,7 +354,8 @@ def find_runs(engine, project_id: str, *, unfinished_only: bool = False, limit: 
         return []
     if not cached:
         return _find_runs(db, project_id, unfinished_only, limit, slim_singles)
-    key = (str(db), project_id, unfinished_only, limit, slim_singles)
+    from custom_tools.storybook.project_paths import current_series_scope
+    key = (str(db), project_id, current_series_scope(), unfinished_only, limit, slim_singles)
     hit = _RUNS_CACHE.get(key)
     now = time.monotonic()
     if hit is not None and now - hit[0] < RUNS_CACHE_TTL_S:
@@ -269,7 +382,7 @@ def _find_runs(db, project_id: str, unfinished_only: bool, limit: int, slim_sing
         ORDER BY wc.timestamp DESC LIMIT ?"""
 
     sql = build("json_object('session_id', json_extract(wc.context, '$.session_id'), "
-                "'variables', json_object('project_id', json_extract(wc.context, '$.variables.project_id')))")
+                "'variables', json_object('project_id', json_extract(wc.context, '$.variables.project_id'), 'series_id', json_extract(wc.context, '$.variables.series_id')))")
     sql_plain = build("NULL")  # без JSON1: сопоставление по workflow_id
     like = f"%{like_escape(project_id)}%"
     rows_limit = max(DB_CONTEXT_ROWS, limit)  # глубокая выборка не должна упираться в окно поиска по context
@@ -296,6 +409,15 @@ def _find_runs(db, project_id: str, unfinished_only: bool, limit: int, slim_sing
     for row in rows:
         if not workflow_id_matches_project(row["workflow_id"], project_id, row["context"]):
             continue
+        from custom_tools.storybook.project_paths import current_series_scope
+        active = current_series_scope()
+        if active and active[0] == project_id:
+            try:
+                context = json.loads(row["context"] or "{}")
+                if context.get("variables", {}).get("series_id") != active[1]:
+                    continue
+            except (TypeError, ValueError, AttributeError):
+                continue
         try:
             completed = json.loads(row["completed_steps"] or "[]")
         except ValueError:
@@ -630,8 +752,11 @@ def build_plan(project_id: str, mode: str, *, start_step: str | None = None, ste
         workflow_id = reuse_wid or new_workflow_id("partial", project_id)
     else:
         workflow_id = new_workflow_id(mode, project_id, start)
+    from custom_tools.storybook.project_paths import current_series_scope
+    active_scope = current_series_scope()
+    series_id = active_scope[1] if active_scope and active_scope[0] == project_id else None
     plan = {
-        "version": PLAN_VERSION, "mode": mode, "project_id": project_id, "pipeline_hash": pipeline_hash(),
+        "version": PLAN_VERSION, "mode": mode, "project_id": project_id, "series_id": series_id, "pipeline_hash": pipeline_hash(),
         "steps_to_run": list(run_ids),
         "skip_steps": skip, "gated_off": gated_off, "start_step": start,
         "source_workflow_id": source_wid, "workflow_id": workflow_id,
@@ -642,6 +767,20 @@ def build_plan(project_id: str, mode: str, *, start_step: str | None = None, ste
         "rebuild_film": bool(rebuild_film) if mode == "regenerate_shots" else False,
         "reuse_workflow_id": bool(reuse_wid),
     }
+    plan.update(stale_results_for_plan(project_id, list(run_ids), inputs=merged,
+                                       explicit_step=start if mode == "single_step" else None))
+    required_steps = set()
+    def collect_inputs(step_id):
+        for dependency in step_by_id.get(step_id, {}).get("depends_on", []):
+            if dependency not in required_steps:
+                required_steps.add(dependency)
+                collect_inputs(dependency)
+    for stale_step in plan["stale_steps"]:
+        collect_inputs(stale_step)
+    output_map = step_output_artifacts()
+    plan["required_inputs"] = list(dict.fromkeys(
+        rel for dependency in all_ids if dependency in required_steps and dependency not in run_ids_set
+        for rel in output_map.get(dependency, []) if (root / rel).exists()))
     plan["can_start"] = not any(p["level"] == "error" for p in plan["problems"])
     plan["plan_digest"] = plan_digest(plan)
     plan["estimate"] = _estimate(project_id, plan)

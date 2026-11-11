@@ -8,6 +8,9 @@ import types
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities
 
 
@@ -35,8 +38,7 @@ media = _LiveMedia()
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / "demo"
-    root.mkdir()
+    root = make_series_project(tmp_path, "demo")
 
     def touch(rel, data=b"x", mtime=None):
         path = root / rel
@@ -47,7 +49,8 @@ def project(tmp_path, monkeypatch):
         return path
 
     touch.root = root
-    return touch
+    with series_scope("demo", "main"):
+        yield touch
 
 
 @pytest.fixture
@@ -63,7 +66,7 @@ def probes(monkeypatch):
 
 
 def inv(**kw):
-    return capabilities.invoke("media_inventory", {"project_id": "demo", "kinds": ["video"], **kw})
+    return capabilities.invoke("media_inventory", {"project_id": "demo", "series_id": "main", "kinds": ["video"], **kw})
 
 
 def make_videos(project, n=5):

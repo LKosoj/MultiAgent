@@ -31,6 +31,7 @@ def env(tmp_path, monkeypatch):
     from StoryBookManager.gui.shots.panel import ShotsPanel
 
     bridge = StudioBridge(root, poll_ms=20)
+    bridge.set_series(PID, "main")
     panel = ShotsPanel(root, bridge=bridge, get_project_id=lambda: PID, on_goto_generation=lambda: None)
     panel.pack(fill="both", expand=True)
     panel.ctl.on_show()
@@ -38,7 +39,7 @@ def env(tmp_path, monkeypatch):
     panel.ctl.select("1-1", immediate=True)
     pump(root, until=lambda: panel.ctl.card_state == "ready")
     pump(root, 0.3)
-    yield root, panel, tmp_path / PID
+    yield root, panel, tmp_path / PID / "series" / "main"
     panel.shutdown()
     root.destroy()
 

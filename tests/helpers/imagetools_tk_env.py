@@ -22,8 +22,9 @@ def make_project(base: Path, pages: int = 3, per_page: int = 1, size=(8, 6)) -> 
     """Проект с шотами (2 картинки + видео-заглушка) и иллюстрациями page_001.. в 50_images."""
     from tests.test_storybook_studio_shots import build
 
-    root = base / PID
-    root.mkdir(parents=True, exist_ok=True)
+    from tests.studio_run_fakes import make_series_project
+
+    root = make_series_project(base, PID)
     build(root)
     for scene, shot in ((1, 1), (2, 3)):
         folder = root / "97_shots" / f"scene_{scene:02d}_shot_{shot:02d}"

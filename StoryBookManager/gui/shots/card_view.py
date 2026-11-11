@@ -164,6 +164,15 @@ class CardView(ttk.Frame):
             for line in lines:
                 self._label(box, line, tone="warning").pack(anchor="w")
             row += 1
+        speech_info = ctx.get("speech_info") or {}
+        decision = speech_info.get("decision") or {}
+        if decision:
+            reason = "видимая речь: видео по образцам и исходной записи; первый/последний кадр недоступны" if decision.get("reason") == "visible_speech" else str(decision.get("reason") or "")
+            self._label(self.content, f"Способ видео: {decision.get('method', '')}. {reason}").grid(row=row, column=0, sticky="w")
+            row += 1
+        for line in speech_info.get("lines", []):
+            self._label(self.content, f"{line.get('speaker_id', '')}: {line.get('text', '')} ({line.get('start', '')}–{line.get('end', '')} с)").grid(row=row, column=0, sticky="w")
+            row += 1
         # ревью
         review = WrapRow(self.content)
         review.grid(row=row, column=0, sticky="ew", pady=(px(PAD_INLINE), 0))

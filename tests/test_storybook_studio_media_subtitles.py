@@ -1,5 +1,8 @@
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities, media
 
 SRT = """1
@@ -50,13 +53,13 @@ def test_parse_bad_blocks_and_sorting():
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / "demo"
-    root.mkdir()
-    return root
+    root = make_series_project(tmp_path, "demo")
+    with series_scope("demo", "main"):
+        yield root
 
 
 def sub(**kw):
-    return capabilities.invoke("media_subtitles", {"project_id": "demo", **kw})
+    return capabilities.invoke("media_subtitles", {"project_id": "demo", "series_id": "main", **kw})
 
 
 def write(root, rel, data):

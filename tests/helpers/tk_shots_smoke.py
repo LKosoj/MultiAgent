@@ -25,21 +25,24 @@ PID = "demo_shots"
 SHOTS = 250
 
 
-def make_project(base: Path, count: int = SHOTS) -> None:
+def make_project(base: Path, count: int = SHOTS) -> dict:
     from PIL import Image
 
-    root = base / PID
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "00_brief.json").write_text(json.dumps(
-        {"title": "Кадры: проверка", "description": "учебный", "genre": "сказка", "target_age": "6-8"},
-        ensure_ascii=False), encoding="utf-8")
+    from custom_tools.storybook.studio import project_store, series
+
+    project_id = project_store.create_project(
+        base, title="Кадры: проверка", description="учебный проект для проверки", genre="сказка",
+        target_age="6-8", id_hint=PID,
+    )
+    episode = series.series_create(project_id, "Episode", "Story", [], {})["series"]
+    root = base / project_id / "series" / episode["series_id"]
     items = []
     for n in range(count):
         scene, shot = n // 5 + 1, n % 5 + 1
         d = root / "97_shots" / f"scene_{scene:02d}_shot_{shot:02d}"
         d.mkdir(parents=True, exist_ok=True)
         for phase in ("start", "end"):
-            rel = f"plots/storybooks/{PID}/97_shots/scene_{scene:02d}_shot_{shot:02d}/img_final_{phase}_{scene:02d}_{shot:02d}.png"
+            rel = f"plots/storybooks/{PID}/series/{episode['series_id']}/97_shots/scene_{scene:02d}_shot_{shot:02d}/img_final_{phase}_{scene:02d}_{shot:02d}.png"
             items.append({"scene_number": scene, "shot_number": shot, "shot_type": phase, "timing": "00:05",
                           "english_prompt": f"prompt {phase} {scene}-{shot} " + "слово " * 8,
                           "negative_prompt": "neg", "video_prompt": "move" if phase == "start" else "",
@@ -50,6 +53,7 @@ def make_project(base: Path, count: int = SHOTS) -> None:
                     d / f"img_final_{phase}_{scene:02d}_{shot:02d}.png")
     (root / "97_shots" / "shots.json").write_text(
         json.dumps({"seed": 7, "consistency_rules": ["a"], "items": items}, ensure_ascii=False), encoding="utf-8")
+    return episode
 
 
 def canvas_items(root) -> int:
@@ -85,8 +89,8 @@ def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="sbm_shots_"))
     projects = tmp / "projects"
     projects.mkdir()
-    make_project(projects)
     os.environ["STORYBOOK_PROJECTS_DIR"] = str(projects)
+    episode = make_project(projects)
 
     import tkinter as tk
     from StoryBookManager.config.settings import app_settings
@@ -117,7 +121,7 @@ def main() -> int:
             if shots:
                 shoot(root, shots / f"{args.tag}_{args.width}x{args.height}_{name}.png")
 
-        app.on_project_selected(app.project_manager.load_project(PID))
+        app.on_series_selected(app.project_manager.load_project(PID), episode)
         app.show_section("shots")
         _pump(root, 2.5)
         ctl = app.shots.ctl

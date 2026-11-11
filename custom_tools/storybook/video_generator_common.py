@@ -5,6 +5,7 @@
 
 import json
 import os
+import contextvars
 import re
 import logging
 import threading
@@ -707,7 +708,7 @@ def update_shots_with_descriptions(
                     updated_count += 1
         else:
             with ThreadPoolExecutor(max_workers=desc_workers) as executor:
-                futures = {executor.submit(_generate_description_for_item, args): args for args in items_needing_description}
+                futures = {executor.submit(contextvars.copy_context().run, _generate_description_for_item, args): args for args in items_needing_description}
                 for future in as_completed(futures):
                     try:
                         if future.result():
@@ -845,7 +846,7 @@ def update_shots_with_descriptions(
                     updated_count += 1
         else:
             with ThreadPoolExecutor(max_workers=enh_workers) as executor:
-                futures = {executor.submit(_enhance_item_prompt, args): args for args in start_items_for_enhance}
+                futures = {executor.submit(contextvars.copy_context().run, _enhance_item_prompt, args): args for args in start_items_for_enhance}
                 for future in as_completed(futures):
                     try:
                         if future.result():

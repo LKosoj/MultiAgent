@@ -117,20 +117,10 @@ class ProjectsController:
 
     # --- Карточка справа ------------------------------------------------------------------
     def load_details(self, project_id: str, done: Callable[[Optional[dict], Optional[dict]], None]) -> None:
-        """Подробности и траты выбранного проекта; done(details, brief), None - не получилось."""
-        got: Dict[str, Optional[dict]] = {}
-
-        def put(key: str, value: Optional[dict]) -> None:
-            got[key] = value
-            if len(got) == 2:
-                done(got["details"], got["brief"])
-
+        """Загрузить общие данные постоянного проекта."""
         self.bridge.call("projects_get", {"project_id": project_id}, latest_only_key="projects_details",
-                         on_success=lambda r: put("details", r.get("details") or {}),
-                         on_error=lambda r: put("details", None))
-        self.bridge.call("project_status_brief", {"project_id": project_id, "surface": "tk"},
-                         latest_only_key="projects_brief",
-                         on_success=lambda r: put("brief", r), on_error=lambda r: put("brief", None))
+                         on_success=lambda r: done(r.get("details") or {}, None),
+                         on_error=lambda r: done(None, None))
 
     # --- Общая обработка заданий ------------------------------------------------------------
     def _progress(self, project_id: Optional[str]):

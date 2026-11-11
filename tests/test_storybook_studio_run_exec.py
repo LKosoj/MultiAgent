@@ -9,7 +9,8 @@ import pytest
 from custom_tools.storybook import project_paths
 from custom_tools.storybook.studio import run_control, run_exec
 from custom_tools.storybook.studio.errors import StudioError
-from tests.studio_run_fakes import FakeEngine, make_plan
+from tests.studio_run_fakes import FakeEngine, make_plan, make_series_project
+from custom_tools.storybook.project_paths import series_scope
 
 STEPS = ["brief_from_prompt", "init_project", "story_planner"]
 
@@ -17,9 +18,9 @@ STEPS = ["brief_from_prompt", "init_project", "story_planner"]
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    base = tmp_path / "p"
-    base.mkdir()
-    return base
+    base = make_series_project(tmp_path, "p")
+    with series_scope("p", "main"):
+        yield base
 
 
 def run(coro):

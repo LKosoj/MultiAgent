@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from custom_tools.storybook.studio import run_plan
+from custom_tools.storybook.studio import run_plan, labels
 from custom_tools.storybook.studio.errors import StudioError
 from tests.studio_run_fakes import FakeEngine
 
@@ -36,7 +36,7 @@ def test_full_requires_task_without_brief_and_keeps_existing_brief(env):
     project, engine = env
     plan = run_plan.build_plan("p", "full", engine=engine)
     assert "invalid_task" in codes(plan, "error") and plan["can_start"] is False
-    assert len(plan["steps_to_run"]) == 36 and plan["workflow_id"].startswith("sbm_p_")
+    assert len(plan["steps_to_run"]) == len(run_plan.steps_catalog()) and plan["workflow_id"].startswith("sbm_p_")
     ok = run_plan.build_plan("p", "full", task="Сказка", engine=engine)
     assert ok["can_start"] and ok["inputs"]["task"] == "Сказка" and ok["input_sources"]["task"] == "explicit"
     put(project, "00_brief.json", json.dumps({"pages_min": 5, "language": "en"}))
@@ -233,7 +233,7 @@ def test_artifact_helpers_match_runner_semantics(env):
 
 def test_steps_catalog_lists_pipeline(env):
     steps = run_plan.steps_catalog()
-    assert len(steps) == 36 and steps[0]["id"] == "brief_from_prompt"
+    assert len(steps) == len(labels.STEP_LABELS) and steps[0]["id"] == "brief_from_prompt"
     assert all({"id", "title", "depends_on", "optional_gate", "output_artifacts"} <= set(s) for s in steps)
 
 

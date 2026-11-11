@@ -1,4 +1,5 @@
 import os
+import contextvars
 import json
 import logging
 import time
@@ -184,7 +185,9 @@ def video_generator_veo_tool(
 
     logger.debug(f"Starting video generation for project: {project_id}, enable: {enable}")
 
-    shots_file_path = f"plots/storybooks/{project_id}/97_shots/shots.json"
+    from .project_paths import safe_storybook_project_dir
+    project_dir = safe_storybook_project_dir(project_id)
+    shots_file_path = str(project_dir / "97_shots/shots.json")
     
     if not os.path.exists(shots_file_path):
         return {"status": "error", "message": f"Файл не найден: {shots_file_path}", "results": []}
@@ -195,6 +198,12 @@ def video_generator_veo_tool(
         items_list = shots_data.get("items", []) if isinstance(shots_data, dict) else shots_data
     except Exception as e:
         return {"status": "error", "message": f"Ошибка чтения: {e}", "results": []}
+
+    if enable and (project_dir / "97_shots/video_plan.json").is_file():
+        from .video_plan import apply_video_plan
+        planned_items = apply_video_plan(project_id, items_list)
+        if any(item.get("video_mode") == "references" for item in planned_items):
+            return {"status": "error", "message": "Этот провайдер пока не передаёт исходную речь и референсы; генерация остановлена.", "results": []}
 
     # ЭТАП 1: Обновляем описания изображений и промпты (единая логика из common)
     logger.info("📝 Этап 1: Анализ и обновление описаний изображений")
@@ -250,7 +259,7 @@ def video_generator_veo_tool(
 
     try:
         job_store = _ProviderJobStore(
-            f"plots/storybooks/{project_id}/97_shots/provider_jobs.json",
+            str(project_dir / "97_shots/provider_jobs.json"),
             provider_name=_VEO_PROVIDER_NAME,
         )
     except Exception as e:
@@ -328,7 +337,7 @@ def video_generator_veo_tool(
         with ThreadPoolExecutor(max_workers=len(batch)) as executor:
             futures = {
                 executor.submit(
-                    _generate_single_video_veo,
+                    contextvars.copy_context().run, _generate_single_video_veo,
                     item,
                     api_key,
                     language,
@@ -383,6 +392,8 @@ def _generate_single_video_veo(
     location: str,
     job_store: Optional[_ProviderJobStore] = None,
 ) -> Dict[str, Any]:
+    if item.get("video_mode") == "references":
+        return {"success": False, "error": "Передача референсов и речи этим провайдером не реализована"}
     scene = item.get("scene_number")
     shot = item.get("shot_number")
     shot_key = f"{scene}-{shot}"

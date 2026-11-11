@@ -23,7 +23,7 @@ _ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Фиксированный список модулей: новые возможности добавляются в эти файлы,
 # а не сюда. Отсутствующий модуль пропускается (ещё не написан).
-STUDIO_MODULES = ("core", "projects", "status", "runs", "run_settings", "shots",
+STUDIO_MODULES = ("core", "projects", "series", "speech", "status", "runs", "run_settings", "shots",
                   "review", "reports", "media", "artifacts", "blockout",
                   "app_settings", "image_edit")
 _PACKAGE = "custom_tools.storybook.studio"
@@ -148,6 +148,10 @@ def invoke(capability_id: str, payload: dict | None = None) -> dict:
         if not (isinstance(key, str) and key.startswith("__"))
     }
     params = inspect.signature(cap.func).parameters
+    scoped = cap.project_scoped and cap.module not in ("projects", "series", "core", "speech", "app_settings")
+    series_id = args.pop("series_id", None) if scoped and "series_id" not in params else args.get("series_id")
+    if scoped and not series_id:
+        return error_result("invalid_argument", "Не хватает параметра: series_id")
     extra = sorted(set(args) - set(params))
     if extra:
         return error_result("invalid_argument", f"Лишние параметры: {', '.join(extra)}")
@@ -160,7 +164,19 @@ def invoke(capability_id: str, payload: dict | None = None) -> dict:
     try:
         if "project_id" in params:
             args["project_id"] = require_safe_storybook_project_id(args.get("project_id"))
-        result = cap.func(**args)
+            if cap.project_scoped:
+                from .project_store import _project_path
+                from custom_tools.storybook.project_paths import storybook_projects_root
+                _project_path(storybook_projects_root(), args["project_id"])
+        if scoped:
+            from custom_tools.storybook.project_paths import series_scope
+            with series_scope(args["project_id"], series_id):
+                result = cap.func(**args)
+            if isinstance(result, dict):
+                result.setdefault("project_id", args["project_id"])
+                result.setdefault("series_id", series_id)
+        else:
+            result = cap.func(**args)
     except PermissionError:
         raise
     except StudioError as exc:

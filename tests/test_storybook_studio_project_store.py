@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+
 from custom_tools.storybook.studio import project_store as ps
 from custom_tools.storybook.studio.errors import StudioError
 
@@ -25,9 +27,9 @@ def dirs(tmp_path):
 
 def make_project(root, name="alpha", files=None):
     base = root / name
-    base.mkdir()
-    (base / "00_brief.json").write_text(json.dumps({"title": "Альфа", "description": "d" * 12}), encoding="utf-8")
-    for rel, text in (files or {"20_story/story.json": json.dumps({"pages": [1, 2]}), "data.txt": "hello"}).items():
+    make_series_project(root, name)
+    (base / "project.json").write_text(json.dumps({"format": "storybook-series-v1", "project_id": name, "title": "Альфа", "description": "d" * 12, "resources": {}}), encoding="utf-8")
+    for rel, text in (files or {"series/main/20_story/story.json": json.dumps({"pages": [1, 2]}), "data.txt": "hello"}).items():
         target = base / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(text, encoding="utf-8")
@@ -51,9 +53,9 @@ def test_list_hides_service_and_outside_links(dirs, tmp_path):
     outside = tmp_path / "outside"
     outside.mkdir()
     (root / "link").symlink_to(outside, target_is_directory=True)
+    make_series_project(root, "real")
     names = sorted(p.name for p in ps.list_project_dirs(root))
-    assert names == ["bare", "real"]
-    assert ps.build_card(root / "bare")["state"] == "empty"
+    assert names == ["real"]
     assert ps.list_project_dirs(root / "missing") == []
 
 
@@ -187,11 +189,10 @@ def test_create_project_writes_brief_and_structure(dirs):
     root, _ = dirs
     pid = ps.create_project(root, **GOOD, id_hint="Мой проект")
     assert pid == "moy_proekt"
-    brief = json.loads((root / pid / "00_brief.json").read_text(encoding="utf-8"))
-    assert brief["title"] == "Лис" and isinstance(brief["seed"], int) and brief["main_characters"] == []
-    assert "Название: Лис" in brief["storybook_prompt"]
-    for rel in ps.PROJECT_STRUCTURE:
-        assert (root / pid / rel).is_dir()
+    project = json.loads((root / pid / "project.json").read_text(encoding="utf-8"))
+    assert project["format"] == "storybook-series-v1" and project["title"] == "Лис"
+    assert project["description"] == GOOD["description"] and project["project_id"] == pid
+    assert (root / pid / "shared").is_dir() and (root / pid / "series").is_dir()
 
 
 # ---- бэкап
@@ -277,7 +278,9 @@ def test_restore_success_creates_safety_backup(dirs):
     (base / "data.txt").write_text("changed")
     (base / "new.txt").write_text("n")
     result = ps.restore_backup(root, backups, "alpha", saved["backup_id"])
-    assert tree_hashes(root / "alpha") == before
+    restored = tree_hashes(root / "alpha")
+    restored.pop(ps.LOCK_NAME, None)  # текущий служебный замок сохраняется при замене каталога
+    assert restored == before
     safety = backups / result["safety_backup_id"]
     assert (safety / "data.txt").read_text() == "changed"
     meta = json.loads((backups / ".meta" / f"{safety.name}.json").read_text(encoding="utf-8"))
@@ -396,22 +399,22 @@ def test_duplicate_excludes_and_titles_copy(dirs):
     result = ps.duplicate_project(root, "alpha", new_id)
     copy = root / new_id
     assert result == {"new_project_id": new_id, "source_busy": False}
-    assert json.loads((copy / "00_brief.json").read_text(encoding="utf-8"))["title"] == "Альфа (копия)"
+    assert json.loads((copy / "project.json").read_text(encoding="utf-8"))["title"] == "Альфа (копия)"
     assert not (copy / ".pipeline.lock").exists() and not (copy / ".studio/thumbs").exists()
-    assert json.loads((base / "00_brief.json").read_text(encoding="utf-8"))["title"] == "Альфа"
+    assert json.loads((base / "project.json").read_text(encoding="utf-8"))["title"] == "Альфа"
 
 
 def test_rename_changes_only_title_atomically(dirs, monkeypatch):
     root, _ = dirs
     base = make_project(root)
     assert ps.rename_project(root, "alpha", "  Новое имя ") == "Альфа"
-    brief = json.loads((base / "00_brief.json").read_text(encoding="utf-8"))
-    assert brief == {"title": "Новое имя", "description": "d" * 12}
+    brief = json.loads((base / "project.json").read_text(encoding="utf-8"))
+    assert brief == {"format": "storybook-series-v1", "project_id": "alpha", "title": "Новое имя", "description": "d" * 12, "resources": {}}
     monkeypatch.setattr(ps.os, "replace", lambda *a: (_ for _ in ()).throw(OSError("x")))
     with pytest.raises(OSError):
         ps.rename_project(root, "alpha", "Ещё")
     monkeypatch.undo()
-    assert json.loads((base / "00_brief.json").read_text(encoding="utf-8"))["title"] == "Новое имя"
+    assert json.loads((base / "project.json").read_text(encoding="utf-8"))["title"] == "Новое имя"
     with pytest.raises(StudioError):
         ps.rename_project(root, "alpha", "x")
 
@@ -428,8 +431,8 @@ def test_export_zip_contents_progress_and_empty(dirs, tmp_path):
     info = ps.export_zip(base, tmp_path / "out.zip", lambda c, t, m: calls.append((c, t)))
     with zipfile.ZipFile(tmp_path / "out.zip") as zf:
         names = set(zf.namelist())
-    assert names == {"00_brief.json", "20_story/story.json", "data.txt"}
-    assert calls[-1] == (3, 3) and info["files_count"] == 3
+    assert names == {"project.json", "series/main/series.json", "series/main/20_story/story.json", "data.txt"}
+    assert calls[-1] == (4, 4) and info["files_count"] == 4
     empty = root / "empty"
     empty.mkdir()
     with pytest.raises(StudioError) as err:
@@ -470,14 +473,14 @@ def test_copy_tolerates_vanished_and_grown_files(dirs, monkeypatch):
     def scan_then_change(src):
         result = real_scan(src)
         (base / "data.txt").write_text("hello, дописано во время копирования", encoding="utf-8")
-        (base / "20_story" / "story.json").unlink()
+        (base / "series/main/20_story" / "story.json").unlink()
         return result
 
     monkeypatch.setattr(ps, "_scan_tree", scan_then_change)
     info = ps.create_backup(root, backups, "alpha")
     copy = backups / info["backup_id"]
     assert (copy / "data.txt").read_text(encoding="utf-8").endswith("копирования")
-    assert not (copy / "20_story" / "story.json").exists()
+    assert not (copy / "series/main/20_story" / "story.json").exists()
 
 
 def test_studio_artifact_history_survives_copy_backup_restore(dirs):
@@ -526,7 +529,7 @@ def test_copy_grown_file_not_false_incomplete_and_counts_copied(dirs, monkeypatc
     monkeypatch.setattr(ps, "_scan_tree", scan_then_drop)
     monkeypatch.setattr(ps.shutil, "copy2", real_copy)
     lost = ps.create_backup(root, backups, "alpha")
-    assert lost["files_count"] == 2
+    assert lost["files_count"] == 3
 
 
 def test_copy_shrunk_file_lenient_without_lock_strict_under_lock(dirs, monkeypatch):
@@ -564,4 +567,4 @@ def test_copy_progress_reaches_total_when_file_vanished(dirs, monkeypatch):
     monkeypatch.setattr(ps, "_scan_tree", scan_then_drop)
     calls = []
     ps.create_backup(root, backups, "alpha", progress=lambda done, total, label: calls.append((done, total)))
-    assert calls and calls[-1][0] == calls[-1][1] == 3
+    assert calls and calls[-1][0] == calls[-1][1] == 4

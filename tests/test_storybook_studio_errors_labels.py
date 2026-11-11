@@ -29,7 +29,7 @@ def test_from_exception_maps_codes():
 def test_step_labels_match_pipeline_yaml():
     data = yaml.safe_load((ROOT / "workflow_pipelines" / "storybook_pipeline.yaml").read_text(encoding="utf-8"))
     assert list(labels.STEP_LABELS) == [step["id"] for step in data["steps"]]
-    assert len(labels.STEP_LABELS) == 36
+    assert len(labels.STEP_LABELS) == len(data["steps"])
 
 
 def test_statuses_cover_workflow_models():

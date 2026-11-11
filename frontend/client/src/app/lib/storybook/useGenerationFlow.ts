@@ -92,6 +92,7 @@ type Args = {
   client: StorybookClient;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  storageId?: string;
   enabled: boolean;
   isAdmin: boolean;
   say: Say;
@@ -104,7 +105,7 @@ type Args = {
 const PLAN_DELAY_MS = 500;
 
 export const useGenerationFlow = (a: Args): GenerationFlowApi => {
-  const { client, runUser, projectId, enabled, isAdmin, intent, titleOf, runApi, settings } = a;
+  const { client, runUser, projectId, storageId = projectId, enabled, isAdmin, intent, titleOf, runApi, settings } = a;
   const status = runApi.status;
   const [selection, setSelection] = useState<Selection>({ mode: "full", stepId: null, shotKeys: [] });
   const [task, setTask] = useState("");
@@ -134,17 +135,17 @@ export const useGenerationFlow = (a: Args): GenerationFlowApi => {
 
   // черновик сказки и брифа возвращается при возвращении на экран
   useEffect(() => {
-    const d = loadForm(sessionStorageOrNull(), projectId);
+    const d = loadForm(sessionStorageOrNull(), storageId);
     if (d) {
       setTask(d.task);
       setBriefState(d.brief);
       setRegenWhat(d.regenWhat);
     }
     setHydrated(true);
-  }, [projectId]);
+  }, [storageId]);
   useEffect(() => {
-    if (hydrated) saveForm(sessionStorageOrNull(), projectId, { task, brief, regenWhat });
-  }, [hydrated, projectId, task, brief, regenWhat]);
+    if (hydrated) saveForm(sessionStorageOrNull(), storageId, { task, brief, regenWhat });
+  }, [hydrated, storageId, task, brief, regenWhat]);
 
   // переход из других экранов применяется один раз на объект перехода, когда уже известно, есть ли что продолжать
   const lastIntent = useRef<IntentLike>(null);

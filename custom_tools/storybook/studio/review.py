@@ -37,6 +37,64 @@ def status_title(status: Any) -> str:
     return rs.status_title(status)
 
 
+def _film_review_state(project_id: str, series_id: str) -> dict:
+    from custom_tools.storybook.project_paths import series_scope
+    from .run_plan import stale_upstream_for_step
+    from .series import series_dir
+
+    root = series_dir(project_id, series_id)
+    digest = hashlib.sha256()
+    for name in ("final_video.mp4", "final_review.json"):
+        path = root / "99_final" / name
+        digest.update(name.encode())
+        if path.is_file():
+            with path.open("rb") as source:
+                digest.update(hashlib.file_digest(source, "sha256").digest())
+    final_available = (root / "99_final/final_video.mp4").is_file()
+    series = json.loads((root / "series.json").read_text())
+    stale_outputs = [name for name in series.get("stale_results", [])
+                     if name == "99_final" or name.startswith("99_final/")]
+    with series_scope(project_id, series_id):
+        stale_outputs = sorted(set(stale_outputs + stale_upstream_for_step(project_id, "montage_assembler")))
+    digest.update(json.dumps(stale_outputs, sort_keys=True).encode())
+    report_path = root / "99_final/final_review.json"
+    report = json.loads(report_path.read_text()) if report_path.is_file() else {}
+    saved_path = root / ".studio/film_review.json"
+    saved = json.loads(saved_path.read_text()) if saved_path.is_file() else {}
+    input_digest = digest.hexdigest()
+    stale = bool(stale_outputs or (saved and saved.get("input_digest") != input_digest))
+    return success(project_id=project_id, series_id=series_id, final_available=final_available,
+                   technical_passed=final_available and report.get("passed") is True and not stale_outputs,
+                   review={"status": "pending" if stale else saved.get("status", "pending"),
+                           "note": saved.get("note", ""), "input_digest": input_digest, "stale": stale})
+
+
+@capability("film_review_get", title="Принятие фильма", access="read")
+def film_review_get(project_id: str, series_id: str) -> dict:
+    """Technical render success never grants artistic approval."""
+    return _film_review_state(project_id, series_id)
+
+
+@capability("film_review_set", title="Сохранить решение по фильму", access="write")
+def film_review_set(project_id: str, series_id: str, status: str, expected_digest: str, note: str = "") -> dict:
+    from custom_tools.storybook.project_paths import series_scope
+    from .project_store import write_json_atomic
+    from .series import series_dir
+
+    if status not in ("pending", "approved", "redo") or not isinstance(note, str):
+        raise StudioError("invalid_argument", "Проверьте решение и заметку по фильму")
+    with series_scope(project_id, series_id), rs._locked(project_id):
+        current = _film_review_state(project_id, series_id)
+        if current["review"]["input_digest"] != expected_digest:
+            raise StudioError("conflict", "Фильм изменился. Просмотрите актуальную версию")
+        if status == "approved" and not current["technical_passed"]:
+            raise StudioError("invalid_argument", "Принять можно готовый фильм с успешной технической проверкой")
+        path = series_dir(project_id, series_id) / ".studio/film_review.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(path, {"status": status, "note": note, "input_digest": expected_digest})
+        return _film_review_state(project_id, series_id)
+
+
 # ------------------------------------------------------------------ хуки для соседей
 
 def review_counts(project_id: str) -> Optional[dict]:

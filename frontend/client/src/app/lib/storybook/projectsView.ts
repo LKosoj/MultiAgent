@@ -3,12 +3,12 @@ import type { ProjectCard } from "./projects";
 import { BUSY_HINT, T } from "./texts";
 import { formatBytes, formatDateRu } from "./format";
 
-export type ProjectSort = "modified" | "name" | "size" | "stage";
+export type ProjectSort = "modified" | "name" | "size" | "series";
 export const PROJECT_SORTS: { value: ProjectSort; label: string }[] = [
   { value: "modified", label: T.sortModified },
   { value: "name", label: T.sortName },
   { value: "size", label: T.sortSize },
-  { value: "stage", label: T.sortStage },
+  { value: "series", label: "Число серий" },
 ];
 
 export const isProjectSort = (value: unknown): value is ProjectSort =>
@@ -35,7 +35,7 @@ export const sortProjects = (
   indexed.sort((x, y) => {
     let diff = 0;
     if (sort === "name") diff = byTitle(x.p, y.p);
-    else if (sort === "stage") diff = y.p.stage.index - x.p.stage.index || byTitle(x.p, y.p);
+    else if (sort === "series") diff = y.p.series_count - x.p.series_count || byTitle(x.p, y.p);
     else if (sort === "size") {
       const sx = sizeOf(x.p.project_id);
       const sy = sizeOf(y.p.project_id);
@@ -62,7 +62,7 @@ export const canDelete = (card: ProjectCard): ActionGate =>
 export const canRename = canDelete;
 
 export const cardSubtitle = (card: ProjectCard, sizeBytes?: number): string => {
-  const parts = [`${T.stagePrefix} ${card.stage.title}`, `${card.pages_count} ${T.pagesSuffix}`];
+  const parts = [`Серий: ${card.series_count}`];
   parts.push(sizeBytes === undefined ? "—" : formatBytes(sizeBytes));
   return parts.join(" · ");
 };

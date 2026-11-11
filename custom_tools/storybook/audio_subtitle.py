@@ -1,7 +1,6 @@
 import json
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -13,164 +12,58 @@ def storybook_audio_subtitle_tool(
     project_id: str,
     language: str = "ru",
     enable: bool = True,
-    allow_missing_subtitles: bool = False,
-    narration_path: str = "",
     generate_subtitles: bool = True,
+    series_id: str = "",
 ) -> Dict[str, Any]:
-    """Create subtitle and audio planning artifacts for a storybook project.
+    """Write subtitles and register audio from the series' measured speech.
 
     Args:
-        session_id: Execution session identifier used in generated artifacts.
-        project_id: Storybook project identifier under plots/storybooks.
-        language: Language code stored in generated metadata.
-        enable: When false, skip artifact generation and return planned output paths.
-        allow_missing_subtitles: When false (default), an empty cue set is a hard error;
-            when true, an empty cue set succeeds with a ``no_subtitle_cues`` warning.
-        narration_path: Existing reader audio to copy unchanged; timing is aligned manually.
-        generate_subtitles: When false, subtitles.srt is not written and missing cues are not an error;
-            cue_sheet and the audio manifest are still produced.
+        session_id: Execution trace identifier.
+        project_id: Project identifier.
+        language: Language code.
+        enable: Whether to prepare subtitles and audio.
+        generate_subtitles: Whether to write subtitles.
+        series_id: Series identifier.
     """
-    enable = _as_bool(enable)
-    # выключенные субтитры = осознанно «без реплик»: отсутствие реплик не ошибка
-    generate_subtitles = _as_bool(generate_subtitles)
-    allow_missing_subtitles = _as_bool(allow_missing_subtitles) or not generate_subtitles
+    from custom_tools.storybook.studio.series import series_dir
     try:
-        base_dir = _safe_project_dir(project_id)
-    except ValueError as exc:
-        return {
-            "status": "error",
-            "message": str(exc),
-            "error": str(exc),
-            "subtitles_path": "",
-            "audio_manifest_path": "",
-            "cue_sheet_path": "",
-            "results": [],
-        }
-    audio_dir = base_dir / "98_audio"
-    subtitles_path = audio_dir / "subtitles.srt"
+        base = series_dir(project_id, series_id)
+    except Exception as exc:
+        return {"status": "error", "error": str(exc), "subtitles_path": "", "audio_manifest_path": "", "cue_sheet_path": ""}
+    audio_dir = base / "98_audio"
+    subtitles = audio_dir / "subtitles.srt"
+    cue_path = audio_dir / "cue_sheet.json"
     manifest_path = audio_dir / "audio_manifest.json"
-    cue_sheet_path = audio_dir / "cue_sheet.json"
-
-    if not enable:
-        return {
-            "status": "skipped",
-            "message": "Audio/subtitle generation disabled",
-            "results": [],
-            "subtitles_path": str(subtitles_path),
-            "audio_manifest_path": str(manifest_path),
-            "cue_sheet_path": str(cue_sheet_path),
-        }
-
-    shots_path = base_dir / "97_shots" / "shots.json"
-    screenplay_path = base_dir / "91_screenplay" / "screenplay.json"
-    audio_dir.mkdir(parents=True, exist_ok=True)
-
-    errors: List[str] = []
-    shots_data: Any = None
-    if shots_path.exists():
-        try:
-            shots_data = _read_json(shots_path)
-        except Exception as exc:
-            errors.append(f"Failed to read shots.json: {exc}")
-            shots_data = None
-    else:
-        errors.append(f"shots.json not found: {shots_path}")
-
-    screenplay_data: Any = None
-    if screenplay_path.exists():
-        try:
-            screenplay_data = _read_json(screenplay_path)
-        except Exception as exc:
-            errors.append(f"Failed to read screenplay.json: {exc}")
-
-    items = _collect_logical_shots(_extract_items(shots_data))
-    screenplay_lookup = _build_screenplay_lookup(screenplay_data)
-    cues, skipped = _build_cues(items, screenplay_lookup)
-
-    warnings: List[str] = []
-    if not cues and allow_missing_subtitles and generate_subtitles:
-        warnings.append("no_subtitle_cues")
-
-    # subtitles.srt is a planning/preview artifact only; montage (WS-F) rebuilds the
-    # final SRT from edit_decisions x cue_sheet against the real timeline.
-    if generate_subtitles:
-        _atomic_write_text(subtitles_path, _format_srt(cues))
-
-    # cue_sheet.json is the authoritative source of cue TEXT for montage. It exposes the
-    # (scene_number, shot_number) join keys plus per-cue text/text_source, and marks the
-    # timeline as "planned" because final timing is owned by montage (WS-F), not this tool.
-    cue_sheet = {
-        "project_id": str(project_id),
-        "session_id": session_id,
-        "language": language,
-        "timeline": "planned",
-        "source_shots_path": str(shots_path),
-        "source_screenplay_path": str(screenplay_path) if screenplay_path.exists() else None,
-        "cue_count": len(cues),
-        "warnings": warnings,
-        "cues": cues,
-        "skipped": skipped,
-    }
-    _write_json(cue_sheet_path, cue_sheet)
-
-    audio_manifest = {
-        "project_id": str(project_id),
-        "session_id": session_id,
-        "language": language,
-        "tts_status": "unavailable",
-        "tts_reason": "No external TTS backend is called by this tool",
-        "audio_tracks": [],
-        "subtitles_path": str(subtitles_path),
-        "cue_sheet_path": str(cue_sheet_path),
-        "cue_count": len(cues),
-        "subtitles_enabled": generate_subtitles,
-        "sources": {
-            "shots_json": str(shots_path) if shots_path.exists() else None,
-            "screenplay_json": str(screenplay_path) if screenplay_path.exists() else None,
-        },
-        "errors": errors,
-    }
-    if narration_path:
-        source = Path(narration_path).resolve()
-        target = audio_dir / ("narration" + source.suffix.lower())
-        if source != target.resolve():
-            shutil.copy2(source, target)
-        elif not source.is_file():
-            raise FileNotFoundError(source)
-        audio_manifest["audio_tracks"].append({"role": "narration", "path": str(target)})
-        audio_manifest["narration_timing"] = "manual_alignment_required"
-    _write_json(manifest_path, audio_manifest)
-
-    if not cues and not allow_missing_subtitles:
-        status = "error"
-        message = "; ".join(errors) if errors else "No subtitle cues were produced"
-    else:
-        status = "success"
-        message = f"Generated {len(cues)} subtitle cues; TTS unavailable"
-        if not cues:
-            message = "No subtitle cues were produced; continuing (allow_missing_subtitles=true)"
-
-    result = {
-        "status": status,
-        "message": message,
-        "subtitles_path": str(subtitles_path),
-        "audio_manifest_path": str(manifest_path),
-        "cue_sheet_path": str(cue_sheet_path),
-        "cue_count": len(cues),
-        "tts_status": "unavailable",
-        "warnings": warnings,
-        "results": {
-            "subtitles_path": str(subtitles_path),
-            "audio_manifest_path": str(manifest_path),
-            "cue_sheet_path": str(cue_sheet_path),
-            "cue_count": len(cues),
-            "tts_status": "unavailable",
-            "warnings": warnings,
-        },
-    }
-    if status == "error":
-        result["error"] = message
-    return result
+    if not _as_bool(enable):
+        return {"status": "skipped", "subtitles_path": str(subtitles),
+                "cue_sheet_path": str(cue_path), "audio_manifest_path": str(manifest_path)}
+    try:
+        speech = _read_json(audio_dir / "speech.json")
+    except (OSError, ValueError) as exc:
+        return {"status": "error", "error": str(exc), "subtitles_path": str(subtitles),
+                "audio_manifest_path": str(manifest_path), "cue_sheet_path": str(cue_path)}
+    if speech.get("status") not in ("success", "silent"):
+        return {"status": "error", "error": "Речь ещё не измерена", "subtitles_path": str(subtitles),
+                "audio_manifest_path": str(manifest_path), "cue_sheet_path": str(cue_path)}
+    cues = [{"index": i, "scene_number": line.get("scene_number"), "shot_number": line.get("shot_number"),
+             "text": line["text"], "start": line["start"], "end": line["end"],
+             "start_timecode": _format_srt_timestamp(line["start"]),
+             "end_timecode": _format_srt_timestamp(line["end"])}
+            for i, line in enumerate(speech["lines"], 1)]
+    if _as_bool(generate_subtitles):
+        _atomic_write_text(subtitles, _format_srt(cues))
+    _write_json(cue_path, {"timeline": "measured", "cues": cues, "cue_count": len(cues)})
+    manifest = _read_json(manifest_path) if manifest_path.exists() else {}
+    tracks = [track for track in manifest.get("audio_tracks", []) if track.get("role") != "narration"]
+    if speech.get("audio_path"):
+        tracks.insert(0, {"role": "narration", "path": speech["audio_path"], "offset_seconds": 0,
+                          "duration_seconds": speech["duration"]})
+    manifest.update(audio_tracks=tracks, tts_status=speech["status"], subtitles_path=str(subtitles),
+                    cue_sheet_path=str(cue_path), subtitles_enabled=_as_bool(generate_subtitles))
+    _write_json(manifest_path, manifest)
+    return {"status": "success", "speech_path": str(audio_dir / "speech.json"),
+            "subtitles_path": str(subtitles), "cue_sheet_path": str(cue_path),
+            "audio_manifest_path": str(manifest_path), "cue_count": len(cues)}
 
 
 def _read_json(path: Path) -> Any:

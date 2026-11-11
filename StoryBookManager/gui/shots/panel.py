@@ -299,7 +299,8 @@ class ShotsPanel(ttk.Frame):
                     self.card_view.current_key == (c.card or {}).get("shot_key"):
                 draft, note = self.card_view.read_form()   # правки в полях переживают смену ревью
             row = c.row_of(c.selected) or {}
-            self.card_view.show_card(c.card, c.entry or {}, {"busy_reason": c.regen_block(),
+            speech_info = self._shot_speech(c.card)
+            self.card_view.show_card(c.card, c.entry or {}, {"speech_info": speech_info, "busy_reason": c.regen_block(),
                                                              "edit_block": self._edit_block(),
                                                              "generating": M.is_generating(row)}, draft, note)
             if c.reports is not None or c.versions is not None:
@@ -315,6 +316,32 @@ class ShotsPanel(ttk.Frame):
         if rel and (card.get("parts") or {}).get("start", {}).get("exists"):
             self._view_images([(T.part_title("start"), rel)], 0)
 
+    def _shot_speech(self, card):
+        import json
+        from pathlib import Path
+        def read(rel):
+            path = self._resolve(rel)
+            if not path or not Path(path).is_file(): return {}
+            try: return json.loads(Path(path).read_text(encoding="utf-8"))
+            except (ValueError, OSError): return {}
+        plan = read("97_shots/video_plan.json")
+        key = card.get("shot_key")
+        decision = next((d for d in plan.get("decisions", []) if key in d.get("shot_keys", [])), {})
+        shots = read("97_shots/shots.json").get("items", [])
+        shot = next((i for i in shots if i.get("scene_number") == card.get("scene") and i.get("shot_number") == card.get("shot") and i.get("shot_type", "start") == "start"), {})
+        speech = read("98_audio/speech.json")
+        interval = next((item for item in plan.get("shot_intervals", []) if item.get("shot_key") == key), None)
+        lines = []
+        if interval is not None:
+            by_id = {line.get("id"): line for line in speech.get("lines", [])}
+            lines = [by_id[entry["line_id"]] for entry in interval.get("speaker_schedule", [])
+                     if entry.get("line_id") in by_id]
+        else:
+            start, end = shot.get("start_s"), shot.get("end_s")
+            if start is not None and end is not None:
+                lines = [line for line in speech.get("lines", []) if line.get("start", end) < end and line.get("end", start) > start]
+        return {"decision": decision, "lines": lines}
+
     def _resolve(self, rel: str) -> Optional[str]:
         project = self._get_project_id()
         if not project or not rel:
@@ -322,7 +349,10 @@ class ShotsPanel(ttk.Frame):
         try:
             from custom_tools.storybook.studio.paths import resolve_in_project
 
-            return str(resolve_in_project(project, rel))
+            from custom_tools.storybook.project_paths import series_scope
+            series_id = self.ctl.bridge._scope[1]
+            with series_scope(project, series_id):
+                return str(resolve_in_project(project, rel))
         except Exception:
             return None
 

@@ -12,7 +12,7 @@ const collect = (value: unknown, out: string[] = []): string[] => {
 describe("тексты раздела", () => {
   it("ключевые фразы совпадают со спекой", () => {
     expect(texts.NO_RIGHTS_TEXT).toBe("Недостаточно прав: это действие доступно администратору.");
-    expect(texts.T.emptyProjects).toBe("Проектов пока нет. Опишите идею сказки, и система создаст первый проект.");
+    expect(texts.T.emptyProjects).toBe("Проектов пока нет. Создайте проект, затем добавьте в него серию и её материал.");
     expect(texts.T.emptyOverview).toBe("Проект ещё не запускался. Настройте запуск и оцените стоимость.");
     expect(texts.T.loadingStatus).toBe("Загрузка состояния проекта…");
     expect(texts.T.noRuns).toBe("Прогон ещё не запускался.");

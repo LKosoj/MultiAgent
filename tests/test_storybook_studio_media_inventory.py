@@ -4,6 +4,9 @@ import os
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from custom_tools.storybook.studio import capabilities
 from custom_tools.storybook.studio.errors import StudioError
 from custom_tools.storybook.studio.paths import resolve_in_project
@@ -38,8 +41,7 @@ def _no_real_probe(monkeypatch):
 @pytest.fixture
 def project(tmp_path, monkeypatch):
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    root = tmp_path / "character_demo"
-    root.mkdir()
+    root = make_series_project(tmp_path, "character_demo")
 
     def touch(rel, data=b"x", mtime=None):
         path = root / rel
@@ -50,7 +52,8 @@ def project(tmp_path, monkeypatch):
         return path
 
     touch.root = root
-    return touch
+    with series_scope("character_demo", "main"):
+        yield touch
 
 
 def scan(touch, **kw):
@@ -158,7 +161,7 @@ def test_sfx_scene_and_music_id_from_manifests(project):
 
 
 def call(project_id="character_demo", **kw):
-    return capabilities.invoke("media_inventory", {"project_id": project_id, **kw})
+    return capabilities.invoke("media_inventory", {"project_id": project_id, "series_id": "main", **kw})
 
 
 def test_filters_and_counts(project):
@@ -191,7 +194,7 @@ def test_errors(project):
         assert call(**kw)["error"]["code"] == "invalid_argument", kw
     assert call("missing_project")["error"]["code"] == "not_found"
     assert call("../x")["error"]["code"] == "invalid_argument"
-    assert capabilities.invoke("media_inventory", {"project_id": "character_demo", "zzz": 1})["error"]["code"] == "invalid_argument"
+    assert capabilities.invoke("media_inventory", {"project_id": "character_demo", "series_id": "main", "zzz": 1})["error"]["code"] == "invalid_argument"
 
 
 def test_sorting(project):

@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+from tests.studio_run_fakes import make_series_project
+from custom_tools.storybook.project_paths import series_scope
+
 from backend.fastapi_app.agui import _storybook_actions as actions
 from backend.fastapi_app.agui.auth import Principal
 from custom_tools.storybook.project_paths import acquire_storybook_project_lock, release_storybook_project_lock
@@ -25,12 +28,13 @@ def _fixture(key):
 def project(tmp_path, monkeypatch):
     art._SNAPSHOTS.clear()  # кэш снимков shots живёт в процессе
     monkeypatch.setenv("STORYBOOK_PROJECTS_DIR", str(tmp_path))
-    (tmp_path / "demo").mkdir()
-    return tmp_path / "demo"
+    series = make_series_project(tmp_path)
+    with series_scope("demo", "main"):
+        yield series
 
 
 def _call(cap, **payload):
-    return caps.invoke(cap, {"project_id": "demo", **payload})
+    return caps.invoke(cap, {"project_id": "demo", "series_id": "main", **payload})
 
 
 def _path(project, key):
@@ -175,14 +179,14 @@ def _proc_worker(root, digest, title, queue):
 
     data = json.loads((FIXTURES / "brief.json").read_text(encoding="utf-8"))
     data["title"] = title
-    queue.put(c.invoke("artifact_save", {"project_id": "demo", "key": "brief", "base_digest": digest, "content": data})["status"])
+    queue.put(c.invoke("artifact_save", {"project_id": "demo", "series_id": "main", "key": "brief", "base_digest": digest, "content": data})["status"])
 
 
 def test_two_processes_same_digest_one_wins(project):
     digest = _seed(project, "brief")
     ctx = multiprocessing.get_context("fork")
     queue = ctx.Queue()
-    procs = [ctx.Process(target=_proc_worker, args=(str(project.parent), digest, t, queue)) for t in ("А", "Б")]
+    procs = [ctx.Process(target=_proc_worker, args=(str(project.parents[2]), digest, t, queue)) for t in ("А", "Б")]
     [p.start() for p in procs]
     [p.join(30) for p in procs]
     assert sorted([queue.get(timeout=5), queue.get(timeout=5)]) == ["error", "success"]
@@ -287,7 +291,7 @@ def test_permissions_through_dispatch(project):
             actions.require_storybook_role(f"storybook.{name}", user)
         actions.require_storybook_role(f"storybook.{name}", admin)
     assert caps.registry()["artifact_save"].access == "write" and caps.registry()["artifact_read"].access == "read"
-    payload = {"project_id": "demo", "key": "synopsis", "base_digest": None, "content": _fixture("synopsis")}
+    payload = {"project_id": "demo", "series_id": "main", "key": "synopsis", "base_digest": None, "content": _fixture("synopsis")}
     assert actions.dispatch("storybook.artifact_save", payload, admin)["status"] == "success"
-    listed = actions.dispatch("storybook.artifacts_list", {"project_id": "demo"}, admin)
+    listed = actions.dispatch("storybook.artifacts_list", {"project_id": "demo", "series_id": "main"}, admin)
     assert [i["artifact_key"] for i in listed["items"]][:2] == ["brief", "synopsis"]  # не закрашено как секрет

@@ -49,6 +49,7 @@ type Args = {
   client: StorybookClient;
   runUser: <T>(task: () => Promise<T>) => Promise<T>;
   projectId: string;
+  storageId?: string;
   enabled: boolean;
 };
 
@@ -68,7 +69,7 @@ const EMPTY: SettingsLoad = {
   restored: false,
 };
 
-export const useRunSettings = ({ client, runUser, projectId, enabled }: Args): RunSettingsApi => {
+export const useRunSettings = ({ client, runUser, projectId, storageId = projectId, enabled }: Args): RunSettingsApi => {
   const [data, setData] = useState<SettingsLoad>(EMPTY);
   const seq = useRef(0);
   const dataRef = useRef(data);
@@ -88,7 +89,7 @@ export const useRunSettings = ({ client, runUser, projectId, enabled }: Args): R
         runHistory(client, { project_id: projectId, limit: 20 }),
       ]);
       if (my !== seq.current) return;
-      const restored = loadSettingsDraft(sessionStorageOrNull(), projectId, settings.digest);
+      const restored = loadSettingsDraft(sessionStorageOrNull(), storageId, settings.digest);
       setData({
         state: "ready",
         error: null,
@@ -108,7 +109,7 @@ export const useRunSettings = ({ client, runUser, projectId, enabled }: Args): R
       if (my !== seq.current) return;
       setData((d) => ({ ...d, state: "error", error: classifyStorybookError(err) }));
     }
-  }, [client, projectId]);
+  }, [client, projectId, storageId]);
 
   useEffect(() => {
     if (!enabled) return;
@@ -122,8 +123,8 @@ export const useRunSettings = ({ client, runUser, projectId, enabled }: Args): R
   const { saved, draft, digest } = data;
   useEffect(() => {
     if (data.state !== "ready") return;
-    saveSettingsDraft(sessionStorageOrNull(), projectId, digest, isDirty(saved, draft) ? draft : null);
-  }, [data.state, projectId, saved, draft, digest]);
+    saveSettingsDraft(sessionStorageOrNull(), storageId, digest, isDirty(saved, draft) ? draft : null);
+  }, [data.state, storageId, saved, draft, digest]);
 
   const reloadHistory = useCallback(async () => {
     try {

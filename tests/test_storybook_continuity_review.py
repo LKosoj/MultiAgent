@@ -908,3 +908,44 @@ def test_video_review_can_run_without_automatic_repair(monkeypatch):
     monkeypatch.setattr(review, '_review', fake_review)
     assert review.storybook_continuity_videos_review_tool('s', 'p', repair=False) == {'status': 'success'}
     assert calls['repair'] is False
+
+
+def test_visual_audit_receives_character_canon_as_separate_reference(tmp_path, monkeypatch):
+    base, items = _project(tmp_path, monkeypatch)
+    canon = base / '20_bible/references/hero.png'
+    Image.new('RGB', (16, 16), 'red').save(canon)
+    for item in items:
+        item['characters'] = [{'name': 'Hero', 'reference_image_path': str(canon)}]
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': items}))
+    requests = []
+    monkeypatch.setattr(review, 'call_openai_api', lambda **kwargs: requests.append(kwargs) or json.dumps({
+        'passed': True, 'violations': [], 'uncertain': []}))
+    task = review._tasks(base, 'images')[0]
+    review._audit(task, task['group'], 0)
+    content = requests[0]['prompt']
+    assert any('CHARACTER.Hero' in item.get('text', '') for item in content)
+    assert 'character identity' in requests[0]['system_prompt'].lower()
+
+
+def test_continuity_tasks_keep_project_id_inside_series_scope(tmp_path, monkeypatch):
+    import shutil
+    from custom_tools.storybook.project_paths import series_scope
+    from custom_tools.storybook.studio.capabilities import invoke
+    from custom_tools.storybook import video_plan
+    old, items = _project(tmp_path, monkeypatch)
+    pid = invoke('projects_create', {'title': 'World', 'description': 'A shared world', 'genre': 'fairy', 'target_age': 'all'})['project_id']
+    sid = invoke('series_create', {'project_id': pid, 'title': 'Series', 'source_material': '', 'participant_ids': [], 'settings': {}})['series_id']
+    base = tmp_path / pid / 'series' / sid
+    shutil.copytree(old, base, dirs_exist_ok=True)
+    for item in items:
+        item['output_path'] = str(base / '97_shots' / (item['shot_type'] + '.png'))
+    (base / '97_shots/shots.json').write_text(json.dumps({'items': items}))
+    called = []
+    original = video_plan.select_image_items
+    def select(project_id, rows):
+        called.append(project_id)
+        return original(project_id, rows)
+    monkeypatch.setattr(video_plan, 'select_image_items', select)
+    with series_scope(pid, sid):
+        assert review._tasks(base, 'images')
+    assert called == [pid]

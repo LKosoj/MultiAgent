@@ -1,4 +1,5 @@
 """Prepare spatial background cards before rendering storyboard frames."""
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -346,7 +347,7 @@ def storybook_background_plan_tool(session_id: str, project_id: str, shots_data:
             return plan
 
         with ThreadPoolExecutor(max_workers=4) as executor:
-            plans = list(executor.map(plan_location, enumerate(planning_inputs, 1)))
+            plans = list((future.result() for future in [executor.submit(contextvars.copy_context().run, plan_location, value) for value in enumerate(planning_inputs, 1)]))
         plan = {"spaces": [space for result in plans for space in result["spaces"]],
                 "skipped": [entry for result in plans for entry in result["skipped"]]}
         sheets, bindings = _build_background_sheets(plan["spaces"], frames, catalog["styles"], output_dir, plan["skipped"])
@@ -429,7 +430,7 @@ def storybook_background_references_tool(session_id: str, project_id: str, shots
             if not output.is_file():
                 raise RuntimeError(f"Background reference was not generated: {output}")
     with ThreadPoolExecutor(max_workers=4) as executor:
-        list(executor.map(render_space, space_sheets.values()))
+        list((future.result() for future in [executor.submit(contextvars.copy_context().run, render_space, value) for value in space_sheets.values()]))
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     with open(str(shots_path) + ".lock", "a+", encoding="utf-8") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

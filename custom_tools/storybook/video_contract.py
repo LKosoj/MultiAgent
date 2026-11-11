@@ -1139,14 +1139,17 @@ def _aitunnel_delivery_input_blockers(
     for item in pending_items:
         try:
             if item.get("video_mode") == "references":
-                from .video_plan import reference_request
-                payload, _ = reference_request(item, configured_model, None)
-                config = catalog[payload['model']]
-                if (not config.get("supports_image_references")
-                        or (config.get("max_image_references") is not None
-                            and len(payload["input_references"]) > config["max_image_references"])
-                        or payload["duration"] not in config["supported_durations"]):
-                    raise ValueError("Unsupported reference video request")
+                from .video_plan import _part_items, reference_request
+                parts = _part_items(item, item["speech_supported_durations"]) if item.get("speech_parts") else [item]
+                for part in parts:
+                    payload, _ = reference_request(part, configured_model, None, provider_name=provider_name)
+                    config = catalog[payload['model']]
+                    image_count = sum(ref.get("type") == "image_url" for ref in payload["input_references"])
+                    if (not config.get("supports_image_references")
+                            or (config.get("max_image_references") is not None
+                                and image_count > config["max_image_references"])
+                            or payload["duration"] not in config["supported_durations"]):
+                        raise ValueError("Unsupported reference video request")
                 continue
             width, height = _resolve_frame_dimensions(item, item.get("start_image"))
             _resolve_model_and_size(
