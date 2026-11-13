@@ -687,3 +687,91 @@ def test_alignment_error_keeps_other_language_and_other_audio_words(tmp_path, mo
     assert (directory / f'{same_key}.mp3').exists()
     assert (directory / f'{other_language_key}.words.json').exists()
     assert (directory / f'{other_audio_key}.words.json').exists()
+
+
+def _silence(path, seconds):
+    import subprocess
+    subprocess.run(['ffmpeg', '-v', 'error', '-y', '-f', 'lavfi', '-i', 'anullsrc=r=8000:cl=mono', '-t', str(seconds),
+                    '-f', 'wav', str(path)], check=True)
+    return path
+
+
+def _asr(answer):
+    """Fake recognition request: answer(clip duration) gives the words of the clip."""
+    from types import SimpleNamespace
+    calls = []
+    def post(endpoint, **kwargs):
+        calls.append(speech._duration(kwargs['files']['file'][1].name))
+        return SimpleNamespace(json=lambda: {'words': answer(calls[-1])})
+    return post, calls
+
+
+def test_term_in_latin_matches_the_same_term_in_cyrillic():
+    texts = ['Prompt', 'Engineering', 'и', 'запуск', 'моделей.', 'Кратко.']
+    words = [{'text': text, 'start': i * .5, 'end': i * .5 + .4} for i, text in enumerate(texts)]
+    timing = measure_line_timing([{'text': 'Промпт-инжиниринг и запуск моделей — кратко.'}], words, 4, 'ru')
+    assert [(x['word_start'], x['word_end']) for x in timing] == [(0, 6)]
+
+
+@pytest.mark.parametrize('texts, words, bounds', [
+    (['Раз два', 'Три четыре', 'Пять шесть'], [('Раз', 0, 1), ('два', 1, 2)], (2, 3)),
+    (['Раз два', 'Три', 'Пять шесть'], [('Раз', 0, 1), ('два', 1, 2), ('Пять', 5, 6), ('шесть', 6, 7)], (2, 5)),
+])
+def test_line_without_words_is_looked_for_in_its_pause(texts, words, bounds):
+    from custom_tools.storybook.speech_alignment import LineNotHeardError
+    with pytest.raises(LineNotHeardError, match='Реплика 2 не найдена') as error:
+        measure_line_timing([{'text': text} for text in texts],
+                            [{'text': t, 'start': s, 'end': e} for t, s, e in words], {2: 3, 4: 8}[len(words)], 'ru')
+    assert (error.value.start, error.value.end) == bounds
+
+
+def test_bad_word_times_of_recognition_are_repaired(tmp_path, monkeypatch):
+    post, _ = _asr(lambda length: [{'word': 'Раз', 'start': 0, 'end': 0}, {'word': 'два', 'start': 0, 'end': 1},
+                                   {'word': 'три', 'start': .8, 'end': 1.5}, {'word': 'четыре', 'start': 1.5, 'end': 3.6}])
+    monkeypatch.setattr(speech, '_post', post)
+    words = speech._transcribe(_silence(tmp_path / 'a.wav', 3), 3, 'ru')
+    # слово нулевой длины и наложенное слово сливаются с соседом, конец за краем записи обрезается
+    assert words == [{'text': 'Раз два три', 'start': 0, 'end': 1.5}, {'text': 'четыре', 'start': 1.5, 'end': 3}]
+
+
+@pytest.mark.parametrize('failures', [2, 3])
+def test_recognition_is_requested_again_after_bad_answer(tmp_path, monkeypatch, failures):
+    post, calls = _asr(lambda length: [] if len(calls) <= failures else [{'word': 'да', 'start': .1, 'end': .5}])
+    monkeypatch.setattr(speech, '_post', post)
+    source = _silence(tmp_path / 'a.wav', 3)
+    if failures < 3:
+        assert speech._transcribe(source, 3, 'ru')[0]['text'] == 'да'
+    else:
+        with pytest.raises(ValueError):
+            speech._transcribe(source, 3, 'ru')
+    assert len(calls) == min(failures + 1, 3)
+
+
+def test_bad_long_chunk_is_recognized_again_in_short_pieces(tmp_path, monkeypatch):
+    # кусок 0..180 с распознаётся без слов, остальные куски нормально
+    post, calls = _asr(lambda length: [] if length > 100 and len(calls) == 1 else [{'word': 'да', 'start': 5, 'end': 5.5}])
+    monkeypatch.setattr(speech, '_post', post)
+    words = speech._transcribe(_silence(tmp_path / 'long.wav', 185), 185, 'ru')
+    assert calls[0] == pytest.approx(180, abs=.1) and max(calls[1:-1]) <= 30.1
+    assert [word['start'] for word in words] == [5 + 25 * i for i in range(7)] + [180]
+
+
+@pytest.mark.parametrize('found', [True, False])
+def test_line_dropped_by_recognition_is_recognized_again_in_its_pause(tmp_path, monkeypatch, found):
+    lines = [{'id': i, 'text': text, 'speaker_id': 'a', 'kind': 'on_screen', 'voice': 'v'}
+             for i, text in enumerate(['Раз два', 'Три', 'Пять шесть'])]
+    monkeypatch.setattr(speech, '_synthesize', lambda _: _silence(tmp_path / 'voice.wav', 13).read_bytes())
+    monkeypatch.setattr(speech, '_transcribe', lambda *_: [
+        {'text': 'Раз', 'start': 0, 'end': 1}, {'text': 'два', 'start': 1, 'end': 2},
+        {'text': 'Пять', 'start': 10, 'end': 11}, {'text': 'шесть', 'start': 11, 'end': 12}])
+    post, calls = _asr(lambda length: [{'word': 'Три', 'start': 3, 'end': 4}] if found else [])
+    monkeypatch.setattr(speech, '_post', post)
+    if found:
+        result = speech.prepare_speech(tmp_path, 'p', 's', lines, 'ru')
+        assert [(line['start'], line['end']) for line in result['lines']] == [(0, 2), (5, 6), (10, 12)]
+        assert [word['text'] for word in result['words']].count('Три') == 1
+    else:
+        with pytest.raises(ValueError, match='Реплика 2 не найдена'):
+            speech.prepare_speech(tmp_path, 'p', 's', lines, 'ru')
+    # распознаётся только пауза между соседями
+    assert calls[0] == pytest.approx(8, abs=.1)

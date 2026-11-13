@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -11,18 +12,13 @@ def test_canon_reference_uses_cached_catalog_style_only(tmp_path, monkeypatch):
     project_dir = tmp_path / "plots" / "storybooks" / "neutral_project"
     style_dir = project_dir / "30_style"
     style_dir.mkdir(parents=True)
-    (style_dir / "style_images.json").write_text(
-        json.dumps(
-            {
-                "color_palette": "GLOBAL_OTHER_PALETTES",
-                "model": "GLOBAL_MODEL_ID",
-                "project_note": "GLOBAL_PROJECT_NOTE",
-                "do_not_include": ["GLOBAL_DO_NOT_INCLUDE"],
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
+    style_images = {
+        "color_palette": "GLOBAL_OTHER_PALETTES",
+        "model": "GLOBAL_MODEL_ID",
+        "project_note": "GLOBAL_PROJECT_NOTE",
+        "do_not_include": ["GLOBAL_DO_NOT_INCLUDE"],
+    }
+    (style_dir / "style_images.json").write_text(json.dumps(style_images, ensure_ascii=False), encoding="utf-8")
     (style_dir / "image_styles.json").write_text(
         json.dumps(
             {
@@ -30,6 +26,10 @@ def test_canon_reference_uses_cached_catalog_style_only(tmp_path, monkeypatch):
                 "default_style_id": "main",
                 "styles": {"main": {"prompt": "READY_STYLE"}},
                 "frame_bindings": {},
+                # Каталог считается готовым только для того же исходного стиля.
+                "source_hash": hashlib.sha256(
+                    json.dumps(style_images, ensure_ascii=False, sort_keys=True).encode()
+                ).hexdigest(),
             },
             ensure_ascii=False,
         ),

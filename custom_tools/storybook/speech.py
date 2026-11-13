@@ -2,6 +2,7 @@
 import hashlib
 import fcntl
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -10,7 +11,15 @@ from pathlib import Path
 import requests
 
 from .music_generator import _load_env_file
-from .speech_alignment import chunk_ranges, measure_line_timing, merge_chunks
+from .speech_alignment import LineNotHeardError, chunk_ranges, measure_line_timing, merge_chunks
+
+
+TRANSCRIBE_ATTEMPTS = 3  # recognition of the same audio failed once on bad word times and passed on the next try
+GAP_RECOGNITIONS = 5  # recognition of the whole audio dropped a short line; its pause is recognized on its own
+CHUNK_SECONDS = 180.0  # longest audio sent for word recognition in one request
+RETRY_CHUNK_SECONDS = 30.0  # a bad chunk is recognized again in pieces this long, from another start
+WORD_END_TOLERANCE = 1.0  # seconds a recognized word may end after its chunk
+WORD_BACK_TOLERANCE = 1.0  # seconds a recognized word may start before the previous one; it is merged with it
 
 
 def _write(path, data):
@@ -50,19 +59,110 @@ def _duration(path):
     return float(subprocess.check_output(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', str(path)], text=True).strip())
 
 
-def _transcribe(path, duration, language):
+def _request_words(clip, length, language):
+    """Words of one clip with times inside it; empty, overlapping and late words are repaired as in one answer."""
+    with clip.open('rb') as audio:
+        response = _post('audio/transcriptions', data={'model': 'llmgateway/whisper', 'response_format': 'verbose_json', 'timestamp_granularities[]': 'word', 'language': language}, files={'file': (clip.name, audio, 'audio/wav')})
+    raw = response.json().get('words')
+    if not isinstance(raw, list) or not raw:
+        raise ValueError('Распознавание не вернуло слов')
+    previous_start = 0.0
+    for item in raw:
+        if not isinstance(item, dict) or not isinstance(item.get('word'), str) or not item['word'].strip():
+            raise ValueError(f'Некорректное слово распознавания: {item!r}')
+        start, end = item.get('start'), item.get('end')
+        if (isinstance(start, bool) or isinstance(end, bool)
+                or not isinstance(start, (int, float)) or not isinstance(end, (int, float))
+                or not math.isfinite(start) or not math.isfinite(end)
+                or start < 0 or start < previous_start - WORD_BACK_TOLERANCE or end < start
+                or end > length + WORD_END_TOLERANCE):
+            raise ValueError(f'Некорректные временные метки слова распознавания: {item!r}')
+        previous_start = max(previous_start, start)
+    words, pending, previous_end = [], [], None
+    for item in raw:
+        # Модель может закончить последнее слово чуть позже конца куска: время обрезается по куску
+        start, end = min(item['start'], length), min(item['end'], length)
+        if start == end:
+            if words and not pending and previous_end == start:
+                words[-1]['text'] += ' ' + item['word']
+            else:
+                pending.append(item)
+        else:
+            if pending and any(min(word['start'], length) != start for word in pending):
+                raise ValueError(f'Пустые слова распознавания перед {item!r}')
+            text = ' '.join([word['word'] for word in pending] + [item['word']])
+            if words and start < words[-1]['end']:
+                words[-1]['text'] += ' ' + text
+                words[-1]['end'] = max(words[-1]['end'], end)
+            else:
+                words.append({'text': text, 'start': start, 'end': end})
+            pending = []
+        previous_end = end
+    if pending:
+        raise ValueError('Пустые слова распознавания в конце записи')
+    return words
+
+
+def _span_words(path, begin, finish, language, directory, size, retry):
+    """Words of begin..finish recognized in overlapping chunks, in the times of the whole audio.
+
+    A bad chunk is not asked again as is: cuts starting at the same point lose the same speech.
+    With retry it is recognized once more in short pieces starting half a piece earlier."""
     chunks = []
-    with tempfile.TemporaryDirectory() as directory:
-        for i, (start, end) in enumerate(chunk_ranges(duration)):
-            clip = Path(directory) / f'{i}.wav'
-            subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', str(start), '-i', str(path), '-t', str(end-start), '-ac', '1', '-ar', '16000', str(clip)], check=True)
-            with clip.open('rb') as audio:
-                response = _post('audio/transcriptions', data={'model': 'llmgateway/whisper', 'response_format': 'verbose_json', 'timestamp_granularities[]': 'word', 'language': language}, files={'file': (clip.name, audio, 'audio/wav')})
-            raw = response.json().get('words')
-            if not isinstance(raw, list) or not raw:
-                raise ValueError('Распознавание не вернуло слов')
-            chunks.append((start, end, [{'text': item['word'], 'start': start + item['start'], 'end': start + item['end']} for item in raw]))
+    for start, end in chunk_ranges(finish - begin, size):
+        start, end = begin + start, begin + end
+        clip = Path(directory) / f'{start}-{end}.wav'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', str(start), '-i', str(path), '-t', str(end-start), '-ac', '1', '-ar', '16000', str(clip)], check=True)
+        try:
+            words = [{**word, 'start': start + word['start'], 'end': start + word['end']}
+                     for word in _request_words(clip, end - start, language)]
+        except ValueError as error:
+            if not retry:
+                raise
+            try:
+                words = _span_words(path, max(0.0, start - RETRY_CHUNK_SECONDS / 2), end, language, directory,
+                                    RETRY_CHUNK_SECONDS, False)
+            except ValueError:
+                raise error from None
+        chunks.append((start, end, words))
     return merge_chunks(chunks)
+
+
+def _merge_overlapping(words):
+    """Words whose times overlap become one item with the common text, as in a single request."""
+    result = []
+    for word in words:
+        if result and word['start'] < result[-1]['end']:
+            result[-1] = {'text': result[-1]['text'] + ' ' + word['text'], 'start': result[-1]['start'],
+                          'end': max(result[-1]['end'], word['end'])}
+        else:
+            result.append(dict(word))
+    return result
+
+
+def _transcribe(path, duration, language):
+    for attempt in range(1, TRANSCRIBE_ATTEMPTS + 1):
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                return _merge_overlapping(_span_words(path, 0.0, duration, language, directory, CHUNK_SECONDS,
+                                                      duration > CHUNK_SECONDS))
+        except ValueError:  # плохие или пустые времена слов: то же аудио распознаётся ещё раз
+            if attempt == TRANSCRIBE_ATTEMPTS:
+                raise
+
+
+def _gap_words(path, start, end, language):
+    """Words recognized in start..end of the audio alone, in the times of the whole audio."""
+    if end <= start:
+        return []
+    with tempfile.TemporaryDirectory() as directory:
+        clip = Path(directory) / 'gap.wav'
+        subprocess.run(['ffmpeg', '-v', 'error', '-y', '-ss', str(start), '-i', str(path), '-t', str(end-start), '-ac', '1', '-ar', '16000', str(clip)], check=True)
+        try:
+            recognized = _request_words(clip, end - start, language)
+        except ValueError:  # и здесь ничего не распознано: реплика остаётся ненайденной
+            return []
+    return [{**word, 'start': start + word['start'], 'end': start + word['end']} for word in recognized]
 
 
 def _insert_pauses(source, target, duration, lines, words):
@@ -159,7 +259,18 @@ def prepare_speech(base, project_id, series_id, lines, language, publish=None):
             words = _transcribe(original, duration, language)
             _write(words_path, json.dumps(words, ensure_ascii=False).encode())
         try:
-            timing = measure_line_timing(lines, words, duration, language)
+            for recognized_gaps in range(GAP_RECOGNITIONS + 1):
+                try:
+                    timing = measure_line_timing(lines, words, duration, language)
+                    break
+                except LineNotHeardError as error:
+                    # Распознавание всей записи пропустило короткую реплику: её пауза распознаётся отдельно
+                    heard = _gap_words(original, error.start, error.end, language) if recognized_gaps < GAP_RECOGNITIONS else []
+                    if not heard:
+                        raise
+                    words = ([word for word in words if word['end'] <= error.start] + heard
+                             + [word for word in words if word['start'] >= error.end])
+                    _write(words_path, json.dumps(words, ensure_ascii=False).encode())
         except ValueError:
             words_path.unlink(missing_ok=True)
             for legacy_path in legacy_words:
