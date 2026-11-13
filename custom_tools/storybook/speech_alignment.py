@@ -48,7 +48,9 @@ def _en_hundreds(number: int) -> list[str]:
 _RULES = {
     "ru": {
         "units": _RU_UNITS, "hundreds": _ru_hundreds, "scales": ["", "тысяча", "миллион", "миллиард"],
-        "point": "запятая", "fraction_by_digits": False, "ordinal": r"[а-я]{1,3}", "thousands": r"[ \u00a0]", "decimal": ",", "fold": {"ё": "е"},
+        "point": "запятая", "fraction_by_digits": False, "ordinal": r"[а-я]{1,3}", "thousands": r"[ \u00a0]", "decimal": ",",
+        # Latin letters are read as Cyrillic: a term may be written in one script and recognized in the other
+        "fold": {"ё": "е"} | dict(zip("abcdefghiklmnopqrstuvwyz", "абкдефгхиклмнопкрстувйз")) | {"j": "дж", "x": "кс"},
         "letters": dict(zip("ABCDEFGHIJKLMNOPQRSTUVWXYZ", (
             "эй би си ди и эф джи эйч ай джей кей эл эм эн оу пи кью ар эс ти ю ви дабл-ю икс уай зед").split())),
         "symbols": [(r"%", " процент "), (r"\$", " доллар "), (r"€", " евро "), (r"№", " номер "), (r"&", " и "),
@@ -215,6 +217,14 @@ def _clip(text: str) -> str:
     return text if len(text) <= SHOWN_CHARS else text[:SHOWN_CHARS - 1] + "…"
 
 
+class LineNotHeardError(ValueError):
+    """No recognized word is left for a line: it should sound in start..end, between the words of its neighbours."""
+
+    def __init__(self, message: str, start: float, end: float):
+        super().__init__(message)
+        self.start, self.end = start, end
+
+
 def _not_found(number: int, line: dict, group_words: list[dict]) -> ValueError:
     heard = " ".join(word["text"] for word in group_words) or "ничего"
     expected = " ".join(line["text"].split())
@@ -288,7 +298,8 @@ def measure_line_timing(lines: list[dict], words: list[dict], duration: float, l
         if not gap and (before < 0 or after >= len(lines)):
             continue
         if len(gap) > high - low - 1:
-            raise _not_found(gap[0] + 1, lines[gap[0]], [])
+            raise LineNotHeardError(str(_not_found(gap[0] + 1, lines[gap[0]], [])),
+                                    words[low]["end"] if low >= 0 else 0.0, words[high]["start"] if high < count else duration)
 
         def pause(position: int) -> float:
             left = words[position]["end"] if position >= 0 else 0.0
@@ -319,13 +330,13 @@ def measure_line_timing(lines: list[dict], words: list[dict], duration: float, l
     return result
 
 
-def chunk_ranges(duration):
+def chunk_ranges(duration, size=180.0):
     if duration <= 0:
         raise ValueError("Длительность записи должна быть положительной")
     ranges = []
     start = 0.0
     while start < duration:
-        end = min(start + 180.0, duration)
+        end = min(start + size, duration)
         ranges.append((start, end))
         if end == duration:
             break

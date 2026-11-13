@@ -113,7 +113,7 @@ def test_wire_rebuilds_roles_after_cap_without_losing_text(tmp_path, monkeypatch
         "negative_prompt": "text", "reference_image_paths": [continuity, boy, platonov, extra, location],
         "locations": [{"name": "yard", "reference_image_path": location}],
         "characters": [
-            {"name": "Boy", "reference_image_path": "/references/characters/boy.png", "immutable_attributes": {"face_shape": "angular"}, "appearance_state": "свитер, без пальто"},
+            {"name": "Boy", "reference_image_path": boy, "immutable_attributes": {"face_shape": "angular"}, "appearance_state": "свитер, без пальто"},
             {"name": "Platonov", "reference_image_path": platonov, "immutable_attributes": {"face_shape": "long"}},
         ],
         "background_reference": {"sequence_id": "chase", "sheet_path": sheet, "card_number": 3},
